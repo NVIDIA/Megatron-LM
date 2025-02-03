@@ -6,6 +6,7 @@
 import torch
 
 
+from megatron.core import parallel_state
 from megatron.training import get_args, get_tokenizer
 from .communication import broadcast_int_list, broadcast_tensor
 
@@ -15,45 +16,45 @@ def detokenize_generations(tokens_gpu_tensor,
                            detokenize_segments):
     """Detokenize the generated tokens."""
 
-    args = get_args()
     tokenizer = get_tokenizer()
     prompts_plus_generations = []
     prompts_plus_generations_segments = []
 
     tokens = tokens_gpu_tensor.cpu().numpy().tolist()
     lengths = lengths_gpu_tensor.cpu().numpy().tolist()
+
     for sequence_tokens, length in zip(tokens, lengths):
         sequence_tokens = sequence_tokens[:length]
-        prompts_plus_generations.append(
-            tokenizer.detokenize(sequence_tokens))
+        detok_str = tokenizer.detokenize(sequence_tokens)
+        prompts_plus_generations.append(detok_str)
         if detokenize_segments:
-            words = []
-            for token in sequence_tokens:
-                if args.tokenizer_type in ['SentencePieceTokenizer',
-                                           'GPTSentencePieceTokenizer',
-                                           'HuggingFaceTokenizer',
-                                           'Llama2Tokenizer']:
-                    word = tokenizer.decoder[token]
-                elif args.tokenizer_type == 'TikTokenizer':
-                    word = tokenizer.detokenize([token])
-                elif args.tokenizer_type in ['Llama3Tokenizer', 'MistralTokenizer']:
-                    word = tokenizer.decode([token])
-                elif args.tokenizer_type == 'NullTokenizer':
-                    word = str(token)
-                else:
+            try:
+                offsets = tokenizer.offsets(sequence_tokens, detok_str)
+                words = [
+                    detok_str[start:end]
+                    for start, end in zip(offsets, offsets[1:] + [len(detok_str)])
+                ]
+            except NotImplementedError:
+                words = []
+                for token in sequence_tokens:
                     word = tokenizer.tokenizer.decoder[token]
-                    word = bytearray(
-                        [tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
-                            'utf-8', errors='replace')
-                words.append(word)
+                    word = bytearray([tokenizer.tokenizer.byte_decoder[c] for c in word]).decode(
+                        "utf-8", errors="replace"
+                    )
+                    words.append(word)
+
             prompts_plus_generations_segments.append(words)
 
     return tokens, prompts_plus_generations, prompts_plus_generations_segments
 
 
 def tokenize_prompts(prompts=None, tokens_to_generate=None,
-                     add_BOS=None, rank=0):
-    """Tokenize prompts and make them avaiable on all ranks."""
+                     add_BOS=None, rank=0, data_parallel=False):
+    """Tokenize prompts and make them avaiable on all ranks.
+
+    Args:
+        data_parallel (bool): Broadcast tokens across a single data parallel model replica.
+    """
 
     # On all ranks set to None so we can pass them to functions
     sizes_list = None
@@ -61,7 +62,11 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None,
     prompts_length_cuda_long_tensor = None
 
     # On the specified rank, build the above.
-    if torch.distributed.get_rank() == rank:
+    src_rank = torch.distributed.get_rank()
+    if data_parallel:
+        src_rank = parallel_state.get_data_parallel_src_rank()
+
+    if src_rank == rank:
         assert prompts is not None
         assert tokens_to_generate is not None
         # Tensor of tokens padded and their unpadded length.
@@ -72,16 +77,16 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None,
                       prompts_tokens_cuda_long_tensor.size(1)] # Sequence lenght
 
     # First, broadcast the sizes.
-    sizes_tensor = broadcast_int_list(2, int_list=sizes_list, rank=rank)
+    sizes_tensor = broadcast_int_list(2, int_list=sizes_list, rank=rank, data_parallel=data_parallel)
 
     # Now that we have the sizes, we can boradcast the tokens
     # and length tensors.
     sizes = sizes_tensor.tolist()
     prompts_tokens_cuda_long_tensor = broadcast_tensor(
-        sizes, torch.int64, tensor=prompts_tokens_cuda_long_tensor, rank=rank)
+        sizes, torch.int64, tensor=prompts_tokens_cuda_long_tensor, rank=rank, data_parallel=data_parallel)
     prompts_length_cuda_long_tensor = broadcast_tensor(
         sizes[0], torch.int64, tensor=prompts_length_cuda_long_tensor,
-        rank=rank)
+        rank=rank, data_parallel=data_parallel)
 
     return prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor
 
@@ -96,7 +101,6 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     """
 
     # Tokenize all the prompts.
-    args = get_args()
     tokenizer = get_tokenizer()
     if hasattr(tokenizer, 'eod'):
         eod_token = tokenizer.eod

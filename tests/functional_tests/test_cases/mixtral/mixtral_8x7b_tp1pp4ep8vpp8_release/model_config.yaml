@@ -4,9 +4,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
-
 TEST_TYPE: "release"
-
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -16,7 +14,6 @@ MODEL_ARGS:
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
   --overlap-param-gather: true
-
   # Training args
   --use-mcore-models: true
   --sequence-parallel: true
@@ -26,23 +23,20 @@ MODEL_ARGS:
   --global-batch-size: 256
   --train-samples: 51200
   --exit-duration-in-mins: 230
-
   # Transformer Engine args
   --transformer-impl: transformer_engine
-
   # Data args
-  --data-cache-path: ${OUTPUT_PATH}/cache
+  --data-cache-path: ${DATA_CACHE_PATH}
   --tokenizer-type: Llama2Tokenizer
   --tokenizer-model: ${DATA_PATH}/tokenizer.model
   --data-path: ${DATA_BLEND}
   --split: 99,1,0
   --no-mmap-bin-files: true
   --num-workers: 6
-
   # Add network size args
   --untie-embeddings-and-output-weights: true
-  --no-position-embedding: true
   --position-embedding-type: rope
+  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 1.0
   --normalization: RMSNorm
   --swiglu: true
@@ -55,13 +49,11 @@ MODEL_ARGS:
   --seq-length: 4096
   --max-position-embeddings: 4096
   --make-vocab-size-divisible-by: 128
-
   # Add regularization args
   --attention-dropout: 0.0
   --hidden-dropout: 0.0
   --clip-grad: 1.0
   --weight-decay: 0.1
-
   # Add learning rate args
   --lr-decay-samples: 255126953
   --lr-warmup-samples: 162761
@@ -70,7 +62,6 @@ MODEL_ARGS:
   --lr-decay-style: cosine
   --adam-beta1: 0.9
   --adam-beta2: 0.95
-
   # Add MoE args
   --expert-model-parallel-size: 8
   --num-experts: 8
@@ -79,21 +70,18 @@ MODEL_ARGS:
   --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-2
   --moe-token-dispatcher-type: alltoall
-
   # Add validation args
   --eval-iters: 32
   --eval-interval: 200
-
   # Add checkpointing args
   --finetune: true
   --auto-detect-ckpt-format: true
   --load: ${LOAD_PATH}
   --save: ${OUTPUT_PATH}/checkpoints
+  --no-ckpt-fully-parallel-save: true
   --save-interval: 500
-
   # Add initialization args
   --init-method-std: 0.008
-
   # Add logging args
   --log-timers-to-tensorboard: true
   --log-memory-to-tensorboard: true
@@ -105,6 +93,5 @@ MODEL_ARGS:
   --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
-
   # Add mixed precision args
   --bf16: true

@@ -38,10 +38,10 @@ try:
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_layer_norm import WrappedTorchLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
-    LNImpl = WrappedTorchLayerNorm
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
 
 
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
@@ -94,6 +94,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=TENorm,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
+                params={"attn_mask_type": AttnMaskType.padding},
                 submodules=CrossAttentionSubmodules(
                     linear_q=TEColumnParallelLinear,
                     linear_kv=TEColumnParallelLinear,
@@ -122,7 +123,7 @@ def encoder_model_with_local_spec() -> ModuleSpec:
             input_layernorm=LNImpl,
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
@@ -170,6 +171,7 @@ def decoder_model_with_local_spec() -> ModuleSpec:
             pre_cross_attn_layernorm=LNImpl,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
+                params={"attn_mask_type": AttnMaskType.arbitrary},
                 submodules=CrossAttentionSubmodules(
                     linear_q=ColumnParallelLinear,
                     linear_kv=ColumnParallelLinear,

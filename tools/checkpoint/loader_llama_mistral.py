@@ -19,10 +19,10 @@ def add_arguments(parser):
 
     # TODO(jbarker): Need assertion to make sure *exactly* one of these is used
     parser.add_argument('--model-size', type=str, required=True,
-                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3-8B', 'llama3-70B', 'llama3-8Bf', 'llama3-70Bf', 'mistral-7B', 'mistral-7Bf', 'yi-34B'],
-                        help='Model size can be `llama2-7B`, `llama2-13B`, `llama2-70B`, `llama3-8B`, `llama3-70B`, `mistral-7B` (for pretrained models), '
-                        'and `llama2-7Bf`, `llama2-13Bf`, `llama2-70Bf`, `llama3-8Bf`, `llama3-70bf` and `mistral-7Bf` (for chat-finetuned models).')
+                        choices=['llama2-7B', 'llama2-13B', 'llama2-70B', 'llama2-7Bf', 'llama2-13Bf', 'llama2-70Bf', 'llama3', 'mistral', 'yi-34B', 'qwen2.5'],
+                        help='Select model size/type')
     parser.add_argument('--checkpoint-type', type=str, required=True,
+                        choices=['meta', 'hf'],
                         help='Type of checkpoint to convert, options are "meta" or "hf"')
     parser.add_argument('--bf16', action='store_true', help='Whether to load weights in bf16.')
     parser.add_argument('--fp16', action='store_true', help='Whether to load weights in fp16.')
@@ -35,6 +35,7 @@ def add_arguments(parser):
                        help='Tokenizer model file.')
     group.add_argument('--megatron-path', type=str, default=None,
                        help='Base directory of Megatron repository')
+    group.add_argument("--make-vocab-size-divisible-by", type=int, default=None, help="Make vocab size divisible by")
     group.add_argument('--loader-transformer-impl', default='local',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
@@ -52,13 +53,6 @@ NUM_SHARDS = {
     "llama2-13Bf": 2,
     "llama2-70B": 8,
     "llama2-70Bf": 8,
-    "llama3-8B": 1,
-    "llama3-8Bf": 1,
-    "llama3-70B": 8,
-    "llama3-70Bf": 8,
-    "mistral-7B": 1,
-    "mistral-7Bf": 1,
-    "yi-34B": 8,
 }
 
 
@@ -79,14 +73,11 @@ def write_json(text, path):
 # This conversion is adapted from
 # https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/convert_llama_weights_to_hf.py
 def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
-
     if "llama2" in model_size:
         from transformers import LlamaConfig as ModelConfig
         from transformers import  LlamaTokenizer, LlamaTokenizerFast
-    elif "llama3" in model_size:
-        from transformers import LlamaConfig as ModelConfig
-    elif "mistral" in model_size:
-        from transformers import MistralConfig as ModelConfig
+    else:
+        raise NotImplementedError(f"converting {model_size} is only supported using HuggingFace weights")
 
     # for backward compatibility, before you needed the repo to be called `my_repo/model_size`
     if not os.path.isfile(os.path.join(input_base_path, "params.json")):
@@ -107,25 +98,18 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if base > 10000.0:
         max_position_embeddings = 32768 if "mistral" in model_size else 16384
     else:
-        max_position_embeddings = 4096 if "mistral" in model_size else 2048
+        max_position_embeddings = 4096
 
     if "llama2" in model_size:
         tokenizer_class = LlamaTokenizer if LlamaTokenizerFast is None else LlamaTokenizerFast
-    elif model_size in ["llama3", "mistral"]:
-        tokenizer_class = transformers.AutoTokenizer.from_pretrained
     else:
         raise AttributeError(f"model_size={model_size} not supported")
+
     if tokenizer_path is not None:
-        if "llama" in model_size:
+        if "llama2" in model_size:
             tokenizer = tokenizer_class(tokenizer_path)
-            if "llama2" in model_size:
-                tokenizer.save_pretrained(model_path)
-                vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
-            elif "llama3" in model_size:
-                 vocab_size = 128256
-        elif "mistral" in model_size:
-            tokenizer = tokenizer_class.from_file(tokenizer_path)
-            vocab_size = 32768
+            tokenizer.save_pretrained(model_path)
+            vocab_size = tokenizer.vocab_size if tokenizer_path is not None else 32000
         else:
             raise AttributeError(f"model_size={model_size} is not supported")
 
@@ -291,15 +275,21 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     return model_path
 
 
-def load_args_from_checkpoint(args):
+def load_args_from_checkpoint(args, model_size):
 
     # Read Llama args.
     model_args_path = os.path.join(args.load, "config.json")
     with open(model_args_path) as f:
         model_args = json.load(f)
+
     # Update Megatron args.
     args.seq_length = 4096
-    args.max_position_embeddings = model_args["max_position_embeddings"]
+    if "llama2" in model_size:
+        # Correct bug in earlier conversion script.
+        args.max_position_embeddings = 4096
+    else:
+        args.max_position_embeddings = model_args["max_position_embeddings"]
+
     args.hidden_size = model_args["hidden_size"]
     args.num_attention_heads = model_args["num_attention_heads"]
     args.num_layers = model_args["num_hidden_layers"]
@@ -310,7 +300,7 @@ def load_args_from_checkpoint(args):
     args.swiglu = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
-    args.untie_embeddings_and_output_weights = True
+    args.untie_embeddings_and_output_weights = not model_args.get("tie_word_embeddings", False)
     args.vocab_size = model_args["vocab_size"]
     args.padded_vocab_size = model_args["vocab_size"]
     args.ffn_hidden_size = model_args["intermediate_size"]
@@ -329,7 +319,8 @@ def set_preprocess_state(args, model, hf_model):
 def set_postprocess_state(args, model, hf_model):
     '''Set output layer & norm params.'''
     model.language_model.encoder.final_norm.weight.data.copy_(hf_model.model.norm.weight)
-    model.language_model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
+    if args.untie_embeddings_and_output_weights:
+        model.language_model.output_layer.weight.data.copy_(hf_model.lm_head.weight)
 
 
 def set_attn_state(args, layer, hf_layer):
@@ -353,6 +344,13 @@ def set_attn_state(args, layer, hf_layer):
         hf_attn.k_proj.weight.reshape((ng, dim, -1)),
         hf_attn.v_proj.weight.reshape((ng, dim, -1)),
     ], dim=1).reshape((-1, args.hidden_size)))
+    if args.add_qkv_bias:
+        attn.query_key_value.bias.data.copy_(torch.cat([
+            hf_attn.q_proj.bias.reshape((ng, dim*nh//ng)),
+            hf_attn.k_proj.bias.reshape((ng, dim)),
+            hf_attn.v_proj.bias.reshape((ng, dim)),
+        ], dim=1).reshape(-1))
+
     attn.dense.weight.data.copy_(hf_attn.o_proj.weight)
 
 
@@ -385,15 +383,10 @@ def load_checkpoint_to_model(args):
     '''Set model params.'''
 
     from pretrain_gpt import model_provider
-    if "llama" in args.model_size or "yi" in args.model_size:
-        from transformers import LlamaForCausalLM as ModelForCausalLM
-    elif "mistral" in args.model_size:
-        from transformers import MistralForCausalLM as ModelForCausalLM
-    else:
-        raise AttributeError(f"args.model_size={args.model_size} not supported")
+    from transformers import AutoModelForCausalLM
 
     # Load Huggingface model.
-    hf_model = ModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
+    hf_model = AutoModelForCausalLM.from_pretrained(args.load, torch_dtype=args.params_dtype, low_cpu_mem_usage=True, device_map="cpu")
 
     # Init Megatron model.
     model = model_provider(True, True).to(args.params_dtype)
@@ -423,6 +416,7 @@ def _load_checkpoint(queue, args):
     if args.checkpoint_type == "meta":
         model_tmp_path = convert_to_hf(model_path=os.path.join(args.save_dir, 'tmp'), input_base_path=args.load_dir, model_size=args.model_size, tokenizer_path=args.tokenizer_model)
         args.load_dir = model_tmp_path
+        args.tokenizer_model = model_tmp_path # point to HF tokenizer model
 
     try:
         from megatron.training.arguments import parse_args, validate_args
@@ -450,19 +444,28 @@ def _load_checkpoint(queue, args):
                 '--no-save-rng',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--no-initialization',
-                '--load', args.load_dir
+                '--load', args.load_dir,
+                '--no-one-logger',
                 ]
+
+    if args.make_vocab_size_divisible_by is not None:
+        sys.argv.extend(["--make-vocab-size-divisible-by", str(args.make_vocab_size_divisible_by)])
 
     margs = parse_args()
     margs.tokenizer_model = args.tokenizer_model
-    load_args_from_checkpoint(margs)
+    load_args_from_checkpoint(margs, args.model_size)
 
-    if "llama2" in args.model_size or "yi" in args.model_size:
+    if "llama2" in args.model_size:
         margs.tokenizer_type = "Llama2Tokenizer"
+    elif "yi" in args.model_size:
+        margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "llama3" in args.model_size:
         margs.tokenizer_type = "HuggingFaceTokenizer"
     elif "mistral" in args.model_size:
         margs.tokenizer_type = "HuggingFaceTokenizer"
+    elif "qwen2.5" in args.model_size:
+        margs.tokenizer_type = "HuggingFaceTokenizer"
+        margs.add_qkv_bias = True
 
     # Arguments do sanity checks on the world size, but we don't care,
     # so trick it into thinking we are plenty of processes.
@@ -535,11 +538,12 @@ def _load_checkpoint(queue, args):
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
+    md.qkv_bias = margs.add_qkv_bias
     md.norm_has_bias = False
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
     md.previous_pipeline_parallel_size = margs.pipeline_model_parallel_size
-    md.make_vocab_size_divisible_by = None
+    md.make_vocab_size_divisible_by = margs.make_vocab_size_divisible_by
     md.checkpoint_args = margs
     md.consumed_train_samples = 0
     md.consumed_valid_samples = 0
@@ -596,8 +600,10 @@ def _load_checkpoint(queue, args):
         dense_weight.append(layer.self_attention.dense.weight.data)
         mlp_l0_weight.append(layer.mlp.dense_h_to_4h.weight.data)
         mlp_l1_weight.append(layer.mlp.dense_4h_to_h.weight.data)
-        if md.linear_bias:
+
+        if md.qkv_bias:
             qkv_bias.append(layer.self_attention.query_key_value.bias.data)
+        if md.linear_bias:
             mlp_l0_bias.append(layer.mlp.dense_h_to_4h.bias.data)
 
         # Handle gated linear units.
@@ -614,8 +620,9 @@ def _load_checkpoint(queue, args):
         message["qkv weight"] = torch.cat(qkv_weight, dim=0)
         message["dense weight"] = torch.cat(dense_weight, dim=1)
         message["mlp l1 weight"] = torch.cat(mlp_l1_weight, dim=1)
-        if md.linear_bias:
+        if md.qkv_bias:
             message["qkv bias"] = torch.cat(qkv_bias, dim=0)
+        if md.linear_bias:
             if md.swiglu:
                 for tp_rank in range(tp_size):
                     mlp_l0_bias[tp_rank] = torch.chunk(mlp_l0_bias[tp_rank], 2, dim=0)
@@ -641,7 +648,7 @@ def _load_checkpoint(queue, args):
     queue.put("done")
 
     if args.checkpoint_type == "meta":
-        shutil.rmtree(os.path.join(args.save_dir, 'tmp'))
+        shutil.rmtree(os.path.join(args.load_dir))
 
 
 def load_checkpoint(queue, args):

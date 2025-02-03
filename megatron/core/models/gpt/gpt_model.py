@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import InferenceParams, tensor_parallel
@@ -50,6 +51,11 @@ class GPTModel(LanguageModule):
             Base period for rotary position embeddings. Ignored unless
             position_embedding_type is 'rope'.
             Defaults to 10000.
+        rope_scaling (bool, optional): Toggle RoPE scaling.
+        rope_scaling_factor (float): RoPE scaling factor. Default 8.
+        scatter_embedding_sequence_parallel (bool, optional):
+            Whether embeddings should be scattered across sequence parallel
+            region or not. Defaults to True.
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
@@ -69,6 +75,9 @@ class GPTModel(LanguageModule):
         position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
+        rope_scaling: bool = False,
+        rope_scaling_factor: float = 8.0,
+        scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
         super().__init__(config=config)
@@ -90,9 +99,11 @@ class GPTModel(LanguageModule):
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        # These 2 attributes are needed for TensorRT-LLM export.
+        # These 4 attributes are needed for TensorRT-LLM export.
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
+        self.rotary_base = rotary_base
+        self.rotary_scaling = rope_scaling
 
         if self.pre_process:
             self.embedding = LanguageModelEmbedding(
@@ -100,17 +111,23 @@ class GPTModel(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
+                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
             )
 
-        if self.position_embedding_type == 'rope':
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(
                 kv_channels=self.config.kv_channels,
                 rotary_percent=rotary_percent,
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                rope_scaling=rope_scaling,
+                rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
+
+        # Cache for RoPE tensors which do not change between iterations.
+        self.rotary_pos_emb_cache = {}
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -185,12 +202,17 @@ class GPTModel(LanguageModule):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -207,11 +229,36 @@ class GPTModel(LanguageModule):
 
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.position_embedding_type == 'rope':
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
+        rotary_pos_cos = None
+        rotary_pos_sin = None
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            if not self.training and self.config.flash_decode and inference_params:
+                # Flash decoding uses precomputed cos and sin for RoPE
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
+                    inference_params.max_sequence_length,
+                    self.rotary_pos_emb.get_cos_sin(inference_params.max_sequence_length),
+                )
+            else:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_params, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                )
+        if (
+            (self.config.enable_cuda_graph or self.config.flash_decode)
+            and rotary_pos_cos is not None
+            and inference_params
+        ):
+            sequence_len_offset = torch.tensor(
+                [inference_params.sequence_len_offset] * inference_params.current_batch_size,
+                dtype=torch.int32,
+                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
             )
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+        else:
+            sequence_len_offset = None
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -219,7 +266,10 @@ class GPTModel(LanguageModule):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
 
@@ -230,7 +280,9 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        logits, _ = self.output_layer(hidden_states, weight=output_weight)
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(

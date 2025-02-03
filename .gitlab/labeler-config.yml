@@ -1,7 +1,9 @@
 CI:
 - .gitlab-ci.yml
-- Dockerfile.ci
-- jet-tests.yml
+- Dockerfile.ci.lts
+- Dockerfile.ci.dev
+- .github/**
+- .gitlab/**
 
 Datasets:
 - megatron/core/datasets/**

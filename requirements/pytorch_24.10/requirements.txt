@@ -1,0 +1,18 @@
+einops
+flask-restful
+nltk
+pytest
+pytest_asyncio
+pytest-cov
+pytest_mock
+pytest-random-order
+sentencepiece
+tiktoken
+wrapt
+zarr
+wandb
+tensorstore!=0.1.46
+torch
+triton==3.1.0
+nvidia-modelopt[torch]>=0.19.0; sys_platform != "darwin"
+nvidia-resiliency-ext

@@ -6,8 +6,9 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.param_and_grad_buffer import partition_buckets
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
 
 
@@ -20,11 +21,14 @@ def get_model_and_buffers(
     bucket_size: int,
     use_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
+    average_in_collective: bool,
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
+        bucket_size=bucket_size,
+        average_in_collective=average_in_collective,
     )
     model = TestModel(
         input_dim=input_dim,
@@ -32,24 +36,16 @@ def get_model_and_buffers(
         num_layers=num_layers,
         bias=bias,
         shared_embedding=shared_embedding,
-    )
-    params = list(model.parameters())
-    param_to_name = {}
-    for name, param in model.named_parameters():
-        param_to_name[param] = name
-    param_indices = list(range(len(params)))
+    ).bfloat16()
 
-    param_and_grad_buffer = _ParamAndGradBuffer(
-        ddp_config,
-        param_dtype=torch.bfloat16,
-        grad_dtype=torch.float32,
-        params=params,
-        data_parallel_group=parallel_state.get_data_parallel_group(),
-        bucket_size=bucket_size,
-        param_to_name=param_to_name,
-        gradient_scaling_factor=1.0,
-        param_indices=param_indices,
+    # Wrap with DistributedDataParallel, and get underlying buffer.
+    # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
+    # errors for num_attention_heads and num_layers.
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config=ddp_config, module=model
     )
+    assert len(model.buffers) == 1
+    param_and_grad_buffer = model.buffers[0]
 
     return model, param_and_grad_buffer
 
@@ -58,7 +54,6 @@ def get_model_and_buffers(
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("shared_embedding", [False, True])
-@pytest.mark.skip(reason="Flaky test")
 def test_bucket_sizes(
     bucket_size: Optional[int], use_distributed_optimizer: bool, bias: bool, shared_embedding: bool
 ):
@@ -79,7 +74,8 @@ def test_bucket_sizes(
         shared_embedding=shared_embedding,
         bucket_size=bucket_size,
         use_distributed_optimizer=use_distributed_optimizer,
-        overlap_grad_reduce=False,
+        overlap_grad_reduce=True,
+        average_in_collective=False,
     )
 
     actual_numel_in_each_bucket = [
@@ -163,7 +159,11 @@ def test_bucket_sizes(
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
-def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
+@pytest.mark.parametrize("average_in_collective", [False, True])
+@pytest.mark.flaky
+def test_grad_sync(
+    use_distributed_optimizer: bool, overlap_grad_reduce: bool, average_in_collective: bool
+):
     Utils.initialize_model_parallel()
 
     input_dim = 100
@@ -178,6 +178,7 @@ def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
         bucket_size=None,  # Group all params into single bucket.
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
+        average_in_collective=average_in_collective,
     )
     bucket_groups = partition_buckets([param_and_grad_buffer])
     param_to_bucket_group = {}
@@ -188,8 +189,16 @@ def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
 
     param_and_grad_buffer.grad_data.data.fill_(1.0)
     expected_grad_data_value_after_collective = 1
-    if torch.distributed.get_rank() == 0 or not use_distributed_optimizer:
-        expected_grad_data_value_after_collective = parallel_state.get_data_parallel_world_size()
+    # under the following conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/DP
+    # this is because when average_in_collective=False, the grad data is always first scaled by 1/DP and then summed by AR/RS
+    # and when use_distributed_optimizer=True, only for rank=0 param_and_grad_buffer.grad_data[0] is updated, for other ranks
+    # another shard of grad_data is updated while param_and_grad_buffer.grad_data[0] is unchanged (=1/DP)
+    if (
+        use_distributed_optimizer
+        and (not average_in_collective)
+        and parallel_state.get_data_parallel_rank() != 0
+    ):
+        expected_grad_data_value_after_collective /= parallel_state.get_data_parallel_world_size()
 
     params = list(model.parameters())
     for i, param in enumerate(params):
@@ -214,7 +223,7 @@ def test_grad_sync(use_distributed_optimizer: bool, overlap_grad_reduce: bool):
         expected_grad_data_value = expected_grad_data_value_after_collective
         if overlap_grad_reduce and i < (len(params) - 1):
             expected_grad_data_value = 1
-        assert int(param_and_grad_buffer.grad_data[0]) == expected_grad_data_value
+        assert param_and_grad_buffer.grad_data[0] == expected_grad_data_value
 
         if not overlap_grad_reduce:
             # Reset grad_data for subsequent collectives.

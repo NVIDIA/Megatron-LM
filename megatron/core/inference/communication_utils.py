@@ -14,6 +14,10 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     """Broadcast a tensor from last pipeline stage to all ranks."""
 
     if parallel_state.is_pipeline_last_stage():
+        assert size == list(
+            tensor.shape
+        ), f"Expected tensor of shape {size} but got {list(tensor.shape)}"
+        assert dtype == tensor.dtype, f"Expected tensor of type {dtype} but got {tensor.dtype}"
         _is_cuda(tensor)
         assert tensor.is_contiguous()
     else:

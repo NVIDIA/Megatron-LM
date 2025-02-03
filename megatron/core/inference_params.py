@@ -6,6 +6,7 @@ class InferenceParams:
     def __init__(self, max_batch_size, max_sequence_length):
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
+        self.current_batch_size = max_batch_size  # Required for bookkeeping variable-sized batches
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
         self.key_value_memory_dict = {}
@@ -28,4 +29,43 @@ class InferenceParams:
             )
 
     def __str__(self):
-        return f"InferenceParams(max_seq_len = {self.max_sequence_length}, max_batch_size = {self.max_batch_size}, sequence_len_offset = {self.sequence_len_offset}, batch_size_offset = {self.batch_size_offset}, key_value_memory_dict = {self.key_value_memory_dict.keys()})"
+        return (
+            f"InferenceParams(max_seq_len = {self.max_sequence_length}, "
+            f"max_batch_size = {self.max_batch_size}, "
+            f"current_batch_size = {self.current_batch_size}, "
+            f"sequence_len_offset = {self.sequence_len_offset}, "
+            f"batch_size_offset = {self.batch_size_offset}, "
+            f"key_value_memory_dict = {self.key_value_memory_dict.keys()})"
+        )
+
+    def __eq__(self, other):
+
+        if not isinstance(other, InferenceParams):
+            return False
+
+        # Check all attributes match
+        basic_attrs = [
+            'max_sequence_length',
+            'max_batch_size',
+            'current_batch_size',
+            'sequence_len_offset',
+            'batch_size_offset',
+        ]
+
+        if not all(hasattr(other, attr) for attr in basic_attrs):
+            return False
+
+        # Check dictionary keys match; i.e. the same number of layers are cached
+        if self.key_value_memory_dict.keys() != other.key_value_memory_dict.keys():
+            return False
+
+        # Check each tensor tuple in the dictionary
+        for key in self.key_value_memory_dict:
+            self_tensors = self.key_value_memory_dict[key]
+            other_tensors = other.key_value_memory_dict[key]
+
+            # Compare each key, value tensor in the tuple
+            for self_tensor, other_tensor in zip(self_tensors, other_tensors):
+                if not self_tensor.shape == other_tensor.shape:
+                    return False
+        return True

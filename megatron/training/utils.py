@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """General utilities."""
+import json
 import os
 import sys
 from datetime import datetime
@@ -11,13 +12,10 @@ try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
 except ImportError:
     try:
+        from amp_C import multi_tensor_l2norm
         from apex.multi_tensor_apply import multi_tensor_applier
     except ImportError:
-        multi_tensor_applier = None
 
-    try:
-        from amp_C import multi_tensor_l2norm
-    except ImportError:
         import warnings
         warnings.warn(
             f'Transformer Engine and Apex are not installed. '
@@ -36,12 +34,21 @@ from megatron.training import (
 )
 from megatron.core import DistributedDataParallel as DDP
 from megatron.core import mpu
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
+from megatron.core.utils import (
+    get_batch_on_this_cp_rank,
+    get_data_parallel_group_if_dtensor,
+    to_local_if_dtensor,
+)
 from megatron.legacy.model import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
 
-
-ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, Float16Module)
+except ImportError:
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
@@ -59,47 +66,108 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return unwrapped_model
 
 
-def calc_params_l2_norm(model):
+def calc_params_l2_norm(model, force_create_fp32_copy=False):
     """Calculate l2 norm of parameters """
     args = get_args()
     if not isinstance(model, list):
         model = [model]
-    # Remove duplicate params.
+    # Seperate moe and dense params
     params_data = []
-    for model_ in model:
-        for param in model_.parameters():
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if mpu.get_expert_model_parallel_rank() > 0:
-                if not getattr(param, 'allreduce', True) and is_not_tp_duplicate:
-                    assert param_is_not_shared(param)
-                    params_data.append(param.data.float() if args.bf16 else param.data)
-            else:
-                is_not_shared = param_is_not_shared(param)
-                if is_not_shared and is_not_tp_duplicate:
-                    params_data.append(param.data.float() if args.bf16 else param.data)
+    moe_params_data = []
+    sharded_params_data = []
+    data_parallel_group = None
 
-    # Calculate norm
+    for model_chunk in model:
+        for param in model_chunk.parameters():
+            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
+            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
+            if not is_not_tp_duplicate:
+                continue
+            assert is_not_tp_duplicate
+            if not getattr(param, 'allreduce', True):
+                # TODO: Implement memory optimization for MoE parameters.
+                assert param_is_not_shared(param)
+                param = to_local_if_dtensor(param)
+                moe_params_data.append(param.data.float() if args.bf16 else param.data)
+            else:
+                if param_is_not_shared(param):
+                    param = to_local_if_dtensor(param)
+                    if args.bf16:
+                        if not force_create_fp32_copy and hasattr(param, 'main_param'):
+                            if getattr(param, 'main_param_sharded', False):
+                                if param.main_param is not None:
+                                    sharded_params_data.append(param.main_param)
+                            else:
+                                params_data.append(param.main_param)
+                        else:
+                            # Fallback to original logic of making a fp32 copy of the
+                            # parameter if `.main_param` attribute is not available.
+                            params_data.append(param.data.float())
+                    else:
+                        params_data.append(param.data)
+
+    # Calculate norm.
     dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-    norm, _ = multi_tensor_applier(
-        multi_tensor_l2norm,
-        dummy_overflow_buf,
-        [params_data],
-        False # no per-parameter norm
-    )
-    norm_2 = norm * norm
-    if mpu.get_expert_model_parallel_world_size() == 1:
-        # Sum across all model-parallel GPUs(tensor + pipeline).
-        torch.distributed.all_reduce(norm_2,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_model_parallel_group())
+    if len(params_data) > 0:
+        norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [params_data],
+            False # no per-parameter norm.
+        )
+        norm_2 = norm * norm
     else:
-        # Sum across tensor, pipeline and expert model-parallel GPUs.
+        norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+
+    if data_parallel_group is not None:
         torch.distributed.all_reduce(norm_2,
                                      op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_tensor_and_expert_parallel_group())
-        torch.distributed.all_reduce(norm_2,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_pipeline_model_parallel_group())
+                                     group=data_parallel_group)
+
+    # Add norm contribution from params with sharded main_params. These norms need to be
+    # accumulated across the DP group since the main parameters are sharded because
+    # of distributed optimizer.
+    if len(sharded_params_data) > 0:
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        sharded_norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [sharded_params_data],
+            False # no per-parameter norm.
+        )
+        sharded_norm_2 = sharded_norm * sharded_norm
+        # Sum over all DP groups.
+        torch.distributed.all_reduce(
+            sharded_norm_2,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group()
+        )
+        norm_2 += sharded_norm_2
+
+    # Sum across all model-parallel GPUs (tensor + pipeline).
+    torch.distributed.all_reduce(
+        norm_2,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_model_parallel_group()
+    )
+
+    # Add norm contribution from expert layers in MoEs.
+    if len(moe_params_data) > 0:
+        moe_norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm,
+            dummy_overflow_buf,
+            [moe_params_data],
+            False # no per-parameter norm.
+        )
+        moe_norm_2 = moe_norm * moe_norm
+        # Sum across expert tensor, model and pipeline parallel GPUs.
+        torch.distributed.all_reduce(
+            moe_norm_2,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_expert_tensor_model_pipeline_parallel_group()
+        )
+        norm_2 += moe_norm_2
+
     return norm_2.item() ** 0.5
 
 
@@ -113,6 +181,41 @@ def average_losses_across_data_parallel_group(losses):
         torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
     return averaged_losses
+
+
+def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
+    """
+    Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
+    We need to ensure the logging and writer rank has those values.
+    This function reduces a stat tensor across the model parallel group.
+
+    We use an all_reduce max since the values have already been summed across optimizer ranks where possible
+    """
+    if stat is None:
+        stat = -1.0
+    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(
+        stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
+    )
+    if stat.item() == -1.0:
+        return None
+    else:
+        return stat.item()
+
+
+def logical_and_across_model_parallel_group(input: bool) -> bool:
+    """
+    This function gathers a bool value across the model parallel group
+    """
+    if input is True:
+        input = 1
+    else:
+        input = 0
+    input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(
+        input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
+    )
+    return bool(input.item())
 
 
 def report_memory(name):
@@ -229,39 +332,6 @@ def get_ltor_masks_and_position_ids(data,
     return attention_mask, loss_mask, position_ids
 
 
-def get_batch_on_this_cp_rank(batch):
-    """ Slice batch input along sequence dimension into multiple chunks,
-        which are parallelized across GPUs in a context parallel group.
-    """
-
-    # With causal masking, each token only attends to its prior tokens. Simply split
-    # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
-    # at the end of sequence have bigger workload than others. To address this issue,
-    # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
-    # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
-    # that we can get balanced workload among GPUs in a context parallel group.
-    args = get_args()
-    cp_size = args.context_parallel_size
-    if cp_size > 1:
-        cp_rank = mpu.get_context_parallel_rank()
-        for key, val in batch.items():
-            if val is not None:
-                seq_dim = 1 if key != 'attention_mask' else 2
-                val = val.view(
-                    *val.shape[0:seq_dim],
-                    2 * cp_size,
-                    val.shape[seq_dim] // (2 * cp_size),
-                    *val.shape[(seq_dim + 1) :],
-                )
-                index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], 
-                                     device="cpu", pin_memory=True).cuda(non_blocking=True)
-                val = val.index_select(seq_dim, index)
-                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
-                batch[key] = val
-
-    return batch
-
-
 def print_rank_0(message):
     """If distributed is initialized, print only on rank 0."""
     if torch.distributed.is_initialized():
@@ -284,7 +354,7 @@ def print_rank_last(message):
 
 
 def append_to_progress_log(string, barrier=True):
-    """ Append given string to progress log. """
+    """Append given string to progress log."""
     args = get_args()
     if args.save is None:
         return
@@ -297,6 +367,54 @@ def append_to_progress_log(string, barrier=True):
             num_gpus = args.world_size
             f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
                     f"# GPUs: {num_gpus}\t{string}\n")
+
+
+def get_blend_and_blend_per_split(args):
+    """Get blend and blend_per_split from passed-in arguments."""
+    use_data_path = args.data_path is not None or \
+        args.data_args_path is not None
+    use_per_split_data_path = any(
+        elt is not None
+        for elt in [args.train_data_path,
+                    args.valid_data_path,
+                    args.test_data_path]) or \
+        args.per_split_data_args_path is not None
+
+    blend = None
+    blend_per_split = None
+    if use_data_path:
+        if args.data_args_path is not None:
+            assert args.data_path is None
+            with open(args.data_args_path, 'r') as f:
+                blend = get_blend_from_list(f.read().split())
+        else:
+            assert args.data_path is not None
+            blend = get_blend_from_list(args.data_path)
+    elif use_per_split_data_path:
+        if args.per_split_data_args_path is not None:
+            with open(args.per_split_data_args_path, 'r') as f:
+                per_split_data_args = json.load(f)
+                # Each element in blend_per_split should be a list of files (and optional
+                # weights), so split string if needed.
+                for split in ["train", "valid", "test"]:
+                    if isinstance(per_split_data_args[split], str):
+                        per_split_data_args[split] = per_split_data_args[split].split()
+
+                blend_per_split = [
+                    get_blend_from_list(per_split_data_args["train"]),
+                    get_blend_from_list(per_split_data_args["valid"]),
+                    get_blend_from_list(per_split_data_args["test"])
+                ]
+        else:
+            blend_per_split = [
+                get_blend_from_list(args.train_data_path),
+                get_blend_from_list(args.valid_data_path),
+                get_blend_from_list(args.test_data_path)
+            ]
+    else:
+        blend, blend_per_split = None, None
+
+    return blend, blend_per_split
 
 
 def get_batch_on_this_tp_rank(data_iterator):
@@ -358,11 +476,11 @@ def get_batch_on_this_tp_rank(data_iterator):
            _broadcast(loss_mask)
            _broadcast(attention_mask)
            _broadcast(position_ids)
- 
+
        elif mpu.is_pipeline_first_stage():
            labels=None
            loss_mask=None
-   
+
            _broadcast(tokens)
            _broadcast(attention_mask)
            _broadcast(position_ids)
@@ -370,11 +488,11 @@ def get_batch_on_this_tp_rank(data_iterator):
        elif mpu.is_pipeline_last_stage():
            tokens=None
            position_ids=None
-    
+
            _broadcast(labels)
            _broadcast(loss_mask)
            _broadcast(attention_mask)
- 
+
        batch = {
            'tokens': tokens,
            'labels': labels,

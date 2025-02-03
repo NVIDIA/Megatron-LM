@@ -3,7 +3,6 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Tree
   CUBLAS_WORKSPACE_CONFIG: :4096:8
-  N_REPEATS: 5
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 624
@@ -22,8 +21,8 @@ MODEL_ARGS:
   --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 320000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --split: 949,50,1
   --tokenizer-type: NullTokenizer
   --vocab-size: 8192
@@ -51,4 +50,5 @@ MODEL_ARGS:
   --img-w: 336
   --patch-dim: 14
   --mock-data: true
+  --log-memory-to-tensorboard: true
 TEST_TYPE: regular

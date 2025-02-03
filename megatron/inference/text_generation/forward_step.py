@@ -6,11 +6,10 @@ from collections.abc import Iterable
 
 import torch
 
+from megatron.core import InferenceParams, mpu
 from megatron.training import get_args
-from megatron.core import mpu, InferenceParams
-from .communication import (
-    send_to_next_pipeline_rank,
-    recv_from_prev_pipeline_rank_)
+
+from .communication import recv_from_prev_pipeline_rank_, send_to_next_pipeline_rank
 
 
 class ForwardStep:
@@ -32,30 +31,40 @@ class ForwardStep:
         args = get_args()
         self.pipeline_size_larger_than_one = (
             args.pipeline_model_parallel_size > 1)
-        # Threshold of pipelining.
+        # Threshold for whether we split up the batch for pipelining.
         self.pipelining_batch_x_seqlen = \
             args.inference_batch_times_seqlen_threshold
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(tokens, position_ids, attention_mask, inference_params=self.inference_params)
 
-    def __call__(self, tokens, position_ids, attention_mask):
+    def __call__(self, tokens, position_ids, attention_mask, recv_buffer_seq_length=None):
         """Invocation of the forward methods. Note that self.inference_params
         is being modified by the forward step."""
         # Pipelining case.
-        if self.pipeline_size_larger_than_one:
-            current_batch_x_seqlen = tokens.size(0) * tokens.size(1)
+        # This runs only if current_batch_x_seqlen > args.inference_batch_times_seqlen_threshold
+        # and requires setting args.pipeline_model_parallel > 1. The batch will be split into
+        # smaller microbatches to be pipelined through the stages.
+        if self.pipeline_size_larger_than_one and self.pipelining_batch_x_seqlen != -1:
+            seq_len = tokens.size(1) if recv_buffer_seq_length is None else recv_buffer_seq_length
+            current_batch_x_seqlen = tokens.size(0) * seq_len
             if current_batch_x_seqlen >= self.pipelining_batch_x_seqlen:
                 micro_batch_size = \
-                    max(1, self.pipelining_batch_x_seqlen // tokens.size(1))
+                    max(1, self.pipelining_batch_x_seqlen // seq_len)
                 return self._with_pipelining_forward_step(tokens,
                                                           position_ids,
                                                           attention_mask,
-                                                          micro_batch_size)
+                                                          micro_batch_size,
+                                                          recv_buffer_seq_length=recv_buffer_seq_length)
+
+        recv_buffer = None
+        if recv_buffer_seq_length is not None:
+            recv_buffer = _allocate_recv_buffer(tokens.size(0), recv_buffer_seq_length)
 
         return self._no_pipelining_forward_step(tokens,
                                                 position_ids,
-                                                attention_mask)
+                                                attention_mask,
+                                                recv_buffer=recv_buffer)
 
 
     def _forward_step_helper(self, tokens, position_ids, attention_mask, recv_buffer=None):
@@ -63,15 +72,20 @@ class ForwardStep:
         only the first time the memory is allocated."""
         batch_size = tokens.size(0)
         sequence_length = tokens.size(1)
+
         if recv_buffer is None:
             recv_buffer = _allocate_recv_buffer(batch_size, sequence_length)
 
         # Receive from previous stage.
-        recv_from_prev_pipeline_rank_(recv_buffer)
+        if recv_buffer is not None and torch.numel(recv_buffer) > 0:
+            recv_from_prev_pipeline_rank_(recv_buffer)
 
         # Forward pass through the model.
-        self.model.set_input_tensor(recv_buffer)
+        if not mpu.is_pipeline_first_stage():
+            self.model.set_input_tensor(recv_buffer)
         output_tensor = self._forward(tokens, position_ids, attention_mask)
+        if isinstance(output_tensor, tuple):
+            output_tensor = output_tensor[0]
 
         # Send output to the next stage.
         send_to_next_pipeline_rank(output_tensor)
@@ -96,10 +110,10 @@ class ForwardStep:
         return logits
 
 
-    def _with_pipelining_forward_step(self, tokens, position_ids, attention_mask, micro_batch_size):
+    def _with_pipelining_forward_step(self, tokens, position_ids, attention_mask, micro_batch_size, recv_buffer_seq_length=None):
         """No interleaving is supported."""
-        sequence_length = tokens.size(1)
         batch_size = tokens.size(0)
+        sequence_length = tokens.size(1) if recv_buffer_seq_length is None else recv_buffer_seq_length
 
         # Divide the batch dimension into micro batches.
         num_micro_batches, last_chunk = divmod(batch_size,
@@ -140,7 +154,7 @@ class ForwardStep:
 
         # Once we are done with all the micro-batches, we can
         # adjust the sequence length offset.
-        self.inference_params.sequence_len_offset += sequence_length
+        self.inference_params.sequence_len_offset += tokens.size(1)
         # and reset the batch size offset
         self.inference_params.batch_size_offset = 0
 

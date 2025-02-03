@@ -26,9 +26,11 @@ MANDATORY_VARS=(
     "TRAINING_PARAMS_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
-    "CHECKPOINT_PATH"
+    "CHECKPOINT_SAVE_PATH"
+    "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
     "RUN_NUMBER"
+    "REPEAT"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -38,18 +40,12 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
 done
 
 # Envsubst model_params
-cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
-mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
-
-# Run before script
-SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq '.BEFORE_SCRIPT')
-if [[ "$SCRIPT" != null ]]; then
-    eval "$SCRIPT"
-fi;
+cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
+TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
 
 # Pull env vars to export
-ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
-for ARGUMENT in $ENV_VARS; do
+ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
+while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
     KEY_LENGTH=${#KEY}
@@ -57,24 +53,30 @@ for ARGUMENT in $ENV_VARS; do
 
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
-done
+done <<<"$ENV_VARS"
+
+# Run before script
+SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.BEFORE_SCRIPT')
+if [[ "$SCRIPT" != null ]]; then
+    eval "$SCRIPT"
+fi
 
 # Exit earlier to leave time for properly saving checkpoint
 if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]]; then
     PARAMS=""
-    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
+    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' "$TRAINING_PARAMS_PATH" | tr '\n' ' ')
 
 else
-    # If this is a second run (of checkpoint-resume), we might want to use a 
+    # If this is a second run (of checkpoint-resume), we might want to use a
     # different model configuration than during first time. So if key `MODEL_ARGS_2`
     # exists we use it, otherwise we use the same as for the first run.
-    if [[ $RUN_NUMBER -eq 2 && $(yq 'has("MODEL_ARGS_2")' $TRAINING_PARAMS_PATH) == true ]]; then
+    if [[ $RUN_NUMBER -eq 2 && $(yq 'has("MODEL_ARGS_2")' "$TRAINING_PARAMS_PATH") == true ]]; then
         export KEY="MODEL_ARGS_2"
     else
-        export  KEY="MODEL_ARGS"
+        export KEY="MODEL_ARGS"
     fi
 
-    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
+    TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' "$TRAINING_PARAMS_PATH" | tr '\n' ' ')
     PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
 fi
 
@@ -92,14 +94,17 @@ MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
+LAST_RANK=$((NUM_NODES * 8 - 1))
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
     --node_rank $SLURM_NODEID
+    --log-dir $OUTPUT_PATH
+    --tee "0:3,$LAST_RANK:3"
+    --redirects "3"
 )
 
 # Start training
-torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS
-
+torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS || EXIT_CODE=$?

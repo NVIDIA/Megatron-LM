@@ -30,13 +30,14 @@ The following applies to all files unless otherwise noted:
 
 This repository also contains code from Hugging Face Inc., Google Research,
 Facebook (from their Fairseq, Dino, and ParlAI projects), Microsoft (from their
-Swin-Transformer project), Philip Popien, and the Mamba project (Tri Dao and
-Albert Gu). Files from these organizations have notices at the top of each file.
+Swin-Transformer project), Philip Popien, the Mamba project (Tri Dao and
+Albert Gu), and the Triton language and compiler project (Philippe Tillet and
+OpenAI). Files from these organizations have notices at the top of each file.
 Below are licenses used in those files, as indicated.
 
 
---------------------------------------------------------------------------------
--- LICENSE FOR Facebook, huggingface, Google Research, LLaVA, and Mamba code  --
+--------------------------------------------------------------------------------------
+-- LICENSE FOR Facebook, huggingface, Google Research, LLaVA, Mamba, and vLLM code  --
 
 
                                  Apache License
@@ -241,7 +242,13 @@ Below are licenses used in those files, as indicated.
    See the License for the specific language governing permissions and
    limitations under the License.
 
-------------- LICENSE FOR Facebook, Inc. and its affiliates, Meta Platforms, Inc. and its affiliates, Microsoft Corporation, and OpenGVLab/InternVL  --------------
+--------------------------------------------------------------------------------
+LICENSE FOR
+Facebook, Inc. and its affiliates,
+Meta Platforms, Inc. and its affiliates,
+Microsoft Corporation,
+OpenGVLab/InternVL, and
+Triton language and compiler.
 
 MIT License
 

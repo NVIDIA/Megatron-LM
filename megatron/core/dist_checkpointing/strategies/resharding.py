@@ -13,7 +13,7 @@ import logging
 import math
 from dataclasses import dataclass
 from itertools import product
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Tuple, Union
 
 import numpy as np
 import torch
@@ -27,7 +27,6 @@ from megatron.core.dist_checkpointing.dict_utils import (
     extract_matching_values,
 )
 from megatron.core.dist_checkpointing.mapping import (
-    ReplicaId,
     ShardedStateDict,
     ShardedTensorFactory,
     StateDict,
@@ -84,11 +83,7 @@ def is_nd_flattened_tensor(sh_ten: Any) -> bool:
     Returns:
         bool: whether the given object is a flattened ShardedTensor and is N-dimensional (N > 1)
     """
-    return (
-        isinstance(sh_ten, ShardedTensor)
-        and sh_ten.flattened_range is not None
-        and len(sh_ten.global_shape) > 1
-    )
+    return isinstance(sh_ten, ShardedTensor) and sh_ten.flattened_range is not None
 
 
 # information needed to restore. With current implementation, this is a nested state dict
@@ -132,8 +127,12 @@ def apply_nd_flattened_tensors_reformulation(
         try:
             sh_ten_reformulation_metadata = reformulation_metadata[sh_ten.key]
         except KeyError as e:
+            # Handle legacy checkpointing where 1-D flatten tensor metadata was not saved
+            if len(sh_ten.global_shape) == 1:
+                return sh_ten
             raise CheckpointingException(
-                f'Missing reformulation metadata for tensor {sh_ten}. Existing keys: {reformulation_metadata.keys()}'
+                f'Missing reformulation metadata for tensor {sh_ten}. '
+                f'Existing keys: {reformulation_metadata.keys()}'
             ) from e
 
         ckpt_actual_saved_shape = sh_ten_reformulation_metadata.ckpt_reform_global_shape
@@ -235,13 +234,16 @@ def reformulate_single_nd_flattened_tensor(
     ):
         # without `int`, it's an exact offset of the app shard expressed in ckpt_local_shape units
         first_overlap_dim_offset = int(ckpt_fragm / app_fragm * app_chunk_dim_offset)
-        # `math.ceil` argument is an exact offset of the app next shard expressed in ckpt_local_shape units
+        # `math.ceil` argument is an exact offset of the app next shard expressed
+        # in ckpt_local_shape units
         next_overlap_dim_offset = math.ceil(ckpt_fragm / app_fragm * (app_chunk_dim_offset + 1))
         overlap_dim_offsets.append(range(first_overlap_dim_offset, next_overlap_dim_offset))
 
     logger.debug(
-        f'Generated the following number of overlap shards for each dimension: {list(map(len, overlap_dim_offsets))}'
-        f' for fragmentation ckpt {ckpt_axis_fragmentation} vs app {sh_ten.axis_fragmentations} and chunk offset {sh_ten.local_chunk_offset_in_global()}'
+        f'Generated the following number of overlap shards for each dimension: '
+        f'{list(map(len, overlap_dim_offsets))} for fragmentation ckpt '
+        f'{ckpt_axis_fragmentation} vs app {sh_ten.axis_fragmentations} '
+        f'and chunk offset {sh_ten.local_chunk_offset_in_global()}'
     )
     reformulated_sh_tens = {}
     for chunk_offset in product(*overlap_dim_offsets):
@@ -286,7 +288,8 @@ def reformulate_single_nd_flattened_tensor(
             # For each ckpt shard, we fill the appropriate application shard part
             dest_ten = app_non_flat_ten
             src_ten = ckpt_ten.view(ckpt_local_shape)
-            # We don't need narrowing over `prepend_axis_num` axes so we take the [sh_ten.prepend_axis_num:] offsets slice
+            # We don't need narrowing over `prepend_axis_num` axes so we take
+            # the [sh_ten.prepend_axis_num:] offsets slice
             for (
                 dim,
                 offset_for_saved_tensor,

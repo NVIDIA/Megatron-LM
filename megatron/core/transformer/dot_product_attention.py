@@ -40,6 +40,8 @@ class DotProductAttention(MegatronModule):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         attention_dropout: float = None,
+        softmax_scale: float = None,
+        cp_comm_type: str = None,
     ):
         super().__init__(config=config)
 
@@ -67,10 +69,14 @@ class DotProductAttention(MegatronModule):
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
         coeff = None
-        self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
+        if softmax_scale is None:
+            self.softmax_scale = 1.0 / math.sqrt(self.hidden_size_per_attention_head)
+        else:
+            self.softmax_scale = softmax_scale
+
         if self.config.apply_query_key_layer_scaling:
             coeff = self.layer_number
-            self.norm_factor *= coeff
+            self.softmax_scale /= coeff
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
             input_in_fp16=self.config.fp16,
@@ -96,12 +102,15 @@ class DotProductAttention(MegatronModule):
         value: Tensor,
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
+        attention_bias: Tensor = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
+        """Forward."""
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
             "Please use TEDotProductAttention instead."
         )
+        assert attention_bias is None, "Attention bias is not supported for DotProductAttention."
 
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
@@ -143,7 +152,7 @@ class DotProductAttention(MegatronModule):
             query.transpose(0, 1),  # [b * np, sq, hn]
             key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
             beta=0.0,
-            alpha=(1.0 / self.norm_factor),
+            alpha=self.softmax_scale,
         )
 
         # change view to [b, np, sq, sk]

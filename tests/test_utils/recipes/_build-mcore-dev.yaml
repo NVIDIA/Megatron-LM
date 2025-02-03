@@ -1,0 +1,11 @@
+type: build
+format_version: 1
+maintainers: [maanug]
+spec:
+  name: mcore-pyt-dev
+  platforms: [linux/amd64]
+  source:
+    # The image tag will be added via `jet-tests.yaml`
+    # Tags are one of {buildcache, $CI_PIPELINE_ID}
+    image: gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev
+    

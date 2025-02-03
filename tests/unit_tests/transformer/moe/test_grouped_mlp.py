@@ -1,17 +1,18 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from importlib.metadata import version
-
 import pytest
 import torch
 import torch.nn.functional as F
-from pkg_resources import packaging
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.legacy.model import Float16Module
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
@@ -21,9 +22,8 @@ DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
-_te_version = packaging.version.Version(version("transformer-engine"))
 
-
+@pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
 class TestParallelGroupedMLP:
 
     def setup_method(self, method, use_cpu_initialization=False, swiglu=True):
@@ -69,9 +69,7 @@ class TestParallelGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=False
-        )
+        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
         self.sequential_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
@@ -218,7 +216,7 @@ class TestParallelGroupedMLP:
 
 
 @pytest.mark.skipif(
-    _te_version < packaging.version.Version("1.9.0.dev0"),
+    not is_te_min_version("1.9.0.dev0"),
     reason="TE Grouped MLP is only supported in TE 1.9.0.dev0 and later.",
 )
 class TestTEGroupedMLP:
@@ -257,9 +255,7 @@ class TestTEGroupedMLP:
         ## Vanilla sequential GEMM
         # Set random seed for reproducability
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=False
-        )
+        transformer_layer_spec = get_gpt_layer_local_spec(self.num_experts, moe_grouped_gemm=False)
         self.sequential_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
 
         self.args = parse_args(ignore_unknown_args=True)
@@ -316,6 +312,7 @@ class TestTEGroupedMLP:
                 self.fc2_ffn_hidden_size,
             )
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_gpu_forward_backward(self):
@@ -359,6 +356,7 @@ class TestTEGroupedMLP:
         for smm_result, gmm_result in zip(smm_results, gmm_results):
             torch.testing.assert_close(smm_result, gmm_result)
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):

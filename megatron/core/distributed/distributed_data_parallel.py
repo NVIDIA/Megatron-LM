@@ -7,16 +7,17 @@ import torch
 
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
-from ..transformer.module import MegatronModule
+from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import is_float8tensor, log_single_rank
+from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
 logger = logging.getLogger(__name__)
 
 
-class DistributedDataParallel(MegatronModule):
+class DistributedDataParallel(_BaseDataParallel):
     """
     DDP wrapper which stores grads in contiguous buffers. Also has option of overlapping
     communication with backprop computation by breaking up full model's gradients into smaller
@@ -41,7 +42,7 @@ class DistributedDataParallel(MegatronModule):
         module: torch.nn.Module,
         disable_bucketing: bool = False,
     ):
-        super().__init__(config=config)
+        super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -151,12 +152,20 @@ class DistributedDataParallel(MegatronModule):
                     with_context_parallel=True
                 )
                 if self.ddp_config.average_in_collective:
-                    # Collective is averaging gradients in collective with data_parallel_group.
-                    assert (
-                        gradient_scaling_factor
-                        / torch.distributed.get_world_size(group=data_parallel_group)
-                        == target_gradient_scaling_factor
-                    )
+                    if self.ddp_config.num_distributed_optimizer_instances == 1:
+                        # Collective is averaging gradients in collective with data_parallel_group.
+                        assert (
+                            gradient_scaling_factor
+                            / torch.distributed.get_world_size(group=data_parallel_group)
+                            == target_gradient_scaling_factor
+                        )
+                    else:
+                        # For non-expert parameters, gradient_scaling_factor is 1.
+                        # For expert parameters, gradient_scaling_factor is 1/ep_size.
+                        assert (gradient_scaling_factor == 1) or (
+                            gradient_scaling_factor
+                            == (1.0 / parallel_state.get_expert_model_parallel_world_size())
+                        )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
 
@@ -188,6 +197,17 @@ class DistributedDataParallel(MegatronModule):
             # bucket group.
             bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
 
+            if self.ddp_config.num_distributed_optimizer_instances > 1:
+                assert (
+                    self.ddp_config.use_distributed_optimizer
+                ), 'Partial DistOpt cannot be used without DistOpt'
+                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                for bucket_group in bucket_groups:
+                    bucket_group.inter_distributed_optimizer_instance_group = (
+                        parallel_state.get_inter_partial_data_parallel_group()
+                    )
+                    bucket_group.communication_stream = communication_stream
+
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
             if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
@@ -218,13 +238,16 @@ class DistributedDataParallel(MegatronModule):
                 data_parallel_world_size = parallel_state.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
+
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params,
-            parallel_state.get_data_parallel_group(with_context_parallel=True),
+            parallel_state.get_data_parallel_group(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
             gradient_scaling_factor=gradient_scaling_factor,
         )
 
@@ -232,7 +255,7 @@ class DistributedDataParallel(MegatronModule):
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
                 expert_parallel_params,
-                parallel_state.get_data_modulo_expert_parallel_group(with_context_parallel=True),
+                parallel_state.get_expert_data_parallel_group(),
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
@@ -283,9 +306,10 @@ class DistributedDataParallel(MegatronModule):
                 self._make_forward_pre_hook()
             )
 
-    def disable_forward_pre_hook(self):
+    def disable_forward_pre_hook(self, param_sync: bool = True):
         """
         Disable forward pre-hooks needed for param all-gather overlap with forward compute.
+        Skip synchronous param all-gather if `param_sync` is False.
         """
         assert self.use_forward_hook
         # De-register forward pre-hook for all sub-modules.
@@ -296,13 +320,8 @@ class DistributedDataParallel(MegatronModule):
         assert len(self.remove_forward_pre_hook_handles) == 0
 
         # Force synchronize parameters.
-        self.start_param_sync(force_sync=True)
-
-    def forward(self, *inputs, **kwargs):
-        """
-        Calls the wrapped module's forward() method.
-        """
-        return self.module(*inputs, **kwargs)
+        if param_sync:
+            self.start_param_sync(force_sync=True)
 
     def _make_forward_pre_hook(self):
         """
@@ -314,6 +333,9 @@ class DistributedDataParallel(MegatronModule):
             assert (
                 self.use_forward_hook
             ), "Should use pre-hook only when overlap_param_gather is True"
+
+            if is_graph_capturing():
+                return
 
             # Make sure all parameters in this module have been all-gathered as necessary.
             for param in module.parameters(recurse=False):
@@ -345,6 +367,9 @@ class DistributedDataParallel(MegatronModule):
         """
 
         def hook(*unused):
+            if is_graph_capturing():
+                return
+
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
@@ -446,40 +471,13 @@ class DistributedDataParallel(MegatronModule):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group(
-                    with_context_parallel=True
-                )
+                data_parallel_group = parallel_state.get_expert_data_parallel_group()
             else:
                 data_parallel_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True
+                    with_context_parallel=True, partial_data_parallel=True
                 )
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
                 group=data_parallel_group,
             )
-
-    def state_dict(self, prefix='', keep_vars=False):
-        """
-        Returns a dictionary containing references to the whole state of the
-        wrapped module.
-
-        Both parameters and persistent buffers (e.g. running averages) are included.
-        Keys are corresponding parameter and buffer names. Parameters and buffers
-        set to None are not included.
-        """
-        return self.module.state_dict(prefix=prefix, keep_vars=keep_vars)
-
-    def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
-        """
-        Returns wrapped module's state_dict for checkpoint saving.
-        """
-        return self.module.state_dict_for_save_checkpoint(prefix=prefix, keep_vars=keep_vars)
-
-    def load_state_dict(self, state_dict, strict=True):
-        """
-        Copies parameters and buffers from state_dict into the wrapped module and its
-        descendants. If strict is True, then the keys of state_dict must exactly match
-        the keys returned by this module’s state_dict() function.
-        """
-        self.module.load_state_dict(state_dict, strict=strict)

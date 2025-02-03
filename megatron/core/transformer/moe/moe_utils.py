@@ -1,10 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
+from typing import Optional
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 
 def switch_load_balancing_loss_func(
@@ -53,6 +55,59 @@ def switch_load_balancing_loss_func(
         num_experts * moe_aux_loss_coeff / (num_tokens * num_tokens * topk)
     )
     return aux_loss
+
+
+def sequence_load_balancing_loss_func(
+    probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    batch_size: int,
+    seq_length: int,
+    topk: int,
+    moe_aux_loss_coeff: float,
+    sequence_partition_group=None,
+):
+    """
+    Calculate the auxiliary loss in sequence-level by computing the loss for each individual sample.
+    Refer to the DeepSeek-V2 huggingface repo
+    (https://huggingface.co/deepseek-ai/DeepSeek-V2) for details.
+
+    Args:
+        probs (torch.Tensor): Softmax probabilities output by the router for each token.
+                              Shape in [num_tokens, num_experts].
+        routing_map (torch.Tensor): Mapping of tokens to experts assignment.
+                                    Shape in [num_tokens, num_experts].
+        batch_size (int): Batch size to process.
+        seq_length (int): Sequence length to process.
+        topk (int): Number of experts to route to for each token.
+        moe_aux_loss_coeff (float): Scaling coefficient for the auxiliary loss.
+        sequence_partition_group (optional): The parallel group over which the sequence is
+                                             partitioned. If None, no partitioning is applied.
+                                             Defaults to None.
+
+    Returns:
+        torch.Tensor: The sequence auxiliary loss for load balancing.
+    """
+    num_sub_sequence = 1
+    num_experts = probs.shape[1]
+
+    probs_for_aux_loss = probs.view(seq_length, batch_size, -1)
+    routing_map = routing_map.view(seq_length, batch_size, -1)
+
+    # If the sequence is partitioned by certain parallelism strategies like Sequence Parallelism
+    # or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full
+    # sequence.
+    if sequence_partition_group is not None:
+        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+        seq_length *= num_sub_sequence
+        probs_for_aux_loss = gather_from_sequence_parallel_region(
+            probs_for_aux_loss, group=sequence_partition_group
+        )
+
+    cost_coeff = routing_map.sum(dim=0, dtype=torch.float).div_(seq_length * topk / num_experts)
+    seq_aux_loss = (cost_coeff * probs_for_aux_loss.mean(dim=0)).sum(dim=1).mean()
+    seq_aux_loss *= moe_aux_loss_coeff
+
+    return seq_aux_loss
 
 
 def z_loss_func(logits, z_loss_coeff):
@@ -107,7 +162,7 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
 
 
 class MoEAuxLossAutoScaler(torch.autograd.Function):
-    """An AutoScaler that compute and scales the grad for auxiliary loss."""
+    """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 
     main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
 
@@ -152,165 +207,117 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         MoEAuxLossAutoScaler.main_loss_backward_scale = scale
 
 
-def permute(tokens, indices, num_out_tokens: int = None, padded_mode: bool = False):
-    """Permute the tokens based on the indices. Token with the same index will be grouped together.
-       The input indices shape is [tokens, top_k], it indicates which experts were selected by each
-       token separately.
+def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool = False):
+    """Permute the tokens and probs based on the mask.
+    Tokens with the same designated expert will be grouped together.
+    The shape of mask is [tokens, num_experts], it indicates which experts were selected
+    by each token.
+
+    When drop_and_pad=True, in routing_map, the number of non-zeros in each column equals to
+    expert capacity. This function exploits this feature to use ops that support cuda graph.
+
     Args:
-        tokens (torch.Tensor): The input token tensor.
-        indices (torch.Tensor): The token to expert indices tensor, should have a shape of
-                                [num_tokens] or [num_tokens, topk].
-        num_out_tokens (int, optional): The effective output token count, when enabling the
-                                        capacity factor, should equal the number of tokens not
-                                        dropped. By default, set to None, meaning no tokens are
-                                        dropped.
-        padded_mode (bool, optional): If True, indicating the indices are padded to
-                                      [num_expert, capacity] to denote selected tokens per expert.
-                                      Defaults to False.
-
-    Returns:
-        torch.Tensor: The permuted tensor.
-        torch.Tensor: The sorted_indices corresponding permuted tensor.
+        tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
+        routing_map (torch.Tensor): The sparse token to expert mapping, [num_tokens, num_experts].
+        num_out_tokens (int, optional): The number of output tokens. If None, it's set to
+                                        the number of input tokens.
+        drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
+                                       and pads the number of tokens to the expert capacity.
+                                       If set to true, routing_map has a fixed number of non-zeros
+                                       in each column.
     """
-    if padded_mode:
-        return permute_with_padded_tokens(tokens, indices)
+    num_tokens, hidden = tokens.shape
+    num_experts = routing_map.shape[1]
+    if drop_and_pad and not (num_out_tokens is None):
+        capacity = num_out_tokens // num_experts
+        assert not routing_map.requires_grad
+        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+        routing_map = routing_map.to(dtype=torch.int8).T.contiguous()
+        # use argsort to put indices of all non-zeros in the beginning of list
+        # and keep the first `capacity` number of indices
+        sorted_indices = routing_map.argsort(dim=-1, descending=True, stable=True)[
+            :, :capacity
+        ].contiguous()
+        # flatten from [num_experts, capacity] to 1D
+        sorted_indices = sorted_indices.view(-1)
+    else:
+        # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
+        routing_map = routing_map.bool().T.contiguous()
 
-    if indices.dim() == 1:
-        indices = indices.unsqueeze(1)
+        # Create a dense expert-to-token mapping from the sparse token-to-expert mapping
+        token_indices = (
+            torch.arange(num_tokens, device=routing_map.device).unsqueeze(0).expand(num_experts, -1)
+        )
+        sorted_indices = token_indices.masked_select(routing_map)
 
-    topk = indices.size(1)
-    flatten_indices = indices.view(-1)
-    sorted_indices = torch.argsort(flatten_indices, stable=True)
-    if num_out_tokens is not None:
-        sorted_indices = sorted_indices[:num_out_tokens]
-    moe_gather_indices = (sorted_indices // topk).unsqueeze(1).expand(-1, tokens.size(-1))
-    permuted_tokens = moe_gather.apply(tokens, moe_gather_indices)
+    # use the mapping to permute the tokens
+    permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_tokens, sorted_indices
+    return permuted_input, sorted_indices
 
 
 def unpermute(
     permuted_tokens: torch.Tensor,
     sorted_indices: torch.Tensor,
-    probs: torch.Tensor = None,
-    padded_mode: bool = False,
-    restore_shape: torch.Size = None,
-):
-    """Unpermute a tensor of permuted tokens based on sorted indices, and optionally merge the
-    tokens with their corresponding probabilities.
-
-    Args:
-        permuted_tokens (torch.Tensor): 2D tensor [num_tokens*topk, hidden]. The tensor of permuted
-                                        tokens to be unpermuted.
-        sorted_indices (torch.Tensor): 1D tensor [num_tokens*topk]. The tensor of sorted indices
-                                       used to unpermute the tokens.
-        probs (torch.Tensor, optional): 2D tensor [num_tokens, topk]. The tensor of probabilities
-                                        corresponding to the permuted tokens. If provided,
-                                        the unpermuted tokens will be merged with their respective
-                                        probabilities.
-        padded_mode (bool, optional): If True, indicating the indices are padded to
-                                      [num_expert, capacity] to denote selected tokens per expert.
-                                      Defaults to False.
-        restore_shape (torch.Size, optional): The input shape before permutation, only used in
-                                              padding mode. Defaults to None.
-
-    Returns:
-        torch.Tensor: The unpermuted tokens, optionally merged with probabilities.
-    """
-    if padded_mode:
-        return unpermute_with_padded_tokens(
-            permuted_tokens, sorted_indices, probs, restore_shape=restore_shape
-        )
-
-    assert sorted_indices.numel() == permuted_tokens.size(
-        0
-    ), f"Got {sorted_indices.numel()} != {permuted_tokens.size(0)}."
-    if probs is not None:
-        # Unpermute and merge the tokens with their probabilities
-        num_unpermuted_tokens = probs.numel()
-        assert probs.dim() == 2, f"Expected 2D tensor for probs, got {probs.dim()} dims."
-        topk = probs.size(1)
-    else:
-        # Unpermute the tokens without merge
-        num_unpermuted_tokens = permuted_tokens.size(0)
-        topk = 1
-
-    output_size = [num_unpermuted_tokens, permuted_tokens.shape[-1]]
-    moe_scatter_indices = sorted_indices.unsqueeze(1).expand(-1, permuted_tokens.size(-1))
-    unpermuted_tokens = moe_scatter.apply(permuted_tokens, moe_scatter_indices, output_size)
-    unpermuted_tokens = unpermuted_tokens.reshape(-1, topk, permuted_tokens.size(-1))
-    if probs is not None:
-        unpermuted_tokens = unpermuted_tokens * probs.unsqueeze(-1)
-    unpermuted_tokens = unpermuted_tokens.sum(dim=1)
-
-    return unpermuted_tokens
-
-
-def permute_with_padded_tokens(tokens, indices):
-    """Permute the tokens based on the indices, only used in padding mode.
-       The input indices shape is [num_expert, capacity], it indicates which tokens were selected
-       by each expert separately.
-    Args:
-        tokens (torch.Tensor): The input token tensor.
-        indices (torch.Tensor): A tensor with shape [num_expert, capacity], indicating the selected
-                                tokens for each expert.
-
-    Returns:
-        torch.Tensor: The permuted tensor.
-        torch.Tensor: The sorted_indices corresponding permuted tensor.
-    """
-    permuted_tokens = tokens.index_select(dim=0, index=indices.view(-1))
-
-    return permuted_tokens, indices
-
-
-def unpermute_with_padded_tokens(
-    permuted_tokens: torch.Tensor,
-    indices: torch.Tensor,
-    probs: torch.Tensor,
     restore_shape: torch.Size,
-) -> torch.Tensor:
+    probs: torch.Tensor = None,
+    routing_map: torch.Tensor = None,
+    drop_and_pad: bool = False,
+):
     """
-    Unpermutes a padded permuted tokens based on sorted indices and merges the tokens with their
-    corresponding probabilities.
+    Restore the original order of tokens after permutation. If probs are provided, it
+    will also apply them to the tokens before restoring the order.
 
-    This function takes a tensor of permuted tokens and reorders them according to the provided
-    indices. It also combines the tokens with their associated probabilities.
+    When drop_and_pad=True, the tensors will have the following properties:
+      - In routing_map, the number of non-zeros in each column equals to expert capacity
+      - The size of sorted_indices equals to num_experts * capacity, each split of `capacity`
+        contains the indices of tokens routed to an expert.
+    This function exploits these features to use ops that support cuda graph.
 
-    Parameters:
-        permuted_tokens (torch.Tensor): A 2D tensor containing permuted tokens.
-        indices (torch.Tensor): A tensor with shape [num_expert, capacity], indicating the selected
-                                tokens for each expert.
-        probs (torch.Tensor): A tensor with the same shape as indices, containing probabilities
-                              corresponding to each token.
-        restore_shape (torch.Size): The target shape for the unpermuted tokens tensor.
+    Args:
+        permuted_tokens (torch.Tensor): The permuted token tensor.
+        sorted_indices (torch.Tensor): The indices used to sort the tokens.
+        restore_shape (torch.Size): The shape of the unpermuted tensor.
+        probs (torch.Tensor, optional): The unpermuted probs tensor,
+        routing_map (torch.Tensor, optional): Token to expert mapping, shape
+            [num_tokens, num_experts].
+        drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
+                                       and pads the number of tokens to the expert capacity.
 
     Returns:
-        torch.Tensor: A tensor of unpermuted tokens, merged with their probabilities.
-
+        torch.Tensor: The tokens restored to their original order.
     """
-    # Ensure permuted_tokens is 2D
-    assert permuted_tokens.dim() == 2, f"Got {permuted_tokens.dim()}D."
+    _, hidden = restore_shape
 
-    # Reshape and expand probabilities and indices to match permuted_tokens
-    probs = probs.view(-1).unsqueeze(-1)
-    indices = indices.view(-1, 1).expand(-1, permuted_tokens.shape[1])
-    assert (
-        permuted_tokens.shape == indices.shape
-    ), "Shape mismatch between permuted_tokens and indices."
+    if probs is not None:
+        assert routing_map is not None, "Mask must be provided to permute the probs."
+        if drop_and_pad:
+            num_experts = routing_map.size(1)
+            num_permuted_tokens = sorted_indices.size(0)
+            capacity = num_permuted_tokens // num_experts
+            num_unpermuted_tokens = probs.size(0)
 
-    # Combine tokens with their probabilities
-    combined_output = probs * permuted_tokens
+            # [num_unpermuted_tokens, num_experts] -> num_experts * num_unpermuted_tokens
+            probs_T_1D = probs.T.contiguous().view(-1)
 
-    # Prepare a tensor of zeros with the desired output shape
-    empty_tokens = torch.zeros(
-        restore_shape, dtype=combined_output.dtype, device=combined_output.device
+            # get 1D indices of the probs selected by routing_map
+            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim1 = sorted_indices.view(num_experts, capacity)
+            indices_1D = (indices_dim0 * num_unpermuted_tokens + indices_dim1).view(-1)
+
+            # get probs from indices
+            permuted_probs = probs_T_1D.index_select(0, indices_1D)
+        else:
+            permuted_probs = probs.T.contiguous().masked_select(routing_map.T.contiguous())
+        permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
+
+    # Create an output tensor filled with zeros
+    output_tokens = torch.zeros(
+        restore_shape, device=permuted_tokens.device, dtype=permuted_tokens.dtype
     )
-
-    # Scatter the combined tokens back to their original positions
-    unpermuted_tokens = torch.scatter_add(empty_tokens, 0, indices, combined_output)
-
-    return unpermuted_tokens
+    # Scatter add the permuted_input back to the original positions
+    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+    return output_tokens
 
 
 def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
@@ -320,13 +327,62 @@ def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_i
     return output
 
 
+def device_limited_topk(
+    scores: torch.Tensor,
+    topk: int,
+    num_tokens: int,
+    num_experts: int,
+    moe_router_topk_limited_devices: int,
+):
+    """Perform top-k routing on a subset of expert parallel ranks.
+
+    Selects N ranks for each token, then conducts top-k selection among experts on these devices.
+    See DeepSeek-V2 technical report (https://arxiv.org/pdf/2405.04434) for details.
+
+    Args:
+        scores (torch.Tensor): Softmax scores from the router.
+        topk (int): The number of experts to select for each token.
+        num_tokens (int): The number of tokens.
+        num_experts (int): The number of experts.
+        moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
+            each token during routing. None means no device limitation.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
+    """
+
+    # Organize the experts into groups
+    num_group = (
+        parallel_state.get_expert_model_parallel_world_size()
+    )  # num_group equals to expert parallel size
+    group_scores = scores.view(num_tokens, num_group, -1).max(dim=-1).values
+    group_idx = torch.topk(group_scores, k=moe_router_topk_limited_devices, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+
+    # Mask the experts based on selection groups
+    score_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_group, num_experts // num_group)
+        .reshape(num_tokens, -1)
+    )
+
+    masked_scores = scores.masked_fill(~score_mask.bool(), 0.0)
+    probs, top_indices = torch.topk(masked_scores, k=topk, dim=-1)
+
+    return probs, top_indices
+
+
 def topk_softmax_with_capacity(
     logits: torch.Tensor,
     topk: int,
-    capacity_factor: float = None,
+    capacity_factor: Optional[float] = None,
     pad_to_capacity: bool = False,
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
+    moe_router_topk_limited_devices: int = None,
+    moe_router_topk_scaling_factor: float = None,
+    deterministic_mode: bool = False,
 ):
     """Apply capacity and padding to the top-k selection.
     Args:
@@ -338,15 +394,21 @@ def topk_softmax_with_capacity(
         drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
                            If "prob", the tokens with the lowest probabilities will be dropped.
                            If "position", tokens at the end of each batch will be dropped.
-
+        use_pre_softmax (bool): Whether to apply softmax before top-k selection.
+        moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
+            each token during routing. None means no device limitation.
+        moe_router_topk_scaling_factor (float): Scaling factor for routing score in top-k
+            selection, only works when use_pre_softmax enabled.
+        deterministic_mode (bool): Deprecated.
     Returns:
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Probs, indices and tokens_per_expert
-                                                         tensor.
-
-        (1) If there's no token padding, the shape of probs and indices is [tokens, top_k],
-            indicating the selected experts for each token.
-        (2) If there's token padding, the shape of probs and indices is [num_expert, capacity],
-            indicating the tokens selected for each expert.
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
+              the routing probabilities for each token to each expert.
+            - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
+              indicating which experts were selected for each token. True values represent
+              the selected experts.
+            - tokens_per_expert (torch.Tensor): A tensor of shape [num_experts] containing
+              the number of local tokens assigned to each expert before dropping and padding.
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens = logits.shape[0]
@@ -354,59 +416,68 @@ def topk_softmax_with_capacity(
     if use_pre_softmax:
         # Pre softmax
         scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-        probs, top_indices = torch.topk(scores, k=topk, dim=1)
+
+        if moe_router_topk_limited_devices:
+            probs, top_indices = device_limited_topk(
+                scores, topk, num_tokens, num_experts, moe_router_topk_limited_devices
+            )
+        else:
+            probs, top_indices = torch.topk(scores, k=topk, dim=1)
+
+        # Normalize the probs.
+        if moe_router_topk_scaling_factor:
+            probs = probs * moe_router_topk_scaling_factor
     else:
         # Post softmax
         if topk == 1:
             # Requires applying softmax before selecting the top-k when k is 1,
             # since softmax on a [num_tokens, 1] would yield a zero gradient.
             raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
-        scores, top_indices = torch.topk(logits, k=topk, dim=1)
+        assert (
+            moe_router_topk_scaling_factor is None
+        ), "moe_router_topk_scaling_factor is not supported with post-softmax"
+        if moe_router_topk_limited_devices:
+            scores, top_indices = device_limited_topk(
+                logits, topk, num_tokens, num_experts, moe_router_topk_limited_devices
+            )
+        else:
+            scores, top_indices = torch.topk(logits, k=topk, dim=1)
         probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+
+    # TODO Try using element-wise operations instead of scatter?
+    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
+    topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    tokens_per_expert = topk_map.sum(dim=0)
 
     if capacity_factor is None:
         # TopK without capacity
-        tokens_per_expert = torch.bincount(top_indices.view(-1), minlength=num_experts)
-        return probs, top_indices, tokens_per_expert
+        return topk_masked_gates, topk_map, tokens_per_expert
     else:
         # TopK with capacity
         expert_capacity = get_capacity(
             num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
         )
-        # TopK selection, Maskout unused experts
-        topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
-        topk_mask = torch.zeros_like(logits).scatter(1, top_indices, 1)
 
         # Maskout exceeded tokens
         if drop_policy == "probs":
-            capacity_probs, capacity_indices = torch.topk(
+            _, capacity_indices = torch.topk(
                 topk_masked_gates, k=expert_capacity, dim=0, sorted=False
             )
-            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1)
+            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
         elif drop_policy == "position":
-            _, capacity_indices = torch.topk(topk_mask, k=expert_capacity, dim=0, sorted=False)
-            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1)
-            capacity_probs = torch.gather(topk_masked_gates, 0, capacity_indices)
+            _, capacity_indices = torch.topk(topk_map.int(), k=expert_capacity, dim=0, sorted=False)
+            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
         else:
             raise ValueError(f"Invalid drop_policy: {drop_policy}")
 
         if pad_to_capacity:
-            final_probs, final_indices = (
-                capacity_probs.T.contiguous(),
-                capacity_indices.T.contiguous(),
-            )
-            tokens_per_expert_before_capacity = topk_mask.sum(dim=0)
+            final_map = capacity_mask
+            final_probs = topk_masked_gates * final_map
         else:
             # Get exceed mask and maskout exceeded probs and indices
-            final_mask = torch.logical_and(topk_mask, capacity_mask)
-            drop_mask = torch.logical_not(final_mask)
-            exceed_mask = torch.gather(drop_mask, 1, top_indices)
-            final_probs = probs * torch.logical_not(exceed_mask)
-            final_indices = top_indices.clone().masked_fill_(
-                exceed_mask, torch.iinfo(torch.long).max
-            )
-            tokens_per_expert_before_capacity = topk_mask.sum(dim=0)
-        return final_probs, final_indices, tokens_per_expert_before_capacity
+            final_map = torch.logical_and(topk_map, capacity_mask)
+            final_probs = topk_masked_gates * final_map
+        return final_probs, final_map, tokens_per_expert
 
 
 def save_to_aux_losses_tracker(
@@ -505,50 +576,3 @@ def track_moe_metrics(
                     )
 
     clear_aux_losses_tracker()
-
-
-class moe_gather(torch.autograd.Function):
-    """Gather the input tensor based on the map tensor."""
-
-    @staticmethod
-    def forward(ctx, input_, map_):
-        """Gather the input tensor based on the map tensor."""
-        ctx.input_size = input_.size()
-        ctx.map = map_
-        return torch.gather(input_, 0, map_)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Scatter the grad_output tensor based on the map tensor."""
-        input_size = ctx.input_size
-        map_ = ctx.map
-
-        output = torch.zeros(
-            input_size, dtype=grad_output.dtype, device=torch.cuda.current_device()
-        )
-        output.scatter_add_(0, map_, grad_output)
-        return output, None, None
-
-
-class moe_scatter(torch.autograd.Function):
-    """Scatter the input tensor based on the map tensor."""
-
-    @staticmethod
-    def forward(ctx, input_, map_, output_size=None):
-        """Scatter the input tensor based on the map tensor."""
-        ctx.map = map_
-
-        if output_size is not None:
-            output = torch.zeros(output_size, dtype=input_.dtype, device=input_.device)
-        else:
-            output = torch.zeros_like(input_)
-
-        output.scatter_add_(0, map_, input_)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Gather the grad_output tensor based on the map tensor."""
-        map_ = ctx.map
-        grad_input = torch.gather(grad_output, 0, map_)
-        return grad_input, None, None, None

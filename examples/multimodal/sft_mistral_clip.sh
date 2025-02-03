@@ -29,15 +29,9 @@ if [[ -z $LOAD_ITER ]]; then
     exit 1
 fi
 
-if [[ -z $TOKENIZER_MODEL ]]; then
-    echo "Please set TOKENIZER_MODEL for tokenizer model name."
-    exit 1
-fi
-
 CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
 
 DATA_TRAIN="${SOURCE}/examples/multimodal/sft_dataset.yaml"
-DATA_VALID="${SOURCE}/examples/multimodal/sft_dataset.yaml"
 
 DEBUG=0
 if [[ $DEBUG -eq 1 ]]; then
@@ -98,10 +92,10 @@ OPTIONS=" \
     --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 500 \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
+    --tokenizer-type MultimodalTokenizer \
+    --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
+    --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
-    --valid-path ${DATA_VALID} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
     --save-interval 500 \
     --save ${FINETUNE_DIR} \
@@ -127,6 +121,7 @@ OPTIONS=" \
     --disable-vision-class-token \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
+    --ckpt-format torch
 "
 
 export NVTE_APPLY_QK_LAYER_SCALING=0

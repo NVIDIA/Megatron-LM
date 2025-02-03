@@ -1,40 +1,47 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from argparse import Namespace
-from typing import List, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
 from megatron.core.models.gpt import GPTModel
 
 
+# pylint: disable=line-too-long
 class GPTInferenceWrapper(AbstractModelInferenceWrapper):
-    def __init__(self, model: GPTModel, args: Namespace):
+    """Inference wrapper for GPT model"""
+
+    def __init__(self, model: GPTModel, inference_wrapper_config: InferenceWrapperConfig):
         """Constructor for the model inference wrapper
 
         The wrapper prepares the model for inference, provides the required input data, and runs the forward pass
 
         Args:
             model (GPTModel): The GPT model (MCore or legacy)
-            args (Namespace): The command line arguments that were passed
+            inference_wrapper_config (InferenceWrapperConfig): Has info like hidden size, vocab size etc
         """
-        super().__init__(model, args)
+        super().__init__(model, inference_wrapper_config)
 
-    def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
-        """A utility function for preparing model for inference
-
-        This function is called before the forward pass. It puts the model in eval mode, builds position ids, and creates attention masks so that required slices can be extracted during the forward pass.
+    def prep_inference_input(self, prompts_tokens: torch.Tensor) -> Dict[str, Any]:
+        """Prepares the inference input data.
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
-        """
 
-        super().prep_model_for_inference(prompts_tokens=prompts_tokens)
-        self.attention_mask, self.position_ids = self._build_attention_mask_and_position_ids(
-            prompts_tokens
-        )
+        Returns:
+            A dict with all the inference input needed for the batch.
+        """
+        attention_mask, position_ids = self._build_attention_mask_and_position_ids(prompts_tokens)
+        return {
+            "tokens": prompts_tokens,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        }
 
     def _build_attention_mask_and_position_ids(
         self, prompts_tokens: torch.Tensor
@@ -63,23 +70,33 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         return attention_mask, position_ids
 
     def get_batch_for_context_window(
-        self, context_start_position: int, context_end_position: int
-    ) -> List:
+        self,
+        inference_input: Dict[str, Any],
+        context_start_position: int,
+        context_end_position: int,
+    ) -> Dict[str, Any]:
         """Returns the inference data given context window
 
         This function gets called iteratively in a loop . Given the start and end context positions , it extracts the appropriate data.
 
         Args:
+            inference_input (Dict[str, Any]): The inference input for the batch.
             context_start_position (int): Start of the context window. During the first inference step it is mostly 0
             context_end_position (int): End of the context window. During the last inference step it will mostly be the max generated sequence length.
 
         Returns:
-            List: A list of inputs that will be used by your model in the forward step
+            Dict[str, Any]: A dict of inputs that will be used by your model in the forward step
         """
-        tokens2use = self.prompts_tokens[:, context_start_position:context_end_position]
-        positions2use = self.position_ids[:, context_start_position:context_end_position]
-        attention_mask2use = self.attention_mask[
+        tokens = inference_input["tokens"]
+        position_ids = inference_input["position_ids"]
+        attention_mask = inference_input["attention_mask"]
+        tokens2use = tokens[:, context_start_position:context_end_position]
+        positions2use = position_ids[:, context_start_position:context_end_position]
+        attention_mask2use = attention_mask[
             ..., context_start_position:context_end_position, :context_end_position
         ]
-        data_at_step_idx = [tokens2use, positions2use, attention_mask2use]
-        return data_at_step_idx
+        return {
+            "tokens": tokens2use,
+            "position_ids": positions2use,
+            "attention_mask": attention_mask2use,
+        }

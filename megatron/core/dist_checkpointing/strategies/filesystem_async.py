@@ -69,7 +69,7 @@ class FileSystemWriterAsync(FileSystemWriter):
     (intermediate state is stored as writer attributes).
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, separation_hint: Optional[str] = None, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.single_file_per_rank:
             raise NotImplementedError(
@@ -79,6 +79,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         # Intermediate state between preparation and finalization
         self.write_buckets: Optional[List[WriteBucket]] = None
         self.results_queue: Optional[mp.Queue] = None
+        self.separation_hint = separation_hint
 
     def prepare_write_data(self, plan: SavePlan, planner: SavePlanner) -> None:
         """
@@ -93,7 +94,12 @@ class FileSystemWriterAsync(FileSystemWriter):
         storage_plan: _StoragePrefix = plan.storage_data
         start = time()
         logger.debug(f"thread_count: {self.thread_count}, time: {start}")
-        item_buckets = _split_by_size_and_type(self.thread_count, plan.items)
+        if self.separation_hint:
+            assert (
+                self.thread_count > 1
+            ), "thread_count must be at least 2 if separation_hint is provided"
+        bins = self.thread_count // 2 if self.separation_hint is not None else self.thread_count
+        item_buckets = _split_by_size_and_type(bins, plan.items, self.separation_hint)
         logger.debug(f"bucket_prep, time: {time() - start}")
 
         start = time()
@@ -101,30 +107,33 @@ class FileSystemWriterAsync(FileSystemWriter):
         # We do D2H synchronously for now
         file_count = 0
 
-        def gen_file():
+        def gen_file(prefix=""):
             nonlocal file_count
-            file_name = f"{storage_plan.prefix}{file_count}{DEFAULT_SUFFIX}"
+            file_name = f"{prefix}{storage_plan.prefix}{file_count}{DEFAULT_SUFFIX}"
             file_count += 1
             return file_name
 
         # Prepare bytes / tensor data in each bucket, which will be assigned to each writer process
         self.write_buckets = []
-        for bucket in item_buckets:
-            bytes_data = [
-                (item, planner.resolve_data(item))
-                for item in bucket
-                if item.type == WriteItemType.BYTE_IO
-            ]
-            tensor_data = [
-                (item, planner.resolve_data(item).detach().to("cpu", non_blocking=True))
-                for item in bucket
-                if item.type != WriteItemType.BYTE_IO
-            ]
-            if len(bytes_data) > 0 or len(tensor_data) > 0:
-                file_name = gen_file()
-                self.write_buckets.append(
-                    (self.path / file_name, file_name, (bytes_data, tensor_data))
-                )
+        for group_name, group_buckets in _split_by_separation_hint(
+            item_buckets, self.separation_hint
+        ).items():
+            for bucket in group_buckets:
+                bytes_data = [
+                    (item, planner.resolve_data(item))
+                    for item in bucket
+                    if item.type == WriteItemType.BYTE_IO
+                ]
+                tensor_data = [
+                    (item, planner.resolve_data(item).detach().to("cpu", non_blocking=True))
+                    for item in bucket
+                    if item.type != WriteItemType.BYTE_IO
+                ]
+                if len(bytes_data) > 0 or len(tensor_data) > 0:
+                    file_name = gen_file(prefix=group_name)
+                    self.write_buckets.append(
+                        (self.path / file_name, file_name, (bytes_data, tensor_data))
+                    )
 
         # Check if there is anything to write on this rank
         if len(self.write_buckets) > 0:
@@ -173,8 +182,8 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         Args:
             write_buckets (List[WriteBucket]): write plan
-            global_results_queue (mp.Queue): mp.Queue to collect Dict[List[WriteResults]] (or an Exception)
-                from parallel write processes to the main training process
+            global_results_queue (mp.Queue): mp.Queue to collect Dict[List[WriteResults]]
+                (or an Exception) from parallel write processes to the main training process
         Returns: None
         """
         w_start = time()
@@ -205,18 +214,23 @@ class FileSystemWriterAsync(FileSystemWriter):
 
             # To make sure all nodes are completed
             count_queue.join()
-            # At this point, all workers completed, so the queue should have exactly `len(write_buckets)` items
+            # At this point, all workers completed, so the queue should have exactly
+            # `len(write_buckets)` items
             for proc_idx in range(len(write_buckets)):
                 try:
                     local_proc_idx, local_results_or_exc = local_results_queue.get()
                 except queue.Empty:
                     write_results_or_exc = RuntimeError(
-                        f'Unexpected empty `local_results_queue` (got only {proc_idx}/{len(write_buckets)} items)'
+                        f'Unexpected empty `local_results_queue`'
+                        f' (got only {proc_idx}/{len(write_buckets)} items)'
                     )
                     break
                 else:
                     if isinstance(local_results_or_exc, Exception):
-                        err_msg = f"Local process {local_proc_idx} encountered an error: {local_results_or_exc}"
+                        err_msg = (
+                            f"Local process {local_proc_idx} encountered"
+                            f" an error: {local_results_or_exc}"
+                        )
                         logger.error(err_msg)
                         write_results_or_exc = local_results_or_exc
                         break
@@ -231,7 +245,8 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         w_end = time()
         logger.debug(
-            f"{w_end}, rank: {torch.distributed.get_rank()}, write(sync,parallel): {w_end - w_start}"
+            f"{w_end}, rank: {torch.distributed.get_rank()},"
+            f" write(sync,parallel): {w_end - w_start}"
         )
 
     @staticmethod
@@ -249,7 +264,8 @@ class FileSystemWriterAsync(FileSystemWriter):
         Args:
             local_proc_idx (int): index of a local process that performs writing
             write_bucket (WriteBucket): data to write to storage
-            results_queue (mp.Queue): queue to return the write results to the proxy checkpoint process.
+            results_queue (mp.Queue): queue to return the write results
+                to the proxy checkpoint process.
             count_queue (mp.JoinableQueue): queue to marks worker task as completed
             use_fsync (bool): if True, calls os.fsync at the end of saving
 
@@ -281,17 +297,21 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         mem_after = _process_memory()
         logger.debug(
-            f"{local_proc_idx} consumed: {mem_after - mem_before}, before: {mem_before}, after: {mem_after}"
+            f"{local_proc_idx} consumed: {mem_after - mem_before},"
+            f" before: {mem_before}, after: {mem_after}"
         )
 
     def write_data(self, plan: SavePlan, planner: SavePlanner) -> Future[List[WriteResult]]:
+        """Write all items from ``plan``."""
         raise NotImplementedError('write_data not implemented for FileSystemWriterAsync')
 
     def retrieve_write_results(self) -> List[WriteResult]:
         """
-        Turn the latest dict including write results from `self.results_queue` into a single results lists. Includes error check.
+        Turn the latest dict including write results from `self.results_queue`
+            into a single results lists. Includes error check.
 
-        Returns (List[WriteResult]): the list of write results from all local processes performing the save.
+        Returns (List[WriteResult]): the list of write results
+            from all local processes performing the save.
 
         """
         assert self.write_buckets is not None
@@ -309,13 +329,15 @@ class FileSystemWriterAsync(FileSystemWriter):
         write_results: dict = write_results_or_exc
         if len(write_results) != len(self.write_buckets):
             raise RuntimeError(
-                f'Incomplete worker results (expected {len(self.write_buckets)}, got {len(write_results)}.'
-                f' This probably indicates a worker failure.'
+                f'Incomplete worker results (expected {len(self.write_buckets)},'
+                f' got {len(write_results)}. This probably indicates a worker failure.'
             )
         return list(chain.from_iterable(write_results.values()))
 
 
-def _split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
+def _split_by_size_and_type(
+    bins: int, items: List[WriteItem], separation_hint: Optional[str] = None
+) -> List[List[WriteItem]]:
     """
     Splits write items according to item size into close to uniform bins.
 
@@ -351,6 +373,37 @@ def _split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[Writ
         bucket_sizes[idx] += _item_size(item)
 
     return buckets
+
+
+def _split_by_separation_hint(
+    buckets: List[List[WriteItem]], separation_hint: Optional[str] = None
+) -> Dict[str, List[List[WriteItem]]]:
+    """
+    Splits buckets into those whose keys begin with the separation_hint and those whose keys do not
+
+    Args:
+        buckets (List[List[WriteItem]]): buckets to split
+        separation_hint (Optional[str]): optional prefix to split on
+
+    Returns (Dict[str, List[List[WriteItem]]]): a dictionary
+        mapping the prefix to the relevant buckets
+    """
+    bins = len(buckets)
+    buckets_with_separation_hint = {}
+    if separation_hint is not None:
+        buckets_default = [[] for _ in range(bins)]
+        buckets_hint = [[] for _ in range(bins)]
+        for i in range(bins):
+            for item in buckets[i]:
+                if item.index.fqn.startswith(separation_hint):
+                    buckets_hint[i].append(item)
+                else:
+                    buckets_default[i].append(item)
+        buckets_with_separation_hint[""] = buckets_default
+        buckets_with_separation_hint[separation_hint] = buckets_hint
+    else:
+        buckets_with_separation_hint[""] = buckets
+    return buckets_with_separation_hint
 
 
 def _item_size(item: WriteItem) -> int:

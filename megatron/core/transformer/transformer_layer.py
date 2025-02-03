@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import warnings
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Union
@@ -15,6 +15,78 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
+
+
+def get_transformer_layer_offset(config: TransformerConfig):
+    """Get the index offset of current pipeline stage, given the level of pipelining."""
+    pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if not parallel_state.is_inside_encoder():
+        pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
+        if pp_decoder_start is not None:
+            pipeline_rank = pipeline_rank - pp_decoder_start
+
+    num_layers_per_pipeline_rank = config.num_layers // config.pipeline_model_parallel_size
+
+    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+        vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+        total_num_layers = config.num_layers
+        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+        total_virtual_chunks = total_num_layers // vp_size
+        offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
+
+    else:
+        # Each stage gets a contiguous set of layers.
+        if config.pipeline_model_parallel_size > 1:
+            if (
+                config.first_pipeline_num_layers is not None
+                or config.last_pipeline_num_layers is not None
+            ):
+                # Calculate number of pipelines for distributing layers
+                middle_pipeline_stages = config.pipeline_model_parallel_size
+                middle_pipeline_stages -= sum(
+                    [
+                        1 if x is not None else 0
+                        for x in (config.first_pipeline_num_layers, config.last_pipeline_num_layers)
+                    ]
+                )
+
+                # Calculate layers to distribute
+                first_pipeline_offset = (
+                    0
+                    if config.first_pipeline_num_layers is None
+                    else config.first_pipeline_num_layers
+                )
+                last_pipeline_offset = (
+                    0
+                    if config.last_pipeline_num_layers is None
+                    else config.last_pipeline_num_layers
+                )
+
+                middle_num_layers = config.num_layers - first_pipeline_offset - last_pipeline_offset
+
+                if middle_pipeline_stages > 0:
+                    num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
+                else:
+                    num_layers_per_pipeline_rank = 0
+
+                middle_pipeline_rank = (
+                    pipeline_rank if config.first_pipeline_num_layers is None else pipeline_rank - 1
+                )
+
+                if pipeline_rank == 0:
+                    offset = 0
+                else:
+                    offset = (
+                        middle_pipeline_rank * num_layers_per_pipeline_rank
+                    ) + first_pipeline_offset
+            else:
+                offset = pipeline_rank * num_layers_per_pipeline_rank
+        else:
+            offset = 0
+
+    return offset
 
 
 @dataclass
@@ -38,7 +110,7 @@ class TransformerLayerSubmodules:
             after cross-attention.
         pre_mlp_layernorm (Union[ModuleSpec, type]): Specification for the layer normalization
             before the MLP.
-        mlp (Union[ModuleSpec, type]): Specification for the MLP.
+        mlp (Union[ModuleSpec, type]): Specification for the MLP in Dense layer.
         mlp_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
@@ -93,14 +165,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
 
-        if config.enable_cuda_graph and self.training:
-            assert (
-                not config.cpu_offloading and config.recompute_granularity is None
-            ), "Cudagraphs not supported"
+        if config.enable_cuda_graph:
+            if not self.training:
+                # Cudagraphs for inference are only enabled with the flash decoding kernel
+                assert (
+                    self.config.flash_decode
+                ), "--flash-decode is required to use CUDA graphs during inference"
             self.cudagraph_manager = CudaGraphManager()
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + self._get_layer_offset()
+        self.layer_number = layer_number + TransformerLayer._get_layer_offset(self.config)
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
@@ -112,9 +186,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
+        attention_optional_kwargs = {}
+        if config.cp_comm_type is not None:
+            if isinstance(config.cp_comm_type, list):
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[self.layer_number]
+            else:
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
+
         # [Module 2: SelfAttention]
         self.self_attention = build_module(
-            submodules.self_attention, config=self.config, layer_number=layer_number
+            submodules.self_attention,
+            config=self.config,
+            layer_number=layer_number,
+            **attention_optional_kwargs,
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -130,7 +214,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # [Module 5: CrossAttention]
         self.cross_attention = build_module(
-            submodules.cross_attention, config=self.config, layer_number=layer_number
+            submodules.cross_attention,
+            config=self.config,
+            layer_number=layer_number,
+            **attention_optional_kwargs,
         )
 
         # [Module 6: BiasDropoutFusion]
@@ -143,10 +230,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
-
         # [Module 8: MLP block]
-        # TODO how to set the gpt_layer_spec.py when we have moe_frequency > 1,
-        #      where MLP and MoE layer both appear alternately?
         self.mlp = build_module(submodules.mlp, config=self.config)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
@@ -162,81 +246,20 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
-    def _get_layer_offset(self):
-        """Get the index number of this layer, given the level of pipelining."""
-        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+    @staticmethod
+    def _get_layer_offset(config: TransformerConfig):
+        """
+        Get the layer offset for the current pipeline stage.
 
-        num_layers_per_pipeline_rank = (
-            self.config.num_layers // self.config.pipeline_model_parallel_size
+        Deprecated: please use `get_transformer_layer_offset` instead.
+        """
+
+        warnings.warn(
+            "TransformerLayer._get_layer_offset is deprecated."
+            "Please use get_transformer_layer_offset instead."
         )
 
-        if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-            vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-            vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-
-            total_num_layers = self.config.num_layers
-            num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
-            total_virtual_chunks = total_num_layers // vp_size
-            offset = vp_rank * total_virtual_chunks + (pipeline_rank * num_layers_per_virtual_rank)
-
-        else:
-            # Each stage gets a contiguous set of layers.
-            if parallel_state.get_pipeline_model_parallel_world_size() > 1:
-                if (
-                    self.config.first_pipeline_num_layers is not None
-                    or self.config.last_pipeline_num_layers is not None
-                ):
-                    # Calculate number of pipelines for distributing layers
-                    middle_pipeline_stages = parallel_state.get_pipeline_model_parallel_world_size()
-                    middle_pipeline_stages -= sum(
-                        [
-                            1 if x is not None else 0
-                            for x in (
-                                self.config.first_pipeline_num_layers,
-                                self.config.last_pipeline_num_layers,
-                            )
-                        ]
-                    )
-
-                    # Calculate layers to distribute
-                    first_pipeline_offset = (
-                        0
-                        if self.config.first_pipeline_num_layers is None
-                        else self.config.first_pipeline_num_layers
-                    )
-                    last_pipeline_offset = (
-                        0
-                        if self.config.first_pipeline_num_layers is None
-                        else self.config.last_pipeline_num_layers
-                    )
-
-                    middle_num_layers = (
-                        self.config.num_layers - first_pipeline_offset - last_pipeline_offset
-                    )
-
-                    if middle_pipeline_stages > 0:
-                        num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
-                    else:
-                        num_layers_per_pipeline_rank = 0
-
-                    middle_pipeline_rank = (
-                        pipeline_rank
-                        if self.config.first_pipeline_num_layers is None
-                        else pipeline_rank - 1
-                    )
-
-                    if pipeline_rank == 0:
-                        offset = 0
-                    else:
-                        offset = (
-                            middle_pipeline_rank * num_layers_per_pipeline_rank
-                        ) + first_pipeline_offset
-                else:
-                    offset = pipeline_rank * num_layers_per_pipeline_rank
-            else:
-                offset = 0
-
-        return offset
+        return get_transformer_layer_offset(config)
 
     def forward(
         self,
@@ -245,8 +268,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         context=None,
         context_mask=None,
         rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        attention_bias=None,
         inference_params=None,
         packed_seq_params=None,
+        sequence_len_offset=None,
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -261,6 +288,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             context (Tensor, optional): Context tensor for cross-attention.
             context_mask (Tensor, optional): Mask tensor for cross-attention.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            attention_bias (Tensor, optional): Bias tensor for Q * K.T.
             inference_params (object, optional): Parameters for inference-time optimizations.
             packed_seq_params (object, optional): Parameters for packed sequence processing.
 
@@ -283,7 +311,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -372,6 +404,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         return sharded_state_dict
 
     def __call__(self, *args, **kwargs):
-        if hasattr(self, 'cudagraph_manager'):
+        # Training and validation mode CUDA graphs
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_params') is None:
+            return self.cudagraph_manager(self, args, kwargs)
+        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
+        elif not self.training and (
+            hasattr(self, 'cudagraph_manager') and kwargs['attention_mask'] is None
+        ):
             return self.cudagraph_manager(self, args, kwargs)
         return super(MegatronModule, self).__call__(*args, **kwargs)

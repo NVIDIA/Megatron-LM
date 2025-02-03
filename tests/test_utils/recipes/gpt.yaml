@@ -1,0 +1,659 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}'
+  model: gpt
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 8
+  n_repeat: 5
+  platforms: dgx_a100
+  artifacts:
+    /workspace/data/gpt3_data: text/the_pile/shard00
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G_dev/22410107
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/22410107
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "DATA_PATH=/workspace/data/gpt3_data"
+        "DATA_CACHE_PATH=/workspace/data/cache"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/{name}"
+        "TRAINING_SCRIPT_PATH=pretrain_gpt.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "N_REPEAT={n_repeat}"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  #######################################################################
+  # Nightly tests: Run both DEV and LTS unless something is flaky       #
+  #######################################################################
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel]
+    products:
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch_dist]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp1_dist_optimizer_overlap_grad_reduce]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp1_overlap_grad_reduce]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp2]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp2_resume_torch]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_overlap_grad_reduce]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_resume_torch]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4_vp1_overlap_grad_reduce]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_overlap_grad_reduce]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_4experts]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_overlap_grad_reduce]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_overlap_grad_reduce]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1_resume_torch]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts]
+  #   products:
+  #     - environment: [dev, lts]
+  #       scope: [nightly]
+  # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_fsdp2_resume_torch_dist_te]
+  #   products:
+  #     - environment: [dev, lts]
+  #       scope: [nightly]
+  #######################################################################
+  # Weekly tests: Run both DEV and LTS unless something is flaky        #
+  #######################################################################
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_nondet_tp1_pp1_fp8_no_model_parallel]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_bf16_baseline]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_fp8_no_model_parallel]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp2_fp8_pp]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp_sp]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_native_fp8_tp_pp_sp]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_pp2_fp8_tp_pp]
+    products:
+      - environment: [dev, lts]
+        scope: [weekly]
+  #######################################################################
+  # MR tests: Mostly DEV on MR, and LTS on nightly cadence, except for  #
+  #             some very important tests.                              #
+  #######################################################################
+  - test_case: [gpt3_mr_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp1_uniform_full_recompute_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G]
+    products:
+      # - environment: [dev] Until TE is at 1.12
+      #   scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G]
+    products:
+      # - environment: [dev] Until TE is at 1.12
+      #   scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_disable_bias_linear_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_sequence_parallel_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_swiglu_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_sequence_parallel_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_swiglu_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_untie_embeddings_and_outputs_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_calculate_per_token_loss_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_decoupled_lr_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_tunable_overlap_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_tunable_overlap_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_uneven_pipeline_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_multi_dist_optimizer_instances_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G]  Failing on max-memory
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ddp_average_in_collective_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_no_create_attention_mask_in_dataloader_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_no_mmap_bin_files_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
+  # - test_case:  # Failing on max-memory[gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_mmap_bin_files_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp1_qk_layernorm_test_mode_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_tp2_pp2_uninstall_te_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_te_tp2_pp2_resume_torch_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_tp1_pp4_vp1_resume_torch_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_7b_mr_dgx_a100_1N8G_tp1_pp4_memory_speed]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_7b_mr_dgx_a100_1N8G_tp4_pp1_memory_speed]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_fsdp2_resume_torch_dist_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #     - environment: [lts]
+  #       scope: [nightly]
+  #######################################################################
+  # Super important MR tests that run for both DEV and LTS per MR       #
+  #######################################################################
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_cp2_nondeterministic_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_te_tp2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_tp1_pp4_vp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_tp2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+
+  # - test_case: [gpt3_mr_mcore_tp2_pp2_resume_torch_dist_uninstall_te_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev, lts]
+  #       scope: [mr]

@@ -1,5 +1,7 @@
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
 ##
-# Compile megatron.core.datasets.helpers dependencies before BlendedDataset import
+# Compile megatron.core.datasets.helpers_cpp dependencies before BlendedDataset import
 ##
 
 import random
@@ -26,7 +28,6 @@ def sample_N(dataset, N, randomize):
     return samples
 
 
-@pytest.mark.skip(reason="Tests are flaky and need to be debugged")
 def test_mock_gpt_dataset():
     if torch.distributed.is_available():
         Utils.initialize_distributed()

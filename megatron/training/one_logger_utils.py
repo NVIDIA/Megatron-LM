@@ -3,6 +3,8 @@ import time, os
 
 from .global_vars import get_one_logger, get_args
 
+_one_logger_utils_version = "1.0.0-mlm"
+
 
 def get_timestamp_in_ms():
     """Helper function to get timestamp in ms
@@ -86,7 +88,7 @@ def _produce_e2e_metrics(log_throughput=False, throughput=None):
             # Unpack and assign local vars
             base_metrics = one_logger.store_get('get_e2e_base_metrics')()
             (iteration, train_duration, eval_duration, eval_iterations,
-             total_flops, num_floating_point_operations_so_far,
+             total_flops_since_current_train_start, num_floating_point_operations_so_far,
              consumed_train_samples, world_size, seq_length) = base_metrics.values()
 
             iteration_start = one_logger.store_get('iteration_start')
@@ -125,7 +127,7 @@ def _produce_e2e_metrics(log_throughput=False, throughput=None):
 
             if log_throughput:
                 if train_duration:
-                    train_throughput_per_gpu = total_flops / (train_duration * 10**12 * world_size)
+                    train_throughput_per_gpu = total_flops_since_current_train_start / (train_duration * 10**12 * world_size)
                 else:
                     train_throughput_per_gpu = 0.0
 
@@ -136,7 +138,7 @@ def _produce_e2e_metrics(log_throughput=False, throughput=None):
 
                 throughput_metrics = {
                     'train_tflop_end': float(num_floating_point_operations_so_far) / (10**12),
-                    'train_tflop': float(total_flops) / (10**12),
+                    'train_tflop': float(total_flops_since_current_train_start) / (10**12),
                     'train_throughput_per_gpu': train_throughput_per_gpu,
                     'train_throughput_per_gpu_max': train_throughput_per_gpu_max,
                 }
@@ -234,7 +236,7 @@ def on_save_checkpoint_start(async_save):
             # Unpack and assign local vars
             base_metrics = one_logger.store_get('get_e2e_base_metrics')()
             (iteration, train_duration, eval_duration, eval_iterations,
-             total_flops, num_floating_point_operations_so_far,
+             total_flops_since_current_train_start, num_floating_point_operations_so_far,
              consumed_train_samples, world_size, seq_length) = base_metrics.values()
 
             save_checkpoint_count = one_logger.store_get('save_checkpoint_count') + 1
@@ -289,6 +291,7 @@ def on_pretrain_start():
                 'app_run_type': 'training',
                 'summary_data_schema_version': '1.0.0',
                 'app_metrics_feature_tags': 'full',
+                'one_logger_utils_version': _one_logger_utils_version,
             })
 
 def track_config_flags(train_iters, skip_train, do_train, do_valid, do_test,

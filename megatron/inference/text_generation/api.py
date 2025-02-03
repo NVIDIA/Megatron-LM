@@ -32,13 +32,20 @@ def generate_and_post_process(model,
                               stop_on_eol=False,
                               prevent_newline_after_colon=False,
                               random_seed=-1,
-                              return_logits=False,
-                              detokenize_segments=True):
+                              detokenize_segments=True,
+                              data_parallel=False,
+                              return_topk_logprobs=0):
     """Run inference and post-process outputs, i.e., detokenize,
-    move to cpu and convert to list."""
+    move to cpu and convert to list.
+
+    Args:
+        data_parallel (bool): Enable data parallel text generation. Note: Caller must ensure
+            that 1) different data parallel model replicas are provided different prompts and
+            2) outputs from the different model replicas are gathered.
+    """
 
     # Main inference.
-    tokens, lengths, output_log_probs, logits = generate(
+    tokens, lengths, output_log_probs, logprobs_topk = generate(
         model,
         forward_step=forward_step,
         prompts=prompts,
@@ -54,7 +61,8 @@ def generate_and_post_process(model,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol,
         prevent_newline_after_colon=prevent_newline_after_colon,
-        random_seed=random_seed)
+        random_seed=random_seed,
+        data_parallel=data_parallel)
 
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
@@ -66,11 +74,10 @@ def generate_and_post_process(model,
             for i, (prob, seg) in enumerate(zip(output_log_probs, prompts_plus_generations_segments)):
                 output_log_probs[i] = prob[:len(seg)-1]
 
-        if return_logits:
-            assert(tokens_to_generate == 0)
-            assert(mpu.get_pipeline_model_parallel_world_size() == 1)
+        if return_topk_logprobs > 0:
+            assert tokens_to_generate == 0
             return prompts_plus_generations, prompts_plus_generations_segments, \
-            output_log_probs, tokens, logits
+            output_log_probs, tokens, logprobs_topk
         else:
             return prompts_plus_generations, prompts_plus_generations_segments, \
             output_log_probs, tokens
@@ -92,15 +99,20 @@ def generate(model,
              stop_on_double_eol=False,
              stop_on_eol=False,
              prevent_newline_after_colon=False,
-             random_seed=-1):
-    """Given prompts and input parameters, run inference and return:
+             random_seed=-1,
+             data_parallel=False):
+    """Given prompts and input parameters, run inference.
+
+    Args:
+        data_parallel (bool): Enable data parallel text generation.
+
+    Returns:
        tokens: prompts plus the generated tokens.
        lengths: length of the prompt + generations. Note that we can
            discard tokens in the tokens tensor that are after the
            corresponding length.
        output_log_probs: log probs of the tokens.
     """
-
     # Make sure input params are avaialble to all ranks.
     values = [tokens_to_generate,
               return_output_log_probs,
@@ -110,7 +122,8 @@ def generate(model,
               stop_on_eol,
               prevent_newline_after_colon,
               random_seed]
-    values_float_tensor = broadcast_float_list(len(values), float_list=values)
+
+    values_float_tensor = broadcast_float_list(len(values), float_list=values, data_parallel=data_parallel)
     tokens_to_generate = int(values_float_tensor[0].item())
     return_output_log_probs = bool(values_float_tensor[1].item())
     top_k_sampling = int(values_float_tensor[2].item())
@@ -129,12 +142,13 @@ def generate(model,
         torch.random.manual_seed(random_seed)
 
     # Tokenize prompts and get the batch.
-    # Note that these tensors are broadcaseted to all ranks.
+    # Note that these tensors are broadcasted to all ranks.
     if torch.distributed.get_rank() == 0:
         assert prompts is not None
 
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
-        prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS)
+        prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=add_BOS,
+        data_parallel=data_parallel)
 
     if tokens_to_generate == 0:
         return score_and_return_on_first_stage(

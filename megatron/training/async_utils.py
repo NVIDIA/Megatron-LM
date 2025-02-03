@@ -37,7 +37,15 @@ def maybe_finalize_async_save(blocking: bool = False):
     if not args.async_save:
         return
 
-    if blocking and _async_calls_queue.get_num_unfinalized_calls() > 0:
+    if blocking and not is_empty_async_queue():
         print_rank_0('Unfinalized async checkpoint saves. Finalizing them synchronously now.')
 
     _async_calls_queue.maybe_finalize_async_calls(blocking)
+
+def is_empty_async_queue() -> bool:
+    """ Check if async calls queue is empty. This result is consistent across ranks.
+
+    Returns:
+        bool: True if there is any ongoing async call.
+    """
+    return _async_calls_queue.get_num_unfinalized_calls() == 0

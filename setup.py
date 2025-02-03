@@ -2,7 +2,7 @@
 
 import importlib.util
 import subprocess
-
+import os
 import setuptools
 from setuptools import Extension
 
@@ -27,16 +27,27 @@ with open("megatron/core/README.md", "r", encoding='utf-8') as fh:
     long_description = fh.read()
 long_description_content_type = "text/markdown"
 
+
+def req_file(filename, folder="requirements"):
+    environment = os.getenv("PY_ENV", "pytorch_24.10")
+
+    content = []
+    with open(os.path.join(folder, environment, filename), encoding='utf-8') as f:
+        content += f.readlines()
+
+    with open(os.path.join("megatron", "core", "requirements.txt"), encoding='utf-8') as f:
+        content += f.readlines()
+
+    # you may also want to remove whitespace characters
+    # Example: `\n` at the end of each line
+    return [x.strip() for x in content]
+
+
+install_requires = req_file("requirements.txt")
+
 ###############################################################################
 #                             Extension Making                                #
 # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% #
-
-extra_compile_args = (
-    subprocess.check_output(["python3", "-m", "pybind11", "--includes"])
-    .decode("utf-8")
-    .strip()
-    .split()
-)
 
 ###############################################################################
 
@@ -96,14 +107,22 @@ setuptools.setup(
     packages=setuptools.find_namespace_packages(include=["megatron.core", "megatron.core.*"]),
     ext_modules=[
         Extension(
-            "megatron.core.datasets.helpers",
+            "megatron.core.datasets.helpers_cpp",
             sources=["megatron/core/datasets/helpers.cpp"],
             language="c++",
-            extra_compile_args=extra_compile_args,
+            extra_compile_args=(
+                subprocess.check_output(["python3", "-m", "pybind11", "--includes"])
+                .decode("utf-8")
+                .strip()
+                .split()
+            )
+            + ['-O3', '-Wall', '-std=c++17'],
+            optional=True,
         )
     ],
     # Add in any packaged data.
     include_package_data=True,
     # PyPI package information.
     keywords=__keywords__,
+    install_requires=install_requires,
 )

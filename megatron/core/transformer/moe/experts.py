@@ -1,7 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import itertools
 from copy import deepcopy
-from functools import partial
+from functools import partial, wraps
 from math import ceil
 from typing import Optional, Tuple
 
@@ -12,6 +13,7 @@ from torch.nn.parameter import Parameter
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
+    LocalNonpersistentObject,
     ReplicaId,
     ShardedStateDict,
     ShardedTensorFactory,
@@ -32,6 +34,54 @@ from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_object_for_checkpoint
+
+try:
+
+    from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+
+    HAVE_TE = True
+
+except ImportError:
+
+    HAVE_TE = False
+
+
+def expert_dist_ckpt_decorator(func):
+    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
+
+    Since !1940, the TP size for Expert layer can be different with Attention.
+    To make distributed checkpoint work in such cases, we use a decorator to
+    replace the default TP parallel states with expert-TP parallel states.
+    """
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        # Store original states
+        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
+        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
+        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
+        try:
+            # Set new states
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = (
+                parallel_state.get_expert_tensor_parallel_rank()
+            )
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = (
+                parallel_state.get_expert_tensor_parallel_world_size()
+            )
+            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = (
+                parallel_state.get_expert_tensor_parallel_group()
+            )
+
+            # Execute the function
+            result = func(*args, **kwargs)
+        finally:
+            # Restore original states
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
+            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
+            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
+        return result
+
+    return wrapper
 
 
 class GroupedMLP(MegatronModule):
@@ -64,20 +114,17 @@ class GroupedMLP(MegatronModule):
             self.activation_func = self.config.activation_func
 
         # How many feature each rank holds for fc1 and fc2, respectively.
-        self.moe_extended_tp = config.moe_extended_tp
-        if config.moe_extended_tp:
-            tp_size = parallel_state.get_tensor_and_expert_parallel_world_size()
-        else:
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_size = parallel_state.get_expert_tensor_parallel_world_size()
+        tp_rank = parallel_state.get_expert_tensor_parallel_rank()
 
-        fc1_output_size = self.config.ffn_hidden_size * self.num_local_experts
+        fc1_output_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
             # Project to 4h. If using swiglu double the output width,
             # see https://arxiv.org/pdf/2002.05202.pdf
             fc1_output_size *= 2
         fc1_output_size_per_partition = divide(fc1_output_size, tp_size)
 
-        fc2_input_size = self.config.ffn_hidden_size * self.num_local_experts
+        fc2_input_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         fc2_input_size_per_partition = divide(fc2_input_size, tp_size)
 
         # Note: The current kernel implementations of grouped_gemm
@@ -107,6 +154,8 @@ class GroupedMLP(MegatronModule):
                     partition_dim=1,
                     init_method=config.init_method,
                     params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
                 )
                 _initialize_affine_weight_cpu(
                     self.weight2,
@@ -116,6 +165,8 @@ class GroupedMLP(MegatronModule):
                     partition_dim=0,
                     init_method=config.output_layer_init_method,
                     params_dtype=config.params_dtype,
+                    rank=tp_rank,
+                    world_size=tp_size,
                 )
         else:
             self.weight1 = Parameter(
@@ -136,16 +187,10 @@ class GroupedMLP(MegatronModule):
             )
             if config.perform_initialization:
                 _initialize_affine_weight_gpu(
-                    self.weight1,
-                    config.init_method,
-                    partition_dim=1,
-                    expert_parallel=self.expert_parallel,
+                    self.weight1, config.init_method, partition_dim=1, is_expert=True
                 )
                 _initialize_affine_weight_gpu(
-                    self.weight2,
-                    config.output_layer_init_method,
-                    partition_dim=0,
-                    expert_parallel=self.expert_parallel,
+                    self.weight2, config.output_layer_init_method, partition_dim=0, is_expert=True
                 )
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
         setattr(self.weight2, 'allreduce', not self.expert_parallel)
@@ -191,13 +236,14 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
+    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
-        """Maps local expert to global experts."""
-        if self.moe_extended_tp:
-            raise NotImplementedError(
-                'Currently distributed checkpointing is not supported for moe_extended_tp'
-            )
-
+        """
+        Maps local expert to global experts.
+        The sharded_state_dict for the weight parts are compatible with the SequentialMLP,
+        whereas the optimizer states are not due to the limitation from weight transposing.
+        That is, for finetuning scenario, the checkpoint is compatible with the SequentialMLP.
+        """
         sharded_state_dict = {}
         num_global_experts = (
             parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
@@ -209,10 +255,10 @@ class GroupedMLP(MegatronModule):
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         prepend_axis_num = len(sharded_offsets)
-        replica_id = (
-            0,
-            0,
-            parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
+        replica_id = (0, 0, parallel_state.get_expert_data_parallel_rank())
+
+        local_ffn_dim_size = (
+            self.weight2.numel() // self.num_local_experts // self.config.hidden_size
         )
 
         @torch.no_grad()
@@ -224,15 +270,25 @@ class GroupedMLP(MegatronModule):
             tp_axis: int,
             with_glu: bool,
         ):
-            if tp_axis == 0:
-                real_shape = (self.num_local_experts, self.config.hidden_size, -1)
-            elif tp_axis == 1:
-                real_shape = (self.num_local_experts, -1, self.config.hidden_size)
+            # TODO: write a generic implementation to cover both cases with and without GLU
+            if tp_axis == 1:
+                # weight1
+                if with_glu:
+                    last_dim_size = local_ffn_dim_size * 2
+                else:
+                    last_dim_size = local_ffn_dim_size
+                real_shape = (self.num_local_experts, self.config.hidden_size, last_dim_size)
+            elif tp_axis == 0:
+                # weight2
+                real_shape = (self.num_local_experts, local_ffn_dim_size, self.config.hidden_size)
                 assert with_glu == False
             else:
                 raise ValueError("tp_axis should be 0 or 1.")
             if flattened_range is None:
+                # weights
                 t = t.view(real_shape).transpose(-1, -2)
+                # change tp_axis due to the transposing
+                tp_axis = 1 - tp_axis
                 if with_glu:
                     local_tensors = torch.chunk(t, 2, -2)
                     sub_states = [
@@ -278,35 +334,226 @@ class GroupedMLP(MegatronModule):
                         prepend_axis_num=prepend_axis_num,
                     )
             else:
-                raise NotImplementedError(
-                    'Currently GroupedMLP does not support distributed checkpointing '
-                    'with the distributed optimizer.'
-                )
+                # flattened optmizer states
+                # the non-flattened weight shape is [local_expert_num, hidden_size, ffn_size]
+                #
+                # For the case without GLU, it is straightforward, we just need to split each
+                # expert along the dim-0.
+                #
+                # For the case with GLU, we need to split the experts along dim-0 and split the
+                # two tensors for GLU along dim-2.
+                # To split along the non-first dim, we need to chunk the tensor into small pieces,
+                # since they belong to different tenors and are interleaved in the flattened space.
+                # Refer to the below sketch graph.
+                # |................|           |........|........|
+                # |............FFFF|           |........|....BBBB|
+                # |FFFFFFFFFFFFFFFF|     ->    |AAAAAAAA|BBBBBBBB|
+                # |FFFFFFFFFFFFFFFF|           |AAAAAAAA|BBBBBBBB|
+                # |FF..............|           |AA......|........|
+                # |................|           |........|........|
+                #
+                # But too many chunks have severe performance issues. We merge these chunks during
+                # the save process along with some length information and recover them during the
+                # load process.
+                assert t.ndim == 1, (key, t.shape)
+                if with_glu:
+                    non_flat_local_shape = (1, self.config.hidden_size, local_ffn_dim_size)
+                    chunk_numel = local_ffn_dim_size
+                    sub_states = []
+                    start_pos = 0
+                    for local_expert_idx in range(self.num_local_experts):
+                        first_glu_idx = -1
+                        w_start_range = -1
+                        v_start_range = -1
+                        w_tensors = []
+                        v_tensors = []
+                        w_lens = []
+                        v_lens = []
+                        for input_dim_idx in range(self.config.hidden_size):
+                            for glu_idx in range(2):
+                                local_idx = (
+                                    local_expert_idx * self.config.hidden_size * 2
+                                    + input_dim_idx * 2
+                                    + glu_idx
+                                )
+                                if (
+                                    flattened_range.start < chunk_numel * (local_idx + 1)
+                                    and flattened_range.stop > chunk_numel * local_idx
+                                ):
+                                    if first_glu_idx == -1:
+                                        first_glu_idx = glu_idx
+                                    end_pos = min(
+                                        flattened_range.stop,
+                                        chunk_numel * (local_idx + 1) - flattened_range.start,
+                                    )
+                                    local_tensor = t[start_pos:end_pos]
+                                    local_flattened_range = slice(
+                                        max(0, flattened_range.start - chunk_numel * local_idx),
+                                        min(
+                                            chunk_numel,
+                                            flattened_range.stop - chunk_numel * local_idx,
+                                        ),
+                                    )
+                                    assert (
+                                        len(local_tensor)
+                                        == local_flattened_range.stop - local_flattened_range.start
+                                    )
+                                    start_pos += len(local_tensor)
+                                    expert_global_idx = (
+                                        local_expert_indices_offset + local_expert_idx
+                                    )
+                                    if glu_idx == 0:
+                                        w_tensors.append(local_tensor)
+                                        w_lens.append(len(local_tensor))
+                                        if w_start_range == -1:
+                                            w_start_range = max(
+                                                0, flattened_range.start - chunk_numel * local_idx
+                                            )
+                                    else:
+                                        v_tensors.append(local_tensor)
+                                        v_lens.append(len(local_tensor))
+                                        if v_start_range == -1:
+                                            v_start_range = max(
+                                                0, flattened_range.start - chunk_numel * local_idx
+                                            )
+                        sub_states.append(
+                            {
+                                'w_tensors': ShardedTensor.from_rank_offsets_flat(
+                                    key,
+                                    (
+                                        torch.cat(w_tensors, -1)
+                                        if len(w_tensors) > 0
+                                        else torch.Tensor()
+                                    ),
+                                    non_flat_local_shape,
+                                    *sharded_offsets,
+                                    (prepend_axis_num, expert_global_idx, num_global_experts),
+                                    (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size * 2),
+                                    replica_id=replica_id,
+                                    prepend_axis_num=prepend_axis_num,
+                                    flattened_range=slice(
+                                        w_start_range, w_start_range + sum(w_lens)
+                                    ),
+                                ),
+                                'w_lens': LocalNonpersistentObject(w_lens),
+                                'v_tensors': ShardedTensor.from_rank_offsets_flat(
+                                    key,
+                                    (
+                                        torch.cat(v_tensors, -1)
+                                        if len(v_tensors) > 0
+                                        else torch.Tensor()
+                                    ),
+                                    non_flat_local_shape,
+                                    *sharded_offsets,
+                                    (prepend_axis_num, expert_global_idx, num_global_experts),
+                                    (
+                                        prepend_axis_num + 1 + tp_axis,
+                                        tp_rank + tp_size,
+                                        tp_size * 2,
+                                    ),
+                                    replica_id=replica_id,
+                                    prepend_axis_num=prepend_axis_num,
+                                    flattened_range=slice(
+                                        v_start_range, v_start_range + sum(v_lens)
+                                    ),
+                                ),
+                                'v_lens': LocalNonpersistentObject(v_lens),
+                                'first_glu_idx': LocalNonpersistentObject(first_glu_idx),
+                            }
+                        )
+                else:
+                    non_flat_local_shape = (
+                        real_shape[0] // self.num_local_experts,
+                        *real_shape[1:],
+                    )
+                    chunk_numel = local_ffn_dim_size * self.config.hidden_size
+                    sub_states = []
+                    start_pos = 0
+                    for local_expert_idx in range(self.num_local_experts):
+                        if (
+                            flattened_range.start < chunk_numel * (local_expert_idx + 1)
+                            and flattened_range.stop > chunk_numel * local_expert_idx
+                        ):
+                            end_pos = min(
+                                flattened_range.stop,
+                                chunk_numel * (local_expert_idx + 1) - flattened_range.start,
+                            )
+                            local_tensor = t[start_pos:end_pos]
+                            local_flattened_range = slice(
+                                max(0, flattened_range.start - chunk_numel * local_expert_idx),
+                                min(
+                                    chunk_numel,
+                                    flattened_range.stop - chunk_numel * local_expert_idx,
+                                ),
+                            )
+                            assert (
+                                len(local_tensor)
+                                == local_flattened_range.stop - local_flattened_range.start
+                            )
+                            start_pos += len(local_tensor)
+                            expert_global_idx = local_expert_indices_offset + local_expert_idx
+                            sub_states.append(
+                                ShardedTensor.from_rank_offsets_flat(
+                                    key,
+                                    local_tensor,
+                                    non_flat_local_shape,
+                                    *sharded_offsets,
+                                    (prepend_axis_num, expert_global_idx, num_global_experts),
+                                    (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size),
+                                    replica_id=replica_id,
+                                    prepend_axis_num=prepend_axis_num,
+                                    flattened_range=local_flattened_range,
+                                )
+                            )
             return sub_states
 
         @torch.no_grad()
         def sh_ten_merge_fn(sub_state_dict, tp_axis: int, with_glu: bool):
-            if tp_axis == 0:
+            if tp_axis == 1:
+                # weight1
                 weight_shape = (self.config.hidden_size, -1)
-            elif tp_axis == 1:
+            elif tp_axis == 0:
+                # weight2
                 weight_shape = (-1, self.config.hidden_size)
                 assert with_glu == False
             else:
                 raise ValueError("tp_axis should be 0 or 1.")
-            if with_glu:
-                sub_state_dict = torch.cat(sub_state_dict, -2)
-            return sub_state_dict.transpose(-1, -2).reshape(weight_shape)
+            if isinstance(sub_state_dict, list) and isinstance(sub_state_dict[0], dict):
+                # flattened tensor with glu
+                res = []
+                for local_expert_dict in sub_state_dict:
+                    w_tensors = torch.split(
+                        local_expert_dict['w_tensors'], local_expert_dict['w_lens']
+                    )
+                    v_tensors = torch.split(
+                        local_expert_dict['v_tensors'], local_expert_dict['v_lens']
+                    )
+                    first_glu_idx = local_expert_dict['first_glu_idx']
+                    if first_glu_idx == 0:
+                        res += [
+                            x for x in itertools.chain(*itertools.zip_longest(w_tensors, v_tensors))
+                        ]
+                    else:
+                        res += [
+                            x for x in itertools.chain(*itertools.zip_longest(v_tensors, w_tensors))
+                        ]
+                return torch.cat(res)
+            elif isinstance(sub_state_dict, list) and sub_state_dict[0].ndim == 1:
+                # flattened tensor without glu
+                return torch.cat(sub_state_dict)
+            else:
+                if with_glu:
+                    sub_state_dict = torch.cat(sub_state_dict, -2)
+                return sub_state_dict.transpose(-1, -2).reshape(weight_shape)
 
         state_dict = self.state_dict(prefix='', keep_vars=True)
-        # To align with SequentialMLP, the weight tensors are transposed,
-        # and the tp_axis is also for the transposed tensors
         for name, tensor in state_dict.items():
             if name == 'weight1':
-                tp_axis = 0
+                tp_axis = 1
                 with_glu = self.config.gated_linear_unit
                 wkey = f'{prefix}experts.linear_fc1.weight'
             else:
-                tp_axis = 1
+                tp_axis = 0
                 with_glu = False
                 wkey = f'{prefix}experts.linear_fc2.weight'
             sharded_state_dict[f'{prefix}{name}'] = ShardedTensorFactory(
@@ -320,7 +567,7 @@ class GroupedMLP(MegatronModule):
         replica_id = (
             0,
             parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
+            parallel_state.get_expert_data_parallel_rank(),
         )
         # Add fake _extra_state to be compatible with SequentialMLP
         for expert_local_idx in range(self.num_local_experts):
@@ -350,12 +597,11 @@ class TEGroupedMLP(MegatronModule):
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
-        self.moe_extended_tp = config.moe_extended_tp
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
-        ffn_hidden_size = self.config.ffn_hidden_size
+        ffn_hidden_size = self.config.moe_ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
@@ -377,7 +623,7 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.num_local_experts,
-            self.config.ffn_hidden_size,
+            self.config.moe_ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
@@ -387,17 +633,10 @@ class TEGroupedMLP(MegatronModule):
             tp_comm_buffer_name='fc2',
         )
 
-        def remove_extra_states_check(self, incompatible_keys):
-            """
-            Remove extra _extra_state from unexpected keys.
-            These keys are for dist ckpt compatibility with SequentialMLP.
-            """
-            keys = deepcopy(incompatible_keys.unexpected_keys)
-            for key in keys:
-                if '_extra_state' in key:
-                    incompatible_keys.unexpected_keys.remove(key)
-
-        self.register_load_state_dict_post_hook(remove_extra_states_check)
+        if self.config.fp8:
+            assert HAVE_TE, "FP8 requires TE."
+            self.fp8_padding = Fp8Padding(self.num_local_experts)
+            self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
 
     def forward(
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
@@ -413,6 +652,12 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         tokens_per_expert = tokens_per_expert.tolist()
+        if self.config.fp8:
+            actual_tokens_per_expert = tokens_per_expert
+            permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
+                permuted_local_hidden_states, tokens_per_expert
+            )
+
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
@@ -434,7 +679,18 @@ class TEGroupedMLP(MegatronModule):
                 raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
+                shape = intermediate_parallel.shape
+                intermediate_parallel = torch.cat(
+                    [
+                        t + b
+                        for t, b in zip(
+                            torch.split(
+                                intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
+                            ),
+                            bias_parallel,
+                        )
+                    ]
+                ).view(shape)
             if self.config.gated_linear_unit:
 
                 def glu(x):
@@ -447,8 +703,13 @@ class TEGroupedMLP(MegatronModule):
 
         output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
+        # upad and concat the output
+        if self.config.fp8:
+            output = self.fp8_unpadding(output, actual_tokens_per_expert)
+
         return output, output_bias
 
+    @expert_dist_ckpt_decorator
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -456,10 +717,6 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
-        if self.moe_extended_tp:
-            raise NotImplementedError(
-                'Currently distributed checkpointing is not supported for moe_extended_tp'
-            )
         sharded_state_dict = {}
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f'{name}.', sharded_offsets, metadata)
@@ -494,9 +751,13 @@ class SequentialMLP(MegatronModule):
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
         super().__init__(config=config)
         self.add_bias = config.add_bias_linear
-        self.moe_extended_tp = config.moe_extended_tp
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
+
+        assert (
+            self.config.moe_ffn_hidden_size == self.config.ffn_hidden_size
+        ), "Please use GroupedMLP or TEGroupedMLP when moe_ffn_hidden_size is \
+                different from ffn_hidden_size"
         for _ in range(self.num_local_experts):
             expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
@@ -550,13 +811,9 @@ class SequentialMLP(MegatronModule):
 
             return output_local, output_bias_local
 
+    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
-        if self.moe_extended_tp:
-            raise NotImplementedError(
-                'Currently distributed checkpointing is not supported for moe_extended_tp'
-            )
-
         sharded_state_dict = {}
         num_global_experts = (
             parallel_state.get_expert_model_parallel_world_size() * self.num_local_experts
@@ -589,7 +846,7 @@ class SequentialMLP(MegatronModule):
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
                 sh_ten.replica_id = (
                     *replica_id[:2],
-                    parallel_state.get_data_modulo_expert_parallel_rank(with_context_parallel=True),
+                    parallel_state.get_expert_data_parallel_rank(),
                 )
 
             sharded_state_dict.update(expert_state_dict)

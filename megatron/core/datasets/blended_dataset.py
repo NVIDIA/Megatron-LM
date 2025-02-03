@@ -29,7 +29,8 @@ class BlendedDataset(torch.utils.data.Dataset):
 
         weights (List[Union[int, float]]): The weights that determine the dataset blend ratios
 
-        size (Optional[int]): The number of samples to draw from the blend. If None, for each dataset index idx draw exactly weights[idx] samples from datasets[idx].
+        size (Optional[int]): The number of samples to draw from the blend. If None, for each
+            dataset index idx draw exactly weights[idx] samples from datasets[idx].
 
         config (BlendedMegatronDatasetConfig): The config
 
@@ -74,7 +75,6 @@ class BlendedDataset(torch.utils.data.Dataset):
         unique_identifiers["split"] = self.split.name
         unique_identifiers["weights"] = self.weights
         unique_identifiers["size"] = self.size
-        unique_identifiers["renormalize_blend_weights"] = self.config.renormalize_blend_weights
 
         self.unique_description = json.dumps(
             unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
@@ -168,7 +168,7 @@ class BlendedDataset(torch.utils.data.Dataset):
                 log_single_rank(
                     logger,
                     logging.WARNING,
-                    f"Unable to save the {type(self).__name__} indexes because path_to_cache is None",
+                    f"Cannot save the {type(self).__name__} indexes because path_to_cache is None",
                 )
 
             t_end = time.time()

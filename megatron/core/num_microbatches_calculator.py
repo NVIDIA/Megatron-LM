@@ -51,6 +51,16 @@ def update_num_microbatches(
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR.update(consumed_samples, consistency_check, verbose)
 
 
+def unset_num_microbatches_calculator():
+    """Unset microbatches calculator.
+
+    Useful for multiple runs. See `tests/unit_tests/ckpt_converter/test_ckpt_converter.py`
+    for an example.
+    """
+    global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+    _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
+
+
 def init_num_microbatches_calculator(
     rank: int,
     rampup_batch_size: Optional[List[int]],
@@ -320,6 +330,8 @@ class ConstantNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             if rank == 0:
                 logger.info(
                     f'decreasing batch size from {global_batch_size} to {running_global_batch_size}'
+                    f'to keep divisiblity by micro_batch_size={micro_batch_size} * '
+                    f'data_parallel_size={data_parallel_size}'
                 )
             self.num_micro_batches = (
                 running_global_batch_size // micro_batch_times_data_parallel_size
@@ -424,7 +436,7 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         self.rampup_samples_per_increment = self.ramup_samples / num_increments
 
         # Initialize number of microbatches.
-        self.update(0, False)
+        self.update(0, consistency_check=False, verbose=True)
 
     def update(self, consumed_samples: int, consistency_check: bool, verbose: bool = False) -> None:
         """Update number of microbatches.
@@ -450,10 +462,13 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
         if old_current_global_batch_size != self.current_global_batch_size:
             global_batch_size_changed = True
         if self.rank == 0 and global_batch_size_changed and verbose:
-            logger.info(
-                f'ramping up batch size from {old_current_global_batch_size} to '
-                f'{self.current_global_batch_size}'
-            )
+            if old_current_global_batch_size is None:
+                logger.info(f'setting initial batch size to {self.current_global_batch_size}')
+            else:
+                logger.info(
+                    f'ramping up batch size from {old_current_global_batch_size} to '
+                    f'{self.current_global_batch_size}'
+                )
 
         # Check consistency of the current global batch size.
         if consistency_check and not self.decrease_batch_size_if_needed:
@@ -477,7 +492,9 @@ class RampupBatchsizeNumMicroBatchesCalculator(NumMicroBatchesCalculator):
             if self.rank == 0 and global_batch_size_changed and verbose:
                 logger.info(
                     f'decreasing batch size from {self.current_global_batch_size} to '
-                    f'{self.current_running_global_batch_size}'
+                    f'{self.current_running_global_batch_size} to keep divisiblity by '
+                    f'micro_batch_size={self.micro_batch_size} * '
+                    f'data_parallel_size={self.data_parallel_size}'
                 )
             assert (
                 self.current_running_global_batch_size % self.micro_batch_times_data_parallel_size

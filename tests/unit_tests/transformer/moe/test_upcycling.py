@@ -7,9 +7,7 @@ import torch.distributed
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -32,7 +30,9 @@ from tests.unit_tests.test_utilities import Utils
 _SEED = 42
 
 
-def model_provider(pre_process=True, post_process=True, layer_spec_fn=gpt_te_spec, **config_kwargs):
+def model_provider(
+    pre_process=True, post_process=True, layer_spec_fn=get_gpt_layer_local_spec, **config_kwargs
+):
     model_parallel_cuda_manual_seed(_SEED)
     args = get_args()
 
@@ -40,7 +40,7 @@ def model_provider(pre_process=True, post_process=True, layer_spec_fn=gpt_te_spe
 
     model = GPTModel(
         config=config,
-        transformer_layer_spec=gpt_te_spec(
+        transformer_layer_spec=layer_spec_fn(
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
         ),
         vocab_size=args.vocal_size,
@@ -128,7 +128,6 @@ class TestGPTModel:
         destroy_num_microbatches_calculator()
 
     @pytest.mark.internal
-    @pytest.mark.skipif(True, reason="The test is flaky")  # TODO: Fix the test
     @pytest.mark.parametrize(
         ('tp_pp_ep', 'enable_vp', 'enable_grouped_gemm'), [((1, 1, 2), (False), (False))]
     )
