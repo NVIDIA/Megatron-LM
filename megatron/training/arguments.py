@@ -2348,8 +2348,6 @@ def get_patch_args(parser):
         ),
     )
 
-    group.add_argument("--moe-ffn-hidden-size", type=int, default=None)
-
     group.add_argument("--shared-moe-ffn-hidden-size", type=int, default=None)
 
     group.add_argument(
@@ -2568,6 +2566,9 @@ def _add_moe_args(parser):
                             'where 1 indicates an expert layer and 0 indicates a dense layer. '
                             'Examples: "([0]+[1]*23)": 1 dense layer followed by 23 experts layers, '
                             '"([1]*3+[0]*2)*2": Three expert layers followed by two dense layers, repeated twice.')
+    group.add_argument('--moe-ffn-hidden-size', type=int, default=None,
+                       help='The hidden size of each expert\'s feed-forward network (ffn). '
+                       'If not specified, defaults to the ffn_hidden_size.')
     group.add_argument('--moe-shared-expert-intermediate-size', type=int, default=None,
                        help='Shared expert total ffn hidden size. '
                        'It should be equal to "num_shared_experts * ffn_size_of_each_shared_expert" if there are multiple shared experts. '
