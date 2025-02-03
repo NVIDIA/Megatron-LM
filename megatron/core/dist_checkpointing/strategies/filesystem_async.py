@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """ Storage writer for PyT Distributed format allowing asynchronous save. """
+import dataclasses
 import gc
 import logging
 import os
@@ -75,6 +76,8 @@ class FileSystemWriterAsync(FileSystemWriter):
             raise NotImplementedError(
                 'single_file_per_rank flag not supported for FileSystemWriterAsync'
             )
+
+        self.can_run_decentralized_global_plan: bool = True
 
         # Intermediate state between preparation and finalization
         self.write_buckets: Optional[List[WriteBucket]] = None
@@ -333,6 +336,21 @@ class FileSystemWriterAsync(FileSystemWriter):
                 f' got {len(write_results)}. This probably indicates a worker failure.'
             )
         return list(chain.from_iterable(write_results.values()))
+
+    def prepare_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
+        """Instead of assigning indices by plan order, uses PyT rank (same outcome).
+
+        Args:
+            local_plan (SavePlan): local plan to turn to a global plan
+                (without interactions with other ranks)
+
+        Returns:
+            SavePlan - locally transformed plan equivalent to the plan that would be
+                created by the coordinator
+        """
+        return dataclasses.replace(
+            local_plan, storage_data=_StoragePrefix(f"__{torch.distributed.get_rank()}_")
+        )
 
 
 def _split_by_size_and_type(

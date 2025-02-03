@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch.distributed.checkpoint import Metadata
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException
@@ -170,6 +171,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self.exchange_algo = exchange_algo
 
         self.cached_distribution: Optional[ShardDistribution] = None
+        self.cached_global_metadata: Optional[Metadata] = None
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -249,6 +251,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
         merge(loaded_state_dict, sharded_tensors)
+        if hasattr(self.base_strategy, "cached_global_metadata"):
+            self.cached_global_metadata = self.base_strategy.cached_global_metadata
         return loaded_state_dict
 
     def _defer_loading_sharded_tensors(
