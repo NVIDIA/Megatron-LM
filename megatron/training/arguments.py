@@ -716,10 +716,6 @@ def validate_args(args, defaults={}):
            any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
            <= 1, "A single data source must be provided in training mode, else None"
 
-    if args.use_tp_pp_dp_mapping:
-        assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
-            "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
-
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -1825,8 +1821,7 @@ def _add_distributed_args(parser):
                        'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
     group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
                         help='If set, distributed ranks initialize order is changed '
-                        'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
-                        'with this option enabled')
+                        'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
     group.add_argument('--replication', action='store_true', default=False,
                        help="If set, replication of local checkpoints is enabled. "
                        "Needs to be enabled on all ranks.")

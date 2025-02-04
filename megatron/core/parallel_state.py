@@ -695,6 +695,12 @@ def initialize_model_parallel(
         rank_offset=encoder_world_size,
     )
 
+    assert (
+        order.endswith("pp")
+        or pipeline_model_parallel_size == 1
+        or expert_data_parallel_size == data_parallel_size
+    ), "When not using pp-last rank ordering, the data parallel size of the attention and moe layers must be the same"
+
     assert decoder_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks(
         "pp"
     ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
