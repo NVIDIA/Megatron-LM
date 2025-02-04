@@ -164,6 +164,31 @@ class TopKRouter(Router):
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             probs = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=probs)
         return probs, indices
+    
+    def expert_choice_load_balancing(self, logits: torch.Tensor):
+        """Apply expert chocie load balancing to the logits tensor.
+
+        Args:
+            logits (torch.Tensor): the logits tensor after gating, shape: [num_tokens, num_experts].
+
+        Returns:
+            probs (torch.Tensor): the probabilities tensor after load balancing.
+            indices (torch.Tensor): the indices tensor after top-k selection.
+        """
+        if self.topk >= 2:
+            import warnings
+            warnings.warn(
+                "Topk is ineffective for expert_choice. To increase each expert's capacity, adjust the moe_expert_capacity_factor."
+            )
+        assert self.config.moe_expert_capacity_factor > 0, "Expert choice routing requires moe_expert_capacity_factor > 0."
+        assert self.config.moe_pad_expert_input_to_capacity, "Expert choice routing requires moe_pad_expert_input_to_capacity=True."
+        
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+        # from [T, E] to [E, T]
+        scores = torch.transpose(scores, 0, 1).contiguous()
+        capacity = int(scores.shape[1] * self.config.moe_expert_capacity_factor / scores.shape[0])
+        probs, indices = torch.topk(scores, k=capacity, dim=1)
+        return probs, indices
 
     def apply_load_balancing_loss(
         self,
@@ -274,6 +299,8 @@ class TopKRouter(Router):
             scores, indices = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "aux_loss":
             scores, indices = self.aux_loss_load_balancing(logits)
+        elif self.routing_type == "expert_choice":
+            scores, indices = self.expert_choice_load_balancing(logits)
         elif self.routing_type == "none":
             # A naive top-k routing without load balancing
             scores, indices, _ = topk_softmax_with_capacity(

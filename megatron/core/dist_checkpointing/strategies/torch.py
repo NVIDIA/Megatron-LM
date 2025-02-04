@@ -2,6 +2,9 @@
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
 import io
+import os
+import pickle
+import warnings
 from collections import ChainMap, defaultdict
 from dataclasses import dataclass
 from itertools import product
@@ -13,14 +16,15 @@ import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
 from torch.distributed._shard.metadata import ShardMetadata
-from torch.distributed._shard.sharded_tensor import Shard, ShardedTensorMetadata, TensorProperties
-from torch.distributed._sharded_tensor import ShardedTensor as TorchShardedTensor
-from torch.distributed._tensor import DTensor
+from torch.distributed._shard.sharded_tensor import Shard
+from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
+from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata, TensorProperties
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
     DefaultLoadPlanner,
     DefaultSavePlanner,
     FileSystemReader,
+    FileSystemWriter,
     LoadPlan,
     Metadata,
     ReadItem,
@@ -33,6 +37,7 @@ from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
 from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
+from ...utils import get_torch_version, is_torch_min_version
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
 from ..mapping import (
@@ -68,6 +73,15 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+try:
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
+
+_metadata_fn: str = ".metadata"
 
 
 def register_default_torch_strategies():
@@ -112,7 +126,9 @@ def flatten_state_dict(
 
 
 def sharded_tensor_to_torch_sharded_tensor(
-    sh_tens: List[ShardedTensor], rank: Optional[int] = None
+    sh_tens: List[ShardedTensor],
+    rank: Optional[int] = None,
+    load_legacy_1d_flatten_tensors: bool = False,
 ) -> TorchShardedTensor:
     """Convert MCore ShardedTensor to PyT ShardedTensor. PyT requires information about all chunks.
 
@@ -124,13 +140,12 @@ def sharded_tensor_to_torch_sharded_tensor(
     NOTE: this function assumes regular (grid) sharding of the MCore ShardedTensor.
     The only local irregularities could be introduced with a `flattened_range` attribute.
 
-    This function handles 3 different type of ShardedTensors:
+    This function handles 2 different type of ShardedTensors:
     1. Non-flat regular ShardedTensors (`not has_flattened_range`)
-    2. 1D flattened ShardedTensors (`is_flattened_range_1d`)
-    3. N-D flattened ShardedTensors (`has_flattened_range`)
+    2. N-D flattened ShardedTensors (`has_flattened_range`)
 
-    (1) and (2) type are saved according to their original shape.
-    Type (3) however requires global shape adjustment for efficiency:
+    (1) type are saved according to their original shape.
+    Type (2) however requires global shape adjustment for efficiency:
     we treat [X, Y, Z] global shape tensor with local shape [x, y, z]
     as a [X // x, Y // y, Z // z, x * y * z] tensor with last axis
     partitioned according to `flattened_range` slices.
@@ -140,6 +155,8 @@ def sharded_tensor_to_torch_sharded_tensor(
         sh_tens (List[ShardedTensor]): list of sharded tensors to convert
         rank (int, optional): current process rank passed to PyT ShardedTensor.
             If None, assumes rank in the default pg.
+        load_legacy_1d_flatten_tensors (bool, optional): flag indicating if 1-D flattened tensors
+            should be loaded in a legacy way. Defaults to False.
 
     Returns (TorchShardedTensor): PyT ShardedTensor containing all passed shards.
 
@@ -149,41 +166,21 @@ def sharded_tensor_to_torch_sharded_tensor(
 
     some_sh_ten = sh_tens[0]
     has_flattened_range = some_sh_ten.flattened_range is not None
-    is_flattened_range_1d = has_flattened_range and len(some_sh_ten.global_shape) == 1
 
     for sh_ten in sh_tens:
         assert (sh_ten.flattened_range is not None) == has_flattened_range, sh_tens
         if not sh_ten.data.is_contiguous():
             sh_ten.data = sh_ten.data.contiguous()
 
+    if load_legacy_1d_flatten_tensors and len(some_sh_ten.global_shape) == 1:
+        # Legacy 1-D flattened tensors are loaded as non-flat regular ShardedTensors
+        has_flattened_range = False
+
     local_global_offsets = {}
 
     prepend_axis_num = sh_tens[0].prepend_axis_num
     # Determine local shards according to tensor type (see docs)
-    if is_flattened_range_1d:
-        # Type (2) case: 1D flattened ShardedTensors
-        for sh_ten in sh_tens:
-            assert len(sh_ten.global_offset) == 1, sh_ten
-            assert sh_ten.prepend_axis_num == 0, sh_ten
-            local_global_offsets.setdefault(sh_ten.global_offset, []).append(sh_ten)
-
-        global_shape = some_sh_ten.global_shape
-        offsets_shape = (
-            some_sh_ten.local_shape
-        )  # local shape is not flattened, we need it for chunk offsets
-
-        local_shards = [
-            Shard.from_tensor_and_offsets(
-                sh_ten.data,
-                [
-                    sh_ten.global_offset[0] + sh_ten.flattened_range.start
-                ],  # additional flattened offset
-                rank,
-            )
-            for sh_ten in sh_tens
-        ]
-
-    elif has_flattened_range:
+    if has_flattened_range:
         # Type (3) case: N-D flattened ShardedTensors
         for sh_ten in sh_tens:
             local_global_offsets.setdefault(sh_ten.local_chunk_offset_in_global(), []).append(
@@ -236,10 +233,7 @@ def sharded_tensor_to_torch_sharded_tensor(
             # local shard
             placement = f"rank:{rank}/cuda"
             for sh_ten in local_global_offsets[offset]:
-                if is_flattened_range_1d:
-                    offset = (sh_ten.global_offset[0] + sh_ten.flattened_range.start,)
-                    size = sh_ten.data.shape
-                elif has_flattened_range:
+                if has_flattened_range:
                     assert offset == sh_ten.local_chunk_offset_in_global()
                     # This is not an actual offset, but an offset of the whole shard
                     # This is needed for a PyT Dist internal integrity check
@@ -256,7 +250,7 @@ def sharded_tensor_to_torch_sharded_tensor(
             # Due to a bug in PyT 24.05 container we must specify some concrete rank within a world size.
             # The exact rank doesn't matter as long as it's different than my rank - hence (rank + 1) % WS.
             placement = f"rank:{(rank + 1) % world_size}/cuda"
-            if has_flattened_range and not is_flattened_range_1d:
+            if has_flattened_range:
                 offset = offset + (0,)
                 size = (1,) * len(offsets_shape) + global_shape[-1:]
             else:
@@ -282,7 +276,7 @@ def sharded_tensor_to_torch_sharded_tensor(
     # This won't be stored in the checkpoint, only for runtime purposes
     pyt_sh_ten.mcore_sh_ten = sh_ten.without_data()
     pyt_sh_ten.mcore_metadata = {}
-    if has_flattened_range and not is_flattened_range_1d:
+    if has_flattened_range:
         pyt_sh_ten.mcore_metadata['nd_reformulated_orig_global_shape'] = sh_ten.global_shape
     return pyt_sh_ten
 
@@ -291,6 +285,7 @@ def mcore_to_pyt_state_dict(
     state_dict: Dict[str, List[ShardedBase]],
     is_loading: bool = False,
     init_device: torch.device = torch.device("cpu"),
+    load_legacy_1d_flatten_tensors: bool = False,
 ) -> Dict[str, Union[TorchShardedTensor, io.BytesIO]]:
     """Convert state dict with ShardedTensors and ShardedObjects
     to state dict compatible with PyT Dist format.
@@ -334,7 +329,9 @@ def mcore_to_pyt_state_dict(
                 if sh_ten.allow_shape_mismatch and is_loading:
                     sh_ten.data.zero_()
 
-        torch_sh_ten = sharded_tensor_to_torch_sharded_tensor(sh_tens, rank)
+        torch_sh_ten = sharded_tensor_to_torch_sharded_tensor(
+            sh_tens, rank, load_legacy_1d_flatten_tensors
+        )
         torch_sh_ten.key = sh_tens[0].key
         return torch_sh_ten
 
@@ -450,7 +447,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
         # during saving.
-        if PkgVersion(torch.__version__) <= PkgVersion("2.2"):
+        if get_torch_version() <= PkgVersion("2.2"):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}
@@ -465,7 +462,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         # add those requests on all ranks. We inline a simplified version of this method below.
         write_items = []
         for fqn, obj in self.state_dict.items():
-            assert not isinstance(
+            assert not HAVE_DTENSOR or not isinstance(
                 obj, DTensor
             )  # translation from MCore ShardedTensors shouldn't result in DTensors
             # Create write requests for tensor and bytes values.
@@ -510,12 +507,23 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
+            if sh_ten.key not in metadata.state_dict_metadata:
+                raise KeyError(
+                    f"{sh_ten.key} from model not in state dict:"
+                    f" {sorted(metadata.state_dict_metadata.keys())}"
+                )
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
             if not is_nd_flattened_tensor(sh_ten):
                 expected_shape = sh_ten.global_shape
             else:
                 expected_shape = nd_flattened_tensor_reformulated_global_shape(sh_ten)
             if loaded_shape != expected_shape:
+                if is_nd_flattened_tensor(sh_ten) and len(sh_ten.global_shape) == 1:
+                    # Handle legacy 1-D flattened tensors checkpoint format
+                    # where the global shape is not stored in the metadata
+                    expected_shape = sh_ten.global_shape
+                    if loaded_shape == expected_shape:
+                        continue
                 _msg = (
                     f'Global shape mismatch for loaded ({loaded_shape})'
                     f' and expected ({expected_shape}) tensor'
@@ -578,6 +586,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         keep_only_main_replica: bool = True,
         thread_count: int = 2,
         cached_metadata: bool = False,
+        separation_hint: str = None,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -590,6 +599,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
                 Affects the number of files in the checkpoint (saving ranks * num_threads).
             cached_metadata (bool, optional): Enables using cached global metadata to avoid
                 gathering local metadata every checkpointing invocation
+            separation_hint(str, optional): If provided, all tensors whose keys have this
+                prefix will be saved to a separate file.
         """
         super().__init__(backend, version)
         self.keep_only_main_replica = keep_only_main_replica
@@ -610,6 +621,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # The knob to enable cached metadata communication in saving
         self.use_cached_ckpt_structure: bool = cached_metadata
 
+        self.separation_hint = separation_hint
+
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
@@ -629,7 +642,9 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
-        writer = FileSystemWriterAsync(checkpoint_dir, thread_count=self.thread_count)
+        writer = FileSystemWriterAsync(
+            checkpoint_dir, separation_hint=self.separation_hint, thread_count=self.thread_count
+        )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
         # Try twice to validate the generated `central_plan` is the same across iterations
@@ -710,6 +725,12 @@ def get_reformulation_metadata(
                 'nd_reformulated_orig_global_shape'
             ]
         except KeyError as e:
+            if len(sh_ten.global_shape) == 1:
+                warnings.warn(
+                    f'Legacy checkpoint format detected for 1-D flattened tensor {sh_ten}. '
+                    'Skip metadata reformulation.'
+                )
+                continue
             raise CheckpointingException(
                 f'Cannot find global shape metadata for N-D flattened tensor {sh_ten} '
                 f'in checkpoint metadata: {ckpt_metadata.mcore_data}'
@@ -735,9 +756,17 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         Returns: loaded state dict
         """
         # Apply N-D tensors resharding
+        reformulation_metadata = get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
         sharded_state_dict, formulation_restore_data = apply_nd_flattened_tensors_reformulation(
-            sharded_state_dict, get_reformulation_metadata(sharded_state_dict, checkpoint_dir)
+            sharded_state_dict, reformulation_metadata
         )
+
+        # Check if there are legacy 1-D flattened tensors in the checkpoint
+        has_legacy_1d_flattened_tensors = False
+        for sh_ten in nested_values(sharded_state_dict):
+            if is_nd_flattened_tensor(sh_ten) and sh_ten.key not in reformulation_metadata:
+                has_legacy_1d_flattened_tensors = True
+                break
 
         flexible_shape_sharded_tensors = [
             sh_ten
@@ -750,7 +779,9 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         (sharded_state_dict, flat_mapping, rename_mapping) = (
             _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
         )
-        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
+        pyt_state_dict = mcore_to_pyt_state_dict(
+            sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
+        )
         # Load PyT Distributed format
         checkpoint.load_state_dict(
             pyt_state_dict,
@@ -825,6 +856,84 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         sharded_metadata.update(self.load_tensors_metadata(checkpoint_dir, metadata))
         return sharded_metadata
 
+    def remove_sharded_tensors(self, checkpoint_dir: str, key_prefix: str):
+        """Removes checkpoint files whose keys have the given prefix.
+
+        Performs the following steps:
+        1. checks whether there are files that start with the key_prefix
+        2. loads metadata
+        3. removes all entries from the metadata that start with the key_prefix
+        4. resaves the new metadata and removes the old metadata
+        5. removes the relevant files
+        """
+
+        assert is_torch_min_version(
+            "2.3.0"
+        ), f'torch >= 2.3.0 is required for remove_sharded_tensors'
+
+        distckpt_files = [f for f in os.listdir(checkpoint_dir) if f.endswith("distcp")]
+        files_to_remove = [f for f in distckpt_files if f.startswith(key_prefix)]
+
+        if not files_to_remove:
+            warnings.warn(
+                f'There are no files in {checkpoint_dir} that begin with "{key_prefix}".'
+                f' Skipping removal.'
+            )
+            return
+
+        fs_reader = FileSystemReader(checkpoint_dir)
+        original_metadata = fs_reader.read_metadata()
+
+        new_state_dict_metadata = {}
+        new_planner_data = {}
+        new_storage_data = {}
+        for k in original_metadata.state_dict_metadata.keys():
+            if k.startswith(key_prefix):
+                continue
+            new_state_dict_metadata[k] = original_metadata.state_dict_metadata[k]
+        for k in original_metadata.planner_data.keys():
+            if k.startswith(key_prefix):
+                continue
+            new_planner_data[k] = original_metadata.planner_data[k]
+        for k in original_metadata.storage_data.keys():
+            if k.fqn.startswith(key_prefix):
+                continue
+            new_storage_data[k] = original_metadata.storage_data[k]
+        metadata = Metadata(
+            state_dict_metadata=new_state_dict_metadata,
+            planner_data=new_planner_data,
+            storage_data=new_storage_data,
+        )
+        fs_writer = FileSystemWriter(checkpoint_dir)
+        metadata_filename = cast(Path, fs_writer.fs.concat_path(fs_writer.path, _metadata_fn))
+        tmp_path = cast(
+            metadata_filename, fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.tmp")
+        )
+        old_path = cast(
+            metadata_filename, fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.bck")
+        )
+        ## save the new metadata
+        with fs_writer.fs.create_stream(tmp_path, "wb") as metadata_file:
+            pickle.dump(metadata, metadata_file)
+            try:
+                os.fsync(metadata_file.fileno())
+            except AttributeError:
+                os.sync()
+        ## move the old metadata
+        fs_writer.fs.rename(fs_writer.metadata_path, old_path)
+        try:
+            ## rename the new metadata
+            fs_writer.fs.rename(tmp_path, fs_writer.metadata_path)
+
+            ## finally, remove the files we want to drop
+            for f in files_to_remove:
+                fs_writer.fs.rm_file(checkpoint_dir / f)
+        except Exception as e:
+            fs_writer.fs.rename(old_path, fs_writer.metadata_path)
+            raise e
+        else:
+            fs_writer.fs.rm_file(old_path)
+
     def can_handle_sharded_objects(self):
         return True
 
@@ -833,3 +942,4 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
     def check_version_compatibility(self, loaded_version):
         pass  # TODO
+

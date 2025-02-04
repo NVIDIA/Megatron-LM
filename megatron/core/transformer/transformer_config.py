@@ -48,6 +48,9 @@ class TransformerConfig(ModelParallelConfig):
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
     num_attention_heads if not provided."""
 
+    crossattn_emb_size: int = None
+    """Cross attention input embedding size"""
+
     hidden_dropout: float = 0.1
     """Dropout probability for transformer hidden state."""
 
@@ -103,6 +106,18 @@ class TransformerConfig(ModelParallelConfig):
     qk_layernorm: bool = False
     """Whether to apply LayerNorm to the query and key embeddings."""
 
+    qk_layernorm_per_head: bool = True
+    """Whether to apply LayerNorm to the query and key embeddings per head."""
+
+    qk_layernorm_separate_weights: bool = False
+    """Whether to initialize separate weights for each attention head in the QK Layernorm."""
+
+    qk_layernorm_self_attn: bool = True
+    """Whether or not to apply QK Layernorm to self attention."""
+
+    qk_layernorm_cross_attn: bool = True
+    """Whether or not to apply QK Layernorm to cross attention."""
+
     test_mode: bool = False
     """Whether to run real-time tests."""
 
@@ -110,8 +125,14 @@ class TransformerConfig(ModelParallelConfig):
     """Whether cross entropy loss is calculated over the actual number of non-padded tokens in the
     global batch, versus the default behavior of assuming all tokens are non-padded."""
 
+    use_kendall_loss: bool = False
+    """Whether to use kendall loss in video diffusion model training."""
+
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
+
+    average_wgrad_by_dgrad_scale: bool = False
+    """Whether to average weight gradients by the scale of data gradients."""
 
     ####################
     # initialization
@@ -385,9 +406,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
-            if self.moe_router_load_balancing_type not in ["aux_loss", "none"]:
+            if self.moe_router_load_balancing_type not in ["aux_loss", "expert_choice", "none"]:
                 raise ValueError(
-                    'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                    f'moe_expert_capacity_factor only works with aux_loss, expert_choice or none load balancing'
                 )
 
         if self.moe_pad_expert_input_to_capacity:

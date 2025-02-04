@@ -137,7 +137,8 @@ class MLP(MegatronModule):
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
             if self.config.gated_linear_unit and name == 'linear_fc1':
-                assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
+                # NOTE: In FSDP, we can have no weight in local.
+                # assert f'{prefix}{name}.weight' in sub_sd, (sub_sd.keys(), f'{prefix}{name}.weight')
                 for k, v in sub_sd.items():
                     if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
@@ -252,4 +253,5 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
         sh_ten_build_fn,
         sh_ten_merge_fn,
         original_sh_ten.replica_id,
+        flattened_range=original_sh_ten.flattened_range,
     )

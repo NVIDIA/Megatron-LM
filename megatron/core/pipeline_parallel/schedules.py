@@ -290,6 +290,8 @@ def forward_step(
                 assert len(outputs) == 2
                 output_tensor, loss_reduced = outputs
                 output_tensor /= num_microbatches
+            if config.average_wgrad_by_dgrad_scale:
+                output_tensor /= parallel_state.get_data_parallel_world_size(with_context_parallel=True)
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)

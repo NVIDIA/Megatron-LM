@@ -9,6 +9,44 @@ from .. import parallel_state
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
 
+def _allreduce_timestep_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    All-reduce timestep embedding grads.
+
+    Reduce grads across all the pp stages to ensure that timestep embedding parameters stay in
+    sync. This should only run for diffusion models that support pipelined model parallelism .
+    """
+    if (
+        parallel_state.get_pipeline_model_parallel_world_size() > 1
+        and hasattr(config, "replicated_t_embedder")
+        and config.replicated_t_embedder
+    ):
+        grads_dict = {}
+        for model_chunk in model:
+            for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+                if param.requires_grad and getattr(param, 'pipeline_parallel', False):
+                    grad = param.main_grad
+                    if name in grads_dict:
+                        # add all the vpp's grad to the first vpp rank locally
+                        grads_dict[name][0].add_(grad)
+                        grads_dict[name].append(grad)
+                    else:
+                        grads_dict[name] = [grad]
+        if grads_dict:
+            # all reduce the grad on the first vpp rank
+            grads = [i[0] for _, i in grads_dict.items()]
+            coalesced = _flatten_dense_tensors(grads)
+            torch.distributed.all_reduce(
+                coalesced, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+                buf.copy_(synced)
+
+            for grads in grads_dict.values():
+                for grad in grads[1:]:
+                    # copy the grad across vpp ranks
+                    grad.copy_(grads[0])
+
 
 def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
@@ -29,10 +67,14 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         if model_module.share_embeddings_and_output_weights:
             weight = model_module.shared_embedding_or_output_weight()
-            grad = weight.main_grad
+            if ddp_config.with_megatron_fsdp_code_path:
+                grad = weight.fsdp_managed_main_grad
+            else:
+                grad = weight.main_grad
             torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
 
 
@@ -52,9 +94,13 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         assert hasattr(model_module, 'position_embeddings')
-        grad = model_module.position_embeddings.weight.main_grad
+        if ddp_config.with_megatron_fsdp_code_path:
+            grad = model_module.position_embeddings.weight.fsdp_managed_main_grad
+        else:
+            grad = model_module.position_embeddings.weight.main_grad
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
 
 
@@ -77,6 +123,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         config.sequence_parallel or config.qk_layernorm
     ):
         grads = []
+        ddp_config = model[0].ddp_config
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
                 if (
@@ -85,7 +132,10 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                     or 'q_layernorm' in name
                     or 'k_layernorm' in name
                 ):
-                    grad = param.main_grad
+                    if ddp_config.with_megatron_fsdp_code_path:
+                        grad = param.fsdp_managed_main_grad
+                    else:
+                        grad = param.main_grad
                     grads.append(grad.data)
         if grads:
             coalesced = _flatten_dense_tensors(grads)
@@ -112,6 +162,15 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         model_chunk.finish_grad_sync()
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
+
+    # All-reduce t_embedder grads (for pp & vpp of DiT).
+    if config.timers is not None:
+        config.timers('t_embedder-grads-all-reduce', log_level=1).start(
+            barrier=config.barrier_with_L1_time
+        )
+    _allreduce_timestep_embedding_grads(model, config)
+    if config.timers is not None:
+        config.timers('t_embedder-grads-all-reduce').stop()
 
     # All-reduce layer-norm grads (for sequence parallelism).
     if config.timers is not None:

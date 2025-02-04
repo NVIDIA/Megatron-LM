@@ -42,3 +42,10 @@ class DistributedDataParallelConfig:
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
+
+    with_megatron_fsdp_code_path: bool = False
+    """If true, use the FSDP code path for DDP."""
+
+    data_parallel_sharding_strategy: str = 'NO_OP'
+    """Sharding strategy for FSDP. Valid values are 'NO_OP', 'OPTIMIZER_STATES',
+        'OPTIMIZER_STATES_AND_GRADS', 'MODEL_AND_OPTIMIZER_STATES'."""

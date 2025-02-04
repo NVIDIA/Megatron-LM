@@ -582,11 +582,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         if is_te_min_version("1.0.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
-            extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
-            extra_kwargs["cp_global_ranks"] = get_context_parallel_global_ranks(
-                check_initialized=False
-            )
-            extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
+            # local attention set for context_parallel_size = 1
+            if self.config.context_parallel_size == 1:
+                extra_kwargs["cp_group"] = None
+                extra_kwargs["cp_global_ranks"] = None
+                extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
+            else:
+                extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
+                extra_kwargs["cp_global_ranks"] = get_context_parallel_global_ranks(
+                    check_initialized=False
+                )
+                extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
         else:
             assert (
                 self.config.context_parallel_size == 1

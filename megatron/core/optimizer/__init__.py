@@ -81,7 +81,12 @@ def _get_param_groups(
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
     for model_chunk in model_chunks:
-        for name, param in model_chunk.named_parameters():
+        if model_chunk.ddp_config.with_megatron_fsdp_code_path:
+            named_parameters = model_chunk.optimizer_named_parameters()
+        else:
+            named_parameters = model_chunk.named_parameters()
+
+        for name, param in named_parameters:
             if not param.requires_grad:
                 continue
 
@@ -375,69 +380,100 @@ def get_megatron_optimizer(
 
     optimizers = []
     model_chunk_offset = 0
-    for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
-        all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
-    ):
-        param_groups, buffers = _get_param_groups_and_buffers(
-            dense_model_chunks,
-            model_chunk_offset=model_chunk_offset,
+    ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
+    if ddp_config.with_megatron_fsdp_code_path:
+        for model_chunk, overlap_param_gather_with_optimizer_step in zip(
+            all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
+        ):
+            param_groups, buffers = _get_param_groups_and_buffers(
+                model_chunk,
+                model_chunk_offset=model_chunk_offset,
+                config=config,
+                no_weight_decay_cond=no_weight_decay_cond,
+                scale_lr_cond=scale_lr_cond,
+                lr_mult=lr_mult,
+                filter_fn=lambda g: True,
+                buffer_name='buffers',
+            )
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config,
+                    model_chunks=model_chunk,
+                    param_groups=param_groups,
+                    per_model_buffers=buffers,
+                    model_parallel_group=mpu.get_model_parallel_group(),
+                    data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
+                        with_context_parallel=True
+                    ),
+                    data_parallel_group_idx=model_parallel_rank,
+                )
+            )
+            model_chunk_offset += 1
+    else:
+        for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
+            all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
+        ):
+            param_groups, buffers = _get_param_groups_and_buffers(
+                dense_model_chunks,
+                model_chunk_offset=model_chunk_offset,
+                config=config,
+                no_weight_decay_cond=no_weight_decay_cond,
+                scale_lr_cond=scale_lr_cond,
+                lr_mult=lr_mult,
+                filter_fn=lambda g: not g['is_expert_parallel'],
+                buffer_name='buffers',
+            )
+            for model_chunk in dense_model_chunks:
+                model_chunk.overlap_param_gather_with_optimizer_step = (
+                    overlap_param_gather_with_optimizer_step
+                )
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config,
+                    model_chunks=dense_model_chunks,
+                    param_groups=param_groups,
+                    per_model_buffers=buffers,
+                    model_parallel_group=mpu.get_model_parallel_group(),
+                    data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
+                        with_context_parallel=True
+                    ),
+                    data_parallel_group_idx=model_parallel_rank,
+                )
+            )
+            model_chunk_offset += 1
+
+        moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
+            model_chunks,
+            model_chunk_offset=0,
             config=config,
             no_weight_decay_cond=no_weight_decay_cond,
             scale_lr_cond=scale_lr_cond,
             lr_mult=lr_mult,
-            filter_fn=lambda g: not g['is_expert_parallel'],
-            buffer_name='buffers',
+            filter_fn=lambda g: g['is_expert_parallel'],
+            buffer_name='expert_parallel_buffers',
         )
-        for model_chunk in dense_model_chunks:
-            model_chunk.overlap_param_gather_with_optimizer_step = (
-                overlap_param_gather_with_optimizer_step
+        if len(moe_param_groups) > 0:
+            model_parallel_world_size = torch.distributed.get_world_size(mpu.get_model_parallel_group())
+            expert_parallel_rank = mpu.get_expert_model_parallel_rank()
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config,
+                    model_chunks=model_chunks,
+                    param_groups=moe_param_groups,
+                    per_model_buffers=moe_buffers,
+                    model_parallel_group=mpu.get_model_parallel_group(with_expert_parallel=True),
+                    data_parallel_group=mpu.get_data_modulo_expert_parallel_group(
+                        with_context_parallel=True
+                    ),
+                    data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(
+                        with_context_parallel=True
+                    ),
+                    data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size
+                    + model_parallel_rank,
+                )
             )
-        optimizers.append(
-            _get_megatron_optimizer_based_on_param_groups(
-                config,
-                model_chunks=dense_model_chunks,
-                param_groups=param_groups,
-                per_model_buffers=buffers,
-                model_parallel_group=mpu.get_model_parallel_group(),
-                data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
-                data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
-                    with_context_parallel=True
-                ),
-                data_parallel_group_idx=model_parallel_rank,
-            )
-        )
-        model_chunk_offset += 1
-
-    moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
-        model_chunks,
-        model_chunk_offset=0,
-        config=config,
-        no_weight_decay_cond=no_weight_decay_cond,
-        scale_lr_cond=scale_lr_cond,
-        lr_mult=lr_mult,
-        filter_fn=lambda g: g['is_expert_parallel'],
-        buffer_name='expert_parallel_buffers',
-    )
-    if len(moe_param_groups) > 0:
-        model_parallel_world_size = torch.distributed.get_world_size(mpu.get_model_parallel_group())
-        expert_parallel_rank = mpu.get_expert_model_parallel_rank()
-        optimizers.append(
-            _get_megatron_optimizer_based_on_param_groups(
-                config,
-                model_chunks=model_chunks,
-                param_groups=moe_param_groups,
-                per_model_buffers=moe_buffers,
-                model_parallel_group=mpu.get_model_parallel_group(with_expert_parallel=True),
-                data_parallel_group=mpu.get_data_modulo_expert_parallel_group(
-                    with_context_parallel=True
-                ),
-                data_parallel_group_gloo=mpu.get_data_modulo_expert_parallel_group_gloo(
-                    with_context_parallel=True
-                ),
-                data_parallel_group_idx=expert_parallel_rank * model_parallel_world_size
-                + model_parallel_rank,
-            )
-        )
 
     if len(optimizers) == 1:
         return optimizers[0]

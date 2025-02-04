@@ -22,13 +22,42 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 import torch
 from packaging.version import Version as PkgVersion
 
+try:
+    from torch.distributed._tensor import DTensor
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
+
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 logger = logging.getLogger(__name__)
 
 
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0")
 _te_version = None
+
+
+def get_torch_version():
+    """Get pytorch version from __version__; if not available use pip's. Use caching."""
+
+    def get_torch_version_str():
+        import torch
+
+        if hasattr(torch, '__version__'):
+            return str(torch.__version__)
+        else:
+            return version("torch")
+
+    global _torch_version
+    if _torch_version is None:
+        _torch_version = PkgVersion(get_torch_version_str())
+    return _torch_version
 
 
 def get_te_version():
@@ -53,6 +82,20 @@ def is_te_min_version(version, check_equality=True):
     if check_equality:
         return get_te_version() >= PkgVersion(version)
     return get_te_version() > PkgVersion(version)
+
+
+def get_torch_version():
+    """Get torch version from __version__."""
+
+    global _torch_version
+    return _torch_version
+
+
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if check_equality:
+        return get_torch_version() >= PkgVersion(version)
+    return get_torch_version() > PkgVersion(version)
 
 
 def ensure_divisibility(numerator, denominator):
@@ -204,8 +247,8 @@ def assert_viewless_tensor(tensor, extra_msg=None):
     assert tensor._base is None, (
         "Ensure tensor._base is None before setting tensor.data or storing "
         "tensor to memory buffer. Otherwise, a memory leak will occur (and "
-        "likely accumulate over iterations). %s"
-    ) % extra_msg
+        f"likely accumulate over iterations). {extra_msg}"
+    )
     return tensor
 
 
@@ -301,8 +344,10 @@ def check_param_hashes_across_dp_replicas(
     """
 
     # Compute per-parameter hashes on this rank.
-    params = []
-    local_param_hashes = []
+    # Keep track of expert and non-expert parameters separately since they need to be
+    # all-gathered across different sets of ranks.
+    non_expert_params, expert_params = [], []
+    local_non_expert_param_hashes, local_expert_param_hashes = [], []
     for model_chunk_id, model_chunk in enumerate(model):
         for param_name, param in model_chunk.named_parameters():
             param_hash = torch.frombuffer(
@@ -311,34 +356,54 @@ def check_param_hashes_across_dp_replicas(
                 ),
                 dtype=torch.uint8,
             )
-            params.append((model_chunk_id, param_name, param))
-            local_param_hashes.append(param_hash)
-    local_param_hashes = torch.stack(local_param_hashes)
+            if getattr(param, 'allreduce', True):
+                non_expert_params.append((model_chunk_id, param_name, param))
+                local_non_expert_param_hashes.append(param_hash)
+            else:
+                expert_params.append((model_chunk_id, param_name, param))
+                local_expert_param_hashes.append(param_hash)
 
-    # Collect per-parameter hashes across all ranks in DP group.
-    all_param_hashes = [
-        torch.zeros_like(local_param_hashes)
-        for _ in range(parallel_state.get_data_parallel_world_size())
-    ]
-    torch.distributed.all_gather(
-        all_param_hashes, local_param_hashes, group=parallel_state.get_data_parallel_group_gloo()
-    )
+    # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
+    # data-parallel group for non-expert param hashes.
+    all_param_hashes_match = True
+    for params, local_param_hashes, all_gather_group in zip(
+        [non_expert_params, expert_params],
+        [local_non_expert_param_hashes, local_expert_param_hashes],
+        [
+            parallel_state.get_data_parallel_group_gloo(),
+            parallel_state.get_expert_data_parallel_group_gloo(),
+        ],
+    ):
+        # Collect per-parameter hashes across all ranks in group.
+        assert len(params) == len(local_param_hashes)
+        if len(params) == 0:
+            continue
+        local_param_hashes = torch.stack(local_param_hashes)
+        all_param_hashes = [
+            torch.zeros_like(local_param_hashes)
+            for _ in range(torch.distributed.get_world_size(all_gather_group))
+        ]
+        torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
 
-    # Make sure local per-parameter hash matches DP rank 0.
-    param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
-    if not param_hashes_match:
-        for i, (model_chunk_id, param_name, param) in enumerate(params):
-            if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
-                rank = torch.distributed.get_rank()
-                logger.info(
-                    f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
-                    f"{model_chunk_id}"
-                )
-    if cross_check:
-        # Make sure all ranks have the same hash.
-        return all(map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes))
-    else:
-        return param_hashes_match
+        # Make sure local per-parameter hash matches DP rank 0.
+        param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
+        if not param_hashes_match:
+            for i, (model_chunk_id, param_name, param) in enumerate(params):
+                if not torch.equal(local_param_hashes[i], all_param_hashes[0][i]):
+                    rank = torch.distributed.get_rank()
+                    logger.info(
+                        f"[Rank {rank}] Hash not matching for {param_name} in model chunk"
+                        f"{model_chunk_id}"
+                    )
+        if cross_check:
+            # Make sure all ranks have the same hash.
+            all_param_hashes_match &= all(
+                map(lambda x: torch.equal(local_param_hashes, x), all_param_hashes)
+            )
+        else:
+            all_param_hashes_match &= param_hashes_match
+
+    return all_param_hashes_match
 
 
 def make_tp_sharded_tensor_for_checkpoint(
@@ -349,21 +414,39 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
     """
-
     prepend_axis_num = len(prepend_offsets)
 
+    new_offsets = []
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    tp_size = parallel_state.get_tensor_model_parallel_world_size()
+    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    new_offsets.append((tp_axis + prepend_axis_num, tp_rank, tp_size))
+
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        # TP + FSDP2 sharding
+        dp_replica_id = 0
+        tensor = tensor._local_tensor
+
+        if tp_axis == 0:
+            # both FSDP2 and TP shards axis 0
+            # default MCore uses tp-cp-ep-dp-pp
+            # FSDP2 is compatibile with TP, CP
+            new_offsets[0] = (prepend_axis_num, tp_rank * dp_size + dp_rank, tp_size * dp_size)
+        else:
+            # FSDP2 shards axis 0 and TP shards some other axis
+            new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
     if replica_id is None:
-        replica_id = (0, 0, parallel_state.get_data_parallel_rank(with_context_parallel=True))
+        replica_id = (0, 0, dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
-        (
-            tp_axis + prepend_axis_num,
-            parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_tensor_model_parallel_world_size(),
-        ),
+        *new_offsets,
         replica_id=replica_id,
         prepend_axis_num=prepend_axis_num,
         **kwargs,
@@ -378,21 +461,46 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     prepend_axis_num = len(prepend_offsets)
 
+    new_offsets = []
+    dp_rank = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+    dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+    dp_replica_id = parallel_state.get_data_parallel_rank(with_context_parallel=True)
+
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        # FSDP2 sharding
+        dp_replica_id = 0
+        tensor = tensor._local_tensor
+        new_offsets.append((prepend_axis_num, dp_rank, dp_size))
+
     if replica_id is None:
-        replica_id = (
-            0,
-            parallel_state.get_tensor_model_parallel_rank(),
-            parallel_state.get_data_parallel_rank(with_context_parallel=True),
-        )
+        replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
 
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
         *prepend_offsets,
+        *new_offsets,
         replica_id=replica_id,
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+
+
+def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
+    """Returns the local shard of the given tensor if it is a DTensor."""
+    with torch.no_grad():
+        return tensor.to_local() if HAVE_DTENSOR and isinstance(tensor, DTensor) else tensor
+
+
+def get_data_parallel_group_if_dtensor(
+    tensor: Union[torch.Tensor, "DTensor"], data_parallel_group: "ProcessGroup" = None
+) -> Optional["ProcessGroup"]:
+    """Gets the data parallel group of the given tensor if it is a DTensor."""
+    if HAVE_DTENSOR and isinstance(tensor, DTensor):
+        current_group = tensor.device_mesh.get_group()
+        assert data_parallel_group is None or current_group == data_parallel_group
+        return current_group
+    return None
 
 
 def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
@@ -412,6 +520,12 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
         )
 
     return grad_output, all_gathered_input
+
+
+if is_torch_min_version("1.13.0"):
+    dist_all_gather_func = torch.distributed.all_gather_into_tensor
+else:
+    dist_all_gather_func = torch.distributed._all_gather_base
 
 
 def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
@@ -442,7 +556,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     all_gathered_input = [None, None]
     if config.sequence_parallel:
         all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = torch.distributed._all_gather_base(
+        handle = dist_all_gather_func(
             all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
         )
 
@@ -480,7 +594,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = torch.distributed._all_gather_base(
+            handle = dist_all_gather_func(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
             )
 
@@ -523,14 +637,8 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
 # works as a drop-in replacement for amp_C.multi_tensor_scale
 def local_multi_tensor_scale(chunk_size, noop_flag, tensor_lists, scale):
     """Works as a drop-in replacement for amp_C.multi_tensor_scale."""
-    inputs, targets = tensor_lists[0], tensor_lists[1]
-    if inputs == targets:
-        for i in range(len(targets)):
-            # for parity with apex implementation
-            targets[i] *= scale
-    else:
-        for i in range(len(targets)):
-            targets[i] = inputs[i] * scale
+    for src, dst in zip(tensor_lists[0], tensor_lists[1]):
+        dst.copy_(src * scale)
 
 
 class _ValueWithRank:
@@ -752,7 +860,7 @@ class StragglerDetector:
             amp (float, optional): Set to 3.0 if we only use timers in fwd pass.
                                    Defaults to 3.0.
             port (int, optional): Control port, useful only for rank-0. Defaults to 65535.
-            prefill (int, optional): Howmany Events to pre-populate. Defaults to 1024.
+            prefill (int, optional): How many Events to pre-populate. Defaults to 1024.
             enabled (bool, optional): Whether or not collection is enabled on startup.
                                       Defaults to False.
         """
@@ -1003,7 +1111,7 @@ class StragglerDetector:
         indirectly from report() is the only way to activate the change that is made
         via rank-0
         """
-        # If no change just commnunicate the current
+        # If no change just communicate the current
         off = self._off
         if self.rank == 0 and self.toggle:
             off = not self._off
@@ -1038,7 +1146,7 @@ class StragglerDetector:
         if self.rank == 0:
             state = "OFF" if self._off else "ON"
             logger.info(
-                f"Controller ready to recv " f"commands on port {self.port}. Current state {state}"
+                f"Controller ready to recv commands on port {self.port}. Current state {state}"
             )
             while True and self.sock is not None:
                 try:
@@ -1209,7 +1317,7 @@ class StragglerDetector:
 
     @property
     def configured(self) -> bool:
-        """Can be called to check if the the instance is already configured
+        """Can be called to check if the instance is already configured
 
         Returns:
             bool: returns True if configure was called and was a success, else False
@@ -1305,3 +1413,42 @@ except (ImportError, ModuleNotFoundError):
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor"""
     return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
+
+
+########################
+### context parallel ###
+########################
+
+
+def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+    """Slice batch input along sequence dimension into multiple chunks,
+    which are parallelized across GPUs in a context parallel group.
+    """
+
+    # With causal masking, each token only attends to its prior tokens. Simply split
+    # sequence into CP chunks can result in severe load imbalance. That's to say, chunks
+    # at the end of sequence have bigger workload than others. To address this issue,
+    # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
+    # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
+    # that we can get balanced workload among GPUs in a context parallel group.
+    cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_size > 1:
+        cp_rank = parallel_state.get_context_parallel_rank()
+        for key, val in batch.items():
+            if val is not None:
+                seq_dim = 1 if key != 'attention_mask' else 2
+                val = val.view(
+                    *val.shape[0:seq_dim],
+                    2 * cp_size,
+                    val.shape[seq_dim] // (2 * cp_size),
+                    *val.shape[(seq_dim + 1) :],
+                )
+                index = torch.tensor(
+                    [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
+                ).cuda(non_blocking=True)
+                val = val.index_select(seq_dim, index)
+                val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
+                batch[key] = val
+
+    return batch
+

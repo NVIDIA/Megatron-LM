@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, Iterator, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict, ShardedTensor
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
@@ -105,6 +105,9 @@ def make_sharded_tensors_for_checkpoint(
                 tensor, layer_key, prepend_offsets=sharded_offsets
             )
 
+        if sharded_state_dict[layer_key] is None:
+            del sharded_state_dict[layer_key]
+
     return sharded_state_dict
 
 
@@ -125,6 +128,9 @@ def make_sharded_object_for_checkpoint(
             ShardedObject
         replica_id (Union[None, int, Tuple[int, ...]]): replica id
     """
+    is_obj_fully_sharded = hasattr(obj, 'fully_shard_param_local_index')
+    assert not is_obj_fully_sharded, f"Fully sharded object not supported: {key}"
+
     if replica_id is None:
         replica_id = (
             0,

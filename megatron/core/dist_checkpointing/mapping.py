@@ -134,7 +134,7 @@ class ShardedTensor(ShardedBase):
             )
 
         for off, sh in zip(self.global_offset[self.prepend_axis_num :], self.local_shape):
-            if off % sh != 0:
+            if sh != 0 and off % sh != 0:
                 raise CheckpointingException(
                     f'Global offset ({off}) must be divisible by local shape ({sh}) for {self}.'
                 )

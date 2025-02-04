@@ -43,6 +43,7 @@ from .optimizer import (
     _zero_grad_group_helper,
 )
 from .optimizer_config import OptimizerConfig
+from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 
 try:
     # This will be used when "--fp8-param-gather" is enabled.
@@ -491,52 +492,53 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 self.gbuf_idx_to_model_idx_map[gbuf_idx] = model_idx
                 gbuf_idx += 1
 
-        self.per_model_bucket_groups = {}
-        for model_idx, buffers in self.per_model_buffers.items():
-            self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
+        if not self.ddp_config.with_megatron_fsdp_code_path:
+            self.per_model_bucket_groups = {}
+            for model_idx, buffers in self.per_model_buffers.items():
+                self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
 
-        self.gbuf_ranges = []
-        self.per_bucket_numel = []
-        self.per_bucket_numel_unpadded = []
-        for buffer in self.buffers:
+            self.gbuf_ranges = []
+            self.per_bucket_numel = []
+            self.per_bucket_numel_unpadded = []
+            for buffer in self.buffers:
 
-            self.per_bucket_numel.append(
-                {
-                    (buffer.param_dtype, buffer.grad_dtype): [
-                        bucket.grad_data.numel() for bucket in buffer.buckets
-                    ]
-                }
+                self.per_bucket_numel.append(
+                    {
+                        (buffer.param_dtype, buffer.grad_dtype): [
+                            bucket.grad_data.numel() for bucket in buffer.buckets
+                        ]
+                    }
+                )
+                self.per_bucket_numel_unpadded.append(
+                    {
+                        (buffer.param_dtype, buffer.grad_dtype): [
+                            bucket.numel_unpadded for bucket in buffer.buckets
+                        ]
+                    }
+                )
+                self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
+            self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
+
+            # Optimizer ranges.
+            (self.model_param_group_index_map, self.opt_group_ranges) = (
+                self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
             )
-            self.per_bucket_numel_unpadded.append(
-                {
-                    (buffer.param_dtype, buffer.grad_dtype): [
-                        bucket.numel_unpadded for bucket in buffer.buckets
-                    ]
-                }
+
+            # Allocate main param shards.
+            (
+                self.model_float16_groups,
+                self.model_fp32_groups,
+                self.shard_float16_groups,
+                self.shard_fp32_groups,
+                self.shard_fp32_from_float16_groups,
+            ) = self._build_model_and_main_param_groups(
+                self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
             )
-            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
-        self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
-        # Optimizer ranges.
-        (self.model_param_group_index_map, self.opt_group_ranges) = (
-            self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
-        )
-
-        # Allocate main param shards.
-        (
-            self.model_float16_groups,
-            self.model_fp32_groups,
-            self.shard_float16_groups,
-            self.shard_fp32_groups,
-            self.shard_fp32_from_float16_groups,
-        ) = self._build_model_and_main_param_groups(
-            self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges
-        )
-
-        # Update optimizer groups.
-        # - Also, leverage state_dict() and load_state_dict() to
-        #   recast preexisting per-param state tensors.
-        self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+            # Update optimizer groups.
+            # - Also, leverage state_dict() and load_state_dict() to
+            #   recast preexisting per-param state tensors.
+            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
         self.optimizer.load_state_dict(self.optimizer.state_dict())
 
     def enable_pre_hook(self):
@@ -652,7 +654,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ]
 
         # Allocate or retrieve optimizer state (i.e., tensors).
-        if len(self.optimizer.state) == 0:
+        if len(self.optimizer.state) == 0 and not self.ddp_config.with_megatron_fsdp_code_path:
             # Allocate empty optimizer state if not previously initialized.
             # - If len(self.optimizer.state) == 0, this means that the optimizer
             #   state has not been previously initialized. Once it has been
@@ -726,6 +728,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
             param_state = state_dict['param_state']
             sharding_type = state_dict['param_state_sharding_type']
+            if self.ddp_config.with_megatron_fsdp_code_path:
+                assert sharding_type == "fully_sharded_model_space", "Only fully sharded model space is supported"
             logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
             if sharding_type == 'dp_zero_gather_scatter':
                 self.load_parameter_state_from_dp_zero(param_state)
@@ -919,6 +923,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 ' Please switch to `full_sharded_model_space`.'
             )
 
+        if self.ddp_config.with_megatron_fsdp_code_path:
+            assert sharding_type == 'fully_sharded_model_space', (
+                f'For FSDP, only `fully_sharded_model_space` is supported. '
+                f'Got: {sharding_type}'
+            )
+
         state_dict = self.state_dict()
         if sharding_type != 'fully_sharded_model_space':
             # State dict differs between different model parallel groups
@@ -938,7 +948,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # which conditionally skips re-allocating the optimizer's state if
             # already initialized, which in turn reduces memory fragmentation.
             self.load_state_dict(self.state_dict())
-
         if sharding_type == 'fully_sharded_bucket_space':
             param_state = self.sharded_param_state_fs_bucket_space(
                 model_sharded_state_dict, is_loading
@@ -1123,49 +1132,83 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
-        param_idx = 0
-        for gbuf_range_maps in self.gbuf_ranges:
-            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
-                for gbuf_range_map in gbuf_range_map_for_all_buckets:
-                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
-                        group_index, group_order = self.model_param_group_index_map[model_param]
-                        param_range = param_range_map['param']
+        def _get_param_state_sharded_tensors(model_param, main_param, item_slice):
+            optim_state = self.optimizer.state[main_param]
+            if self.ddp_config.with_megatron_fsdp_code_path and is_loading:
+                # Pre-populate optimizer state for dist-ckpt loading.
+                assert isinstance(self.optimizer, Adam)
+                optim_state['exp_avg'] = torch.empty_like(main_param)
+                optim_state['exp_avg_sq'] = torch.empty_like(main_param)
 
-                        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
-                        optim_state = self.optimizer.state[main_param]
+            tensors = {"fp32_param": main_param, **optim_state}
+            # Match optimizer parameter with model ShardedTensor (or
+            # ShardedTensorFactory).
+            try:
+                sharded_metadata = param_to_sharded_metadata[model_param]
+            except KeyError as e:
+                raise ValueError(
+                    f'Model param {model_param} not in model_sharded_state_dict'
+                ) from e
 
-                        tensors = {"fp32_param": main_param, **optim_state}
-                        # Match optimizer parameter with model ShardedTensor (or
-                        # ShardedTensorFactory).
-                        try:
-                            sharded_metadata = param_to_sharded_metadata[model_param]
-                        except KeyError as e:
-                            raise ValueError(
-                                f'Model param {model_param} not in model_sharded_state_dict'
-                            ) from e
+            # Set DP corresponding replica_id coordinate to 0.
+            assert (
+                len(sharded_metadata.replica_id) == 3
+            ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
+            replica_id = (*sharded_metadata.replica_id[:2], 0)
 
-                        # Set DP corresponding replica_id coordinate to 0.
-                        assert (
-                            len(sharded_metadata.replica_id) == 3
-                        ), f'Expected replica_id format (PP, TP, DP), got: {sharded_metadata}'
-                        replica_id = (*sharded_metadata.replica_id[:2], 0)
+            # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
+            # params.
+            for state_key, state_ten in tensors.items():
+                replace_kwargs = dict(
+                    key=f'{prefix}.{state_key}.{sharded_metadata.key}',
+                    data=state_ten,
+                    dtype=state_ten.dtype,
+                    flattened_range=slice(*item_slice),
+                    replica_id=replica_id,
+                )
+                if isinstance(sharded_metadata, ShardedTensorFactory):
+                    replace_kwargs.pop('dtype')
+                tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
+                tensors[state_key].validate_metadata_integrity()
+            return tensors
 
-                        # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
-                        # params.
-                        for state_key, state_ten in tensors.items():
-                            replace_kwargs = dict(
-                                key=f'{prefix}.{state_key}.{sharded_metadata.key}',
-                                data=state_ten,
-                                dtype=state_ten.dtype,
-                                flattened_range=slice(param_range.start, param_range.end),
-                                replica_id=replica_id,
+        if self.ddp_config.with_megatron_fsdp_code_path:
+            for pg_buffer in self.buffers:
+                for pg in pg_buffer.parameter_groups:
+                    gbuf = pg.main_grad_buffer
+                    wbuf = pg.model_weight_buffer
+                    for model_param in gbuf.params:
+                        item_id = gbuf.param_idx[model_param]
+                        param_name = pg_buffer.param_to_name[model_param]
+                        main_param = dict(pg_buffer.optimizer_named_parameters)[param_name]
+
+                        item_slice = gbuf._get_item_slice_in_shard(item_id)
+                        if item_slice[0] == item_slice[1]:
+                            # This param is not in this shard.
+                            continue
+
+                        if wbuf.is_data_distributed:
+                            state[param_name] = _get_param_state_sharded_tensors(
+                                model_param.fully_shard_param_local_shard, main_param, item_slice
                             )
-                            if isinstance(sharded_metadata, ShardedTensorFactory):
-                                replace_kwargs.pop('dtype')
-                            tensors[state_key] = replace(sharded_metadata, **replace_kwargs)
-                            tensors[state_key].validate_metadata_integrity()
-                        state[param_idx] = tensors
-                        param_idx += 1
+                        else:
+                            state[param_name] = _get_param_state_sharded_tensors(
+                                model_param, main_param, item_slice)
+        else:
+            param_idx = 0
+            for gbuf_range_maps in self.gbuf_ranges:
+                for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                    for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                        for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                            group_index, group_order = self.model_param_group_index_map[model_param]
+                            param_range = param_range_map['param']
+                            item_slice = (param_range.start, param_range.end)
+
+                            main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+
+                            state[param_idx] = _get_param_state_sharded_tensors(
+                                model_param, main_param, item_slice)
+                            param_idx += 1
         return state
 
     def load_parameter_state_from_fs_bucket_space(self, state_dict):
@@ -1219,21 +1262,37 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Inverse of the `sharded_param_state_fs_model_space` method.
         """
-        param_idx = 0  # matching order with `sharded_param_state_fs_model_space`
-        for gbuf_range_maps in self.gbuf_ranges:
-            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
-                for gbuf_range_map in gbuf_range_map_for_all_buckets:
-                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
-                        group_index, group_order = self.model_param_group_index_map[model_param]
-                        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
-                        optim_state = self.optimizer.state[main_param]
+        if self.ddp_config.with_megatron_fsdp_code_path:
+            for pg_buffer in self.buffers:
+                for model_param in pg_buffer.params:
+                    param_name = pg_buffer.param_to_name[model_param]
+                    main_param = dict(pg_buffer.optimizer_named_parameters)[param_name]
+                    optim_state = self.optimizer.state[main_param]
 
-                        src_tensors = state_dict[param_idx]
-                        dst_tensors = {"fp32_param": main_param, **optim_state}
-                        for key in dst_tensors:
-                            dst_tensors[key].copy_(src_tensors[key])
+                    if param_name not in state_dict:
+                        continue
 
-                        param_idx += 1
+                    src_tensors = state_dict[param_name]
+                    main_param.copy_(src_tensors["fp32_param"])
+                    for key in src_tensors:
+                        if key != "fp32_param":
+                            optim_state[key] = src_tensors[key]
+        else:
+            param_idx = 0  # matching order with `sharded_param_state_fs_model_space`
+            for gbuf_range_maps in self.gbuf_ranges:
+                for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                    for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                        for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                            group_index, group_order = self.model_param_group_index_map[model_param]
+                            main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+                            optim_state = self.optimizer.state[main_param]
+
+                            src_tensors = state_dict[param_idx]
+                            dst_tensors = {"fp32_param": main_param, **optim_state}
+                            for key in dst_tensors:
+                                dst_tensors[key].copy_(src_tensors[key])
+
+                            param_idx += 1
 
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):
@@ -1635,6 +1694,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Args:
             set_to_none (bool): if true, set grads to None.
         """
+        if self.ddp_config.with_megatron_fsdp_code_path:
+            for param_and_grad_buffer in self.buffers:
+                param_and_grad_buffer.zero_grad()
+            return
+
         for groups in (
             self.model_float16_groups,
             self.model_fp32_groups,
@@ -1677,6 +1741,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         from the grad buffer to the main shard's grad field.
         """
 
+        if self.ddp_config.with_megatron_fsdp_code_path:
+            # FSDP will handle the grad copy, so we can return early.
+            return
+
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -1702,6 +1770,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer, this method is responsible for copying the updated params
         from the main shards into the correct position in the grad buffer.
         """
+
+        if self.ddp_config.with_megatron_fsdp_code_path:
+            for param_and_grad_buffer in self.buffers:
+                param_and_grad_buffer.update_model_weights()
+            return
 
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
@@ -1754,6 +1827,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         an intermediary.
         """
 
+        if self.ddp_config.with_megatron_fsdp_code_path:
+            for param_and_grad_buffer in self.buffers:
+                param_and_grad_buffer.copy_model_weight_to_master_weight()
+            return
+
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -1780,16 +1858,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         scale_invs = []
         # Iterate over all parameters inside this optimizer to find FP8 parameters.
         for buffer in self.buffers:
-            for bucket in buffer.buckets:
-                for param in bucket.params_list:
-                    if is_float8tensor(param):
-                        fp8_meta = param._fp8_meta['scaling_fwd']
-                        fp8_meta_index = param._fp8_meta_index
-                        amaxes.append(fp8_meta.amax_history[0][fp8_meta_index].view(1))
-                        scales.append(fp8_meta.scale[fp8_meta_index].view(1))
-                        scale_invs.append(param._scale_inv.view(1))
-                        # Reset transpose cache
-                        param._reset_caches()
+            for param in buffer.params:
+                if is_float8tensor(param):
+                    fp8_meta = param._fp8_meta['scaling_fwd']
+                    fp8_meta_index = param._fp8_meta_index
+                    amaxes.append(fp8_meta.amax_history[0][fp8_meta_index].view(1))
+                    scales.append(fp8_meta.scale[fp8_meta_index].view(1))
+                    scale_invs.append(param._scale_inv.view(1))
+                    # Reset transpose cache
+                    param._reset_caches()
 
         # If there is no FP8 parameters, skip all operations.
         if len(scales) > 0:
@@ -1826,13 +1903,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         timers = self.config.timers
         if timers is not None:
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
-        # If not overlapping all-gather for parameters, launch synchronous all-gather
-        # communication calls here. If overlapping all-gather for parameters, the following
-        # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
-        # call and subsequent all-gathers are launched in the forward pre-hook.
-        if not self.ddp_config.overlap_param_gather:
+
+        if self.ddp_config.with_megatron_fsdp_code_path:
             for model_chunk in self.model_chunks:
                 model_chunk.start_param_sync()
+        else:
+            # If not overlapping all-gather for parameters, launch synchronous all-gather
+            # communication calls here. If overlapping all-gather for parameters, the following
+            # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
+            # call and subsequent all-gathers are launched in the forward pre-hook.
+            if not self.ddp_config.overlap_param_gather:
+                for model_chunk in self.model_chunks:
+                    model_chunk.start_param_sync()
         if timers is not None:
             timers('params-all-gather').stop()
 

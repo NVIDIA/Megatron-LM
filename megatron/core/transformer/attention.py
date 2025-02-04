@@ -2,8 +2,15 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Union
-
+import warnings
 import torch
+import torch.nn as nn
+try:
+    from einops import rearrange
+except ImportError:
+    # Handle the import error
+    print("Optional module not available. Skipping...")
+    pass
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
@@ -21,7 +28,7 @@ from megatron.core.utils import divide
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
-
+import copy
 try:
     import transformer_engine  # pylint: disable=unused-import
 
@@ -47,6 +54,22 @@ class CrossAttentionSubmodules:
     linear_kv: Union[ModuleSpec, type] = None
     core_attention: Union[ModuleSpec, type] = None
     linear_proj: Union[ModuleSpec, type] = None
+    q_layernorm: Union[ModuleSpec, type] = None
+    k_layernorm: Union[ModuleSpec, type] = None
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
 
 class Attention(MegatronModule, ABC):
@@ -107,6 +130,17 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
         )
+
+        if self.config.qk_layernorm_per_head:
+            qk_layernorm_size = self.hidden_size_per_attention_head
+        else:
+            # FIXME this breaks TP assumption
+            assert self.config.tensor_model_parallel_size == 1
+            qk_layernorm_size = self.config.hidden_size
+        
+        import transformer_engine as te
+        self.q_layernorm = te.pytorch.RMSNorm(qk_layernorm_size, eps=1e-6)
+        self.k_layernorm = te.pytorch.RMSNorm(qk_layernorm_size, eps=1e-6)
 
     def _checkpointed_attention_forward(
         self,
@@ -228,6 +262,40 @@ class Attention(MegatronModule, ABC):
         is "self-attn" or "cross-attn".
         """
 
+    def apply_qk_layernorm(self, query, key):
+        if self.config.qk_layernorm_per_head:
+            if self.q_layernorm is not None:
+                if self.config.qk_layernorm_separate_weights:
+                    query_output = torch.empty_like(query)
+                    for i in range(query.shape[2]):
+                        query_output[:, :, i, :] = self.q_layernorm[i](query[:, :, i, :]) / self.config.num_attention_heads
+                    query = query_output
+                else:
+                    query = self.q_layernorm(query)
+
+            if self.k_layernorm is not None:
+                if self.config.qk_layernorm_separate_weights:
+                    key_output = torch.empty_like(key)
+                    for i in range(key.shape[2]):
+                        key_output[:, :, i, :] = self.k_layernorm[i](key[:, :, i, :]) / self.config.num_attention_heads
+                    key = key_output
+                else:
+                    key = self.k_layernorm(key)
+        else:
+            if self.q_layernorm is not None:
+                x, y, z, w = query.shape
+                query = rearrange(query, "x y z w -> x y (z w)")
+                query = self.q_layernorm(query)
+                query = rearrange(query, "x y (z w) -> x y z w", z=z, w=w)
+
+            if self.k_layernorm is not None:
+                x, y, z, w = key.shape
+                key = rearrange(key, "x y z w -> x y (z w)")
+                key = self.k_layernorm(key)
+                key = rearrange(key, "x y (z w) -> x y z w", z=z, w=w)
+
+        return query, key
+
     def forward(
         self,
         hidden_states,
@@ -249,7 +317,7 @@ class Attention(MegatronModule, ABC):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
-
+        
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
@@ -257,7 +325,7 @@ class Attention(MegatronModule, ABC):
             inference_params, key, value, rotary_pos_emb
         )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
@@ -268,20 +336,28 @@ class Attention(MegatronModule, ABC):
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None:
-                cu_seqlens_q = packed_seq_params.cu_seqlens_q
-                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
-            else:
-                cu_seqlens_q = cu_seqlens_kv = None
-            query = apply_rotary_pos_emb(
-                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
-            )
-            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
+            # if query.shape == key.shape:
+            from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+            query = apply_rotary_pos_emb(query, q_pos_emb, tensor_format='sbhd', fused=True)
+            key = apply_rotary_pos_emb(key, k_pos_emb, tensor_format='sbhd', fused=True)
+                
+                # if packed_seq_params is not None:
+                #     cu_seqlens_q = packed_seq_params.cu_seqlens_q
+                #     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+
+                # else:
+                #     cu_seqlens_q = cu_seqlens_kv = None
+                # query = apply_rotary_pos_emb(
+                #     query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+                # )
+                # key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
+            
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+
 
         # ==================================
         # core attention computation
@@ -306,7 +382,7 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
             # (t, np, hn) -> (t, b=1, h=np*hn)
             # t is the pack size = sum (sq_i)
@@ -356,26 +432,6 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
         )
-
-        if submodules.q_layernorm is not None:
-            self.q_layernorm = build_module(
-                submodules.q_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
-        else:
-            self.q_layernorm = None
-
-        if submodules.k_layernorm is not None:
-            self.k_layernorm = build_module(
-                submodules.k_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
-        else:
-            self.k_layernorm = None
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -490,7 +546,7 @@ class SelfAttention(Attention):
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
+            query = self.q_layernorm(query.contiguous())
 
         if self.k_layernorm is not None:
             key = self.k_layernorm(key)
@@ -515,6 +571,9 @@ class CrossAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
     ):
+        config = copy.deepcopy(config)
+        config.num_query_groups =  config.num_attention_heads
+
         super().__init__(
             config=config,
             submodules=submodules,
@@ -541,7 +600,7 @@ class CrossAttention(Attention):
 
         self.linear_kv = build_module(
             submodules.linear_kv,
-            self.config.hidden_size,
+            self.config.crossattn_emb_size,
             2 * self.kv_projection_size,
             config=self.config,
             init_method=self.config.init_method,
@@ -578,5 +637,11 @@ class CrossAttention(Attention):
             self.hidden_size_per_attention_head,
         )
         query = query.view(*new_tensor_shape)
+
+        if self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+
+        if self.k_layernorm is not None:
+            key = self.k_layernorm(key)
 
         return query, key, value
