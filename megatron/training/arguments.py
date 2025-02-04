@@ -1114,6 +1114,9 @@ def _add_ft_package_args(parser):
     group.add_argument('--enable-ft-package', action='store_true',
                        help='If set, Fault Tolerance package is enabled. '
                        'Note: This feature is for Nvidia internal use only.')
+    group.add_argument('--calc-ft-timeouts', action='store_true',
+                       help='If set, FT package will try to automatically compute the timeouts. '
+                       'Note: This feature is for Nvidia internal use only.')
     return parser
 
 

@@ -33,6 +33,8 @@ from ..core.dist_checkpointing.serialization import \
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
 from . import wandb_utils
 
+from . import ft_integration
+
 # [ModelOpt]: Import
 try:
     from modelopt.torch.opt.plugins import (
@@ -302,7 +304,7 @@ class CheckpointType(Enum):
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, ft_client=None, preprocess_common_state_dict_fn = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -325,6 +327,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Prepare E2E metrics at start of save checkpoint
     productive_metrics = on_save_checkpoint_start(args.async_save)
+
+    # Monitor for the checkpointing timeout (no-op if FT is not enabled)
+    ft_integration.on_checkpointing_start()
 
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
@@ -417,8 +422,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             rerun_state=rerun_state,
         )
 
-        if args.enable_ft_package and ft_client is not None:
-            state_dict["ft_state"] = ft_client.state_dict()
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -550,6 +553,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
 
+    ft_integration.on_checkpointing_end(is_async_finalization=False)
 
 def cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=False):
     if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
@@ -1061,7 +1065,7 @@ def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
 
 
 def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    ft_client=None, checkpointing_context=None, skip_load_to_model_and_opt=False):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1100,11 +1104,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             rank0=True,
             checkpointing_context=checkpointing_context,
         )
-        if args.enable_ft_package and ft_client is not None and state_dict is not None:
-            if 'ft_state' in state_dict:
-                ft_client.load_state_dict(state_dict['ft_state'])
-            else:
-                print_rank_0("ft_state is not present in state_dict")
+
         is_dist_ckpt = (
             ckpt_type == CheckpointType.LOCAL
             or dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name)
@@ -1192,12 +1192,6 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
         **load_kwargs
     )
-
-    if args.enable_ft_package and ft_client is not None and state_dict is not None:
-        if 'ft_state' in state_dict:
-            ft_client.load_state_dict(state_dict['ft_state'])
-        else:
-            print_rank_0("ft_state is not present in state_dict")
 
     # Checkpoint not loaded.
     if state_dict is None:
@@ -1353,6 +1347,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                  f'at iteration {iteration}')
 
     torch.cuda.empty_cache()
+
+    if iteration > 0:
+        # Notify FT that a checkpoint was loaded.
+        is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
+        ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
+
     return iteration, num_floating_point_operations_so_far
 
 
