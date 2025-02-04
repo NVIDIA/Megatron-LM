@@ -69,6 +69,30 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
     products:
       - environment: [dev, lts]
@@ -459,7 +483,21 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_etp4_dp_last_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
