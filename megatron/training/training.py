@@ -286,6 +286,12 @@ def pretrain(
     if args.log_progress:
         append_to_progress_log("Starting job")
 
+    # Initialize fault tolerance
+    # NOTE: ft_integration functions other than `setup` are no-op if the FT is not initialized
+    if args.enable_ft_package:
+        ft_integration.setup(args)
+        ft_integration.maybe_setup_simulated_fault()
+
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
 
@@ -381,11 +387,6 @@ def pretrain(
                                         args.do_valid, args.do_test, args.dataloader_type,
                                         args.retro_project_dir, args.retro_cyclic_train_iters)
 
-    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
-        ft_integration.get_rank_monitor_client().init_workload_monitoring()
-        ft_timeouts = ft_integration.get_rank_monitor_client().timeouts
-        print_rank_0(f"Fault tolerance client initialized. Timeouts: {ft_timeouts}")
-
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
@@ -417,8 +418,7 @@ def pretrain(
             save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                             num_floating_point_operations_so_far, checkpointing_context,
                             train_data_iterator=train_data_iterator,
-                            ft_client=ft_integration.get_rank_monitor_client(
-                            ft_integration.StateMachineActions.SAVE_CHECKPOINT), preprocess_common_state_dict_fn=preprocess_common_state_dict)
+                            preprocess_common_state_dict_fn=preprocess_common_state_dict)
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -448,11 +448,16 @@ def pretrain(
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         wandb_writer.finish()
+
+    ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True)
+    ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     one_logger and one_logger.log_metrics({
         'app_finish_time': one_logger_utils.get_timestamp_in_ms()
     })
+    
+    ft_integration.shutdown()
     one_logger_utils.finish()
 
 
@@ -730,8 +735,7 @@ def setup_model_and_optimizer(model_provider_func,
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-                model, optimizer, opt_param_scheduler,
-                ft_client=ft_integration.get_rank_monitor_client(), checkpointing_context=checkpointing_context,
+                model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context,
                 skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False))
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
@@ -1177,8 +1181,7 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
                     non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
-                    ft_client=ft_integration.get_rank_monitor_client(
-                    ft_integration.StateMachineActions.SAVE_CHECKPOINT), preprocess_common_state_dict_fn=preprocess_common_state_dict)
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict)
     if args.use_distributed_optimizer and args.overlap_param_gather:
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
@@ -1201,21 +1204,6 @@ def post_training_step_callbacks(model, optimizer, opt_param_scheduler, iteratio
                                  num_floating_point_operations_since_last_log_event):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
-
-    # Send heartbeat to FT package and update timeouts.
-    if args.enable_ft_package:
-        ft_client = ft_integration.get_rank_monitor_client(
-            ft_integration.StateMachineActions.TRAIN_HEARTBEAT)
-        if ft_client is not None:
-            ft_client.send_heartbeat()
-            # TODO: We are always calculating timeouts in the current implementation.
-            # If we want to rely on manually setting these, then we need to add additional
-            # arguments to training and pass it here.
-            if ft_integration.can_update_timeouts():
-                ft_integration.get_rank_monitor_client(
-                    ft_integration.StateMachineActions.UPDATE_TIMEOUT).calculate_and_set_timeouts()
-                print_rank_0(f'Updated FT timeouts. New values: \
-                    {ft_integration.get_rank_monitor_client().timeouts}')
 
     # Bring CPU and GPU back in sync if on right iteration.
     if args.train_sync_interval and iteration % args.train_sync_interval == 0:
@@ -1477,7 +1465,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 torch.cuda.cudart().cudaProfilerStart()
                 torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
 
+        ft_integration.on_checkpointing_start()
         maybe_finalize_async_save(blocking=False)
+        ft_integration.on_checkpointing_end(is_async_finalization=True)
 
         # Update number of microbatches first without consistency check to decide if a
         # checkpoint should be saved. If the number of microbatches is different
@@ -1498,6 +1488,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         # Run training step.
         args.curr_iteration = iteration
+        ft_integration.on_training_step_start()
         loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -1505,6 +1496,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        optimizer,
                        opt_param_scheduler,
                        config)
+        ft_integration.on_training_step_end()
         if should_checkpoint:
             save_checkpoint_and_time(iteration, model, optimizer,
                                      opt_param_scheduler,
@@ -1600,10 +1592,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 pre_hook_enabled = True
             timers('interval-time', log_level=0).start(barrier=True)
 
-            if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
-                ft_integration.get_rank_monitor_client(
-                    ft_integration.StateMachineActions.EVAL_HEARTBEAT).send_heartbeat()
-
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations.
         post_training_step_callbacks(model, optimizer, opt_param_scheduler, iteration, prof,
@@ -1627,16 +1615,16 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if pre_hook_enabled:
         disable_forward_pre_hook(model)
 
-    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
-        ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
-
+    ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True)
+    ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
+        ft_integration.shutdown()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
@@ -1687,6 +1675,7 @@ def evaluate(forward_step_func,
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
             config.timers = None
+            ft_integration.on_eval_step_start()
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
@@ -1696,6 +1685,7 @@ def evaluate(forward_step_func,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True)
+            ft_integration.on_eval_step_end()
             config.timers = get_timers()
 
             # Empty unused memory
