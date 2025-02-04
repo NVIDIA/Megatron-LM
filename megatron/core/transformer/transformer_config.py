@@ -290,6 +290,20 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax 
     enabled. Defaults to None, which means no scaling."""
 
+    moe_router_score_function: str = "softmax"
+    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+
+    moe_router_enable_expert_bias: bool = False
+    """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
+    The routing decision is based on the sum of the routing scores and the expert bias.
+    See https://arxiv.org/abs/2408.15664 for details."""
+
+    moe_router_bias_update_rate: float = 1e-3
+    """The expert bias is updated based on the number of assigned tokens to each expert 
+    in a global batch, where the bias is increased for the experts with less assigned tokens
+    and decreased for the experts with more assigned tokens. 
+    The default value 1e-3 is same as that used in DeepSeekV3."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -309,7 +323,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_input_jitter_eps: float = None
     """Add noise to the input tensor by applying jitter with a specified epsilon value."""
 
-    moe_token_dropping: bool = False  # TODO: Support token dropping.
+    moe_token_dropping: bool = False
     """This feature involves selectively dropping and padding tokens for each expert to achieve a
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
@@ -589,6 +603,12 @@ class TransformerConfig(ModelParallelConfig):
                 "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
             )
 
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+            raise ValueError(
+                "Expert bias for aux-loss-free routing only supports sigmoid score function."
+                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+            )
+
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
             if not is_te_min_version("1.7.0.dev0"):
@@ -602,6 +622,16 @@ class TransformerConfig(ModelParallelConfig):
                     "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
                     f"but your version is {get_te_version()}."
                 )
+
+        if (
+            self.moe_router_topk == 1
+            and self.moe_router_score_function == 'softmax'
+            and not self.moe_router_pre_softmax
+            and self.moe_router_load_balancing_type != 'sinkhorn'
+        ):
+            # Requires applying softmax before selecting the top-k when k is 1,
+            # since softmax on a [num_tokens, 1] would yield a zero gradient.
+            raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
 
         if self.moe_router_topk_limited_devices:
             if self.moe_router_topk_limited_devices > self.expert_model_parallel_size:

@@ -381,14 +381,16 @@ def topk_softmax_with_capacity(
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
     moe_router_topk_limited_devices: int = None,
-    moe_router_topk_scaling_factor: float = None,
+    moe_router_topk_scaling_factor: Optional[float] = None,
     deterministic_mode: bool = False,
+    score_function: str = "softmax",
+    expert_bias: Optional[torch.Tensor] = None,
 ):
     """Apply capacity and padding to the top-k selection.
     Args:
         logits (torch.Tensor): Logits tensor.
         topk (int): The number of experts to select for each token.
-        capacity_factor (int): The capacity factor of each expert. Will drop tokens if the number
+        capacity_factor (float): The capacity factor of each expert. Will drop tokens if the number
                                of tokens exceeds the capacity.
         pad_to_capacity (bool): Whether to need padding in token drop mode.
         drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
@@ -411,38 +413,35 @@ def topk_softmax_with_capacity(
               the number of local tokens assigned to each expert before dropping and padding.
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
-    num_tokens = logits.shape[0]
-    num_experts = logits.shape[1]
-    if use_pre_softmax:
-        # Pre softmax
-        scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+    num_tokens, num_experts = logits.shape
 
-        if moe_router_topk_limited_devices:
-            probs, top_indices = device_limited_topk(
-                scores, topk, num_tokens, num_experts, moe_router_topk_limited_devices
-            )
+    def compute_topk(scores, topk, limited_devices=None):
+        if limited_devices:
+            return device_limited_topk(scores, topk, num_tokens, num_experts, limited_devices)
         else:
-            probs, top_indices = torch.topk(scores, k=topk, dim=1)
+            return torch.topk(scores, k=topk, dim=1)
 
-        # Normalize the probs.
-        if moe_router_topk_scaling_factor:
-            probs = probs * moe_router_topk_scaling_factor
+    if score_function == "softmax":
+        if use_pre_softmax:
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            probs, top_indices = compute_topk(scores, topk, moe_router_topk_limited_devices)
+        else:
+            scores, top_indices = compute_topk(logits, topk, moe_router_topk_limited_devices)
+            probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+    elif score_function == "sigmoid":
+        scores = torch.sigmoid(logits)
+        if expert_bias is not None:
+            scores_for_routing = scores + expert_bias
+            _, top_indices = compute_topk(scores_for_routing, topk, moe_router_topk_limited_devices)
+            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
+        else:
+            scores, top_indices = compute_topk(scores, topk, moe_router_topk_limited_devices)
+        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
-        # Post softmax
-        if topk == 1:
-            # Requires applying softmax before selecting the top-k when k is 1,
-            # since softmax on a [num_tokens, 1] would yield a zero gradient.
-            raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
-        assert (
-            moe_router_topk_scaling_factor is None
-        ), "moe_router_topk_scaling_factor is not supported with post-softmax"
-        if moe_router_topk_limited_devices:
-            scores, top_indices = device_limited_topk(
-                logits, topk, num_tokens, num_experts, moe_router_topk_limited_devices
-            )
-        else:
-            scores, top_indices = torch.topk(logits, k=topk, dim=1)
-        probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
+        raise ValueError(f"Invalid score_function: {score_function}")
+
+    if moe_router_topk_scaling_factor:
+        probs = probs * moe_router_topk_scaling_factor
 
     # TODO Try using element-wise operations instead of scatter?
     topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
@@ -576,3 +575,23 @@ def track_moe_metrics(
                     )
 
     clear_aux_losses_tracker()
+
+
+def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_rate):
+    """Update expert bias for biased expert routing. See https://arxiv.org/abs/2408.15664v1#
+
+    Args:
+        tokens_per_expert (torch.Tensor): The number of tokens assigned to each expert.
+        expert_bias (torch.Tensor): The bias for each expert.
+        expert_bias_udpate_rate (float): The update rate for the expert bias.
+    """
+    with torch.no_grad():
+        # All Reduce Across TPxCPxDP group
+        torch.distributed.all_reduce(
+            tokens_per_expert,
+            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+        )
+        average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
+        offset = average_tokens - tokens_per_expert
+        updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
+        return updated_expert_bias
