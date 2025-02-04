@@ -25,13 +25,21 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
-    first_pipeline_num_layers: int = None
+    num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage. 
     None implies equal layer division across PP ranks."""
 
-    last_pipeline_num_layers: int = None
+    num_layers_in_last_pipeline_stage: Optional[int] = None
     """Number of transformer layers on last pipeline stage. 
     None implies equal layer division across PP ranks."""
+
+    account_for_embedding_in_pipeline_split: bool = False
+    """If set, the embedding layer will be treated as a standard transformer
+    layer in the context of partition and placement for pipeline parallelism."""
+
+    account_for_loss_in_pipeline_split: bool = False
+    """If set, the loss layer will be treated as a standard transformer
+    layer in the context of partition and placement for pipeline parallelism."""
 
     hidden_size: int = 0
     """Transformer hidden size."""
@@ -526,11 +534,125 @@ class TransformerConfig(ModelParallelConfig):
                     f'false when sequence parallel is enabled: {self.sequence_parallel}'
                 )
 
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ) and (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
+            raise ValueError(
+                'num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage cannot be'
+                'set at the same time with account_for_embedding_in_pipeline_split'
+                'and account_for_loss_in_pipeline_split'
+            )
+
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ):
+            pipeline_parallel_size = self.pipeline_model_parallel_size
+            num_layers = self.num_layers
+
+            if self.num_layers_in_first_pipeline_stage is not None:
+                if self.num_layers_in_first_pipeline_stage <= 0:
+                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+
+                if self.virtual_pipeline_model_parallel_size is not None:
+                    if (
+                        self.num_layers_in_first_pipeline_stage
+                        % self.virtual_pipeline_model_parallel_size
+                        != 0
+                    ):
+                        raise ValueError(
+                            f'number of layers at first stage: '
+                            f'{self.num_layers_in_first_pipeline_stage}'
+                            f'must be divisible by virtual pipeline'
+                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                        )
+                num_layers -= self.num_layers_in_first_pipeline_stage
+                pipeline_parallel_size -= 1
+
+            if self.num_layers_in_last_pipeline_stage is not None:
+                if self.num_layers_in_last_pipeline_stage <= 0:
+                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+
+                if self.virtual_pipeline_model_parallel_size is not None:
+                    if (
+                        self.num_layers_in_last_pipeline_stage
+                        % self.virtual_pipeline_model_parallel_size
+                        != 0
+                    ):
+                        raise ValueError(
+                            f'number of layers at last stage: '
+                            f'{self.num_layers_in_last_pipeline_stage}'
+                            f'must be divisible by virtual pipeline'
+                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                        )
+                num_layers -= self.num_layers_in_last_pipeline_stage
+                pipeline_parallel_size -= 1
+
+            if not num_layers % pipeline_parallel_size == 0:
+                raise ValueError(
+                    f'number of layers at middle stage: {num_layers} must be divisible by'
+                    f'the middle pipeline model parallel size {pipeline_parallel_size}'
+                )
+
             if self.virtual_pipeline_model_parallel_size is not None:
-                if not self.num_layers % self.virtual_pipeline_model_parallel_size == 0:
+                num_layers_per_middle_pipeline_rank = num_layers // pipeline_parallel_size
+                if (
+                    not num_layers_per_middle_pipeline_rank
+                    % self.virtual_pipeline_model_parallel_size
+                    == 0
+                ):
                     raise ValueError(
-                        f'num_layers: {self.num_layers} must be divisible by '
-                        f'virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
+                        f'number of layers on each middle pipeline rank:'
+                        f'{num_layers_per_middle_pipeline_rank} must be divisible by virtual'
+                        f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
+                    )
+
+        if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
+            if self.virtual_pipeline_model_parallel_size is None:
+                pipeline_parallel_size = self.pipeline_model_parallel_size
+
+                if self.account_for_embedding_in_pipeline_split:
+                    pipeline_parallel_size -= 1
+
+                if self.account_for_loss_in_pipeline_split:
+                    pipeline_parallel_size -= 1
+
+                if not self.num_layers % pipeline_parallel_size == 0:
+                    raise ValueError(
+                        f'number of middle layers: {self.num_layers} must be divisible by '
+                        f'middle pipeline_model_parallel_size {pipeline_parallel_size}'
+                    )
+            else:
+                num_layers = self.num_layers
+                if self.account_for_embedding_in_pipeline_split:
+                    num_layers += 1
+
+                if self.account_for_loss_in_pipeline_split:
+                    num_layers += 1
+
+                if not num_layers % self.pipeline_model_parallel_size == 0:
+                    raise ValueError(
+                        f'num_layers: {num_layers} after enable'
+                        f'account_for_embedding_in_pipeline_split or '
+                        f'account_for_loss_in_pipeline_split must be divisible'
+                        f'by pipeline_model_parallel_size '
+                        f'{self.pipeline_model_parallel_size}'
+                    )
+
+                num_layers_per_pipeline_rank = num_layers // self.pipeline_model_parallel_size
+                if (
+                    not num_layers_per_pipeline_rank % self.virtual_pipeline_model_parallel_size
+                    == 0
+                ):
+                    raise ValueError(
+                        f'number of layers on each pipeline rank: {num_layers_per_pipeline_rank}'
+                        f'(after enable account_for_embedding_in_pipeline_split or '
+                        f'account_for_loss_in_pipeline_split) must be divisible by'
+                        f'virtual_pipeline_model_parallel_size'
+                        f'{self.virtual_pipeline_model_parallel_size}'
                     )
 
         if self.apply_query_key_layer_scaling:
@@ -637,6 +759,11 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+
+        assert (
+            self.pipeline_model_parallel_size > 0
+        ), f"Pipeline model parallel size must be larger than 0 \
+            when enable --standalone-embedding-stage and --standalone-loss-stage"
 
 
 @dataclass
