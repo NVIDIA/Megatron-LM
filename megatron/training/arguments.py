@@ -227,12 +227,8 @@ def validate_args(args, defaults={}):
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
-    # Pipeline model parallel size.
-    args.transformer_pipeline_model_parallel_size = (
-        args.pipeline_model_parallel_size - 1
-        if args.standalone_embedding_stage else
-        args.pipeline_model_parallel_size
-    )
+    # Pipeline model parallel size.        
+    args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
     args.data_parallel_size = args.world_size // total_model_size
 
@@ -336,13 +332,12 @@ def validate_args(args, defaults={}):
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
-    if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
-        # Divisibility check not applicable for T5 models which specify encoder_num_layers
-        # and decoder_num_layers.
-        if args.num_layers is not None:
-            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                'Number of layers should be divisible by the pipeline-model-parallel size'
-    if args.num_layers_per_virtual_pipeline_stage is not None:
+    
+    # Uneven virtual pipeline parallelism
+    assert args.num_layers_per_virtual_pipeline_stage is None or args.num_virtual_stages_per_pipeline_rank is None, \
+        '--num-layers-per-virtual-pipeline-stage and --num-virtual-stages-per-pipeline-rank cannot be set at the same time'
+                  
+    if args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
                 'When interleaved schedule is used, pipeline-model-parallel size '\
@@ -352,15 +347,28 @@ def validate_args(args, defaults={}):
                 'When interleaved schedule is used and p2p communication overlap is disabled, '\
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
-        assert args.num_layers is not None
-        # Double check divisibility check here since check above is if guarded.
-        assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-            'Number of layers should be divisible by the pipeline-model-parallel size'
-        num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
-        assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
-            'Number of layers per pipeline stage must be divisible by number of layers per virtual pipeline stage'
-        args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
-            args.num_layers_per_virtual_pipeline_stage
+        
+        if args.num_virtual_stages_per_pipeline_rank is None:
+            assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
+                'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
+            num_layers = args.num_layers
+            
+            if args.account_for_embedding_in_pipeline_split:
+                num_layers += 1
+            
+            if args.account_for_loss_in_pipeline_split:
+                num_layers += 1
+            
+            assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'number of layers of the model must be divisible pipeline model parallel size'
+            num_layers_per_pipeline_stage = num_layers // args.transformer_pipeline_model_parallel_size
+            
+            assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
+                'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+            args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
+                args.num_layers_per_virtual_pipeline_stage
+        else:
+            args.virtual_pipeline_model_parallel_size = args.num_virtual_stages_per_pipeline_rank
     else:
         args.virtual_pipeline_model_parallel_size = None
         # Overlap P2P communication is disabled if not using the interleaved schedule.
@@ -371,7 +379,23 @@ def validate_args(args, defaults={}):
             print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
                   'since non-interleaved schedule does not support overlapping p2p communication '
                   'and aligned param AG')
+            
+        if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
+            # Divisibility check not applicable for T5 models which specify encoder_num_layers
+            # and decoder_num_layers.
+            if args.num_layers is not None:
+                num_layers = args.num_layers
+                
+                if args.account_for_embedding_in_pipeline_split:
+                    num_layers += 1
+                
+                if args.account_for_loss_in_pipeline_split:
+                    num_layers += 1
+                    
+                assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                    'Number of layers should be divisible by the pipeline-model-parallel size'
 
+    print("Virtual model parallel size ", args.virtual_pipeline_model_parallel_size)
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
@@ -776,6 +800,15 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    # MoE loss and include embedding and loss layer check
+    if args.num_experts is not None:
+        if args.moe_router_load_balancing_type != "none" or args.moe_z_loss_coeff is not None:
+            assert not args.account_for_embedding_in_pipeline_split, \
+                "Cannot support load balancing loss and z loss with --account-for-embedding-in-pipeline-split"
+            assert not args.account_for_loss_in_pipeline_split, \
+                "Cannot support load balancing loss and z loss with --account-for-loss-in-pipeline-split"
+                
+
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
     if args.replication:
@@ -831,8 +864,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['first_pipeline_num_layers']= args.decoder_first_pipeline_num_layers
-    kw_args['last_pipeline_num_layers']= args.decoder_last_pipeline_num_layers
+    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1749,6 +1782,8 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--num-virtual-stages-per-pipeline-rank', type=int, default=None,
+                       help='Number of virtual pipeline stages per pipeline parallelism rank')
     group.add_argument('--microbatch-group-size-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of contiguous microbatches per virtual pipeline stage',
                        dest='microbatch_group_size_per_vp_stage')
@@ -1803,11 +1838,12 @@ def _add_distributed_args(parser):
                        'complete it instead.Also turns on '
                        '--use-cpu-initialization flag. This is for '
                        'external DDP manager.' )
-    group.add_argument('--standalone-embedding-stage', action='store_true',
-                       default=False, help='If set, *input* embedding layer '
-                       'is placed on its own pipeline stage, without any '
-                       'transformer layers. (For T5, this flag currently only '
-                       'affects the encoder embedding.)')
+    group.add_argument('--account-for-embedding-in-pipeline-split', action='store_true',
+                       default=False, help='If set, *input* embedding layer will be treated as a standard transformer'
+                       'layer in the context of partition and placement for pipeline parallelism.')
+    group.add_argument('--account-for-loss-in-pipeline-split', action='store_true',
+                       default=False, help='If set, loss layer will be treated as a standard transformer'
+                       'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,

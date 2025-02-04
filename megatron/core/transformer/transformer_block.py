@@ -53,35 +53,63 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
-    if config.first_pipeline_num_layers is not None or config.last_pipeline_num_layers is not None:
-        assert (
-            parallel_state.get_virtual_pipeline_model_parallel_world_size() is None
-        ), "Uneven number of layer not compatible with interleaved pipeline schedule"
+    if (
+        config.num_layers_in_first_pipeline_stage is not None
+        or config.num_layers_in_last_pipeline_stage is not None
+    ):
 
+        assert not (
+            config.account_for_embedding_in_pipeline_split
+            or config.account_for_loss_in_pipeline_split
+        ), " \
+        Does not support standalone embedding stage and standalone loss stage with uneven pp"
         # Number of layers to distribute over rest of pipeline stages
         layers_to_distribute = config.num_layers
         # Number of pipeline stages left for distributing transformer layers
         pipeline_stages_left = parallel_state.get_pipeline_model_parallel_world_size()
 
-        if config.first_pipeline_num_layers is not None:
-            layers_to_distribute -= config.first_pipeline_num_layers
+        # If the uneven first (last) pipeline stage is enabled, remove the specified number
+        # of layers to calculate the number of layers on each middle pipeline stage.
+        if config.num_layers_in_first_pipeline_stage is not None:
+            layers_to_distribute -= config.num_layers_in_first_pipeline_stage
             pipeline_stages_left -= 1
-            if parallel_state.is_pipeline_first_stage():
-                return config.first_pipeline_num_layers
 
-        if config.last_pipeline_num_layers is not None:
-            layers_to_distribute -= config.last_pipeline_num_layers
+        if config.num_layers_in_last_pipeline_stage is not None:
+            layers_to_distribute -= config.num_layers_in_last_pipeline_stage
             pipeline_stages_left -= 1
-            if parallel_state.is_pipeline_last_stage():
-                return config.last_pipeline_num_layers
 
         assert (
             layers_to_distribute % pipeline_stages_left == 0
         ), "With uneven pipelineing the left over layers must be divisible by left over stages"
         num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+
+        # If the uneven first (last) pipeline stage is enabled, return the specified number
+        # of layers for all virtual pipeline parallel stages within the first (last) pipeline
+        # parallel stage.
+        if (
+            parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+            and config.num_layers_in_first_pipeline_stage is not None
+        ):
+            num_layers_per_pipeline_rank = config.num_layers_in_first_pipeline_stage
+
+        if (
+            parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+            and config.num_layers_in_last_pipeline_stage is not None
+        ):
+            num_layers_per_pipeline_rank = config.num_layers_in_last_pipeline_stage
     else:
-        pipeline_ranks = config.pipeline_model_parallel_size
-        num_layers_per_pipeline_rank = config.num_layers // pipeline_ranks
+        # Include the embedding layer and loss layer into pipeline parallelism partition
+        num_layers = config.num_layers
+        if config.account_for_embedding_in_pipeline_split:
+            num_layers += 1
+
+        if config.account_for_loss_in_pipeline_split:
+            num_layers += 1
+
+        assert (
+            num_layers % config.pipeline_model_parallel_size == 0
+        ), "num_layers should be divisible by pipeline_model_parallel_size"
+        num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
     if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
         # Interleaved pipeline parallelism:
@@ -95,9 +123,11 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
         # layers to stages like (each list is a model chunk):
         # Stage 0: [0, 1]  [4, 5]
         # Stage 1: [2, 3]  [6, 7]
-
         vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
+        assert (
+            num_layers_per_pipeline_rank % vp_size == 0
+        ), "num_layers_per_pipeline_rank should be divisible by vp_size"
         num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
 
         num_layers_to_build = num_layers_per_virtual_rank
@@ -105,8 +135,18 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
     else:
         # Non-interleaved pipeline parallelism:
         # Each stage gets a contiguous set of layers.
-
         num_layers_to_build = num_layers_per_pipeline_rank
+
+    # The embedding (or loss) layer cannot function as a standalone transformer layer
+    # Reduce the number of layers to construct by 1 on the first (or last) stage if the
+    # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
+    if parallel_state.is_pipeline_first_stage() and config.account_for_embedding_in_pipeline_split:
+        num_layers_to_build -= 1
+        assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
+
+    if parallel_state.is_pipeline_last_stage() and config.account_for_loss_in_pipeline_split:
+        num_layers_to_build -= 1
+        assert num_layers_to_build >= 0, "Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
 
@@ -242,7 +282,7 @@ class TransformerBlock(MegatronModule):
             ]
         )
 
-        # @TODO: add back standalone_embedding_stage (see issue #293)
+        # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
