@@ -444,7 +444,7 @@ def get_conversation(task, question):
 
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{q}"},
         ]
 
     return conversation

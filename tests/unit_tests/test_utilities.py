@@ -95,7 +95,7 @@ class Utils:
             pipeline_model_parallel_size,
             virtual_pipeline_model_parallel_size,
             **kwargs,
-        )
+        ) 
         init_async_calls(process_group=ps.get_default_process_group())
         get_current_device()
         Utils.inited = True

@@ -409,6 +409,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             # Grab the selected frames of the video as a tensor with shape
             # fhwc: (num_frames, num_channels, height, width).
             video_fchw = sample.images.frames
+            if video_fchw.shape[0] == 0:
+                raise ValueError(f"Video {sample.__key__} {sample.__restore_key__} {sample.texts} has no frames.")
             selected_frames = torch.linspace(
                 0, video_fchw.shape[0] - 1, self.args.num_frames).long()
             video_fchw = video_fchw[selected_frames]

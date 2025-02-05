@@ -223,7 +223,7 @@ class Pipeline:
             )
             np.random.seed(orig_numpy_seed)
 
-            torch_input_ids = torch.from_numpy(numpy_input_ids).to("cuda")
+            torch_input_ids = torch.from_numpy(numpy_input_ids).to(device=get_current_device())
 
             return torch_input_ids
         else:

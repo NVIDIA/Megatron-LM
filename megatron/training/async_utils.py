@@ -23,6 +23,9 @@ def schedule_async_save(async_request: AsyncRequest):
     Args:
         async_request (AsyncRequest): the async save request.
     """
+    global _async_calls_queue
+    if _async_calls_queue is None:
+        _async_calls_queue = AsyncCallsQueue(process_group=mpu.get_default_process_group())
     _async_calls_queue.schedule_async_request(async_request)
 
 
@@ -42,7 +45,16 @@ def maybe_finalize_async_save(blocking: bool = False):
     if _async_calls_queue is None:
         _async_calls_queue = AsyncCallsQueue(process_group=mpu.get_default_process_group())
 
-    if blocking and _async_calls_queue.get_num_unfinalized_calls() > 0:
+    if blocking and not is_empty_async_queue():
         print_rank_0('Unfinalized async checkpoint saves. Finalizing them synchronously now.')
 
     _async_calls_queue.maybe_finalize_async_calls(blocking)
+
+def is_empty_async_queue() -> bool:
+    """ Check if async calls queue is empty. This result is consistent across ranks.
+
+    Returns:
+        bool: True if there is any ongoing async call.
+    """
+    global _async_calls_queue
+    return _async_calls_queue is None or _async_calls_queue.get_num_unfinalized_calls() == 0

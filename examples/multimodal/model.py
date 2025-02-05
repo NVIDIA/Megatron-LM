@@ -91,7 +91,7 @@ def model_provider(
     )
 
     vision_model_type = args.vision_model_type
-    if vision_model_type in ["clip", "siglip"]:
+    if vision_model_type in ["clip", "siglip", "radio"]:
         if use_te:
             vision_transformer_layer_spec = get_layer_spec_te(
                 is_vit=True
@@ -169,6 +169,7 @@ def model_provider(
         vision_projection_type="mlp",
         allow_missing_vision_projection_checkpoint=args.allow_missing_vision_projection_checkpoint,
         parallel_output=parallel_output,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
         pre_process=pre_process,

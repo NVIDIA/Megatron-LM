@@ -12,4 +12,7 @@ local/
 .gitmodules
 *.out
 =*
-test_dist*.py
+.gitmodules
+wandb/
+onelogger.log
+onelogger.err

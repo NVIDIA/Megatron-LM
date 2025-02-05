@@ -13,6 +13,9 @@ import sys
 
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device, get_xla_model
+from typing import List
+
+import torch.distributed
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -61,6 +64,7 @@ from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
+    get_default_process_group,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -321,11 +325,30 @@ def pretrain(
 
     # Context used for persisting some state between checkpoint saves.
     if args.non_persistent_ckpt_type == 'local':
-        raise RuntimeError('LocalCheckpointManagers are not yet integrated')
-        checkpointing_context = {
-            'local_checkpoint_manager': BasicLocalCheckpointManager(
-                args.non_persistent_local_ckpt_dir
+        try:
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
+                LocalCheckpointManager
+            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import \
+                parse_group_sequence, GroupWrapper
+            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import \
+                CliqueReplicationStrategy
+        except ModuleNotFoundError:
+            raise RuntimeError("The 'nvidia_resiliency_ext' module is required for local "
+                               "checkpointing but was not found. Please ensure it is installed.")
+
+        if args.replication:
+            repl_strategy = CliqueReplicationStrategy.from_replication_params(
+                args.replication_jump,
+                args.replication_factor
             )
+        else:
+            repl_strategy = None
+
+        checkpointing_context = {
+            'local_checkpoint_manager': LocalCheckpointManager(args.non_persistent_local_ckpt_dir,
+                                                               repl_strategy=repl_strategy,
+                                                               group=get_default_process_group()
+                                                               )
         }
     else:
         checkpointing_context = {}
@@ -1158,7 +1181,6 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
     # Extra barrier is added to make sure all ranks report the max time.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
     timers(timer_key, log_level=0).start(barrier=True)
-    save_checkpoint_start_time = timers('save-checkpoint').active_time()
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
@@ -1173,11 +1195,10 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
-    save_checkpoint_finish_time = timers('save-checkpoint').active_time()
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    save_checkpoint_duration = save_checkpoint_finish_time - save_checkpoint_start_time
+    save_checkpoint_duration = timers(timer_key).elapsed()
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
 
     if args.log_progress and not non_persistent_ckpt:
@@ -1285,14 +1306,12 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
 
     elif args.save and args.non_persistent_save_interval and \
         iteration % args.non_persistent_save_interval == 0:
-        timers('interval-time').stop()
         save_checkpoint_and_time(iteration, model, optimizer,
                                  opt_param_scheduler,
                                  num_floating_point_operations_so_far,
                                  checkpointing_context,
                                  non_persistent_ckpt=True, train_data_iterator=train_data_iterator)
         saved_checkpoint = True
-        timers('interval-time', log_level=0).start(barrier=True)
 
     # Exit based on duration.
     if args.exit_duration_in_mins:

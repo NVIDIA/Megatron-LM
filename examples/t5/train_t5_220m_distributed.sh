@@ -29,7 +29,7 @@ T5_ARGS="
     --encoder-num-layers 12 \
     --decoder-num-layers 12 \
     --hidden-size 768 \
-    --num-attention-heads 12 \
+    --num-attention-heads 16 \
     --kv-channels 64 \
     --ffn-hidden-size 3072 \
     --encoder-seq-length 512 \
@@ -49,7 +49,7 @@ T5_ARGS="
     --vocab-extra-ids 100 \
     --init-method-std 0.015 \
     --transformer-impl transformer_engine \
-    --tensor-model-parallel-size 1 \
+    --tensor-model-parallel-size $GPUS_PER_NODE \
     --pipeline-model-parallel-size 1 \
     --attention-backend auto \
 "

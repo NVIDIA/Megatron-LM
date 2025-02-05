@@ -26,9 +26,16 @@ _import_trigger = None
 timers = defaultdict(list)
 
 logger = getLogger(__name__)
+logger.warning(
+    'megatron.core.dist_checkpointing.two_stage module is deprecated'
+    ' and will be removed in Megatron-Core v0.12. Please use'
+    ' FullyParallelLoadStrategyWrapper to accomplish a parallelized checkpoint load.'
+)
 
 
 def timed(verbose=True):
+    """Timing decorator."""
+
     def timed_dec(fn):
         name = fn.__name__
 
@@ -59,6 +66,7 @@ class _ShardedTensorMetadata:
 
 
 def sharded_tensor_chunk_id(sharded_tensor: ShardedTensor):
+    """Id of a sharded tensor."""
     return (sharded_tensor.key, sharded_tensor.global_offset)
 
 
@@ -102,6 +110,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         self.global_rank = torch.distributed.get_rank()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+        """Main load method."""
         self.maybe_init_gloo_group()
         all_tensors_sorted = self._build_load_plan(sharded_state_dict)
         self._exchange_loaded_tensors(all_tensors_sorted, sharded_state_dict, checkpoint_dir)
@@ -110,6 +119,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         return sharded_state_dict
 
     def summarize_load_times(self):
+        """Summarize load times."""
         torch.distributed.barrier()
         logger.info('Checkpoint loading finished. Summary:')
         # TODO: `timers` keys are not guaranteed to be the same across ranks which causes hangs
@@ -125,6 +135,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
 
     @timed(verbose=False)
     def load_tensor_from_storage(self, checkpoint_dir, ten_meta: _ShardedTensorMetadata):
+        """Load tensor from storage."""
         logger.debug(f'_load_from_array({ten_meta.sharded_tensor_no_data.key}) init')
         ret = _load_from_array(
             ten_meta.sharded_tensor_no_data,
@@ -137,6 +148,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
 
     @timed()
     def maybe_init_gloo_group(self):
+        """Create Gloo groups."""
         if not self.cpu_transfer:
             return
         all_groups = [None] * torch.distributed.get_world_size()

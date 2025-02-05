@@ -54,6 +54,8 @@ class GPTModel(LanguageModule):
             Base period for rotary position embeddings. Ignored unless
             position_embedding_type is 'rope'.
             Defaults to 10000.
+        rope_scaling (bool, optional): Toggle RoPE scaling.
+        rope_scaling_factor (float): RoPE scaling factor. Default 8.
         scatter_embedding_sequence_parallel (bool, optional):
             Whether embeddings should be scattered across sequence parallel
             region or not. Defaults to True.
@@ -77,6 +79,7 @@ class GPTModel(LanguageModule):
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
+        rope_scaling_factor: float = 8.0,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
     ) -> None:
@@ -122,6 +125,7 @@ class GPTModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 rope_scaling=rope_scaling,
+                rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
@@ -246,7 +250,11 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                 )
-        if (self.config.enable_cuda_graph or self.config.flash_decode) and inference_params:
+        if (
+            (self.config.enable_cuda_graph or self.config.flash_decode)
+            and rotary_pos_cos is not None
+            and inference_params
+        ):
             sequence_len_offset = torch.tensor(
                 [inference_params.sequence_len_offset] * inference_params.current_batch_size,
                 dtype=torch.int32,

@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
+from megatron.core.device_utils import get_current_device
 from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
 from megatron.core.export.model_type import ModelType
@@ -22,7 +23,7 @@ from tests.unit_tests.test_utilities import Utils
 VOCAB_SIZE = 256
 SEQUENCE_LENGTH = 64
 NUM_LAYERS = 2
-DEVICE = torch.device("cuda")
+DEVICE = get_current_device()
 DTYPE = torch.bfloat16
 
 

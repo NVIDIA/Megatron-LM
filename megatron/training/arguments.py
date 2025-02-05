@@ -202,8 +202,14 @@ def moe_freq_type(x):
 def validate_args(args, defaults={}):
 
     # Temporary
-    assert args.non_persistent_ckpt_type in ['global', None], \
-        'Currently only global checkpoints are supported'
+    assert args.non_persistent_ckpt_type in ['global', 'local', None], \
+        'Currently only global and local checkpoints are supported'
+    if args.non_persistent_ckpt_type == 'local':
+        try:
+            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
+                LocalCheckpointManager
+        except ModuleNotFoundError as e:
+            raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
@@ -422,10 +428,12 @@ def validate_args(args, defaults={}):
     dtype_map = {
         'fp32': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp8': torch.uint8,
     }
-    args.main_grads_dtype = dtype_map[args.main_grads_dtype]
-    args.main_params_dtype = dtype_map[args.main_params_dtype]
-    args.exp_avg_dtype = dtype_map[args.exp_avg_dtype]
-    args.exp_avg_sq_dtype = dtype_map[args.exp_avg_sq_dtype]
+    map_dtype = lambda d: d if isinstance(d, torch.dtype) else dtype_map[d]
+
+    args.main_grads_dtype = map_dtype(args.main_grads_dtype)
+    args.main_params_dtype = map_dtype(args.main_params_dtype)
+    args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
+    args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer, \
@@ -804,6 +812,14 @@ def validate_args(args, defaults={}):
         args.bias_dropout_fusion=False
         print('Warning: No Transformer Engine found: forcing bias_swiglu_fusion=False')
         args.bias_swiglu_fusion=False
+    if args.non_persistent_ckpt_type == "local":
+        assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
+    if args.replication:
+        assert args.replication_jump is not None, "--replication requires the value of --replication-jump!"
+        assert args.non_persistent_ckpt_type == "local", f"--replication requires args.non_persistent_ckpt_type == 'local', but got: {args.non_persistent_ckpt_type}"
+    elif args.replication_jump:
+        print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
+        args.replication_jump = None
 
     # Print arguments.
     _print_args("arguments", args)
@@ -940,6 +956,8 @@ def _add_inference_args(parser):
                        help='Whether to use the flash decoding kernel.')
     group.add_argument('--enable-cuda-graph', default=False, action="store_true",
                        help='Use CUDA graph capture and replay.')
+    group.add_argument("--cuda-graph-warmup-steps", type=int, default=2,
+                       help="Number of CUDA graph warmup steps")
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length allocated for prefill during inference.',
                        dest='inference_max_seq_length')
@@ -1042,7 +1060,9 @@ def _add_network_size_args(parser):
     group.add_argument('--rotary-seq-len-interpolation-factor', type=int, default=None,
                        help='Sequence length interpolation factor for rotary embeddings.')
     group.add_argument('--use-rope-scaling', action='store_true',
-                       help='Apply rope scaling as used in llama3.1')
+                       help='Apply rope scaling as used in llama3.x')
+    group.add_argument('--rope-scaling-factor', type=float, default=8.0,
+                       help='Rope scaling factor in llama3.x models')
     group.add_argument('--no-position-embedding',
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
@@ -1613,8 +1633,7 @@ def _add_checkpointing_args(parser):
                        choices=['global', 'local', 'in_memory', None],
                        help='Type of non-persistent model checkpoints. '
                            '"global" - Saved as a standard checkpoint (e.g., on Lustre) with old checkpoints being removed. '
-                           '"local" - [TBD] Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
-                           '"in_memory" - [TBD] A special kind of local checkpoint that avoids serialization. '
+                           '"local" - Each rank saves a portion of the checkpoint locally (e.g., on SSD/ramdisk). '
                            'None - No non-persistent checkpointing (default option).')
     group.add_argument('--non-persistent-global-ckpt-dir', type=str, default=None,
                        help='Directory containing global non-persistent model checkpoints.')
@@ -1852,6 +1871,16 @@ def _add_distributed_args(parser):
                         help='If set, distributed ranks initialize order is changed '
                         'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
                         'with this option enabled')
+    group.add_argument('--replication', action='store_true', default=False,
+                       help="If set, replication of local checkpoints is enabled. "
+                       "Needs to be enabled on all ranks.")
+    group.add_argument('--replication-jump', default=None, type=int,
+                       help="Specifies `J`, the spacing between ranks storing replicas of a given rank's data. "
+                       "Replicas for rank `n` may be on ranks `n+J`, `n+2J`, ..., or `n-J`, `n-2J`, etc. "
+                       "This flag has an effect only if --replication is used. "
+                       "and must be consistent across all ranks.")
+    group.add_argument('--replication-factor', default=2, type=int,
+                       help="Number of machines storing the replica of a given rank's data.")
     return parser
 
 
@@ -1918,11 +1947,6 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
-    group.add_argument('--renormalize-blend-weights', action='store_true',
-                       help='Renormalize the blend weights to account for the mid-level dataset '
-                       'oversampling done to ensure fulfillment of the requested number of '
-                       'samples. Use this option if prompted. Defaults to False for backward '
-                       'comparability in the data sample order.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
@@ -2171,7 +2195,7 @@ def _add_moe_args(parser):
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
                        help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
-    group.add_argument('--moe-router-topk-limited-devices', type=int, default=None, 
+    group.add_argument('--moe-router-topk-limited-devices', type=int, default=None,
                        help='Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. Default is None, which means no limited devices.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')

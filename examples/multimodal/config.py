@@ -100,6 +100,19 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 29568
+    elif config.language_model_type == "llama3.2_1b":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 8192
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 
@@ -151,9 +164,8 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.layernorm_epsilon = 1e-6
     elif config.vision_model_type == "internvit":
         config.num_layers = 45
-        config.num_attention_heads = 32     # Padded for TP=8.
-        config.num_query_groups = 32    # Padded for TP=8.
-        config.kv_channels = 128
+        config.num_attention_heads = ((24 // config.tensor_model_parallel_size) + 1) * config.tensor_model_parallel_size
+        config.num_query_groups = config.num_attention_heads
         config.add_bias_linear = True
         config.add_qkv_bias = False
         config.hidden_size = 3200
@@ -170,6 +182,26 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.normalization = 'RMSNorm'
         config.layernorm_epsilon = 1e-6
         config.apply_rope_fusion = False
+    elif config.vision_model_type == "radio":
+        config.num_layers = 32
+        config.num_attention_heads = 16
+        config.add_bias_linear = True
+        config.add_qkv_bias = True
+        config.hidden_size = 1280
+        config.ffn_hidden_size = 5120
+        config.gated_linear_unit = False
+        config.activation_func = fast_gelu
+        config.kv_channels = 80
+        config.num_query_groups = 16
+        config.layernorm_zero_centered_gamma = False
+        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.normalization = 'LayerNorm'
+        config.apply_rope_fusion = False
+        config.qk_layernorm = False
+        config.layernorm_epsilon = 1e-6
     else:
         raise ValueError(f"unknown vision model type {config.vision_model_type}")
 
@@ -187,6 +219,9 @@ def get_vision_projection_config(config, hidden_size):
     elif config.language_model_type == "llama3.1_8b":
         config.ffn_hidden_size = 4096
         config.activation_func = torch.nn.functional.gelu
+        config.layernorm_epsilon = 1e-5
+        config.add_bias_linear = True
+        config.normalization = "LayerNorm"
     elif config.language_model_type == "mistral_7b":
         config.ffn_hidden_size = 14336
         config.activation_func = torch.nn.functional.gelu
@@ -202,6 +237,10 @@ def get_vision_projection_config(config, hidden_size):
         config.ffn_hidden_size = 29568
         config.normalization = "LayerNorm"
         config.activation_func = torch.nn.functional.gelu
+    elif config.language_model_type == "llama3.2_1b":
+        config.ffn_hidden_size = 2048
+        config.activation_func = torch.nn.functional.gelu
+        config.normalization = "LayerNorm"
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 

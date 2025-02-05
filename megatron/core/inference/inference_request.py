@@ -32,8 +32,11 @@ class InferenceRequest:
     prompt_tokens: List[int]
     arrival_time: float
     status: Status
+    prompt_log_probs: Optional[float] = None
     encoder_prompt: Optional[str] = None
     generated_text: Optional[str] = None
+    generated_segments: Optional[List[List[str]]] = None
+    generated_sequence_lengths: Optional[List[int]] = None
     generated_tokens: Optional[torch.Tensor] = None
-    generated_log_probs: Optional[torch.Tensor] = None
+    generated_log_probs: Optional[float] = None
     generated_length: int = 0

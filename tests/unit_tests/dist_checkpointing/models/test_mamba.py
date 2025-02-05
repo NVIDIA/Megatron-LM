@@ -1,10 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import traceback
 import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_xla_model
+from megatron.core.device_utils import get_xla_model, set_manual_seed
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import (
@@ -24,7 +25,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def initialize_mamba(seed, glu=True, **config_kwargs):
-    torch.manual_seed(seed)
+    set_manual_seed(seed)
     model_parallel_device_manual_seed(seed)
 
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()

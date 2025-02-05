@@ -65,6 +65,13 @@ def initialize_megatron(
 
     if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
         assert args.load is not None, "--use-checkpoint-args requires --load argument"
+        assert (
+            args.non_persistent_ckpt_type != "local"
+        ), (
+            "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
+            "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
+            "before initializing LocalCheckpointManager."
+        )
         load_args_from_checkpoint(args)
 
     if args.yaml_cfg is not None:
@@ -85,7 +92,7 @@ def initialize_megatron(
         return {
             'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
         }
-    
+
     def state_restore_func(state_dict):
         if state_dict['rng_tracker_states']:
             tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
@@ -256,7 +263,7 @@ def _initialize_tp_communicators():
             )
         # Create a MPI process group to help with TP communication overlap bootstrap.
         create_group(backend='mpi', group_desc='TP_BOOTSTRAP_GROUP_MPI')
-    
+
         te_module.base.initialize_ub(shape = input_shape, tp_size = args.tensor_model_parallel_size,
                                      use_fp8 = (args.fp8 is not None) , ub_cfgs = ub_cfgs)
 

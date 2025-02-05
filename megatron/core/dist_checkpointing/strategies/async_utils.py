@@ -15,6 +15,8 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from torch import multiprocessing as mp
 
+from ..utils import debug_time
+
 logger = logging.getLogger(__name__)
 
 xm = get_xla_model()
@@ -99,7 +101,7 @@ class DistributedAsyncCaller:
             torch.cuda.synchronize()
             end_sync = time()
             logger.debug(
-                f"rank: {torch.distributed.get_rank(group=self.process_group)}, takes {end_sync - start_sync} to finish D2H "
+                f"rank: {torch.distributed.get_rank()}, takes {end_sync - start_sync} to finish D2H "
             )
         elif xm:
             xm.mark_step()
@@ -110,7 +112,7 @@ class DistributedAsyncCaller:
         self.process.start()
         init_time = time()
         logger.debug(
-            f"rank: {torch.distributed.get_rank(group=self.process_group)}, takes {init_time - self.start_time} to schedule async ckpt "
+            f"rank: {torch.distributed.get_rank()}, takes {init_time - self.start_time} to schedule async ckpt "
         )
 
     def is_current_async_call_done(self, blocking=False) -> bool:
@@ -128,24 +130,25 @@ class DistributedAsyncCaller:
             bool: True if all ranks are done (immediately of after active wait
                 if `blocking` is True), False if at least one rank is still active.
         """
-        # The following takes the same overhead as torch.distributed.barrier (single integer all-reduce)
+        # Same overhead as torch.distributed.barrier (single integer all-reduce)
         is_alive = int(self.process.is_alive()) if self.process is not None else 0
         cc_device = "cpu" if get_xla_model() else get_current_device()
         ten = torch.tensor([is_alive], dtype=torch.int, device=cc_device)
         logger.debug(
-            f"rank: {torch.distributed.get_rank(group=self.process_group)}, DistributedAsyncCaller is_alive: {is_alive}"
+            f"rank: {torch.distributed.get_rank()}, DistributedAsyncCaller is_alive: {is_alive}"
         )
         torch.distributed.all_reduce(ten, group=self.process_group)
         if ten[0] > 0 and not blocking:
             return False
         else:
             if self.process is not None:
-                logger.debug(f"rank: {torch.distributed.get_rank(group=self.process_group)}, joining self.process")
+                logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
                 self.process.join()
                 self.process = None
 
                 logger.debug(
-                    f"DistributedAsyncCaller: Async process join finished after {time() - self.start_time:.2f}s from forking"
+                    "DistributedAsyncCaller: Async process join finished after "
+                    f"{time() - self.start_time:.2f}s from forking"
                 )
                 self.start_time = None
             return True

@@ -400,7 +400,7 @@ class MMMUDataset(torch.utils.data.Dataset):
         )
 
 
-class VideoMMMEDataset(torch.utils.data.Dataset):
+class VideoMMEDataset(torch.utils.data.Dataset):
     "Video MME evaluation dataset."
 
     def __init__(
@@ -442,7 +442,7 @@ class VideoMMMEDataset(torch.utils.data.Dataset):
         self._ground_truth = ground_truth
         self._img_h = img_h
         self._img_w = img_w
-        self._use_tiling = use_tiling
+        self._use_tiling = False
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._num_frames = num_frames
@@ -463,21 +463,15 @@ class VideoMMMEDataset(torch.utils.data.Dataset):
         if self._num_frames == 1:
             video_frames = video_frames[None]
 
-        imgs = list(
-            itertools.chain.from_iterable(
-                get_visual_transform(
-                    img,
-                    self._img_h,
-                    self._img_w,
-                    self._use_tiling,
-                    self._max_num_tiles,
-                    self._use_thumbnail,
-                    augment=False,
-                    vision_model_type=self._vision_model_type,
-                )
-                for img in video_frames
+        imgs = []
+        for img in video_frames:
+            from torchvision.transforms import ToPILImage
+            to_pil = ToPILImage()
+            img = to_pil(img)
+            imgs += get_visual_transform(
+                img, self._img_h, self._img_w, self._use_tiling, self._max_num_tiles,
+                self._use_thumbnail, augment=False, vision_model_type=self._vision_model_type
             )
-        )
 
         for question in gt["questions"]:
             # Very hacky, but we essentially re-create gt holding only the
@@ -858,7 +852,7 @@ def get_evaluation_dataset(
             vision_model_type=vision_model_type,
         )
     elif task == "VideoMME":
-        dataset = VideoMMMEDataset(
+        dataset = VideoMMEDataset(
             input_image_path,
             gt_path,
             num_samples_per_partition,

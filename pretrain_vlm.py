@@ -29,7 +29,7 @@ from megatron.training.utils import get_batch_on_this_cp_rank
 from megatron.core import mpu
 from pretrain_gpt import loss_func
 
-def calculate_model_parallel_padding(decoder_seq_len, text_only=False):
+def calculate_model_parallel_padding(decoder_seq_len):
     args = get_args()
     cp_size = args.context_parallel_size
     tp_size = args.tensor_model_parallel_size
@@ -38,7 +38,7 @@ def calculate_model_parallel_padding(decoder_seq_len, text_only=False):
     # TP Comm overlap is performed with combined text+image embeddings.
     # text_only flag skips using the full sequence length to calculate padding and uses
     # the provided decoder_seq_len
-    if args.sequence_parallel and args.decoder_tp_comm_overlap and not text_only:
+    if args.sequence_parallel and args.decoder_tp_comm_overlap:
         # If TP Comm Overlap is enabled for combined text+image embedding in LM backbone,
         # user needs to provide decoder_seq_length with any potential padding needed for SP+CP
         assert args.decoder_seq_length is not None, \
@@ -53,9 +53,6 @@ def calculate_model_parallel_padding(decoder_seq_len, text_only=False):
         elif args.sequence_parallel:
             padding_factor = tp_size
         mp_padding_needed = int((decoder_seq_len + padding_factor - 1) // (padding_factor) * (padding_factor)) - decoder_seq_len
-        args.decoder_seq_length = decoder_seq_len + mp_padding_needed
-    else:
-        args.decoder_seq_length = decoder_seq_len
 
     return mp_padding_needed
 
@@ -82,6 +79,8 @@ def model_provider(
     vision_model_type = "clip"
 
     assert args.ckpt_format == 'torch', "Only ckpt-format torch is supported for VLM training currently."
+    assert not (args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1), "PP+CP is not yet supported by this script. \
+    Current mock dataset does not support natively packed sequence dataset required for correct PP comm shapes."
 
     num_image_embeddings = get_num_image_embeddings(
         args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token,
@@ -103,6 +102,7 @@ def model_provider(
             f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
         )
     mp_padding_needed = calculate_model_parallel_padding(decoder_seq_len)
+    args.decoder_seq_length = decoder_seq_len + mp_padding_needed
 
     args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
@@ -183,11 +183,16 @@ def model_provider(
     if args.virtual_pipeline_model_parallel_size:
         raise NotImplementedError("virtual pipeline model parallelism is not supported yet.")
 
+    language_max_sequence_length = args.decoder_seq_length
+    if args.context_parallel_size > 1:
+        if args.use_packed_sequence or mp_padding_needed > 0:
+            # Use THD data format
+            language_max_sequence_length = args.decoder_seq_length * args.micro_batch_size
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
         language_vocab_size=args.padded_vocab_size,
-        language_max_sequence_length=args.decoder_seq_length,
+        language_max_sequence_length=language_max_sequence_length,
         vision_transformer_config=vision_transformer_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
         drop_vision_class_token=args.disable_vision_class_token,
@@ -298,7 +303,7 @@ def get_batch(data_iterator):
     Returns:
         sample: A data sample with images, tokens, etc.
     """
-    def _get_packed_seq_params(tokens, img_seq_len, mp_padding_needed):
+    def _get_packed_seq_params(tokens, img_seq_len, mp_padding_needed, use_packed_sequence):
         batch_size = tokens.shape[0]
         # Calculate the valid token seq len that LM backbone should compute on
         combined_valid_seqlen = tokens.shape[1] + img_seq_len - mp_padding_needed
@@ -308,7 +313,7 @@ def get_batch(data_iterator):
         combined_padded_seqlen = tokens.shape[1] + img_seq_len
         cu_seqlens_padded = None
         qkv_format = 'sbhd'
-        if cp_size > 1:
+        if cp_size > 1 and (mp_padding_needed > 0 or use_packed_sequence):
             # Provide cu_seqlens_<q/kv>_padded for CP support
             cu_seqlens_padded = torch.arange(
                 0, (batch_size + 1) * (combined_padded_seqlen), step=(combined_padded_seqlen), dtype=torch.int32, device=tokens.device)
@@ -353,20 +358,34 @@ def get_batch(data_iterator):
             args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token, 1
         )
         # Pad to make sure the text sequence can be sharded equally by CP chunks.
-        mp_padding_needed_for_text = calculate_model_parallel_padding(tokens.shape[1], text_only=True)
-        if mp_padding_needed_for_text > 0:
-            tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed_for_text)) for item in (tokens, position_ids, labels, loss_mask)]
-        # Image token mask must be supplied before distributed sequence to CP ranks.
         image_token_mask = tokens == DEFAULT_IMAGE_TOKEN_INDEX
         num_images_per_sample = torch.sum(image_token_mask, dim=-1)
         img_seq_len = (num_image_embeddings_per_tile * num_images_per_sample - num_images_per_sample).max()
-        packed_seq_params = _get_packed_seq_params(tokens, img_seq_len, mp_padding_needed_for_text)
+        mp_padding_needed_for_text = calculate_model_parallel_padding(tokens.shape[1] + img_seq_len)
+        if mp_padding_needed_for_text > 0:
+            tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed_for_text)) for item in (tokens, position_ids, labels, loss_mask)]
+        packed_seq_params = _get_packed_seq_params(tokens, img_seq_len, mp_padding_needed_for_text, args.use_packed_sequence)
 
-    # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank({"tokens": tokens, "position_ids": position_ids})
+        if packed_seq_params.qkv_format == 'thd':
+            # Reshape from [B,S] to [T,1]
+            tokens = (
+                tokens.contiguous()
+                .view(tokens.shape[0] * tokens.shape[1])
+                .unsqueeze(0)
+            )
+            position_ids = (
+                position_ids.contiguous()
+                .view(position_ids.shape[0] * position_ids.shape[1])
+                .unsqueeze(0)
+            )
+            labels = labels.view(labels.shape[0] * labels.shape[1]).unsqueeze(0)
+            loss_mask = loss_mask.view(
+                loss_mask.shape[0] * loss_mask.shape[1]
+            ).unsqueeze(0)
+
     attention_mask = None  # Use the attention mask type defined in layer spec. Typically no mask for the vision model and causal mask for the vision model.
 
-    return batch["tokens"], batch["position_ids"], labels, images, loss_mask, attention_mask, image_token_mask, packed_seq_params
+    return tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -384,11 +403,11 @@ def forward_step(data_iterator, model: LLaVAModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, position_ids, labels, images, loss_mask, attention_mask, image_token_mask, packed_seq_params = get_batch(data_iterator)
+    tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params = get_batch(data_iterator)
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(
-        images, tokens, position_ids, attention_mask, labels, loss_mask, image_token_mask=image_token_mask, packed_seq_params=packed_seq_params
+        images, tokens, position_ids, attention_mask, labels, loss_mask, packed_seq_params=packed_seq_params
     )
 
     return output_tensor, partial(loss_func, loss_mask)
@@ -413,6 +432,12 @@ def add_vlm_extra_args(parser):
     group.add_argument("--decoder-tp-comm-overlap", action="store_true", default=False, help="Enables the overlap of "
                         "Tensor parallel communication and GEMM kernels in Decoder only. "
                         "Please provide decoder-seq-length when using this feature.")
+    group.add_argument(
+        "--use-packed-sequence",
+        action="store_true",
+        default=False,
+        help="Use packed sequence",
+    )
     return parser
 
 

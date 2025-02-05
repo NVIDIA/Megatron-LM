@@ -1,5 +1,6 @@
 from functools import partial
 from types import SimpleNamespace
+from typing import Any, Callable, Tuple, Union
 from unittest import mock
 
 import torch
@@ -65,7 +66,7 @@ def initialize_moe_model(
     use_sp=False,
     use_te=False,
     use_grouped_mlp=False,
-    **config_kwargs
+    **config_kwargs,
 ):
     model_parallel_device_manual_seed(seed)
     expert_num = 8
@@ -192,6 +193,31 @@ def setup_model_and_optimizer(
     optimizer.reload_model_params()
 
     return unwrap_model(model), optimizer
+
+
+def find_matching_values(
+    x: Union[dict, list], predicate: Callable[[Any], bool]
+) -> Tuple[Union[dict, list], Union[dict, list]]:
+    """Return matching values in a single list
+
+    Args:
+        x (Union[dict, list]) : state dict to process. Top-level argument must be a dict or list
+        predicate (object -> bool): determines matching values
+    """
+
+    matching_vals = []
+    if hasattr(x, 'values') and callable(getattr(x, 'values')):
+        values = x.values()
+    elif isinstance(x, list):
+        values = x
+    else:
+        raise ValueError(f'Unexpected top-level object type: {type(x)}')
+    for v in values:
+        if isinstance(v, (list, dict)):
+            matching_vals += find_matching_values(v, predicate)
+        elif predicate(v):
+            matching_vals.append(v)
+    return matching_vals
 
 
 def setup_moe_model_and_optimizer(

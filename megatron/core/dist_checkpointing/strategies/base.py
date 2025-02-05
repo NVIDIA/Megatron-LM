@@ -233,6 +233,7 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
 def init_async_calls(process_group: torch.distributed.ProcessGroup=None):
     global async_calls
     async_calls = AsyncCallsQueue(process_group=process_group)
+    rank = torch.distributed.get_rank()
 
 def deinit_async_calls():
     global async_calls

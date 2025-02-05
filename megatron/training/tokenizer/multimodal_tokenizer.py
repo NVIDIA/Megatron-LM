@@ -109,7 +109,7 @@ class MultimodalTokenizer(MegatronTokenizer):
                 has_bos=True,
                 has_system_role=True,
             )
-        elif prompt_format == "llama3p1":
+        elif prompt_format in ("llama3p1", "llama3p2"):
             # "<|start_header_id|>assistant<|end_header|>\n\n" is the prefix for assistant messages.
             # That occupies 4 tokens and can be masked in the target.
             self._prompt_config = PromptConfig(
