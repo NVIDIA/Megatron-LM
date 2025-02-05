@@ -11,6 +11,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.longrope_rotary_pos_embedding import LongRoPERotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
@@ -42,7 +43,7 @@ class GPTModel(LanguageModule):
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional):
             When True, input embeddings and output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope], optional):
+        position_embedding_type (Literal[learned_absolute,rope,longrope], optional):
             Position embedding type.. Defaults to 'learned_absolute'.
         rotary_percent (float, optional):
             Percent of rotary dimension to use for rotary position embeddings.
@@ -72,7 +73,7 @@ class GPTModel(LanguageModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
+        position_embedding_type: Literal['learned_absolute', 'rope', 'longrope', 'none'] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
@@ -124,6 +125,19 @@ class GPTModel(LanguageModule):
                 rope_scaling=rope_scaling,
                 rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+            )
+        elif self.position_embedding_type == 'longrope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = LongRoPERotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                short_factor=self.config.short_factor,
+                long_factor=self.config.long_factor,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                rope_scaling_factor=rope_scaling_factor,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                original_max_position_embeddings=config.max_position_embeddings
             )
 
         # Cache for RoPE tensors which do not change between iterations.
