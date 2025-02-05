@@ -2,6 +2,7 @@
 
 import argparse
 import importlib
+import torch
 import torch.multiprocessing as mp
 import sys
 
@@ -107,6 +108,9 @@ def load_plugin(plugin_type, name):
     return plugin
 
 def main():
+    if not torch.cuda.is_initialized():
+        torch.cuda.init()
+
     import argparse
     parser = argparse.ArgumentParser(description="Megatron Checkpoint Converter Arguments",
                                      allow_abbrev=False, conflict_handler='resolve')
@@ -167,4 +171,5 @@ def main():
 
 
 if __name__ == '__main__':
+    mp.set_start_method(method='spawn')
     main()
