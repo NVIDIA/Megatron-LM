@@ -358,6 +358,30 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    ##################
+    # Cuda Graphs
+    ##################
+    enable_cuda_graph: bool = False
+    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
+
+    cuda_graph_use_single_mempool: bool = False
+    """When set to true, cudagraphs will be captured inside a single mempool, in which all 
+    cudagraphs may only be used once per step. If false, cudagraphs may be reused across 
+    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation, 
+    however may greatly increase the number of cudagraphs created when the number of microbatches 
+    is high."""
+
+    cuda_graph_retain_backward_graph: bool = False
+    """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
+    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For 
+    more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
+
+    cuda_graph_warmup_steps: int = 3
+    """Number of warmup steps for CUDA graphs"""
+
+    external_cuda_graph: bool = False
+    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+
     ####################
     # miscellaneous
     ####################
@@ -367,20 +391,6 @@ class TransformerConfig(ModelParallelConfig):
 
     disable_parameter_transpose_cache: bool = False
     """When set to true, the parameter transposes are not cached for subsequent iterations."""
-
-    enable_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
-
-    cuda_graph_retain_backward_graph: bool = False
-    """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
-    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For 
-    more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
-
-    external_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
-
-    cuda_graph_warmup_steps: int = 3
-    """Number of warmup steps for CUDA graphs"""
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""

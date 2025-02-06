@@ -171,7 +171,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 assert (
                     self.config.flash_decode
                 ), "--flash-decode is required to use CUDA graphs during inference"
-            self.cudagraph_manager = CudaGraphManager()
+            self.cudagraph_manager = CudaGraphManager(config)
 
         self.submodules_config = submodules
         self.layer_number = layer_number + TransformerLayer._get_layer_offset(self.config)
