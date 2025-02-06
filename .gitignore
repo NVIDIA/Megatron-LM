@@ -12,3 +12,5 @@ local/
 wandb/
 onelogger.log
 onelogger.err
+core_nid*
+datasets/
