@@ -1,0 +1,1 @@
+Recommended directory to store all slurm logs

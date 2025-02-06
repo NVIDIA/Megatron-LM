@@ -1,0 +1,1 @@
+Recommended directory to store all training slurm logs
