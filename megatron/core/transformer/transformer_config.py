@@ -290,6 +290,11 @@ class TransformerConfig(ModelParallelConfig):
     routing on a subset of expert parallel ranks by first selecting N ranks for each token, then
     conducting top-k selection among experts on these devices. None means no device limitation."""
 
+    moe_router_device_choice_method: str = 'max'
+    """The method to select the top-k devices, only works when --moe-router-topk-limited-devices 
+    is not None. "max" is used in DeepSeekV2 and "top2-sum" is used in DeepSeekV3. The default is 
+    "max"."""
+
     moe_router_pre_softmax: bool = False
     """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
     By default, softmax is done after top-k."""

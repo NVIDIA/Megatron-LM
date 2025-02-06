@@ -333,6 +333,7 @@ def device_limited_topk(
     num_tokens: int,
     num_experts: int,
     moe_router_topk_limited_devices: int,
+    moe_router_topk_limited_devices_method: str,
 ):
     """Perform top-k routing on a subset of expert parallel ranks.
 
@@ -346,16 +347,25 @@ def device_limited_topk(
         num_experts (int): The number of experts.
         moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
             each token during routing. None means no device limitation.
+        moe_router_topk_limited_devices_method (str): The method to select the top-k devices.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
-
+        
     # Organize the experts into groups
     num_group = (
         parallel_state.get_expert_model_parallel_world_size()
     )  # num_group equals to expert parallel size
-    group_scores = scores.view(num_tokens, num_group, -1).max(dim=-1).values
+
+    group_scores = scores.view(num_tokens, num_group, -1)
+    if moe_router_topk_limited_devices_method == "max":
+        group_scores = group_scores.max(dim=-1).values
+    elif moe_router_topk_limited_devices_method == "top2-sum":
+        group_scores = group_scores.topk(2, dim=-1).sum(dim=-1).values
+    else:
+        raise ValueError(f"Invalid moe_router_topk_limited_devices_method: {moe_router_topk_limited_devices_method}")
+
     group_idx = torch.topk(group_scores, k=moe_router_topk_limited_devices, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
@@ -381,6 +391,7 @@ def topk_softmax_with_capacity(
     drop_policy: str = "probs",
     use_pre_softmax: bool = False,
     moe_router_topk_limited_devices: int = None,
+    moe_router_device_choice_method: str = "max",
     moe_router_topk_scaling_factor: Optional[float] = None,
     deterministic_mode: bool = False,
     score_function: str = "softmax",
@@ -399,6 +410,8 @@ def topk_softmax_with_capacity(
         use_pre_softmax (bool): Whether to apply softmax before top-k selection.
         moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
             each token during routing. None means no device limitation.
+        moe_router_device_choice_method (str): The method to select the top-k devices.
+            only works when --moe-router-topk-limited-devices is not None.
         moe_router_topk_scaling_factor (float): Scaling factor for routing score in top-k
             selection, only works when use_pre_softmax enabled.
         deterministic_mode (bool): Deprecated.
@@ -415,27 +428,54 @@ def topk_softmax_with_capacity(
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
 
-    def compute_topk(scores, topk, limited_devices=None):
+    def compute_topk(scores, topk, limited_devices=None, device_choice_method='max'):
         if limited_devices:
-            return device_limited_topk(scores, topk, num_tokens, num_experts, limited_devices)
+            return device_limited_topk(
+                scores,
+                topk,
+                num_tokens,
+                num_experts,
+                limited_devices,
+                device_choice_method,
+            )
         else:
             return torch.topk(scores, k=topk, dim=1)
 
     if score_function == "softmax":
         if use_pre_softmax:
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
-            probs, top_indices = compute_topk(scores, topk, moe_router_topk_limited_devices)
+            probs, top_indices = compute_topk(
+                scores,
+                topk,
+                moe_router_topk_limited_devices,
+                moe_router_device_choice_method,
+            )
         else:
-            scores, top_indices = compute_topk(logits, topk, moe_router_topk_limited_devices)
+            scores, top_indices = compute_topk(
+                scores,
+                topk,
+                moe_router_topk_limited_devices,
+                moe_router_device_choice_method,
+            )
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
         scores = torch.sigmoid(logits)
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias
-            _, top_indices = compute_topk(scores_for_routing, topk, moe_router_topk_limited_devices)
+            _, top_indices = compute_topk(
+                scores_for_routing,
+                topk,
+                moe_router_topk_limited_devices,
+                moe_router_device_choice_method,
+            )
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
-            scores, top_indices = compute_topk(scores, topk, moe_router_topk_limited_devices)
+            scores, top_indices = compute_topk(
+                scores_for_routing,
+                topk,
+                moe_router_topk_limited_devices,
+                moe_router_device_choice_method,
+            )
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")

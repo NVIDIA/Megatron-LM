@@ -2199,6 +2199,10 @@ def _add_moe_args(parser):
                        help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
     group.add_argument('--moe-router-topk-limited-devices', type=int, default=None,
                        help='Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. Default is None, which means no limited devices.')
+    group.add_argument('--moe-router-device-choice-method', type=int, default='max',
+                       choices=['max', 'top2-sum'],
+                       help='The method to select the top-k devices, only works when --moe-router-topk-limited-devices is not None. "max" is used in DeepSeekV2 and "top2-sum" is used in DeepSeekV3. The default is "max".'
+    )
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
     group.add_argument('--moe-router-enable-expert-bias', action='store_true',
