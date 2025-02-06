@@ -352,7 +352,6 @@ def device_limited_topk(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
-        
     # Organize the experts into groups
     num_group = (
         parallel_state.get_expert_model_parallel_world_size()
