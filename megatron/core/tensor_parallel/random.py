@@ -5,10 +5,12 @@
 
 import contextlib
 import logging
+from functools import partial
+from typing import Union
 
 import torch
 from torch import _C
-from torch.cuda import _lazy_call
+from torch.cuda import _lazy_call, _lazy_init
 from torch.cuda import device as device_ctx_manager
 from torch.utils.checkpoint import detach_variable
 
@@ -21,17 +23,59 @@ from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_da
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ModuleNotFoundError:
+    HAVE_TE = False
+
+
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
 _DATA_PARALLEL_RNG_TRACKER_NAME = 'data-parallel-rng'
 
 
-def _set_cuda_rng_state(new_state, device=-1):
+def _get_cuda_rng_state(
+    device: Union[int, str, torch.device] = "cuda", clone: bool = False, graph_safe: bool = False
+) -> torch.Tensor:
+    """Return the random number generator state of the specified GPU.
+
+    Arguments:
+        device (int): The gpu to retrieve the rng state
+        clone (bool): Whether to also clone the retrieved RNG state
+        graph_safe (bool): Get the rng state in a graph safe manner.
+
+    This function is adapted from torch.cuda.random.get_rng_state()"""
+
+    # if not using cuda graphs, just use the builtin pytorch function
+    if not graph_safe:
+        return torch.cuda.random.get_rng_state(device=device)
+
+    _lazy_init()
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device("cuda", device)
+    idx = device.index
+    if idx is None:
+        idx = torch.cuda.current_device()
+
+    default_generator = torch.cuda.default_generators[idx]
+    if clone:
+        return default_generator.clone_state()
+    return default_generator.graphsafe_get_state()
+
+
+def _set_cuda_rng_state(new_state: torch.Tensor, device: int = -1, graph_safe: bool = False):
     """Sets the random number generator state of the current GPU.
 
-    Argumentss:
+    Arguments:
         new_state (torch.ByteTensor): The desired state
+        device (int): The gpu to retrieve the rng state
+        graph_safe (bool): Set the rng state in a graph safe manner.
+
     This function is adapted from PyTorch repo (torch.cuda.set_rng_state)
     with a single change: the input state is not cloned. Cloning caused
     major performance issues for +4 GPU cases.
@@ -56,7 +100,12 @@ def _set_cuda_rng_state(new_state, device=-1):
             if idx is None:
                 idx = torch.cuda.current_device()
             default_generator = torch.cuda.default_generators[idx]
-            default_generator.set_state(new_state)
+
+            # if graph capturing, set the rng state in a cudagraphable way
+            if graph_safe:
+                default_generator.graphsafe_set_state(new_state)
+            else:
+                default_generator.set_state(new_state)
 
     _lazy_call(cb)
 
@@ -82,8 +131,17 @@ class CudaRNGStatesTracker:
     cuda state.
     """
 
-    def __init__(self):
+    def __init__(self, use_cudagraphable_rng=False):
         self.reset()
+        self.use_cudagraphable_rng = use_cudagraphable_rng
+
+        if self.use_cudagraphable_rng:
+            assert (
+                hasattr(torch.cuda.CUDAGraph, "register_generator_state")
+                and hasattr(torch.Generator, "graphsafe_set_state")
+                and hasattr(torch.Generator, "graphsafe_get_state")
+                and hasattr(torch.Generator, "clone_state")
+            ), "Tried using cudagraphs with RNG, however not detected in pytorch!"
 
     def is_initialized(self):
         """Checks if the internal RNG state has been set wirth set_states()."""
@@ -125,13 +183,20 @@ class CudaRNGStatesTracker:
         # Check that state is not already defined.
         if name in self.states_:
             raise Exception('cuda rng state {} already exists'.format(name))
-        # Get the current rng state.
-        orig_rng_state = torch.cuda.get_rng_state()
-        # Set the new state and store it.
-        torch.cuda.manual_seed(seed)
-        self.states_[name] = torch.cuda.get_rng_state()
-        # Reset rng state to what it was.
-        _set_cuda_rng_state(orig_rng_state)
+
+        # If available, create the state in a graph safe manner
+        if self.use_cudagraphable_rng:
+            new_state = _get_cuda_rng_state(clone=True, graph_safe=True)
+            new_state.manual_seed(seed)
+            self.states_[name] = new_state
+        else:
+            # Get the current rng state.
+            orig_rng_state = torch.cuda.get_rng_state()
+            # Set the new state and store it.
+            torch.cuda.manual_seed(seed)
+            self.states_[name] = torch.cuda.get_rng_state()
+            # Reset rng state to what it was.
+            _set_cuda_rng_state(orig_rng_state)
 
     @contextlib.contextmanager
     def fork(self, name=_MODEL_PARALLEL_RNG_TRACKER_NAME):
@@ -141,9 +206,9 @@ class CudaRNGStatesTracker:
         if name not in self.states_:
             raise Exception('cuda rng state {} is not added'.format(name))
         # Store current rng state.
-        orig_cuda_rng_state = torch.cuda.get_rng_state()
+        orig_cuda_rng_state = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
         # Set rng state to the desired one
-        _set_cuda_rng_state(self.states_[name])
+        _set_cuda_rng_state(self.states_[name], graph_safe=self.use_cudagraphable_rng)
         # Record cpu RNG state
         cpu_rng_state = torch.get_rng_state()
         # Do the stuff we wanted to do.
@@ -154,9 +219,9 @@ class CudaRNGStatesTracker:
             if not torch.all(cpu_rng_state == torch.get_rng_state()).item():
                 logging.getLogger(__name__).warning('CPU RNG state changed within GPU RNG context')
             # Update the current rng state for later use.
-            self.states_[name] = torch.cuda.get_rng_state()
+            self.states_[name] = _get_cuda_rng_state(graph_safe=self.use_cudagraphable_rng)
             # And set the state to the original state we started with.
-            _set_cuda_rng_state(orig_cuda_rng_state)
+            _set_cuda_rng_state(orig_cuda_rng_state, graph_safe=self.use_cudagraphable_rng)
 
 
 # RNG tracker object.
@@ -164,7 +229,11 @@ _CUDA_RNG_STATE_TRACKER = None
 _CUDA_RNG_STATE_TRACKER_INITIALIZED = False
 
 
-def initialize_rng_tracker(use_te_rng_tracker: bool = False, inference_rng_tracker: bool = False):
+def initialize_rng_tracker(
+    use_te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
     Megatron or TransformerEngine's implementation.
     In particular, TransformerEngine's implementation is cudagraphable and supports FP8.
@@ -176,14 +245,14 @@ def initialize_rng_tracker(use_te_rng_tracker: bool = False, inference_rng_track
 
     # Get the base tracker class
     base_tracker = None
-    if use_te_rng_tracker:
+    if HAVE_TE and use_te_rng_tracker:
         if not is_te_min_version("1.5.0"):
             raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
         base_tracker = TECudaRNGStatesTracker
     else:
-        base_tracker = CudaRNGStatesTracker
+        base_tracker = partial(CudaRNGStatesTracker, use_cudagraphable_rng=use_cudagraphable_rng)
 
     if inference_rng_tracker:
 
@@ -214,6 +283,28 @@ def get_cuda_rng_tracker(use_te_rng_tracker=False, inference_rng_tracker=False):
     """Get cuda rng tracker."""
     initialize_rng_tracker(use_te_rng_tracker, inference_rng_tracker)
     return _CUDA_RNG_STATE_TRACKER
+
+
+def get_all_rng_states() -> bool:
+    """Returns all generator states used by the current `CudaRNGStatesTracker`."""
+
+    assert (
+        _CUDA_RNG_STATE_TRACKER_INITIALIZED
+    ), "Tried getting all rng states but RNG Tracker has not been initalized!"
+
+    if isinstance(_CUDA_RNG_STATE_TRACKER, CudaRNGStatesTracker):
+        return _CUDA_RNG_STATE_TRACKER.states_
+    # If TE is installed, check if we are using TE's RNG tracker
+    elif HAVE_TE and is_te_min_version("1.5.0"):
+        from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+
+        if isinstance(_CUDA_RNG_STATE_TRACKER, TECudaRNGStatesTracker):
+            from transformer_engine.pytorch.distributed import get_all_rng_states
+
+            return get_all_rng_states()
+    # no valid tracker, return an empty dict
+    else:
+        return {}
 
 
 def model_parallel_cuda_manual_seed(seed, te_rng_tracker=False, inference_rng_tracker=False):
@@ -271,7 +362,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
-        ctx.fwd_cuda_rng_state = torch.cuda.get_rng_state()
+        ctx.fwd_cuda_rng_state = _get_cuda_rng_state()
         ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
 
         with torch.no_grad():
@@ -306,7 +397,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Store the current states.
         bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_cuda_rng_state = torch.cuda.get_rng_state()
+        bwd_cuda_rng_state = _get_cuda_rng_state()
         bwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
 
         # Set the states to what it used to be before the forward pass.
