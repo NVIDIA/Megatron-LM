@@ -333,7 +333,7 @@ def device_limited_topk(
     num_tokens: int,
     num_experts: int,
     moe_router_topk_limited_devices: int,
-    moe_router_topk_limited_devices_method: str,
+    moe_router_device_choice_method: str,
 ):
     """Perform top-k routing on a subset of expert parallel ranks.
 
@@ -347,7 +347,7 @@ def device_limited_topk(
         num_experts (int): The number of experts.
         moe_router_topk_limited_devices (int): Number of expert parallel ranks to consider for
             each token during routing. None means no device limitation.
-        moe_router_topk_limited_devices_method (str): The method to select the top-k devices.
+        moe_router_device_choice_method (str): The method to select the top-k devices.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
@@ -359,12 +359,12 @@ def device_limited_topk(
     )  # num_group equals to expert parallel size
 
     group_scores = scores.view(num_tokens, num_group, -1)
-    if moe_router_topk_limited_devices_method == "max":
+    if moe_router_device_choice_method == "max":
         group_scores = group_scores.max(dim=-1).values
-    elif moe_router_topk_limited_devices_method == "top2-sum":
+    elif moe_router_device_choice_method == "top2-sum":
         group_scores = group_scores.topk(2, dim=-1).sum(dim=-1).values
     else:
-        raise ValueError(f"Invalid moe_router_topk_limited_devices_method: {moe_router_topk_limited_devices_method}")
+        raise ValueError(f"Invalid moe_router_device_choice_method: {moe_router_device_choice_method}")
 
     group_idx = torch.topk(group_scores, k=moe_router_topk_limited_devices, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
