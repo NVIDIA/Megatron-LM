@@ -1184,6 +1184,16 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 if ckpt_tp_pp != run_tp_pp:
                     print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
 
+            # [ModelOpt]: IMPORTANT! Restoring modelopt_state (sharded or not) must be performed
+            # after the model instance has been created and before _load_base_checkpoint is called.
+            if has_nvidia_modelopt:
+                if ckpt_type == CheckpointType.LOCAL:
+                    raise NotImplementedError('Local checkpointing does not support model opt')
+                if not args.use_dist_ckpt:
+                    restore_modelopt_state(model, state_dict)
+                else:
+                    restore_sharded_modelopt_state(model, checkpoint_name)
+
             # [ModelOpt]: Initial loading from non-resume sharded checkpoint to a Distillation Model
             # will result in key mismatch with loss modules potentially containing parameters, since
             # it requires generating a state_dict before loading. Here we hide those modules if present.
@@ -1243,13 +1253,6 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                                               'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
-
-    # [ModelOpt]: loading modelopt_state (sharded or not)
-    if has_nvidia_modelopt:
-        if ckpt_type == CheckpointType.GLOBAL:
-            restore_sharded_modelopt_state(model, checkpoint_name)
-        else:
-            restore_modelopt_state(model, state_dict)
 
     # Model.
     strict = False if args.retro_add_retriever else strict
