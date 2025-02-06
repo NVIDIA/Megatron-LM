@@ -87,7 +87,7 @@ def score_and_return_on_first_stage(model, tokens: torch.Tensor, lengths: torch.
         if mpu.is_pipeline_last_stage():
             # Always the last stage should have an output.
             assert logits is not None
-            log_probs = F.log_softmax(logits, dim=2)
+            log_probs = F.log_softmax(logits, dim=2).to(dtype=output_topk_log_probs.dtype)
 
             # Pick the tokens that we need to get the log
             # probabilities for. Note that next input token is
