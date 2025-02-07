@@ -35,6 +35,35 @@ This is the codebase to run megatron efficiently at scale using Clariden. The co
 
 You can submit issues and create branches on `https://github.com/swiss-ai/Megatron-LM`. The main branch is protected so you won't be able to directly commit to it.
 
+1. Pull the latest version
+  ```
+  git pull
+  ```
+
+2. Create a branch with a descriptive name
+  ```
+  git checkout -b my-contribution-branch
+  ```
+
+3. Make your changes locally and commit them. Make sure your latest commit works as expected. Do not commit unnecessary files. 
+
+4. sync with the latest main
+  ```
+  git pull origin main
+  ```
+
+5. Push your commit to your branch
+```
+git push origin my-contribution-branch
+```
+
+6. Go to `https://github.com/swiss-ai/Megatron-LM` and create a new issue that references your branch and explains what you did. Add ischlag or TJ-Solergibert for now. 
+
+7. Use this command to return to main branch.
+  ```
+  git checkout main
+  ```
+
 ## How To's
 
 We will add detailed steps for specific workflows fairly soon.
