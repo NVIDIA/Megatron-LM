@@ -57,7 +57,7 @@ def get_moe_model_and_buffers(
     num_moe_experts: int,
     moe_grouped_gemm: bool,
     ep_size: int,
-    bucket_size: int,
+    bucket_size: Optional[int],
     use_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
     average_in_collective: bool,

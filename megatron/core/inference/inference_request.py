@@ -18,7 +18,7 @@ class Status(Enum):
     COMPLETED = 4
 
 
-@dataclass
+@dataclass(kw_only=True)
 class InferenceRequest:
     """Class for one inference request
 
@@ -28,15 +28,24 @@ class InferenceRequest:
 
     request_id: str
     prompt: str
-    inference_parameters: SamplingParams
-    prompt_tokens: List[int]
-    arrival_time: float
-    status: Status
-    prompt_log_probs: Optional[float] = None
+    inference_parameters: Optional[SamplingParams] = None
+    prompt_tokens: Optional[List[int]] = None
+    arrival_time: Optional[float] = None
+    status: Optional[Status] = None
     encoder_prompt: Optional[str] = None
     generated_text: Optional[str] = None
     generated_segments: Optional[List[List[str]]] = None
     generated_sequence_lengths: Optional[List[int]] = None
     generated_tokens: Optional[torch.Tensor] = None
-    generated_log_probs: Optional[float] = None
-    generated_length: int = 0
+    generated_log_probs: Optional[torch.Tensor] = None
+    generated_length: Optional[int] = None
+
+
+@dataclass(kw_only=True)
+class VLMInferenceRequest(InferenceRequest):
+    """Class for a VLM inference request"""
+
+    num_img_embeddings_per_tile: int
+    imgs: torch.Tensor
+    num_tiles: torch.Tensor
+    decoder_seq_length: int
