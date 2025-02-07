@@ -23,8 +23,8 @@ Resolved Issues:
 
 ```shell
 # clone source code
-git clone https://github.com/microsoft/DeepSpeed.git
-git clone https://github.com/microsoft/Megatron-DeepSpeed.git
+git clone https://github.com/deepspeedai/DeepSpeed.git
+git clone https://github.com/deepspeedai/Megatron-DeepSpeed.git
 git clone https://github.com/NVIDIA/apex
 
 # creat a new virtual environment
@@ -52,7 +52,7 @@ Megatron-DeepSpeed's sequence parallelism can be combined with the following typ
 - FlashAttention version 2.x (enabled by `--use-flash-attn-v2`)
 - FlashAttention + Triton (enabled by `--use-flash-attn-triton`)
 
-FlashAttention version 2.x may have numerical stability issues. For the best performance, we recommend using FlashAttention + Triton. 
+FlashAttention version 2.x may have numerical stability issues. For the best performance, we recommend using FlashAttention + Triton.
 We show installation steps of thoes 3 types of FlashAttention
 
 ```shell
@@ -82,7 +82,7 @@ python setup.py install
 
 One of the optimizations enabled from this rebase is to enable Megatron-style long sequence parallelism. To enable sequence parallelism, add the `--sequence-parallel` flag in the training script. We provide two training scripts for ([GPT1.3B](pretrain_gpt_1.3B_seq_parallel.sh) and [GPT30B](pretrain_gpt_13B_seq_parallel.sh)) that enable sequence parallelism, which are available in this foloder.
 
-By default, the degree of sequence parallelism is equal to the degree of model tensor parallelism. The users may also want to ensure that the sequence length is divisible by the degree of sequence parallelism to avoid performance penalties. 
+By default, the degree of sequence parallelism is equal to the degree of model tensor parallelism. The users may also want to ensure that the sequence length is divisible by the degree of sequence parallelism to avoid performance penalties.
 Please also ensure that your model dimension is compliant with FlashAttention's requirements. For instance, to achieve the optimal performance, the head size should be divisible by 8. Refer to the document of [FlashAttention](https://github.com/Dao-AILab/flash-attention/tree/v1.0.4) for more details.
 
 ## Performance Comparison between Old Megatron-DeepSpeed and New Megatron-DeepSpeed

@@ -1,14 +1,14 @@
 ## Latest News
-* [2023/07] Synced with [upstream](https://github.com/NVIDIA/Megatron-LM) over 1k commits, see [rebase folder for more details](https://github.com/microsoft/Megatron-DeepSpeed/tree/main/examples_deepspeed/rebase) in terms of features and updated performance.
+* [2023/07] Synced with [upstream](https://github.com/NVIDIA/Megatron-LM) over 1k commits, see [rebase folder for more details](https://github.com/deepspeedai/Megatron-DeepSpeed/tree/main/examples_deepspeed/rebase) in terms of features and updated performance.
 
 ## Megatron-DeepSpeed
 DeepSpeed version of NVIDIA's Megatron-LM that adds additional support for several features such as MoE model training, Curriculum Learning, 3D Parallelism, and others. The ```examples_deepspeed/``` folder includes example scripts about the features supported by DeepSpeed.
 
 ### Recent sync with NVIDIA/Megatron-LM
-In July 2023, we had a sync with the NVIDIA/Megatron-LM repo (where this repo is forked from) by git-merging 1100+ commits. Details can be found in the ```examples_deepspeed/rebase``` folder. Given the amount of merged commits, bugs can happen in the cases that we haven't tested, and your contribution (bug report, bug fix pull request) is highly welcomed. We also created a [backup branch](https://github.com/microsoft/Megatron-DeepSpeed/tree/before_rebase) which is the version before this sync. This backup branch is just for comparison tests and for temporary use when you need to debug the main branch. We do not plan to continue supporting the version before sync.
+In July 2023, we had a sync with the NVIDIA/Megatron-LM repo (where this repo is forked from) by git-merging 1100+ commits. Details can be found in the ```examples_deepspeed/rebase``` folder. Given the amount of merged commits, bugs can happen in the cases that we haven't tested, and your contribution (bug report, bug fix pull request) is highly welcomed. We also created a [backup branch](https://github.com/deepspeedai/Megatron-DeepSpeed/tree/before_rebase) which is the version before this sync. This backup branch is just for comparison tests and for temporary use when you need to debug the main branch. We do not plan to continue supporting the version before sync.
 
 ### Run on Azure and AzureML
-To try out DeepSpeed on Azure, this fork of Megatron offers easy-to-use recipes and bash scripts. We strongly recommend to start with AzureML recipe in the ```examples_deepspeed/azureml``` folder. If you have a custom infrastructure (e.g. HPC clusters) or Azure VM based environment, please refer to the bash scripts in the ```examples_deepspeed/azure``` folder. 
+To try out DeepSpeed on Azure, this fork of Megatron offers easy-to-use recipes and bash scripts. We strongly recommend to start with AzureML recipe in the ```examples_deepspeed/azureml``` folder. If you have a custom infrastructure (e.g. HPC clusters) or Azure VM based environment, please refer to the bash scripts in the ```examples_deepspeed/azure``` folder.
 
 Below is Megatron-LM's original README. Note that examples mentioned below are from the original NVIDIA/Megatron-LM repo. All of them do NOT have DeepSpeed technologies integrations, and some of them may not work due to changes in this Megatron-DeepSpeed repo. Thus we recommend you to go to ```../examples_deepspeed/``` folder which includes examples that have DeepSpeed technologies integrated and are tested by DeepSpeed team.
 ------

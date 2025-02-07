@@ -103,7 +103,7 @@ if __name__ == '__main__':
         # usage during merge is about 600GB. If you don't have enough memory,
         # one solution is to directly use the 30 data chunks as multiple
         # datasets. See '--data-path' in
-        # github.com/microsoft/Megatron-DeepSpeed/blob/main/megatron/arguments.py
+        # github.com/deepspeedai/Megatron-DeepSpeed/blob/main/megatron/arguments.py
         pile_merge(file_path)
     else:
         if sys.argv[1] == "range":
