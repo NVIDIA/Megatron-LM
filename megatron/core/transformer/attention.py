@@ -374,9 +374,9 @@ class Attention(MegatronModule, ABC):
         if (
             self.config.flash_decode
             and inference_params is not None
-            and self.layer_number
-            in inference_params.key_value_memory_dict  # Decode phase if key already exists
+            and inference_params.decode_mode
         ):
+            assert self.layer_number in inference_params.key_value_memory_dict
             assert inference_params.sequence_len_offset is not None
             inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                 self.layer_number

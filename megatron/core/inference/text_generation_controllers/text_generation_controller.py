@@ -360,13 +360,15 @@ class TextGenerationController:
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
-        use_attention_mask = True
-
         with torch.no_grad():
 
             self.inference_wrapped_model.prep_model_for_inference(
                 prompts_tokens=batch_prompt_tokens
             )
+
+            assert (
+                not self.inference_wrapped_model.inference_params.decode_mode
+            ), f"Generation must start in prefill mode"
 
             inference_input: Dict[str, Any] = self.prep_inference_input(
                 prompts_tokens=batch_prompt_tokens, active_requests=active_requests
@@ -382,8 +384,10 @@ class TextGenerationController:
                     )
                 )
 
+                # Disable attention mask when using CUDA graphs for decode
                 if (
-                    not use_attention_mask
+                    enable_cuda_graph
+                    and self.inference_wrapped_model.inference_params.decode_mode
                     and "attention_mask" in inference_input_for_context_window
                 ):
                     inference_input_for_context_window["attention_mask"] = None
@@ -472,9 +476,9 @@ class TextGenerationController:
                 if all_prompts_done:
                     break
 
-                # Disable attention mask for CUDA graphs (decode only)
-                if use_attention_mask and enable_cuda_graph and torch.all(generation_started):
-                    use_attention_mask = False
+                # Change to decode mode if all prefill is complete
+                if torch.all(generation_started):
+                    self.inference_wrapped_model.inference_params.enable_decode_mode()
 
         # Close all streams
         if streaming_enabled:
