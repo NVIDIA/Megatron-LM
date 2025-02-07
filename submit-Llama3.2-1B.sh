@@ -2,7 +2,7 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=00:59:59
-#SBATCH --job-name=Megatron-LM-Llama3-1B
+#SBATCH --job-name=Megatron-LM-Llama3.2-1B
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
 #SBATCH --nodes=1
@@ -170,7 +170,7 @@ TOKENIZER_ARGS=(
 DATA_ARGS=(
 	--split 100,0,0
 	--seq-length $SEQ_LEN
-	--num-workers 1
+	--num-workers 2
 	--num-dataset-builder-threads 1
 )
 
