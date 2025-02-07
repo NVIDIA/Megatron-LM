@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=00:59:59 # 59
+#SBATCH --time=00:59:59
 #SBATCH --job-name=Megatron-LM-Llama3.2-3B
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
