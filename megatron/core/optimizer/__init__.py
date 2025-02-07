@@ -23,6 +23,8 @@ except ImportError:
         # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
         from torch.optim import AdamW as Adam, SGD
 
+from .ademamix import AdEMAMix
+
 from megatron.core import mpu
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
@@ -298,6 +300,32 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
                                 opt.initialize_state(p)
+
+        elif config.optimizer == 'ademamix':
+            kwargs = {
+                "params": param_groups,
+                "lr": config.lr,
+                "weight_decay": config.weight_decay,
+                "betas": (config.adam_beta1, config.adam_beta2, config.ademamix_beta3),
+                "alpha": config.ademamix_alpha,
+                "beta3_warmup": config.ademamix_beta3_warmup,
+                "alpha_warmup": config.ademamix_alpha_warmup,
+                "eps": config.adam_eps,
+            }
+
+            optimizer = AdEMAMix(**kwargs)
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            if config.adam_beta1 != 0:
+                                opt.state[p]['exp_avg_fast'] = torch.zeros_like(p.data)
+                            opt.state[p]['exp_avg_slow'] = torch.zeros_like(p.data)
+                            opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                        else:
+                            opt.initialize_state(p)
+
 
         elif config.optimizer == 'sgd':
             optimizer = SGD(
