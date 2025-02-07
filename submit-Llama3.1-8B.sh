@@ -2,7 +2,7 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=02:59:59
-#SBATCH --job-name=Megatron-LM-Llama3-8B
+#SBATCH --job-name=Megatron-LM-Llama3.1-8B
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
 #SBATCH --nodes=16
@@ -11,18 +11,14 @@
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
-##SBATCH --signal=SIGUSR2@600	# TODO(tj.solergibert) # Send SIGUSR2 (Auto-checkpoint saver signal) 600 seconds before hitting the time limit
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
 echo "START TIME: $(date)"
 
-# TODO(tj.solergibert) Set up Auto-Checkpoint & Auto-Job resubmission 
-# echo "[$(date)] $(sbatch --dependency=singleton $0)"
-
 ################ Configs ################
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full"
 
-MBS=1 # NOTE(tj.solergibert) Set MBS=2 if running with > 32 Nodes
+MBS=1 # NOTE(tj.solergibert) Set MBS=2 if running with >= 32 Nodes
 GBS=256
 SEQ_LEN=8192
 TRAINING_STEPS=5000
@@ -61,7 +57,6 @@ mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
 ln -sfn $CKPT_DIR $EXP_DIR/checkpoint-dir-link
 
-# TODO(tj.solergibert) Set up triggers
 # Clean triggers
 rm -f $TRIGGER_DIR/save
 rm -f $TRIGGER_DIR/exit
@@ -78,13 +73,6 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 
 srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 ulimit -c 0
-
-# TODO(tj.solergibert) Check --record-memory-history
-# TODO(tj.solergibert) Check --tp-comm-overlap
-# TODO(tj.solergibert) Check --exit-signal-handler
-# TODO(tj.solergibert) Check --no-initialization
-# TODO(tj.solergibert) Check --config-logger-dir
-# TODO(tj.solergibert) Check --overlap-param-gather-with-optimizer-step | NOT supported with distributed checkpointing yet?
 
 ### Megatron Args ### Check megatron/training/arguments.py
 TRANSFORMER_ENGINE_ARGS=(
@@ -222,13 +210,11 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
 # WANDB Logging
 if [ -n "$WANDB_API_KEY" ]; then
   echo "[$(date)] WANDB API key detected. Enabling WANDB logging."
-
   # Sync any previous run data if present
   if [ -d "$LOG_EXP_DIR/wandb/latest-run" ]; then
     echo "[$(date)] Syncing WANDB from previous run"
     wandb sync "$LOG_EXP_DIR/wandb/latest-run"
   fi
-
   # Add wandb-related args to TRAINING_CMD
   TRAINING_CMD="$TRAINING_CMD \
     --wandb-save-dir $LOGGING_DIR \
