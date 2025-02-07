@@ -3,7 +3,7 @@
 
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
-BASE_DATA_PATH=datasets
+BASE_DATA_PATH=dataset
 DATASET=${BASE_DATA_PATH}/my-gpt2_text_document
 VOCAB_PATH=${BASE_DATA_PATH}/gpt2-vocab.json
 MERGE_PATH=${BASE_DATA_PATH}/gpt2-merges.txt
@@ -14,7 +14,7 @@ script_dir=$(dirname $script_path)
 CONFIG_JSON="$script_dir/ds_config.json"
 
 ZERO_STAGE=1
-DTYPE="bf16"
+DTYPE="fp16"
 
 # Debug
 DEBUG_MODE=1
@@ -38,7 +38,7 @@ PP=2
 DP=1
 SP=1
 WORLD_SIZE=$((TP*PP*DP*SP))
-GLOBAL_BATCH=4
+GLOBAL_BATCH=16
 MICRO_BATCH=$((GLOBAL_BATCH/WORLD_SIZE))
 TRAIN_ITERS=100000
 LR=6.0e-3
@@ -78,7 +78,7 @@ done
 options=" \
 	--tensor-model-parallel-size $TP \
 	--pipeline-model-parallel-size $PP \
-	--ds-sequence-parallel-size $SP \
+    --ds-sequence-parallel-size $SP \
         --num-layers $LAYERS \
         --hidden-size $HIDDEN \
         --num-attention-heads 32 \
@@ -136,11 +136,16 @@ cat <<EOT > $CONFIG_JSON
   },
 
   "bf16": {
-    "enabled": true
+    "enabled": false
   },
 
-  "data_types": {
-        "grad_accum_dtype": "fp32" 
+  "fp16": {
+    "enabled": true,
+    "loss_scale": 0,
+    "loss_scale_window": 50,
+    "hysteresis": 2,
+    "min_loss_scale": 1,
+    "initial_scale_power": 12
   },
 
   "wall_clock_breakdown" : false
@@ -149,6 +154,7 @@ EOT
 
 WORKER_STR="--num_nodes 1 --num_gpus $WORLD_SIZE"
 run_cmd="deepspeed --master_port 29700 $WORKER_STR ${DIR}/pretrain_gpt.py $@ ${options}"
+
 
 echo ${options}
 echo ${run_cmd}

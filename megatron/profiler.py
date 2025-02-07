@@ -36,7 +36,9 @@ def setup_profiler(args, device):
     def is_capture_step():
         return cur_step >= start_step and cur_step <= end_step
 
-    if args.profile.startswith('pt'):
+    if args.profile.startswith('pt') and (
+        args.profile_ranks is None or torch.distributed.get_rank() in args.profile_ranks
+    ):
         schedule = torch.profiler.schedule(wait=0, warmup=0, active=active_steps, repeat=1)
         activities = [torch.profiler.ProfilerActivity.CPU]
         activities.extend([torch.profiler.ProfilerActivity.HPU] if device.startswith("hpu") else [])

@@ -9,6 +9,7 @@ import importlib.util
 import torch
 
 from torch import einsum, nn
+from deepspeed.accelerator import get_accelerator
 
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
@@ -20,7 +21,9 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, dim, theta=10000):
         super().__init__()
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer('inv_freq', inv_freq)
+        self.inv_freq = inv_freq.to(get_accelerator().current_device_name())
+        self.theta = theta
+        # self.register_buffer('inv_freq', inv_freq)
         if importlib.util.find_spec('einops') is None:
             raise RuntimeError("einops is required for Rotary Embedding")
 
@@ -32,7 +35,9 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
         from einops import rearrange
-        return rearrange(emb, 'n d -> n 1 1 d')
+        base = rearrange(emb, 'n d -> n 1 1 d')
+        rope = [base.cos(), base.sin()]
+        return rope
 
 
 def _rotate_half(x):

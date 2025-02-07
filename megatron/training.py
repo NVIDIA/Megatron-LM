@@ -672,7 +672,6 @@ def train_step(forward_step_func, data_iterator,
     timers = get_timers()
 
     if args.deepspeed and args.ds_pipeline_enabled:
-        skipped_iter = 0
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
         loss = model[0].train_batch(data_iter=data_iterator)
@@ -682,6 +681,8 @@ def train_step(forward_step_func, data_iterator,
         if additional_losses is not None:
             loss_dict.update(additional_losses)
         grad_norm = model[0].get_global_grad_norm()
+        update_successful = model[0].was_step_applied()
+        skipped_iter = 0 if update_successful else 1
         return loss_dict, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
@@ -724,7 +725,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
-        torch.cuda.empty_cache()
+        get_accelerator().empty_cache()
 
     # Reduce gradients.
     if not args.deepspeed:
@@ -760,7 +761,7 @@ def train_step(forward_step_func, data_iterator,
 
     # Update learning rate.
     if args.deepspeed:
-        skipped_iter = 0
+        skipped_iter = 0 if update_successful else 1
         grad_norm = None
         num_zeros_in_grad = None
         
@@ -781,7 +782,7 @@ def train_step(forward_step_func, data_iterator,
 
         # Empty unused memory.
         if args.empty_unused_memory_level >= 2:
-            torch.cuda.empty_cache()
+            get_accelerator().empty_cache()
 
         if mpu.is_pipeline_last_stage(ignore_virtual=True):
             # Average loss across microbatches.
@@ -1031,6 +1032,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         if args.log_optimizer_states_to_tensorboard and optimizer is not None:
             opt_stats = [0.0] * 8
             opt_stats_2 = [0.0] * 4
+
+            #TODO(billishyahao): Remove me after bf16_optimizer promotes its state.
+            if not hasattr(optimizer, "state"):
+                assert hasattr(optimizer, "optimizer"), f"Optimizer must have optimizer property."
+                optimizer.state = optimizer.optimizer.state
+
             for _, group in enumerate(optimizer.param_groups):
                 for _, param in enumerate(group['params']):
                     opt_stats[0] += (torch.norm(optimizer.state[param]['exp_avg_sq']).item())**2
@@ -1437,7 +1444,7 @@ def evaluate(forward_step_func,
 
             # Empty unused memory
             if args.empty_unused_memory_level >= 1:
-                torch.cuda.empty_cache()
+                get_accelerator().empty_cache()
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):
                 # Reduce across processes.

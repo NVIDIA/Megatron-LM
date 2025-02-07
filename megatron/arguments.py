@@ -399,7 +399,8 @@ def validate_args(args, defaults={}):
         args.async_tensor_model_parallel_allreduce = False
 
     if not args.use_dataset_only:
-        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+        if deepspeed.accelerator.get_accelerator().device_name() == "cuda" \
+            and os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
             if args.sequence_parallel:
                 raise RuntimeError(
                     "Using sequence parallelism requires setting the environment variable "
@@ -974,6 +975,14 @@ def _add_training_args(parser):
                        help='Enable DeepSpeed\'s sequence parallel. Cannot be combined with "--sequence-parallel", which enables Megatron-LM\'s sequence parallel.')
     group.add_argument('--force-ds-sequence-parallel', action='store_true',
                        help='use DeepSpeed sequence parallelism regardless of sequence parallel size.')
+    
+    group.add_argument('--ds-sequence-parallel-fpdt', action='store_true',
+                       help='use DeepSpeed sequence parallelism with FPDT.')
+    group.add_argument('--ds-sequence-parallel-fpdt-chunk-size', type=int, default=65536,
+                       help='Chunk size used in FPDT attention.')
+    group.add_argument('--ds-sequence-parallel-fpdt-offloading', action='store_true',
+                       help='use DeepSpeed sequence parallelism FPDT with offloading.')
+
     group.add_argument('--no-gradient-accumulation-fusion',
                        action='store_false',
                        help='Disable fusing gradient accumulation to weight '
@@ -1569,5 +1578,11 @@ def _add_profiler_args(parser):
      type=str,
      default='2,3',
      help="Which steps to profile. Format: <start step>,<end step>")
+    
+    group.add_argument("--profile-ranks",
+     type=int,
+     nargs='+',
+     default=None,
+     help="Which ranks to profile. Format: 0 1 2 3")
 
     return parser

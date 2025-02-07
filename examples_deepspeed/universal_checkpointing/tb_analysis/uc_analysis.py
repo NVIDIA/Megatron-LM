@@ -19,7 +19,7 @@ class UniversalCheckpointingAnalysis(TensorBoardAnalysis):
         tp, pp, dp, sp = match.groups()
 
         self._label_name = f"Training Run: TP: {tp}, PP: {pp}, DP: {dp}"
-        self._csv_name = f"uc_out_tp_{tp}_pp_{pp}_dp_{dp}_sp_{sp}"
+        self._csv_name = f"uc_out_tp{tp}_pp{pp}_dp{dp}_sp{sp}"
 
     def get_label_name(self):
         return self._label_name

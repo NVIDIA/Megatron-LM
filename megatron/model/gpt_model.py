@@ -1,3 +1,4 @@
+# Copyright (C) 2024 Habana Labs, Ltd. an Intel Company.
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """GPT-2 model."""
@@ -19,6 +20,7 @@ from megatron.model import LayerNorm, RMSNorm
 from .language_model import EmbeddingPipe
 from .transformer import ParallelTransformerLayerPipe, LMHeadPipe, get_num_experts_per_layer
 from deepspeed.pipe import PipelineModule, LayerSpec, TiedLayerSpec
+from deepspeed.sequence.fpdt_layer import FPDT_LogitsLoss
 
 
 try:         
@@ -39,28 +41,35 @@ def post_language_model_processing(lm_output, labels, logit_weights,
                                    fp16_lm_cross_entropy):
 
     # Output. Format [s b h]
-    output = parallel_lm_logits(
-        lm_output,
-        logit_weights,
-        parallel_output)
-
-    if labels is None:
-        # [s b h] => [b s h]
-        return output.transpose(0,1).contiguous()
-    else:
-        # [b s] => [s b]
-        labels = labels.transpose(0,1).contiguous()
-        cross_entropy = sequence_parallel.vocab_sequence_parallel_cross_entropy if mpu.get_sequence_parallel_world_size() > 1 \
-            else tensor_parallel.vocab_parallel_cross_entropy
-        if fp16_lm_cross_entropy:
-            assert output.dtype == torch.half
-            loss = cross_entropy(output, labels)
-        else:
-            loss = cross_entropy(output.float(), labels)
-
-        # [s b] => [b, s]
-        loss = loss.transpose(0,1).contiguous()
+    args = get_args()
+    if args.ds_sequence_parallel_fpdt:
+        seq_len = lm_output.shape[0]
+        num_chunks_ce = int(seq_len // (args.ds_sequence_parallel_fpdt_chunk_size // mpu.get_sequence_parallel_world_size() // 32))
+        loss = FPDT_LogitsLoss.apply(lm_output, labels, logit_weights, mpu.get_sequence_parallel_rank(), mpu.get_sequence_parallel_world_size(), mpu.get_sequence_parallel_group(), num_chunks_ce)
         return loss
+    else:
+        output = parallel_lm_logits(
+            lm_output,
+            logit_weights,
+            parallel_output)
+
+        if labels is None:
+            # [s b h] => [b s h]
+            return output.transpose(0,1).contiguous()
+        else:
+            # [b s] => [s b]
+            labels = labels.transpose(0,1).contiguous()
+            cross_entropy = sequence_parallel.vocab_sequence_parallel_cross_entropy if mpu.get_sequence_parallel_world_size() > 1 \
+                else tensor_parallel.vocab_parallel_cross_entropy
+            if fp16_lm_cross_entropy:
+                assert output.dtype == torch.half
+                loss = cross_entropy(output, labels)
+            else:
+                loss = cross_entropy(output.float(), labels)
+
+            # [s b] => [b, s]
+            loss = loss.transpose(0,1).contiguous()
+            return loss
 
 
 class UniversalCheckpointInfo:
@@ -393,9 +402,12 @@ class GPTModelPipe(PipelineModule,MegatronModule):
         if args.normalization == 'layernorm':
             self.specs.append(LayerSpec(LayerNorm,
                           args.hidden_size,
-                          eps=args.layernorm_epsilon))
+                          eps=args.layernorm_epsilon,
+                          sequence_parallel=args.sequence_parallel))
         else:
-            self.specs.append(LayerSpec(RMSNorm, args.hidden_size, args.layernorm_epsilon))
+            self.specs.append(LayerSpec(RMSNorm, args.hidden_size,
+                                        args.layernorm_epsilon,
+                                        sequence_parallel=args.sequence_parallel))
 
         def _logits_helper(embedding, lm_output):
             """A wrapper to massage inputs/outputs from pipeline. """
