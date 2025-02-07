@@ -489,8 +489,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_params') is None:
             return self.cudagraph_manager(self, args, kwargs)
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif not self.training and (
-            hasattr(self, 'cudagraph_manager') and kwargs['attention_mask'] is None
+        elif (
+            not self.training
+            and hasattr(self, 'cudagraph_manager')
+            and kwargs.get('inference_params') is not None
+            and kwargs['inference_params'].decode_mode
         ):
+            assert (
+                kwargs.get('attention_mask') is None
+            ), f"Attention mask must not be set when using CUDA graphs for decode"
             return self.cudagraph_manager(self, args, kwargs)
         return super(MegatronModule, self).__call__(*args, **kwargs)
