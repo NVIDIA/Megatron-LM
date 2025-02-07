@@ -41,7 +41,6 @@ MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
 CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache # Path to store cache from datasets ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
-WANDB_KEY_DIR=/capstor/scratch/cscs/$USER/.keys/wand_token.txt # Path to a .txt file containing a WANDB key. If not set WANDB will be disabled
 #########################################
 
 PROJECT_DIR=$MEG_RUNS_DIR/$PROJECT_NAME
@@ -50,7 +49,7 @@ TRIGGER_DIR=$EXP_DIR/triggers
 DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
 LOGGING_DIR=$EXP_DIR/logging
 TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
-WANDB_DIR=$LOGGING_DIR # Creates folder automatically
+WANDB_DIR=$LOGGING_DIR  # Creates folder automatically
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
 
