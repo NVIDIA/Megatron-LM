@@ -1,29 +1,25 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=02:59:59
-#SBATCH --job-name=Megatron-LM-Llama3-8B
-#SBATCH --output=/capstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
-#SBATCH --error=/capstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
+#SBATCH --time=00:59:59
+#SBATCH --job-name=Megatron-LM-Llama3-1B
+#SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
-##SBATCH --signal=SIGUSR2@600	# TODO(tj.solergibert) # Send SIGUSR2 (Auto-checkpoint saver signal) 600 seconds before hitting the time limit
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
 echo "START TIME: $(date)"
 
-# TODO(tj.solergibert) Set up Auto-Checkpoint & Auto-Job resubmission 
-# echo "[$(date)] $(sbatch --dependency=singleton $0)"
-
 ################ Configs ################
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-2"
+DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full"
 
-MBS=1 # NOTE(tj.solergibert) Set MBS=2 if running with > 32 Nodes
-GBS=8
+MBS=3
+GBS=252
 SEQ_LEN=8192
 TRAINING_STEPS=5000
 CHECKPOINT_STEPS=10000
@@ -36,12 +32,11 @@ MOCK_DATA=false # Set to `true` to use mock data
 
 # Directories, Logging & Artifacts
 PROJECT_NAME=TheMeg-Clariden
-EXP_NAME=Llama3-8B-NODES-$SLURM_NNODES
-MEGATRON_LM_DIR=/capstor/scratch/cscs/$USER/Megatron-LM
+EXP_NAME=Llama3-1B-NODES-$SLURM_NNODES
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
 CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache # Path to store cache from datasets ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
-WANDB_KEY_DIR=/capstor/scratch/cscs/$USER/.keys/wand_token.txt # Path to a .txt file containing a WANDB key. If not set WANDB will be disabled
 #########################################
 
 PROJECT_DIR=$MEG_RUNS_DIR/$PROJECT_NAME
@@ -50,7 +45,7 @@ TRIGGER_DIR=$EXP_DIR/triggers
 DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
 LOGGING_DIR=$EXP_DIR/logging
 TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
-WANDB_DIR=$LOGGING_DIR # Creates folder automatically
+WANDB_DIR=$LOGGING_DIR  # Creates folder automatically
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
 
@@ -62,7 +57,6 @@ mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
 ln -sfn $CKPT_DIR $EXP_DIR/checkpoint-dir-link
 
-# TODO(tj.solergibert) Set up triggers
 # Clean triggers
 rm -f $TRIGGER_DIR/save
 rm -f $TRIGGER_DIR/exit
@@ -80,13 +74,6 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 ulimit -c 0
 
-# TODO(tj.solergibert) Check --record-memory-history
-# TODO(tj.solergibert) Check --tp-comm-overlap
-# TODO(tj.solergibert) Check --exit-signal-handler
-# TODO(tj.solergibert) Check --no-initialization
-# TODO(tj.solergibert) Check --config-logger-dir
-# TODO(tj.solergibert) Check --overlap-param-gather-with-optimizer-step | NOT supported with distributed checkpointing yet?
-
 ### Megatron Args ### Check megatron/training/arguments.py
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
@@ -95,9 +82,9 @@ TRANSFORMER_ENGINE_ARGS=(
 )
 
 NETWORK_SIZE_ARGS=(
-	--num-layers 32
-	--hidden-size 4096
-	--ffn-hidden-size 14336
+	--num-layers 16
+	--hidden-size 2048
+	--ffn-hidden-size 8192
 	--num-attention-heads 32
 	--group-query-attention
 	--num-query-groups 8
@@ -105,11 +92,10 @@ NETWORK_SIZE_ARGS=(
 	--position-embedding-type rope
 	--rotary-base 500000
 	--use-rope-scaling
-	--rope-scaling-factor 8
+	--rope-scaling-factor 32
 	--make-vocab-size-divisible-by 128
 	--normalization RMSNorm
 	--swiglu
-	--untie-embeddings-and-output-weights
 )
 
 LOGGING_ARGS=(
@@ -169,7 +155,7 @@ MIXED_PRECISION_ARGS=(
 DISTRIBUTED_ARGS=(
 	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
-	--context-parallel-size 2
+	--context-parallel-size 1
 	--wgrad-deferral-limit 50
 	--use-distributed-optimizer
     --overlap-grad-reduce
@@ -221,17 +207,21 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     $DATA_ARGS"
 
 # WANDB Logging
-if [ -n "$WANDB_KEY_DIR" ]; then
-  echo "[$(date)] Setting WANDB logging"
-  export WANDB_API_KEY=$(cat $WANDB_KEY_DIR)
+if [ -n "$WANDB_API_KEY" ]; then
+  echo "[$(date)] WANDB API key detected. Enabling WANDB logging."
+  # Sync any previous run data if present
   if [ -d "$LOG_EXP_DIR/wandb/latest-run" ]; then
     echo "[$(date)] Syncing WANDB from previous run"
-    wandb sync $LOG_EXP_DIR/wandb/latest-run
+    wandb sync "$LOG_EXP_DIR/wandb/latest-run"
   fi
-  TRAINING_CMD="$TRAINING_CMD --wandb-save-dir $LOGGING_DIR --wandb-project $PROJECT_NAME --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
+  # Add wandb-related args to TRAINING_CMD
+  TRAINING_CMD="$TRAINING_CMD \
+    --wandb-save-dir $LOGGING_DIR \
+    --wandb-project $PROJECT_NAME \
+    --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
 else
   export WANDB_MODE=disabled
-  echo "[$(date)] WANDB Logging disabled"
+  echo "[$(date)] No WANDB API key found. WANDB logging disabled."
 fi
 
 # NCCL Debug
