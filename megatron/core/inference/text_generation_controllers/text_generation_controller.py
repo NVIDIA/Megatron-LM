@@ -16,7 +16,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from megatron.core.utils import get_model_config
 
 
 class TextGenerationController:
@@ -295,9 +295,14 @@ class TextGenerationController:
         Returns:
             OrderedDict[str, InferenceRequest]: The result for each of the incoming requests
         """
+        assert all(request.prompt_tokens is not None for request in active_requests.values())
+
         # Perform a deep copy so that the request prompt tokens do not get modified.
-        batch_prompt_tokens_list = list(
-            map(lambda request: copy.deepcopy(request.prompt_tokens), active_requests.values())
+        batch_prompt_tokens_list: List[List[int]] = list(
+            map(
+                lambda request: copy.deepcopy(request.prompt_tokens),  # type: ignore[arg-type]
+                active_requests.values(),
+            )
         )
         prompt_lengths_in_batch = torch.tensor(
             [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list],
@@ -336,9 +341,9 @@ class TextGenerationController:
             batch_size, device=torch.cuda.current_device()
         ).cuda()
 
-        # Use model vocab size since tokenizer vocab size might not include padding
+        # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2
-        vocab_size = get_attr_wrapped_model(self.inference_wrapped_model.model, "vocab_size")
+        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = get_model_config(self.inference_wrapped_model.model).enable_cuda_graph

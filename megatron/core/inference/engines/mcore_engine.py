@@ -40,13 +40,18 @@ class MCoreEngine(AbstractEngine):
         self.random_seed = random_seed
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
 
+    def get_new_request_id(self) -> str:
+        """Gets a new request id from the scheduler"""
+        return self.scheduler.get_new_request_id()
+
     def add_request(
         self,
-        prompt: str,
+        prompt: Optional[str] = None,
         add_BOS: bool = False,
         encoder_prompt: Optional[str] = None,
         inference_parameters: Optional[SamplingParams] = None,
         streaming: bool = False,
+        inference_request: Optional[InferenceRequest] = None,
     ) -> str:
         """
         Adds a request to the scheduler and returns the request ID.
@@ -57,12 +62,20 @@ class MCoreEngine(AbstractEngine):
             encoder_prompt (str): The encoder prompt string
             inference_parameters (SamplingParams): The inference parameters
             streaming (bool): Whether to stream incremental outputs for this request
+            inference_request (InferenceRequest, optional): A fully constructed request.
+                Defaults to None.
 
         Returns:
             The newly created request ID.
         """
+        assert (
+            prompt is not None or inference_request is not None
+        ), f"At least one of `prompt` or `inference_request` must be specified"
 
-        prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
+        if inference_request is None:
+            prompt_tokens = self.text_generation_controller.tokenize_prompt(prompt, add_BOS)
+        else:
+            prompt_tokens = inference_request.prompt_tokens
 
         return self.scheduler.add_request(
             prompt=prompt,
@@ -70,6 +83,7 @@ class MCoreEngine(AbstractEngine):
             encoder_prompt=encoder_prompt,
             inference_parameters=inference_parameters,
             streaming=streaming,
+            inference_request=inference_request,
         )
 
     def get_stream_generator(
@@ -83,11 +97,12 @@ class MCoreEngine(AbstractEngine):
 
     def generate(
         self,
-        prompts: List[str],
+        prompts: Optional[List[str]] = None,
         add_BOS: bool = False,
         encoder_prompts: Optional[List[str]] = None,
         common_inference_params: Optional[SamplingParams] = None,
         sampling_params: Optional[SamplingParams] = None,
+        inference_requests: Optional[List[InferenceRequest]] = None,
     ) -> List[InferenceRequest]:
         """The megatron core inference backend generate function
 
@@ -102,6 +117,7 @@ class MCoreEngine(AbstractEngine):
             common_inference_params: Deprecated. Only used for backward compatibility with
             MCore <= 0.9.0. Use `sampling_params` going forward.
             sampling_params (SamplingParams): The request-level sampling parameters
+            inference_requests (List[InferenceRequest]): A pre-populated list of inference requests
 
         Returns:
             List[InferenceRequest]: The output is list of inference requests containing the
@@ -109,25 +125,30 @@ class MCoreEngine(AbstractEngine):
         """
         # TODO :M core- get rng state tracker
 
-        if common_inference_params:
-            sampling_params = common_inference_params
-        if sampling_params is None:
-            sampling_params = SamplingParams()
+        request_ids: List[str] = []
 
         if self.random_seed:
             torch.random.manual_seed(self.random_seed)
 
-        request_ids: List[str] = []
-        for i in range(len(prompts)):
-            prompt = prompts[i]
-            encoder_prompt = encoder_prompts[i] if encoder_prompts is not None else None
-            request_id = self.add_request(
-                prompt=prompt,
-                add_BOS=add_BOS,
-                encoder_prompt=encoder_prompt,
-                inference_parameters=sampling_params,
-            )
-            request_ids.append(request_id)
+        if inference_requests is None:
+            assert prompts is not None
+
+            if common_inference_params:
+                sampling_params = common_inference_params
+
+            for i in range(len(prompts)):
+                prompt = prompts[i]
+                encoder_prompt = encoder_prompts[i] if encoder_prompts is not None else None
+                request_id = self.add_request(
+                    prompt=prompt,
+                    encoder_prompt=encoder_prompt,
+                    inference_parameters=sampling_params,
+                )
+                request_ids.append(request_id)
+        else:
+            for inference_request in inference_requests:
+                request_ids.append(inference_request.request_id)
+                self.scheduler.add_request(inference_request=inference_request)
 
         self.run_engine()
 
