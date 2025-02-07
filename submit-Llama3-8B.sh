@@ -3,9 +3,9 @@
 #SBATCH --account=a-a06
 #SBATCH --time=02:59:59
 #SBATCH --job-name=Megatron-LM-Llama3-8B
-#SBATCH --output=/capstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
-#SBATCH --error=/capstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
-#SBATCH --nodes=1
+#SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
+#SBATCH --nodes=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
@@ -20,10 +20,10 @@ echo "START TIME: $(date)"
 # echo "[$(date)] $(sbatch --dependency=singleton $0)"
 
 ################ Configs ################
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-2"
+DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full"
 
 MBS=1 # NOTE(tj.solergibert) Set MBS=2 if running with > 32 Nodes
-GBS=8
+GBS=256
 SEQ_LEN=8192
 TRAINING_STEPS=5000
 CHECKPOINT_STEPS=10000
@@ -37,7 +37,7 @@ MOCK_DATA=false # Set to `true` to use mock data
 # Directories, Logging & Artifacts
 PROJECT_NAME=TheMeg-Clariden
 EXP_NAME=Llama3-8B-NODES-$SLURM_NNODES
-MEGATRON_LM_DIR=/capstor/scratch/cscs/$USER/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
 CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache # Path to store cache from datasets ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
@@ -221,17 +221,23 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
     $DATA_ARGS"
 
 # WANDB Logging
-if [ -n "$WANDB_KEY_DIR" ]; then
-  echo "[$(date)] Setting WANDB logging"
-  export WANDB_API_KEY=$(cat $WANDB_KEY_DIR)
+if [ -n "$WANDB_API_KEY" ]; then
+  echo "[$(date)] WANDB API key detected. Enabling WANDB logging."
+
+  # Sync any previous run data if present
   if [ -d "$LOG_EXP_DIR/wandb/latest-run" ]; then
     echo "[$(date)] Syncing WANDB from previous run"
-    wandb sync $LOG_EXP_DIR/wandb/latest-run
+    wandb sync "$LOG_EXP_DIR/wandb/latest-run"
   fi
-  TRAINING_CMD="$TRAINING_CMD --wandb-save-dir $LOGGING_DIR --wandb-project $PROJECT_NAME --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
+
+  # Add wandb-related args to TRAINING_CMD
+  TRAINING_CMD="$TRAINING_CMD \
+    --wandb-save-dir $LOGGING_DIR \
+    --wandb-project $PROJECT_NAME \
+    --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
 else
   export WANDB_MODE=disabled
-  echo "[$(date)] WANDB Logging disabled"
+  echo "[$(date)] No WANDB API key found. WANDB logging disabled."
 fi
 
 # NCCL Debug
