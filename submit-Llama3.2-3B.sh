@@ -16,7 +16,7 @@
 echo "START TIME: $(date)"
 
 ################ Configs ################
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full"
+DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
 MBS=1
 GBS=256
