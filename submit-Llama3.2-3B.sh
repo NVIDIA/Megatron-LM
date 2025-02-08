@@ -2,7 +2,7 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=00:59:59
-#SBATCH --job-name=Megatron-LM-Llama3.2-1B
+#SBATCH --job-name=Megatron-LM-Llama3.2-3B
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
 #SBATCH --nodes=1
@@ -18,8 +18,8 @@ echo "START TIME: $(date)"
 ################ Configs ################
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
-MBS=3
-GBS=252
+MBS=1
+GBS=256
 SEQ_LEN=8192
 TRAINING_STEPS=5000
 CHECKPOINT_STEPS=10000
@@ -82,10 +82,10 @@ TRANSFORMER_ENGINE_ARGS=(
 )
 
 NETWORK_SIZE_ARGS=(
-	--num-layers 16
-	--hidden-size 2048
+	--num-layers 28
+	--hidden-size 3072
 	--ffn-hidden-size 8192
-	--num-attention-heads 32
+	--num-attention-heads 24
 	--group-query-attention
 	--num-query-groups 8
 	--max-position-embeddings $SEQ_LEN
