@@ -209,18 +209,15 @@ class MegatronGenerate(Resource):
                             prompts=prompts, common_inference_params=sampling_params
                         )
                     )
-                    response = [x.generated_text for x in result]
-                    response_logprobs = [x.prompt_log_probs + x.generated_log_probs for x in result]
+                    response_dict = {"text": [x.prompt + x.generated_text for x in result]}
+                    if sampling_params.return_log_probs:
+                        response_logprobs = [x.prompt_log_probs + x.generated_log_probs for x in
+                                             result]
+                        response_dict["logprobs"] = response_logprobs
                     if sampling_params.return_segments:
-                        response = {
-                            "text": response,
-                            "segments": [x.segments[0] for x in result],
-                            "logprobs": response_logprobs,
-                        }
-                    else:
-                        response = {"text": response, "logprobs": response_logprobs}
+                        response_dict["segments"] = [x.segments for x in result]
 
-                    return jsonify(response)
+                    return jsonify(response_dict)
 
             except ValueError as ve:
                 return ve.args[0]

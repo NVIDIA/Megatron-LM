@@ -4,7 +4,7 @@ import random
 import string
 import time
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, List
 from unittest import mock
 
 import pytest
@@ -187,6 +187,12 @@ class TestTextGenerationController:
             assert (
                 all_prompt_tokens[request_id] == request.prompt_tokens
             ), "Prompt tokens should not have changed during generation"
+            assert len(request.segments) == len(request.prompt_log_probs) + len(
+                request.generated_log_probs
+            ), "Segments should be returned for both prompt and generated tokens"
+            assert len(request.prompt) + len(request.generated_text) == len(
+                request.text
+            ), "Output text should include prompts and generations"
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_output_log_probs(self, dtype):

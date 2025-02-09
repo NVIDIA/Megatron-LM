@@ -66,7 +66,7 @@ class TextGenerationController:
         """Detokenize the generated tokens.
 
         Args:
-            tokens_gpu_tensor (torch.Tensor): Tensor containing the generated tokens
+            tokens_gpu_tensor (torch.Tensor): Tensor containing the tokens
             lengths_gpu_tensor (torch.Tensor): Tensor containing the lengths of each sequence
             detokenize_segments (bool): If True, returns individually detokenized tokens. If False,
             returns None as second element. Helpful for understanding per-token boundaries in
@@ -525,12 +525,15 @@ class TextGenerationController:
                 .tolist()
             )
             request.status = Status.COMPLETED
-            request.generated_text, request.generated_segments = self.detokenize_generations(
-                required_result_tokens,
+
+            text, segments = self.detokenize_generations(
+                batch_prompt_tokens_with_generations[idx],
                 input_prompt_length + generated_sequence_lengths,
                 sampling_params.return_segments,
             )
-
+            request.text = text  # Inference server returns prompts & generations together
+            request.segments = segments[0]
+            request.generated_text = text[len(request.prompt) :]
         return active_requests
 
     def prep_inference_input(
