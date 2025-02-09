@@ -6,7 +6,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_SOCKET_IFNAME=eth0
 
 GPUS_PER_NODE=2 # testing 241205
-
+ 
 # #single node
 # MASTER_ADDR=localhost
 # MASTER_PORT=6000
@@ -18,7 +18,7 @@ GPUS_PER_NODE=2 # testing 241205
 # # multinode
 MASTER_ADDR=127.0.0.1
 MASTER_PORT=6006
-NNODES=2
+NNODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
@@ -32,7 +32,7 @@ DISTRIBUTED_ARGS="
     --nnodes $NNODES \
     --node_rank $NODE_RANK \
     --master_addr $MASTER_ADDR \
-    --master_port $MASTER_PORT
+    --master_port $MASTER_PORT \
 "
 
 
