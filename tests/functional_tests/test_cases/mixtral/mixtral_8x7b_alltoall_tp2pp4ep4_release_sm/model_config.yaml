@@ -76,8 +76,8 @@ MODEL_ARGS:
   --eval-iters: 32
   --eval-interval: 200
   # Add checkpointing args
-  --load: ${OUTPUT_PATH}/checkpoints
-  --save: ${OUTPUT_PATH}/checkpoints
+  --save: ${CHECKPOINT_LOAD_PATH}
+  --load: ${CHECKPOINT_SAVE_PATH}
   --save-interval: 500
   # Add initialization args
   --init-method-std: 0.010

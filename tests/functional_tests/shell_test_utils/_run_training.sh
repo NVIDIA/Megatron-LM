@@ -94,7 +94,7 @@ MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
-LAST_RANK=$((NUM_NODES * 8 - 1))
+LAST_RANK=7
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
@@ -102,7 +102,7 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
     --node_rank $SLURM_NODEID
     --log-dir $OUTPUT_PATH
-    --tee "0:3,$LAST_RANK:3"
+    --tee "0:3,7:3"
     --redirects "3"
 )
 
