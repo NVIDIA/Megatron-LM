@@ -205,7 +205,7 @@ class GPTModel(LanguageModule):
         runtime_gather_output: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
+        through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given  or the final hidden units
