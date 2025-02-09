@@ -31,8 +31,7 @@ DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
     --nnodes $NNODES \
     --node_rank $NODE_RANK \
-    --master_addr $MASTER_ADDR \
-    --master_port $MASTER_PORT \
+    --rdzv-endpoint 213.181.123.87:12345
 "
 
 
