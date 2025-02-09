@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, Advanced Micro Devices, Inc. All rights reserved.
 
 from abc import ABC
 from dataclasses import dataclass, field
@@ -55,6 +56,7 @@ class TransformerLayerSubmodules:
 
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
+    mlp_dense: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
@@ -263,6 +265,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         attention_bias=None,
         inference_params=None,
         packed_seq_params=None,
+        **kwargs
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -304,6 +307,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             rotary_pos_sin=rotary_pos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
+            **kwargs
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself

@@ -1,4 +1,16 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024 Alibaba PAI and Nvidia Megatron-LM Team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -50,6 +62,7 @@ class MLP(MegatronModule):
         submodules: MLPSubmodules,
         is_expert: bool = False,
         input_size: int = None,
+        is_shared_expert: bool = False,
     ):
         super().__init__(config=config)
 
@@ -57,9 +70,28 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
-        # If this is a gated linear unit we double the output width
-        # see https://arxiv.org/pdf/2002.05202.pdf
-        ffn_hidden_size = self.config.ffn_hidden_size
+        # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
+        if is_expert:
+            ffn_hidden_size = self.config.ffn_hidden_size if not self.config.moe_ffn_hidden_size else self.config.moe_ffn_hidden_size
+        else:
+            if not is_shared_expert:
+                ffn_hidden_size = self.config.ffn_hidden_size
+            else:
+                ffn_hidden_size = self.config.moe_ffn_hidden_size * self.config.num_shared_experts
+
+        self.linear_fc2 = build_module(
+            submodules.linear_fc2,
+            ffn_hidden_size,
+            self.config.hidden_size,
+            config=self.config,
+            init_method=self.config.output_layer_init_method,
+            bias=self.config.add_bias_linear,
+            input_is_parallel=True,
+            skip_bias_add=True,
+            is_expert=is_expert,
+            tp_comm_buffer_name='fc2',
+        )
+
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
@@ -78,18 +110,6 @@ class MLP(MegatronModule):
 
         self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
-        )
 
     def forward(self, hidden_states):
         """Perform the forward pass through the MLP block."""
