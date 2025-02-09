@@ -2,10 +2,10 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=00:59:59
-#SBATCH --job-name=Megatron-LM-Llama3.2-3B
+#SBATCH --job-name=Megatron-LM-Llama3.1-70B
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
-#SBATCH --nodes=1
+#SBATCH --nodes=32
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
@@ -32,7 +32,7 @@ MOCK_DATA=false # Set to `true` to use mock data
 
 # Directories, Logging & Artifacts
 PROJECT_NAME=TheMeg-Clariden
-EXP_NAME=Llama3-3B-NODES-$SLURM_NNODES
+EXP_NAME=Llama3-70B-NODES-$SLURM_NNODES
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
 CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
@@ -82,20 +82,21 @@ TRANSFORMER_ENGINE_ARGS=(
 )
 
 NETWORK_SIZE_ARGS=(
-	--num-layers 28
-	--hidden-size 3072
-	--ffn-hidden-size 8192
-	--num-attention-heads 24
+	--num-layers 80
+	--hidden-size 8192
+	--ffn-hidden-size 28672
+	--num-attention-heads 64
 	--group-query-attention
 	--num-query-groups 8
 	--max-position-embeddings $SEQ_LEN
 	--position-embedding-type rope
 	--rotary-base 500000
 	--use-rope-scaling
-	--rope-scaling-factor 32
+	--rope-scaling-factor 8
 	--make-vocab-size-divisible-by 128
 	--normalization RMSNorm
 	--swiglu
+	--untie-embeddings-and-output-weights
 )
 
 LOGGING_ARGS=(
@@ -127,7 +128,7 @@ TRAINING_ARGS=(
 	--optimizer adam
 	--dataloader-type single
 	--manual-gc
-	--manual-gc-interval 5000
+	--manual-gc-interval 50
 )
 
 INITIALIZATION_ARGS=(
@@ -153,13 +154,17 @@ MIXED_PRECISION_ARGS=(
 )
 
 DISTRIBUTED_ARGS=(
-	--tensor-model-parallel-size 1
-	--pipeline-model-parallel-size 1
+	--tensor-model-parallel-size $SLURM_GPUS_PER_NODE
+	--sequence-parallel
+	--pipeline-model-parallel-size 8
+	--num-layers-per-virtual-pipeline-stage 5
 	--context-parallel-size 1
-	--wgrad-deferral-limit 50
+	--wgrad-deferral-limit 22
 	--use-distributed-optimizer
     --overlap-grad-reduce
-    --overlap-param-gather
+	--overlap-param-gather
+	--defer-embedding-wgrad-compute
+	--overlap-p2p-communication-warmup-flush
 )
 
 TOKENIZER_ARGS=(
@@ -170,7 +175,7 @@ TOKENIZER_ARGS=(
 DATA_ARGS=(
 	--split 100,0,0
 	--seq-length $SEQ_LEN
-	--num-workers 2
+	--num-workers 1
 	--num-dataset-builder-threads 1
 )
 
