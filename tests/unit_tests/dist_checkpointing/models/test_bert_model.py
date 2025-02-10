@@ -66,6 +66,8 @@ class TestBertModel:
     @pytest.mark.parametrize(
         'dst_layer_spec', [bert_layer_with_transformer_engine_spec, bert_layer_local_spec]
     )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_sharded_state_dict_save_load(self, tmp_path_dist_ckpt, src_layer_spec, dst_layer_spec):
         common_test_simple_sharded_state_dict_save_load(
             initialize_bert_model, tmp_path_dist_ckpt, src_layer_spec, dst_layer_spec

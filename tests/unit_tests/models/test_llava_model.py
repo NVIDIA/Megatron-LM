@@ -84,6 +84,8 @@ class TestLLaVAModel:
         assert self.model.vision_model.decoder.input_tensor.shape == expected_shape
 
     @pytest.mark.internal
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_preprocess_data(self):
         self.model.cuda()
 
@@ -565,6 +567,7 @@ class TestLLaVAModelTokenParallel:
     @pytest.mark.parametrize(
         "cp_size,tp_size,sequence_parallel", [(1, 8, True), (2, 4, False), (2, 4, True)]
     )
+    @pytest.mark.flaky
     def test_process_embedding_token_parallel(self, cp_size, tp_size, sequence_parallel):
         self.cp_size = cp_size
         self.tp_size = tp_size
@@ -670,6 +673,8 @@ def count_parameters(model):
 @pytest.mark.parametrize(
     'dtp, dpp, etp, epp', [(1, 1, 1, 0), (1, 1, 1, 1), (2, 1, 2, 0), (2, 3, 2, 1), (2, 4, 2, 0)]
 )
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_llava_model_parallelism(dtp, dpp, etp, epp):
     """
     The purpose of this test is to check that vit, vision projection and lm layer

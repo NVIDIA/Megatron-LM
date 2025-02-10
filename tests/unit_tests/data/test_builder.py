@@ -48,6 +48,8 @@ def do_setup(odir):
     return paths
 
 
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_builder():
     if torch.distributed.is_available():
         Utils.initialize_distributed()

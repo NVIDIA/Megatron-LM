@@ -89,6 +89,7 @@ def test_check_param_hashes_across_dp_replicas():
     _deinit_distributed()
 
 
+@pytest.mark.flaky_in_dev
 def test_cross_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))

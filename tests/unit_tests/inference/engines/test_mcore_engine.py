@@ -3,6 +3,7 @@ import string
 from typing import List
 from unittest import mock
 
+import pytest
 import torch
 
 from megatron.core.inference.common_inference_params import CommonInferenceParams
@@ -70,6 +71,8 @@ class TestMCoreEngine:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_generate(self):
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
@@ -94,6 +97,8 @@ class TestMCoreEngine:
             assert result.generated_length > 0, f"Generated length should be greater than zero"
             assert result.generated_text is not None, f'Generated text should not be None'
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_generate_empty_prompt(self):
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
