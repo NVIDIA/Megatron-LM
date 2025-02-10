@@ -9,6 +9,14 @@ from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 
 
+# Trying to apply @jit_fuser / @torch.compile to XIELU class causes issues with sharded_state_dict naming
+@jit_fuser
+def compiled_xielu(x, alpha_p, alpha_n, beta, eps):
+    return torch.where(x > 0,
+                      alpha_p * x * x + beta * x,
+                      alpha_n * torch.expm1(torch.min(x, eps)) - alpha_n * x + beta * x)
+
+
 class XIELU(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
         super(XIELU, self).__init__(config)
@@ -62,9 +70,7 @@ class XIELU(MegatronModule):
     def forward(self, x):
         alpha_p = F.softplus(self.alpha_p)
         alpha_n = self.beta + F.softplus(self.alpha_n)
-        return torch.where(x > 0,
-                           alpha_p * x * x + self.beta * x,
-                           alpha_n * torch.expm1(torch.min(x, self.eps)) - alpha_n * x + self.beta * x)
+        return compiled_xielu(x, alpha_p, alpha_n, self.beta, self.eps)
 
 
 @jit_fuser
