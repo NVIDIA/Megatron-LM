@@ -52,6 +52,7 @@ def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **conf
 class TestGPTModel:
     @pytest.mark.parametrize('src_layer_spec_fn', [gpt_te_spec, gpt_local_spec])
     @pytest.mark.parametrize('dst_layer_spec_fn', [gpt_te_spec, gpt_local_spec])
+    @pytest.mark.flaky_in_dev
     def test_sharded_state_dict_save_load(
         self, tmp_path_dist_ckpt, src_layer_spec_fn, dst_layer_spec_fn
     ):

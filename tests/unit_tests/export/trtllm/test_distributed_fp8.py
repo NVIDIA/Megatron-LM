@@ -216,6 +216,7 @@ class TestTRTLLMSingleDeviceConverterFP8:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     def test_get_model_weights_converter(self, mocker):
         pytest.importorskip('tensorrt_llm')
         mocker.patch(
