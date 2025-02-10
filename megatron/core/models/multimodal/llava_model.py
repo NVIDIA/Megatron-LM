@@ -513,9 +513,17 @@ class LLaVAModel(MegatronModule):
             ]
 
             # Put image embeddings to image positions.
-            final_embedding[images_mask] = (
-                image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
-            )
+            # NOTE: FSDP can hang with text-only samples so we use a workaround to run a dummy image
+            # through the vision model and then zero-out the impact of the output here.
+            if num_image_tiles.shape[0] == 0 and image_embeddings.shape[0] > 0:
+                assert images_mask.sum() == 0 and getattr(
+                    self.vision_model, "_is_fsdp_managed_module", False
+                ), "expected FSDP and dummy image"
+                final_embedding[:1, :1, :1] += 0 * image_embeddings[:1, :1, :1]
+            else:
+                final_embedding[images_mask] = (
+                    image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+                )
 
         # Create the final labels and loss mask (if this is the last language model stage).
         final_labels, final_loss_mask = None, None

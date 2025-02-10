@@ -67,11 +67,19 @@ def get_batch(data_iterator):
     cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"]
     max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"]
 
-    # No image input (text-only sample) if the dataloader produced a dummy image.
+    # No image input (text-only sample) if the dataloader returned a size 1 image.
     if imgs.shape == torch.Size([1, 1]):
-        # FIXME: text-only data can cause a hang if the vision model is own its own pipeline rank and --freeze-ViT is enabled.
-        imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
-        num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
+        # model and then add image embeddings with a zero multiplier.
+        if args.use_torch_fsdp2:
+            imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
+            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        else:
+            # Similar workaround is not needed without FSDP and we can use an empty image.
+            # FIXME: text-only data can cause still cause a hang in the special case where
+            # the vision model is own its own pipeline rank and --freeze-ViT is enabled.
+            imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
+            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
 
     # Last pipeline parallel stage doesn't need images.
     if pp_size > 1 and is_pipeline_last_stage():
@@ -142,7 +150,7 @@ def get_mask_start_and_end_idx(arr):
     """
     Returns a list of tuples holding the start and end index in arr of the non-zeros contiguuous
     sub arrays.
-    
+
     For instance, if arr = [0, 1, 0, 0, 1, 1]
     get_mask_start_and_end_idx(arr) = [(1, 1), (4, 5)]
     such that arr[1:1+1] = [1] and arr[4:5+1] = [1, 1]
