@@ -398,6 +398,49 @@ class TestLLaVAModel:
             )
 
     @pytest.mark.internal
+    def test_forward_fsdp(self):
+        """Test FSDP workaround for text-only data.
+
+        FSDP can hang with text-only data. As a workaround, we run the vision model with a dummy image,
+        but then effectively discard the image embeddings.
+        """
+        self.model.cuda()
+
+        # Dummy image for the FSDP workaround but not image tiles.
+        img = torch.zeros((1, 3, 336, 336)).cuda()
+        num_image_tiles = torch.tensor([], dtype=torch.int).cuda()
+
+        # No image tag in the input ids (text-only sample).
+        image_token_index = self.model.image_token_index
+        input_ids = torch.arange(1024, device="cuda").unsqueeze(0)
+        assert (
+            torch.sum(input_ids == image_token_index) == 0
+        ), "expected no image tag in the input ids"
+
+        position_ids = torch.arange(1024, device="cuda").unsqueeze(0)
+
+        loss_mask = torch.ones((1, 1024), device="cuda")
+
+        attention_mask = None  # Causal.
+
+        labels = torch.arange(1, 1025, device="cuda").unsqueeze(0)
+
+        # Mock the FSDP attribute.
+        self.model.vision_model._is_fsdp_managed_module = True
+        loss, new_loss_mask = self.model.forward(
+            img,
+            input_ids,
+            position_ids,
+            attention_mask,
+            labels,
+            loss_mask,
+            num_image_tiles=num_image_tiles,
+        )
+        self.model.vision_model._is_fsdp_managed_module = False
+
+        assert loss.shape == new_loss_mask.shape == torch.Size((1, 1024))
+
+    @pytest.mark.internal
     def test_save_load(self, tmp_path):
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)
