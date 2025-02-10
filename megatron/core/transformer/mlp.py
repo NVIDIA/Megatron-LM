@@ -45,11 +45,11 @@ class MLP(MegatronModule):
     """
 
     def __init__(
-            self,
-            config: TransformerConfig,
-            submodules: MLPSubmodules,
-            is_expert: bool = False,
-            input_size: int = None,
+        self,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        is_expert: bool = False,
+        input_size: int = None,
     ):
         super().__init__(config=config)
 
@@ -133,7 +133,7 @@ class MLP(MegatronModule):
         return output, output_bias
 
     def sharded_state_dict(
-            self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
@@ -160,16 +160,16 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
     original_numel = int(np.prod(original_shape))
     local_axis_size = original_shape[swiglu_shard_axis]
     assert (
-            original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
+        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
     )
     rank_offset = (
-            original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
+        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
     )
     axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
 
     @torch.no_grad()
     def sh_ten_build_fn(
-            key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
         offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
         offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset + axis_frag, axis_frag * 2)
