@@ -10,6 +10,7 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
+#SBATCH --exclude=nid005079,nid007195,nid006510,nid005091,nid005866,nid005776
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
@@ -83,13 +84,13 @@ ulimit -c 0
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	--use-precision-aware-optimizer
-	--main-grads-dtype bf16
+	--main-grads-dtype fp32
 )
 
 NETWORK_SIZE_ARGS=(
 	--num-layers 32
 	--hidden-size 4096
-	--ffn-hidden-size 14336
+	--ffn-hidden-size 12288  # was 14336 but with fp32 grad hits OOM
 	--num-attention-heads 32
 	--group-query-attention
 	--num-query-groups 8
@@ -165,7 +166,6 @@ DISTRIBUTED_ARGS=(
 	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
 	--context-parallel-size 2
-	--wgrad-deferral-limit 50
 	--use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather

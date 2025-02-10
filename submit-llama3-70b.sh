@@ -5,11 +5,12 @@
 #SBATCH --job-name=llama-70b
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=128
+#SBATCH --nodes=256
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
+#SBATCH --exclude=nid005079,nid007195,nid006510,nid005091,nid005866,nid005776
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
@@ -37,7 +38,7 @@ MOCK_DATA=false # Set to `true` to use mock data
 
 # Directories, Logging & Artifacts
 PROJECT_NAME=Megatron-Clariden
-EXP_NAME=llama3-70b-${SLURM_NNODES}n
+EXP_NAME=llama3-70b-${SLURM_NNODES}n-fp32grads
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
 CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
@@ -84,7 +85,7 @@ ulimit -c 0
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	--use-precision-aware-optimizer
-	--main-grads-dtype bf16
+	--main-grads-dtype fp32
 )
 
 NETWORK_SIZE_ARGS=(
@@ -168,11 +169,11 @@ DISTRIBUTED_ARGS=(
 	--pipeline-model-parallel-size 8
 	--num-layers-per-virtual-pipeline-stage 5
 	--context-parallel-size 1
-	--wgrad-deferral-limit 22
 	--use-distributed-optimizer
     --overlap-grad-reduce
 	--overlap-param-gather
 	--defer-embedding-wgrad-compute
+	--wgrad-deferral-limit 22
 	--overlap-p2p-communication-warmup-flush
 )
 
