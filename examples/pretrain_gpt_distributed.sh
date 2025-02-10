@@ -16,8 +16,8 @@ GPUS_PER_NODE=2 # testing 241205
 
 
 # # multinode
-MASTER_ADDR=213.181.123.87
-MASTER_PORT=12345
+MASTER_ADDR=localhost
+MASTER_PORT=23456
 NNODES=2
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
@@ -31,7 +31,8 @@ DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
     --nnodes $NNODES \
     --node_rank $NODE_RANK \
-    --rdzv-endpoint 213.181.123.87:12345
+    --master-addr $MASTER_ADDR \
+    --master-port $MASTER_PORT
 "
 
 
