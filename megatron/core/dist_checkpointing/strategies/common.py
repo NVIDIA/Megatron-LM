@@ -5,7 +5,7 @@
 import logging
 import os
 from pathlib import Path
-
+from pathlib_abc import PathBase
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict
@@ -35,13 +35,13 @@ def register_default_common_strategies():
 class TorchCommonSaveStrategy(SaveCommonStrategy):
     """Common save strategy leveraging native torch save/load."""
 
-    def save_common(self, common_state_dict: StateDict, checkpoint_dir: Path):
+    def save_common(self, common_state_dict: StateDict, checkpoint_dir: PathBase):
         """Save common part of the state dict."""
         if torch.distributed.get_rank() == 0:
             torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)
 
     def save_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: PathBase
     ):
         """Save sharded objects from the state dict."""
         for sh_obj in nested_values(sharded_objects_state_dict):
@@ -58,7 +58,7 @@ class TorchCommonSaveStrategy(SaveCommonStrategy):
 class TorchCommonLoadStrategy(LoadCommonStrategy):
     """Common load strategy leveraging native torch save/load."""
 
-    def load_common(self, checkpoint_dir: Path):
+    def load_common(self, checkpoint_dir: PathBase):
         """Load common (non-sharded) objects state dict from the checkpoint.
 
         Args:
@@ -67,7 +67,7 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
         Returns:
             StateDict: state dict with non-sharded objects from the checkpoint
         """
-        load_path = Path(checkpoint_dir) / COMMON_STATE_FNAME
+        load_path = checkpoint_dir / COMMON_STATE_FNAME
         try:
             return torch.load(load_path, map_location='cpu', weights_only=False)
         except FileNotFoundError as e:
@@ -77,7 +77,7 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
             raise CheckpointingException(err_msg) from e
 
     def load_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: PathBase
     ):
         """Replaces all ShardedObject from a given state dict with values loaded from the
         checkpoint.
@@ -120,7 +120,7 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
 
         return dict_list_map_inplace(load_sharded_object, sharded_objects_state_dict)
 
-    def load_sharded_metadata(self, checkpoint_dir: Path) -> ShardedStateDict:
+    def load_sharded_metadata(self, checkpoint_dir: PathBase) -> ShardedStateDict:
         sharded_metadata = {}
         for subdir in checkpoint_dir.iterdir():
             if not subdir.is_dir():

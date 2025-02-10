@@ -5,6 +5,7 @@
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import Optional
 
 CONFIG_FNAME = 'metadata.json'
@@ -45,7 +46,7 @@ def check_is_distributed_checkpoint(checkpoint_dir):
     return maybe_load_config(checkpoint_dir) is not None
 
 
-def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
+def maybe_load_config(checkpoint_dir: str | PathBase) -> Optional[CheckpointingConfig]:
     """Returns checkpoint config if `checkpoint_dir` is a distributed checkpoint and None otherwise
 
     Args:
@@ -54,7 +55,9 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
     Returns:
         CheckpointingConfig (optional): None if checkpoint is not a valid distributed checkpoint
     """
-    config_path = Path(checkpoint_dir, CONFIG_FNAME)
+    if isinstance(checkpoint_dir, str):
+        config_path = Path(checkpoint_dir)
+    config_path = config_path / CONFIG_FNAME
     if not config_path.exists():
         return None
     with config_path.open() as f:
@@ -62,7 +65,7 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
     return CheckpointingConfig(**config_dict)
 
 
-def save_config(config: CheckpointingConfig, checkpoint_dir: str):
+def save_config(config: CheckpointingConfig, checkpoint_dir: str | PathBase):
     """Save given config to checkpoint directory.
 
     Args:
@@ -72,6 +75,8 @@ def save_config(config: CheckpointingConfig, checkpoint_dir: str):
     Returns:
         None
     """
-    config_path = Path(checkpoint_dir, CONFIG_FNAME)
+    if isinstance(checkpoint_dir, str):
+        config_path = Path(checkpoint_dir)
+    config_path = config_path / CONFIG_FNAME
     with config_path.open('w') as f:
         json.dump(asdict(config), f)
