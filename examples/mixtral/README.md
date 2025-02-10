@@ -137,7 +137,7 @@ bash lora_mixtral_8x7b_distributed.sh \
     path/to/data
 ```
 
-To run LoRA with another parallelizm setting convert model to the Megatron-LM checkpoint with target paralleizm and modify `MODEL_PARALLEL_ARGS` arguments in `lora_mixtral_8x7b_distributed.sh`.
+To run LoRA with another parallelizm setting convert model to the Megatron-LM checkpoint with target parallelism and modify `MODEL_PARALLEL_ARGS` arguments in `lora_mixtral_8x7b_distributed.sh`.
 
 ## Acknowledgements
 Contributors outside NVIDIA for the huggingface converter and example of Mixtral models in Megatron-Core:

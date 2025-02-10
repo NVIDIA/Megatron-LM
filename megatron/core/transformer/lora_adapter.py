@@ -33,18 +33,20 @@ TE_COLUMN_PARALLEL_LAYERS = [
     partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, parallel_mode=None, skip_weight_param_allocation=False),
     partial(TEColumnParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, gather_output=False),
 ]
+ROW_PARALLEL_LAYERS = [
+    partial(RowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
+    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
+]
+TE_ROW_PARALLEL_LAYERS = [
+    partial(TERowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
+    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
+]
 LORA_LAYERS_MAPPING = {
     ColumnParallelLinear: COLUMN_PARALLEL_LAYERS,
     TEColumnParallelLinear: TE_COLUMN_PARALLEL_LAYERS,
     TELayerNormColumnParallelLinear: TE_COLUMN_PARALLEL_LAYERS,
-    RowParallelLinear: [
-        partial(RowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-        partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
-    ],
-    TERowParallelLinear: [
-        partial(TERowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-        partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
-    ],
+    RowParallelLinear: ROW_PARALLEL_LAYERS,
+    TERowParallelLinear: TE_ROW_PARALLEL_LAYERS,
 }
 
 

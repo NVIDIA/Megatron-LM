@@ -87,9 +87,7 @@ TRAINING_ARGS=(
     --micro-batch-size 2
     --global-batch-size 64
     --lr 1e-4
-    # --lr-decay-iters 320000
     --lr-decay-style cosine
-    # --lr-warmup-iters 500
     --min-lr 1.0e-5
     --weight-decay 0.1
     --clip-grad 1.0
@@ -128,7 +126,7 @@ LOGGING_ARGS=(
 )
 
 mkdir -p $CHECKPOINT_PATH/logs
-torchrun ${DISTRIBUTED_ARGS[@]} examples/mixtral/lora_mixtral.py \
+torchrun ${DISTRIBUTED_ARGS[@]} lora_mixtral.py \
     ${MODEL_ARGS[@]} \
     ${MOE_ARGS[@]} \
     ${DATA_ARGS[@]} \

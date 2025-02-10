@@ -26,7 +26,7 @@ def lora_model_provider(pre_process: bool = True, post_process: bool = True) -> 
     args = get_args()
     rank = args.lora_rank
     alpha = args.lora_alpha
-    assert rank > 0 and alpha > 0, "LoRA rank and alpha have to be greater then zero"
+    assert rank > 0 and alpha > 0, "LoRA rank and alpha have to be greater than zero"
     
     model = model_provider(pre_process, post_process)
     common_args = {
