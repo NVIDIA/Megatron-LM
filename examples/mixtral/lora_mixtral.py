@@ -35,6 +35,7 @@ def lora_model_provider(pre_process: bool = True, post_process: bool = True) -> 
         "alpha": alpha,
         "dropout": args.lora_dropout,
     }
+    model.embedding.word_embeddings = LoraAdapter(model.embedding.word_embeddings, **common_args)
     for layer in model.decoder.layers:
         layer.self_attention.linear_qkv = LoraAdapter(layer.self_attention.linear_qkv, **common_args)
         layer.self_attention.linear_proj = LoraAdapter(layer.self_attention.linear_proj, **common_args)

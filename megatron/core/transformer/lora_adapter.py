@@ -4,7 +4,7 @@ import logging
 import math
 from copy import deepcopy
 from functools import partial
-from typing import Tuple
+from typing import Tuple, Union
 
 import torch
 
@@ -99,12 +99,18 @@ class LoraAdapter(MegatronModule):
             if "lora_" in key:
                 incompatible_keys.missing_keys.remove(key)
 
-    def forward(self, input: torch.Tensor, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-        output, bias = self.base_layer(input, *args, **kwargs)
+    def forward(self, input: torch.Tensor, *args, **kwargs) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        output = self.base_layer(input, *args, **kwargs)
         if self.lora_a is None:
-            return output, bias
+            return output
 
         lora_a_output_parallel, _ = self.lora_a(input)
         lora_b_output_parallel, _ = self.lora_b(lora_a_output_parallel)
         lora_dropout_output_parallel = self.lora_dropout(lora_b_output_parallel)
-        return output + self.lora_alpha * lora_dropout_output_parallel, bias
+        lora_output_parallel = self.lora_alpha * lora_dropout_output_parallel
+
+        if type(output) is torch.Tensor:
+            return output + lora_output_parallel
+        
+        output, bias = output
+        return output + lora_output_parallel, bias
