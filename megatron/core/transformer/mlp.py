@@ -1,11 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Optional, Union
-
 import numpy as np
 import torch
 import torch.nn.functional as F
+from dataclasses import dataclass
+from typing import Optional, Union
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
@@ -19,6 +18,7 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.activations import XIELU
 
 
 @dataclass
@@ -45,11 +45,11 @@ class MLP(MegatronModule):
     """
 
     def __init__(
-        self,
-        config: TransformerConfig,
-        submodules: MLPSubmodules,
-        is_expert: bool = False,
-        input_size: int = None,
+            self,
+            config: TransformerConfig,
+            submodules: MLPSubmodules,
+            is_expert: bool = False,
+            input_size: int = None,
     ):
         super().__init__(config=config)
 
@@ -76,7 +76,10 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.activation_func == XIELU:
+            self.activation_func = XIELU(config=self.config)
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -130,17 +133,19 @@ class MLP(MegatronModule):
         return output, output_bias
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+            self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
-            if self.config.gated_linear_unit and name == 'linear_fc1':
-                assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
-                for k, v in sub_sd.items():
-                    if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
-                        sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
-            sharded_state_dict.update(sub_sd)
+            if hasattr(module, 'sharded_state_dict'):
+                sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
+                if self.config.gated_linear_unit and name == 'linear_fc1':
+                    assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
+                    for k, v in sub_sd.items():
+                        if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
+                            sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
+                sharded_state_dict.update(sub_sd)
+
         return sharded_state_dict
 
 
@@ -155,16 +160,16 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
     original_numel = int(np.prod(original_shape))
     local_axis_size = original_shape[swiglu_shard_axis]
     assert (
-        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
+            original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] % local_axis_size == 0
     )
     rank_offset = (
-        original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
+            original_sh_ten.global_offset[swiglu_shard_axis + prepend_axis_num] // local_axis_size
     )
     axis_frag = original_sh_ten.axis_fragmentations[swiglu_shard_axis + prepend_axis_num]
 
     @torch.no_grad()
     def sh_ten_build_fn(
-        key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
+            key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
         offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
         offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset + axis_frag, axis_frag * 2)
@@ -223,7 +228,7 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                 )
             if flattened_range.stop > chunk_numel:
                 # Non-empty `v` chunk
-                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
+                tensor_v = t[-(flattened_range.stop - chunk_numel):]
                 flattened_range_v = slice(
                     max(chunk_numel, flattened_range.start) - chunk_numel,
                     flattened_range.stop - chunk_numel,
