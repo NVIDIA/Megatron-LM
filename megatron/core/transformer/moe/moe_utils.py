@@ -8,6 +8,17 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
+try:
+    from megatron.core.extensions.transformer_engine import (
+        fused_permute,
+        fused_sort_chunks_by_index,
+        fused_unpermute,
+    )
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
 
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
@@ -207,7 +218,13 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
         MoEAuxLossAutoScaler.main_loss_backward_scale = scale
 
 
-def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool = False):
+def permute(
+    tokens,
+    routing_map,
+    num_out_tokens: Optional[int] = None,
+    fused: bool = False,
+    drop_and_pad: bool = False,
+):
     """Permute the tokens and probs based on the mask.
     Tokens with the same designated expert will be grouped together.
     The shape of mask is [tokens, num_experts], it indicates which experts were selected
@@ -221,11 +238,17 @@ def permute(tokens, routing_map, num_out_tokens: int = None, drop_and_pad: bool 
         routing_map (torch.Tensor): The sparse token to expert mapping, [num_tokens, num_experts].
         num_out_tokens (int, optional): The number of output tokens. If None, it's set to
                                         the number of input tokens.
+        fused (bool, optional): Whether use the fused permute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
     """
+    if fused:
+        if not HAVE_TE or fused_permute is None:
+            raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
+        return fused_permute(tokens, routing_map, num_out_tokens)
+
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
     if drop_and_pad and not (num_out_tokens is None):
@@ -262,6 +285,7 @@ def unpermute(
     restore_shape: torch.Size,
     probs: torch.Tensor = None,
     routing_map: torch.Tensor = None,
+    fused: bool = False,
     drop_and_pad: bool = False,
 ):
     """
@@ -281,12 +305,18 @@ def unpermute(
         probs (torch.Tensor, optional): The unpermuted probs tensor,
         routing_map (torch.Tensor, optional): Token to expert mapping, shape
             [num_tokens, num_experts].
+        fused (bool, optional): Whether use the fused unpermute function.
         drop_and_pad (bool, optional): Whether or not the token dispatcher uses token-drop
                                        and pads the number of tokens to the expert capacity.
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
     """
+    if fused:
+        if not HAVE_TE or fused_unpermute is None:
+            raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        return fused_unpermute(permuted_tokens, sorted_indices, probs, restore_shape)
+
     _, hidden = restore_shape
 
     if probs is not None:
@@ -320,10 +350,19 @@ def unpermute(
     return output_tokens
 
 
-def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor):
+def sort_chunks_by_idxs(
+    input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor, fused: bool = False
+):
     """Split and sort the input tensor based on the split_sizes and sorted indices."""
+    if fused:
+        if not HAVE_TE or fused_sort_chunks_by_index is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs)
+
     input = torch.split(input, split_sizes.tolist(), dim=0)
-    output = torch.cat([input[i] for i in sorted_idxs], dim=0)
+    output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
     return output
 
 

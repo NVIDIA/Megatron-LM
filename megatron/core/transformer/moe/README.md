@@ -76,6 +76,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --moe-pad-expert-input-to-capacity | Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set. |
 | --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
 | --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
+| --moe-permute-fusion | Fuse token rearrangement ops during token dispatching. |
 | --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
 | --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
 | --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
@@ -90,6 +91,7 @@ To train a top-2 MoE model with 8 experts and auxiliary loss, include the follow
 --num-experts 8
 --expert-model-parallel-size 8
 --moe-grouped-gemm
+--moe-permute-fusion
 --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, none. Default is aux_loss.
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
@@ -241,6 +243,7 @@ MOE_ARGS=(
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
+    --moe-permute-fusion
 )
 
 DATA_ARGS=(

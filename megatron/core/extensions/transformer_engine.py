@@ -5,7 +5,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Callable
+from typing import Any, Callable, Optional
 
 import torch
 import transformer_engine as te
@@ -113,13 +113,13 @@ class TELinear(te.pytorch.Linear):
         input_size: int,
         output_size: int,
         *,
-        parallel_mode: str,
+        parallel_mode: Optional[str],
         config: ModelParallelConfig,
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
         skip_weight_param_allocation: bool,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
         is_expert: bool = False,
     ):
         self.config = config
@@ -275,7 +275,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         self.config = config
 
@@ -440,7 +440,7 @@ class TEColumnParallelLinear(TELinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
@@ -523,7 +523,7 @@ class TERowParallelLinear(TELinear):
         input_is_parallel: bool,
         skip_bias_add: bool,
         is_expert: bool,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         if not input_is_parallel:
             raise ValueError(
@@ -608,10 +608,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        attention_dropout: float = None,
-        softmax_scale: float = None,
-        k_channels: int = None,
-        v_channels: int = None,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        k_channels: Optional[int] = None,
+        v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
     ):
         self.config = config
@@ -628,7 +628,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"setting query key layer scaling via argument, so these two must match."
             )
 
-        extra_kwargs = {}
+        extra_kwargs: dict[str, Any] = {}
         if is_te_min_version("0.11.0"):
             extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
         elif self.config.num_query_groups != self.config.num_attention_heads:
@@ -827,13 +827,13 @@ if is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
-            parallel_mode: str,
+            parallel_mode: Optional[str],
             config: ModelParallelConfig,
             init_method: Callable,
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool = False,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
             self.config = config
 
@@ -1070,7 +1070,7 @@ if is_te_min_version("1.9.0.dev0"):
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
 
             super().__init__(
@@ -1115,7 +1115,7 @@ if is_te_min_version("1.9.0.dev0"):
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
 
             super().__init__(
@@ -1143,9 +1143,9 @@ if is_te_min_version("1.9.0.dev0"):
 
 else:
 
-    TEGroupedLinear = None
-    TEColumnParallelGroupedLinear = None
-    TERowParallelGroupedLinear = None
+    TEGroupedLinear = None  # type: ignore[assignment, misc]
+    TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
+    TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
@@ -1279,7 +1279,7 @@ try:
 
 except ImportError:
 
-    get_cpu_offload_context = None
+    get_cpu_offload_context = None  # type: ignore[assignment, misc]
 
 try:
 
@@ -1322,3 +1322,21 @@ except ImportError:
 
     Fp8Padding = None
     Fp8Unpadding = None
+
+try:
+
+    from transformer_engine.pytorch.permutation import (
+        moe_permute,
+        moe_sort_chunks_by_index,
+        moe_unpermute,
+    )
+
+    fused_permute = moe_permute
+    fused_unpermute = moe_unpermute
+    fused_sort_chunks_by_index = moe_sort_chunks_by_index
+
+except ImportError:
+
+    fused_permute = None
+    fused_unpermute = None
+    fused_sort_chunks_by_index = None
