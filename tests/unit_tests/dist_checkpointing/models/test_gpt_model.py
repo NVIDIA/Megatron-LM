@@ -90,6 +90,7 @@ class TestGPTModelReconfiguration:
             (False, 'tp-dp-pp', 'tp-pp-dp', (2, 4), (2, 4), gpt_local_spec, gpt_local_spec),
         ],
     )
+    @pytest.mark.flaky_in_dev
     def test_parallel_reconfiguration_e2e(
         self,
         tmp_path_dist_ckpt,

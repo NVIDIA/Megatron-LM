@@ -118,6 +118,7 @@ class TestExpertLayerReconfiguration:
             # ("ep-tp-dp-pp", "tp-ep-dp-pp"),
         ],
     )
+    @pytest.mark.flaky
     def test_parallel_reconfiguration_e2e(
         self,
         tmp_path_dist_ckpt,

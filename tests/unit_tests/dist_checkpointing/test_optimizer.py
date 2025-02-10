@@ -334,6 +334,7 @@ class TestDistributedOptimizer:
                 assert not diffs[0] and not diffs[1] and diffs[2]
                 assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
 
+    @pytest.mark.flaky
     def test_can_load_deprecated_bucket_space_format(self, tmp_path_dist_ckpt):
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         tp = 4

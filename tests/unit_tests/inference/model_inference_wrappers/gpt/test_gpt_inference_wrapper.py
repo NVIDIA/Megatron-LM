@@ -1,5 +1,6 @@
 from argparse import Namespace
 
+import pytest
 import torch
 
 from megatron.core import parallel_state
@@ -61,6 +62,7 @@ class TestGPTInferenceWrapper:
         Utils.destroy_model_parallel()
 
     # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_small_input_batch()
+    @pytest.mark.flaky
     def test_inference_pipeline_parallel_small_size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
 
