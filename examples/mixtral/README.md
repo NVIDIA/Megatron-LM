@@ -132,8 +132,8 @@ By default `lora_mixtral_8x7b_distributed.sh` uses TP1PP1EP8 parallelizm. To run
 
 ```bash
 bash lora_mixtral_8x7b_distributed.sh \
-    /workspace/checkpoints/mixtral-mcore-TP1PP1EP8 \
-    /workspace/checkpoints/mixtral-hf/tokenizer.model \
+    $CHECKPOINT_PATH \
+    $TOKENIZER_MODEL \
     path/to/data
 ```
 
