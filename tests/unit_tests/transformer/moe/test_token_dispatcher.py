@@ -10,6 +10,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import permute, unpermute
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -69,6 +70,7 @@ class MoEModelTestContainer:
             use_cpu_initialization=kwargs.get("use_cpu_initialization", True),
             sequence_parallel=tp_size > 1,
             add_bias_linear=kwargs.get("add_bias_linear", False),
+            moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
         )
 
         # init moe layer
@@ -220,6 +222,11 @@ class MoEModelTestContainer:
         Utils.destroy_model_parallel()
 
 
+permute_fusion_params = [False]
+if is_te_min_version("1.14.0"):
+    permute_fusion_params.append(True)
+
+
 class TestAllgatherDispatcher:
     def setup_method(self, method):
         pass
@@ -231,9 +238,10 @@ class TestAllgatherDispatcher:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
+    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
-    def test_forward_backward(self, tp_size, ep_size):
+    def test_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -242,6 +250,7 @@ class TestAllgatherDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="allgather",
+            moe_permute_fusion=permute_fusion,
         )
 
         container.dispatcher_dropless_test()
@@ -249,12 +258,13 @@ class TestAllgatherDispatcher:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.parametrize(
         "tp_size,ep_size,moe_tp_size", [(1, 1, 8), (1, 2, 4), (1, 4, 2), (2, 2, 4)]
     )
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
-    def test_moe_tp_forward_backward(self, tp_size, ep_size, moe_tp_size):
+    def test_moe_tp_forward_backward(self, tp_size, ep_size, moe_tp_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -266,6 +276,7 @@ class TestAllgatherDispatcher:
             moe_token_dispatcher_type="allgather",
             sequence_parallel=True,
             moe_grouped_gemm=True,
+            moe_permute_fusion=permute_fusion,
             use_cpu_initialization=False,
         )
 

@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
+from tests.unit_tests.transformer.moe.test_token_dispatcher import (
+    MoEModelTestContainer,
+    permute_fusion_params,
+)
 
 
 def test_placeholder():
@@ -23,9 +26,10 @@ class TestAlltoAllDispatcher:
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
+    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
-    def test_forward_backward(self, tp_size, ep_size):
+    def test_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -34,6 +38,7 @@ class TestAlltoAllDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
+            moe_permute_fusion=permute_fusion,
         )
         container.dispatcher_dropless_test()
 
@@ -52,6 +57,7 @@ class TestAlltoAllDispatcher:
             moe_router_topk=2,
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall_seq",
+            moe_permute_fusion=False,
         )
         container.dispatcher_dropless_test()
 
@@ -59,9 +65,10 @@ class TestAlltoAllDispatcher:
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
+    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
-    def test_capacity_forward_backward(self, tp_size, ep_size):
+    def test_capacity_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -73,6 +80,7 @@ class TestAlltoAllDispatcher:
             moe_token_drop_policy="probs",
             moe_expert_capacity_factor=0.5,
             moe_pad_expert_input_to_capacity=False,
+            moe_permute_fusion=permute_fusion,
         )
         container.dispatcher_capacity_test()
 
@@ -80,7 +88,10 @@ class TestAlltoAllDispatcher:
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
-    def test_capacity_padding_forward_backward(self, tp_size, ep_size):
+    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    def test_capacity_padding_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -92,5 +103,6 @@ class TestAlltoAllDispatcher:
             moe_token_drop_policy="probs",
             moe_expert_capacity_factor=0.6,
             moe_pad_expert_input_to_capacity=True,
+            moe_permute_fusion=permute_fusion,
         )
         container.dispatcher_drop_and_pad_test()
