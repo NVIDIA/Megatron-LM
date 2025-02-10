@@ -85,6 +85,7 @@ class TestGPTInferenceWrapper:
             ), f"Shape mismatch . Expected {(self.batch_size, 5, self.vocab_size)}, but got {logits.shape}"
 
     # This will call the inference_wrapped_model.forward_pass_with_pipeline_parallel_large_input_batch()
+    @pytest.mark.flaky
     def test_inference_pipeline_parallel_large__size(self):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
 

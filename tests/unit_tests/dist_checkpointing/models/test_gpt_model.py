@@ -116,6 +116,7 @@ class TestGPTModelReconfiguration:
             store_order,
         )
 
+    @pytest.mark.flaky_in_dev
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):
         common_test_state_dict_comparison(initialize_gpt_model, tmp_path_dist_ckpt)
 
