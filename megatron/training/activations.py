@@ -9,7 +9,6 @@ from megatron.core.jit import jit_fuser
 from megatron.core.transformer.module import MegatronModule
 
 
-@jit_fuser
 class XIELU(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
         super(XIELU, self).__init__(config)
