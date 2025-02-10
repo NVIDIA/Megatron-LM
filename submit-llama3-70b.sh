@@ -10,7 +10,6 @@
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --exclude=nid005079,nid007195,nid006510,nid005091,nid005866,nid005776
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
