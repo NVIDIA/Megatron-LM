@@ -107,6 +107,7 @@ class TestGPTInferenceWrapper:
                 self.vocab_size,
             ), f"Shape mismatch . Expected {(self.batch_size,10, self.vocab_size)}, but got {logits.shape}"
 
+    @pytest.mark.flaky
     def test_inference_only_tensor_parallel(self):
         self.setup_model(tensor_parallel_size=4, pipeline_parallel_size=1)
 

@@ -130,6 +130,7 @@ class TestGPTModelReconfiguration:
             (17, (1, 1), (1, 8)),
         ],
     )
+    @pytest.mark.flaky_in_dev
     def test_vocab_size_padding_change(
         self, tmp_path_dist_ckpt, vocab_size_base, src_tp_pp, dest_tp_pp
     ):

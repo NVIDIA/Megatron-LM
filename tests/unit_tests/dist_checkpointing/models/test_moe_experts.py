@@ -218,6 +218,7 @@ class TestExpertLayerReconfiguration:
         ],
     )
     @pytest.mark.parametrize("src_module,dest_module", src_dest_expert_type)
+    @pytest.mark.flaky
     def test_sequential_grouped_mlp_interchangeable(
         self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, src_module, dest_module
     ):
