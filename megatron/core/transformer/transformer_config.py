@@ -736,6 +736,9 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
                 )
 
+            if self.multi_latent_attention:
+                raise ValueError("multi_latent_attention does not support apply_rope_fusion.")
+
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
