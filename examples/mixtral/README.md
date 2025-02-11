@@ -34,7 +34,7 @@ MEGATRON_FORMAT_DIR=/workspace/checkpoints/mixtral-mcore-TP${TARGET_TP_SIZE}PP${
 
 python tools/checkpoint/convert.py \
 --model-type GPT \
---loader loader_mixtral_hf \
+--loader mixtral_hf \
 --saver mcore \
 --target-tensor-parallel-size ${TARGET_TP_SIZE} \
 --target-pipeline-parallel-size ${TARGET_PP_SIZE} \
