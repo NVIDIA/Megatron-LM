@@ -53,6 +53,7 @@ class TestLoraAdapterWithLoraLayers:
             config=self.config,
             rank=self.rank,
             alpha=self.alpha,
+            dropout=0.01,
         )
         yield
         Utils.destroy_model_parallel()
@@ -78,8 +79,8 @@ class TestLoraAdapterWithLoraLayers:
         assert missing_keys == []
         assert unexpected_keys == []
         assert self.lora_adapter.base_layer.weight.all()
-        assert self.lora_adapter.lora_a.weight.all()
-        assert not self.lora_adapter.lora_b.weight.all()
+        assert torch.any(self.lora_adapter.lora_a.weight)
+        assert self.lora_adapter.lora_b.weight.sum() == 0
 
 
 class TestLoraAdapterWithUnknownBaseLayer:
@@ -105,6 +106,7 @@ class TestLoraAdapterWithUnknownBaseLayer:
             config=self.transformer_config,
             rank=self.rank,
             alpha=self.alpha,
+            dropout=0.01,
         )
         yield
         Utils.destroy_model_parallel()
