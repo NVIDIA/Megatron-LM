@@ -516,10 +516,6 @@ class LocalNonpersistentObject:
         return self.obj
 
 
-# TODO: Delete once NeMo fixes typo.
-LocalNonpersitentObject = LocalNonpersistentObject
-
-
 @dataclass
 class ShardedObject(ShardedBase):
     """Represents a mapping between a local object and a global object.
