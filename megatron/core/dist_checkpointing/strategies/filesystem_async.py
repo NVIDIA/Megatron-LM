@@ -7,7 +7,9 @@ import logging
 import os
 import queue
 from contextlib import contextmanager
+from heapq import heappop, heappush
 from itertools import chain
+from operator import itemgetter
 from pathlib import Path
 from time import time
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -102,7 +104,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 self.thread_count > 1
             ), "thread_count must be at least 2 if separation_hint is provided"
         bins = self.thread_count // 2 if self.separation_hint is not None else self.thread_count
-        item_buckets = _split_by_size_and_type(bins, plan.items, self.separation_hint)
+        item_buckets = _split_by_size_and_type(bins, plan.items)
         logger.debug(f"bucket_prep, time: {time() - start}")
 
         start = time()
@@ -365,9 +367,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         )
 
 
-def _split_by_size_and_type(
-    bins: int, items: List[WriteItem], separation_hint: Optional[str] = None
-) -> List[List[WriteItem]]:
+def _split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
     """
     Splits write items according to item size into close to uniform bins.
 
@@ -383,24 +383,32 @@ def _split_by_size_and_type(
     if bins == 1:
         return [items]
 
-    bytes_items = [wi for wi in items if wi.type == WriteItemType.BYTE_IO]
-    tensor_items = [wi for wi in items if wi.type != WriteItemType.BYTE_IO]
+    bytes_items: List[WriteItem] = []
+    tensor_items: List[WriteItem] = []
+    for wi in items:
+        container = bytes_items if wi.type == WriteItemType.BYTE_IO else tensor_items
+        container.append(wi)
 
     buckets: List[List[WriteItem]] = [[] for _ in range(bins)]
     bucket_sizes = [0 for _ in range(bins)]
-
-    tensor_items.sort(key=_item_size, reverse=True)
 
     # Assign bytes with a simple round-robin
     for i, item in enumerate(bytes_items):
         buckets[i % bins].append(item)
 
-    # Then, assign tensors according to their sizes
-    for item in tensor_items:
-        # TODO replace with headq
-        idx = min(enumerate(bucket_sizes), key=lambda x: x[1])[0]
-        buckets[idx].append(item)
-        bucket_sizes[idx] += _item_size(item)
+    # Sort tensor items by size in decreasing order once and store the size with item
+    sized_tensors = [(item, _item_size(item)) for item in tensor_items]
+    sized_tensors.sort(key=itemgetter(1), reverse=True)
+
+    # Use a min heap for bin assignment
+    # Store (total_size_of_bin, bin_index) tuples
+    heap: List[Tuple[int, int]] = [(0, i) for i in range(bins)]
+
+    # Assign tensors using heap
+    for item, size in sized_tensors:
+        total_bin_size, bin_idx = heappop(heap)
+        buckets[bin_idx].append(item)
+        heappush(heap, (total_bin_size + size, bin_idx))
 
     return buckets
 
