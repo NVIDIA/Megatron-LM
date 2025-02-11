@@ -14,7 +14,11 @@ from megatron.core.extensions.transformer_engine import (
     TELinear,
     TERowParallelLinear,
 )
-from megatron.core.tensor_parallel import ColumnParallelLinear, RowParallelLinear
+from megatron.core.tensor_parallel import (
+    ColumnParallelLinear,
+    Linear,
+    RowParallelLinear,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 
@@ -26,7 +30,7 @@ LORA_LAYERS_DEFAULT_CONFIG = {
     "skip_bias_add": True,
 }
 COLUMN_PARALLEL_LAYERS = [
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(Linear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD),
     partial(ColumnParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_),
 ]
 TE_COLUMN_PARALLEL_LAYERS = [
@@ -35,7 +39,7 @@ TE_COLUMN_PARALLEL_LAYERS = [
 ]
 ROW_PARALLEL_LAYERS = [
     partial(RowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(Linear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_),
 ]
 TE_ROW_PARALLEL_LAYERS = [
     partial(TERowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),

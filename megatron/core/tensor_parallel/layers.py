@@ -1206,3 +1206,141 @@ class RowParallelLinear(torch.nn.Module):
     def get_extra_state(self) -> None:
         """Keep compatibility with TE state dict."""
         return None
+
+
+class Linear(ColumnParallelLinear):
+    """Linear layer.
+
+    The linear layer is defined as Y = XA + b.
+
+    Args:
+        input_size:
+            first dimension of matrix A.
+        output_size:
+            second dimension of matrix A.
+        bias:
+            If true, add bias
+        init_method:
+            method to initialize weights. Note that bias is always set to zero.
+        stride:
+            For the strided linear layers.
+        keep_master_weight_for_test:
+            This was added for testing and should be set to False. It
+            returns the master weights used for initialization.
+        skip_bias_add:
+            If True, do not add the bias term, instead return it to be added by the
+            caller. This enables performance optimations where bias can be fused with other
+            elementwise operations.
+        skip_weight_param_allocation:
+            If True, weight parameter is not allocated and must be passed
+            as a keyword argument `weight` during the forward pass. Note that this does not
+            affect bias, which will be allocated if bias is True. Defaults to False.
+        embedding_activation_buffer:
+            This buffer holds the input activations of the final embedding
+            linear layer on the last pipeline stage when defer_embedding_wgrad_compute is enabled.
+        grad_output_buffer:
+            This buffer holds the gradient outputs of the final embedding linear
+            layer on the last pipeline stage when defer_embedding_wgrad_compute is enabled.
+        is_expert:
+            If True, the layer is treated as an MoE expert layer.
+        config:
+            ModelParallelConfig object
+    """
+
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        *,
+        config: ModelParallelConfig,
+        init_method: Callable,
+        bias=True,
+        stride=1,
+        keep_master_weight_for_test=False,
+        skip_bias_add=False,
+        skip_weight_param_allocation: bool = False,
+        embedding_activation_buffer: Optional[List[torch.Tensor]] = None,
+        grad_output_buffer: Optional[List[torch.Tensor]] = None,
+        is_expert: bool = False,
+    ):
+        super(Linear, self).__init__(
+            input_size,
+            output_size,
+            config=config,
+            init_method=init_method,
+            bias=bias,
+            stride=stride,
+            keep_master_weight_for_test=keep_master_weight_for_test,
+            skip_bias_add=skip_bias_add,
+            skip_weight_param_allocation=skip_weight_param_allocation,
+            embedding_activation_buffer=embedding_activation_buffer,
+            grad_output_buffer=grad_output_buffer,
+            is_expert=is_expert,
+        )
+
+        if is_expert:
+            world_size = get_expert_tensor_parallel_world_size()
+            rank = get_expert_tensor_parallel_rank()
+        else:
+            world_size = get_tensor_model_parallel_world_size()
+            rank = get_tensor_model_parallel_rank()
+
+        if not skip_weight_param_allocation:
+            if config.use_cpu_initialization:
+                self.weight = Parameter(
+                    torch.empty(
+                        self.output_size, self.input_size, dtype=config.params_dtype
+                    )
+                )
+                if config.perform_initialization:
+                    self.master_weight = _initialize_affine_weight_cpu(
+                        self.weight,
+                        self.output_size,
+                        self.input_size,
+                        self.output_size,
+                        0,
+                        init_method,
+                        stride=stride,
+                        return_master_weight=keep_master_weight_for_test,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+            else:
+                self.weight = Parameter(
+                    torch.empty(
+                        self.output_size,
+                        self.input_size,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                )
+                if config.perform_initialization:
+                    _initialize_affine_weight_gpu(
+                        self.weight,
+                        init_method,
+                        partition_dim=0,
+                        stride=stride,
+                        is_expert=self.is_expert,
+                    )
+
+            setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
+
+        if bias:
+            if config.use_cpu_initialization:
+                self.bias = Parameter(
+                    torch.empty(self.output_size, dtype=config.params_dtype)
+                )
+            else:
+                self.bias = Parameter(
+                    torch.empty(
+                        self.output_size,
+                        device=torch.cuda.current_device(),
+                        dtype=config.params_dtype,
+                    )
+                )
+            set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
+            if config.perform_initialization:
+                # Always initialize bias to zero.
+                with torch.no_grad():
+                    self.bias.zero_()
+            setattr(self.bias, 'allreduce', not (self.is_expert and self.expert_parallel))
