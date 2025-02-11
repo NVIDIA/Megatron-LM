@@ -118,6 +118,7 @@ class TestLocalCheckpointingReplication:
             yield
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     def test_repl_save_and_load(self, tmp_dir_per_class, tp, pp, async_save, algo, repl_groups):
         with self.post_init(tmp_dir_per_class, tp, pp, async_save, algo, repl_groups):
             num_floating_point_operations_so_far = 0

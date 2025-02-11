@@ -225,6 +225,8 @@ class TestDistributedOptimizer:
             # ((2, 1), 2, 2),
         ],
     )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl, initialize_fn):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp

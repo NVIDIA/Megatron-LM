@@ -2,6 +2,7 @@
 import inspect
 import tempfile
 
+import pytest
 import torch
 
 from megatron.core import InferenceParams, dist_checkpointing

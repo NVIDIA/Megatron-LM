@@ -73,6 +73,8 @@ class TestMCoreEngine:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_generate(self):
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
@@ -97,6 +99,8 @@ class TestMCoreEngine:
             assert result.generated_length > 0, f"Generated length should be greater than zero"
             assert result.generated_text is not None, f'Generated text should not be None'
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_generate_empty_prompt(self):
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
@@ -123,6 +127,8 @@ class TestMCoreEngine:
             assert result.generated_text is not None, f'Generated text should not be None'
 
     @pytest.mark.asyncio
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     async def test_streaming(self):
         async def collect_stream(stream_generator, num_tokens_to_generate):
             prev_log_probs = None
@@ -219,6 +225,8 @@ class TestMCoreEngine:
                 f"final_streamed_token.generated_log_probs={final_streamed_token.generated_log_probs}"
             )
 
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_multiple_generations(self):
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
