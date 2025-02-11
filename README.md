@@ -74,5 +74,5 @@ To submit your contribution you have to provide a fresh wandb project with the r
 
 2. Use the `copy_wandb_project.py` to create a copy of your run from your personal wandb project. Make sure it contains the relevant ablations and baselines.
   ```
-  python copy_wandb_project.py -se myusername -de myusername -sp Megatron-Clariden -dp contrib_linear_attention -r f5v94x1q  
+  python scripts/copy_wandb_project.py -se myusername -de myusername -sp Megatron-Clariden -dp contrib_linear_attention -r f5v94x1q  
   ```
