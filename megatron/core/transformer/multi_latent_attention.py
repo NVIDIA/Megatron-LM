@@ -64,6 +64,10 @@ class MultiLatentAttention(Attention):
 
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
 
+        # Overwrite the base class kv shape to support MLA inference
+        self.key_hidden_size = self.q_head_dim
+        self.val_hidden_size = self.config.v_head_dim
+
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
 
@@ -116,6 +120,7 @@ class MultiLatentAttention(Attention):
         attention_bias=None,
         packed_seq_params=None,
         position_ids=None,
+        sequence_len_offset=None,
     ):
         """Forward pass for multi-latent attention"""
         assert rotary_pos_emb is None, "Rotary position embeddings should not be passed into MLA."

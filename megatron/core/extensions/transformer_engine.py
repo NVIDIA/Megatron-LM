@@ -256,6 +256,17 @@ class TELinear(te.pytorch.Linear):
             return out
         return out, None
 
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Replicate cross TP/DP."""
+
+        # Provide the dist-ckpt support when TELinear is directly used
+        # It can only happen with duplicated parallel mode
+        assert (
+            self.parallel_mode == None
+        ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
+
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """
