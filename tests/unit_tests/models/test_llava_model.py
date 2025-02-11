@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -84,8 +85,6 @@ class TestLLaVAModel:
         assert self.model.vision_model.decoder.input_tensor.shape == expected_shape
 
     @pytest.mark.internal
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_preprocess_data(self):
         self.model.cuda()
 
@@ -133,7 +132,6 @@ class TestLLaVAModel:
 
         use_inference_kv_cache = False
         inference_params = None
-        image_token_mask = None
 
         embeddings, labels, loss_mask = self.model._preprocess_data(
             image_embeddings,
@@ -145,7 +143,6 @@ class TestLLaVAModel:
             inference_params,
             image_token_index,
             num_image_tiles,
-            image_token_mask,
         )
 
         img_seq_len = 577
@@ -533,19 +530,18 @@ def create_test_args(cp_size, sequence_parallel):
 
 class TestLLaVAModelTokenParallel:
 
-    def init_llava_model(self):
-        self.language_hidden_size = 64
-        self.language_num_attention_heads = 16
+    def _init_llava_model(self, cp_size, tp_size, sequence_parallel):
+        language_hidden_size = 64
+        language_num_attention_heads = 16
 
         language_config = TransformerConfig(
             num_layers=3,
-            hidden_size=self.language_hidden_size,
-            num_attention_heads=self.language_num_attention_heads,
+            hidden_size=language_hidden_size,
+            num_attention_heads=language_num_attention_heads,
             use_cpu_initialization=False,
-            tensor_model_parallel_size=self.tp_size,
-            sequence_parallel=self.sequence_parallel,
-            context_parallel_size=1,  # Init with CP=1 until CI catches up to TEv1.10
-            # context_parallel_size=self.cp_size,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=sequence_parallel,
+            context_parallel_size=cp_size,
         )
         # SP and CP are not yet supported for the Vision Backbone
         vision_config = TransformerConfig(
@@ -553,17 +549,17 @@ class TestLLaVAModelTokenParallel:
             hidden_size=16,
             num_attention_heads=8,
             use_cpu_initialization=False,
-            tensor_model_parallel_size=self.tp_size,
+            tensor_model_parallel_size=tp_size,
             sequence_parallel=False,
             context_parallel_size=1,
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
-            hidden_size=self.language_hidden_size,
-            ffn_hidden_size=1024,
+            hidden_size=language_hidden_size,
+            ffn_hidden_size=128,
             num_attention_heads=8,
             use_cpu_initialization=False,
-            tensor_model_parallel_size=self.tp_size,
+            tensor_model_parallel_size=tp_size,
             sequence_parallel=False,
             context_parallel_size=1,
         )
@@ -589,7 +585,7 @@ class TestLLaVAModelTokenParallel:
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
         vision_config.vision_model_type = "clip"
-        self.model = LLaVAModel(
+        model = LLaVAModel(
             language_transformer_config=language_config,
             language_transformer_layer_spec=language_layer_spec,
             language_vocab_size=8192,
@@ -604,7 +600,9 @@ class TestLLaVAModelTokenParallel:
             patch_dim=14,
         )
 
-    @pytest.mark.internal  # The model is under active development and its methods may change.
+        return model
+
+    @pytest.mark.internal
     def setup_method(self, method):
         Utils.destroy_model_parallel()
 
@@ -617,36 +615,43 @@ class TestLLaVAModelTokenParallel:
         "cp_size,tp_size,sequence_parallel,padding",
         [(1, 8, True, True), (2, 4, False, True), (2, 4, True, False), (2, 4, True, True)],
     )
-    @pytest.mark.flaky
     def test_process_embedding_token_parallel(self, cp_size, tp_size, sequence_parallel, padding):
-        self.cp_size = cp_size
-        self.tp_size = tp_size
-        self.sequence_parallel = sequence_parallel
-        self.padding = padding
+        """Test _process_embedding_token_parallel.
+
+        Note: This test requires TE version >= 1.10.0 to run properly.
+        """
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=self.tp_size, context_parallel_size=self.cp_size
+            tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
         )
         model_parallel_cuda_manual_seed(123)
 
-        self.init_llava_model()
-        self.model.cuda()
-        # Setting CP size for LLM here as model init is done with CP=1 to
-        # avoid TE version check until CI catches up to TEv1.10
-        if self.cp_size > 1:
-            self.model.context_parallel_lm = self.cp_size
+        # TE version must be at least 1.10.0 if using context parallelism. Exit otherwise.
+        ctx = (
+            nullcontext()
+            if (is_te_min_version("1.10.0") or cp_size <= 1)
+            else pytest.raises(AssertionError)
+        )
+        model = None
+        with ctx:
+            model = self._init_llava_model(cp_size, tp_size, sequence_parallel)
 
-        args = create_test_args(self.cp_size, self.sequence_parallel)
+        if model is None:
+            return
+
+        model.cuda()
+
+        args = create_test_args(cp_size, sequence_parallel)
         set_args(args)
 
         batch_size = 2
-        if self.padding:
+        if padding:
             combined_valid_seqlen = 2049
             combined_padded_seqlen = 2064
         else:
             combined_valid_seqlen = 2048
             combined_padded_seqlen = 2048
 
-        if self.cp_size > 1:
+        if cp_size > 1:
             combined_embeddings = torch.ones(
                 [batch_size, combined_padded_seqlen, 4096], device='cuda', dtype=torch.bfloat16
             )  # [B, S, H]
@@ -677,7 +682,7 @@ class TestLLaVAModelTokenParallel:
         )
 
         qkv_format = 'sbhd'  # Default format when not using padding
-        if self.cp_size > 1 and self.padding:
+        if cp_size > 1 and padding:
             # Reshape from [B,S] to [1,T]
             combined_embeddings = (
                 combined_embeddings.contiguous()
@@ -701,39 +706,39 @@ class TestLLaVAModelTokenParallel:
         )
 
         combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
-            self.model._process_embedding_token_parallel(
+            model._process_embedding_token_parallel(
                 combined_embeddings, new_labels, new_loss_mask, packed_seq_params
             )
         )
 
         # Check if output shape is as expected
-        if self.cp_size > 1 and self.sequence_parallel:
-            if self.padding:
+        if cp_size > 1 and sequence_parallel:
+            if padding:
                 # THD format
                 assert combined_embeddings.shape[0] == batch_size * (
-                    combined_padded_seqlen / (self.tp_size * self.cp_size)
+                    combined_padded_seqlen / (tp_size * cp_size)
                 )
                 assert combined_embeddings.shape[1] == 1
             else:
                 # SBHD format
                 assert combined_embeddings.shape[0] == (
-                    combined_padded_seqlen / (self.tp_size * self.cp_size)
+                    combined_padded_seqlen / (tp_size * cp_size)
                 )
                 assert combined_embeddings.shape[1] == batch_size
-        elif self.cp_size > 1:
-            if self.padding:
+        elif cp_size > 1:
+            if padding:
                 # THD format
                 assert combined_embeddings.shape[0] == batch_size * (
-                    combined_padded_seqlen / self.cp_size
+                    combined_padded_seqlen / cp_size
                 )
                 assert combined_embeddings.shape[1] == 1
             else:
                 # SBHD format
-                assert combined_embeddings.shape[0] == (combined_padded_seqlen / self.cp_size)
+                assert combined_embeddings.shape[0] == (combined_padded_seqlen / cp_size)
                 assert combined_embeddings.shape[1] == batch_size
         else:
             # SBHD format
-            assert combined_embeddings.shape[0] == combined_padded_seqlen / self.tp_size
+            assert combined_embeddings.shape[0] == combined_padded_seqlen / tp_size
             assert combined_embeddings.shape[1] == batch_size
 
 
@@ -745,8 +750,6 @@ def count_parameters(model):
 @pytest.mark.parametrize(
     'dtp, dpp, etp, epp', [(1, 1, 1, 0), (1, 1, 1, 1), (2, 1, 2, 0), (2, 3, 2, 1), (2, 4, 2, 0)]
 )
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 def test_llava_model_parallelism(dtp, dpp, etp, epp):
     """
     The purpose of this test is to check that vit, vision projection and lm layer
@@ -767,7 +770,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     model_parallel_cuda_manual_seed(123)
 
     language_config = TransformerConfig(
-        num_layers=8,
+        num_layers=12,
         hidden_size=language_hidden_size,
         num_attention_heads=language_num_attention_heads,
         use_cpu_initialization=False,
@@ -839,7 +842,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     add_decoder = False if (pp_rank == 0 and epp == 1) else True
 
     language_config = TransformerConfig(
-        num_layers=8,
+        num_layers=12,
         hidden_size=language_hidden_size,
         num_attention_heads=language_num_attention_heads,
         use_cpu_initialization=False,
