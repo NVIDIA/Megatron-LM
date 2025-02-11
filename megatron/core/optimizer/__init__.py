@@ -27,7 +27,7 @@ from megatron.core import mpu
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
-from ..utils import log_single_rank
+from ..utils import is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
@@ -286,6 +286,9 @@ def _get_megatron_optimizer_based_on_param_groups(
                         "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
                     }
                 )
+
+                if is_te_min_version("2.1.0.dev0"):
+                    kwargs.update({"store_param_remainders": True})
 
             optimizer = Adam(**kwargs)
 
