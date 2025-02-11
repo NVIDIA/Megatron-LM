@@ -147,9 +147,15 @@ class TestTextGenerationController:
 
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.return_value = ''.join(
-            random.choices(string.ascii_letters, k=random.randint(4, 10))
+        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                for _ in range(len(x))
+            ]
         )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
 
         active_requests: Dict[str, InferenceRequest] = OrderedDict()
         all_prompt_tokens: Dict[str, List[int]] = OrderedDict()
@@ -166,7 +172,9 @@ class TestTextGenerationController:
             inference_request = InferenceRequest(
                 request_id=request_id,
                 prompt=prompt,
-                inference_parameters=SamplingParams(num_tokens_to_generate=10),
+                inference_parameters=SamplingParams(
+                    num_tokens_to_generate=10, return_log_probs=True, return_segments=True
+                ),
                 arrival_time=time.time(),
                 prompt_tokens=prompt_tokens,
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
@@ -201,9 +209,15 @@ class TestTextGenerationController:
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.bos = 0
         self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.return_value = ''.join(
-            random.choices(string.ascii_letters, k=random.randint(4, 10))
+        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+            [
+                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                for _ in range(len(x))
+            ]
         )
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == ' '
+        ] + [len(s)]
 
         prompt = ""
         active_requests: Dict[int, InferenceRequest] = OrderedDict()
