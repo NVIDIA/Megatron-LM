@@ -371,13 +371,13 @@ class TextGenerationController:
                 prompts_tokens=batch_prompt_tokens
             )
 
-            assert (
-                not self.inference_wrapped_model.inference_params.decode_mode
-            ), f"Generation must start in prefill mode"
-
             inference_input: Dict[str, Any] = self.prep_inference_input(
                 prompts_tokens=batch_prompt_tokens, active_requests=active_requests
             )
+
+            assert (
+                not self.inference_wrapped_model.inference_params.decode_mode
+            ), f"Generation must start in prefill mode"
 
             context_start_position = 0
             # Pick the context window that we need to pass through the network.
@@ -541,7 +541,8 @@ class TextGenerationController:
                 sampling_params.return_segments,
             )
             request.text = text  # Inference server returns prompts & generations together
-            request.segments = segments[0]
+            if sampling_params.return_segments:
+                request.segments = segments[0]
             request.generated_text = text[len(request.prompt) :]
         return active_requests
 

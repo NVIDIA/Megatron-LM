@@ -34,7 +34,8 @@ class InferenceRequest:
     status: Optional[Status] = None
     encoder_prompt: Optional[str] = None
     generated_text: Optional[str] = None
-    generated_segments: Optional[List[List[str]]] = None
+    segments: Optional[List[str]] = None
+    generated_segments: Optional[List[str]] = None
     generated_sequence_lengths: Optional[List[int]] = None
     generated_tokens: Optional[torch.Tensor] = None
     generated_log_probs: Optional[torch.Tensor] = None
