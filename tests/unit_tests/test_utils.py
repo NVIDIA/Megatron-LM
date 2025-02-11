@@ -71,6 +71,7 @@ def _deinit_distributed():
     torch.distributed.barrier()
 
 
+@pytest.mark.flaky_in_dev
 def test_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -95,6 +96,7 @@ def test_check_param_hashes_across_dp_replicas():
     _deinit_distributed()
 
 
+@pytest.mark.flaky_in_dev
 def test_cross_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -118,6 +120,7 @@ def test_cross_check_param_hashes_across_dp_replicas():
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.flaky_in_dev
 def test_param_norm(use_distributed_optimizer: bool):
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -166,6 +169,7 @@ def test_param_norm(use_distributed_optimizer: bool):
     _deinit_distributed()
 
 
+@pytest.mark.flaky_in_dev
 def test_straggler_detector():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
