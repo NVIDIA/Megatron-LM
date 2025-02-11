@@ -11,9 +11,6 @@ export NVTE_CK_V3_BF16_CVT=1
 export NVTE_CK_V3_SPEC=1
 export NVTE_CK_USES_BWD_V3=1
 
-export TE_HIPBLASLT_TUNING_ALGO_COUNT=50
-export TE_HIPBLASLT_TUNING_RUN_COUNT=10
-
 export TORCH_NCCL_HIGH_PRIORITY=1
 
 GPUS_PER_NODE=8
@@ -68,8 +65,6 @@ MOE_ARGS=(
     --moe-aux-loss-coeff 1e-2
     --moe-z-loss-coeff 1e-3
     --moe-token-dispatcher-type alltoall
-    --moe-pad-expert-input-to-capacity
-    --moe-expert-capacity-factor 1.25
     --overlap-param-gather
     --overlap-grad-reduce
 )
@@ -84,9 +79,9 @@ DATA_ARGS=(
 
 TRAINING_ARGS=(
     --train-iters 5000
-    --micro-batch-size 2
+    --micro-batch-size 1
     --global-batch-size 64
-    --lr 1e-4
+    --lr 1e-5
     --lr-decay-style cosine
     --min-lr 1.0e-5
     --weight-decay 0.1
@@ -118,7 +113,7 @@ LOGGING_ARGS=(
     --ckpt-format torch
     --no-save-optim
     --save $CHECKPOINT_PATH
-    --save-interval 500
+    --save-interval 250
     --exit-on-missing-checkpoint
     --load $CHECKPOINT_PATH
     --no-load-optim
