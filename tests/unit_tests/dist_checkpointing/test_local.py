@@ -242,7 +242,6 @@ class TestLocalCheckpointing:
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
     @pytest.mark.parametrize(('algo'), ['atomic', 'fully_parallel'])
-    @pytest.mark.flaky_in_dev
     def test_failed_save(self, caplog, tmp_path_dist_ckpt, tp, pp, use_ramdisk, async_save, algo):
         Utils.initialize_model_parallel(tp, pp)
         num_floating_point_operations_so_far = 0

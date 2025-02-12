@@ -462,7 +462,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
-                save_modelopt_state(model, state_dict)
+                if ckpt_type == CheckpointType.LOCAL:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                else:
+                    save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
@@ -1188,8 +1191,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             # after the model instance has been created and before _load_base_checkpoint is called.
             if has_nvidia_modelopt:
                 if ckpt_type == CheckpointType.LOCAL:
-                    raise NotImplementedError('Local checkpointing does not support model opt')
-                if not args.use_dist_ckpt:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                elif ckpt_type == CheckpointType.GLOBAL:
                     restore_modelopt_state(model, state_dict)
                 else:
                     restore_sharded_modelopt_state(model, checkpoint_name)
