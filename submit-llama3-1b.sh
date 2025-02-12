@@ -26,7 +26,7 @@ MBS=3
 GBS=504
 SEQ_LEN=4096
 TRAINING_STEPS=48441
-CHECKPOINT_STEPS=5000
+CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -45,8 +45,8 @@ PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
 
-CKPT_DIR=$PROJECT_DIR/checkpoints
 EXP_DIR=$PROJECT_DIR/$EXP_NAME
+CKPT_DIR=$EXP_DIR/checkpoints
 TRIGGER_DIR=$EXP_DIR/triggers
 DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
