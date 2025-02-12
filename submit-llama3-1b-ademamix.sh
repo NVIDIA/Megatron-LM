@@ -80,9 +80,9 @@ ulimit -c 0
 
 #### Megatron Args #### Check megatron/training/arguments.py
 # Based on the Llama 3.2 1B model.
+# 	--use-precision-aware-optimizer
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
-	--use-precision-aware-optimizer
 	--main-grads-dtype bf16
 )
 
