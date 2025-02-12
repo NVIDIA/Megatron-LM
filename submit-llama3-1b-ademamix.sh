@@ -83,7 +83,7 @@ ulimit -c 0
 # 	--use-precision-aware-optimizer
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
-	--main-grads-dtype bf16
+	--main-grads-dtype fp32
 )
 
 NETWORK_SIZE_ARGS=(
@@ -161,10 +161,10 @@ LEARNING_RATE_ARGS=(
 # )
 
 
+#	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
-	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 	--ckpt-format torch_dist
 	--async-save
 )
