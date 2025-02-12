@@ -235,7 +235,11 @@ if [ -n "$WANDB_API_KEY" ]; then
     wandb sync "$LOGGING_DIR/wandb/latest-run"
   fi
   # Add wandb-related args to TRAINING_CMD
-  TRAINING_CMD="git switch ademamix
+  TRAINING_CMD="
+  orig_dir=$(pwd)
+  cd "$MEGATRON_LM_DIR"
+  git switch ademamix
+  cd "$orig_dir"
   
   $TRAINING_CMD \
     --wandb-save-dir $LOGGING_DIR \
