@@ -235,7 +235,9 @@ if [ -n "$WANDB_API_KEY" ]; then
     wandb sync "$LOGGING_DIR/wandb/latest-run"
   fi
   # Add wandb-related args to TRAINING_CMD
-  TRAINING_CMD="$TRAINING_CMD \
+  TRAINING_CMD="git switch ademamix
+  
+  $TRAINING_CMD \
     --wandb-save-dir $LOGGING_DIR \
     --wandb-project $PROJECT_NAME \
     --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
