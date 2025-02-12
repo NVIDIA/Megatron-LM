@@ -52,7 +52,7 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> float:
+) -> tuple[list[torch.Tensor], float]:
     """Calculate the norm of gradients in fp32.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -68,25 +68,31 @@ def get_grad_norm_fp32(
             world for the distributed optimizer.
 
     Returns:
-        Total norm of the parameters (viewed as a single vector).
+        Tuple containing:
+        - List of individual gradient norms for each tensor
+        - Total norm of all parameters combined (viewed as a single vector)
     """
 
     if isinstance(grads_for_norm, torch.Tensor):
         grads_for_norm = [grads_for_norm]
 
     data_parallel_group = None
+    data_parallel_groups = []
     for grad in grads_for_norm:
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
+        data_parallel_groups.append(data_parallel_group)
 
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
 
     # Norm parameters.
     norm_type = float(norm_type)
     total_norm = 0.0
+    individual_norms = []
 
     # Calculate norm.
     if norm_type == inf:
-        total_norm = max(grad.abs().max() for grad in grads_for_norm)
+        individual_norms = [grad.abs().max() for grad in grads_for_norm]
+        total_norm = max(individual_norms)
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
@@ -118,22 +124,31 @@ def get_grad_norm_fp32(
             total_norm = grad_norm**norm_type
 
         else:
-            for grad in grads_for_norm:
-                grad_norm = torch.norm(grad, norm_type)
-                total_norm += grad_norm**norm_type
-
+            individual_norms = [torch.norm(grad, norm_type) for grad in grads_for_norm]
+            total_norm = sum(norm**norm_type for norm in individual_norms)
+            
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
-            )
+            ) 
+            # print("1", total_norm)
+            # for i in range(len(individual_norms)):
+            #     torch.distributed.all_reduce(
+            #         individual_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
+            #     )
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         total_norm = total_norm.item() ** (1.0 / norm_type)
-
-    return total_norm
-
+        # print("2", total_norm)
+        # for i in range(len(individual_norms)):
+        #     torch.distributed.all_reduce(
+        #         individual_norms[i], op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+        #     )
+        #     individual_norms[i] = individual_norms[i].item() ** (1 / norm_type)
+            
+    return individual_norms, total_norm
 
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
