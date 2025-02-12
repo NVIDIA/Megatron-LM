@@ -293,7 +293,8 @@ If loading for either inference or finetuning, use the following arguments for L
 --attention-softmax-in-fp32 \
 --disable-bias-linear \
 --transformer-impl transformer_engine \
---group-query-attention 8 \
+--group-query-attention \
+--num-query-groups 8 \
 --attention-dropout 0.0 \
 --hidden-dropout 0.0 \
 --rotary-base 500000 \
