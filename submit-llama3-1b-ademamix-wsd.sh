@@ -160,12 +160,11 @@ LEARNING_RATE_ARGS=(
 	--lr-wsd-decay-iters 4844  # last 10%
 )
 
-
-#	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
 	--ckpt-format torch_dist
+	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 	--async-save
 )
 
