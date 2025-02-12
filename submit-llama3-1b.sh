@@ -243,8 +243,7 @@ if [ "$NSYS_PROFILER" = true ]; then
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
 
-# Save sbatch script
-cat $0 >> $EXP_DIR/submit_run.sbatch
+cp $0 $DEBUG_DIR
 
 # Checkpoint Compute Environment
 echo -e "$(date)" > $COMPUTE_ENVIRONMENT_DIR 
