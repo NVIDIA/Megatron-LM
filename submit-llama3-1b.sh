@@ -1,11 +1,11 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=00:59:59
-#SBATCH --job-name=Megatron-LM-Llama3.2-1B
-#SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
-#SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
-#SBATCH --nodes=1
+#SBATCH --time=11:59:59
+#SBATCH --job-name=llama-1b
+#SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
+#SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
+#SBATCH --nodes=21
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
@@ -16,13 +16,17 @@
 echo "START TIME: $(date)"
 
 ################ Configs ################
+# Use the FineWeb Edu dataset
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
+# This config trains for ~100B tokens with 504 * 4096 = 2_064_384 tokens per batch.
+# Results in 504 / 3 = 168 forward passes with 4 replicas per node requires a 
+# maximum of 42 nodes such that each replica does batch accumulation of 1.
 MBS=3
-GBS=252
-SEQ_LEN=8192
-TRAINING_STEPS=5000
-CHECKPOINT_STEPS=10000
+GBS=504
+SEQ_LEN=4096
+TRAINING_STEPS=48441
+CHECKPOINT_STEPS=5000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -31,8 +35,8 @@ MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
 # Directories, Logging & Artifacts
-PROJECT_NAME=TheMeg-Clariden
-EXP_NAME=Llama3-1B-NODES-$SLURM_NNODES
+PROJECT_NAME=Megatron-Clariden
+EXP_NAME=llama3-1b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
 CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
@@ -75,6 +79,7 @@ srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $G
 ulimit -c 0
 
 ### Megatron Args ### Check megatron/training/arguments.py
+# Based on the Llama 3.2 1B model.
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	--use-precision-aware-optimizer
@@ -137,13 +142,16 @@ INITIALIZATION_ARGS=(
 
 # NOTE(tj.solergibert) Check all the arguments in megatron/training/arguments.py#L1548 or https://github.com/NVIDIA/Megatron-LM/blob/0dd78ddcdb117ce4f2e9761449274d87af717674/megatron/training/arguments.py#L1548-L1606
 LEARNING_RATE_ARGS=(
-	--lr 0.00001
+	--lr 0.0003
+	--min-lr 0.00003  # x10 reduction
+	--lr-decay-style cosine
+	--lr-warmup-iters 2000
 )
 
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
-	--load $CKPT_DIR
+	--load $CKPT_DIR  # uncomment this to reload from the latest checkpoint
 	--ckpt-format torch_dist
 	--async-save
 )
