@@ -146,7 +146,7 @@ You can submit issues and create branches on `https://github.com/swiss-ai/Megatr
 
 9. In your PR explain what you did and why. 
 
-10. If you make a contribution with a run, use the `scripts/copy_wandb_project.py` to create a copy in a new fresh wandb project that contains only the relevant run and the respective baseline. See instructions in the next section.
+10. If you make a contribution with a run, either use the wandb web UI to move your run into a new folder (select the run in the runs table and a move button will appear) or use the `scripts/copy_wandb_project.py` to create a copy in a new fresh wandb project that contains only the relevant run and the respective baseline (but in this case all runs will start from step 0). See instructions in the next section on how to use the copy script.
 
 11. If you want to archive your logs, move your log folder `~/Megatron-LM/logs/Meg-Runs/your_project_name/your_experiment_name` to `/capstor/store/cscs/swissai/a06/megatron_runs` and share the path in your PR.
 
