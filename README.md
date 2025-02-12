@@ -29,44 +29,45 @@ We also provide scripts to tokenize data using datatrove at scale and tools to c
 
 # Setup
 
-1. Clone megatron to your `iopsstor`.
+1. Clone the Megatron-LM repository to your `iopsstor`.
   ```
   cd /iopsstor/scratch/cscs/$USER/
   git clone https://github.com/swiss-ai/Megatron-LM.git
   ```
 
-2. You need to have to set the weights & biases environment variable with your key. Ideally you add it `~/.bashrc`.
+2. You need to set the weights & biases environment variable with your key. Ideally you add it `~/.bashrc`.
   ```
   export WANDB_API_KEY=57b215a80f....
   ```
   Now re-login or run `source ~/.bashrc` to make sure it is set. 
 
-## Submit a run
+## Submit a Run
 
-1. Start an 8B run by submitting the `submit-llama3-8B.sh` sbatch script. 
+1. Start the llama 3 8B baseline run by submitting the `submit-llama3-8B.sh` sbatch script. 
   ```
   sbatch submit-llama3-8B.sh
   ```
   You can find all available arguments here: [https://github.com/swiss-ai/Megatron-LM/blob/main/megatron/training/arguments.py](https://github.com/swiss-ai/Megatron-LM/blob/main/megatron/training/arguments.py)
-  (We will add 1.5B, 3B, and 70B baseline runs using the llama3 architecture very soon.)
+  (We will add <1B, 3B, and 70B baseline runs using the llama3 architecture very soon.)
 
-2. The main logs will be visible ~2min after launching the script in the `TheMeg-Clariden` Project on your personal weights and biases page.
+2. The main logs will be visible ~2min after launching the script in the `Megatron-Clariden` Project on your personal weights and biases page.
 
-3. The local logs will be at `/iopsstor/scratch/cscs/schlag/Megatron-LM/logs` with the slurm outputs and error files at `/iopsstor/scratch/cscs/schlag/Megatron-LM/logs/slurm/training`.
+3. The local logs will be at `/iopsstor/scratch/cscs/$USER/Megatron-LM/logs` with the slurm outputs and error files at `/iopsstor/scratch/cscs/$USER/Megatron-LM/logs/slurm/training`.
 
 # Data
 >[!NOTE]
 > On the Alps supercomputer, you can find tokenized datasets in `/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai`
+
 ## Tokenization
-While Megatron provides data tokenization tools, we use `datatrove`, which enables us reading data in multiple formats (`json`, `parquet`, `csv`...), easy parallelization across multiple nodes and efficiently filter and deduplicate our data.
+While Megatron provides data tokenization tools, we use `datatrove`, which enables us reading data in multiple formats (`json`, `parquet`, `csv`...), easy parallelization across multiple nodes, and efficient filtering and deduplication our data.
 
 We have extended `datatrove` ([PR](https://github.com/huggingface/datatrove/pull/304)) to include the [`MegatronDocumentTokenizer`](https://github.com/huggingface/datatrove/blob/22606036e92c8d83268f313f462ee98eceb3fa0b/src/datatrove/pipeline/tokens/megatron_tokenizer.py#L144) pipeline stage, allowing the generation of files containing tokenized documents compatible with NeMo/Megatron.
 
-All Megatron tokenized files, also referred as *file prefixes*, consist of two file types:
+All Megatron tokenized files, also referred to as *file prefixes*, consist of two file types:
 - The `.bin` files contain raw tokens, where each token is either 4 bytes (for vocabularies > 65535) or 2 bytes.
 - The `.idx` files contain metadata about the corresponding `.bin` files. For more details on creating these files, refer to [this example](https://github.com/huggingface/datatrove/blob/22606036e92c8d83268f313f462ee98eceb3fa0b/src/datatrove/pipeline/tokens/megatron_tokenizer.py#L59-L72).
 >[!CAUTION]
-> 🚨 On the Alps Supercomputer, ensure you **DO NOT WRITE**  under **`/capstor/store`**. Use `/iopsstor/scratch` instead 🚨
+> 🚨 On the Alps Supercomputer, ensure you **DO NOT WRITE**  under **`/capstor/store`**. Always use `/iopsstor/scratch`! 🚨
 
 We include a launcher to tokenize data at scale using multiple nodes in `scripts/tokenization`. Start by preparing your workspace using the `scripts/tokenization/prepare_dumps.py` script, which identifies parquet files in the specified directory, filters them based on criteria (check `--filter-in` and `--filter-out`), and splits the workload evenly across `--n-dumps`.  This process generates *.txt* files for each dump, specifying the files to process.
 
@@ -101,13 +102,13 @@ Checkpointing is a critical component of LLM training. It must be fast to minimi
 
 We use the PyTorch distributed checkpointing backend (`--ckpt-format torch_dist`) leveraging the asynchronous checkpointing option and parallelizing both storing and loading checkpoints within all the devices. The checkpoints are topology-agnostic, allowing them to be loaded with a different topology from the one used to store them. Each process will store 2 files (Default value for `thread_count` [[1](https://github.com/NVIDIA/Megatron-LM/blob/55cdfc1e8bfe116f54dbe6e48ff70cc92c9f4a91/megatron/core/dist_checkpointing/strategies/torch.py#L614)], [[2](https://pytorch.org/docs/stable/distributed.checkpoint.html#torch.distributed.checkpoint.FileSystemWriter)]) containing the state of the run.
 
-In Alps, writing a Llama3-70B checkpoint to `/iopsstor/scratch` blocks training for approximately 40 seconds. Be aware that these checkpoints are huge: A Llama3-70B model checkpoint takes **920 GB** and the Llama3-8B version takes **105 GB**.
+In Alps, writing a Llama3-70B checkpoint to `/iopsstor/scratch` blocks training for approximately 40 seconds. Be aware that these checkpoints are huge: A Llama3-70B model checkpoint takes **920 GB** and the Llama3-8B version takes **105 GB** (model weights in bf16 and optimizer states in fp32).
 
 In the launcher set `CHECKPOINT_STEPS` as the frequency every how many steps you want to store a checkpoint.
 ## Resuming from a checkpoint
 In Megatron, we use `--save` and `--load` to specify where checkpoints are read from and saved to.  
 
-With each checkpoint save, the file `latest_checkpointed_iteration.txt` will be updated in the `--save` directory, containing a reference to the last saved checkpoint.  
+With each checkpoint save, the file `latest_checkpointed_iteration.txt` will be updated in the `--save` directory, containing a reference to the last saved checkpoint. There is currently no feature to just keep the last `N` checkpoints.
 
 When resuming a run, the application will attempt to load the checkpoint referenced in the `latest_checkpointed_iteration.txt` file from the `--load` directory. To load a checkpoint from a different iteration, you will need to manually modify the reference inside `latest_checkpointed_iteration.txt`.
 
@@ -137,14 +138,26 @@ You can submit issues and create branches on `https://github.com/swiss-ai/Megatr
   git push origin my-contribution-branch
   ```
 
-6. Go to `https://github.com/swiss-ai/Megatron-LM` and create a new issue that references your branch and explains what you did. Add `ischlag` or `TJ-Solergibert` for now. 
+6. Go to `https://github.com/swiss-ai/Megatron-LM. 
 
-7. Use this command to return to main branch.
+7. GitHub will have a pop-up proposing to you to create a new PR. Click on that green button. 
+
+8. IMPORTANT: Change the base repository to `swiss-ai/Megatron-LM` or your PR will be submitted to the official Nvidia repo!
+
+9. In your PR explain what you did and why. 
+
+10. If you make a contribution with a run, use the `scripts/copy_wandb_project.py` to create a copy in a new fresh wandb project that contains only the relevant run and the respective baseline. See instructions in the next section.
+
+11. If you want to archive your logs, move your log folder `~/Megatron-LM/logs/Meg-Runs/your_project_name/your_experiment_name` to `/capstor/store/cscs/swissai/a06/megatron_runs` and share the path in your PR.
+
+12. Add `ischlag` or `TJ-Solergibert` to review your PR.
+
+13. Use this command to return to main branch.
   ```
   git checkout main
   ```
 
-## Copy your wandb logs to a new project. 
+## Copy Your Wandb Logs to a New Project 
 
 To submit your contribution you have to provide a fresh wandb project with the relevant logs. 
 
