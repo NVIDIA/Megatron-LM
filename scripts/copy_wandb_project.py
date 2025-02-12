@@ -69,11 +69,11 @@ def main(args):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Copies one or all of the runs in a wandb project to another.")
-    parser.add_argument("-se", "--src-entity", type=str, help="Source wandb entity name.")
-    parser.add_argument("-sp", "--src-project", type=str, help="Name of the wandb project.")
-    parser.add_argument("-de", "--dst-entity", type=str, help="Destination wandb entity name.")
-    parser.add_argument("-dp", "--dst-project", type=str, help="Name of destination wandb project.")
-    parser.add_argument("-r", "--runs", nargs="*", type=str, help="List of run IDs to copy. If None, all runs will be copied.")
+    parser.add_argument("-se", "--src-entity", required=True, type=str, help="Source wandb entity name.")
+    parser.add_argument("-sp", "--src-project", required=True, type=str, help="Name of the wandb project.")
+    parser.add_argument("-de", "--dst-entity", required=True, type=str, help="Destination wandb entity name.")
+    parser.add_argument("-dp", "--dst-project", required=True, type=str, help="Name of destination wandb project.")
+    parser.add_argument("-r", "--runs", nargs="*", required=True, type=str, help="List of run IDs to copy. If None, all runs will be copied.")
     parser.add_argument("-n", "--names", nargs="*", type=str, default=None, help="List of new names for copied runs (optional).")
 
     main(parser.parse_args())
