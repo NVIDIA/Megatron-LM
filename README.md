@@ -65,3 +65,14 @@ You can submit issues and create branches on `https://github.com/swiss-ai/Megatr
 ## How To's
 
 We will add detailed steps for specific workflows fairly soon.
+
+### How to copy your wandb logs to a new project. 
+
+To submit your contribution you have to provide a fresh wandb project with the relevant logs. 
+
+1. Go to your `wandb.ai` page and create a new public project (e.g. `contrib_linear_attention`)
+
+2. Use the `copy_wandb_project.py` to create a copy of your run from your personal wandb project. Make sure it contains the relevant ablations and baselines.
+  ```
+  python scripts/copy_wandb_project.py -se myusername -de myusername -sp Megatron-Clariden -dp contrib_linear_attention -r f5v94x1q  
+  ```
