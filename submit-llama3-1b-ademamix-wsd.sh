@@ -230,18 +230,12 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
 if [ -n "$WANDB_API_KEY" ]; then
   echo "[$(date)] WANDB API key detected. Enabling WANDB logging."
   # Sync any previous run data if present
-  if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
-    echo "[$(date)] Syncing WANDB from previous run"
-    wandb sync "$LOGGING_DIR/wandb/latest-run"
-  fi
+#   if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
+#     echo "[$(date)] Syncing WANDB from previous run"
+#     wandb sync "$LOGGING_DIR/wandb/latest-run"
+#   fi
   # Add wandb-related args to TRAINING_CMD
-  TRAINING_CMD="
-  orig_dir=$(pwd)
-  cd "$MEGATRON_LM_DIR"
-  git switch ademamix
-  cd "$orig_dir"
-  
-  $TRAINING_CMD \
+  TRAINING_CMD="$TRAINING_CMD \
     --wandb-save-dir $LOGGING_DIR \
     --wandb-project $PROJECT_NAME \
     --wandb-exp-name $EXP_NAME-$SLURM_JOB_ID"
@@ -261,11 +255,18 @@ if [ "$NSYS_PROFILER" = true ]; then
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
 
+PRE_CMD="
+  orig_dir=\$(pwd)
+  cd \"$MEGATRON_LM_DIR\"
+  git switch ademamix
+  cd \"$orig_dir\"
+  "
+
 cp $0 $DEBUG_DIR
 
 # Checkpoint Compute Environment
 echo -e "$(date)" > $COMPUTE_ENVIRONMENT_DIR 
-printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
+printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR
 echo -e "\nCMD: $CMD_PREFIX $TRAINING_CMD" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
 echo -e "\nSlurm file: $0\n" >> $COMPUTE_ENVIRONMENT_DIR
@@ -287,6 +288,6 @@ printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR
 echo -e "\nEnvironment Variables:\n\n$(printenv)" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
 
-srun -lu --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "$CMD_PREFIX $TRAINING_CMD"
+srun -lu --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "$PRE_CMD $CMD_PREFIX $TRAINING_CMD"
 
 echo "END TIME: $(date)"
