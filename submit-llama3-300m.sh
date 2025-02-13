@@ -1,11 +1,11 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=11:59:59
-#SBATCH --job-name=llama-1b
+#SBATCH --time=5:00:00
+#SBATCH --job-name=llama-300m
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=21
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
@@ -16,16 +16,15 @@
 echo "START TIME: $(date)"
 
 ################ Configs ################
-# Use the FineWeb Edu dataset
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
-# This config trains for ~100B tokens with 504 * 4096 = 2_064_384 tokens per batch.
-# Results in 504 / 3 = 168 forward passes with 4 replicas per node requires a 
-# maximum of 42 nodes such that each replica does batch accumulation of 1.
-MBS=3
-GBS=504
+# global batch size = 256 * 4096 ~ 1M tokens
+# iteration time ~0.9 sec. Throughput ~ 140 TFLOPS/GPU/s
+# 8B tokens -> 8k iterations -> 8k * 0.9 sec = 1.8 hours
+MBS=2
+GBS=256
 SEQ_LEN=4096
-TRAINING_STEPS=48441
+TRAINING_STEPS=8000
 CHECKPOINT_STEPS=1000
 
 #### Debugging ####
@@ -40,7 +39,7 @@ DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
 PROJECT_NAME=Megatron-Clariden
-EXP_NAME=llama3-1b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
+EXP_NAME=llama3-300m-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
@@ -78,8 +77,7 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 ulimit -c 0
 
-#### Megatron Args #### Check megatron/training/arguments.py
-# Based on the Llama 3.2 1B model.
+### Megatron Args ### Check megatron/training/arguments.py
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	--use-precision-aware-optimizer
@@ -87,12 +85,12 @@ TRANSFORMER_ENGINE_ARGS=(
 )
 
 NETWORK_SIZE_ARGS=(
-	--num-layers 16
+	--num-layers 6
 	--hidden-size 2048
-	--ffn-hidden-size 8192
-	--num-attention-heads 32
+	--ffn-hidden-size 6144
+	--num-attention-heads 16
 	--group-query-attention
-	--num-query-groups 8
+	--num-query-groups 4
 	--max-position-embeddings $SEQ_LEN
 	--position-embedding-type rope
 	--rotary-base 500000
@@ -145,13 +143,13 @@ LEARNING_RATE_ARGS=(
 	--lr 0.0003
 	--min-lr 0.00003  # x10 reduction
 	--lr-decay-style cosine
-	--lr-warmup-iters 2000
+	--lr-warmup-iters 500
 )
 
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
-	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
+	--load $CKPT_DIR
 	--ckpt-format torch_dist
 	--async-save
 )
