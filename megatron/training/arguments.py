@@ -22,7 +22,7 @@ from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_torch_min_version
 from megatron.training.activations import squared_relu
-from megatron.training.activations import XIELU
+from megatron.training.activations import XIELU, XIPReLU, XIPReLUP
 from megatron.training.utils import update_use_dist_ckpt
 
 
@@ -873,9 +873,11 @@ def core_transformer_config_from_args(args, config_class=None):
         assert not args.swiglu
         kw_args['activation_func'] = squared_relu
     if args.xielu:
-        # TODO add support for fused xielu
-        assert not args.swiglu and not args.squared_relu
         kw_args['activation_func'] = XIELU
+    if args.xiprelu:
+        kw_args['activation_func'] = XIPReLU
+    if args.xiprelup:
+        kw_args['activation_func'] = XIPReLUP
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -1088,6 +1090,10 @@ def _add_network_size_args(parser):
                        help='Use squared relu activation instead of default gelu')
     group.add_argument('--xielu', action='store_true',
                        help='Use xielu activation instead of default gelu')
+    group.add_argument('--xiprelu', action='store_true',
+                       help='Use xiprelu activation instead of default gelu')
+    group.add_argument('--xiprelup', action='store_true',
+                       help='Use xiprelup activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,
