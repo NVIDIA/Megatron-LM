@@ -5,7 +5,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_SOCKET_IFNAME=ens3
 
-GPUS_PER_NODE=2 # testing 241205
+GPUS_PER_NODE=1 # testing 241205
  
 # #single node
 # MASTER_ADDR=localhost
@@ -54,8 +54,8 @@ GPT_ARGS="
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --use-mcore-models \
-    --num-experts 8 \
-    --expert-model-parallel-size 2 \
+    --num-experts 2 \
+    --expert-model-parallel-size 1 \
     --use-distributed-optimizer \
 "
 # Arguments should vary by commit version
