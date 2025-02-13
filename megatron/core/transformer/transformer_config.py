@@ -132,6 +132,11 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    post_layer_norm: bool = False
+    
+    downscale_residual: Optional[float] = None
+    single_residual_gain: bool = False
+
     ####################
     # initialization
     ####################

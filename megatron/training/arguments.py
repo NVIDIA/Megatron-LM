@@ -1093,6 +1093,22 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.')
     group.add_argument('--multi-latent-attention', action='store_true',
                        help='Use multi-latent attention for model.')
+
+    # OP arguments
+    group.add_argument('--no-attn-layernorm', action='store_false', dest='attn_layernorm',
+                       help='Disable pre-attention layernorm')
+    group.add_argument('--no-mlp-layernorm', action='store_false', dest='mlp_layernorm',
+                       help='Disable pre-mlp layernorm')
+    group.add_argument('--no-final-layernorm', action='store_false', dest='final_layernorm',
+                       help='Disable final pre-lmhead layernorm')
+    group.add_argument("--post-layer-norm", action="store_true",
+                       help=("When set, apply layer normalization after the attention and mlp "
+                             "instead of before. It is advise to also set --no-final-layernorm"))
+    group.add_argument("--input-embeddings-multiplier", type=float, default=1.0,
+                       help="Multiply input_embeddings by this value")
+    group.add_argument("--downscale-residual", default=None, type=float,
+                       help="If set, add learnable downscaling of the residuals, initialized to this value")
+    group.add_argument("--single-residual-gain", action="store_true")
     return parser
 
 
@@ -2151,6 +2167,8 @@ def _add_vision_args(parser):
     # regularization arguments
     group.add_argument('--qk-layernorm', action='store_true',
                        help='Whether to layer normalize the q and k attention embeddings.')
+    group.add_argument('--use-torchqknorm', action='store_true',
+                       help='When set, megatron will use wrapped torch RMSnorm instead of TE norm')
 
     return parser
 

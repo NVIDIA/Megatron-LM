@@ -89,8 +89,16 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 # Define the decoder layer spec
                 if use_te:
                     transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        args.num_experts, args.moe_grouped_gemm,
-                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+                        num_experts=args.num_experts, 
+                        moe_grouped_gemm=args.moe_grouped_gemm,
+                        qk_layernorm=args.qk_layernorm, 
+                        multi_latent_attention=args.multi_latent_attention,
+                        attn_layernorm=args.attn_layernorm,
+                        mlp_layernorm=args.mlp_layernorm,
+                        use_torchqknorm=args.use_torchqknorm,
+                        post_layer_norm=args.post_layer_norm,
+                        downscale_residual=args.downscale_residual,
+                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm)
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
                         args.num_experts, args.moe_grouped_gemm,
@@ -125,7 +133,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 position_embedding_type=args.position_embedding_type,
                 rotary_percent=args.rotary_percent,
                 rotary_base=args.rotary_base,
-                rope_scaling=args.use_rope_scaling
+                rope_scaling=args.use_rope_scaling,
+                input_embeddings_multiplier=args.input_embeddings_multiplier,
+                final_layernorm=args.final_layernorm,
             )
 
     return model
