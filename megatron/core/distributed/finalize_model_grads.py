@@ -185,9 +185,8 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         grads = []
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
-                if (
-                    param.requires_grad
-                    and getattr(param, 'sequence_parallel', False)
+                if param.requires_grad and (
+                    getattr(param, 'sequence_parallel', False)
                     or 'q_layernorm' in name
                     or 'k_layernorm' in name
                 ):
