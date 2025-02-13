@@ -255,13 +255,6 @@ if [ "$NSYS_PROFILER" = true ]; then
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
 
-PRE_CMD="
-  orig_dir=\$(pwd)
-  cd \"$MEGATRON_LM_DIR\"
-  git switch ademamix
-  cd \"$orig_dir\"
-  "
-
 cp $0 $DEBUG_DIR
 
 # Checkpoint Compute Environment
@@ -288,6 +281,6 @@ printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR
 echo -e "\nEnvironment Variables:\n\n$(printenv)" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
 
-srun -lu --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "$PRE_CMD $CMD_PREFIX $TRAINING_CMD"
+srun -lu --cpus-per-task $SLURM_CPUS_PER_TASK --wait 60 bash -c "$CMD_PREFIX $TRAINING_CMD"
 
 echo "END TIME: $(date)"
