@@ -356,6 +356,9 @@ def print_rank_last(message):
     else:
         print(message, flush=True)
 
+def get_device_arch_version():
+    """Returns GPU arch version (8: Ampere, 9: Hopper, 10: Blackwell, ...)"""
+    return torch.cuda.get_device_properties(torch.device("cuda:0")).major
 
 def append_to_progress_log(string, barrier=True):
     """Append given string to progress log."""
