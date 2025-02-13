@@ -25,7 +25,7 @@ MBS=2
 GBS=256
 SEQ_LEN=4096
 TRAINING_STEPS=8000
-CHECKPOINT_STEPS=2000
+CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -34,7 +34,7 @@ MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/experiments/300m-model/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
