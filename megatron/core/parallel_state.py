@@ -434,6 +434,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
+    pipeline_model_parallel_comm_backend: Optional[str] = "nccl",
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
@@ -945,13 +946,75 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+    if pipeline_model_parallel_comm_backend == 'ucc':
+        # The UCC backend provides two key benefits:
+        # 1) Achieves better bandwidth utilization than NCCL when using InfiniBand links.
+        # 2) Does not use GPU SM resources (Zero-SM), mitigating performance interference
+        #    with overlapping compute kernels.
+
+        # The UCC backend is recommended in the following cases:
+        # 1) When the exposed pipeline-parallel (PP) communications are significant.
+        #    - E.g., Pipeline parallelism with very less gradient accumulation steps.
+        #    - It may provide better performance due to improved bandwidth utilization.
+        # 2) When the critical-path pipeline stage has substantial PP-communication overlap.
+        #    - E.g., Uneven pipeline parallelism.
+        #    - It may provide better performance due to zero SM resource usage.
+        if 'CUDA_DEVICE_MAX_CONNECTIONS' in os.environ:
+            # UCC backend requires CUDA_DEVICE_MAX_CONNECTIONS variable to be larger than 1,
+            # to gurantee the overlapped UCC communications. If this environment variable is set to 1,
+            # all the UCC communication will be serialized.
+            assert (
+                os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] is not '1'
+            ), "UCC-backend requires CUDA_DEVICE_MAX_CONNECTIONS > 1"
+
+        # Setting up required environment variables for ucc backend
+        #
+        # "TORCH_UCC_BLOCKING_WAIT=none" allows non-blocking waits of the communiction handle
+        # "UCC_EC_CUDA_STREAM_TASK_MODE" controls how CUDA execution engines (EC)
+        # schedule tasks on CUDA streams.
+        # "UCX_TLS" controls transport layer selection
+        # "NSYS_UCP_COMM_PARAMS=1" enables capturing ucx tracing in nsys profiling
+        # "UCX_RNDV_THRESH" controls threshold threshold for switching between
+        # eager and rendezvous (RNDV) communication protocols.
+        # "UCX_NET_DEVICES" select which network interfaces UCX should use.
+        # "UCC_CL_BASIC_TLS" controls which Transport Layers are used by
+        # the Basic Collective libraray
+
+        os.environ['TORCH_UCC_BLOCKING_WAIT'] = (
+            os.environ['TORCH_UCC_BLOCKING_WAIT']
+            if "TORCH_UCC_BLOCKING_WAIT" in os.environ
+            else 'none'
+        )
+        os.environ['UCC_EC_CUDA_STREAM_TASK_MODE'] = (
+            os.environ['UCC_EC_CUDA_STREAM_TASK_MODE']
+            if "UCC_EC_CUDA_STREAM_TASK_MODE" in os.environ
+            else 'driver'
+        )
+        os.environ['UCX_TLS'] = (
+            os.environ['UCX_TLS'] if "UCX_TLS" in os.environ else 'ib,cuda_copy'
+        )  # cuda_ipc (i.e., NVLink-enablement) will be later supported
+        os.environ['NSYS_UCP_COMM_PARAMS'] = '1'
+        os.environ['UCX_RNDV_THRESH'] = '0'
+        os.environ['UCX_NET_DEVICES'] = 'all'
+        os.environ['UCC_CL_BASIC_TLS'] = '^sharp,nccl'
+
     for ranks in generator_wrapper('pp'):
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options('pp', nccl_comm_cfgs),
+            backend=pipeline_model_parallel_comm_backend,
+            pg_options=(
+                None
+                if pipeline_model_parallel_comm_backend == 'ucc'
+                else get_nccl_options('pp', nccl_comm_cfgs)
+            ),
             group_desc='PIPELINE_MODEL_PARALLEL_GROUP',
         )
+        assert (
+            pipeline_model_parallel_comm_backend == 'nccl'
+            or pipeline_model_parallel_comm_backend == 'ucc'
+        ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
+
         if rank in ranks:
             if _PIPELINE_MODEL_PARALLEL_GROUP is None:
                 _PIPELINE_MODEL_PARALLEL_GROUP = group
