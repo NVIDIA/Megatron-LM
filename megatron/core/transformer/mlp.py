@@ -148,7 +148,6 @@ class MLP(MegatronModule):
                     if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
             sharded_state_dict.update(sub_sd)
-
         return sharded_state_dict
 
 
