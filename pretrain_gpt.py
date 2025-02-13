@@ -261,6 +261,9 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         cross_document_attention=args.cross_document_attention,
         s3_cache_path=args.s3_cache_path,
+        goldfish_loss=args.goldfish_loss,
+        goldfish_k=args.goldfish_k,
+        goldfish_h=args.goldfish_h,
     )
 
 
