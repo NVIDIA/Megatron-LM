@@ -35,7 +35,7 @@ MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/experiments/ademamix/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
