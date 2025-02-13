@@ -76,8 +76,10 @@ def model_provider(
     language_config = get_language_model_config(language_config)
 
     if use_te:
+        # Padding mask needed for SP/CP.
+        padding = args.context_parallel_size > 1 and args.sequence_parallel
         language_transformer_layer_spec = get_layer_spec_te(
-            is_vit=False
+            is_vit=False, padding=padding
         )  # TENorm detects LayerNorm/RMS automatically.
     else:
         language_transformer_layer_spec = get_layer_spec(
@@ -148,6 +150,14 @@ def model_provider(
     vision_projection_config.recompute_method = None
     vision_projection_config.recompute_num_layers = None
 
+    # TODO: Vision model and projection do not use SP/CP yet.
+    vision_config.sequence_parallel = False
+    vision_config.context_parallel_size = 1
+    vision_config.tp_comm_overlap = False
+
+    vision_projection_config.sequence_parallel = False
+    vision_projection_config.context_parallel_size = 1
+    vision_projection_config.tp_comm_overlap = False
 
     tokenizer = get_tokenizer()
     image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)

@@ -66,6 +66,7 @@ class _get_data_on_this_cp_rank(torch.autograd.Function):
                 ctx.decoder_emb_index = index
                 ctx.decoder_emb_seqlen = data.size(1)
             batch[key] = data.index_select(1, index)
+            batch[key].requires_grad = data.requires_grad
 
         return batch
 
@@ -224,6 +225,12 @@ class LLaVAModel(MegatronModule):
                 language_transformer_config.pipeline_model_parallel_size > 1
             )
 
+            # Newer Transformer Engine versions add _extra_state keys in state_dict when using FP8.
+            # Older models may not have _extra_state and can be ignored.
+            self.language_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
+            )
+
         class_token_len = 1
         if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
@@ -276,6 +283,10 @@ class LLaVAModel(MegatronModule):
                     "supported."
                 )
 
+            self.vision_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
+            )
+
             vision_projection_input_size = vision_transformer_config.hidden_size
             vision_projection_input_size *= 4 if pixel_shuffle else 1
 
@@ -299,7 +310,7 @@ class LLaVAModel(MegatronModule):
                     partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
                 )
 
-        self._img_seq_len = get_num_image_embeddings(
+        self.img_seq_len = get_num_image_embeddings(
             img_h,
             img_w,
             patch_dim,
@@ -420,7 +431,7 @@ class LLaVAModel(MegatronModule):
         if use_inference_kv_cache:
             return language_embeddings, loss_mask, labels
 
-        img_seq_len = self._img_seq_len
+        img_seq_len = self.img_seq_len
         batch_size, text_seq_len = input_ids.shape
 
         has_labels = labels is not None
@@ -879,6 +890,28 @@ def _load_state_dict_hook_ignore_param_names(
                 f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
             )
             incompatible_keys.missing_keys.remove(param_name)
+
+
+def _load_state_dict_hook_ignore_extra_state(
+    module: torch.nn.Module, incompatible_keys: namedtuple
+):
+    """Hook to ignore Transformer Engine _extra_state used for FP8.
+
+    This is for backwards-compatibility. Newer TE versions add _extra_state keys to the state dict,
+    while older models might not have those keys. Those keys can be ignored when not using FP8.
+
+    Args:
+        module (torch.nn.Module): The torch module this hook applies to. Required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys,
+            which collect the missing and unexpected keys, respectively.
+    """
+    for name, keys in incompatible_keys._asdict().items():
+        for key in keys[::-1]:
+            if "extra_state" in key:
+                logging.getLogger(__name__).warning(
+                    f"_extra_state key {key} being removed from {name}"
+                )
+                keys.remove(key)
 
 
 # pylint: disable-next=line-too-long
