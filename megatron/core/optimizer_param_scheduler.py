@@ -174,6 +174,8 @@ class OptimizerParamScheduler:
                     coeff = 0.5 * (math.cos(math.pi * wsd_decay_ratio) + 1.0)
                 elif self.lr_wsd_decay_style == "exponential":
                     coeff = (2.0 * math.pow(0.5, wsd_decay_ratio)) - 1.0
+                elif self.lr_wsd_decay_style == "1-sqrt":
+                    coeff = 1.0 - math.sqrt(wsd_decay_ratio)
         else:
             raise Exception(f'{self.lr_decay_style} decay style is not supported.')
 
