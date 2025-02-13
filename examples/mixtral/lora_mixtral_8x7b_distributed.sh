@@ -34,7 +34,6 @@ DISTRIBUTED_ARGS=(
 )
 
 MODEL_ARGS=(
-    --use-mcore-models
     --disable-bias-linear
     --seq-length 4096
     --max-position-embeddings 32768
@@ -42,9 +41,9 @@ MODEL_ARGS=(
     --hidden-size 4096
     --ffn-hidden-size 14336
     --num-attention-heads 32
-    --init-method-std 0.01
-    --attention-dropout 0.0
-    --hidden-dropout 0.0
+    --init-method-std 1e-2
+    --attention-dropout 0
+    --hidden-dropout 0
     --normalization RMSNorm
     --position-embedding-type rope
     --swiglu
@@ -83,9 +82,9 @@ TRAINING_ARGS=(
     --global-batch-size 64
     --lr 1e-5
     --lr-decay-style cosine
-    --min-lr 1.0e-5
-    --weight-decay 0.1
-    --clip-grad 1.0
+    --min-lr 1e-5
+    --weight-decay 1e-1
+    --clip-grad 1
     --bf16
     --no-gradient-accumulation-fusion
     --fp8-margin 0
@@ -127,4 +126,5 @@ torchrun ${DISTRIBUTED_ARGS[@]} lora_mixtral.py \
     ${DATA_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
-    ${LOGGING_ARGS[@]} |& tee $CHECKPOINT_PATH/logs/output_`date +"%Y%m%d_%H%M"`.log
+    ${LOGGING_ARGS[@]} \
+    $4 |& tee $SAVE_PATH/output_`date +"%Y%m%d_%H%M"`.log

@@ -3,7 +3,6 @@ from .cross_entropy import vocab_parallel_cross_entropy
 from .data import broadcast_data
 from .layers import (
     ColumnParallelLinear,
-    Linear,
     RowParallelLinear,
     VocabParallelEmbedding,
     copy_tensor_model_parallel_attributes,
@@ -46,7 +45,6 @@ __all__ = [
     "broadcast_data",
     # layers.py
     "ColumnParallelLinear",
-    "Linear",
     "RowParallelLinear",
     "VocabParallelEmbedding",
     "set_tensor_model_parallel_attributes",
