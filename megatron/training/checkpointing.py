@@ -852,24 +852,28 @@ def _load_base_checkpoint(
     non_persistent_iteration = _get_non_persistent_iteration(
         non_persistent_global_dir, args, checkpointing_context
     )
-    iteration, release = -1, False
-    tracker_filename = 'because load directory is not defined'
-    if load_dir is not None:
-        tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if os.path.isfile(tracker_filename):
-            iteration, release = read_metadata(tracker_filename)
-    if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
-        if non_persistent_iteration >= iteration:
-            return _load_non_persistent_base_checkpoint(
-                non_persistent_global_dir,
-                args,
-                rank0,
-                sharded_state_dict,
-                non_persistent_iteration,
-                checkpointing_context,
-            )
-        else:
-            print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
+    if args.ckpt_step is None:
+        iteration, release = -1, False
+        tracker_filename = 'because load directory is not defined'
+        if load_dir is not None:
+            tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            if os.path.isfile(tracker_filename):
+                iteration, release = read_metadata(tracker_filename)
+        if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
+            if non_persistent_iteration >= iteration:
+                return _load_non_persistent_base_checkpoint(
+                    non_persistent_global_dir,
+                    args,
+                    rank0,
+                    sharded_state_dict,
+                    non_persistent_iteration,
+                    checkpointing_context,
+                )
+            else:
+                print_rank_0('WARNING: non-persistent checkpoints are older than persistent checkpoint')
+    else:
+        iteration = args.ckpt_step
+        release = False
 
     # Otherwise we are dealing with global checkpoints
     # If no tracker file, return nothing
