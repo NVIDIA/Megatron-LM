@@ -97,6 +97,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                             if getattr(param, 'main_param_sharded', False):
                                 if param.main_param is not None:
                                     sharded_params_data.append(param.main_param)
+                                else:
+                                    # Fallback to data if `.main_param`
+                                    # is available but is None
+                                    params_data.append(param.data)
                             else:
                                 params_data.append(param.main_param)
                         else:
