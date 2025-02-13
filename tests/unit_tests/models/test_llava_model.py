@@ -9,6 +9,7 @@ import torch
 from megatron.core import InferenceParams
 from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -975,3 +976,39 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
 
     Utils.destroy_model_parallel()
     torch.cuda.empty_cache()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "cp_size, tp_size, has_sp, seq_len, expected_padding",
+    [(1, 1, False, 99, 0), (2, 2, True, 99, 5), (2, 2, False, 99, 1)],
+)
+def test_get_padding(cp_size, tp_size, has_sp, seq_len, expected_padding):
+    """Test calculating padding for context parallel."""
+    padding = context_parallel.get_padding(seq_len, cp_size, tp_size, has_sp)
+
+    assert padding == expected_padding
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "tokens, img_seq_len, padding_needed, cp_size, expected_seq_len",
+    [(torch.ones((1, 100)), 100, 0, 2, 200), (torch.ones((1, 100)), 128, 1, 2, 227)],
+)
+def test_get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, expected_seq_len):
+    """Test creating PackedSeqParams for context parallel."""
+    packed_seq_params = context_parallel.get_packed_seq_params(
+        tokens, img_seq_len, padding_needed, cp_size
+    )
+
+    assert torch.equal(
+        packed_seq_params.cu_seqlens_q, torch.tensor([0, expected_seq_len], dtype=torch.int32)
+    )
+
+    if padding_needed > 0:
+        padded_seq_len = tokens.shape[1] + img_seq_len
+        assert torch.equal(
+            packed_seq_params.cu_seqlens_q_padded,
+            torch.tensor([0, padded_seq_len], dtype=torch.int32),
+        )
+        assert packed_seq_params.max_seqlen_q == padded_seq_len

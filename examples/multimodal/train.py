@@ -18,6 +18,7 @@ from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -26,10 +27,10 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.training.utils import is_last_rank
+from megatron.training.utils import is_last_rank, get_batch_on_this_cp_rank
 
 
-def get_batch(data_iterator):
+def get_batch(data_iterator, image_token_index, img_seq_len):
     """Generate a batch
 
     Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
@@ -117,6 +118,24 @@ def get_batch(data_iterator):
     torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
     loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
     torch.cuda.nvtx.range_pop()
+
+    # If context parallel is enabled, must shard inputs to CP ranks.
+    if args.context_parallel_size > 1 or args.sequence_parallel:
+        assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
+
+        num_image_tokens = torch.sum(tokens == image_token_index).item()
+        num_image_embeddings = num_image_tokens * img_seq_len - num_image_tokens
+        seq_len = text_length + num_image_embeddings
+
+        # CP expects sequence length is divisible by CP size so apply padding.
+        mp_padding_needed = context_parallel.get_padding(
+            seq_len, args.context_parallel_size,
+            args.tensor_model_parallel_size, args.sequence_parallel,
+        )
+        tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed)) for item in (tokens, position_ids, labels, loss_mask)]
+
+        # Get PackedSeqParams that indicate the amount of padding for TransformerEngine.
+        packed_seq_params = context_parallel.get_packed_seq_params(tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True)
 
     return (
         tokens,
@@ -220,6 +239,8 @@ def scaled_loss_func(loss_mask, output_tensor):
 
 
 def loss_func(loss_mask, output_tensor):
+    args = get_args()
+
     losses = output_tensor.float()
 
     loss_mask = loss_mask.contiguous().view(-1).float()
@@ -228,12 +249,20 @@ def loss_func(loss_mask, output_tensor):
     total_loss = torch.sum(losses.view(-1) * loss_mask)
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
 
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
-    return (total_loss, local_num_tokens, {'lm loss': (reporting_loss[0], reporting_loss[1])})
+    # We multiply by context parallel size because later there will be a divide by CP(+DP) size.
+    return (
+        loss[0] * args.context_parallel_size,
+        local_num_tokens,
+        {'lm loss': (reporting_loss[0], reporting_loss[1])}
+    )
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -260,7 +289,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         images,
         num_image_tiles,
         packed_seq_params,
-    ) = get_batch(data_iterator)
+    ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(
