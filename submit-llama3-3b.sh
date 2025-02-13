@@ -142,8 +142,8 @@ INITIALIZATION_ARGS=(
 
 # NOTE(tj.solergibert) Check all the arguments in megatron/training/arguments.py#L1548 or https://github.com/NVIDIA/Megatron-LM/blob/0dd78ddcdb117ce4f2e9761449274d87af717674/megatron/training/arguments.py#L1548-L1606
 LEARNING_RATE_ARGS=(
-	--lr 0.00022
-	--min-lr 0.000022  # x10 reduction
+	--lr 0.0003
+	--min-lr 0.00003  # x10 reduction
 	--lr-decay-style cosine
 	--lr-warmup-iters 2000
 )
