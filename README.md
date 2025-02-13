@@ -112,6 +112,16 @@ With each checkpoint save, the file `latest_checkpointed_iteration.txt` will be 
 
 When resuming a run, the application will attempt to load the checkpoint referenced in the `latest_checkpointed_iteration.txt` file from the `--load` directory. To load a checkpoint from a different iteration, you will need to manually modify the reference inside `latest_checkpointed_iteration.txt`.
 
+# Evaluation
+
+You can use `scripts/evaluation/submit_evaluation.sh` to run lm-harness benchmarks on existing checkpoints.
+Example:
+```
+WANDB_API_KEY=<key> TOKENIZER=<tokenizer> bash scripts/evaluation/submit_evaluation.sh <ckp-path> --size <model-size> --wandb-entity <entity> --wandb-project <project> --wandb-id <runid> --iteration <it> --tasks hellaswag
+```
+
+For more information see `src/evaluation/README.md` and `bash scripts/evaluation/submit_evaluation.sh --help`.
+
 # Contribute
 
 You can submit issues and create branches on `https://github.com/swiss-ai/Megatron-LM`. The main branch is protected so you won't be able to directly commit to it.
