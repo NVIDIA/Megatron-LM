@@ -141,14 +141,13 @@ class MLP(MegatronModule):
     ) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            if hasattr(module, 'sharded_state_dict'):
-                sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
-                if self.config.gated_linear_unit and name == 'linear_fc1':
-                    assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
-                    for k, v in sub_sd.items():
-                        if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
-                            sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
-                sharded_state_dict.update(sub_sd)
+            sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
+            if self.config.gated_linear_unit and name == 'linear_fc1':
+                assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
+                for k, v in sub_sd.items():
+                    if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
+                        sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
+            sharded_state_dict.update(sub_sd)
 
         return sharded_state_dict
 
