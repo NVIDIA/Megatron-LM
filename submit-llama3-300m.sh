@@ -2,7 +2,7 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=5:00:00
-#SBATCH --job-name=llama3-300m
+#SBATCH --job-name=llama-300m
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
 #SBATCH --nodes=8
@@ -34,7 +34,7 @@ MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/experiments/300m-model/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
