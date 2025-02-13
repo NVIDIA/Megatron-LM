@@ -25,7 +25,7 @@ DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/
 MBS=1
 GBS=512
 SEQ_LEN=4096
-TRAINING_STEPS=5000
+TRAINING_STEPS=47684
 CHECKPOINT_STEPS=1000
 
 #### Debugging ####
@@ -35,7 +35,7 @@ MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
-MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/experiments/llama_3b_baseline/Megatron-LM
+MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
