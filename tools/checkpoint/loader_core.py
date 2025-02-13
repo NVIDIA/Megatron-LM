@@ -220,6 +220,7 @@ def _load_checkpoint(queue, args):
     md = types.SimpleNamespace()
     md.model_type = args.model_type
     md.num_layers = margs.num_layers
+    md.encoder_num_layers = margs.num_layers
     md.hidden_size = margs.hidden_size
     md.seq_length = margs.seq_length
     md.num_attention_heads = margs.num_attention_heads
