@@ -2,7 +2,7 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=5:00:00
-#SBATCH --job-name=Megatron-LM-Llama3.2-300m
+#SBATCH --job-name=llama3-300m
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
 #SBATCH --nodes=8
