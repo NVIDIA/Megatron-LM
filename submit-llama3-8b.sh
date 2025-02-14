@@ -23,9 +23,9 @@ DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/
 # This config trains for ~100B tokens with 1024 * 4096 = 4_194_304 tokens per batch.
 # Results in 1024 / 4 = 256 forward passes with 2 replicas per node requires 128 nodes such 
 # that each replica does batch accumulation of 1 and 64 nodes for batch accumulation of 8.
-MBS=4 # Note(ischlag) mbsz > 1 and cp > 1 is broken
-GBS=1024
-SEQ_LEN=4096 
+MBS=1
+GBS=512
+SEQ_LEN=8192 
 TRAINING_STEPS=23842
 CHECKPOINT_STEPS=1000
 
@@ -40,7 +40,7 @@ MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
-PROJECT_NAME=Meditron-Clariden
+PROJECT_NAME=Megatron-Clariden
 EXP_NAME=llama3-8b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
@@ -150,11 +150,11 @@ LEARNING_RATE_ARGS=(
 	--lr-warmup-iters 2000
 )
 
-#	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
 	--ckpt-format torch_dist
+	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 	--async-save
 )
 
@@ -163,9 +163,8 @@ MIXED_PRECISION_ARGS=(
 )
 
 DISTRIBUTED_ARGS=(
-	--tensor-model-parallel-size 2
+	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
-	--context-parallel-size 1
 	--use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather
