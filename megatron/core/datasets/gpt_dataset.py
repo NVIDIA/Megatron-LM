@@ -698,6 +698,10 @@ def _get_ltor_masks_and_position_ids(
                     if reset_attention_mask:
                         # Block cross document attention
                         attention_mask[0, i:, :i+1] = 0
+
+                        # If cross document attention is blocked, mask loss for last token of previous document
+                        if i > 0:  # Skip first BOS as there's no previous document
+                            loss_mask[i-1] = 0.0  # Mask loss for token right before BOS
                     
                 # Reset positions.
                 if reset_position_ids:
