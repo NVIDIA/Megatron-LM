@@ -21,6 +21,8 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
+from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -487,9 +489,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        assert (
-            isinstance(optimizer, Adam) or optimizer is None
-        ), "Only Adam currently supported, due to checkpointing requirements."
+        assert isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None, (
+            "Only Adam and HybridDeviceOptimizer currently supported, "
+            "due to checkpointing requirements."
+        )
 
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
@@ -568,11 +571,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
-        # Update optimizer groups.
-        # - Also, leverage state_dict() and load_state_dict() to
-        #   recast preexisting per-param state tensors.
-        self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
-        self.optimizer.load_state_dict(self.optimizer.state_dict())
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer = HybridDeviceOptimizer(
+                params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
+            )
+        else:
+            self.optimizer.param_groups = [g["orig_group"] for g in self.opt_group_ranges]
+            self.optimizer.load_state_dict(self.optimizer.state_dict())
 
         self.is_stub_optimizer = False
 
@@ -610,6 +615,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
             assert len(steps) == 1
             step = steps[0]
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            step = None
+            for optimizer in self.optimizer.sub_optimizers:
+                if isinstance(optimizer, torch.optim.AdamW):
+                    if len(optimizer.state) == 0:
+                        continue
+                    steps = list(set([s["step"].item() for s in optimizer.state.values()]))
+                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    step = steps[0]
+                    break
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
@@ -618,6 +633,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if not HAVE_APEX_OR_TE:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
+            elif isinstance(self.optimizer, HybridDeviceOptimizer) and step is not None:
+                param_group["step"] = int(step)
 
         # Grad scaler state.
         if self.grad_scaler:
@@ -654,6 +671,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         - state_order : The index of a parameter within the shared parameter
             list.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer) and len(self.optimizer.state) == 0:
+            self.optimizer.dummy_step()
 
         # Get the Torch optimizer's state dict.
         # - This 'inner' optimizer at this point is unallocated, and only
@@ -716,6 +735,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for s in state_dict_state.values():
                 # Native PyTorch state dict requires step (i.e., iteration).
                 s["step"] = step
+        elif isinstance(self.optimizer, HybridDeviceOptimizer):
+            # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
+            # has an extra optimizer state “step”.
+            steps = list(
+                set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g])
+            )
+            if len(steps) != 0:
+                assert len(steps) == 1, f"steps: {steps}"
+                step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
+                for v in self.optimizer.state.values():
+                    v["step"] = step.detach().clone()
 
         # Optimizer.
         self.optimizer.load_state_dict(
@@ -768,6 +798,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             tensors = {}
             for k in self.optimizer.state[sharded_model_param]:
+                if isinstance(self.optimizer, HybridDeviceOptimizer):
+                    tensors[k] = self.optimizer.state[sharded_model_param][k]
+                    continue
+
                 tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
             tensors["param"] = tensors.pop("master_param")
         else:
@@ -790,6 +824,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             for k, v in tensors.items():
+                if isinstance(self.optimizer, HybridDeviceOptimizer):
+                    if k == "param":
+                        k = "master_param"
+                    self.optimizer.state[sharded_model_param][k] = v
+                    continue
+
                 if k == "param":
                     self.optimizer.set_scaled_state(sharded_model_param, "master_param", v)
                 else:
@@ -1034,7 +1074,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Fixed TPxPP. Save on DP rank 0 only
             param_state = ShardedObject(
                 f'optimizer.distributed.dp_group_idx_{self.data_parallel_group_idx}.param_state',
-                param_state_data,
+                param_state_data,  # pylint: disable=E0606
                 (1,),
                 (0,),
             )
@@ -1211,6 +1251,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Instantiate ShardedTensor (or ShardedTensorFactory) for optimizer
                         # params.
                         for state_key, state_ten in tensors.items():
+                            if state_key == 'step':
+                                # Note that step is a 0-dim tensor, unlike other
+                                # states have the same size as the parameter.
+                                # The optimizer state of STEP is handled
+                                # specifically and is read from param_groups.
+                                continue
+
                             replace_kwargs = dict(
                                 key=f'{prefix}.{state_key}.{sharded_metadata.key}',
                                 data=state_ten,
@@ -1278,12 +1325,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
                         src_tensors = {}
                         for k, v in state_dict[param_idx].items():
+                            if k == "step":
+                                # Handle torch Adam "step" state separately.
+                                continue
                             if k == "fp32_param":
                                 src_tensors["param"] = v
                             else:
                                 src_tensors[k] = v
                         self._set_main_param_and_optimizer_states(model_param, src_tensors)
                         param_idx += 1
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer._sync_hdo_state_to_sub_optimizers()
 
     @classmethod
     def _update_legacy_world_tensors(cls, old_tensors, new_numels):
@@ -1837,6 +1889,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            return
 
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):
