@@ -26,7 +26,7 @@ MBS=3
 GBS=504
 SEQ_LEN=4096
 TRAINING_STEPS=48441
-CHECKPOINT_STEPS=5000
+CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`

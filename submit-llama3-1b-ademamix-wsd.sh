@@ -26,7 +26,7 @@ MBS=3
 GBS=504
 SEQ_LEN=4096
 TRAINING_STEPS=48441
-CHECKPOINT_STEPS=5000
+CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -40,7 +40,7 @@ DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
 PROJECT_NAME=optimiser-ablation
-EXP_NAME=llama3-1b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz-ademamix-WSD
+EXP_NAME=llama3-1b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz-ademamix-WSD-lr1e-4
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
@@ -153,7 +153,7 @@ INITIALIZATION_ARGS=(
 # )
 
 LEARNING_RATE_ARGS=(
-	--lr 0.0003
+	--lr 0.0001
 	--lr-decay-style WSD
 	--lr-warmup-iters 0
 	--lr-wsd-decay-style linear
@@ -230,10 +230,10 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
 if [ -n "$WANDB_API_KEY" ]; then
   echo "[$(date)] WANDB API key detected. Enabling WANDB logging."
   # Sync any previous run data if present
-#   if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
-#     echo "[$(date)] Syncing WANDB from previous run"
-#     wandb sync "$LOGGING_DIR/wandb/latest-run"
-#   fi
+  if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
+    echo "[$(date)] Syncing WANDB from previous run"
+    wandb sync "$LOGGING_DIR/wandb/latest-run"
+  fi
   # Add wandb-related args to TRAINING_CMD
   TRAINING_CMD="$TRAINING_CMD \
     --wandb-save-dir $LOGGING_DIR \
