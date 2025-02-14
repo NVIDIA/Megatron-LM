@@ -3,7 +3,7 @@
 """Pretrain utilities."""
 
 import dataclasses
-from datetime import datetime
+from datetime import datetime, timedelta
 import functools
 import gc
 import logging
@@ -959,7 +959,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 dump(snapshot, f)
 
         if wandb_writer:
-            wandb_writer.log({'samples vs steps': args.consumed_train_samples},
+            wandb_writer.log({
+                              'consumed_samples': args.consumed_train_samples,
+                              'consumed_tokens': args.consumed_train_samples * args.seq_length ,
+                             },
                              iteration)
         writer.add_scalar('learning-rate', learning_rate, iteration)
         writer.add_scalar('learning-rate vs samples', learning_rate,
@@ -972,11 +975,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
-        writer.add_scalar('batch-size', batch_size, iteration)
-        writer.add_scalar('batch-size vs samples', batch_size,
-                          args.consumed_train_samples)
-        if wandb_writer:
-            wandb_writer.log({'batch-size': batch_size}, iteration)
+        if args.rampup_batch_size:
+            writer.add_scalar('batch-size', batch_size, iteration)
+            writer.add_scalar('batch-size vs samples', batch_size,
+                            args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'batch-size': batch_size}, iteration)
         for key in loss_dict:
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
@@ -1001,7 +1005,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                               args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
-        if num_zeros_in_grad is not None:
+        if num_zeros_in_grad is not None and num_zeros_in_grad != 0:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
                               args.consumed_train_samples)
@@ -1046,6 +1050,28 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
 
+        # Calculate tokens per second
+        tokens_per_iteration = args.global_batch_size * args.seq_length
+        tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+        tokens_per_sec_per_gpu = tokens_per_sec / torch.distributed.get_world_size()
+        
+        # Calculate ETA
+        iterations_remaining = args.train_iters - iteration
+        eta_seconds = iterations_remaining * elapsed_time_per_iteration
+        eta = str(timedelta(seconds=int(eta_seconds)))
+
+        if writer:
+            writer.add_scalar('tokens-per-sec', tokens_per_sec, iteration)
+            writer.add_scalar('tokens-per-sec-per-gpu', tokens_per_sec_per_gpu, iteration)
+            writer.add_scalar('eta-seconds', eta_seconds, iteration)
+            
+        if wandb_writer:
+            wandb_writer.log({
+                'tokens-per-sec': tokens_per_sec,
+                'tokens-per-sec-per-gpu': tokens_per_sec_per_gpu,
+                'eta-seconds': eta_seconds
+            }, iteration)
+
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
         if args.log_timers_to_tensorboard:
@@ -1060,11 +1086,15 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
+        consumed_tokens = args.consumed_train_samples * args.seq_length / 1e9
+        log_string += ' consumed tokens: {:.3f}B |'.format(consumed_tokens)
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(
                 args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        log_string += f" eta: {eta} |"
+        log_string += f" tokens/sec/gpu: {tokens_per_sec_per_gpu:.1f} |"
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
@@ -1092,7 +1122,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
-        if num_zeros_in_grad is not None:
+        if num_zeros_in_grad is not None and num_zeros_in_grad != 0:
             log_string += f' num zeros: {num_zeros_in_grad} |'
         if params_norm is not None:
             log_string += f' params norm: {params_norm:.3f} |'

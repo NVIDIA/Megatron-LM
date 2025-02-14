@@ -1555,8 +1555,8 @@ def _add_learning_rate_args(parser):
     group.add_argument('--lr-decay-style', type=str, default='linear',
                        choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
                        help='Learning rate decay function.')
-    group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
-                       choices=['exponential', 'linear', 'cosine'],
+    group.add_argument('--lr-wsd-decay-style', type=str, default='1-sqrt',
+                       choices=['exponential', 'linear', 'cosine', '1-sqrt'],
                        help='Decay style for the annealing phase of WSD'),
     group.add_argument('--lr-decay-iters', type=int, default=None,
                        help='number of iterations to decay learning rate over,'
