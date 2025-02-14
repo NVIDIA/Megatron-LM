@@ -796,6 +796,13 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    # OP checks.
+    if args.post_layer_norm:
+        assert not args.add_bias_linear
+    if not args.attn_layernorm or not args.mlp_layernorm or not args.final_layernorm \
+            or args.post_layer_norm or args.layernorm_init != 1.0 or args.use_torchqknorm:
+        assert args.transformer_impl == "transformer_engine", "OP arguments are only checked with the TE transformer implementation"
+
     # MoE loss and include embedding and loss layer check
     if args.num_experts is not None:
         if args.moe_router_load_balancing_type != "none" or args.moe_z_loss_coeff is not None:
@@ -803,7 +810,6 @@ def validate_args(args, defaults={}):
                 "Cannot support load balancing loss and z loss with --account-for-embedding-in-pipeline-split"
             assert not args.account_for_loss_in_pipeline_split, \
                 "Cannot support load balancing loss and z loss with --account-for-loss-in-pipeline-split"
-                
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -1106,9 +1112,8 @@ def _add_network_size_args(parser):
                              "instead of before. It is advise to also set --no-final-layernorm"))
     group.add_argument("--input-embeddings-multiplier", type=float, default=1.0,
                        help="Multiply input_embeddings by this value")
-    group.add_argument("--downscale-residual", default=None, type=float,
-                       help="If set, add learnable downscaling of the residuals, initialized to this value")
-    group.add_argument("--single-residual-gain", action="store_true")
+    group.add_argument("--layernorm-init", default=1.0, type=float,
+                       help="Initialization value for layernorms")
     return parser
 
 

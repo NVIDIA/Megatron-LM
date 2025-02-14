@@ -79,7 +79,6 @@ class GPTModel(LanguageModule):
         rope_scaling_factor: float = 8.0,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
-        input_embeddings_multiplier: float = 1.0,
         final_layernorm: bool = True,
     ) -> None:
         super().__init__(config=config)
@@ -96,7 +95,6 @@ class GPTModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
-        self.input_embeddings_multiplier = input_embeddings_multiplier
         self.final_layernorm = final_layernorm
 
         # megatron core pipelining currently depends on model type
@@ -227,8 +225,6 @@ class GPTModel(LanguageModule):
             pass
         elif self.pre_process:
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-            if self.input_embeddings_multiplier != 1.0:
-                decoder_input = decoder_input*self.input_embeddings_multiplier
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor

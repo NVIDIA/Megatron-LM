@@ -8,7 +8,6 @@ from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
-from megatron.core.transformer.layer_scale import LayerScale
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -68,7 +67,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     mlp_layernorm: bool = True,
     use_torchqknorm: bool = False,
     post_layer_norm: bool = False,
-    downscale_residual: Optional[float] = float,
+    layernorm_init: float = 1.0,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
@@ -142,13 +141,16 @@ def get_gpt_layer_with_transformer_engine_spec(
         qk_norm = TENorm if is_te_min_version("1.9.0") else FusedLayerNorm
         qk_norm = WrappedTorchNorm if use_torchqknorm else qk_norm
 
-        # Determine how to handle attention layernorm.
-        if attn_layernorm and post_layer_norm:
+        # Determine where to handle attention layernorm.
+        if attn_layernorm and post_layer_norm: # Post-layer normalization case: input_layernorm module will be used.
             linear_qkv = TEColumnParallelLinear
+            input_layernorm = TENorm
         elif attn_layernorm:  # standard pre-norm case: TELayerNormColumnParallelLinear handles it.
             linear_qkv = TELayerNormColumnParallelLinear
+            input_layernorm = IdentityOp
         else:  # no layernorms at all.
             linear_qkv = TEColumnParallelLinear
+            input_layernorm = IdentityOp
 
         # Determine how to handle mlp norm.
         if mlp_layernorm and post_layer_norm:
@@ -157,7 +159,6 @@ def get_gpt_layer_with_transformer_engine_spec(
             # even when mlp_layernorm but not post_layer_norm, we have the identity op
             # because mlp.fc1 will fuse the layernorm :)
             pre_mlp_layernorm = IdentityOp
-
 
         return ModuleSpec(
             module=TransformerLayer,
@@ -173,8 +174,6 @@ def get_gpt_layer_with_transformer_engine_spec(
                         k_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     ),
                 ),
-                input_residual_downscaling=IdentityOp if downscale_residual is None else LayerScale,
-                attention_residual_downscaling=IdentityOp if downscale_residual is None else LayerScale,
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=pre_mlp_layernorm,
                 mlp=mlp,
@@ -314,7 +313,7 @@ def get_mlp_module_spec(
             fc1 = TELayerNormColumnParallelLinear
         else:
             fc1 = TEColumnParallelLinear
-    else:
+    else:  # No OP arguments can be given without te.
         fc1 = ColumnParallelLinear
         
     if num_experts is None:

@@ -182,12 +182,10 @@ class TransformerLayerSubmodules:
 
     Args:
         input_layernorm (Union[ModuleSpec, type]): Specification for the input layer normalization.
-        input_residual_downscaling (Union[ModuleSpec, type]): Specification for the input residual downscaling.
 
         self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
         self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after self-attention.
-        attention_residual_downscaling (Union[ModuleSpec, type]): Specification for the attention residual downscaling.
         
         pre_cross_attn_layernorm (Union[ModuleSpec, type]): Specification for the layer
             normalization before cross-attention.
@@ -204,17 +202,13 @@ class TransformerLayerSubmodules:
     """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
-    input_residual_downscaling: Union[ModuleSpec, type]  = IdentityOp
 
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
-    attention_residual_downscaling: Union[ModuleSpec, type] = IdentityOp
 
     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
     cross_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
-
-
 
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
@@ -277,14 +271,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
 
-        # [Module 1.1: Input residual downscaling]
-        self.input_residual_downscaling = build_module(
-            submodules.input_residual_downscaling,
-            hidden_size=None if self.config.single_residual_gain else self.config.hidden_size,
-            initial_value=self.config.downscale_residual,
-            sequence_parallel=self.config.sequence_parallel
-        )
-
         attention_optional_kwargs = {}
         if config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
@@ -298,14 +284,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             config=self.config,
             layer_number=layer_number,
             **attention_optional_kwargs,
-        )
-
-        # [Module 2.1: Attention residual downscaling]
-        self.attention_residual_downscaling = build_module(
-            submodules.attention_residual_downscaling,
-            hidden_size=None if self.config.single_residual_gain else self.config.hidden_size,
-            initial_value=self.config.downscale_residual,
-            sequence_parallel=self.config.sequence_parallel
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -431,10 +409,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         if self.config.post_layer_norm:
             attention_output = self.input_layernorm(attention_output)
-        #print(f"Pre pln1: {attention_output}")
-        attention_output = self.input_residual_downscaling(attention_output)
-        if bias is not None:
-            bias = self.input_residual_downscaling(bias)
+            assert bias is None
         attention_output_with_bias = (attention_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
@@ -481,9 +456,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         mlp_output, bias = self.mlp(pre_mlp_layernorm_output)
         if self.config.post_layer_norm:
             mlp_output = self.pre_mlp_layernorm(mlp_output)
-        mlp_output = self.attention_residual_downscaling(mlp_output)
-        if bias is not None:
-            bias = self.attention_residual_downscaling(bias)
         mlp_output_with_bias = (mlp_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself

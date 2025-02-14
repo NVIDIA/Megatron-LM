@@ -1054,9 +1054,6 @@ def load_args_from_checkpoint(
     _set_arg('attn_layernorm', force=True)
     _set_arg('mlp_layernorm', force=True)
     _set_arg('final_layernorm', force=True)
-    _set_arg('downscale_residual', force=True)
-    _set_arg('single_residual_gain', force=True)
-    _set_arg('input_embeddings_multiplier', force=True)
     _set_arg('post_layernorm', force=True)
 
 
