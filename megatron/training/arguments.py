@@ -1998,15 +1998,17 @@ def _add_data_args(parser):
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
+                       help='Reset posistion ids after BOS token.')
     group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
-                       'end-of-document token.')
+                       help='Reset self attention maske after BOS token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--no-cross-document-attention', action='store_false',
+                       help='If set, restricts attention to only tokens within the same document during training.',
+                       dest='cross_document_attention')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--s3-cache-path', type=str, default=None,

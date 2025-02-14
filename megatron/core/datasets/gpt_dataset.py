@@ -40,6 +40,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        generates masks by itself.
     """
 
+    cross_document_attention: bool = True
+    """Option to allow tokens to attend to all tokens regardless of document boundaries."""
+
     drop_last_partial_validation_sequence: bool = True
     """Option to drop the last partial validation sequence"""
 
@@ -92,6 +95,10 @@ class GPTDataset(MegatronDataset):
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
+        if not self.config.cross_document_attention:
+            self.config.reset_position_ids = True
+            self.config.reset_attention_mask = True
+            
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
@@ -103,6 +110,8 @@ class GPTDataset(MegatronDataset):
         self.cached_attention_mask = None
         self.cached_loss_mask = None
         self.cached_position_ids = None
+
+        self._bos_token_id = self.config.tokenizer.bos
 
         try:
             self._pad_token_id = self.config.tokenizer.pad
@@ -187,6 +196,7 @@ class GPTDataset(MegatronDataset):
         ):
             attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
                 tokens,
+                self.config.tokenizer.bos,
                 self.config.tokenizer.eod,
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
@@ -209,6 +219,9 @@ class GPTDataset(MegatronDataset):
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
         labels[labels == self._pad_token_id] = 0
+
+        # Do not try to predict BoS tokens
+        loss_mask[labels == self._bos_token_id] = 0.0
 
         # Batch padding sequence so we mask the loss
         if idx is None:
@@ -619,6 +632,7 @@ def _build_shuffle_index(
 
 def _get_ltor_masks_and_position_ids(
     data: torch.Tensor,
+    bos_token: int,
     eod_token: int,
     reset_position_ids: bool,
     reset_attention_mask: bool,
@@ -669,23 +683,27 @@ def _get_ltor_masks_and_position_ids(
         position_ids = position_ids.clone()
 
     if reset_position_ids or reset_attention_mask:
-        # Find indices where EOD token is.
-        eod_index = position_ids[data == eod_token]
-        # Detach indices from positions if going to modify positions.
-        if reset_position_ids:
-            eod_index = eod_index.clone()
+        # Find indices where BOS token is
+        bos_indices = (data == bos_token).nonzero(as_tuple=True)[0]
 
-        # Loop through EOD indices:
-        prev_index = 0
-        for j in range(eod_index.numel()):
-            i = eod_index[j]
-            # Mask attention loss.
-            if reset_attention_mask and attention_mask is not None:
-                attention_mask[0, (i + 1) :, : (i + 1)] = 0
-            # Reset positions.
-            if reset_position_ids:
-                position_ids[(i + 1) :] -= i + 1 - prev_index
-                prev_index = i + 1
+        # Loop through BOS indices:
+        if bos_indices.numel() > 0:  # Only process if BOS tokens exist
+            prev_index = 0
+            for i in bos_indices:  # Changed from j to i for clarity
+                if attention_mask is not None:
+                    # BOS token masking
+                    attention_mask[0, :, i] = 0  # No tokens can attend to BOS
+                    attention_mask[0, i, :] = 0  # BOS can't attend to any tokens
+                    
+                    if reset_attention_mask:
+                        # Block cross document attention
+                        attention_mask[0, i:, :i+1] = 0
+                    
+                # Reset positions.
+                if reset_position_ids:
+                    if i > 0:  # Skip first BOS as it's already at position 0
+                        position_ids[i:] = position_ids[i:] - (i - prev_index)
+                    prev_index = i
 
     if attention_mask is not None:
         # Convert attention mask to binary:

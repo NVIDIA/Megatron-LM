@@ -258,6 +258,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
+        cross_document_attention=args.cross_document_attention,
         s3_cache_path=args.s3_cache_path,
     )
 
