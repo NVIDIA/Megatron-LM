@@ -37,9 +37,13 @@ MOCK_DATA=false # Set to `true` to use mock data
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
-MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
-CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
-DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache # Path to store cache from datasets ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
+DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
+
+# Logging directories & artifacts
+PROJECT_NAME=Megatron-Clariden
+EXP_NAME=llama3-70b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
+PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
+
 # Overwrite SRC_DIR/Megatron-LM with the current codebase
 BACKUP_CODEBASE=false  
 #########################################
@@ -51,6 +55,8 @@ DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
 SRC_DIR=$EXP_DIR/src
+LOGGING_DIR=$EXP_DIR/logging
+TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
 
 # Set up directories
 mkdir -p $CKPT_DIR
@@ -58,7 +64,6 @@ mkdir -p $PROJECT_DIR
 mkdir -p $TRIGGER_DIR
 mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
-ln -sfn $CKPT_DIR $EXP_DIR/checkpoint-dir-link
 mkdir -p $SRC_DIR
 
 # Clean triggers
