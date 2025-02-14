@@ -687,9 +687,9 @@ def _get_ltor_masks_and_position_ids(
         bos_indices = (data == bos_token).nonzero(as_tuple=True)[0]
 
         # Loop through BOS indices:
-        if bos_indices.numel() > 0:  # Only process if BOS tokens exist
+        if bos_indices.numel() > 0:  # Only process if BOS tokens exist (codewise not strictly required but improves clarity.)
             prev_index = 0
-            for i in bos_indices:  # Changed from j to i for clarity
+            for i in bos_indices: 
                 if attention_mask is not None:
                     # BOS token masking
                     attention_mask[0, :, i] = 0  # No tokens can attend to BOS
