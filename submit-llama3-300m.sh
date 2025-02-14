@@ -1,32 +1,30 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=11:59:59
-#SBATCH --job-name=llama-8b
+#SBATCH --time=5:00:00
+#SBATCH --job-name=llama-300m
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=64
+#SBATCH --nodes=8
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --exclude=nid005195,nid006936,nid006930,nid006930,nid006941,nid006161,nid006825,nid007005
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
 echo "START TIME: $(date)"
 
 ################ Configs ################
-# Use the FineWeb Edu dataset
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
-# This config trains for ~100B tokens with 1024 * 4096 = 4_194_304 tokens per batch.
-# Results in 1024 / 4 = 256 forward passes with 2 replicas per node requires 128 nodes such 
-# that each replica does batch accumulation of 1 and 64 nodes for batch accumulation of 8.
-MBS=4 # Note(ischlag) mbsz > 1 and cp > 1 is broken
-GBS=1024
-SEQ_LEN=4096 
-TRAINING_STEPS=23842
+# global batch size = 256 * 4096 ~ 1M tokens
+# iteration time ~0.9 sec. Throughput ~ 140 TFLOPS/GPU/s
+# 8B tokens -> 8k iterations -> 8k * 0.9 sec = 1.8 hours
+MBS=2
+GBS=256
+SEQ_LEN=4096
+TRAINING_STEPS=8000
 CHECKPOINT_STEPS=1000
 
 #### Debugging ####
@@ -40,8 +38,8 @@ MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
-PROJECT_NAME=Meditron-Clariden
-EXP_NAME=llama3-8b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
+PROJECT_NAME=Megatron-Clariden
+EXP_NAME=llama3-300m-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
@@ -79,8 +77,7 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 ulimit -c 0
 
-#### Megatron Args #### Check megatron/training/arguments.py
-# Based on the Llama 3.1 8B model.
+### Megatron Args ### Check megatron/training/arguments.py
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	--use-precision-aware-optimizer
@@ -88,21 +85,20 @@ TRANSFORMER_ENGINE_ARGS=(
 )
 
 NETWORK_SIZE_ARGS=(
-	--num-layers 32
-	--hidden-size 4096
-	--ffn-hidden-size 14336
-	--num-attention-heads 32
+	--num-layers 6
+	--hidden-size 2048
+	--ffn-hidden-size 6144
+	--num-attention-heads 16
 	--group-query-attention
-	--num-query-groups 8
+	--num-query-groups 4
 	--max-position-embeddings $SEQ_LEN
 	--position-embedding-type rope
 	--rotary-base 500000
 	--use-rope-scaling
-	--rope-scaling-factor 8
+	--rope-scaling-factor 32
 	--make-vocab-size-divisible-by 128
 	--normalization RMSNorm
 	--swiglu
-	--untie-embeddings-and-output-weights
 )
 
 LOGGING_ARGS=(
@@ -144,16 +140,16 @@ INITIALIZATION_ARGS=(
 
 # NOTE(tj.solergibert) Check all the arguments in megatron/training/arguments.py#L1548 or https://github.com/NVIDIA/Megatron-LM/blob/0dd78ddcdb117ce4f2e9761449274d87af717674/megatron/training/arguments.py#L1548-L1606
 LEARNING_RATE_ARGS=(
-	--lr 0.00022
-	--min-lr 0.000022  # x10 reduction
+	--lr 0.0003
+	--min-lr 0.00003  # x10 reduction
 	--lr-decay-style cosine
-	--lr-warmup-iters 2000
+	--lr-warmup-iters 500
 )
 
-#	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
+	--load $CKPT_DIR
 	--ckpt-format torch_dist
 	--async-save
 )
@@ -163,9 +159,10 @@ MIXED_PRECISION_ARGS=(
 )
 
 DISTRIBUTED_ARGS=(
-	--tensor-model-parallel-size 2
+	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
 	--context-parallel-size 1
+	--wgrad-deferral-limit 50
 	--use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather
@@ -179,7 +176,7 @@ TOKENIZER_ARGS=(
 DATA_ARGS=(
 	--split 100,0,0
 	--seq-length $SEQ_LEN
-	--num-workers 1
+	--num-workers 2
 	--num-dataset-builder-threads 1
 )
 
@@ -244,7 +241,6 @@ if [ "$NSYS_PROFILER" = true ]; then
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
 
-# Save sbatch script
 cp $0 $DEBUG_DIR
 
 # Checkpoint Compute Environment
