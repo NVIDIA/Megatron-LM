@@ -1,11 +1,11 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=11:59:59
+#SBATCH --time=00:19:59
 #SBATCH --job-name=llama-70b
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=256
+#SBATCH --nodes=64
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
@@ -19,15 +19,15 @@ echo "START TIME: $(date)"
 # Use the FineWeb Edu dataset
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
-# This config trains for ~100B tokens with 1024 * 8192 = 8_388_608 tokens per batch.
-# Results in 1024 / 1 = 1024 forward passes 
+# 1024 * 8192 = 8_388_608 tokens per batch
+# 1024 / 1 = 1024 forward passes
 # With 1 replica over 8 nodes and 256 nodes we get 32 model replicas.
 # With 1024 forward passes over 32 replicas each replica does batch accumulation of 1024 / 32 = 32
 MBS=1
 GBS=1024
 SEQ_LEN=8192
-TRAINING_STEPS=11921
-CHECKPOINT_STEPS=5000
+TRAINING_STEPS=5000
+CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -35,24 +35,25 @@ NSYS_PROFILER=false # Turn on the NSYS profiler # NOTE(tj.solergibert) When usin
 MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
-# Directories, Logging & Artifacts
-PROJECT_NAME=Megatron-Clariden
-EXP_NAME=llama3-70b-${SLURM_NNODES}n-fp32grads
+# Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
-MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
-CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
-DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache # Path to store cache from datasets ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
+DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
+
+# Logging directories & artifacts
+PROJECT_NAME=Megatron-Clariden
+EXP_NAME=llama3-70b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
+PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
+
 #########################################
 
-PROJECT_DIR=$MEG_RUNS_DIR/$PROJECT_NAME
 EXP_DIR=$PROJECT_DIR/$EXP_NAME
+CKPT_DIR=$EXP_DIR/checkpoints
 TRIGGER_DIR=$EXP_DIR/triggers
 DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
-LOGGING_DIR=$EXP_DIR/logging
-TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
-WANDB_DIR=$LOGGING_DIR  # Creates folder automatically
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
+LOGGING_DIR=$EXP_DIR/logging
+TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
 
 # Set up directories
 mkdir -p $CKPT_DIR
@@ -60,7 +61,6 @@ mkdir -p $PROJECT_DIR
 mkdir -p $TRIGGER_DIR
 mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
-ln -sfn $CKPT_DIR $EXP_DIR/checkpoint-dir-link
 
 # Clean triggers
 rm -f $TRIGGER_DIR/save
@@ -79,12 +79,12 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 ulimit -c 0
 
-### Megatron Args ### Check megatron/training/arguments.py
+#### Megatron Args #### Check megatron/training/arguments.py
 # Based on the Llama 3.1 70B model.
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	--use-precision-aware-optimizer
-	--main-grads-dtype fp32
+	--main-grads-dtype bf16
 )
 
 NETWORK_SIZE_ARGS=(
@@ -153,8 +153,8 @@ LEARNING_RATE_ARGS=(
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
-	--load $CKPT_DIR
 	--ckpt-format torch_dist
+	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 	--async-save
 )
 
@@ -224,9 +224,9 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
 if [ -n "$WANDB_API_KEY" ]; then
   echo "[$(date)] WANDB API key detected. Enabling WANDB logging."
   # Sync any previous run data if present
-  if [ -d "$LOG_EXP_DIR/wandb/latest-run" ]; then
+  if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
     echo "[$(date)] Syncing WANDB from previous run"
-    wandb sync "$LOG_EXP_DIR/wandb/latest-run"
+    wandb sync "$LOGGING_DIR/wandb/latest-run"
   fi
   # Add wandb-related args to TRAINING_CMD
   TRAINING_CMD="$TRAINING_CMD \
@@ -248,6 +248,9 @@ if [ "$NSYS_PROFILER" = true ]; then
     NSYS_LAUNCHER="nsys profile -s none --trace='nvtx,cudnn,cublas,cuda' --output=$DEBUG_DIR/nsys-trace.nsys-rep --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop"
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
+
+# Save sbatch script
+cp $0 $DEBUG_DIR
 
 # Checkpoint Compute Environment
 echo -e "$(date)" > $COMPUTE_ENVIRONMENT_DIR 

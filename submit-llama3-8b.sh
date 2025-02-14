@@ -1,16 +1,15 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=11:59:59
+#SBATCH --time=00:19:59
 #SBATCH --job-name=llama-8b
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=64
+#SBATCH --nodes=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --exclude=nid005195,nid006936,nid006930,nid006930,nid006941,nid006161,nid006825,nid007005
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
@@ -20,13 +19,13 @@ echo "START TIME: $(date)"
 # Use the FineWeb Edu dataset
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
-# This config trains for ~100B tokens with 1024 * 4096 = 4_194_304 tokens per batch.
-# Results in 1024 / 4 = 256 forward passes with 2 replicas per node requires 128 nodes such 
-# that each replica does batch accumulation of 1 and 64 nodes for batch accumulation of 8.
-MBS=4 # Note(ischlag) mbsz > 1 and cp > 1 is broken
-GBS=1024
+# 128 * 4096 = 524_288 tokens per batch
+# 128 / 1 = 128 forward passes with 2 replicas per node requires 64 nodes such that
+# each replica does batch accumulation of 1 and 16 nodes for batch accumulation of 4.
+MBS=1
+GBS=128
 SEQ_LEN=4096 
-TRAINING_STEPS=23842
+TRAINING_STEPS=5000
 CHECKPOINT_STEPS=1000
 
 #### Debugging ####
@@ -40,7 +39,7 @@ MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
 
 # Logging directories & artifacts
-PROJECT_NAME=Meditron-Clariden
+PROJECT_NAME=Megatron-Clariden
 EXP_NAME=llama3-8b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
@@ -150,11 +149,11 @@ LEARNING_RATE_ARGS=(
 	--lr-warmup-iters 2000
 )
 
-#	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
 	--ckpt-format torch_dist
+	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 	--async-save
 )
 
@@ -163,9 +162,8 @@ MIXED_PRECISION_ARGS=(
 )
 
 DISTRIBUTED_ARGS=(
-	--tensor-model-parallel-size 2
+	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
-	--context-parallel-size 1
 	--use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather
