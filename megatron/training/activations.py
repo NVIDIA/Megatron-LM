@@ -26,7 +26,7 @@ def compiled_xiprelu(x, alpha_p, alpha_n, beta):
 
 @jit_fuser
 def compiled_xiprelup(x, alpha_p, alpha_n, power, beta, eps):
-    x_power = torch.pow(torch.max(torch.abs(x), self.eps), power)
+    x_power = torch.pow(torch.max(torch.abs(x), eps), power)
     return torch.where(x > 0,
                       alpha_p * x_power + beta * x,
                       alpha_n * x_power + beta * x)
