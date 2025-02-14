@@ -11,21 +11,21 @@ from megatron.core.transformer.module import MegatronModule
 
 # Trying to apply @jit_fuser / @torch.compile to XIELU class causes issues with sharded_state_dict naming
 @jit_fuser
-def compiled_xielu(x, alpha_p, alpha_n, beta, eps):
+def compiled_xielu(x, alpha_p, alpha_n, beta=0.5, eps=-1e-6):
     return torch.where(x > 0,
                       alpha_p * x * x + beta * x,
                       alpha_n * torch.expm1(torch.min(x, eps)) - alpha_n * x + beta * x)
 
 
 @jit_fuser
-def compiled_xiprelu(x, alpha_p, alpha_n, beta):
+def compiled_xiprelu(x, alpha_p, alpha_n, beta=0.5):
     return torch.where(x > 0,
                       alpha_p * x * x + beta * x,
                       alpha_n * x * x + beta * x)
 
 
 @jit_fuser
-def compiled_xiprelup(x, alpha_p, alpha_n, power, beta, eps):
+def compiled_xiprelup(x, alpha_p, alpha_n, power, beta=0.5, eps=1e-6):
     x_power = torch.pow(torch.max(torch.abs(x), eps), power)
     return torch.where(x > 0,
                       alpha_p * x_power + beta * x,
