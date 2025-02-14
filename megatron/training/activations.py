@@ -25,10 +25,11 @@ def compiled_xiprelu(x, alpha_p, alpha_n, beta):
 
 
 @jit_fuser
-def compiled_xiprelup(x, alpha_p, alpha_n, power_p, power_n, beta, eps):
+def compiled_xiprelup(x, alpha_p, alpha_n, power, beta, eps):
+    x_power = torch.pow(torch.max(torch.abs(x), self.eps), power)
     return torch.where(x > 0,
-                      alpha_p * torch.pow(torch.max(x, eps), power_p) + beta * x,
-                      alpha_n * torch.pow(torch.abs(torch.min(x, -eps)), power_n) + beta * x)
+                      alpha_p * x_power + beta * x,
+                      alpha_n * x_power + beta * x)
 
 
 class XIELU(MegatronModule):
@@ -128,8 +129,7 @@ class XIPReLUP(MegatronModule):
         self.config = config
         self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
         self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_n_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
-        self.power_p = nn.Parameter(torch.log(torch.exp(torch.tensor(power_p_init - 1.0, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
-        self.power_n = nn.Parameter(torch.log(torch.exp(torch.tensor(power_n_init - 1.0, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
+        self.power = nn.Parameter(torch.log(torch.exp(torch.tensor(power_p_init - 1.0, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
         self.beta = beta
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
 
@@ -162,34 +162,23 @@ class XIPReLUP(MegatronModule):
                 replica_id=(tp_rank, pp_rank, dp_rank),
                 dtype=self.alpha_n.dtype,
             ),
-             f'{prefix}power_p': ShardedTensor(
-                key=f'{prefix}power_p',
-                data=self.power_p,
+             f'{prefix}power': ShardedTensor(
+                key=f'{prefix}power',
+                data=self.power,
                 global_shape=(num_layers,),
                 global_offset=(layer_idx,),
                 local_shape=(1,),
                 axis_fragmentations=(num_layers,),
                 replica_id=(tp_rank, pp_rank, dp_rank),
-                dtype=self.power_p.dtype,
-            ),
-            f'{prefix}power_n': ShardedTensor(
-                key=f'{prefix}power_n',
-                data=self.power_n,
-                global_shape=(num_layers,),
-                global_offset=(layer_idx,),
-                local_shape=(1,),
-                axis_fragmentations=(num_layers,),
-                replica_id=(tp_rank, pp_rank, dp_rank),
-                dtype=self.power_n.dtype,
+                dtype=self.power.dtype,
             )
         }
 
     def forward(self, x):
         alpha_p = F.softplus(self.alpha_p)
         alpha_n = F.softplus(self.alpha_n)
-        power_p = 1 + F.softplus(self.power_p)
-        power_n = 1 + F.softplus(self.power_n)
-        return compiled_xiprelup(x, alpha_p, alpha_n, power_p, power_n, self.beta, self.eps)
+        power = 1 + F.softplus(self.power)
+        return compiled_xiprelup(x, alpha_p, alpha_n, power, self.beta, self.eps)
 
 
 @jit_fuser
