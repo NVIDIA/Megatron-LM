@@ -37,13 +37,11 @@ MOCK_DATA=false # Set to `true` to use mock data
 
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
-DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
-
-# Logging directories & artifacts
-PROJECT_NAME=Megatron-Clariden
-EXP_NAME=llama3-70b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
-PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
-
+MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
+CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
+DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache # Path to store cache from datasets ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
+# Overwrite SRC_DIR/Megatron-LM with the current codebase
+BACKUP_CODEBASE=false  
 #########################################
 
 EXP_DIR=$PROJECT_DIR/$EXP_NAME
@@ -52,8 +50,7 @@ TRIGGER_DIR=$EXP_DIR/triggers
 DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
-LOGGING_DIR=$EXP_DIR/logging
-TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
+SRC_DIR=$EXP_DIR/src
 
 # Set up directories
 mkdir -p $CKPT_DIR
@@ -61,12 +58,27 @@ mkdir -p $PROJECT_DIR
 mkdir -p $TRIGGER_DIR
 mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
+ln -sfn $CKPT_DIR $EXP_DIR/checkpoint-dir-link
+mkdir -p $SRC_DIR
 
 # Clean triggers
 rm -f $TRIGGER_DIR/save
 rm -f $TRIGGER_DIR/exit
 
+# Copy current source code to SRC_DIR if asked to or if the SRC_DIR is empty
+if [ "$BACKUP_CODEBASE" == true ] || [ -z "$(ls -A "$SRC_DIR")" ]; then
+  echo "Copying current codebase to $SRC_DIR..."
+  rsync -av --exclude-from=$MEGATRON_LM_DIR/.gitignore $MEGATRON_LM_DIR/ $SRC_DIR/
+  # Save current commit hash
+  cd ~/Megatron-LM
+else
+  echo "In order to backup the latest codebase you can turn BACKUP_CODEBASE to true"
+fi
+echo "The codebase path for this job: $SRC_DIR"
+
 # Set up ENV
+cd $SRC_DIR
+export PYTHONPATH=$SRC_DIR:$PYTHONPATH
 cd $MEGATRON_LM_DIR
 export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
@@ -192,7 +204,7 @@ DATA_ARGS=(
 if [ "$MOCK_DATA" = true ]; then
   DATA_ARGS="${DATA_ARGS[@]} --mock-data"
 else
-  DATA_ARGS="${DATA_ARGS[@]} --data-path $(python3 $MEGATRON_LM_DIR/scripts/tools/create_data_config.py -p $DATASETS) --data-cache-path $DATASET_CACHE_DIR"
+  DATA_ARGS="${DATA_ARGS[@]} --data-path $(python3 $SRC_DIR/scripts/tools/create_data_config.py -p $DATASETS) --data-cache-path $DATASET_CACHE_DIR"
 fi
 
 TORCHRUN_ARGS=(
@@ -206,7 +218,7 @@ TORCHRUN_ARGS=(
 
 CMD_PREFIX="numactl --membind=0-3"
 
-TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
+TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $SRC_DIR/pretrain_gpt.py \
     ${TRANSFORMER_ENGINE_ARGS[@]} \
     ${NETWORK_SIZE_ARGS[@]} \
     ${LOGGING_ARGS[@]} \
@@ -267,7 +279,7 @@ echo -e "" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
 echo -e "\nNODES: $(scontrol show hostnames $SLURM_JOB_NODELIST)" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
-echo -e "\nMegatron path: $MEGATRON_LM_DIR ($(git -C $MEGATRON_LM_DIR rev-parse --verify HEAD))" >> $COMPUTE_ENVIRONMENT_DIR
+echo -e "\nMegatron path: $SRC_DIR ($(git -C $SRC_DIR rev-parse --verify HEAD))" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
 echo -e "\n$(pip list)" >> $COMPUTE_ENVIRONMENT_DIR
 printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR 
