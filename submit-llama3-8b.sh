@@ -1,16 +1,15 @@
 #!/bin/bash
 
 #SBATCH --account=a-a06
-#SBATCH --time=11:59:59
+#SBATCH --time=00:19:59
 #SBATCH --job-name=llama-8b
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=64
+#SBATCH --nodes=16
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
 #SBATCH --mem=460000
-#SBATCH --exclude=nid005195,nid006936,nid006930,nid006930,nid006941,nid006161,nid006825,nid007005
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
@@ -20,13 +19,13 @@ echo "START TIME: $(date)"
 # Use the FineWeb Edu dataset
 DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
 
-# This config trains for ~100B tokens with 1024 * 4096 = 4_194_304 tokens per batch.
-# Results in 1024 / 4 = 256 forward passes with 2 replicas per node requires 128 nodes such 
-# that each replica does batch accumulation of 1 and 64 nodes for batch accumulation of 8.
+# 128 * 4096 = 524_288 tokens per batch
+# 128 / 1 = 128 forward passes with 2 replicas per node requires 64 nodes such that
+# each replica does batch accumulation of 1 and 16 nodes for batch accumulation of 4.
 MBS=1
-GBS=512
-SEQ_LEN=8192 
-TRAINING_STEPS=23842
+GBS=128
+SEQ_LEN=4096 
+TRAINING_STEPS=5000
 CHECKPOINT_STEPS=1000
 
 #### Debugging ####
