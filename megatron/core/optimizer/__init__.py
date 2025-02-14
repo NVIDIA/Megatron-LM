@@ -94,7 +94,7 @@ def _get_param_groups(
                 no_wd = name.endswith(".bias") or len(param.shape) == 1
 
             # TODO add more elegant way to disable weight decay for alpha_p and alpha_n
-            if "alpha_p" in name or "alpha_n" in name or "power_p" in name or "power_n" in name:
+            if "alpha_p" in name or "alpha_n" in name or "power" in name:
                 no_wd = True
 
             if scale_lr_cond is not None:
