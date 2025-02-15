@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 import torch
+import torch.distributed
 
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device, get_xla_model
@@ -15,7 +16,12 @@ from megatron.core.dist_checkpointing.dict_utils import (
     nested_values,
 )
 from megatron.core.dist_checkpointing.exchange_utils import _get_empty_tensor_for_exchange
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict, is_main_replica
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedObject,
+    ShardedStateDict,
+    ShardedTensorFactory,
+    is_main_replica,
+)
 from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
     SaveShardedStrategy,
@@ -28,6 +34,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class MockSaveStrategy(SaveShardedStrategy):
     def __init__(self):
@@ -35,11 +42,9 @@ class MockSaveStrategy(SaveShardedStrategy):
         self.save_keys = set()
 
     def save(self, sharded_state_dict, ckpt_dir):
-        self.save_keys = {
-            sh_ten.key
-            for sh_ten in nested_values(sharded_state_dict)
-            if is_main_replica(sh_ten.replica_id)
-        }
+        for sh_ten in nested_values(sharded_state_dict):
+            if is_main_replica(sh_ten.replica_id):
+                self.save_keys.add(sh_ten.key)
 
 
 class MockLoadStrategy(LoadShardedStrategy):
@@ -49,17 +54,19 @@ class MockLoadStrategy(LoadShardedStrategy):
         self.load_keys = set()
 
     def load(self, sharded_state_dict, ckpt_dir):
-        self.load_keys = {
-            sh_ten.key
-            for sh_ten in nested_values(sharded_state_dict)
-            if is_main_replica(sh_ten.replica_id)
-        }
+        for sh_ten in nested_values(sharded_state_dict):
+            if is_main_replica(sh_ten.replica_id):
+                self.load_keys.add(sh_ten.key)
 
         def load_rand(x):
-            assert isinstance(x, ShardedTensor)
-            x.init_data(self.device)
-            x.data.fill_(Utils.rank)
-            return x.data
+            assert isinstance(x, ShardedTensor) or isinstance(x, ShardedObject)
+            if isinstance(x, ShardedTensor):
+                x.init_data(self.device)
+                x.data.fill_(Utils.rank)
+                return x.data
+            else:
+                x.data = [Utils.rank]
+                return x.data
 
         return dict_list_map_outplace(load_rand, sharded_state_dict)
 
@@ -166,7 +173,6 @@ class TestFullyParallelSaveAndLoad:
                     'key_TP_repl2': [1],  # smallest tensor, last rank is the least occupied
                 }
 
-        xm = get_xla_model()
         default_process_group = parallel_state.get_default_process_group()
         if xm is None:
             parallelization_group = (
@@ -259,7 +265,6 @@ class TestFullyParallelSaveAndLoad:
 
        
         default_process_group = parallel_state.get_default_process_group()
-        xm = get_xla_model()
         if xm is None:
              parallelization_group = (
                 parallel_state.get_data_parallel_group(with_context_parallel=True)
@@ -401,3 +406,24 @@ class TestFullyParallelSaveAndLoad:
                     assert broadcast_mock.call_count == expected_count
 
         Utils.destroy_model_parallel()
+
+    def test_broadcast_sharded_objects(self, tmp_path_dist_ckpt):
+        Utils.initialize_model_parallel(1, 1)
+
+        sharded_state_dict = {
+            f'Obj_{i}': ShardedObject(f'Obj_{i}', None, (1,), (0,), replica_id=abs(Utils.rank - i))
+            for i in range(Utils.world_size)
+        }
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_broadcast_sharded_objects') as ckpt_dir:
+            load_strategy = MockLoadStrategy()
+            load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
+                                                             parallelization_group=parallel_state.get_default_process_group())
+
+            loaded_state_dict = load_strategy.load(sharded_state_dict, ckpt_dir)
+
+            # each rank is supposed to only load obj_rank because of how replica_id is set
+            assert load_strategy.base_strategy.load_keys == set({f'Obj_{Utils.rank}'})
+
+            # since each rank only loaded their Obj they were broadcasted
+            assert set(sharded_state_dict.keys()) == set(loaded_state_dict.keys())

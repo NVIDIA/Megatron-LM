@@ -1,11 +1,17 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.device_utils import get_current_device
+from contextlib import nullcontext
+
+import pytest
 import torch
 import pytest 
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core import parallel_state
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
@@ -138,3 +144,98 @@ class TestParallelTransformerBlock:
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
+
+
+class TestPipelineParallelTransformerBlock:
+    @pytest.mark.skip("Test is broken")
+    @pytest.mark.parametrize(
+        "num_layers, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, "
+        "include_embedding_in_pipeline_split, include_loss_in_pipeline_split, "
+        "first_pipeline_num_layers, last_pipeline_num_layers, should_assert_error",
+        [
+            # Last pipeline stage has specified layers
+            (60, 5, None, False, False, None, 4, False),
+            # Uneven PP 6*[8]+[6]+[6]=60
+            (60, 8, None, False, False, 6, 6, False),
+            # Even PP
+            (64, 4, None, False, False, None, None, False),
+            # Even VPP
+            (64, 4, 8, False, False, None, None, False),
+            # First pipeline stage has specified layers
+            # Should distribute remaining layers evenly among other stages
+            (60, 6, None, False, False, 5, None, False),
+            # Uneven distribution leading to assertion error
+            (101, 8, None, False, False, 13, 13, True),
+            # Include embedding in pipeline split without virtual PP
+            (63, 4, None, True, False, None, None, False),
+            # Include loss in pipeline split without virtual PP
+            (63, 4, None, False, True, None, None, False),
+            # Include embedding and loss in pipeline split without virtual PP
+            (62, 4, None, True, True, None, None, False),
+            # Include embedding and loss with virtual PP
+            (62, 4, 2, True, True, None, None, False),
+            # num_layers not divisible by pipeline size without embedding/loss
+            (65, 4, None, False, False, None, None, True),
+            # num_layers not divisible by pipeline size with embedding/loss
+            (65, 4, None, True, True, None, None, True),
+            # Uneven distribution with specified first pipeline layers causing error
+            (61, 4, None, False, False, 12, None, True),
+            # Too few layers for the number of pipeline stages
+            (2, 4, None, False, False, None, None, True),
+            # Uneven PP with embedding included (should assert per code)
+            (60, 6, None, True, False, 5, 5, True),
+            # Virtual PP where num_layers not divisible by total virtual stages
+            (50, 2, 7, False, False, None, None, True),
+            # Edge case where num_layers per virtual rank is zero
+            (4, 4, 4, False, False, None, None, True),
+        ],
+    )
+    def test_layer_builder(
+        self,
+        num_layers,
+        pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size,
+        include_embedding_in_pipeline_split,
+        include_loss_in_pipeline_split,
+        first_pipeline_num_layers,
+        last_pipeline_num_layers,
+        should_assert_error,
+    ):
+        Utils.fake_initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+        )
+        context = (
+            pytest.raises((AssertionError, ValueError)) if should_assert_error else nullcontext()
+        )
+        with context:
+            transformer_config = TransformerConfig(
+                num_layers=num_layers,
+                pipeline_model_parallel_size=pipeline_model_parallel_size,
+                virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+                include_embedding_in_pipeline_split=include_embedding_in_pipeline_split,
+                include_loss_in_pipeline_split=include_loss_in_pipeline_split,
+                first_pipeline_num_layers=first_pipeline_num_layers,
+                last_pipeline_num_layers=last_pipeline_num_layers,
+                pipeline_dtype=torch.bfloat16,
+                hidden_size=128,
+                num_attention_heads=16,
+            )
+            total_build_layers = 0
+            for i in range(pipeline_model_parallel_size):
+                parallel_state.set_pipeline_model_parallel_rank(i)
+                if virtual_pipeline_model_parallel_size is not None:
+                    for j in range(virtual_pipeline_model_parallel_size):
+                        parallel_state.set_virtual_pipeline_model_parallel_rank(j)
+                        num_layers_to_build = get_num_layers_to_build(transformer_config)
+                        total_build_layers += num_layers_to_build
+                else:
+                    num_layers_to_build = get_num_layers_to_build(transformer_config)
+                    total_build_layers += num_layers_to_build
+        if not should_assert_error:
+            assert (
+                total_build_layers == num_layers
+            ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
+        parallel_state.set_pipeline_model_parallel_world_size(None)
+        parallel_state.set_virtual_pipeline_model_parallel_world_size(None)

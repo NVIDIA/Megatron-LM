@@ -4,7 +4,7 @@
 
 from logging import getLogger
 from time import time
-from typing import TYPE_CHECKING, Optional, Tuple, cast
+from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -14,13 +14,30 @@ from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE, Metadata
 from torch.distributed.checkpoint.planner import SavePlan, SavePlanner
 from torch.distributed.checkpoint.utils import _DistWrapper, _get_failure_dict
 
-from megatron.core.device_utils import get_xla_model
+from megatron.core.device_utils import get_current_device
 
 if TYPE_CHECKING:
     from .filesystem_async import FileSystemWriterAsync
+    from .torch import MCoreSavePlanner
 
 
 logger = getLogger(__name__)
+
+from dataclasses import fields
+
+
+def _compare_dataclasses(obj1, obj2):
+    if type(obj1) != type(obj2):
+        return f"Objects are of different types: {type(obj1)} and {type(obj2)}"
+
+    differences = []
+    for field in fields(obj1):
+        value1 = getattr(obj1, field.name)
+        value2 = getattr(obj2, field.name)
+        if value1 != value2:
+            differences.append(f"{field.name}: {value1} != {value2}")
+
+    return differences if differences else "All fields are equal"
 
 
 def save_state_dict_async_plan(
@@ -28,9 +45,10 @@ def save_state_dict_async_plan(
     storage_writer: 'FileSystemWriterAsync',
     process_group: Optional[dist.ProcessGroup] = None,
     coordinator_rank: int = 0,
-    planner: Optional[SavePlanner] = None,
+    planner: Optional[Union[SavePlanner, 'MCoreSavePlanner']] = None,
     cached_ckpt_structure: Optional[Tuple[SavePlan, SavePlan, bool]] = None,
-) -> Tuple[Tuple['FileSystemWriterAsync', Metadata, _DistWrapper], SavePlan, bool]:
+    loaded_all_plans: Optional[List[SavePlan]] = None,
+) -> Tuple[Tuple['FileSystemWriterAsync', Union[Metadata, None], _DistWrapper], SavePlan, bool]:
     """
     First stage of saving a state dict to storage.
 
@@ -64,7 +82,7 @@ def save_state_dict_async_plan(
 
     Returns: Tuple of:
         - storage writer (the one passed as input)
-        - metadata from planning
+        - metadata from planning (or None if we reuse cached global metadata)
         - distributed wrapper used for planning
     The return value of this function should be passed as an input to
     `save_state_dict_async_finalize` and cached_plan to skip `reduce_scatter` at planning.
@@ -82,6 +100,7 @@ def save_state_dict_async_plan(
     global_metadata = None
     logger.debug(f"rank: {rank}, starting state dict save")
     local_plan = cached_local_plan
+    global_md_verify_reuse = False
 
     def local_step():
         nonlocal local_plan
@@ -103,11 +122,34 @@ def save_state_dict_async_plan(
         return all_local_plans
 
     # Execute local and global planning
+    # Ideally we want to use the cached plan. Otherwise if the planner and storage_writer
+    # allow it (`can_run_decentralized_global_plan`) we gather the plans to create
+    # the metadata but prepare the plans independently on each rank.
+    # In the worst case we have to reduce_scatter all the plans.
     start_plan = time()
     if validated_cache_reuse and cached_central_plan:
         logger.debug(f"rank: {rank}, Passed cache reusable")
         local_step()
         central_plan = cached_central_plan
+    elif getattr(planner, 'can_run_decentralized_global_plan', False) and getattr(
+        storage_writer, 'can_run_decentralized_global_plan', False
+    ):
+        local_plan = local_step()
+        global_md_verify_reuse = verify_global_md_reuse(
+            loaded_all_plans, local_plan, rank, dist_wrapper
+        )
+
+        if not loaded_all_plans or not global_md_verify_reuse:
+            all_local_plans = dist_wrapper.gather_object(local_plan)
+            if dist_wrapper.is_coordinator:
+                _, global_metadata = planner.create_global_plan(all_local_plans)
+                global_metadata.all_local_plans = all_local_plans
+        else:
+            logger.debug(f"rank: {rank}, Passed cached global metadata")
+            global_metadata = None
+        local_plan = planner.create_decentralized_global_plan(local_plan)
+        local_plan = storage_writer.prepare_decentralized_global_plan(local_plan)
+        central_plan = local_plan
     else:
         central_plan = dist_wrapper.reduce_scatter("plan", local_step, global_step)
     central_plan = planner.finish_plan(central_plan)
@@ -120,11 +162,54 @@ def save_state_dict_async_plan(
     end = time()
     logger.debug(f"{time()} rank: {rank}, write(async) time: {end - start}")
     return (
-        (storage_writer, cast(Metadata, global_metadata), dist_wrapper),
+        (storage_writer, global_metadata, dist_wrapper),
         central_plan,
         local_plan,
         cached_central_plan == central_plan,
+        global_md_verify_reuse,
     )
+
+
+def verify_global_md_reuse(
+    loaded_all_plans: List[SavePlan], local_plan: SavePlan, rank: int, dist_wrapper: _DistWrapper
+) -> bool:
+    """
+    Verifies that global metadata reuse is possible by checking the loaded plans from the
+     checkpoint are consistent, which means we have the same settings when resuming training.
+    Args:
+        loaded_all_plans: List[SavePlan], The loaded plans from the checkpoint
+         (stored in checkpoint metadata).
+        local_plan: SavePlan, The local save plan.
+        rank: Current process rank.
+        dist_wrapper (_DistWrapper): distributed wrapper created during planning
+
+    Returns: True iff the global metadata reuse is possible.
+
+    """
+    logger.debug(f"verifying reuse of global metadata")
+    if not loaded_all_plans:
+        global_md_verify_reuse = False
+        logger.debug("loaded global metadata reuse verification: no loaded plans passed")
+
+    elif len(loaded_all_plans) == dist_wrapper.get_world_size():
+        local_verify_reuse = all(
+            getattr(local_plan, f.name) == getattr(loaded_all_plans[rank], f.name)
+            for f in fields(local_plan)
+            if f.name != 'storage_data'
+        )
+
+        if not local_verify_reuse:
+            logger.debug(
+                f"local_verify_reuse is False: diffs -"
+                f" {_compare_dataclasses(local_plan, loaded_all_plans[rank])}"
+            )
+        all_results = torch.tensor([local_verify_reuse], dtype=torch.int, device=get_current_device())
+        torch.distributed.all_reduce(all_results, op=torch.distributed.ReduceOp.MIN)
+        # Check if all reduced results are True
+        global_md_verify_reuse = all_results.item() == 1
+    else:
+        global_md_verify_reuse = False
+    return global_md_verify_reuse
 
 
 def save_state_dict_async_finalize(

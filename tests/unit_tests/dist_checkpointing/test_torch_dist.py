@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+"""Tests for PyTorch DCP based checkpoint format. """
+
 import pickle
 from copy import deepcopy
 from dataclasses import fields
@@ -104,3 +106,36 @@ class TestCachedMetadata:
                 ), f'{field.name} is different in metadata from non-cached, cached metadata impls'
         ckpt_dir.cleanup()
         Utils.destroy_model_parallel()
+
+
+class TestCPUTensors:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
+    def test_cpu_tensors_dont_take_too_much_space(self, tmp_path_dist_ckpt):
+        large_cuda_tensor = torch.ones(1_000_000, dtype=torch.float, device='cuda')
+        large_cpu_tensor = torch.ones(1_000_000, dtype=torch.float)
+        # Create small tensors which are a view of a large tensor
+        sharded_state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', large_cuda_tensor[:10], replica_id=Utils.rank
+            ),
+            'sd_keyB': ShardedTensor.from_rank_offsets(
+                'keyB', large_cpu_tensor[:10], replica_id=Utils.rank
+            ),
+        }
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_cpu_tensors_dont_take_too_much_space'
+        ) as ckpt_dir:
+            save(sharded_state_dict, ckpt_dir)
+
+            distcp_files = [(ckpt_dir / '__0_0.distcp'), (ckpt_dir / '__0_1.distcp')]
+            for file in distcp_files:
+                assert file.exists()
+                file_size = file.stat().st_size
+                assert file_size < 10_000, file.name

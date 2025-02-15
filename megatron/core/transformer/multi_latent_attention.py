@@ -13,11 +13,17 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE=False
 
 @dataclass
 class MLASelfAttentionSubmodules:
@@ -50,11 +56,6 @@ class MultiLatentAttention(Attention):
         attention_type: str,
         cp_comm_type: str = None,
     ) -> None:
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        assert (
-            world_size == 1
-        ), "MLA is not supported with Tensor Parallelism yet, \
-        use Expert Parallelism and Pipeline Parallelism for better performance."
 
         super().__init__(
             config=config,
@@ -82,17 +83,28 @@ class MultiLatentAttention(Attention):
             mscale_all_dim=self.config.mscale_all_dim,
         )
 
-        self.core_attention = build_module(
-            submodules.core_attention,
-            config=self.config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type,
-            attention_type=self.attention_type,
-            softmax_scale=self.softmax_scale,
-            k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
-            cp_comm_type=cp_comm_type,
-        )
+        if HAVE_TE:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                k_channels=self.q_head_dim,
+                v_channels=self.config.v_head_dim,
+                cp_comm_type=cp_comm_type,
+            )
+        else:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                cp_comm_type=cp_comm_type,
+            )
 
         # Output.
         self.linear_proj = build_module(
@@ -224,17 +236,29 @@ class MLASelfAttention(MultiLatentAttention):
 
         else:
 
-            self.linear_q_down_proj = build_module(
-                submodules.linear_q_down_proj,
-                self.config.hidden_size,
-                self.config.q_lora_rank,
-                config=self.config,
-                init_method=self.config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-            )
+            if HAVE_TE:
+                self.linear_q_down_proj = build_module(
+                    submodules.linear_q_down_proj,
+                    self.config.hidden_size,
+                    self.config.q_lora_rank,
+                    parallel_mode="duplicated",
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                )
+            else:
+                self.linear_q_down_proj = build_module(
+                    submodules.linear_q_down_proj,
+                    self.config.hidden_size,
+                    self.config.q_lora_rank,
+                    config=self.config,
+                    init_method=self.config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    skip_weight_param_allocation=False,
+                )
 
             self.linear_q_up_proj = build_module(
                 submodules.linear_q_up_proj,
@@ -248,17 +272,29 @@ class MLASelfAttention(MultiLatentAttention):
                 is_expert=False,
             )
 
-        self.linear_kv_down_proj = build_module(
-            submodules.linear_kv_down_proj,
-            self.config.hidden_size,
-            self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=False,
-            skip_bias_add=False,
-            is_expert=False,
-        )
+        if HAVE_TE:
+            self.linear_kv_down_proj = build_module(
+                submodules.linear_kv_down_proj,
+                self.config.hidden_size,
+                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+            )
+        else:
+            self.linear_kv_down_proj = build_module(
+                submodules.linear_kv_down_proj,
+                self.config.hidden_size,
+                self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+            )
 
         self.linear_kv_up_proj = build_module(
             submodules.linear_kv_up_proj,
@@ -303,7 +339,6 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        q_len, bsz, _ = hidden_states.size()
 
         if self.config.q_lora_rank is not None:
             q_compressed, _ = self.linear_q_down_proj(hidden_states)
@@ -312,6 +347,8 @@ class MLASelfAttention(MultiLatentAttention):
         else:
             # hidden_states:[s, b, 2048], q: [s, b, n * 192]
             q, _ = self.linear_q_proj(hidden_states)
+
+        q_len, bsz, _ = q.size()
 
         # q: [s, b, n, 192]
         q = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim)
@@ -328,6 +365,10 @@ class MLASelfAttention(MultiLatentAttention):
         kv_compressed, k_pos_emb = torch.split(
             kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
+
+        # Gather the input from sequence parallel region
+        if parallel_state.get_tensor_model_parallel_world_size() > 1:
+            k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
 
         # kv: [s, b, 2048]
         kv, _ = self.linear_kv_up_proj(self.kv_layernorm(kv_compressed))
@@ -349,6 +390,8 @@ class MLASelfAttention(MultiLatentAttention):
         if len(rotary_pos_emb) == 2:
             mscale = rotary_pos_emb[1]
             rotary_pos_emb = rotary_pos_emb[0]
+        else:
+            mscale = 1.0
 
         if inference_params is not None:
             # add offset to the sequence start for inference
@@ -377,7 +420,7 @@ class MLASelfAttention(MultiLatentAttention):
         query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
         # key: [s, b, n, 192]
-        k_pos_emb = k_pos_emb.expand(-1, -1, self.config.num_attention_heads, -1)
+        k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
         query = query.contiguous()

@@ -17,6 +17,10 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     """Broadcast a tensor from last pipeline stage to all ranks."""
 
     if parallel_state.is_pipeline_last_stage():
+        assert size == list(
+            tensor.shape
+        ), f"Expected tensor of shape {size} but got {list(tensor.shape)}"
+        assert dtype == tensor.dtype, f"Expected tensor of type {dtype} but got {tensor.dtype}"
         _is_device(tensor)
         assert tensor.is_contiguous()
     else:
@@ -62,7 +66,7 @@ def recv_from_prev_pipeline_rank_(recv_buffer=None):
         torch.cuda.synchronize()
     elif xm:
         xm.mark_step()
-    
+
 def send_to_next_pipeline_rank(tensor=None):
     """Send output to the next pipeline stage."""
     

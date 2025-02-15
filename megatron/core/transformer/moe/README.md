@@ -19,6 +19,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 - Load Balancing algorithms:
     - Sinkhorn (S-BASE)
     - Aux loss / Load balancing loss
+    - Aux-loss-free load balancing strategy
 
 ### Performance Optimizations
 - GroupedGEMM when num local experts > 1
@@ -59,9 +60,12 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --moe-grouped-gemm | When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine. |
 | --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
+| --moe-router-score-function | Score function for MoE routing. Can be "softmax" or "sigmoid". Default is "softmax". |
 | --moe-router-pre-softmax | Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k. |
 | --moe-router-topk-limited-devices | Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. None means no device limitation. Default is None, which means no limited devices. |
 | --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
+| --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
+| --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
 | --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
 | --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
 | --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |
@@ -331,13 +335,13 @@ Here we provide some general rules to get better performance:
     - In practice, EP8TP1 is better than EP4TP2 for 8x7B.
 5. Enable Context Parallelism for long context training.
     - The efficiency of CP largely depends on whether its communication can be overlapped with computation. 
-    - Emperically, use CP when sequence length >= 8K.
+    - Empirically, use CP when sequence length >= 8K.
 
 ### MoE Parallel Folding
 
 MoE Parallel Folding separates the MoE related parallel groups from Dense groups.
 1. Traditional MoE parallel groups are entangled with dense by using a 5-dimension parallel group generator with default order `tp-cp-ep-dp-pp`. The EP group in MoE is a sub-group of DP in Attention.
-2. With MoE Parallel Fodling, we use a parallel group generator with `tp-cp-dp-pp` for Attention, and another with `tp-ep-dp-pp` for MoE. The EPxTP group in MoE is a sub-group of DPxCPxTP in Attention.
+2. With MoE Parallel Folding, we use a parallel group generator with `tp-cp-dp-pp` for Attention, and another with `tp-ep-dp-pp` for MoE. The EPxTP group in MoE is a sub-group of DPxCPxTP in Attention.
 
 By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 

@@ -6,12 +6,13 @@ import logging
 from collections import defaultdict
 from functools import reduce
 from itertools import zip_longest
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 
 import numpy as np
 import torch
 
 from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.parallel_state import get_default_process_group
 
 from .core import CheckpointingException
 from .dict_utils import nested_values
@@ -396,6 +397,37 @@ def exchange_loaded_tensors_gather_object(
         raise CheckpointingException(err_msg)
 
     return all_loaded_tensors
+
+
+def exchange_loaded_objects_gather_object(
+    loaded_objects: Dict[_ShardId, Any]
+) -> Dict[_ShardId, Any]:
+    """Exchange the objects loaded by different ranks with a simple all_gather_object call.
+
+    Args:
+        loaded_objects (Dict[_ShardId, Any]): mapping from shard ids to objects
+          already loaded by this rank.
+
+    Returns:
+        Dict[_ShardId, Any]: dictionary mapping shard ids to objects needed by this rank to
+         load a given state dict.
+    """
+    all_loaded_objects_list = [None] * torch.distributed.get_world_size(group=get_default_process_group())
+    torch.distributed.all_gather_object(all_loaded_objects_list, loaded_objects, group=get_default_process_group())
+    all_loaded_objects_list = cast(List[Dict[_ShardId, Any]], all_loaded_objects_list)
+    all_loaded_objects = reduce(lambda x, y: {**x, **y}, all_loaded_objects_list)
+
+    # Error checks
+    if len(all_loaded_objects) != sum(map(len, all_loaded_objects_list)):
+        err_msg = 'Duplicate shard ids loaded by different ranks'
+        if torch.distributed.get_rank() == 0:
+            logger.error(
+                f'{err_msg}. Shards ids by rank:'
+                f' {[lt.keys() for lt in all_loaded_objects_list]}'
+            )
+        raise CheckpointingException(err_msg)
+
+    return all_loaded_objects
 
 
 @torch.no_grad()

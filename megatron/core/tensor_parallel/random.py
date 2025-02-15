@@ -21,6 +21,14 @@ from megatron.core.utils import is_te_min_version, safely_set_viewless_tensor_da
 
 from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ModuleNotFoundError:
+    HAVE_TE = False
+
+
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 _EXPERT_PARALLEL_RNG_TRACKER_NAME = 'expert-parallel-rng'
@@ -47,8 +55,17 @@ class DeviceRNGStatesTracker:
     device state.
     """
 
-    def __init__(self):
+    def __init__(self, use_cudagraphable_rng=False):
         self.reset()
+        self.use_cudagraphable_rng = use_cudagraphable_rng
+
+        if self.use_cudagraphable_rng:
+            assert (
+                hasattr(torch.cuda.CUDAGraph, "register_generator_state")
+                and hasattr(torch.Generator, "graphsafe_set_state")
+                and hasattr(torch.Generator, "graphsafe_get_state")
+                and hasattr(torch.Generator, "clone_state")
+            ), "Tried using cudagraphs with RNG, however not detected in pytorch!"
 
     def is_initialized(self):
         """Checks if the internal RNG state has been set wirth set_states()."""
@@ -130,7 +147,11 @@ _DEVICE_RNG_STATE_TRACKER = None
 _DEVICE_RNG_STATE_TRACKER_INITIALIZED = False
 
 
-def initialize_rng_tracker(use_te_rng_tracker: bool = False, inference_rng_tracker: bool = False):
+def initialize_rng_tracker(
+    use_te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
     Megatron or TransformerEngine's implementation.
     In particular, TransformerEngine's implementation is cudagraphable and supports FP8.
@@ -149,7 +170,7 @@ def initialize_rng_tracker(use_te_rng_tracker: bool = False, inference_rng_track
 
     # Get the base tracker class
     base_tracker = None
-    if use_te_rng_tracker:
+    if HAVE_TE and use_te_rng_tracker:
         if not is_te_min_version("1.5.0"):
             raise RuntimeError("use_te_rng_tracker requires TransformerEngine version >= 1.5")
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
@@ -189,6 +210,27 @@ def get_device_rng_tracker():
     return _DEVICE_RNG_STATE_TRACKER
 
 
+def get_all_rng_states():
+    """Returns all generator states used by the current `DeviceRNGStatesTracker`."""
+
+    assert (
+        _DEVICE_RNG_STATE_TRACKER_INITIALIZED
+    ), "Tried getting all rng states but RNG Tracker has not been initalized!"
+
+    if isinstance(_DEVICE_RNG_STATE_TRACKER, DeviceRNGStatesTracker):
+        return _DEVICE_RNG_STATE_TRACKER.states_
+    # If TE is installed, check if we are using TE's RNG tracker
+    elif HAVE_TE and is_te_min_version("1.5.0"):
+        from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
+
+        if isinstance(_DEVICE_RNG_STATE_TRACKER, TECudaRNGStatesTracker):
+            from transformer_engine.pytorch.distributed import get_all_rng_states
+
+            return get_all_rng_states()
+    # no valid tracker, return an empty dict
+    else:
+        return {}
+    
 def model_parallel_device_manual_seed(seed, te_rng_tracker=False, inference_rng_tracker=False):
     """Initialize model parallel device seed.
 

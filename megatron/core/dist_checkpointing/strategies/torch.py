@@ -56,6 +56,7 @@ from .base import (
     StrategyAction,
     register_default_strategy,
 )
+from .cached_metadata_filesystem_reader import CachedMetadataFileSystemReader
 from .filesystem_async import FileSystemWriterAsync
 from .resharding import (
     TensorReformulationMetadata,
@@ -445,6 +446,7 @@ class MCoreSavePlanner(DefaultSavePlanner):
         *args,
         dedup_replicated_tensors: Optional[bool] = None,
         nd_flattened_global_shapes: Optional[Dict[str, Tuple[int, ...]]] = None,
+        can_run_decentralized_global_plan: bool = True,
         **kwargs,
     ) -> None:
         # `dedup_replicated_tensors` was deprecated in 2.3; this check avoids warnings
@@ -453,6 +455,14 @@ class MCoreSavePlanner(DefaultSavePlanner):
             kwargs['dedup_replicated_tensors'] = dedup_replicated_tensors
         super().__init__(*args, **kwargs)
         self.nd_flattened_global_shapes = nd_flattened_global_shapes or {}
+        self.can_run_decentralized_global_plan = can_run_decentralized_global_plan
+        if can_run_decentralized_global_plan:
+            assert (
+                not dedup_replicated_tensors
+            ), 'Cannot run decentralized plan with dedup_replicated_tensors=True'
+            assert (
+                not self.flatten_state_dict
+            ), 'Cannot run decentralized plan with flatten_state_dict=True'
 
     def create_local_plan(self) -> SavePlan:
         """Adds IOBytes write request on non-coordinator ranks."""
@@ -487,6 +497,23 @@ class MCoreSavePlanner(DefaultSavePlanner):
         global_plan, metadata = super().create_global_plan(all_plans)
         metadata.mcore_data = dict(ChainMap(*(plan.mcore_data for plan in all_plans)))
         return global_plan, metadata
+
+    def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
+        """Nothing to do, just some checks.
+
+        Args:
+            local_plan (SavePlan): local plan to turn to a global plan
+                (without interactions with other ranks)
+
+        Returns:
+            SavePlan - locally transformed plan equivalent to the plan that would be
+                created by the coordinator
+        """
+        assert (
+            not self.flatten_state_dict
+        ), 'Cannot run decentralized plan with flatten_state_dict=True'
+        assert not local_plan.planner_data, 'Planner data should be empty with decentralized plan'
+        return local_plan
 
     def transform_object(self, write_item: WriteItem, object: Any):
         """Make no transformations - bytes objects are already serialized."""
@@ -628,6 +655,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         
         self.separation_hint = separation_hint
 
+        self.validated_loaded_metadata_reuse = False
+
     def async_save(
         self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
     ) -> AsyncRequest:
@@ -657,7 +686,14 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # From the 3rd iteration, `save_state_dict_async_plan` will not generate `global_metadata`
         # (return None) so `self.cached_global_metadata` is reused
         args_cached_plans = None
+        loaded_all_plans = None
         if self.use_cached_ckpt_structure:
+            loaded_all_plans = getattr(self.cached_global_metadata, "all_local_plans", None)
+            if loaded_all_plans is None:
+                logger.debug(
+                    "no all_local_plans in metadata - can't verify global metadata reuse..."
+                )
+
             args_cached_plans = (
                 self.cached_central_plan,
                 self.cached_local_plan,
@@ -669,24 +705,44 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
             self.cached_central_plan,
             self.cached_local_plan,
             self.validated_cache_reuse,
+            self.validated_loaded_metadata_reuse,
         ) = save_state_dict_async_plan(
             pyt_state_dict,
             writer,
             self.process_group,
             coordinator,
-            planner=MCoreSavePlanner(dedup_replicated_tensors=not self.keep_only_main_replica),
+            planner=MCoreSavePlanner(
+                dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
+            ),
             cached_ckpt_structure=args_cached_plans,
+            loaded_all_plans=loaded_all_plans,
         )
         rank = torch.distributed.get_rank()
         if self.use_cached_ckpt_structure:
-            if self.validated_cache_reuse:
+            if (
+                loaded_all_plans
+                and self.cached_global_metadata
+                and self.validated_loaded_metadata_reuse
+            ):
+                if coordinator == rank:
+                    logger.debug(
+                        f"rank: {rank}, reuse global metadata from loaded"
+                        f" .metadata, {save_state_dict_ret[1]}"
+                    )
+                    save_state_dict_ret = list(save_state_dict_ret)
+                    save_state_dict_ret[1] = self.cached_global_metadata
+
+            elif self.validated_cache_reuse:
                 logger.debug(f"rank: {rank}, cache validated")
                 if save_state_dict_ret[1]:  # when global_metadata is not cached
                     self.cached_global_metadata = save_state_dict_ret[1]  # Cache Metadata
                 # Only Coordinator rank holds cached global_metadata
                 # (None is returned for global_metadata)
                 elif coordinator == rank:
-                    logger.debug(f"rank: {rank}, reuse metadata, {save_state_dict_ret[1]}")
+                    logger.debug(
+                        f"rank: {rank}, reuse global metadata cached from previous"
+                        f" save iteration, {save_state_dict_ret[1]}"
+                    )
                     save_state_dict_ret = list(save_state_dict_ret)
                     save_state_dict_ret[1] = self.cached_global_metadata
 
@@ -754,6 +810,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         self,
         process_group:  torch.distributed.ProcessGroup=None
     ):
+        self.cached_global_metadata: Optional[Metadata] = None
         super().__init__()
         self.process_group = process_group
 
@@ -795,14 +852,20 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
         # Load PyT Distributed format
+        fsr = CachedMetadataFileSystemReader(checkpoint_dir)
         checkpoint.load_state_dict(
             pyt_state_dict,
-            FileSystemReader(checkpoint_dir),
+            fsr,
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors
             ),
             process_group=self.process_group
         )
+
+        self.cached_global_metadata = (
+            fsr.read_metadata()
+        )  # no storage interaction thanks to caching
+
         pyt_state_dict = cast(
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict
         )
@@ -896,6 +959,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         fs_reader = FileSystemReader(checkpoint_dir)
         original_metadata = fs_reader.read_metadata()
+
+        original_metadata.state_dict_metadata = original_metadata.state_dict_metadata or {}
+        original_metadata.planner_data = original_metadata.planner_data or {}
+        original_metadata.storage_data = original_metadata.storage_data or {}
 
         new_state_dict_metadata = {}
         new_planner_data = {}

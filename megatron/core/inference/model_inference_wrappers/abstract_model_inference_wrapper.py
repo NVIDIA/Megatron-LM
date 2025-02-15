@@ -159,6 +159,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
             logits = output_tensor
             logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
 
+            # Explicitly cast logits to expected dtype
+            logits = logits.to(self.inference_wrapper_config.params_dtype)
+            
         return logits
 
     def forward_pass_with_pipeline_parallel_large_input_batch(
@@ -190,7 +193,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if parallel_state.is_pipeline_last_stage():
             logits = torch.empty(
                 (batch_size, seq_len, self.inference_wrapper_config.padded_vocab_size),
-                dtype=torch.float32,
+                dtype=self.pipeline_communication_dtype,
                 device=get_current_device(),
             )
 
@@ -217,7 +220,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             )
 
             if not parallel_state.is_pipeline_last_stage():
-                send_to_next_pipeline_rank(output_tensor)
+                send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
 
             self.inference_params.batch_size_offset += current_micro_batch_size
 
@@ -225,7 +228,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
                 output_tensor = tensor_parallel.gather_from_tensor_model_parallel_region(
                     output_tensor
                 )
+                assert logits is not None
                 logits[start:end, ...] = output_tensor
+
+                # Explicitly cast logits to expected dtype
+                logits = logits.to(self.inference_wrapper_config.params_dtype)
 
         # Once done with all micro batches, we reset batch size offset and seq len offset
         self.inference_params.sequence_len_offset += seq_len

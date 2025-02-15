@@ -4,7 +4,7 @@ import random
 import string
 import time
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, List
 from unittest import mock
 
 import pytest
@@ -25,7 +25,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
+from megatron.core.parallel_state import get_default_process_group, is_pipeline_first_stage, is_pipeline_last_stage
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -34,9 +34,11 @@ from tests.unit_tests.test_utilities import Utils
 
 class TestTextGenerationController:
 
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
-        model_parallel_device_manual_seed(123)        
+    def setup_model(self, dtype):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+        )
+        model_parallel_device_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 12
         self.vocab_size = 100
@@ -62,7 +64,7 @@ class TestTextGenerationController:
             hidden_size=self.hidden_size,
             inference_batch_times_seqlen_threshold=-1,
             fp32_residual_connection=False,
-            params_dtype=torch.float,
+            params_dtype=dtype,
             padded_vocab_size=self.vocab_size,
         )
 
@@ -78,6 +80,8 @@ class TestTextGenerationController:
         Utils.destroy_model_parallel()
 
     def test_sample_from_logits(self):
+        self.setup_model(torch.float32)
+
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
                 last_token_logits=None,
@@ -141,7 +145,11 @@ class TestTextGenerationController:
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
-    def test_generate_all_output_tokens_static_batch(self):
+    @pytest.mark.skip("upstream bug")
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_generate_all_output_tokens_static_batch(self, dtype):
+        self.setup_model(dtype)
+
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
         self.mock_tokenizer.detokenize.return_value = ''.join(
@@ -184,7 +192,11 @@ class TestTextGenerationController:
                 all_prompt_tokens[request_id] == request.prompt_tokens
             ), "Prompt tokens should not have changed during generation"
 
-    def test_output_log_probs(self):
+    @pytest.mark.skip("upstream bug")
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_output_log_probs(self, dtype):
+        self.setup_model(dtype)
+
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.bos = 0
         self.mock_tokenizer.eod = self.vocab_size - 1

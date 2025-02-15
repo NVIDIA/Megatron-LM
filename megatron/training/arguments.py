@@ -242,12 +242,8 @@ def validate_args(args, defaults={}):
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
-    # Pipeline model parallel size.
-    args.transformer_pipeline_model_parallel_size = (
-        args.pipeline_model_parallel_size - 1
-        if args.standalone_embedding_stage else
-        args.pipeline_model_parallel_size
-    )
+    # Pipeline model parallel size.        
+    args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
     args.data_parallel_size = args.world_size // total_model_size
 
@@ -351,13 +347,12 @@ def validate_args(args, defaults={}):
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
-    if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
-        # Divisibility check not applicable for T5 models which specify encoder_num_layers
-        # and decoder_num_layers.
-        if args.num_layers is not None:
-            assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-                'Number of layers should be divisible by the pipeline-model-parallel size'
-    if args.num_layers_per_virtual_pipeline_stage is not None:
+    
+    # Uneven virtual pipeline parallelism
+    assert args.num_layers_per_virtual_pipeline_stage is None or args.num_virtual_stages_per_pipeline_rank is None, \
+        '--num-layers-per-virtual-pipeline-stage and --num-virtual-stages-per-pipeline-rank cannot be set at the same time'
+                  
+    if args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
                 'When interleaved schedule is used, pipeline-model-parallel size '\
@@ -367,15 +362,28 @@ def validate_args(args, defaults={}):
                 'When interleaved schedule is used and p2p communication overlap is disabled, '\
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
-        assert args.num_layers is not None
-        # Double check divisibility check here since check above is if guarded.
-        assert args.num_layers % args.transformer_pipeline_model_parallel_size == 0, \
-            'Number of layers should be divisible by the pipeline-model-parallel size'
-        num_layers_per_pipeline_stage = args.num_layers // args.transformer_pipeline_model_parallel_size
-        assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
-            'Number of layers per pipeline stage must be divisible by number of layers per virtual pipeline stage'
-        args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
-            args.num_layers_per_virtual_pipeline_stage
+        
+        if args.num_virtual_stages_per_pipeline_rank is None:
+            assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
+                'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
+            num_layers = args.num_layers
+            
+            if args.account_for_embedding_in_pipeline_split:
+                num_layers += 1
+            
+            if args.account_for_loss_in_pipeline_split:
+                num_layers += 1
+            
+            assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                'number of layers of the model must be divisible pipeline model parallel size'
+            num_layers_per_pipeline_stage = num_layers // args.transformer_pipeline_model_parallel_size
+            
+            assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
+                'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
+            args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
+                args.num_layers_per_virtual_pipeline_stage
+        else:
+            args.virtual_pipeline_model_parallel_size = args.num_virtual_stages_per_pipeline_rank
     else:
         args.virtual_pipeline_model_parallel_size = None
         # Overlap P2P communication is disabled if not using the interleaved schedule.
@@ -386,9 +394,25 @@ def validate_args(args, defaults={}):
             print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
                   'since non-interleaved schedule does not support overlapping p2p communication '
                   'and aligned param AG')
+            
+        if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
+            # Divisibility check not applicable for T5 models which specify encoder_num_layers
+            # and decoder_num_layers.
+            if args.num_layers is not None:
+                num_layers = args.num_layers
+                
+                if args.account_for_embedding_in_pipeline_split:
+                    num_layers += 1
+                
+                if args.account_for_loss_in_pipeline_split:
+                    num_layers += 1
+                    
+                assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
+                    'Number of layers should be divisible by the pipeline-model-parallel size'
 
     if args.use_distributed_optimizer:
         assert xm is None, "--use-distributed-optimizer is not supported with XLA"
+    print("Virtual model parallel size ", args.virtual_pipeline_model_parallel_size)
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather is only supported with distributed optimizer'
@@ -633,6 +657,10 @@ def validate_args(args, defaults={}):
 
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
+        
+    if args.multi_latent_attention:
+        if args.tensor_model_parallel_size > 1:
+            assert args.sequence_parallel == True, 'Sequence parallelism should be enabled when MLA is used with tensor parallel'
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -735,10 +763,6 @@ def validate_args(args, defaults={}):
            any([args.train_data_path, args.valid_data_path, args.test_data_path]) \
            <= 1, "A single data source must be provided in training mode, else None"
 
-    if args.use_tp_pp_dp_mapping:
-        assert args.context_parallel_size * args.expert_model_parallel_size <= 1, \
-            "context_parallel and expert_model_parallel can't be used with tp-pp-dp mapping."
-
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -812,6 +836,15 @@ def validate_args(args, defaults={}):
         args.bias_dropout_fusion=False
         print('Warning: No Transformer Engine found: forcing bias_swiglu_fusion=False')
         args.bias_swiglu_fusion=False
+    # MoE loss and include embedding and loss layer check
+    if args.num_experts is not None:
+        if args.moe_router_load_balancing_type != "none" or args.moe_z_loss_coeff is not None:
+            assert not args.account_for_embedding_in_pipeline_split, \
+                "Cannot support load balancing loss and z loss with --account-for-embedding-in-pipeline-split"
+            assert not args.account_for_loss_in_pipeline_split, \
+                "Cannot support load balancing loss and z loss with --account-for-loss-in-pipeline-split"
+                
+
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
     if args.replication:
@@ -867,8 +900,8 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
     kw_args['num_moe_experts'] = args.num_experts
     kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['first_pipeline_num_layers']= args.decoder_first_pipeline_num_layers
-    kw_args['last_pipeline_num_layers']= args.decoder_last_pipeline_num_layers
+    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
+    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1149,6 +1182,9 @@ def _add_ft_package_args(parser):
     group = parser.add_argument_group(title='ft_package')
     group.add_argument('--enable-ft-package', action='store_true',
                        help='If set, Fault Tolerance package is enabled. '
+                       'Note: This feature is for Nvidia internal use only.')
+    group.add_argument('--calc-ft-timeouts', action='store_true',
+                       help='If set, FT package will try to automatically compute the timeouts. '
                        'Note: This feature is for Nvidia internal use only.')
     return parser
 
@@ -1782,6 +1818,8 @@ def _add_distributed_args(parser):
                        '--tensor-model-parallel-size instead.')
     group.add_argument('--num-layers-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of layers per virtual pipeline stage')
+    group.add_argument('--num-virtual-stages-per-pipeline-rank', type=int, default=None,
+                       help='Number of virtual pipeline stages per pipeline parallelism rank')
     group.add_argument('--microbatch-group-size-per-virtual-pipeline-stage', type=int, default=None,
                        help='Number of contiguous microbatches per virtual pipeline stage',
                        dest='microbatch_group_size_per_vp_stage')
@@ -1836,11 +1874,12 @@ def _add_distributed_args(parser):
                        'complete it instead.Also turns on '
                        '--use-cpu-initialization flag. This is for '
                        'external DDP manager.' )
-    group.add_argument('--standalone-embedding-stage', action='store_true',
-                       default=False, help='If set, *input* embedding layer '
-                       'is placed on its own pipeline stage, without any '
-                       'transformer layers. (For T5, this flag currently only '
-                       'affects the encoder embedding.)')
+    group.add_argument('--account-for-embedding-in-pipeline-split', action='store_true',
+                       default=False, help='If set, *input* embedding layer will be treated as a standard transformer'
+                       'layer in the context of partition and placement for pipeline parallelism.')
+    group.add_argument('--account-for-loss-in-pipeline-split', action='store_true',
+                       default=False, help='If set, loss layer will be treated as a standard transformer'
+                       'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
@@ -1869,8 +1908,7 @@ def _add_distributed_args(parser):
                        'setting `min_ctas`, `max_ctas`, and `cga_cluster_size`.')
     group.add_argument('--use-tp-pp-dp-mapping', action='store_true', default=False,
                         help='If set, distributed ranks initialize order is changed '
-                        'from tp-dp-pp to tp-pp-dp. Make sure EP and CP aren\'t used '
-                        'with this option enabled')
+                        'from tp-cp-ep-dp-pp to tp-cp-ep-pp-dp.')
     group.add_argument('--replication', action='store_true', default=False,
                        help="If set, replication of local checkpoints is enabled. "
                        "Needs to be enabled on all ranks.")
@@ -2191,6 +2229,10 @@ def _add_moe_args(parser):
                        choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+    group.add_argument('--moe-router-score-function', type=str,
+                       choices=['softmax', 'sigmoid'],
+                       default='softmax',
+                       help='Score function for MoE TopK routing. Can be "softmax" or "sigmoid".')
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
@@ -2199,6 +2241,15 @@ def _add_moe_args(parser):
                        help='Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. Default is None, which means no limited devices.')
     group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
                        help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
+    group.add_argument('--moe-router-enable-expert-bias', action='store_true',
+                       help='TopK routing with dynamic expert bias in the aux-loss-free load balancing strategy. '
+                       'The routing decision is based on the sum of the routing scores and the expert bias. '
+                       'See https://arxiv.org/abs/2408.15664 for details.')
+    group.add_argument('--moe-router-bias-update-rate', type=float, default=1e-3,
+                       help='Expert bias update rate in the aux-loss-free load balancing strategy. '
+                       'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
+                       'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
+                       'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
                        help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,

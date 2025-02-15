@@ -738,6 +738,12 @@ def initialize_model_parallel(
         rank_offset=encoder_world_size,
     )
 
+    assert (
+        order.endswith("pp")
+        or pipeline_model_parallel_size == 1
+        or expert_data_parallel_size == data_parallel_size
+    ), "When not using pp-last rank ordering, the data parallel size of the attention and moe layers must be the same"
+
     assert decoder_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks(
         "pp"
     ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
@@ -810,9 +816,13 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
     assert (
-        data_parallel_size % num_distributed_optimizer_instances == 0
-    ), 'Data parallel size should be divisible by partial DistOpt shard factor'
-    intra_partial_data_parallel_size = data_parallel_size // num_distributed_optimizer_instances
+        data_parallel_size * context_parallel_size
+    ) % num_distributed_optimizer_instances == 0, (
+        'Data parallel size should be divisible by partial DistOpt shard factor'
+    )
+    intra_partial_data_parallel_size = (
+        data_parallel_size * context_parallel_size
+    ) // num_distributed_optimizer_instances
 
     for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = create_group(

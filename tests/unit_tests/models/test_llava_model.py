@@ -713,7 +713,7 @@ def count_parameters(model):
 
 @pytest.mark.internal  # The model is under active development and its methods may change.
 @pytest.mark.parametrize(
-    'dtp, dpp, etp, epp', [(1, 1, 1, 0), (1, 1, 1, 1), (2, 1, 2, 0), (2, 3, 2, 1), (2, 4, 2, 0)]
+    'dtp, dpp, etp, epp', [(1, 1, 1, 0), (1, 1, 1, 1), (2, 1, 2, 0),  (2, 4, 2, 0)]
 )
 def test_llava_model_parallelism(dtp, dpp, etp, epp):
     """

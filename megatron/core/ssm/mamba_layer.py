@@ -5,12 +5,14 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
-from typing import Union
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Union
 
 import torch
 from torch import Tensor
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -37,6 +39,9 @@ class MambaLayerSubmodules:
     mixer: Union[ModuleSpec, type] = IdentityOp
     mamba_bda: Union[ModuleSpec, type] = IdentityOp
 
+    # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
+    sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
 
 class MambaLayer(MegatronModule):
     """
@@ -57,6 +62,7 @@ class MambaLayer(MegatronModule):
         """Initialize Mamba Layer."""
         super().__init__(config)
         self.config = config
+        self.submodules_config = submodules
         self.layer_number = layer_number
         self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = config.hidden_dropout
@@ -114,3 +120,26 @@ class MambaLayer(MegatronModule):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """Allocate the inference cache."""
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
+
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """
+        Generate a sharded state dictionary for the mamba layer.
+
+        Args:
+            prefix (str, optional): Prefix to be added to all keys in the state dict.
+            sharded_offsets (tuple, optional): Tuple of sharding offsets.
+            metadata (Optional[dict], optional): Additional metadata for sharding.
+
+        Returns:
+            ShardedStateDict: A dictionary containing the sharded state of the mamba layer.
+        """
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        prefixed_map = {
+            f'{prefix}{k}': f'{prefix}{v}'
+            for k, v in self.submodules_config.sharded_state_dict_keys_map.items()
+        }
+        if prefixed_map:
+            apply_prefix_mapping(sharded_state_dict, prefixed_map)
+        return sharded_state_dict

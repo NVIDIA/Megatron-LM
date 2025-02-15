@@ -19,6 +19,8 @@ except ImportError:
     except ImportError:
         HAVE_FSDP = False
 
+from megatron.core.utils import is_float8tensor
+
 from .. import parallel_state, tensor_parallel
 from ..models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from ..models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -94,6 +96,12 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             custom_attrs = {}
             for name, param in module.named_parameters():
                 attrs = vars(param)
+                if is_float8tensor(param):
+                    # disable fp8 transpose cache and perform transposing fp8 weights
+                    # at each micro-batch because torch-FSDP doesn't recognize the
+                    # micro-batch id, thus removing unnecessary memory stores
+                    attrs['_fp8_attrs']['transpose_invalid'] = False
+                    del attrs['_fp8_attrs']['transpose']
                 custom_attrs[name] = {k: v for k, v in attrs.items()}
             return custom_attrs
 

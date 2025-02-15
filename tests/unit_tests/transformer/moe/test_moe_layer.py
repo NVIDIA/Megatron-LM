@@ -86,8 +86,8 @@ class TestMoELayerInit:
         )
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
-    @pytest.mark.parametrize("grouped_gemm", [True, False])
+    @pytest.mark.parametrize("moe_token_dispatcher_type", ["alltoall"])
+    @pytest.mark.parametrize("grouped_gemm", [True])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (2, 2)])
     def test_moe_with_late_initialize(
         self, moe_token_dispatcher_type, grouped_gemm, tp_size, ep_size

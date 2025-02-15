@@ -90,12 +90,12 @@ def initialize_megatron(
     # init rerun state
     def state_save_func():
         return {
-            'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()
+            'rng_tracker_states': tensor_parallel.get_device_rng_tracker().get_states()
         }
 
     def state_restore_func(state_dict):
         if state_dict['rng_tracker_states']:
-            tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
+            tensor_parallel.get_device_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
     args = get_args()
     initialize_rerun_state_machine(
@@ -316,7 +316,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 expert_tensor_parallel_size=args.expert_tensor_parallel_size,
                 distributed_timeout_minutes=args.distributed_timeout_minutes,
                 nccl_communicator_config_path=args.nccl_communicator_config_path,
-                order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-pp-dp',
+                order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
                 encoder_tensor_model_parallel_size=args.encoder_tensor_model_parallel_size,
                 encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
                 get_embedding_ranks=get_embedding_ranks,

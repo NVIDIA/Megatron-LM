@@ -2,13 +2,13 @@
 import logging
 from pathlib import Path
 from time import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple, TypeVar
 
 import torch
 import torch.distributed as dist
+from torch.distributed.checkpoint import Metadata
 
-from megatron.core.device_utils import get_xla_model
-from megatron.core.dist_checkpointing import ShardedTensor
+from megatron.core.dist_checkpointing import ShardedObject, ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.dict_utils import (
     dict_list_map_inplace,
@@ -20,6 +20,7 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     ShardDistribution,
     determine_main_replica_uniform_distribution,
     exchange_by_distribution,
+    exchange_loaded_objects_gather_object,
 )
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
 from megatron.core.dist_checkpointing.strategies.base import (
@@ -27,15 +28,20 @@ from megatron.core.dist_checkpointing.strategies.base import (
     LoadShardedStrategy,
     SaveShardedStrategy,
 )
-from megatron.core.dist_checkpointing.utils import _sharded_tensor_shard_id, _ShardId, debug_time
+from megatron.core.dist_checkpointing.utils import (
+    _sharded_object_id,
+    _sharded_tensor_shard_id,
+    _ShardId,
+    debug_time,
+)
 from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
 
-xm = get_xla_model()
-
 logger = logging.getLogger(__name__)
+
+T = TypeVar('T', ShardedObject, ShardedTensor)
 
 
 class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
@@ -60,7 +66,7 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
             to maximize performance. Defaults to the whole world.
         do_cache_distribution (bool, optional): whether to cache the save distribution
             from previous calls. Should be set to True only if the state dict
-            structure between the calls is always the same. Defaults to False.
+            structure between the calls is always the same. Defaults to True.
     """
 
     def __init__(
@@ -179,6 +185,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
         self.exchange_algo = exchange_algo
 
         self.cached_distribution: Optional[ShardDistribution] = None
+        self.cached_global_metadata: Optional[Metadata] = None
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
@@ -210,6 +217,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             a state dict that would be loaded with the underlying strategy
             without this wrapper.
         """
+
+        loaded_state_dict = {}
+
         if torch.distributed.get_world_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
@@ -222,17 +232,25 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 precomputed_distribution is not None
             ), 'Expecting non-trivial distribution for non-trivial parallelization group'
 
+        # Step 3: load part of the checkpoint.
+        # Load only sharded objects first. ShardedTensors will be loaded separately
+        # so that we can keep track of sharded tensors loaded by this rank
+        (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
+            self._defer_loading_sharded_tensors(sharded_state_dict)
+        )
+
+        (sharded_objects, sharded_state_dict, to_load_objects, unloaded_objects) = (
+            self._defer_loading_sharded_objects(sharded_state_dict)
+        )
+
+        assert (
+            len(sharded_state_dict) == 0
+        ), "sharded_state_dict is not empty after deferring tensors and objects"
         with debug_time("base_load_ShardedObjects", logger):
-            # Step 3: load part of the checkpoint.
-            # Load only sharded objects first. ShardedTensors will be loaded separately
-            # so that we can keep track of sharded tensors loaded by this rank
-            (sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards) = (
-                self._defer_loading_sharded_tensors(sharded_state_dict)
-            )
-            loaded_state_dict = self.base_strategy.load(sharded_state_dict, checkpoint_dir)
+            # Load sharded objects first
+            loaded_objects = self.base_strategy.load(to_load_objects, checkpoint_dir)
 
         with debug_time("base_load_ShardedTensors", logger):
-
             # Load sharded tensors separately
             loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
 
@@ -257,54 +275,86 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                 with debug_time("torch.cuda.synchronize", logger):
                     torch.cuda.synchronize()
 
+        all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
+
+        if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
+            missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
+            raise CheckpointingException(
+                f'Missing object shards after fully parallel loading: {missing_object_shards}'
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
+        self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)
+
+        merge(loaded_state_dict, sharded_objects)
         merge(loaded_state_dict, sharded_tensors)
+        if hasattr(self.base_strategy, "cached_global_metadata"):
+            self.cached_global_metadata = self.base_strategy.cached_global_metadata
         return loaded_state_dict
 
+    @staticmethod
+    def _defer_loading_sharded_objects(
+        sharded_state_dict: ShardedStateDict,
+    ) -> Tuple[
+        ShardedStateDict,
+        ShardedStateDict,
+        Dict[_ShardId, ShardedObject],
+        Dict[_ShardId, ShardedObject],
+    ]:
+        return _defer_loading_sharded_items(sharded_state_dict, ShardedObject, _sharded_object_id)
+
+    @staticmethod
     def _defer_loading_sharded_tensors(
-        self, sharded_state_dict: ShardedStateDict
+        sharded_state_dict: ShardedStateDict,
     ) -> Tuple[
         ShardedStateDict,
         ShardedStateDict,
         Dict[_ShardId, ShardedTensor],
         Dict[_ShardId, ShardedTensor],
     ]:
-        """Divides state dict into parts loaded by this vs other ranks.
-
-        ShardedTensors with main replica_id will be loaded by this rank,
-        others will be received by other ranks (after loading from storage).
-
-        Args:
-            sharded_state_dict (ShardedStateDict): state dict with ShardedTensor
-                that will be divided.
-
-        Returns: a tuple of:
-            - ShardedStateDict: sub-state dict only with ShardedTensors
-            - ShardedStateDict: sub-state dict with non-ShardedTensors
-            - Dict[_ShardId, ShardedTensor]: ShardedTensor are uniquely identified
-                by shard ids. This is a mapping from shard id to a corresponding
-                ShardedTensor for tensors loaded by *this* rank
-            - Dict[_ShardId, ShardedTensor]: mapping from shard id to a corresponding
-                ShardedTensor for tensors loaded by *other* ranks
-        """
-        to_load_shards = {}
-        unloaded_shards = {}
-
-        sharded_tensors, sharded_state_dict = extract_matching_values(
-            sharded_state_dict, lambda v: isinstance(v, ShardedTensor)
+        return _defer_loading_sharded_items(
+            sharded_state_dict, ShardedTensor, _sharded_tensor_shard_id
         )
 
-        def wrap_non_main_replicas(x):
-            if isinstance(x, ShardedTensor):
-                # Assign shard to be loaded or not
-                if is_main_replica(x.replica_id):
-                    to_load_shards[_sharded_tensor_shard_id(x)] = x
-                else:
-                    unloaded_shards[_sharded_tensor_shard_id(x)] = x
-            return x
+    @staticmethod
+    def fill_in_deferred_sharded_objects(
+        sharded_state_dict: ShardedStateDict, loaded_objects: Dict[_ShardId, Any]
+    ) -> None:
+        """Fill in objects not loaded by current rank with objects from `loaded_objects` map.
 
-        dict_list_map_inplace(wrap_non_main_replicas, sharded_tensors)
-        return sharded_tensors, sharded_state_dict, to_load_shards, unloaded_shards
+        Args:
+            sharded_state_dict (ShardedStateDict): sharded state dict to fill in.
+                ShardedObjects are completely replaced with corresponding objects.
+            loaded_objects (Dict[_ShardId, Any]): dict allowing to map
+                ShardedObject from the sharded_state_dict to loaded objects.
+
+        Returns:
+            None
+        """
+        _fill_in_deferred_sharded_items(
+            sharded_state_dict, loaded_objects, ShardedObject, _sharded_object_id
+        )
+
+    @staticmethod
+    def fill_in_deferred_sharded_tensors(
+        sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[_ShardId, torch.Tensor]
+    ) -> None:
+        """Fill in tensors not loaded by current rank with tensors from `loaded_tensors` map.
+
+        Args:
+            sharded_state_dict (ShardedStateDict): sharded state dict to fill in.
+                ShardedTensors are completely replaced with corresponding torch.Tensors.
+            loaded_tensors (Dict[_ShardId, torch.Tensor]): dict allowing to map
+                ShardedTensor from the sharded_state_dict to loaded tensors.
+
+        Returns:
+            None
+        """
+        _fill_in_deferred_sharded_items(
+            sharded_state_dict, loaded_tensors, ShardedTensor, _sharded_tensor_shard_id
+        )
 
     def apply_loading_parallelization(
         self, sharded_state_dict: ShardedStateDict
@@ -342,34 +392,6 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             self.cached_distribution = precomputed_distribution
 
         return precomputed_distribution
-
-    def fill_in_deferred_sharded_tensors(
-        self, sharded_state_dict: ShardedStateDict, loaded_tensors: Dict[_ShardId, torch.Tensor]
-    ) -> None:
-        """Fill in tensors not loaded by current rank with tensors from `loaded_tensors` map.
-
-        Args:
-            sharded_state_dict (ShardedStateDict): sharded state dict to fill in.
-                ShardedTensors are completely replaced with corresponding torch.Tensors.
-            loaded_tensors (Dict[_ShardId, torch.Tensor]): dict allowing to map
-                ShardedTensor from the sharded_state_dict to loaded tensors.
-
-        Returns:
-
-        """
-
-        def fill_in_sharded_tensor(x):
-            if isinstance(x, ShardedTensor):
-                try:
-                    x = loaded_tensors[_sharded_tensor_shard_id(x)]
-                except KeyError as e:
-                    raise CheckpointingException(
-                        f'Missing loaded tensor shard: {_sharded_tensor_shard_id(x)}'
-                    ) from e
-
-            return x
-
-        dict_list_map_inplace(fill_in_sharded_tensor, sharded_state_dict)
 
     @property
     def can_handle_sharded_objects(self):
@@ -441,3 +463,61 @@ def distribute_main_replicas_with_precomputed_distribution(
             sh_ten.replica_id = 0
         else:
             sh_ten.replica_id = 1
+
+
+def _defer_loading_sharded_items(
+    sharded_state_dict: ShardedStateDict, item_type: type, shard_id_func: Callable[[T], _ShardId]
+) -> Tuple[ShardedStateDict, ShardedStateDict, Dict[_ShardId, T], Dict[_ShardId, T]]:
+    """Divides state dict into parts loaded by this vs other ranks.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): state dict with sharded items
+            that will be divided.
+        item_type: The type of sharded item (ShardedObject or ShardedTensor)
+        shard_id_func: Function to get the shard ID for the item type
+
+    Returns: a tuple of:
+        - ShardedStateDict: sub-state dict only with sharded items
+        - ShardedStateDict: sub-state dict with non-sharded items
+        - Dict[_ShardId, T]: mapping from shard id to items loaded by *this* rank
+        - Dict[_ShardId, T]: mapping from shard id to items loaded by *other* ranks
+    """
+    to_load_shards = {}
+    unloaded_shards = {}
+
+    sharded_items, remaining_state_dict = extract_matching_values(
+        sharded_state_dict, lambda v: isinstance(v, item_type)
+    )
+
+    def wrap_non_main_replicas(x: Any) -> Any:
+        if isinstance(x, item_type):
+            shard_id = shard_id_func(x)
+            if is_main_replica(x.replica_id):
+                to_load_shards[shard_id] = x
+            else:
+                unloaded_shards[shard_id] = x
+        return x
+
+    dict_list_map_inplace(wrap_non_main_replicas, sharded_items)
+    return sharded_items, remaining_state_dict, to_load_shards, unloaded_shards
+
+
+def _fill_in_deferred_sharded_items(
+    sharded_state_dict: ShardedStateDict,
+    loaded_items: Dict[_ShardId, Any],
+    item_type: type,
+    shard_id_func: Callable[[T], _ShardId],
+) -> None:
+    """Helper function to fill in items not loaded by current rank."""
+
+    def fill_in_sharded_item(x: Any) -> Any:
+        if isinstance(x, item_type):
+            try:
+                x = loaded_items[shard_id_func(x)]
+            except KeyError as e:
+                raise CheckpointingException(
+                    f'Missing loaded item shard: {shard_id_func(x)}'
+                ) from e
+        return x
+
+    dict_list_map_inplace(fill_in_sharded_item, sharded_state_dict)

@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import signal
+from typing import List, Optional, Union
 
 import torch
 
@@ -37,7 +38,8 @@ def get_device(local_rank=None):
     return device
 
 
-def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None, groups=None):
+def all_gather_item(item, dtype, group:Optional[Union[torch.distributed.ProcessGroup, List[List[int]]]]=None, async_op=False, local_rank=None):
+    
     if not torch.distributed.is_available() or \
        not torch.distributed.is_initialized():
         return [item]
@@ -52,7 +54,7 @@ def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None, gr
     tensor = torch.tensor([item], device=device, dtype=dtype)
     xm = get_xla_model()
     if xm:
-        output_tensors = list(xm.all_gather(tensor, groups=groups).split(tensor.size()[0]), pin_layout=False)
+        output_tensors = list(xm.all_gather(tensor, groups=group).split(tensor.size()[0]), pin_layout=False)
     else:
         output_tensors = [
             torch.zeros(1, dtype=tensor.dtype, device=tensor.device)

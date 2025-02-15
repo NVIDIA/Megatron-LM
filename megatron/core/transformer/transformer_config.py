@@ -26,13 +26,21 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
-    first_pipeline_num_layers: int = None
+    num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage. 
     None implies equal layer division across PP ranks."""
 
-    last_pipeline_num_layers: int = None
+    num_layers_in_last_pipeline_stage: Optional[int] = None
     """Number of transformer layers on last pipeline stage. 
     None implies equal layer division across PP ranks."""
+
+    account_for_embedding_in_pipeline_split: bool = False
+    """If set, the embedding layer will be treated as a standard transformer
+    layer in the context of partition and placement for pipeline parallelism."""
+
+    account_for_loss_in_pipeline_split: bool = False
+    """If set, the loss layer will be treated as a standard transformer
+    layer in the context of partition and placement for pipeline parallelism."""
 
     hidden_size: int = 0
     """Transformer hidden size."""
@@ -291,6 +299,20 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax 
     enabled. Defaults to None, which means no scaling."""
 
+    moe_router_score_function: str = "softmax"
+    """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+
+    moe_router_enable_expert_bias: bool = False
+    """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
+    The routing decision is based on the sum of the routing scores and the expert bias.
+    See https://arxiv.org/abs/2408.15664 for details."""
+
+    moe_router_bias_update_rate: float = 1e-3
+    """The expert bias is updated based on the number of assigned tokens to each expert 
+    in a global batch, where the bias is increased for the experts with less assigned tokens
+    and decreased for the experts with more assigned tokens. 
+    The default value 1e-3 is same as that used in DeepSeekV3."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -310,7 +332,7 @@ class TransformerConfig(ModelParallelConfig):
     moe_input_jitter_eps: float = None
     """Add noise to the input tensor by applying jitter with a specified epsilon value."""
 
-    moe_token_dropping: bool = False  # TODO: Support token dropping.
+    moe_token_dropping: bool = False
     """This feature involves selectively dropping and padding tokens for each expert to achieve a
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
@@ -359,6 +381,30 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    ##################
+    # Cuda Graphs
+    ##################
+    enable_cuda_graph: bool = False
+    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
+
+    cuda_graph_use_single_mempool: bool = False
+    """When set to true, cudagraphs will be captured inside a single mempool, in which all 
+    cudagraphs may only be used once per step. If false, cudagraphs may be reused across 
+    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation, 
+    however may greatly increase the number of cudagraphs created when the number of microbatches 
+    is high."""
+
+    cuda_graph_retain_backward_graph: bool = False
+    """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
+    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For 
+    more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
+
+    cuda_graph_warmup_steps: int = 3
+    """Number of warmup steps for CUDA graphs"""
+
+    external_cuda_graph: bool = False
+    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
+
     ####################
     # miscellaneous
     ####################
@@ -368,20 +414,6 @@ class TransformerConfig(ModelParallelConfig):
 
     disable_parameter_transpose_cache: bool = False
     """When set to true, the parameter transposes are not cached for subsequent iterations."""
-
-    enable_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
-
-    cuda_graph_retain_backward_graph: bool = False
-    """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
-    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For 
-    more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
-
-    external_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
-
-    cuda_graph_warmup_steps: int = 3
-    """Number of warmup steps for CUDA graphs"""
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
@@ -547,11 +579,125 @@ class TransformerConfig(ModelParallelConfig):
                     f'false when sequence parallel is enabled: {self.sequence_parallel}'
                 )
 
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ) and (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
+            raise ValueError(
+                'num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage cannot be'
+                'set at the same time with account_for_embedding_in_pipeline_split'
+                'and account_for_loss_in_pipeline_split'
+            )
+
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ):
+            pipeline_parallel_size = self.pipeline_model_parallel_size
+            num_layers = self.num_layers
+
+            if self.num_layers_in_first_pipeline_stage is not None:
+                if self.num_layers_in_first_pipeline_stage <= 0:
+                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+
+                if self.virtual_pipeline_model_parallel_size is not None:
+                    if (
+                        self.num_layers_in_first_pipeline_stage
+                        % self.virtual_pipeline_model_parallel_size
+                        != 0
+                    ):
+                        raise ValueError(
+                            f'number of layers at first stage: '
+                            f'{self.num_layers_in_first_pipeline_stage}'
+                            f'must be divisible by virtual pipeline'
+                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                        )
+                num_layers -= self.num_layers_in_first_pipeline_stage
+                pipeline_parallel_size -= 1
+
+            if self.num_layers_in_last_pipeline_stage is not None:
+                if self.num_layers_in_last_pipeline_stage <= 0:
+                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+
+                if self.virtual_pipeline_model_parallel_size is not None:
+                    if (
+                        self.num_layers_in_last_pipeline_stage
+                        % self.virtual_pipeline_model_parallel_size
+                        != 0
+                    ):
+                        raise ValueError(
+                            f'number of layers at last stage: '
+                            f'{self.num_layers_in_last_pipeline_stage}'
+                            f'must be divisible by virtual pipeline'
+                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                        )
+                num_layers -= self.num_layers_in_last_pipeline_stage
+                pipeline_parallel_size -= 1
+
+            if not num_layers % pipeline_parallel_size == 0:
+                raise ValueError(
+                    f'number of layers at middle stage: {num_layers} must be divisible by'
+                    f'the middle pipeline model parallel size {pipeline_parallel_size}'
+                )
+
             if self.virtual_pipeline_model_parallel_size is not None:
-                if not self.num_layers % self.virtual_pipeline_model_parallel_size == 0:
+                num_layers_per_middle_pipeline_rank = num_layers // pipeline_parallel_size
+                if (
+                    not num_layers_per_middle_pipeline_rank
+                    % self.virtual_pipeline_model_parallel_size
+                    == 0
+                ):
                     raise ValueError(
-                        f'num_layers: {self.num_layers} must be divisible by '
-                        f'virtual_model_parallel_size {self.virtual_pipeline_model_parallel_size}'
+                        f'number of layers on each middle pipeline rank:'
+                        f'{num_layers_per_middle_pipeline_rank} must be divisible by virtual'
+                        f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
+                    )
+
+        if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
+            if self.virtual_pipeline_model_parallel_size is None:
+                pipeline_parallel_size = self.pipeline_model_parallel_size
+
+                if self.account_for_embedding_in_pipeline_split:
+                    pipeline_parallel_size -= 1
+
+                if self.account_for_loss_in_pipeline_split:
+                    pipeline_parallel_size -= 1
+
+                if not self.num_layers % pipeline_parallel_size == 0:
+                    raise ValueError(
+                        f'number of middle layers: {self.num_layers} must be divisible by '
+                        f'middle pipeline_model_parallel_size {pipeline_parallel_size}'
+                    )
+            else:
+                num_layers = self.num_layers
+                if self.account_for_embedding_in_pipeline_split:
+                    num_layers += 1
+
+                if self.account_for_loss_in_pipeline_split:
+                    num_layers += 1
+
+                if not num_layers % self.pipeline_model_parallel_size == 0:
+                    raise ValueError(
+                        f'num_layers: {num_layers} after enable'
+                        f'account_for_embedding_in_pipeline_split or '
+                        f'account_for_loss_in_pipeline_split must be divisible'
+                        f'by pipeline_model_parallel_size '
+                        f'{self.pipeline_model_parallel_size}'
+                    )
+
+                num_layers_per_pipeline_rank = num_layers // self.pipeline_model_parallel_size
+                if (
+                    not num_layers_per_pipeline_rank % self.virtual_pipeline_model_parallel_size
+                    == 0
+                ):
+                    raise ValueError(
+                        f'number of layers on each pipeline rank: {num_layers_per_pipeline_rank}'
+                        f'(after enable account_for_embedding_in_pipeline_split or '
+                        f'account_for_loss_in_pipeline_split) must be divisible by'
+                        f'virtual_pipeline_model_parallel_size'
+                        f'{self.virtual_pipeline_model_parallel_size}'
                     )
 
         if self.apply_query_key_layer_scaling:
@@ -610,6 +756,12 @@ class TransformerConfig(ModelParallelConfig):
                 "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
             )
 
+        if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
+            raise ValueError(
+                "Expert bias for aux-loss-free routing only supports sigmoid score function."
+                "Please set --moe-router-score-function sigmoid for sigmoid score function."
+            )
+
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
             if not is_te_min_version("1.7.0.dev0"):
@@ -623,6 +775,16 @@ class TransformerConfig(ModelParallelConfig):
                     "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
                     f"but your version is {get_te_version()}."
                 )
+
+        if (
+            self.moe_router_topk == 1
+            and self.moe_router_score_function == 'softmax'
+            and not self.moe_router_pre_softmax
+            and self.moe_router_load_balancing_type != 'sinkhorn'
+        ):
+            # Requires applying softmax before selecting the top-k when k is 1,
+            # since softmax on a [num_tokens, 1] would yield a zero gradient.
+            raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
 
         if self.moe_router_topk_limited_devices:
             if self.moe_router_topk_limited_devices > self.expert_model_parallel_size:
@@ -658,6 +820,11 @@ class TransformerConfig(ModelParallelConfig):
                 assert isinstance(
                     self.cp_comm_type, str
                 ), "Unsupported communication type for context parallelism!"
+
+        assert (
+            self.pipeline_model_parallel_size > 0
+        ), f"Pipeline model parallel size must be larger than 0 \
+            when enable --standalone-embedding-stage and --standalone-loss-stage"
 
 
 @dataclass
