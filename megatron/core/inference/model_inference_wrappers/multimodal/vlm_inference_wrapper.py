@@ -18,17 +18,13 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         """A utility function for preparing model for inference
 
         The function gets called once before the auto regressive inference loop.
-        It puts the model in eval mode and initializes the inference_params.
+        It puts the model in eval mode.
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
 
         """
-        self.model.eval()
-
-        # Defer setting inference_params until self.prep_inference_input because the
-        # KV cache shape depends on num_img_embeddings
-        self.inference_params = None
+        super().prep_model_for_inference(prompts_tokens)
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
         self.model_is_pipeline_parallel = not (

@@ -25,6 +25,12 @@ class InferenceWrapperConfig:
     """The final padded vocab size (Padded to make it divisible by 
     --make-vocab-size-divisible-by value)"""
 
+    inference_max_requests: int = 8
+    """ Maximum number of requests for inference (prefill & decode). Necessary for CUDA graphs. """
+
+    inference_max_seq_length: int = 2560
+    """ Maximum sequence length for inference (prefill & decode). Necessary for CUDA graphs. """
+
     fp32_residual_connection: bool = False
     """Move residual connections to fp32. Obtained from arguments.py"""
 

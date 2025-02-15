@@ -9,6 +9,7 @@ class InferenceParams:
         self.current_batch_size = max_batch_size  # Required for bookkeeping variable-sized batches
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
+        self.decode_mode = False
         self.key_value_memory_dict = {}
         self.decode_mode = False
 
@@ -44,6 +45,13 @@ class InferenceParams:
         the prompts for *all* requests in a batch.
         """
         self.decode_mode = True
+
+    def reset(self):
+        """Resets the inference state for a new batch."""
+        self.current_batch_size = self.max_batch_size
+        self.sequence_len_offset = 0
+        self.batch_size_offset = 0
+        self.enable_prefill_mode()
 
     def __str__(self):
         return (
@@ -84,6 +92,9 @@ class InferenceParams:
 
             # Compare each key, value tensor in the tuple
             for self_tensor, other_tensor in zip(self_tensors, other_tensors):
-                if not self_tensor.shape == other_tensor.shape:
+                if (
+                    self_tensor.data_ptr() != other_tensor.data_ptr()
+                    or self_tensor.shape != other_tensor.shape
+                ):
                     return False
         return True

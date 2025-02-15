@@ -48,11 +48,15 @@ class AbstractModelInferenceWrapper(abc.ABC):
             else self.inference_wrapper_config.params_dtype
         )
 
+        max_batch_size = self.inference_wrapper_config.inference_max_requests
+        max_sequence_length = self.inference_wrapper_config.inference_max_seq_length
+        self.inference_params = InferenceParams(max_batch_size, max_sequence_length)
+
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
 
         The function gets called once before the auto regressive inference loop.
-        It puts the model in eval mode and initializes the inference_params.
+        It puts the model in eval mode.
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
@@ -64,8 +68,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
-        batch_size, max_sequence_length = prompts_tokens.shape
-        self.inference_params = InferenceParams(batch_size, max_sequence_length)
+
+        self.inference_params.reset()
 
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:

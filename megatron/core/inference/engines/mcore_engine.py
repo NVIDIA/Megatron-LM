@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import asyncio
+import warnings
 from collections import OrderedDict
 from typing import AsyncGenerator, Dict, List, Optional, Union
 
@@ -25,7 +26,9 @@ class MCoreEngine(AbstractEngine):
         text_generation_controller (TextGenerationController): A text generation
             controller that will be used to define how to preprocess prompts, generate
             outputs and detokenizer the output tokens.
-        max_batch_size : The maxinum number of requests to process at once
+        max_batch_size (int, optional): The maximum number of requests to process at once.
+            Will be set from the InferenceWrapperConfig in `text_generation_controller` by
+            default.
         random_seed (int, optional): Use a random seed if you want deterministic
             results. Defaults to None.
     """
@@ -33,9 +36,24 @@ class MCoreEngine(AbstractEngine):
     def __init__(
         self,
         text_generation_controller: TextGenerationController,
-        max_batch_size,
+        max_batch_size: Optional[int] = None,
         random_seed: Optional[int] = None,
     ):
+        inference_wrapper_config = (
+            text_generation_controller.inference_wrapped_model.inference_wrapper_config
+        )
+        inference_max_batch_size = inference_wrapper_config.inference_max_requests
+        if max_batch_size is None:
+            max_batch_size = inference_max_batch_size
+        elif max_batch_size > inference_max_batch_size:
+            warnings.warn(
+                f"Engine `max_batch_size` ({max_batch_size}) > "
+                f"`inference_max_requests` in `inference_wrapper_config` "
+                f"({inference_max_batch_size}); setting `max_batch_size` to "
+                f"{inference_max_batch_size}",
+                UserWarning,
+            )
+            max_batch_size = inference_max_batch_size
         self.text_generation_controller = text_generation_controller
         self.random_seed = random_seed
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
