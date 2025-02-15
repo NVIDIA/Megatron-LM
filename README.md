@@ -23,7 +23,6 @@
     - [Copy Your Wandb Logs to a New Project](#copy-your-wandb-logs-to-a-new-project)
 
 <!-- /TOC -->
-
 # Introduction
 This repository contains scripts to train large language models (LLMs) at scale using Megatron-LM, specifically tailored for Slurm clusters. It's tailored for large-scale training runs and include mechanism for improved fault tolerance, automatic resumption after crashes or interruptions, automated evaluation submission, and enhanced WANDB logging. Additionally, it provides configurations optimized for peak performance on the Alps Supercomputer.
 
@@ -154,3 +153,4 @@ To submit your contribution you have to provide a fresh wandb project with the r
 2. Use the `copy_wandb_project.py` to create a copy of your run from your personal wandb project. Make sure it contains the relevant ablations and baselines.
   ```
   python scripts/copy_wandb_project.py -se myusername -de myusername -sp Megatron-Clariden -dp contrib_linear_attention -r f5v94x1q  
+  ```
