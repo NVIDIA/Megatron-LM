@@ -136,6 +136,7 @@ class GPTDataset(MegatronDataset):
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
                 self.config.bod_hiding,
+                self.config.goldfish_loss,
             ]
         )
         self.masks_and_position_ids_are_cached = False
