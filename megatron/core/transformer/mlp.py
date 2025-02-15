@@ -1,10 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from dataclasses import dataclass
+from typing import Optional, Union
+
 import numpy as np
 import torch
 import torch.nn.functional as F
-from dataclasses import dataclass
-from typing import Optional, Union
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
