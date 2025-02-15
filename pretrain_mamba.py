@@ -104,8 +104,8 @@ def get_batch(data_iterator):
     return batch.values()
 
 
-# define spiky loss as a variation of 20% or more
-SPIKY_LOSS_PERC = 0.2
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
@@ -141,11 +141,22 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=True,
         )
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
             result=loss[0],
-            rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
             message="Spiky loss",
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=False,

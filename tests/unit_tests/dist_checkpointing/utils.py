@@ -111,6 +111,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.use_distributed_optimizer = True
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
+    args.check_for_large_grads = False
     args.ddp_average_in_collective = False
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp

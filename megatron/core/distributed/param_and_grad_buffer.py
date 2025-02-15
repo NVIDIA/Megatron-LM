@@ -4,6 +4,7 @@ import logging
 import math
 from contextlib import nullcontext
 from enum import Enum
+from functools import partial
 from typing import Dict, List, Optional
 
 import torch
@@ -149,21 +150,43 @@ class _ParamAndGradBucketGroup:
         self.params_with_grad = set()
         self.is_last_microbatch = True
 
-    def check_for_nan_in_grad(self):
+    def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
         Make sure norm of grads in bucket are not NaN prior to data-parallel
         all-reduce / reduce-scatter.
         """
         rerun_state_machine = get_rerun_state_machine()
         for i in range(len(self.buckets)):
-            rerun_state_machine.validate_result(
-                result=self.buckets[i].grad_data.norm(p=2),
-                rejection_func=torch.isnan,
-                message=f"found NaN in local grad norm for bucket #{i} "
-                f"in backward pass before data-parallel communication collective",
-                tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
-                fatal=True,
-            )
+            grad_norm = self.buckets[i].grad_data.norm(p=2)
+            # check for NaN, Inf and unexpectedly large grads
+            if check_for_nan_or_inf:
+                rerun_state_machine.validate_result(
+                    result=grad_norm,
+                    rejection_func=torch.isnan,
+                    message=f"found NaN in local grad norm for bucket #{i} "
+                    f"in backward pass before data-parallel communication collective",
+                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
+                    fatal=True,
+                )
+                rerun_state_machine.validate_result(
+                    result=grad_norm,
+                    rejection_func=torch.isinf,
+                    message=f"found Inf in local grad norm for bucket #{i} "
+                    f"in backward pass before data-parallel communication collective",
+                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
+                    fatal=True,
+                )
+            if check_for_large:
+                rerun_state_machine.validate_result(
+                    result=grad_norm,
+                    rejection_func=partial(
+                        rerun_state_machine.is_unexpectedly_large, threshold=10, context="grads"
+                    ),
+                    message=f"found unexpected large grads in bucket #{i} "
+                    f"in backward pass before data-parallel communication collective",
+                    tolerance=0.001,  # 0.1% tolerance to account for non-deterministic FA backward
+                    fatal=False,
+                )
 
     def start_param_sync(self, force_sync: bool = False):
         """
@@ -256,8 +279,11 @@ class _ParamAndGradBucketGroup:
             self.grad_reduce_handle is None
         ), 'Should not have multiple communication calls outstanding at once'
 
-        if self.ddp_config.check_for_nan_in_grad:
-            self.check_for_nan_in_grad()
+        if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
+            self.check_grads(
+                check_for_nan_or_inf=self.ddp_config.check_for_nan_in_grad,
+                check_for_large=self.ddp_config.check_for_large_grads,
+            )
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
