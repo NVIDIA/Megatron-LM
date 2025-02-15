@@ -250,7 +250,6 @@ class TextGenerationController:
         Returns:
             torch.Tensor: A torch tensor of shape [bs, max_seq_len] (i.e)
             max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate,
-            with extra indices for each tensor padded with mask id.
         """
         max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate
 
@@ -321,6 +320,16 @@ class TextGenerationController:
             num_tokens_to_generate=sampling_params.num_tokens_to_generate,
         )
         batch_size, max_sequence_length = batch_prompt_tokens.shape
+
+        # Verify that output sequence length is within configured limit
+        # TODO(ksanthanam): Raise TokenOverflowError once !2518 is merged
+        inference_max_sequence_length = (
+            self.inference_wrapped_model.inference_wrapper_config.inference_max_seq_length
+        )
+        assert max_sequence_length <= inference_max_sequence_length, (
+            f"Maximum allowed sequence length was set to {inference_max_sequence_length} tokens "
+            f"but requested generation of {max_sequence_length} tokens"
+        )
 
         # Pre allocate log probs tensor
         output_log_probs = None
@@ -423,7 +432,7 @@ class TextGenerationController:
                     last_token_logits, sampling_params, vocab_size
                 )
 
-                # Substitute the sampled logits only for only the prompts that
+                # Substitute the sampled logits only for the prompts that
                 # have started generating tokens
                 batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
                     generation_started
