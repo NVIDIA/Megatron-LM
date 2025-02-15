@@ -1177,7 +1177,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_opt_param_scheduler = None
 
             # Determine if rerun state will be loaded
-            if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune):
+            if (
+                ckpt_tp_pp == run_tp_pp
+                and not release
+                and not args.finetune
+                and 'rerun_state_machine' in state_dict
+            ):
                 rerun_state_machine = get_rerun_state_machine()
                 gen_sd_rerun_state = rerun_state_machine.state_dict(
                     data_iterator=None, use_dist_ckpt=True

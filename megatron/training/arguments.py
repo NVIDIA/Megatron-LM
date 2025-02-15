@@ -18,6 +18,7 @@ from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
     get_gpt_data_dir as get_retro_data_dir,
 )
+from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_torch_min_version
@@ -762,6 +763,14 @@ def validate_args(args, defaults={}):
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True
 
+    if args.result_rejected_tracker_filename is not None:
+        # Append to passed-in args.iterations_to_slip.
+        iterations_to_skip_from_file = RerunStateMachine.get_skipped_iterations_from_tracker_file(
+            args.result_rejected_tracker_filename
+        )
+        args.iterations_to_skip.extend(iterations_to_skip_from_file)
+
+
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
         print('--ckpt-fully-parallel-save flag is deprecated and has no effect.'
@@ -1325,6 +1334,9 @@ def _add_training_args(parser):
     group.add_argument('--check-for-spiky-loss', action='store_true',
                        help='Check for spiky loss',
                        dest='check_for_spiky_loss')
+    group.add_argument('--check-for-large-grads', action='store_true',
+                       help='Check for unexpectedly large grads',
+                       dest='check_for_large_grads')
     group.add_argument('--distribute-saved-activations',
                        action='store_true',
                        help='If set, distribute recomputed activations '
@@ -1357,6 +1369,10 @@ def _add_training_args(parser):
                        help='Global step to start profiling.')
     group.add_argument('--profile-step-end', type=int, default=12,
                        help='Global step to stop profiling.')
+    group.add_argument('--iterations-to-skip', nargs='+', type=int, default=[],
+                       help='List of iterations to skip, empty by default.')
+    group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
+                       help='Optional name of file tracking `result_rejected` events.')
     group.add_argument('--use-pytorch-profiler', action='store_true',
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',
