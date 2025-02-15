@@ -180,12 +180,12 @@ srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $G
 if [ "$BACKUP_CODEBASE" == true ]; then
   if [ -z "$(ls -A "$BACKUP_CODEBASE_DIR")" ]; then
   	echo "[$(date)] Copying codebase in $MEGATRON_LM_DIR to $BACKUP_CODEBASE_DIR..."
-  	rsync -av --exclude-from=$MEGATRON_LM_DIR/.gitignore $MEGATRON_LM_DIR/ $BACKUP_CODEBASE_DIR/
+  	rsync -av --exclude-from=$MEGATRON_LM_DIR/.gitignore $MEGATRON_LM_DIR/ $BACKUP_CODEBASE_DIR/ &> /dev/null
   fi
   MEGATRON_LM_DIR=$BACKUP_CODEBASE_DIR
 fi
 
-echo "[$(date)] Using codebase in $BACKUP_CODEBASE_DIR"
+echo "[$(date)] Using codebase in $MEGATRON_LM_DIR"
 
 cd $MEGATRON_LM_DIR
 export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
