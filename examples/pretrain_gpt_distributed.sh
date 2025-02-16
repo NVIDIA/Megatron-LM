@@ -3,7 +3,7 @@
 # Runs the "345M" parameter model
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NCCL_SOCKET_IFNAME=ens3
+export NCCL_SOCKET_IFNAME=docker0
 export GLOO_SOCKER_IFNAME=docker0
 
 GPUS_PER_NODE=2 # testing 241205
