@@ -70,12 +70,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
-        assert self.goldfish_loss is not None
-
-        if self.goldfish_loss:
-            assert isinstance(self.goldfish_k, int), "goldfish_k (frequency) must be an integer."
-            assert isinstance(self.goldfish_h, int), "goldfish_h (context width) must be an integer."   
-
+        assert self.goldfish_loss is not None  
 
 class GPTDataset(MegatronDataset):
     """The base GPT dataset
@@ -245,7 +240,7 @@ class GPTDataset(MegatronDataset):
                 goldfish_token_id=self._goldfish_token_id,
                 k=self._goldfish_k,
                 goldfish_hash_table=self._goldfish_hash_table,
-                goldfish_context_width=self._goldfish_h ,
+                goldfish_context_width=self._goldfish_h,
             )
 
             loss_mask[goldfish_labels == self._goldfish_token_id] = 0.0
