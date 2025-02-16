@@ -35,6 +35,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     eod_mask_loss: bool = None
     """Option to enable the EOD mask loss"""
 
+    bod_hiding: bool = None
+    """Option to enbale the BOD mask attention"""
+
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
        generates masks by itself.
@@ -63,6 +66,22 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+        assert self.bod_hiding is not None
+
+        if not self.cross_document_attention:
+            assert self.reset_position_ids, (
+                'reset_position_ids must be True when cross_document_attention is False '
+                'to maintain proper document-level position encoding'
+            )
+            assert self.reset_attention_mask, (
+                'reset_attention_mask must be True when cross_document_attention is False '
+                'to prevent cross-document attention'
+            )
+
+        if self.bod_hiding:
+            assert self.reset_attention_mask, (
+                'reset_attention_mask must be True when bod_hiding is True'
+            )
 
 
 class GPTDataset(MegatronDataset):
@@ -95,15 +114,13 @@ class GPTDataset(MegatronDataset):
         super().__init__(
             indexed_dataset, dataset_path, indexed_indices, num_samples, index_split, config
         )
-        if not self.config.cross_document_attention:
-            self.config.reset_position_ids = True
-            self.config.reset_attention_mask = True
             
         self.masks_and_position_ids_are_cacheable = not any(
             [
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
+                self.config.bod_hiding,
             ]
         )
         self.masks_and_position_ids_are_cached = False
@@ -111,7 +128,7 @@ class GPTDataset(MegatronDataset):
         self.cached_loss_mask = None
         self.cached_position_ids = None
 
-        self._bos_token_id = self.config.tokenizer.bos
+        self._bod_token_id = self.config.tokenizer.bod
 
         try:
             self._pad_token_id = self.config.tokenizer.pad
@@ -196,12 +213,14 @@ class GPTDataset(MegatronDataset):
         ):
             attention_mask, loss_mask, position_ids = _get_ltor_masks_and_position_ids(
                 tokens,
-                self.config.tokenizer.bos,
+                self.config.tokenizer.bod,
                 self.config.tokenizer.eod,
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
                 self.config.create_attention_mask,
+                self.config.cross_document_attention,
+                self.config.bod_hiding,
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
@@ -220,8 +239,10 @@ class GPTDataset(MegatronDataset):
         tokens[tokens == self._pad_token_id] = 0
         labels[labels == self._pad_token_id] = 0
 
-        # Do not try to predict BoS tokens
-        loss_mask[labels == self._bos_token_id] = 0.0
+        # Control BOD token prediction masking
+        # While BOD tokens should conceptually never be predicted,
+        # we use bod_hiding flag to maintain original behavior for ablation studies
+        loss_mask[labels == self._bod_token_id] = 1.0 - self.config.bod_hiding
 
         # Batch padding sequence so we mask the loss
         if idx is None:
@@ -632,17 +653,21 @@ def _build_shuffle_index(
 
 def _get_ltor_masks_and_position_ids(
     data: torch.Tensor,
-    bos_token: int,
+    bod_token: int,
     eod_token: int,
     reset_position_ids: bool,
     reset_attention_mask: bool,
     eod_mask_loss: bool,
     create_attention_mask: bool,
+    cross_document_attention: bool,
+    bod_hiding: bool,
 ):
     """Build masks and position id for left to right model.
 
     Args:
         data (torch.Tensor): The data tenor that holds the tokens from the dataset
+
+        bod_token (int): ID of the token to that is considered the BOD
 
         eod_token (int): ID of the token to that is considered the EOD
 
@@ -654,6 +679,11 @@ def _get_ltor_masks_and_position_ids(
 
         create_attention_mask (bool): Switch to enable the attention masks generation. Can be
             disabled if attention kernel generates masks by itself.
+
+        cross_document_attention (bool): Switch to enable tokens to attend to all tokens,
+            regardless of document boundaries.
+
+        bod_hiding: (bool): Switch to hide bos tokens to attend to all tokens
 
     Returns:
         torch.Tensor: Attention mask needed to be used for Attention
@@ -683,29 +713,29 @@ def _get_ltor_masks_and_position_ids(
         position_ids = position_ids.clone()
 
     if reset_position_ids or reset_attention_mask:
-        # Find indices where BOS token is
-        bos_indices = (data == bos_token).nonzero(as_tuple=True)[0]
+        # Find indices where BOD token is
+        bod_indices = (data == bod_token).nonzero(as_tuple=True)[0]
 
-        # Loop through BOS indices:
-        if bos_indices.numel() > 0:  # Only process if BOS tokens exist (codewise not strictly required but improves clarity.)
+        # Loop through BOD indices:
+        if bod_indices.numel() > 0:
             prev_index = 0
-            for i in bos_indices: 
-                if attention_mask is not None:
-                    # BOS token masking
-                    attention_mask[0, :, i] = 0  # No tokens can attend to BOS
-                    attention_mask[0, i, :] = 0  # BOS can't attend to any tokens
+            for i in bod_indices: 
                     
-                    if reset_attention_mask:
-                        # Block cross document attention
-                        attention_mask[0, i:, :i+1] = 0
+                if reset_attention_mask and attention_mask is not None:
+                    # Block cross document attention
+                    # If bod_hiding is true:
+                    # No tokens can attend to BOD
+                    # BOD can't attend to any token (include itself)
+                    attention_mask[0, i:, :i+bod_hiding] = 0
 
-                        # If cross document attention is blocked, mask loss for last token of previous document
-                        if i > 0:  # Skip first BOS as there's no previous document
-                            loss_mask[i-1] = 0.0  # Mask loss for token right before BOS
+                    # When masking cross-document attention, optionally mask loss at document boundaries.
+                    # Each token before BOD (except the first BOD) is the last token of a document.
+                    if i > 0:  # Skip first BOD as there's no previous document
+                        loss_mask[i-1] = 1.0 - (bod_hiding or eod_mask_loss)
                     
                 # Reset positions.
                 if reset_position_ids:
-                    if i > 0:  # Skip first BOS as it's already at position 0
+                    if i > 0:  # Skip first BOD as it's already at position 0
                         position_ids[i:] = position_ids[i:] - (i - prev_index)
                     prev_index = i
 

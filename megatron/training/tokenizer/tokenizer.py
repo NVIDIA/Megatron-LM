@@ -176,7 +176,7 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
         return self._tokenizer.eos_token_id
 
     @property
-    def bos(self):
+    def bod(self):
         return self._tokenizer.bos_token_id
 
 
