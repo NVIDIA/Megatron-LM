@@ -5,7 +5,7 @@
 #SBATCH --job-name=llama-70b
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/%x-%j.err
-#SBATCH --nodes=64
+#SBATCH --nodes=32
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
@@ -16,18 +16,14 @@
 echo "START TIME: $(date)"
 
 ################ Configs ################
-# Use the FineWeb Edu dataset
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
+# NOTE(tj.solergibert) Check the `Data` section in the README. Use `,` to specify multiple datasets e.g. "/path/to/dataset/A,/path/to/dataset/B,/path/to/dataset/C"
+DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai-v2/swissai-fineweb-edu-filterrobots-merge"
 
-# 1024 * 8192 = 8_388_608 tokens per batch
-# 1024 / 1 = 1024 forward passes
-# With 1 replica over 8 nodes and 256 nodes we get 32 model replicas.
-# With 1024 forward passes over 32 replicas each replica does batch accumulation of 1024 / 32 = 32
-MBS=1
-GBS=1024
-SEQ_LEN=8192
-TRAINING_STEPS=5000
-CHECKPOINT_STEPS=1000
+MBS=1 # Micro batch size
+GBS=1024 # Global batch size
+SEQ_LEN=8192 # Sequence length 
+TRAINING_STEPS=500
+CHECKPOINT_STEPS=250
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -38,10 +34,11 @@ MOCK_DATA=false # Set to `true` to use mock data
 # Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
+BACKUP_CODEBASE=false # Set to `true` to copy the codebase to the experiment folder and re-use it across runs
 
 # Logging directories & artifacts
 PROJECT_NAME=Megatron-Clariden
-EXP_NAME=llama3-70b-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz
+EXP_NAME=llama3-8b-$SLURM_NNODES-nodes
 PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
 
 #########################################
@@ -54,33 +51,19 @@ COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
 LOGGING_DIR=$EXP_DIR/logging
 TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
-
-# Set up directories
-mkdir -p $CKPT_DIR
-mkdir -p $PROJECT_DIR
-mkdir -p $TRIGGER_DIR
-mkdir -p $DEBUG_DIR
-mkdir -p $LOGGING_DIR
-
-# Clean triggers
-rm -f $TRIGGER_DIR/save
-rm -f $TRIGGER_DIR/exit
+BACKUP_CODEBASE_DIR=$EXP_DIR/Megatron-LM
 
 # Set up ENV
-cd $MEGATRON_LM_DIR
-export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 MASTER_ADDR=$(hostname)
 MASTER_PORT=25678
 export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
-
-srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 ulimit -c 0
 
 #### Megatron Args #### Check megatron/training/arguments.py
-# Based on the Llama 3.1 70B model.
+# Based on the Llama 3.1 8B model.
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	--use-precision-aware-optimizer
@@ -145,16 +128,17 @@ INITIALIZATION_ARGS=(
 # NOTE(tj.solergibert) Check all the arguments in megatron/training/arguments.py#L1548 or https://github.com/NVIDIA/Megatron-LM/blob/0dd78ddcdb117ce4f2e9761449274d87af717674/megatron/training/arguments.py#L1548-L1606
 LEARNING_RATE_ARGS=(
 	--lr 0.00015
-	--min-lr 0.000015  # x10 reduction
+	--min-lr 0.000015
 	--lr-decay-style cosine
-	--lr-warmup-iters 2000
+	--lr-warmup-iters 200
 )
 
+# NOTE(tj.solergibert) Check the `Checkpointing` section in the README
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
 	--ckpt-format torch_dist
-	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
+	--load $CKPT_DIR
 	--async-save
 )
 
@@ -187,6 +171,30 @@ DATA_ARGS=(
 	--num-workers 1
 	--num-dataset-builder-threads 1
 )
+
+# Set up directories
+mkdir -p $CKPT_DIR
+mkdir -p $PROJECT_DIR
+mkdir -p $TRIGGER_DIR
+mkdir -p $DEBUG_DIR
+mkdir -p $LOGGING_DIR
+mkdir -p $BACKUP_CODEBASE_DIR
+
+srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
+
+# Backup codebase
+if [ "$BACKUP_CODEBASE" == true ]; then
+  if [ -z "$(ls -A "$BACKUP_CODEBASE_DIR")" ]; then
+  	echo "[$(date)] Copying codebase in $MEGATRON_LM_DIR to $BACKUP_CODEBASE_DIR..."
+  	rsync -av --exclude-from=$MEGATRON_LM_DIR/.gitignore $MEGATRON_LM_DIR/ $BACKUP_CODEBASE_DIR/ &> /dev/null
+  fi
+  MEGATRON_LM_DIR=$BACKUP_CODEBASE_DIR
+fi
+
+echo "[$(date)] Using codebase in $MEGATRON_LM_DIR"
+
+cd $MEGATRON_LM_DIR
+export PYTHONPATH=$MEGATRON_LM_DIR:$PYTHONPATH
 
 # Data Args
 if [ "$MOCK_DATA" = true ]; then
@@ -251,6 +259,10 @@ fi
 
 # Save sbatch script
 cp $0 $DEBUG_DIR
+
+# Clean triggers
+rm -f $TRIGGER_DIR/save
+rm -f $TRIGGER_DIR/exit
 
 # Checkpoint Compute Environment
 echo -e "$(date)" > $COMPUTE_ENVIRONMENT_DIR 
