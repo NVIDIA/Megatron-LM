@@ -4,6 +4,7 @@
 
 import dataclasses
 from datetime import datetime, timedelta
+from pathlib import Path
 import functools
 import gc
 import logging
@@ -1291,13 +1292,13 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
     saved_checkpoint = False
     if args.exit_signal_handler:
         signal_handler = get_signal_handler()
-        if any(signal_handler.signals_received()):
+        if signal_handler.signals_received():
             if args.save:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
                                          num_floating_point_operations_so_far,
                                          checkpointing_context, train_data_iterator=train_data_iterator)
-            print_datetime('exiting program after receiving SIGTERM.')
+            print_datetime('exiting program after receiving SIGUSR2.')
 
             return True
 
@@ -1349,6 +1350,21 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
+    
+    # Exit & Save triggers 
+    # NOTE(tj.solergibert) We `% args.log_interval` to not check too frequently os.path.isfile & the triggers are visible to all ranks
+    if iteration % args.log_interval == 0 and args.trigger_path is not None:
+        if os.path.isfile(args.save_trigger):
+            if args.save and not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                opt_param_scheduler,
+                                num_floating_point_operations_so_far,
+                                checkpointing_context, train_data_iterator=train_data_iterator)
+            torch.distributed.barrier()
+            if torch.distributed.get_rank() == 0:
+                os.remove(args.save_trigger)
+        if os.path.isfile(args.exit_trigger):
+            return True
 
     return False
 
@@ -1656,6 +1672,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             wandb_writer.finish()
         ft_integration.shutdown()
         sys.exit(exit_code)
+    
+    if iteration >= args.train_iters:
+        print(f"Training finished after {iteration} iterations; Canceling the pending scheduled jobs.")
+        Path(args.exit_trigger).touch()
 
     return iteration, num_floating_point_operations_so_far
 

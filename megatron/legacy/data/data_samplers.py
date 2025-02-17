@@ -9,7 +9,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from megatron.training import get_args
 from megatron.core import mpu
-
+from pathlib import Path
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
@@ -65,11 +65,18 @@ class MegatronPretrainingSampler:
         self.drop_last = drop_last
 
         # Sanity checks.
-        assert self.total_samples > 0, \
-            'no sample to consume: {}'.format(self.total_samples)
-        assert self.consumed_samples < self.total_samples, \
-            'no samples left to consume: {}, {}'.format(self.consumed_samples,
-                                                        self.total_samples)
+        try:
+            assert self.total_samples > 0, \
+                'no sample to consume: {}'.format(self.total_samples)
+            assert self.consumed_samples < self.total_samples, \
+                'no samples left to consume: {}, {}'.format(self.consumed_samples,
+                                                            self.total_samples)
+        except AssertionError:
+            print("An error has been detected; canceling the pending scheduled jobs.")
+            args = get_args()
+            Path(args.exit_trigger).touch()
+            raise
+        
         assert self.micro_batch_size > 0
         assert data_parallel_size > 0
         assert self.data_parallel_rank < data_parallel_size, \

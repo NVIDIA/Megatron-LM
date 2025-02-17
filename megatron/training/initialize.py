@@ -10,6 +10,7 @@ import warnings
 import numpy as np
 import torch
 from datetime import timedelta
+from pathlib import Path
 
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume
@@ -74,7 +75,13 @@ def initialize_megatron(
     if args.yaml_cfg is not None:
         args = validate_yaml(args, args_defaults)
     else:
-        validate_args(args, args_defaults)
+        try:
+            validate_args(args, args_defaults)
+        except AssertionError:
+            print("An error has been detected; Canceling the pending scheduled jobs.")
+            args = get_args()
+            Path(args.exit_trigger).touch()
+            raise
 
 
     # set global args, build tokenizer, and set adlr-autoresume,
