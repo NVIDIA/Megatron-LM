@@ -818,7 +818,24 @@ def validate_args(args, defaults={}):
     if args.goldfish_loss:
         assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
         assert args.goldfish_h > 0, f"goldfish_h (context width) must be a positive integer. ({args.goldfish_h})"
-    
+        
+    # Cross document attention
+    if not args.cross_document_attention:
+            assert args.reset_position_ids, (
+                'reset_position_ids must be True when cross_document_attention is False '
+                'to maintain proper document-level position encoding'
+            )
+            assert args.reset_attention_mask, (
+                'reset_attention_mask must be True when cross_document_attention is False '
+                'to prevent cross-document attention'
+            )
+
+    # BOD hiding
+    if args.bod_hiding:
+        assert args.reset_attention_mask, (
+            'reset_attention_mask must be True when bod_hiding is True'
+        )
+
     # Print arguments.
     _print_args("arguments", args)
 

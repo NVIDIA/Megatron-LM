@@ -37,7 +37,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Option to enable the EOD mask loss"""
 
     bod_hiding: bool = None
-    """Option to enbale the BOD mask attention"""
+    """Option to enbale the BOD mask attention and loss"""
 
     goldfish_loss: bool = None
     """Option to enable the goldfish loss"""
@@ -47,9 +47,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     goldfish_h: int = None
     """Context width for hashing, everytime the same sequence of h tokens appears, the (h+1)th token is ingored"""
-
-    bod_hiding: bool = None
-    """Option to enbale the BOD mask attention"""
 
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
@@ -79,41 +76,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
-        assert self.bod_hiding is not None
-
-        if not self.cross_document_attention:
-            assert self.reset_position_ids, (
-                'reset_position_ids must be True when cross_document_attention is False '
-                'to maintain proper document-level position encoding'
-            )
-            assert self.reset_attention_mask, (
-                'reset_attention_mask must be True when cross_document_attention is False '
-                'to prevent cross-document attention'
-            )
-
-        if self.bod_hiding:
-            assert self.reset_attention_mask, (
-                'reset_attention_mask must be True when bod_hiding is True'
-            )
         assert self.goldfish_loss is not None  
         assert self.bod_hiding is not None
 
-        if not self.cross_document_attention:
-            assert self.reset_position_ids, (
-                'reset_position_ids must be True when cross_document_attention is False '
-                'to maintain proper document-level position encoding'
-            )
-            assert self.reset_attention_mask, (
-                'reset_attention_mask must be True when cross_document_attention is False '
-                'to prevent cross-document attention'
-            )
-
-        if self.bod_hiding:
-            assert self.reset_attention_mask, (
-                'reset_attention_mask must be True when bod_hiding is True'
-            )
-
-
+        
 class GPTDataset(MegatronDataset):
     """The base GPT dataset
 
@@ -152,7 +118,6 @@ class GPTDataset(MegatronDataset):
                 self.config.eod_mask_loss,
                 self.config.bod_hiding,
                 self.config.goldfish_loss,
-                self.config.bod_hiding,
             ]
         )
         self.masks_and_position_ids_are_cached = False
