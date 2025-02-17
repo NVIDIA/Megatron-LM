@@ -2,6 +2,7 @@
 
 import logging
 import math
+import warnings
 from contextlib import nullcontext
 from enum import Enum
 from typing import Dict, List, Optional
@@ -239,9 +240,17 @@ class _ParamAndGradBucketGroup:
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
-            # Dispatch next bucket's asynchronous param AG.
+            # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
-                self.next_param_gather_bucket_group.start_param_sync()
+                if self.next_param_gather_bucket_group.param_gather_dispatched:
+                    warnings.warn(
+                        "The next bucket's parameter all-gather operation has already been "
+                        "dispatched. This may be caused by a mismatch between the order of "
+                        "parameter registration and forward pass execution, which will "
+                        "hurt the communication-computation overlap performance."
+                    )
+                else:
+                    self.next_param_gather_bucket_group.start_param_sync()
 
     def start_grad_sync(self):
         """
