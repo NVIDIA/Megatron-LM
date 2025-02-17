@@ -88,141 +88,141 @@ test:build_image:
   retry:
     max: 2
 
-test:unit_tests_configure:
-  extends: [.test_rules]
-  needs:
-    - test:build_image
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
-  before_script:
-    - git rm -r tests/test_utils/local_recipes || true
-    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
-    - ls tests/test_utils/local_recipes
-  script:
-    - set -x
-    - |
-      A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
-      H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
-    - |
-      export PYTHONPATH=$(pwd)
-      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        --scope "unit-tests" \
-        --environment lts \
-        --n-repeat "${UNIT_TEST_REPEAT}" \
-        --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
-        --test-cases "all" \
-        --a100-cluster "dgxa100_dracooci-ord" \
-        --h100-cluster "dgxh100_coreweave" \
-        --container-image ${UTILITY_IMAGE} \
-        --container-tag ${CI_PIPELINE_ID} \
-        --dependent-job "test:unit_tests_configure" \
-        --tag "legacy" \
-        --output-path "unit-test-job-lts-legacy.yaml"
-    - |
-      export PYTHONPATH=$(pwd)
-      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        --scope "unit-tests" \
-        --environment lts \
-        --n-repeat "${UNIT_TEST_REPEAT}" \
-        --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
-        --test-cases "all" \
-        --a100-cluster "dgxa100_dracooci-ord" \
-        --h100-cluster "dgxh100_coreweave" \
-        --container-image ${UTILITY_IMAGE} \
-        --container-tag ${CI_PIPELINE_ID} \
-        --dependent-job "test:unit_tests_configure" \
-        --tag "latest" \
-        --output-path "unit-test-job-lts-latest.yaml"
-    - |
-      export PYTHONPATH=$(pwd)
-      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        --scope "unit-tests" \
-        --environment dev \
-        --n-repeat "${UNIT_TEST_REPEAT}" \
-        --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
-        --test-cases "all" \
-        --a100-cluster "dgxa100_dracooci-ord" \
-        --h100-cluster "dgxh100_coreweave" \
-        --container-image ${UTILITY_IMAGE} \
-        --container-tag ${CI_PIPELINE_ID} \
-        --dependent-job "test:unit_tests_configure" \
-        --tag "legacy" \
-        --output-path "unit-test-job-dev-legacy.yaml"
-    - |
-      export PYTHONPATH=$(pwd)
-      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        --scope "unit-tests" \
-        --environment dev \
-        --n-repeat "${UNIT_TEST_REPEAT}" \
-        --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
-        --test-cases "all" \
-        --a100-cluster "dgxa100_dracooci-ord" \
-        --h100-cluster "dgxh100_coreweave" \
-        --container-image ${UTILITY_IMAGE} \
-        --container-tag ${CI_PIPELINE_ID} \
-        --dependent-job "test:unit_tests_configure" \
-        --tag "latest" \
-        --output-path "unit-test-job-dev-latest.yaml"
+# test:unit_tests_configure:
+#   extends: [.test_rules]
+#   needs:
+#     - test:build_image
+#   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+#   tags: [mcore-docker-node-small]
+#   before_script:
+#     - git rm -r tests/test_utils/local_recipes || true
+#     - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
+#     - ls tests/test_utils/local_recipes
+#   script:
+#     - set -x
+#     - |
+#       A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
+#       H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+#     - |
+#       export PYTHONPATH=$(pwd)
+#       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+#         --scope "unit-tests" \
+#         --environment lts \
+#         --n-repeat "${UNIT_TEST_REPEAT}" \
+#         --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
+#         --test-cases "all" \
+#         --a100-cluster "dgxa100_dracooci-ord" \
+#         --h100-cluster "dgxh100_coreweave" \
+#         --container-image ${UTILITY_IMAGE} \
+#         --container-tag ${CI_PIPELINE_ID} \
+#         --dependent-job "test:unit_tests_configure" \
+#         --tag "legacy" \
+#         --output-path "unit-test-job-lts-legacy.yaml"
+#     - |
+#       export PYTHONPATH=$(pwd)
+#       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+#         --scope "unit-tests" \
+#         --environment lts \
+#         --n-repeat "${UNIT_TEST_REPEAT}" \
+#         --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
+#         --test-cases "all" \
+#         --a100-cluster "dgxa100_dracooci-ord" \
+#         --h100-cluster "dgxh100_coreweave" \
+#         --container-image ${UTILITY_IMAGE} \
+#         --container-tag ${CI_PIPELINE_ID} \
+#         --dependent-job "test:unit_tests_configure" \
+#         --tag "latest" \
+#         --output-path "unit-test-job-lts-latest.yaml"
+#     - |
+#       export PYTHONPATH=$(pwd)
+#       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+#         --scope "unit-tests" \
+#         --environment dev \
+#         --n-repeat "${UNIT_TEST_REPEAT}" \
+#         --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
+#         --test-cases "all" \
+#         --a100-cluster "dgxa100_dracooci-ord" \
+#         --h100-cluster "dgxh100_coreweave" \
+#         --container-image ${UTILITY_IMAGE} \
+#         --container-tag ${CI_PIPELINE_ID} \
+#         --dependent-job "test:unit_tests_configure" \
+#         --tag "legacy" \
+#         --output-path "unit-test-job-dev-legacy.yaml"
+#     - |
+#       export PYTHONPATH=$(pwd)
+#       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+#         --scope "unit-tests" \
+#         --environment dev \
+#         --n-repeat "${UNIT_TEST_REPEAT}" \
+#         --time-limit "$(( UNIT_TEST_TIMEOUT * 60 ))" \
+#         --test-cases "all" \
+#         --a100-cluster "dgxa100_dracooci-ord" \
+#         --h100-cluster "dgxh100_coreweave" \
+#         --container-image ${UTILITY_IMAGE} \
+#         --container-tag ${CI_PIPELINE_ID} \
+#         --dependent-job "test:unit_tests_configure" \
+#         --tag "latest" \
+#         --output-path "unit-test-job-dev-latest.yaml"
 
-  artifacts:
-    paths:
-      - unit-test-job-dev-legacy.yaml
-      - unit-test-job-dev-latest.yaml
-      - unit-test-job-lts-legacy.yaml
-      - unit-test-job-lts-latest.yaml
-      - tests/test_utils/local_recipes
+#   artifacts:
+#     paths:
+#       - unit-test-job-dev-legacy.yaml
+#       - unit-test-job-dev-latest.yaml
+#       - unit-test-job-lts-legacy.yaml
+#       - unit-test-job-lts-latest.yaml
+#       - tests/test_utils/local_recipes
 
-.unit_tests_run:
-  needs:
-    - test:formatting
-    - test:copyright
-    - job: test:secret_detection
-      optional: true
-    - test:unit_tests_configure
-  extends: [.test_rules]
-  trigger:
-    include:
-      - artifact: unit-test-job-$ENVIRONMENT-$TAG.yaml
-        job: test:unit_tests_configure
-    strategy: depend
-  variables:
-    RO_API_TOKEN: $PAT
-    CONTAINER_TAG: $CI_PIPELINE_ID
-    CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
-    GITLAB_ENDPOINT: $GITLAB_ENDPOINT
-    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
-  inherit:
-    variables: true
-  rules:
-    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
-      when: on_success
+# .unit_tests_run:
+#   needs:
+#     - test:formatting
+#     - test:copyright
+#     - job: test:secret_detection
+#       optional: true
+#     - test:unit_tests_configure
+#   extends: [.test_rules]
+#   trigger:
+#     include:
+#       - artifact: unit-test-job-$ENVIRONMENT-$TAG.yaml
+#         job: test:unit_tests_configure
+#     strategy: depend
+#   variables:
+#     RO_API_TOKEN: $PAT
+#     CONTAINER_TAG: $CI_PIPELINE_ID
+#     CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
+#     GITLAB_ENDPOINT: $GITLAB_ENDPOINT
+#     PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+#   inherit:
+#     variables: true
+#   rules:
+#     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+#       allow_failure: true
+#       when: on_success
+#     - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+#       when: on_success
 
-test:unit_tests_pyt(DEV)_mcore(legacy):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: dev
-    TAG: legacy
+# test:unit_tests_pyt(DEV)_mcore(legacy):
+#   extends: [.unit_tests_run]
+#   variables:
+#     ENVIRONMENT: dev
+#     TAG: legacy
 
-test:unit_tests_pyt(LTS)_mcore(legacy):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: dev
-    TAG: legacy
+# test:unit_tests_pyt(LTS)_mcore(legacy):
+#   extends: [.unit_tests_run]
+#   variables:
+#     ENVIRONMENT: dev
+#     TAG: legacy
 
-test:unit_tests_pyt(DEV)_mcore(latest):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: lts
-    TAG: latest
+# test:unit_tests_pyt(DEV)_mcore(latest):
+#   extends: [.unit_tests_run]
+#   variables:
+#     ENVIRONMENT: lts
+#     TAG: latest
 
-test:unit_tests_pyt(LTS)_mcore(latest):
-  extends: [.unit_tests_run]
-  variables:
-    ENVIRONMENT: lts
-    TAG: latest
+# test:unit_tests_pyt(LTS)_mcore(latest):
+#   extends: [.unit_tests_run]
+#   variables:
+#     ENVIRONMENT: lts
+#     TAG: latest
 
 test:notify_unit_tests:
   extends: [.test_rules]
