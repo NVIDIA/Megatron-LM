@@ -463,37 +463,37 @@ test:gh_release:
         eval "$CMD"
       fi
 
-test:notify_release:
-  needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
-  extends: [.test_rules]
-  image: badouralix/curl-jq
-  tags: [mcore-docker-node-small]
-  variables:
-    PUBLISH_DRYRUN: 'yes'
-  script:
-    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
-    - >
-      MESSAGE='{
-          "blocks": [
-            {
-              "type": "section",
-              "text": {
-                "type": "mrkdwn",
-                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
-              }
-            }
-          ]
-        }'
-    - echo "$MESSAGE"
-    - >
-      CMD=$(echo curl \
-        -X POST \
-        -H "Content-type: application/json" \
-        --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
-      )
+# test:notify_release:
+#   needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
+#   extends: [.test_rules]
+#   image: badouralix/curl-jq
+#   tags: [mcore-docker-node-small]
+#   variables:
+#     PUBLISH_DRYRUN: 'yes'
+#   script:
+#     - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
+#     - >
+#       MESSAGE='{
+#           "blocks": [
+#             {
+#               "type": "section",
+#               "text": {
+#                 "type": "mrkdwn",
+#                     "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
+#               }
+#             }
+#           ]
+#         }'
+#     - echo "$MESSAGE"
+#     - >
+#       CMD=$(echo curl \
+#         -X POST \
+#         -H "Content-type: application/json" \
+#         --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+#       )
 
-      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
-        echo "$CMD"
-      else
-        eval "$CMD"
-      fi
+#       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
+#         echo "$CMD"
+#       else
+#         eval "$CMD"
+#       fi
