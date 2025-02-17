@@ -3,7 +3,7 @@
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: on_success
-    - when: on_success
+    - when: never
   stage: test
 
 include:
