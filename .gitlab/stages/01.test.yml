@@ -3,7 +3,7 @@
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: on_success
-    - when: never
+    - when: on_success
   stage: test
 
 include:
@@ -224,32 +224,32 @@ test:build_image:
 #     ENVIRONMENT: lts
 #     TAG: latest
 
-test:notify_unit_tests:
-  extends: [.test_rules]
-  image: badouralix/curl-jq
-  needs:
-    - test:unit_tests_pyt(DEV)_mcore(latest)
-    - test:unit_tests_pyt(LTS)_mcore(latest)
-  tags:
-    - mcore-docker-node-small
-  script:
-    - apk add bash
-    - apk add --update coreutils
-    - env
-    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
-    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
-    - export GITLAB_ENDPOINT
-    - export CONTEXT="unit-tests-extended"
-    - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "test:unit_tests_pyt"
-  artifacts:
-    when: always
-    paths:
-      - scripts
-  rules:
-    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
-      when: always
-    - when: never
+# test:notify_unit_tests:
+#   extends: [.test_rules]
+#   image: badouralix/curl-jq
+#   needs:
+#     - test:unit_tests_pyt(DEV)_mcore(latest)
+#     - test:unit_tests_pyt(LTS)_mcore(latest)
+#   tags:
+#     - mcore-docker-node-small
+#   script:
+#     - apk add bash
+#     - apk add --update coreutils
+#     - env
+#     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+#     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+#     - export GITLAB_ENDPOINT
+#     - export CONTEXT="unit-tests-extended"
+#     - export DATE=$(date +"%Y-%m-%d")
+#     - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "test:unit_tests_pyt"
+#   artifacts:
+#     when: always
+#     paths:
+#       - scripts
+#   rules:
+#     - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
+#       when: always
+#     - when: never
 
 test:docs_build:
   extends: [.test_rules]
@@ -463,37 +463,37 @@ test:gh_release:
         eval "$CMD"
       fi
 
-# test:notify_release:
-#   needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
-#   extends: [.test_rules]
-#   image: badouralix/curl-jq
-#   tags: [mcore-docker-node-small]
-#   variables:
-#     PUBLISH_DRYRUN: 'yes'
-#   script:
-#     - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
-#     - >
-#       MESSAGE='{
-#           "blocks": [
-#             {
-#               "type": "section",
-#               "text": {
-#                 "type": "mrkdwn",
-#                     "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
-#               }
-#             }
-#           ]
-#         }'
-#     - echo "$MESSAGE"
-#     - >
-#       CMD=$(echo curl \
-#         -X POST \
-#         -H "Content-type: application/json" \
-#         --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
-#       )
+test:notify_release:
+  needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
+  extends: [.test_rules]
+  image: badouralix/curl-jq
+  tags: [mcore-docker-node-small]
+  variables:
+    PUBLISH_DRYRUN: 'yes'
+  script:
+    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
+    - >
+      MESSAGE='{
+          "blocks": [
+            {
+              "type": "section",
+              "text": {
+                "type": "mrkdwn",
+                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
+              }
+            }
+          ]
+        }'
+    - echo "$MESSAGE"
+    - >
+      CMD=$(echo curl \
+        -X POST \
+        -H "Content-type: application/json" \
+        --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+      )
 
-#       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
-#         echo "$CMD"
-#       else
-#         eval "$CMD"
-#       fi
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
+        echo "$CMD"
+      else
+        eval "$CMD"
+      fi
