@@ -145,7 +145,7 @@ class TestTextGenerationController:
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
-    @pytest.mark.skip("upstream bug")
+
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_generate_all_output_tokens_static_batch(self, dtype):
         self.setup_model(dtype)
@@ -192,7 +192,6 @@ class TestTextGenerationController:
                 all_prompt_tokens[request_id] == request.prompt_tokens
             ), "Prompt tokens should not have changed during generation"
 
-    @pytest.mark.skip("upstream bug")
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_output_log_probs(self, dtype):
         self.setup_model(dtype)

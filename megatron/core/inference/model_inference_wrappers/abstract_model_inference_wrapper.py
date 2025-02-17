@@ -211,10 +211,12 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if current_micro_batch_size != micro_batch_size:
                 recv_buffer = self._allocate_recv_buffer(current_micro_batch_size, seq_len)
 
+            input_tensor = None
             if not parallel_state.is_pipeline_first_stage():
                 recv_from_prev_pipeline_rank_(recv_buffer)
+                input_tensor = recv_buffer.float()
 
-            self.model.set_input_tensor(recv_buffer)
+            self.model.set_input_tensor(input_tensor)
             output_tensor = self.model(
                 tokens2use, position_ids2use, attention_mask, inference_params=self.inference_params
             )
