@@ -5,7 +5,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=288
-#SBATCH --environment=/capstor/scratch/cscs/asolergi/Megatron-LM/container/datatrove.toml # WARN(tj.solergibert) Modify path to your own file
+#SBATCH --environment=/iopsstor/scratch/cscs/asolergi/Megatron-LM/container/datatrove.toml # WARN(tj.solergibert) Modify path to your own file
 #SBATCH --no-requeue
 
 input_folder=$1
@@ -16,17 +16,21 @@ CSV_RESULTS_FILE=$5
 paths_file=$6
 number_of_tasks=$7
 MEGATRON_LM_DIR=$8
+COLUMN_KEY=$9
+
+set -eo pipefail
 
 # Setup ENV
 export HF_HUB_ENABLE_HF_TRANSFER=0
 # Setup directories
 rm -rf $output_folder
+rm -rf $logging_dir
 mkdir -p $output_folder
 
 echo "START TIME: $(date) | Preprocessing $paths_file with $number_of_tasks tasks per node with the $tokenizer tokenizer. Storing tokenized dataset in $output_folder"
 start_s=`date`
 start=`date +%s`
-numactl --membind=0-3 python3 $MEGATRON_LM_DIR/scripts/tokenization/preprocess_megatron.py --tokenizer-name-or-path $tokenizer --output-folder $output_folder --logging-dir $logging_dir --n-tasks $number_of_tasks --dataset $input_folder --paths-file $paths_file
+numactl --membind=0-3 python3 $MEGATRON_LM_DIR/scripts/tokenization/preprocess_megatron.py --tokenizer-name-or-path $tokenizer --output-folder $output_folder --logging-dir $logging_dir --n-tasks $number_of_tasks --dataset $input_folder --paths-file $paths_file --column $COLUMN_KEY
 end=`date +%s`
 end_s=`date`
 echo "FINISH TIME: $(date) | Preprocessed $paths_file ! Stored in $output_folder"
@@ -43,4 +47,4 @@ echo "$SLURM_JOB_ID,$(hostname),$start_s,$end_s,$paths_file,$output_folder,$data
 
 sleep 10
 ls -lS $output_folder
-mv $paths_file $(dirname $(dirname $paths_file))/completed_dumps
+mv $paths_file $(dirname $(dirname $paths_file))/completed-dumps
