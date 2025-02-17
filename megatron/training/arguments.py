@@ -814,6 +814,11 @@ def validate_args(args, defaults={}):
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
 
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, f"goldfish_h (context width) must be a positive integer. ({args.goldfish_h})"
+    
     # Print arguments.
     _print_args("arguments", args)
 
@@ -2005,9 +2010,9 @@ def _add_data_args(parser):
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
     group.add_argument('--goldfish-loss', action='store_true',
-                       help='Enable goldfish loss during pretraining')
+                       help='Enable goldfish loss during pretraining.')
     group.add_argument('--goldfish-k', type=int, default=50,
-                       help='Dropout factor k for goldfish loss masking, where dropout probability is 1/k')
+                       help='Dropout factor k for goldfish loss masking, where dropout probability is 1/k.')
     group.add_argument('--goldfish-h', type=int, default=50,                        
                         help='Context width for hashing in goldfish loss masking. Controls how many preceding tokens determine masking.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
