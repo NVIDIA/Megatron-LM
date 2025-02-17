@@ -347,10 +347,19 @@ test:pypi_build_wheel:
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
     - auditwheel repair dist/*.whl
+    - rm -rf dist/*.whl
+
+    - pushd megatron/core
+    - EXPECTED_RELEASE_NUMBER=$(/opt/python/cp311-cp311/bin/python -c "import package_info; print(package_info.__version__)")
+    - popd
+    - echo "EXPECTED_RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
     paths:
       - megatron/core/package_info.py
       - wheelhouse/
+      - dist/
+    reports:
+      dotenv: build.env
 
 test:pypi_test_wheel:
   extends: [.test_rules]
@@ -374,6 +383,7 @@ test:pypi_test_wheel:
       dotenv: build.env
     paths:
       - wheelhouse/
+      - dist/
 
 test:pypi_push_wheel:
   extends: [.test_rules]
@@ -394,10 +404,13 @@ test:pypi_push_wheel:
         export TWINE_USERNAME=$TWINE_PROD_USERNAME
         export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
       fi
+
+    - ls -al dist/
+    - ls -al wheelhouse/
     - pip install twine
     - >
       for i in 1 2 3 4 5; do 
-        twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* && break || sleep $(( 60*2**i )); 
+        twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* dist/* && break || sleep $(( 60*2**i )); 
       done
   rules:
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
