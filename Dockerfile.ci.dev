@@ -11,7 +11,11 @@ RUN pip3 wheel -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
 
 FROM $FROM_IMAGE_NAME as build_mamba_ssm
 WORKDIR /opt
-RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.2.0
+RUN git clone https://github.com/state-spaces/mamba.git && \
+    cd mamba && \
+    git checkout v2.2.0 && \
+    sed -i "/triton/d" setup.py && \
+    MAMBA_FORCE_BUILD=TRUE pip3 wheel -v .
 
 FROM $FROM_IMAGE_NAME as main
 ENV DEBIAN_FRONTEND=noninteractive
@@ -25,7 +29,7 @@ RUN apt-get update && \
 
 COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
 COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
-COPY --from=build_mamba_ssm /opt/mamba_ssm-*.whl ./
+COPY --from=build_mamba_ssm /opt/mamba/mamba_ssm-*.whl ./
 
 RUN \
     --mount=type=bind,source=requirements,target=requirements \
