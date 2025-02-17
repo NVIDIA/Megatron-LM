@@ -134,6 +134,8 @@ class TransformerConfig(ModelParallelConfig):
 
     post_layer_norm: bool = False
 
+    layernorm_init: Optional[float] = None
+
     ####################
     # initialization
     ####################

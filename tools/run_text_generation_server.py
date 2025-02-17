@@ -85,9 +85,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                         multi_latent_attention=args.multi_latent_attention,
                         attn_layernorm=args.attn_layernorm,
                         mlp_layernorm=args.mlp_layernorm,
-                        use_torchqknorm=args.use_torchqknorm,
+                        qknorm_impl=args.qknorm_impl,
                         post_layer_norm=args.post_layer_norm,
-                        layernorm_init=args.layernorm_init,
                         moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm)
             else:
                 transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)

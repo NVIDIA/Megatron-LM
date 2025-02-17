@@ -799,9 +799,17 @@ def validate_args(args, defaults={}):
     # OP checks.
     if args.post_layer_norm:
         assert not args.add_bias_linear
+    if args.layernorm_init is not None:
+        assert args.post_layer_norm, "layernorm_init != None only implemented with --post-layer-norm"
+        assert args.layernorm_init == 0.0 or not args.apply_layernorm_1p, "can't have --layernorm-init and --apply-layernorm-1p at the same time"
+        assert args.normalization == "RMSNorm", "--layernorm-init only implemented with RMSNorm"
+        assert args.transformer_impl == "transformer_engine", "--layernorm-init only implemented with TE"
+        if args.qk_layernorm:
+            assert args.qknorm_impl != "te", "Use --qknorm-impl=apex or --qknorm-impl=torch when --layernorm-init is specified"
     if not args.attn_layernorm or not args.mlp_layernorm or not args.final_layernorm \
-            or args.post_layer_norm or args.layernorm_init != 1.0 or args.use_torchqknorm:
+            or args.post_layer_norm or args.layernorm_init is not None or args.qknorm_impl != "te":
         assert args.transformer_impl == "transformer_engine", "OP arguments are only checked with the TE transformer implementation"
+        assert not args.multi_latent_attention, "OP arguments are not implemented with --multi-latent-attention"
 
     # MoE loss and include embedding and loss layer check
     if args.num_experts is not None:
@@ -1112,7 +1120,7 @@ def _add_network_size_args(parser):
                              "instead of before. It is advise to also set --no-final-layernorm"))
     group.add_argument("--input-embeddings-multiplier", type=float, default=1.0,
                        help="Multiply input_embeddings by this value")
-    group.add_argument("--layernorm-init", default=1.0, type=float,
+    group.add_argument("--layernorm-init", default=None, type=float,
                        help="Initialization value for layernorms")
     return parser
 
@@ -2172,8 +2180,8 @@ def _add_vision_args(parser):
     # regularization arguments
     group.add_argument('--qk-layernorm', action='store_true',
                        help='Whether to layer normalize the q and k attention embeddings.')
-    group.add_argument('--use-torchqknorm', action='store_true',
-                       help='When set, megatron will use wrapped torch RMSnorm instead of TE norm')
+    group.add_argument('--qknorm-impl', default='te', choices={'te', 'torch', 'apex'},
+                        help='QK layernorm implementation')
 
     return parser
 

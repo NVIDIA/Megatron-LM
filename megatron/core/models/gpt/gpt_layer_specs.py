@@ -46,10 +46,10 @@ except ImportError:
 try:
     import apex  # pylint: disable=unused-import
 
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+    from megatron.core.fusions.fused_layer_norm import FusedApexNorm
 
     HAVE_APEX = True
-    LNImpl = FusedLayerNorm
+    LNImpl = FusedApexNorm
 except ImportError:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
@@ -65,9 +65,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     attn_layernorm: bool = True,
     mlp_layernorm: bool = True,
-    use_torchqknorm: bool = False,
+    qknorm_impl: str = 'te',
     post_layer_norm: bool = False,
-    layernorm_init: float = 1.0,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
@@ -138,8 +137,14 @@ def get_gpt_layer_with_transformer_engine_spec(
         # TENorm significantly harms convergence when used
         # for QKLayerNorm if TE Version < 1.9;
         # we instead use the Apex implementation.
-        qk_norm = TENorm if is_te_min_version("1.9.0") else FusedLayerNorm
-        qk_norm = WrappedTorchNorm if use_torchqknorm else qk_norm
+        if qknorm_impl == "te":
+            qk_norm = TENorm if is_te_min_version("1.9.0") else FusedApexNorm
+        elif qknorm_impl == "apex":
+            qk_norm = FusedApexNorm
+        elif qknorm_impl == "torch":
+            qk_norm = WrappedTorchNorm
+        else:
+            raise KeyError(f"Unknown qknorm_impl {qknorm_impl}")
 
         # Determine where to handle attention layernorm.
         if attn_layernorm and post_layer_norm: # Post-layer normalization case: input_layernorm module will be used.
@@ -174,6 +179,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                         k_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     ),
                 ),
+                input_layernorm=input_layernorm,
                 self_attn_bda=get_bias_dropout_add,
                 pre_mlp_layernorm=pre_mlp_layernorm,
                 mlp=mlp,
