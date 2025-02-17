@@ -20,7 +20,8 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 _PAD_TOKEN_ID = -1
-
+_GOLDFISH_TOKEN_ID = -2
+_HASH_TABLE_SIZE = 1_000_003
 
 @dataclass
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
@@ -34,6 +35,15 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     eod_mask_loss: bool = None
     """Option to enable the EOD mask loss"""
+
+    goldfish_loss: bool = None
+    """Option to enable the goldfish loss"""
+
+    goldfish_k: int = None
+    """Frequency of ignoring tokens for goldfish loss: 1 / k"""
+
+    goldfish_h: int = None
+    """Context width for hashing, everytime the same sequence of h tokens appears, the (h+1)th token is ingored"""
 
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
@@ -60,7 +70,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
-
+        assert self.goldfish_loss is not None  
 
 class GPTDataset(MegatronDataset):
     """The base GPT dataset
@@ -97,6 +107,7 @@ class GPTDataset(MegatronDataset):
                 self.config.reset_position_ids,
                 self.config.reset_attention_mask,
                 self.config.eod_mask_loss,
+                self.config.goldfish_loss,
             ]
         )
         self.masks_and_position_ids_are_cached = False
@@ -112,6 +123,12 @@ class GPTDataset(MegatronDataset):
         (self.document_index, self.sample_index, self.shuffle_index) = (
             self._build_document_sample_shuffle_indices()
         )
+
+        if self.config.goldfish_loss:
+            self._goldfish_k = self.config.goldfish_k
+            self._goldfish_h = self.config.goldfish_h
+            self._goldfish_token_id = _GOLDFISH_TOKEN_ID
+            self._goldfish_hash_table = None
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: IndexedDataset) -> int:
@@ -209,6 +226,24 @@ class GPTDataset(MegatronDataset):
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
         labels[labels == self._pad_token_id] = 0
+
+        # Goldfish loss masking
+        if self.config.goldfish_loss:
+
+            # Init the hash table once only
+            if self._goldfish_hash_table is None:
+                self._goldfish_hash_table = _create_hash_table(device=labels.device)
+
+            # Apply the goldfish mask
+            goldfish_labels = apply_goldfish(
+                labels,
+                goldfish_token_id=self._goldfish_token_id,
+                k=self._goldfish_k,
+                goldfish_hash_table=self._goldfish_hash_table,
+                goldfish_context_width=self._goldfish_h,
+            )
+
+            loss_mask[goldfish_labels == self._goldfish_token_id] = 0.0
 
         # Batch padding sequence so we mask the loss
         if idx is None:
@@ -692,6 +727,45 @@ def _get_ltor_masks_and_position_ids(
         attention_mask = attention_mask < 0.5
 
     return attention_mask, loss_mask, position_ids
+
+
+def _create_hash_table(device):
+    """Goldfish Loss Pre-computed Hash Table"""
+    rng = torch.Generator(device=device)
+    rng.manual_seed(2971215073)
+    hash_table = torch.rand(_HASH_TABLE_SIZE, device=device, generator=rng)
+
+    return hash_table
+
+
+def apply_goldfish(
+    labels: torch.Tensor,
+    goldfish_token_id: int,
+    k: int,
+    goldfish_hash_table: torch.Tensor,
+    goldfish_context_width: int=4,
+):
+    """
+    Apply a mask to a tensor to skip every k-th token, using only the 'hash-table' strategy from the original Goldfish Loss implementation. 
+    This is utilized within GPTDataset.__getitem__.
+
+    Original implementation: https://github.com/ahans30/goldfish-loss
+    
+
+    Args:
+        labels (torch.Tensor):          The label tensor to apply the goldfish mask to.
+        goldfish_token_id (int):        The token ID to use for the goldfish mask.
+        k (int):                        The frequency with which tokens are ignored.
+        goldfish_context_width (int):   Context width for hashing.
+    """
+    assert labels.ndim == 1, "Expected 1D tensor as used within GPTDataset.__getitem__"
+    masked_labels = labels.clone()
+
+    hashed_keys = goldfish_hash_table[labels.unfold(0, goldfish_context_width, 1).prod(dim=-1) % _HASH_TABLE_SIZE]
+    dropped_token_indices = (hashed_keys < 1 / k)
+    masked_labels[goldfish_context_width-1:][dropped_token_indices] = goldfish_token_id
+
+    return masked_labels
 
 
 class MockGPTLowLevelDataset:
