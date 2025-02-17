@@ -752,7 +752,7 @@ def _get_ltor_masks_and_position_ids(
                     # Functions the same as loss_mask[data == eod_token] = 1.0 - eod_mask_loss 
                     # Each token before BOD (except the first BOD) is the last token of a document.
                     if i > 0:  # Skip first BOD as there's no previous document
-                        loss_mask[i-1] = 1.0 - eod_mask_loss
+                        loss_mask[i-1] = float(cross_document_attention)
                     
                 # Reset positions.
                 if reset_position_ids:
