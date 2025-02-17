@@ -27,7 +27,7 @@ def combine(input_files, module_prefixes, output_files):
             zip(current_input_files, current_module_prefixes)
         ):
             # initialize the combined state dict using the first provided input file
-            current_state_dict = torch.load(input_file)
+            current_state_dict = torch.load(input_file, weights_only=False)
             if i == 0:
                 combined_state_dict = current_state_dict.copy()
                 combined_state_dict["model"] = dict()

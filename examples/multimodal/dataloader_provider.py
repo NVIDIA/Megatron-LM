@@ -130,7 +130,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
             )
             if os.path.exists(data_save_name):
                 try:
-                    dataset_state_dict = torch.load(data_save_name, map_location="cpu")
+                    dataset_state_dict = torch.load(data_save_name, map_location="cpu", weights_only=False)
                     train_dataloader.restore_state_rank(dataset_state_dict["dataloader_state_dict"])
                     print(f"restored dataset state from {data_save_name}")
                 except Exception as e:

@@ -152,11 +152,11 @@ def convert_to_hf(model_path, input_base_path, model_size, tokenizer_path):
     if num_shards == 1:
         # Not sharded
         # (The sharded implementation would also work, but this is simpler.)
-        loaded = torch.load(os.path.join(input_base_path, "consolidated.00.pth"), map_location="cpu")
+        loaded = torch.load(os.path.join(input_base_path, "consolidated.00.pth"), map_location="cpu", weights_only=False)
     else:
         # Sharded
         loaded = [
-            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location="cpu")
+            torch.load(os.path.join(input_base_path, f"consolidated.{i:02d}.pth"), map_location="cpu", weights_only=False)
             for i in range(num_shards)
         ]
     param_count = 0

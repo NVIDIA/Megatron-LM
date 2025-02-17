@@ -200,7 +200,7 @@ class BiEncoderModel(MegatronModule):
 
         # Load the checkpoint.
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except ModuleNotFoundError:
             from megatron.legacy.fp16_deprecated import loss_scaler
             # For backward compatibility.
@@ -209,7 +209,7 @@ class BiEncoderModel(MegatronModule):
                 'megatron.fp16_deprecated.loss_scaler']
             sys.modules['megatron.fp16.loss_scaler'] = sys.modules[
                 'megatron.fp16_deprecated.loss_scaler']
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
             sys.modules.pop('fp16.loss_scaler', None)
             sys.modules.pop('megatron.fp16.loss_scaler', None)
         except Exception:

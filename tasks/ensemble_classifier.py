@@ -13,7 +13,7 @@ def process_files(args):
     for path in args.paths:
         path = os.path.join(path, args.prediction_name)
         try:
-            data = torch.load(path)
+            data = torch.load(path, weights_only=False)
             for dataset in data:
                 name, d = dataset
                 predictions, labels, uid = d

@@ -131,7 +131,7 @@ class ICTBertModel(MegatronModule):
                 torch.distributed.get_rank(), checkpoint_name))
 
         try:
-            state_dict = torch.load(checkpoint_name, map_location='cpu')
+            state_dict = torch.load(checkpoint_name, map_location='cpu', weights_only=False)
         except Exception:
             raise ValueError("Could not load checkpoint")
 

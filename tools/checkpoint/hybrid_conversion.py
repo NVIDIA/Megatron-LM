@@ -242,7 +242,7 @@ def main(args):
 
     # load one of the model parallel ranks to get arguments
     sample_model_file = os.path.join(input_model_dir, input_sub_models[0], "model_optim_rng.pt")
-    sample_model = torch.load(sample_model_file)
+    sample_model = torch.load(sample_model_file, weights_only=False)
     print(f"Sample model {sample_model_file} is loaded.\n")
 
     # input tensor and pipeline parallel size
@@ -261,7 +261,7 @@ def main(args):
                 dir_name += "_{:03d}".format(pp)
             model_file = os.path.join(input_model_dir, dir_name, "model_optim_rng.pt")
 
-            tp_models.append(torch.load(model_file))
+            tp_models.append(torch.load(model_file), weights_only=False)
             print(f"Model {model_file} is loaded.")
 
         if input_tp_rank > 1:

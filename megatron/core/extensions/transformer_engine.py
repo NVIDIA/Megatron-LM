@@ -930,7 +930,7 @@ if is_te_min_version("1.9.0.dev0"):
                 return pickle.loads(state.detach().cpu().numpy().tobytes())
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
-                return torch.load(state, map_location="cuda")
+                return torch.load(state, map_location="cuda", weights_only=False)
             else:
                 raise RuntimeError("Unsupported checkpoint format.")
 
