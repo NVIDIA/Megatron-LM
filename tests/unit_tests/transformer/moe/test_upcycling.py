@@ -131,8 +131,6 @@ class TestGPTModel:
     @pytest.mark.parametrize(
         ('tp_pp_ep', 'enable_vp', 'enable_grouped_gemm'), [((1, 1, 2), (False), (False))]
     )
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_upcycling(self, tp_pp_ep, enable_vp, enable_grouped_gemm):
         tp = tp_pp_ep[0]
         pp = tp_pp_ep[1]

@@ -27,8 +27,6 @@ class TestAlltoAllDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -46,8 +44,6 @@ class TestAlltoAllDispatcher:
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_a2aseq_forward_backward(self, tp_size, ep_size):
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -66,8 +62,6 @@ class TestAlltoAllDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_capacity_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -89,8 +83,6 @@ class TestAlltoAllDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_capacity_padding_forward_backward(self, tp_size, ep_size, permute_fusion):
         container = MoEModelTestContainer(
             tp_size=tp_size,
