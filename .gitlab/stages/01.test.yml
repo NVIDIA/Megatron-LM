@@ -30,7 +30,7 @@ test:build_image:
         FILE: Dockerfile.ci.dev
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.07-py3
       - IMAGE: CI_NEMO_IMAGE
-        FILE: Dockerfile.ci.lts
+        FILE: Dockerfile.ci.dev
         BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
