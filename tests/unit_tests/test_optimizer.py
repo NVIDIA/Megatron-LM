@@ -1,9 +1,16 @@
+import os
+
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
 
-from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
 
 
 class Net(nn.Module):
@@ -111,3 +118,45 @@ def test_precision_aware_fused_adam():
             bytes_2 = p_2.data.view(torch.uint8)
             # Make sure bit-wise matched
             assert torch.all(bytes_1 == bytes_2)
+
+
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.parametrize("precision", ['bf16', 'fp32'])
+def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    # Setup: distributed, model, mock_args.
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    for param in model.parameters():
+        assert param.requires_grad
+
+    if precision == 'bf16':
+        optimizer_config = OptimizerConfig(
+            optimizer='adam', bf16=True, use_distributed_optimizer=use_distributed_optimizer
+        )
+    elif precision == 'fp32':
+        optimizer_config = OptimizerConfig(
+            optimizer='adam',
+            bf16=False,
+            fp16=False,
+            use_distributed_optimizer=use_distributed_optimizer,
+        )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    model_sharded_state_dict = model.sharded_state_dict()
+    sharded_state_dict = optim.sharded_state_dict(model_sharded_state_dict)
+
+    if 'optimizer' in sharded_state_dict and 'state' in sharded_state_dict['optimizer']:
+        assert (
+            'common_step' not in sharded_state_dict['optimizer']['state']
+            or sharded_state_dict['optimizer']['state']['common_step'] is not None
+        ), "Found 'optimizer.state.common_step=None' in sharded state dict."
