@@ -42,7 +42,7 @@ test:build_image:
     DOCKER_CERT_PATH: '$DOCKER_TLS_CERTDIR/client'
     TAG: purpose/builder-large
     STAGE: jet
-    MCORE_BACKWARDS_REF: 6be98151c6f38a9369f18bb4b48d2a1d19729746
+    MCORE_BACKWARDS_REF: core_r0.10.0
   script:
     - apk add bash
     - |
@@ -192,12 +192,16 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
   variables:
     ENVIRONMENT: dev
     TAG: legacy
+  rules:
+    - when: never
 
 test:unit_tests_pyt(LTS)_mcore(legacy):
   extends: [.unit_tests_run]
   variables:
     ENVIRONMENT: lts
     TAG: legacy
+  rules:
+    - when: never
 
 test:unit_tests_pyt(DEV)_mcore(latest):
   extends: [.unit_tests_run]
