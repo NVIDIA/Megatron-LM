@@ -92,6 +92,9 @@ def build_tokenizer(args, **kwargs):
             args.special_tokens,
             args.image_tag_type,
         )
+    elif args.tokenizer_type == "DeepSeekV2Tokenizer":
+        tokenizer = _DeepSeekV2Tokenizer(args.tokenizer_model, args.extra_vocab_size)
+        args.padded_vocab_size = tokenizer.vocab_size
     else:
         raise NotImplementedError('{} tokenizer is not ' 'implemented.'.format(args.tokenizer_type))
 
@@ -605,6 +608,77 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
     def additional_special_tokens_ids(self):
         return None
 
+class _DeepSeekV2Tokenizer(MegatronTokenizer):
+    def __init__(self, tokenizer_path, extra_vocab_size):
+        super().__init__(tokenizer_path)
+
+        try:
+            import transformers
+        except ImportError:
+            raise EnvironmentError(
+                f"The transformers library must be installed to use huggingface_tokenizer_provider"
+            )
+        
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_path,
+            padding_side="right",
+            trust_remote_code=True
+        )
+        self.extra_vocab_size = extra_vocab_size
+
+        if self.tokenizer.chat_template is None:
+            self.tokenizer.chat_template = "{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n' }}{% endif %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
+            try:
+                test_conversation = [
+                    {'role': 'user', 'content': 'hello world'}
+                ]
+                self.apply_chat_template(test_conversation)
+            except Exception:
+                # the default chat_template is invalid, assume user will not do SFT
+                self.tokenizer.chat_template = None
+
+    def __call__(self, text, return_tensors=None,
+                    padding=None, max_length=None, truncation=None, add_special_tokens=None):
+
+        return self.tokenizer(text, return_tensors=return_tensors, padding=padding,
+                max_length=max_length, truncation=truncation, add_special_tokens=add_special_tokens)
+
+    def apply_chat_template(self, conversations, tokenize:bool=True, **kwargs):
+        return self.tokenizer.apply_chat_template(conversations, tokenize=tokenize, **kwargs)
+
+    @property
+    def vocab_size(self):
+        return len(self.tokenizer) + self.extra_vocab_size - 2
+
+    @property
+    def vocab(self):
+        return self.tokenizer.encoder
+
+    @property
+    def inv_vocab(self):
+        return self.tokenizer.decoder
+
+    def tokenize(self, text):
+        return self.tokenizer.encode(text)
+
+    def detokenize(self, token_ids):
+        return self.tokenizer.decode(token_ids)
+
+    @property
+    def eod(self):
+        return self.tokenizer.eos_token_id
+
+    @property
+    def eos_token(self):
+        return self.tokenizer.eos_token
+
+    @property
+    def pad_token_id(self):
+        return self.tokenizer.pad_token_id
+
+    @property
+    def eos_token_id(self):
+        return self.tokenizer.eos_token_id
 
 def reload_mergeable_ranks(path: str, max_vocab: Optional[int] = None) -> Dict[bytes, int]:
     """
