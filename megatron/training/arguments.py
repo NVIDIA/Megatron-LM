@@ -22,7 +22,7 @@ from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_torch_min_version
 from megatron.training.activations import squared_relu
-from megatron.training.utils import update_use_dist_ckpt
+from megatron.training.utils import update_use_dist_ckpt, is_rank0
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):
@@ -816,9 +816,10 @@ def validate_args(args, defaults={}):
 
     # Exit & Save triggers
     args.exit_trigger = os.path.join(args.trigger_path, "exit")
-    print(f'Exit trigger setup! run `touch {args.exit_trigger}` to stop training')
     args.save_trigger = os.path.join(args.trigger_path, "save")
-    print(f'Save trigger setup! run `touch {args.save_trigger}` to save a checkpoint')
+    if is_rank0():
+        print(f'Exit trigger setup! run `touch {args.exit_trigger}` to stop training')
+        print(f'Save trigger setup! run `touch {args.save_trigger}` to save a checkpoint')
 
     # Goldfish loss
     if args.goldfish_loss:
