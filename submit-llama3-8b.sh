@@ -156,7 +156,7 @@ DISTRIBUTED_ARGS=(
 
 TOKENIZER_ARGS=(
 	--tokenizer-type HuggingFaceTokenizer
-	--tokenizer-model nvidia/OpenMath2-Llama3.1-8B
+	--tokenizer-model tj-solergibert/swai
 )
 
 DATA_ARGS=(
