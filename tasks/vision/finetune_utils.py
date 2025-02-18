@@ -241,13 +241,15 @@ def finetune(
         elif args.pretrained_checkpoint_type == 'external':
             unwrap_model = utils.unwrap_model(model)
             state_dict = torch.load(args.pretrained_checkpoint,
-                                    map_location="cpu")
+                                    map_location="cpu",
+                                    weights_only=False)
             unwrap_model[0].module.backbone.load_state_dict(state_dict,
                                                             strict=False)
         elif args.pretrained_checkpoint_type == 'constrastive':
             unwrap_model = utils.unwrap_model(model)
             state_dict = torch.load(args.pretrained_checkpoint,
-                                    map_location="cpu")
+                                    map_location="cpu",
+                                    weights_only=False)
             state_dict = state_dict["model"]
             state_dict = {k.replace("teacher.backbone.", ""): v
                           for k, v in state_dict.items()

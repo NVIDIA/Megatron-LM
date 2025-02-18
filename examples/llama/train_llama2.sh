@@ -39,8 +39,6 @@ TEE_OUTPUT="${TEE_OUTPUT:-1}"
 USE_FLASH_ATTN="${USE_FLASH_ATTN:-1}"
 NO_TRAINING="${NO_TRAINING:-0}" # NO_TRAINING=1: for computing metrics only
 ENABLE_PROFILING="${ENABLE_PROFILING:-0}" #enable pytorch profiling
-ENABLE_ROPE="${ENABLE_ROPE:-1}"
-DISABLE_ROPE_TE="${DISABLE_ROPE_TE:-0}"
 echo "NO_TRAINING=$NO_TRAINING"
 
 CWD=`pwd`
@@ -56,8 +54,8 @@ NODE_RANK="${NODE_RANK:-0}"
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
 if [ "${NNODES:-1}" -gt 1 ]; then
-    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens5}"
-    export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-ens50f0}"
+    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens51np0}"
+    export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-ens51np0}"
     echo "NCCL and GLOO socket interfaces set."
 else
     echo "Single node setup, skipping NCCL and GLOO socket interface settings."
@@ -76,6 +74,18 @@ CONTI_PARAMS="${CONTI_PARAMS:-0}"
 TE_FP8="${TE_FP8:-0}"  # 0: disable FP8, 1: enable FP8
 GEMM_TUNING="${GEMM_TUNING:-1}"
 MCORE="${MCORE:-1}"
+OPTIMIZER="${OPTIMIZER:-adam}"
+FSDP="${FSDP:-1}"
+RECOMPUTE="${RECOMPUTE:-0}"
+TOKENIZER_TYPE="${TOKENIZER_TYPE:-HuggingFaceTokenizer}"
+ROPE_FUSION="${ROPE_FUSION:-1}" # 1: use rope-fusion, 0: no-rope-fusion
+MOCK_DATA="${MOCK_DATA:-0}" # 1: use mock data, 0: use real data
+
+if [ "$FSDP" -eq 1 ] && [ "$TP" -gt 1 ]; then
+    echo "It is not recommended to use FSDP and TP together. Disabling TP."
+    TP=1
+    echo "Resetting TP=$TP"
+fi
 
 EXPERIMENT_DIR="experiment"
 mkdir -p $EXPERIMENT_DIR
@@ -85,13 +95,28 @@ CHECKPOINT_PATH=${CHECKPOINT_PATH:-"$EXPERIMENT_DIR/ckpts"}
 DATA_DIR="${DATA_DIR:-/root/.cache/data}"
 DATA_PATH=${DATA_PATH:-"$DATA_DIR/bookcorpus_text_sentence"}
 
-TOKENIZER_MODEL=$EXPERIMENT_DIR/tokenizer.model
-# Download the tokenizer model
-if ! [ -f "$TOKENIZER_MODEL" ]; then
-wget -O $TOKENIZER_MODEL https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.model
+TOKENIZER_MODEL="$DATA_DIR/tokenizer_llama2"
+if ! [ -d "$TOKENIZER_MODEL" ]; then
+    echo "Creating directory and downloading tokenizer files..."
+    mkdir -p "$TOKENIZER_MODEL"
+    wget -O "$TOKENIZER_MODEL/special_tokens_map.json" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/special_tokens_map.json
+    wget -O "$TOKENIZER_MODEL/tokenizer.json" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.json
+    wget -O "$TOKENIZER_MODEL/tokenizer.model" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.model
+    wget -O "$TOKENIZER_MODEL/tokenizer_config.json" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer_config.json
+    echo "Tokenizer files downloaded successfully to $TOKENIZER_MODEL."
+else
+    echo "Folder $TOKENIZER_MODEL already exists. Skipping download."
 fi
 
-MAX_POSITION_EMBEDDINGS=4096
+if [ "$TOKENIZER_TYPE" == "Llama2Tokenizer" ]; then
+    echo "Using Llama2Tokenizer."
+    TOKENIZER_MODEL="$TOKENIZER_MODEL/tokenizer.model"  
+    echo "$TOKENIZER_MODEL"
+else
+    echo "Using HuggingFaceTokenizer."
+fi
+
+MAX_POSITION_EMBEDDINGS=32000
 
 DEFAULT_LOG_DIR="${EXPERIMENT_DIR}/${NNODES}nodes_rank${NODE_RANK}_train_${MODEL_SIZE}B_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_cp${CP}_iter${TOTAL_ITERS}/TE_FP8_${TE_FP8}/${TIME_STAMP}"
 LOG_DIR="${LOG_DIR:-${DEFAULT_LOG_DIR}}"
@@ -117,12 +142,15 @@ if [[ $MODEL_SIZE -eq 7 ]]; then #llama2-7B
         NUM_LAYERS=32 # e.g. llama-13b: 40
         NUM_HEADS=32 # e.g. llama-13b: 40
         NUM_KV_HEADS=32 # No GQA for llama2 7b.
+        SEQ_LENGTH=$SEQ_LENGTH
 elif [[ $MODEL_SIZE -eq 70 ]]; then
         HIDDEN_SIZE=8192 # e.g. llama-13b: 5120
         FFN_HIDDEN_SIZE=28672 # e.g. llama-13b: 13824
         NUM_LAYERS=80 # e.g. llama-13b: 40
         NUM_HEADS=64 # e.g. llama-13b: 40
         NUM_KV_HEADS=8 # llama3 70B uses GQA
+        SEQ_LENGTH=$SEQ_LENGTH
+        MAX_POSITION_EMBEDDINGS=$MAX_POSITION_EMBEDDINGS
 else
         echo "Model size not supported."
         exit 1
@@ -158,8 +186,17 @@ GPT_ARGS="
     --no-async-tensor-model-parallel-allreduce \
     --bf16 \
     --no-masked-softmax-fusion \
-    --disable-bias-linear \
 "
+if [ "$RECOMPUTE" -eq 1 ]; then
+    GPT_ARGS="$GPT_ARGS --recompute-num-layers 80 \
+        --recompute-granularity full \
+        --recompute-method block \
+        "
+fi 
+
+if [ "$ROPE_FUSION" -eq 0 ]; then
+    GPT_ARGS="$GPT_ARGS --no-rope-fusion"
+fi
 
 TRAIN_ARGS="--lr 1e-4 \
         --min-lr 1e-5 \
@@ -167,11 +204,25 @@ TRAIN_ARGS="--lr 1e-4 \
         --lr-decay-style cosine \
         --weight-decay 1.0e-1 \
         --clip-grad 1.0 \
-        --optimizer adam \
+        --ckpt-format torch_dist \
 "
+#   --use-torch-fsdp2 requires --ckpt-format torch_dist
+
+
+if [ "$OPTIMIZER" == "adam" ]; then
+    TRAIN_ARGS="$TRAIN_ARGS --optimizer adam \
+        --adam-beta1 0.9 \
+        --adam-beta2 0.95 \
+        "
+else
+    TRAIN_ARGS="$TRAIN_ARGS --optimizer sgd \
+        "
+fi
+
 DATA_ARGS="
-    --tokenizer-type Llama2Tokenizer  \
+    --tokenizer-type ${TOKENIZER_TYPE} \
     --tokenizer-model ${TOKENIZER_MODEL} \
+    --split 99990,8,2 \
     --dataloader-type cyclic \
     --save-interval 200000 \
     --tensorboard-dir $LOG_DIR \
@@ -179,9 +230,14 @@ DATA_ARGS="
     --eval-interval 320000 \
     --eval-iters 10 \
     --num-workers $ds_works \
-    --mock-data
 "
-#    --data-path $DATA_PATH \
+
+if [ "$MOCK_DATA" -eq 1 ];then
+    DATA_ARGS="$DATA_ARGS --mock-data"
+else
+    DATA_ARGS="$DATA_ARGS --data-path $DATA_PATH"
+fi
+
 OUTPUT_ARGS="
     --log-interval 1 \
     --save-interval 5000 \
@@ -211,10 +267,22 @@ EXTRA_ARGS="
     --no-gradient-accumulation-fusion \
     --distributed-backend nccl \
     --distributed-timeout-minutes 120 \
-    --use-distributed-optimizer \
-    --overlap-param-gather \
     --overlap-grad-reduce \
 "
+
+
+if [ "$FSDP" -eq 1 ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --use-torch-fsdp2"
+    if [ "$SEQ_PARALLEL" -eq 1 ]; then
+        echo "Warning: Sequence Parallelism and FSDP2 have conflicting CUDA_MAX_CONNECTIONS requirements. It is recommended not to use them together."
+        echo "FSDP2 and sequence parallel are on. Disabling sequence parallel."
+        SEQ_PARALLEL=0
+    fi
+else
+    if [ "$OPTIMIZER" == "adam" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --use-distributed-optimizer --overlap-param-gather"
+    fi
+fi
 
 if [ "$ENABLE_PROFILING" -eq 1 ]; then
 EXTRA_ARGS="$EXTRA_ARGS --profile --use-pytorch-profiler --tensorboard-dir $LOG_DIR"
@@ -234,14 +302,6 @@ fi
 
 if [ "$MCORE" -eq 1 ]; then
 EXTRA_ARGS="$EXTRA_ARGS --use-mcore-models"
-fi
-
-if [ "$ENABLE_ROPE" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --position-embedding-type rope"
-fi
-
-if [ "$DISABLE_ROPE_TE" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --disable-te-fused-rope"
 fi
 
 if [ "$TE_FP8" -eq 1 ]; then

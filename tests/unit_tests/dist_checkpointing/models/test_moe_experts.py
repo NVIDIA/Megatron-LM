@@ -382,7 +382,7 @@ class TestExpertLayerReconfiguration:
             torch.save(model.state_dict(), ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
 
             # Load checkpoint
-            state_dict = torch.load(ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
+            state_dict = torch.load(ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt", weights_only=False)
             model.load_state_dict(state_dict)
 
             Utils.destroy_model_parallel()

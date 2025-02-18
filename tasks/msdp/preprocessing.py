@@ -375,7 +375,7 @@ def prompt_selection_for_knowledge_generation(
     print("> loading tokenizer and encoder")
     tokenizer = DPRQuestionEncoderTokenizer.from_pretrained(
                     'facebook/dpr-question_encoder-single-nq-base')
-    encoder = torch.load(model_path).cuda()
+    encoder = torch.load(model_path, weights_only=False).cuda()
 
     print("> getting dialog embeddings")
     with torch.no_grad():

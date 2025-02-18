@@ -1602,7 +1602,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         state_dict = None
         if torch.distributed.get_rank(self.data_parallel_group) == 0:
-            state_dict = torch.load(filename)
+            state_dict = torch.load(filename, weights_only=False)
 
         self.load_parameter_state_from_dp_zero(
             state_dict, update_legacy_format=update_legacy_format

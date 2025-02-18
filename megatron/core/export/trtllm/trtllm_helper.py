@@ -212,7 +212,7 @@ class TRTLLMHelper:
                 continue
 
             val.seek(0)
-            extra_states = torch.load(val)
+            extra_states = torch.load(val, weights_only=False)
 
             activation_scaling_factor_key = key.replace(mock_suffix, activation_scaling_suffix)
             weight_scaling_factor_key = key.replace(mock_suffix, weight_scaling_suffix)
