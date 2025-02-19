@@ -64,7 +64,6 @@ publish:release_branch:
         -d "title=chore: Fix version of \`$RELEASE_BRANCH\`" \
         -d "description=[🤖]: Hi @okoenig 👋,<br><br>we've adjusted the version number of \`$RELEASE_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
 
-
 publish:pypi_build_wheel:
   extends: [test:pypi_build_wheel, .publish_common_release]
   dependencies: []
@@ -80,12 +79,14 @@ publish:pypi_test_wheel:
 publish:pypi_push_wheel:
   extends: [test:pypi_push_wheel, .publish_common_release]
   needs: [publish:pypi_test_wheel]
+  dependencies: [publish:pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: 'no'
 
 publish:gh_release:
   extends: [test:gh_release, .publish_common_release]
-  dependencies: []
+  dependencies: [publish:pypi_test_wheel]
+  needs: [publish:pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: 'no'
 
@@ -104,6 +105,7 @@ publish:docs:
     - rm -rf documentation && git clone https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
     - cd documentation/megatron-lm
     - git fetch
+    - git fetch origin $CI_COMMIT_SHA
     - git checkout $CI_COMMIT_SHA
     - cd ..
     - git add megatron-lm
