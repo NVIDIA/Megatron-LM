@@ -2,11 +2,10 @@
 
 """ Storage writer for PyT Distributed format allowing asynchronous save. """
 import dataclasses
-import gc
 import logging
 import os
 import queue
-from contextlib import contextmanager
+from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
 from operator import itemgetter
@@ -23,6 +22,8 @@ from torch.distributed.checkpoint.planner import SavePlan, SavePlanner, WriteIte
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
+from .async_utils import _disable_gc
+
 logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
@@ -36,19 +37,6 @@ def _get_write_results_queue():
         ctx = mp.get_context('spawn')
         _results_queue = ctx.Manager().Queue()
     return _results_queue
-
-
-@contextmanager
-def _disable_gc():
-    """Temporarily disables GC."""
-    gc_enabled = gc.isenabled()
-    try:
-        if gc_enabled:
-            gc.disable()
-        yield
-    finally:
-        if gc_enabled:
-            gc.enable()
 
 
 class FileSystemWriterAsync(FileSystemWriter):
@@ -118,15 +106,20 @@ class FileSystemWriterAsync(FileSystemWriter):
             file_count += 1
             return file_name
 
-        def _copy_to_cpu(ten: torch.Tensor):
-            """Pinned D2H copy (or a simple clone() if already on the CPU).
+        def _clone_if_needed(ten: torch.Tensor):
+            """Clone if we detect incontiguous storage for CPU tensors
 
             Makes sure we perform a `clone` only if we detect incontiguous storage,
             so that we don't blow up host memory unnecessarily.
+
+            TODO: For persistent worker, this work should be changed to move the cpu tensor
+            to shared_memory.
             """
             ten = ten.detach()
             if ten.device.type != "cpu":
-                return ten.to("cpu", non_blocking=True)
+                # We do D2H later when the async_request is scheduled for both sync / async
+                # checkpointing
+                return ten
             is_view = ten.untyped_storage().size() != ten.numel() * ten.itemsize
             return ten.clone() if is_view else ten
 
@@ -142,7 +135,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     if item.type == WriteItemType.BYTE_IO
                 ]
                 tensor_data = [
-                    (item, _copy_to_cpu(planner.resolve_data(item)))
+                    (item, _clone_if_needed(planner.resolve_data(item)))
                     for item in bucket
                     if item.type != WriteItemType.BYTE_IO
                 ]
@@ -164,23 +157,49 @@ class FileSystemWriterAsync(FileSystemWriter):
         end = time()
         logger.debug(f"D2H and push, time: {end - start}")
 
-    def get_save_function_and_args(self) -> Tuple[Optional[Callable], Tuple]:
+    def get_save_function_and_args(self) -> Tuple[Optional[Callable], Optional[Callable], List]:
         """
         Get function that saves the data to storage along with its arguments.
         Allows the external caller to apply the save function synchronously or asynchronously.
 
         Returns: None (if there is nothing to write on this rank) or a tuple of:
-            - the function that saves the data
-            - arguments to that function
+            1) the function that saves the data.
+            2) the function that stages the GPU tensors to a destination for async checkpointing.
+               This function should be self-contained.
+            3) arguments to that function in 1).
         """
         if not self.write_buckets:
-            return None, ()
-        return (self.write_preloaded_data_multiproc, (self.write_buckets, self.results_queue))
+            return None, None, ()
+        return (
+            self.write_preloaded_data_multiproc,
+            partial(self.preload_tensors, self.write_buckets, True),
+            [torch.distributed.get_rank(), self.write_buckets, self.results_queue],
+        )
+
+    @staticmethod
+    def preload_tensors(write_buckets: List[WriteBucket], non_blocking=True) -> List[WriteBucket]:
+        """Preload tensors in state_dict to host memory through CPU memory
+        Args:
+            write_buckets(List): List of `WriteBucket`,
+                                 which includes what to be saved in a checkpoint
+            non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
+        """
+        result = []
+
+        for bucket in write_buckets:
+            file_name, storage_key, (bytes_data, tensor_data) = bucket
+            tensor_data = [
+                (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
+            ]
+            result.append((file_name, storage_key, (bytes_data, tensor_data)))
+        if non_blocking:
+            torch.cuda.synchronize()
+        return result
 
     @staticmethod
     @_disable_gc()
     def write_preloaded_data_multiproc(
-        write_buckets: List[WriteBucket], global_results_queue: mp.Queue
+        rank, write_buckets: List[WriteBucket], global_results_queue: mp.Queue
     ) -> None:
         """
         Performs saving data to storage with multiple processes.
@@ -203,6 +222,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 (or an Exception) from parallel write processes to the main training process
         Returns: None
         """
+        logger = logging.getLogger(__name__)
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
         ctx = mp.get_context('fork')
@@ -251,20 +271,16 @@ class FileSystemWriterAsync(FileSystemWriter):
                         logger.error(err_msg)
                         write_results_or_exc = local_results_or_exc
                         break
-                    else:
-                        assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
-                        write_results_or_exc[local_proc_idx] = local_results_or_exc
-                        p_list[local_proc_idx].join()
+                    assert isinstance(local_results_or_exc, list), type(local_results_or_exc)
+                    write_results_or_exc[local_proc_idx] = local_results_or_exc
+                    p_list[local_proc_idx].join()
 
             logger.debug('FileSystemWriterAsync: collected worker results successfully')
 
         global_results_queue.put(write_results_or_exc)
 
         w_end = time()
-        logger.debug(
-            f"{w_end}, rank: {torch.distributed.get_rank()},"
-            f" write(sync,parallel): {w_end - w_start}"
-        )
+        logger.debug(f"{w_end}, rank: {rank}," f" write(sync,parallel): {w_end - w_start}")
 
     @staticmethod
     @_disable_gc()
@@ -288,6 +304,8 @@ class FileSystemWriterAsync(FileSystemWriter):
 
         Returns: None, the write result are put into the `queue`
         """
+        logger = logging.getLogger(__name__)
+        logger.debug(f'{local_proc_idx} started')
         mem_before = _process_memory()
 
         local_results = []
@@ -305,6 +323,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     os.fsync(stream.fileno())
             local_output = (local_proc_idx, local_results)
         except Exception as e:
+            logger.debug(f'{local_proc_idx} failed')
             local_output = (local_proc_idx, e)
 
         results_queue.put(local_output)
