@@ -745,13 +745,13 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
     def _get_save_and_finalize_callbacks(self, writer, save_state_dict_ret) -> AsyncRequest:
         save_fn_args = writer.get_save_function_and_args()
-        save_fn, save_args = save_fn_args
+        save_fn, preload_fn, save_args = save_fn_args
 
         def finalize_fn():
             save_state_dict_async_finalize(*save_state_dict_ret)
             torch.distributed.barrier()
 
-        return AsyncRequest(save_fn, save_args, [finalize_fn])
+        return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
 
     def can_handle_sharded_objects(self):
         return True

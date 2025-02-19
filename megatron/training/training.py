@@ -454,7 +454,7 @@ def pretrain(
         wandb_writer.finish()
 
     ft_integration.on_checkpointing_start()
-    maybe_finalize_async_save(blocking=True)
+    maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     one_logger and one_logger.log_metrics({
@@ -1647,8 +1647,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         disable_forward_pre_hook(model)
 
     ft_integration.on_checkpointing_start()
-    maybe_finalize_async_save(blocking=True)
+    # This will finalize all unfinalized async request and terminate
+    # a persistent async worker if persistent ckpt worker is enabled
+    maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
+        ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:

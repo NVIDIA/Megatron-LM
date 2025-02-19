@@ -33,7 +33,8 @@ class TestAsyncSave:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_async_is_equivalent_to_sync(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize('persistent', [True, False])
+    def test_async_is_equivalent_to_sync(self, tmp_path_dist_ckpt, persistent):
         Utils.initialize_model_parallel(2, 4)
 
         sharded_state_dict = {
@@ -51,7 +52,7 @@ class TestAsyncSave:
             tmp_path_dist_ckpt / 'test_equivalence_sync'
         ) as sync_ckpt_dir:
             # async
-            async_calls = AsyncCallsQueue()
+            async_calls = AsyncCallsQueue(persistent)
             async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
             async_calls.schedule_async_request(async_request)
 
@@ -66,6 +67,7 @@ class TestAsyncSave:
             loaded_sync_state_dict = load(sharded_state_dict, sync_ckpt_dir)
             diffs = diff(loaded_async_state_dict, loaded_sync_state_dict)
             assert not any(map(bool, diffs)), diffs
+            async_calls.close()
 
         Utils.destroy_model_parallel()
 
