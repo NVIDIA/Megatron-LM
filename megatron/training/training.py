@@ -74,7 +74,7 @@ from .async_utils import maybe_finalize_async_save
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
-    calc_params_l2_norm_per_layer,
+    calc_params_l2_norm_per_param,
     check_adlr_autoresume_termination,
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -870,7 +870,7 @@ def train_step(forward_step_func, data_iterator,
 
 def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, params_norm_per_layer, num_zeros_in_grad):
+                 grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -1018,8 +1018,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                               args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if params_norm_per_layer is not None:
-            for k, v in params_norm_per_layer.items():
+        if params_norm_per_param is not None:
+            for k, v in params_norm_per_param.items():
                 writer.add_scalar(f'params-norm/{k}', v, iteration)
                 writer.add_scalar(f'params-norm vs samples/{k}', v,
                               args.consumed_train_samples)
@@ -1586,9 +1586,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        params_norm_per_layer = None
-        if args.log_params_norm_per_layer:
-            params_norm_per_layer = calc_params_l2_norm_per_layer(model)
+        params_norm_per_param = None
+        if args.log_params_norm_per_param:
+            params_norm_per_param = calc_params_l2_norm_per_param(model)
 
         learning_rate = None
         decoupled_learning_rate = None
@@ -1602,7 +1602,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, params_norm_per_layer, num_zeros_in_grad)
+                                          grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad)
 
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and \

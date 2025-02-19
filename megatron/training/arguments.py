@@ -1162,7 +1162,7 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
-    group.add_argument('--log-params-norm-per-layer', action='store_true',
+    group.add_argument('--log-params-norm-per-param', action='store_true',
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')

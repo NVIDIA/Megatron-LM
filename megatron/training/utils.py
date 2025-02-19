@@ -511,7 +511,7 @@ def get_batch_on_this_tp_rank(data_iterator):
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
 
-def calc_params_l2_norm_per_layer(model):
+def calc_params_l2_norm_per_param(model):
     """
     Calculate the L2 norm of each parameter individually, while properly synchronizing
     over the different parallel groups (data, model, and expert/pipeline parallel groups).
