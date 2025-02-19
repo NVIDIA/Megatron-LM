@@ -460,7 +460,7 @@ def pretrain(
     one_logger and one_logger.log_metrics({
         'app_finish_time': one_logger_utils.get_timestamp_in_ms()
     })
-    
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -602,11 +602,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 kwargs[f.name] = getattr(args, f.name)
         kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
         kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
-        # Use getattr to get the check_for_large_grads flag from args so that this doesn't
-        # fail if the flag isn't present in args. This circumvents a backward compatibility
-        # unittests failure (old unittest + new codebase). The underlying issue is that
-        # unittest mocks up its own args directly rather than use the codebase to populate it.
-        kwargs['check_for_large_grads'] = getattr(args, 'check_for_large_grads', False)
+        kwargs['check_for_large_grads'] = args.check_for_large_grads
         kwargs['bucket_size'] = args.ddp_bucket_size
         kwargs['average_in_collective'] = args.ddp_average_in_collective
         ddp_config = DistributedDataParallelConfig(**kwargs)

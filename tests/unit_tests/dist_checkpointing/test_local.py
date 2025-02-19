@@ -11,6 +11,8 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.training.arguments import parse_args
+
 nvidia_resiliency_ext = pytest.importorskip(
     "nvidia_resiliency_ext",
     reason="nvidia_resiliency_ext is required for local checkpointing tests",
@@ -77,7 +79,7 @@ class TestLocalCheckpointing:
         use_dist_ckpt = True
         iteration = None
         optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
         mock_args.use_torch_fsdp2 = use_torch_fsdp2
@@ -154,7 +156,9 @@ class TestLocalCheckpointing:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
+        mock_args = (
+            SimpleNamespace()
+        )  # FIXME: fails with additional arguments (e.g.,'weight_decay')
         if use_ramdisk:
             tmp_path_dist_ckpt = Path("/dev/shm")
         with TempNamedDir(
@@ -251,7 +255,7 @@ class TestLocalCheckpointing:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         if use_ramdisk:
             tmp_path_dist_ckpt = Path("/dev/shm")
 
