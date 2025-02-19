@@ -527,10 +527,6 @@ def calc_params_l2_norm_per_layer(model):
     
     for model_chunk in model:
         for name, param in model_chunk.named_parameters():
-            # Ensure each parameter is processed only once.
-            if not param_is_not_tensor_parallel_duplicate(param):
-                continue
-
             # Update data parallel group if not already set.
             dp_group = get_data_parallel_group_if_dtensor(param, dp_group)
             tensor = to_local_if_dtensor(param)
@@ -552,6 +548,10 @@ def calc_params_l2_norm_per_layer(model):
             else:
                 if not param_is_not_shared(param):
                     continue
+                if not param_is_not_tensor_parallel_duplicate(param):
+                    # do not skip but insert dummy tensor for sync
+                    # otherwise we deadlock
+                    param = torch.zeros_like(param)
                 param = to_local_if_dtensor(param)
                 value = param.data.float() if args.bf16 else param.data
 
