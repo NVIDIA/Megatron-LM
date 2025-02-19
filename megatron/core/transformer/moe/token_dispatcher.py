@@ -392,7 +392,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     @contextmanager
     def per_batch_state_context(self, state: MoEAlltoAllPerBatchState):
         origin_state = MoEAlltoAllPerBatchState()
-        self.collect_per_batch_state(self, origin_state)
+        self.collect_per_batch_state(origin_state)
         try:
             self.apply_per_batch_state(state)
             yield
@@ -472,7 +472,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 num_local_tokens_per_expert.reshape(self.ep_size, self.num_local_experts)
                 .sum(axis=1)
                 .to(torch.device("cpu"), non_blocking=True)
-                .numpy()
+                #.numpy()
             )
             # Gather the global distribution of tokens across ranks.
             # num_global_tokens_per_expert represents the number of tokens sent to each
@@ -497,7 +497,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits = (
                 num_global_tokens_per_rank[self.tp_rank]
                 .to(torch.device("cpu"), non_blocking=True)
-                .numpy()
+                #.numpy()
             )
             # [tp_size, ep_size] -> [tp_size]
             # self.output_splits_tp represents the number of tokens received by the current
@@ -505,7 +505,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.output_splits_tp = (
                 num_global_tokens_per_rank.sum(axis=1)
                 .to(torch.device("cpu"), non_blocking=True)
-                .numpy()
+                #.numpy()
             )
             # [tp_size, ep_size, num_local_experts] -> [num_local_experts]
             num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1)).to(
@@ -546,6 +546,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     def sync_meta_dtoh(self, point):
         if self.cuda_sync_point == point:
             self.preprocess_event.synchronize()
+            if self.input_splits is not None:
+                self.input_splits = self.input_splits.numpy()
+            if self.output_splits is not None:
+                self.output_splits = self.output_splits.numpy()
+            if  self.output_splits_tp is not None:
+                self.output_splits_tp = self.output_splits_tp.numpy()
+                
 
 
     def dispatch_preprocess(self, hidden_states: torch.Tensor, routing_map: torch.Tensor):
@@ -610,7 +617,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     self.sort_input_by_local_experts,
                     fused=self.config.moe_permute_fusion,
                 )
-        self.sync_meta_dtoh(self, "before_finish")
+        self.sync_meta_dtoh("before_finish")
         return global_input_tokens
 
 

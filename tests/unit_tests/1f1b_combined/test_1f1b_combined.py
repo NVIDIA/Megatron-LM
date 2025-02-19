@@ -184,7 +184,6 @@ def build_data(args):
 
 def build_transformer_layer(args):
     config = core_transformer_config_from_args(args)
-    config.moe_permute_fusion = True
     model_spec = get_gpt_layer_with_transformer_engine_spec(
         args.num_experts,
         args.moe_grouped_gemm,
