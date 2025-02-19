@@ -97,10 +97,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy: bool = False):
                             if getattr(param, 'main_param_sharded', False):
                                 if param.main_param is not None:
                                     sharded_params_data.append(param.main_param)
-                                else:
-                                    # Fallback to data if `.main_param`
-                                    # is available but is None
-                                    params_data.append(param.data)
                             else:
                                 params_data.append(param.main_param)
                         else:
@@ -515,56 +511,65 @@ def get_batch_on_this_tp_rank(data_iterator):
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
 
+def calc_params_l2_norm_per_layer(model):
+    """
+    Calculate the L2 norm of each parameter individually, while properly synchronizing
+    over the different parallel groups (data, model, and expert/pipeline parallel groups).
 
-def calc_params_l2_norm_per_layer(model, force_create_fp32_copy: bool = False):
+    Note: not memory efficient as the function operates in fp32.
+    """
     args = get_args()
+    # Ensure uniform processing.
     if not isinstance(model, list):
         model = [model]
     norm_dict = {}
-    data_parallel_group = None
-
-    # Iterate over each model chunk and compute per-parameter norm
+    dp_group = None  # Data parallel group reference.
+    
     for model_chunk in model:
-        # Use named_parameters to get parameter names
         for name, param in model_chunk.named_parameters():
-            # Skip tensor parallel duplicates
+            # Ensure each parameter is processed only once.
             if not param_is_not_tensor_parallel_duplicate(param):
                 continue
-            # Update data parallel group if needed
-            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
+
+            # Update data parallel group if not already set.
+            dp_group = get_data_parallel_group_if_dtensor(param, dp_group)
+            tensor = to_local_if_dtensor(param)
             
-            # Case 1: MoE parameters (do not allreduce)
+            # Case 1: MoE parameters not participating in typical all-reduce.
             if not getattr(param, 'allreduce', True):
-                # For MoE, ensure parameter is not shared
-                assert param_is_not_shared(param)
-                tensor = to_local_if_dtensor(param)
+                # For MoE parameters, always use the parameter's raw data (converted to fp32 if bf16).
                 value = tensor.data.float() if args.bf16 else tensor.data
-                local_norm_sq = value.norm().pow(2)
+                local_norm_sq = torch.norm(value, p=2) ** 2
                 moe_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
-                torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM, group=moe_group)
+                # Synchronize across the expert, model, and pipeline parallel group.
+                torch.distributed.all_reduce(
+                    local_norm_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=moe_group
+                )
                 final_norm = local_norm_sq.sqrt().item()
                 norm_dict[name] = final_norm
-            # Case 2: Dense (or sharded) parameters
-            elif param_is_not_shared(param):
-                tensor = to_local_if_dtensor(param)
-                if args.bf16:
-                    if not force_create_fp32_copy and hasattr(tensor, 'main_param'):
-                        if getattr(tensor, 'main_param_sharded', False):
-                            if tensor.main_param is not None:
-                                value = tensor.main_param
-                            else:
-                                value = tensor.data
-                        else:
-                            value = tensor.main_param
-                    else:
-                        value = tensor.data.float()
-                else:
-                    value = tensor.data
-                local_norm_sq = value.norm().pow(2)
-                if data_parallel_group is not None:
-                    torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group)
-                torch.distributed.all_reduce(local_norm_sq, op=torch.distributed.ReduceOp.SUM, group=mpu.get_model_parallel_group())
+            else:
+                if not param_is_not_shared(param):
+                    continue
+                param = to_local_if_dtensor(param)
+                value = param.data.float() if args.bf16 else param.data
+
+                local_norm_sq = torch.norm(value, p=2) ** 2
+                # First, all-reduce across the data parallel group.
+                if dp_group is not None:
+                    torch.distributed.all_reduce(
+                        local_norm_sq,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=dp_group
+                    )
+                # Next, all-reduce across the model parallel (tensor and pipeline) group.
+                torch.distributed.all_reduce(
+                    local_norm_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=mpu.get_model_parallel_group()
+                )
                 final_norm = local_norm_sq.sqrt().item()
                 norm_dict[name] = final_norm
-            # If parameter is shared, skip it to avoid computing norm multiple times
+
     return norm_dict
