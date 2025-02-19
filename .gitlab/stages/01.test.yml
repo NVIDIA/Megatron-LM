@@ -69,6 +69,7 @@ test:build_image:
 
         DOCKER_BUILDKIT=1 docker build \
           --secret id=JET_INDEX_URLS \
+          --secret id=LOGGER_INDEX_URL \
           --target $STAGE \
           -f $FILE \
           -t ${IMAGE}:${CI_PIPELINE_ID} \
@@ -94,7 +95,13 @@ test:unit_tests_configure:
   needs:
     - test:build_image
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   before_script:
     - git rm -r tests/test_utils/local_recipes || true
     - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
@@ -217,8 +224,13 @@ test:notify_unit_tests:
   needs:
     - test:unit_tests_pyt(DEV)_mcore(latest)
     - test:unit_tests_pyt(LTS)_mcore(latest)
-  tags:
-    - mcore-docker-node-small
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   script:
     - apk add bash
     - apk add --update coreutils
@@ -241,7 +253,13 @@ test:notify_unit_tests:
 test:docs_build:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   needs: [test:build_image]
   script:
     - cd ..
@@ -253,7 +271,13 @@ test:docs_build:
 test:formatting:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   needs: [test:build_image]
   variables:
     GIT_STRATEGY: 'clone'
@@ -282,7 +306,13 @@ test:formatting:
 
 test:copyright:
   extends: [.test_rules]
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs: [test:build_image]
   script:
@@ -296,7 +326,13 @@ secret_detection:
 
 # Inherit and modify template
 test:secret_detection:
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   extends: ['.secret-analyzer']
   variables:
     GIT_DEPTH: 0
@@ -320,7 +356,13 @@ test:pypi_build_wheel:
   image:
     name: quay.io/pypa/manylinux_2_28_x86_64
     entrypoint: ['']
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   variables:
     PUBLISH_DRYRUN: 'yes'
     PY_ENV: pytorch_24.10
@@ -352,9 +394,21 @@ test:pypi_build_wheel:
 
 test:pypi_test_wheel:
   extends: [.test_rules]
-  image: python:3.11
+  image: 
+    name: python:3.11
+    entrypoint: ['']
   needs: [test:pypi_build_wheel]
-  tags: [mcore-docker-node-small]
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: '2376'
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/builder-small
+    - team/megatron
   variables:
     PUBLISH_DRYRUN: 'yes'
   script:
@@ -378,7 +432,13 @@ test:pypi_test_wheel:
 test:pypi_push_wheel:
   extends: [.test_rules]
   image: python:3.11
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   needs: [test:pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: 'yes'
@@ -414,7 +474,13 @@ test:pypi_push_wheel:
 test:gh_release:
   extends: [.test_rules]
   needs: [test:pypi_test_wheel]
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   image: badouralix/curl-jq
   variables:
     PUBLISH_DRYRUN: 'yes'
@@ -450,7 +516,7 @@ test:gh_release:
       ')
 
     - >
-      if [[ "$IS_DRY_RUN" == "true" ]]; then
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo -E "$CMD"
       else
         eval "$CMD"
@@ -461,7 +527,13 @@ test:notify_release:
   needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
   extends: [.test_rules]
   image: badouralix/curl-jq
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   variables:
     PUBLISH_DRYRUN: 'yes'
   script:

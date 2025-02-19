@@ -57,44 +57,51 @@ def launch_and_wait_for_completion(
 
     n_submission_attempts = 0
     while n_submission_attempts < 3:
-        pipeline = jetclient.JETClient(
-            customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
-        ).workloads.submit(
-            workloads=common.load_workloads(
-                test_case=test_case,
-                n_repeat=n_repeat,
-                time_limit=time_limit,
-                tag=tag,
-                scope=scope,
-                container_image=container_image,
-                container_tag=container_tag,
-                environment=environment,
-                record_checkpoints=record_checkpoints,
-            ),
-            config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
-            custom_config={
-                "launchers": {cluster: cluster_config},
-                "executors": {
-                    "jet-ci": {
-                        "environments": {
-                            cluster: {
-                                "variables": {
-                                    "RUN_NAME": run_name or "",
-                                    "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
-                                    "WANDB_EXPERIMENT": wandb_experiment or "",
+        try:
+            pipeline = jetclient.JETClient(
+                customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
+            ).workloads.submit(
+                workloads=common.load_workloads(
+                    test_case=test_case,
+                    n_repeat=n_repeat,
+                    time_limit=time_limit,
+                    tag=tag,
+                    scope=scope,
+                    container_image=container_image,
+                    container_tag=container_tag,
+                    environment=environment,
+                    record_checkpoints=record_checkpoints,
+                ),
+                config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
+                custom_config={
+                    "launchers": {cluster: cluster_config},
+                    "executors": {
+                        "jet-ci": {
+                            "environments": {
+                                cluster: {
+                                    "variables": {
+                                        "RUN_NAME": run_name or "",
+                                        "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
+                                        "WANDB_EXPERIMENT": wandb_experiment or "",
+                                    }
                                 }
                             }
                         }
-                    }
+                    },
+                    "outputs": {
+                        "enabled": True,
+                        "artifacts_storages": [common.resolve_artifact_config(cluster)],
+                    },
                 },
-                "outputs": {
-                    "enabled": True,
-                    "artifacts_storages": [common.resolve_artifact_config(cluster)],
-                },
-            },
-            wait_for_validation=True,
-            max_wait_time=(60 * 60),
-        )
+                wait_for_validation=True,
+                max_wait_time=(60 * 60),
+            )
+        except jetclient.clients.gitlab.GitlabAPIError as e:
+            logger.error(f"Faced {str(e)}. Waiting and retrying...")
+            n_submission_attempts += 1
+            time.sleep(5)
+            continue
+
         if pipeline.get_status() == PipelineStatus.SUBMISSION_FAILED:
             n_submission_attempts += 1
             logger.info("Submission failed, attempt again (%s/3)", str(n_submission_attempts))
