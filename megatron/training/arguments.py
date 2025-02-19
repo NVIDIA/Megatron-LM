@@ -1544,9 +1544,10 @@ def _add_training_args(parser):
     group.add_argument('--disable-tp-comm-split-rs', action='store_false',
                        help='Disables the Reduce-Scatter overlap with fprop GEMM.',
                        dest='tp_comm_split_rs')
-    group.add_argument('--pipeline-model-parallel-comm-backend', type=str, default='nccl',
+    group.add_argument('--pipeline-model-parallel-comm-backend', type=str, default=None,
                        choices=['nccl', 'ucc'],
-                       help='Select a communicator backend for pipeline parallel communication.')
+                       help='Select a communicator backend for pipeline parallel communication. '
+                       'If None, the default backend will be used.')
 
     return parser
 
