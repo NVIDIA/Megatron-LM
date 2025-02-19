@@ -10,6 +10,7 @@ loading the sharded tensors.
 
 import logging
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
@@ -55,7 +56,7 @@ CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
 
 def load(
     sharded_state_dict: ShardedStateDict,
-    checkpoint_dir: str,
+    checkpoint_dir: str | PathBase,
     sharded_strategy: Union[LoadShardedStrategy, Tuple[str, int], None] = None,
     common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
@@ -102,7 +103,8 @@ def load(
         checkpoint_dir, sharded_strategy, common_strategy
     )
 
-    checkpoint_dir = Path(checkpoint_dir)
+    if isinstance(checkpoint_dir, str):
+        checkpoint_dir = Path(checkpoint_dir)
     common_state_dict = common_strategy.load_common(checkpoint_dir)
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
@@ -156,7 +158,7 @@ def load(
         return common_state_dict
 
 
-def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
+def load_common_state_dict(checkpoint_dir: PathBase) -> StateDict:
     """Load common (non-sharded) objects state dict from the checkpoint.
 
     Args:
@@ -170,7 +172,7 @@ def load_common_state_dict(checkpoint_dir: Path) -> StateDict:
 
 
 def load_tensors_metadata(
-    checkpoint_dir: str, sharded_strategy: Union[LoadShardedStrategy, None] = None
+    checkpoint_dir: str | PathBase, sharded_strategy: Union[LoadShardedStrategy, None] = None
 ) -> CkptShardedMetadata:
     """Load tensors metadata from the checkpoint.
 
@@ -197,11 +199,13 @@ def load_tensors_metadata(
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
         checkpoint_dir, sharded_strategy
     )
-    return sharded_strategy.load_tensors_metadata(Path(checkpoint_dir))
+    if isinstance(checkpoint_dir, str):
+        checkpoint_dir = Path(checkpoint_dir)
+    return sharded_strategy.load_tensors_metadata(checkpoint_dir)
 
 
 def load_sharded_metadata(
-    checkpoint_dir: str,
+    checkpoint_dir: str | PathBase,
     sharded_strategy: Union[LoadShardedStrategy, None] = None,
     common_strategy: Union[LoadCommonStrategy, None] = None,
 ) -> CkptShardedMetadata:
@@ -235,15 +239,17 @@ def load_sharded_metadata(
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
         checkpoint_dir, sharded_strategy, common_strategy
     )
-    sharded_metadata = sharded_strategy.load_sharded_metadata(Path(checkpoint_dir))
+    if isinstance(checkpoint_dir, str):
+        checkpoint_dir = Path(checkpoint_dir)
+    sharded_metadata = sharded_strategy.load_sharded_metadata(checkpoint_dir)
     if not sharded_strategy.can_handle_sharded_objects:
         validate_sharded_objects_handling(sharded_strategy, common_strategy)
-        common_metadata = common_strategy.load_sharded_metadata(Path(checkpoint_dir))
+        common_metadata = common_strategy.load_sharded_metadata(checkpoint_dir)
         sharded_metadata = merge(sharded_metadata, common_metadata)
     return sharded_metadata
 
 
-def load_plain_tensors(checkpoint_dir: str) -> StateDict:
+def load_plain_tensors(checkpoint_dir: str | PathBase) -> StateDict:
     """Load checkpoint tensors without any sharding and plain structure.
 
     NOTE: common state dict is NOT included.
@@ -254,6 +260,8 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
     Returns:
         StateDict: checkpoint state dict containing only torch.Tensors.
     """
+    if isinstance(checkpoint_dir, str):
+        checkpoint_dir = Path(checkpoint_dir)
     sharded_state_dict = load_tensors_metadata(checkpoint_dir)
     # Don't validate integrity because shards will be overlapped
     # if world_size > 1 (all processes load whole tensors)
@@ -279,15 +287,17 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
 #     return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
 
 
-def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
+def remove_sharded_tensors(checkpoint_dir: str | PathBase, key_prefix: str):
     """determine the appropriate sharding strategy and delegate removal to the sharded strategy"""
+    if isinstance(checkpoint_dir, str):
+        checkpoint_dir = Path(checkpoint_dir)
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(checkpoint_dir)
     sharded_strategy.remove_sharded_tensors(checkpoint_dir, key_prefix)
 
 
 def save(
     sharded_state_dict: ShardedStateDict,
-    checkpoint_dir: str,
+    checkpoint_dir: str | PathBase,
     sharded_strategy: Union[SaveShardedStrategy, Tuple[str, int], None] = None,
     common_strategy: Union[SaveCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
@@ -342,7 +352,8 @@ def save(
             async request that should be scheduled by the caller of this function.
             None otherwise.
     """
-    checkpoint_dir = Path(checkpoint_dir)
+    if isinstance(checkpoint_dir, str):
+        checkpoint_dir = Path(checkpoint_dir)
 
     if torch.distributed.get_rank() == 0:
         if not checkpoint_dir.exists():
