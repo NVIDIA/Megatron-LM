@@ -1,5 +1,4 @@
 from functools import partial
-from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
 
@@ -13,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
 
@@ -111,7 +111,6 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.use_distributed_optimizer = True
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
-    args.check_for_large_grads = False
     args.ddp_average_in_collective = False
     args.tensor_model_parallel_size = tp
     args.pipeline_model_parallel_size = pp
@@ -157,7 +156,7 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
 def setup_model_and_optimizer(
     seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True
 ):
-    mock_args = SimpleNamespace()
+    mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         model = get_model(
@@ -228,7 +227,7 @@ def setup_moe_model_and_optimizer(
     use_grouped_mlp=False,
     use_glu=False,
 ):
-    mock_args = SimpleNamespace()
+    mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         model = get_model(
