@@ -597,7 +597,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if hasattr(args, f.name):
                 kwargs[f.name] = getattr(args, f.name)
         kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
-        kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+        kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad 
         kwargs['bucket_size'] = args.ddp_bucket_size
         kwargs['average_in_collective'] = args.ddp_average_in_collective
         ddp_config = DistributedDataParallelConfig(**kwargs)
