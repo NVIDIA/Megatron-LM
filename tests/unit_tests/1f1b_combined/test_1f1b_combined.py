@@ -188,6 +188,7 @@ def build_transformer_layer(args):
         args.num_experts,
         args.moe_grouped_gemm,
         multi_latent_attention=args.multi_latent_attention,
+        moe_use_legacy_grouped_gemm=True,
     )
     transformer_layer = build_module(model_spec, config=config, layer_number=1)
     return transformer_layer
