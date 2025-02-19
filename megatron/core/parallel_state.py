@@ -434,7 +434,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
-    pipeline_model_parallel_comm_backend: Optional[str] = "nccl",
+    pipeline_model_parallel_comm_backend: Optional[str] = None,
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
@@ -487,6 +487,10 @@ def initialize_model_parallel(
             pipeline_model_parallel_size is 8 and
             pipeline_model_parallel_split_rank is 3, then ranks 0-2
             will be the encoder and ranks 3-7 will be the decoder.
+
+        pipeline_model_parallel_comm_backend (str, optional):
+            The backend to use for pipeline parallel communication.
+            If None, the default backend will be used.
 
         use_sharp (bool, default = False):
             Set the use of SHARP for the collective communications of
@@ -1011,7 +1015,8 @@ def initialize_model_parallel(
             group_desc='PIPELINE_MODEL_PARALLEL_GROUP',
         )
         assert (
-            pipeline_model_parallel_comm_backend == 'nccl'
+            pipeline_model_parallel_comm_backend == None
+            or pipeline_model_parallel_comm_backend == 'nccl'
             or pipeline_model_parallel_comm_backend == 'ucc'
         ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
 
