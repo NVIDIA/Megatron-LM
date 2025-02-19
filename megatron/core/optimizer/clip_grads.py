@@ -110,18 +110,21 @@ def get_grad_norm_fp32(
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            if grads_for_norm:
-                grad_norm, _ = multi_tensor_applier(
+            if grads_for_norm:   #### DHIA: i think we are here
+                print("###### we will now apply TE's multi_tensor_applier to get grad-norms ######")
+                grad_norm, grad_norms_list = multi_tensor_applier(
                     l2_norm_impl,
                     dummy_overflow_buf,
                     [grads_for_norm],
-                    False,  # no per-parameter norm
+                    True,  # also return per-parameter norm
                 )
             else:
                 grad_norm = torch.tensor([0], dtype=torch.float, device='cuda')
+                grad_norms_list = [torch.tensor([0], dtype=torch.float, device='cuda')] ## dhia
             # Since we will be summing across data parallel groups,
             # we need the pow(norm-type).
             total_norm = grad_norm**norm_type
+            individ_norms = [grad_norms_list[i]**norm_type for i in range(len(grads_for_norm))] ## dhia
 
         else:
             individual_norms = [torch.norm(grad, norm_type) for grad in grads_for_norm]
@@ -132,15 +135,24 @@ def get_grad_norm_fp32(
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             ) 
-            # print("1", total_norm)
-            # for i in range(len(individual_norms)):
-            #     torch.distributed.all_reduce(
-            #         individual_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
-            #     )
+            ## Dhia: i added this
+            for i in range(len(individ_norms)):
+                print(f"{i}th all reduce...")
+                torch.distributed.all_reduce(
+                    individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
+                )
+                torch.distributed.all_reduce(
+                    individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+                )
+                individ_norms[i] = individ_norms[i].item() ** (1 / norm_type)
+            ## Dhia: end of addition
+
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         total_norm = total_norm.item() ** (1.0 / norm_type)
+        
+
         # print("2", total_norm)
         # for i in range(len(individual_norms)):
         #     torch.distributed.all_reduce(
@@ -148,7 +160,7 @@ def get_grad_norm_fp32(
         #     )
         #     individual_norms[i] = individual_norms[i].item() ** (1 / norm_type)
             
-    return individual_norms, total_norm
+    return individ_norms, total_norm
 
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
