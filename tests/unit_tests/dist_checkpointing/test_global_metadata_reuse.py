@@ -1,11 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
@@ -30,7 +30,7 @@ class TestGlobalMetadataReuse:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         with TempNamedDir(
             tmp_path_dist_ckpt / "test_global_metadata_reuse"
         ) as non_persistent_ckpt_dir, mock.patch(
@@ -100,7 +100,7 @@ class TestGlobalMetadataReuse:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         with TempNamedDir(
             tmp_path_dist_ckpt / "test_global_metadata_reuse"
         ) as non_persistent_ckpt_dir, mock.patch(

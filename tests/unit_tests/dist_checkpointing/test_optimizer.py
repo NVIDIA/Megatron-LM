@@ -2,7 +2,6 @@
 from copy import deepcopy
 from functools import partial
 from time import sleep
-from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -30,6 +29,7 @@ from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
@@ -312,7 +312,7 @@ class TestDistributedOptimizer:
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
         ) as ckpt_dir:
-            mock_args = SimpleNamespace()
+            mock_args = parse_args(ignore_unknown_args=True)
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
                 init_checkpointing_mock_args(mock_args, ckpt_dir, False)
