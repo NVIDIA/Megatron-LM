@@ -356,12 +356,16 @@ test:pypi_build_wheel:
   image:
     name: quay.io/pypa/manylinux_2_28_x86_64
     entrypoint: ['']
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: '2376'
   tags: 
     - arch/amd64
     - env/prod
     - origin/jet-fleet
     - owner/jet-core
-    - purpose/utility
+    - purpose/builder-small
     - team/megatron
   variables:
     PUBLISH_DRYRUN: 'yes'
