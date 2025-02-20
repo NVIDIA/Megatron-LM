@@ -71,7 +71,10 @@ ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 FROM main as jet
 ARG CACHEBUST=0
 RUN --mount=type=secret,id=JET_INDEX_URLS \
+    --mount=type=secret,id=LOGGER_INDEX_URL \
+    LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL) && \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install "jet-client~=2.0" jet-api --upgrade $JET_INDEX_URLS
+    pip install "jet-client~=2.0" jet-api --upgrade $JET_INDEX_URLS  && \
+    pip install "one-logger" --upgrade $LOGGER_INDEX_URL
 ENV PATH="$PATH:/opt/jet/bin"
 ###
