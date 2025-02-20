@@ -497,13 +497,14 @@ test:gh_release:
       fi
     - >
       PAYLOAD=$(jq -nc \
-                  --arg CI_COMMIT_BRANCH "$CI_COMMIT_BRANCH" \
+                  --arg TAG_NAME "v${RELEASE_NUMBER}" \
+                  --arg CI_COMMIT_SHA "$CI_COMMIT_SHA" \
                   --arg NAME "$NAME" \
                   --arg BODY "$CHANGELOG" \
                   --argjson PRERELEASE "$IS_PRERELEASE" \
                   '{
-                      "tag_name": $CI_COMMIT_BRANCH,
-                      "target_commitish": $CI_COMMIT_BRANCH,
+                      "tag_name": $TAG_NAME,
+                      "target_commitish": $CI_COMMIT_SHA,
                       "name": $NAME,
                       "body": $BODY,
                       "draft": false,
