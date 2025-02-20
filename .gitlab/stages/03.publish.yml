@@ -116,12 +116,11 @@ publish:docs:
     - cd ..
     - rm -rf documentation && git clone https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
     - cd documentation/megatron-lm
-    - git fetch
+      git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
     - git fetch origin $CI_COMMIT_SHA
     - git checkout $CI_COMMIT_SHA
     - cd ..
     - git add megatron-lm
     - >
       git commit -m 'feat: Bump mcore'
-
     - git push
