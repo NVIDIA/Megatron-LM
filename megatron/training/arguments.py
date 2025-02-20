@@ -21,7 +21,10 @@ from megatron.core.models.retro.utils import (
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import (
+    is_torch_min_version,
+    get_torch_version,
+)
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
 

@@ -113,6 +113,9 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 8192
+    elif config.language_model_type.startswith("huggingface"):
+        # Loaded from HuggingFace config file.
+        pass
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 
@@ -202,6 +205,9 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.apply_rope_fusion = False
         config.qk_layernorm = False
         config.layernorm_epsilon = 1e-6
+    elif config.vision_model_type.startswith("huggingface"):
+        # Loaded from HuggingFace config file.
+        pass
     else:
         raise ValueError(f"unknown vision model type {config.vision_model_type}")
 
@@ -241,6 +247,12 @@ def get_vision_projection_config(config, hidden_size):
         config.ffn_hidden_size = 2048
         config.activation_func = torch.nn.functional.gelu
         config.normalization = "LayerNorm"
+    elif config.language_model_type.startswith("huggingface"):
+        config.activation_func = torch.nn.functional.gelu
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(config.huggingface_model_name_or_path)
+        if "qwen" in hf_config.model_type:
+            config.ffn_hidden_size = 1536
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 

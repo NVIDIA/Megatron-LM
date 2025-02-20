@@ -51,6 +51,7 @@ class TestLLaVAModel:
         vision_layer_spec = deepcopy(language_layer_spec)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
+        language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,
@@ -485,6 +486,7 @@ class TestLLaVAModelSigLIP:
         vision_layer_spec = deepcopy(language_layer_spec)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
+        language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "siglip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,
@@ -585,6 +587,7 @@ class TestLLaVAModelTokenParallel:
         vision_layer_spec = deepcopy(language_layer_spec)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
+        language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         model = LLaVAModel(
             language_transformer_config=language_config,
@@ -799,6 +802,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
     vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
+    language_config.language_model_type = "dummy"
     vision_config.vision_model_type = "clip"
     non_parallel_model = LLaVAModel(
         language_transformer_config=language_config,
@@ -871,6 +875,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
     vision_projection_spec = deepcopy(vision_layer_spec.submodules.mlp.submodules)
 
+    language_config.language_model_type = "dummy"
     vision_config.vision_model_type = "clip"
     model = LLaVAModel(
         language_transformer_config=language_config,

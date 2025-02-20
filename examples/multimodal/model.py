@@ -86,10 +86,23 @@ def model_provider(
             is_vit=False, normalization=language_config.normalization
         )
 
+    vision_model_type = args.vision_model_type
     vision_config = deepcopy(base_config)
     vision_config = get_vision_model_config(
         vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
     )
+    if vision_model_type.startswith("huggingface"):
+        assert args.encoder_tensor_model_parallel_size < 2, "Huggingface vision encoders do not support --encoder-tensor-model-parallel-size > 1"
+        assert args.encoder_pipeline_model_parallel_size == 0, "Huggingface vision encoders do not support --encoder-pipeline-model-parallel-size > 0"
+        assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
+        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert args.vision_huggingface_model_name_or_path is not None, "Providing --vision-huggingface-model-name-or-path is necessary when using huggingface vision model"
+
+        vision_config.huggingface_model_name_or_path = args.vision_huggingface_model_name_or_path
+
+        from transformers import AutoConfig
+        huggingface_config = AutoConfig.from_pretrained(vision_config.huggingface_model_name_or_path)
+        vision_config.hidden_size = huggingface_config.hidden_size
 
     vision_model_type = args.vision_model_type
     if vision_model_type in ["clip", "siglip", "radio"]:
@@ -104,10 +117,24 @@ def model_provider(
     elif vision_model_type == "internvit":
         from nvlm.internvit import get_internvit_layer_spec
         vision_transformer_layer_spec = get_internvit_layer_spec(use_te=use_te)
+    elif vision_model_type.startswith("huggingface"):
+        vision_transformer_layer_spec = None
     else:
         raise RuntimeError("unsupported vision model type", vision_model_type)
 
     vision_projection_config = deepcopy(base_config)
+
+    if base_config.language_model_type.startswith("huggingface"):
+        assert args.tensor_model_parallel_size == 1, "Huggingface models do not support --tensor-model-parallel-size > 1"
+        assert args.pipeline_model_parallel_size < 2, "Huggingface models do not support --pipeline-model-parallel-size > 1"
+        assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
+        assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
+        assert args.language_huggingface_model_name_or_path is not None, "Providing --language-huggingface-model-name-or-path is necessary when using huggingface language model"
+
+        language_config.huggingface_model_name_or_path = args.language_huggingface_model_name_or_path
+        # Pass to vision projection config so can choose the correct ffn hidden size
+        vision_projection_config.huggingface_model_name_or_path = args.language_huggingface_model_name_or_path
+
     vision_projection_config = get_vision_projection_config(
         vision_projection_config, language_config.hidden_size
     )
