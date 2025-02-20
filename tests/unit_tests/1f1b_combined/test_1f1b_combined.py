@@ -7,6 +7,8 @@ import sys
 
 import torch
 from torch import Tensor
+from megatron.training import get_args
+from megatron.training.initialize import initialize_megatron
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer import transformer_layer
 from megatron.core.pipeline_parallel.combined_1f1b import ScheduleNode, StreamRelease, StreamAcquire
@@ -197,6 +199,9 @@ def build_transformer_layer(args):
 
 def test_1f1b_overlap(args):
     layer = build_transformer_layer(args)
+    for param in layer.parameters():
+        param.grad = None
+        param.main_grad = torch.zeros_like(param, dtype=torch.float32)
     datas = [ build_data(args) for _ in range(16)]
     events = [torch.cuda.Event() for _ in range(16)]
     com_stream = torch.cuda.Stream(device="cuda")
@@ -217,7 +222,6 @@ def schedule_1f1b_overlap(datas, events, comp_stream, com_stream, layer):
         output = g.forward(*output)
     pre_output = output
 
-
     # 1f1b
     for i in range(1, l):
         grad = torch.ones_like(pre_output)
@@ -229,24 +233,34 @@ def schedule_1f1b_overlap(datas, events, comp_stream, com_stream, layer):
         grad = (grad,)
         torch.cuda.nvtx.range_push(f"1f1b")
         # post combine_backward
+        print("post combine_backward")
         grad = pre_graphs[4].backward(*grad)
         # combine_backward
+        print("combine_backward")
         grad = pre_graphs[3].backward(*grad)
         # attn
+        print("attn")
         output = graphs[0].forward(*output)
         # dispatch
+        print("dispatch")
         output = graphs[1].forward(*output)
         # mlp backward
+        print("mlp backward")
         grad = pre_graphs[2].backward(*grad)
         # mlp forward
+        print("mlp forward")
         output = graphs[2].forward(*output)
         # dispatch backward
+        print("dispatch backward")
         grad = pre_graphs[1].backward(*grad)
         # combine forward
+        print("combine forward")
         output = graphs[3].forward(*output)
         # attn backward
+        print("attn backward")
         grad = pre_graphs[0].backward(*grad)
         # post combine
+        print("post combine")
         output = graphs[4].forward(*output)
 
 
@@ -272,7 +286,8 @@ def schedule_1f1b_overlap(datas, events, comp_stream, com_stream, layer):
     print("finish")
 
 def main():
-
+    initialize_megatron()
+    args = get_args()
     torch.cuda.cudart().cudaProfilerStart()
     test_1f1b_overlap(args)
     torch.cuda.cudart().cudaProfilerStop()

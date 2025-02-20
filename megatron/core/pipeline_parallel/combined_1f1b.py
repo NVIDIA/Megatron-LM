@@ -80,7 +80,7 @@ class ScheduleNode:
         if len(output_grad) == 1:
             output_grad = output_grad[0]
         with torch.cuda.stream(self.stream):
-            torch.autograd.backward(self.output, grad_tensors=output_grad)
+            torch.autograd.backward(self.output, grad_tensors=output_grad, retain_graph=True)
         torch.cuda.nvtx.range_pop()
         return self.get_grad()
 
