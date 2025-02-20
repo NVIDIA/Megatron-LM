@@ -512,7 +512,7 @@ test:gh_release:
                   }'
               )
       echo -E "$PAYLOAD" > payload.txt
-
+    - cat payload.txt
     - >
       CMD=$(echo -E 'curl -L \
         -X POST \
