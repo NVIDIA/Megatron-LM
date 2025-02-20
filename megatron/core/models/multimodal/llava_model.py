@@ -201,25 +201,31 @@ class LLaVAModel(MegatronModule):
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         if self.add_decoder:
-            self.language_model = GPTModel(
-                config=language_transformer_config,
-                transformer_layer_spec=language_transformer_layer_spec,
-                vocab_size=language_vocab_size,
-                max_sequence_length=language_max_sequence_length,
-                parallel_output=parallel_output,
-                share_embeddings_and_output_weights=share_embeddings_and_output_weights,
-                position_embedding_type=language_position_embedding_type,
-                rotary_percent=language_rotary_percent,
-                pre_process=self.pre_process,
-                post_process=self.post_process,
-                rotary_base=language_rotary_base,
-                rope_scaling=language_rope_scaling,
-                rope_scaling_factor=language_rope_scaling_factor,
-                scatter_embedding_sequence_parallel=False,
-            )
-            self.share_embeddings_and_output_weights = (
-                self.language_model.share_embeddings_and_output_weights
-            )
+            if hasattr(
+                language_transformer_config, "language_model_type"
+            ) and language_transformer_config.language_model_type.startswith("huggingface"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.language_model = build_hf_model(language_transformer_config)
+            else:
+                self.language_model = GPTModel(
+                    config=language_transformer_config,
+                    transformer_layer_spec=language_transformer_layer_spec,
+                    vocab_size=language_vocab_size,
+                    max_sequence_length=language_max_sequence_length,
+                    parallel_output=parallel_output,
+                    position_embedding_type=language_position_embedding_type,
+                    rotary_percent=language_rotary_percent,
+                    pre_process=self.pre_process,
+                    post_process=self.post_process,
+                    rotary_base=language_rotary_base,
+                    rope_scaling=language_rope_scaling,
+                    scatter_embedding_sequence_parallel=False,
+                )
+
+                self.share_embeddings_and_output_weights = (
+                    self.language_model.share_embeddings_and_output_weights
+                )
             self._language_max_sequence_length = language_max_sequence_length
             self._language_is_pipeline_parallel = (
                 language_transformer_config.pipeline_model_parallel_size > 1
@@ -276,6 +282,10 @@ class LLaVAModel(MegatronModule):
                     embedder_bias=embedder_bias,
                     use_mask_token=use_mask_token,
                 )
+            elif vision_transformer_config.vision_model_type.startswith("huggingface"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.vision_model = build_hf_model(vision_transformer_config)
             else:
                 raise ValueError(
                     "Vision model "

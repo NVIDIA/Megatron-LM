@@ -24,6 +24,7 @@ from packaging.version import Version as PkgVersion
 
 try:
     from torch.distributed._tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
 
     HAVE_DTENSOR = True
 except ImportError:
@@ -469,7 +470,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
         # FSDP2 sharding
         dp_replica_id = 0
-        tensor = tensor._local_tensor
+        tensor = get_full_tensor_if_necessary(tensor)
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
@@ -484,6 +485,22 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+
+
+def get_full_tensor_if_necessary(tensor):
+    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    need_full_tensor = False
+    for i in range(tensor.device_mesh.ndim):
+        if (
+            isinstance(tensor.placements[i], Shard)
+            and tensor.device_mesh.shape[i] > tensor.shape[tensor.placements[i].dim]
+        ):
+            need_full_tensor = True
+            break
+
+    tensor = tensor.full_tensor() if need_full_tensor else tensor._local_tensor
+
+    return tensor
 
 
 def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
