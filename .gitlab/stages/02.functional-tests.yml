@@ -25,7 +25,13 @@ functional:configure:
       optional: true
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   before_script:
     - git rm -r tests/test_utils/local_recipes || true
     - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes

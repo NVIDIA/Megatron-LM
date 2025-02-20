@@ -23,7 +23,13 @@ pre:mirror_to_github:
   rules:
     - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
     - when: never
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   stage: .pre
   image: python:3.10
   variables:
@@ -45,7 +51,13 @@ pre:create_ci_branches:
       - branch: ci-nightly
       - branch: ci-weekly
       - branch: ci-pre-release
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   stage: .pre
   image: python:3.10
   variables:
@@ -79,7 +91,13 @@ pre:maybe_cherry_pick_commit:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
     - when: never
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   stage: .pre
   image: nentangso/alpine-git-curl-jq
   variables:
@@ -163,7 +181,13 @@ pre:maybe_cherry_pick_commit:
 pre:check_milestone:
   extends: [.pre_rules]
   image: badouralix/curl-jq
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   script:
     - env
     - |
