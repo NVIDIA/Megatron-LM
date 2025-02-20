@@ -116,9 +116,10 @@ def get_grad_norm_fp32(
                     l2_norm_impl,
                     dummy_overflow_buf,
                     [grads_for_norm],
-                    True,  # also return per-parameter norm
+                    True,  # also return per-parameter grad-norms (TE implementation)
                 )
             else:
+                print("###### grads_for_norm is empty ######")
                 grad_norm = torch.tensor([0], dtype=torch.float, device='cuda')
                 grad_norms_list = [torch.tensor([0], dtype=torch.float, device='cuda')] ## dhia
             # Since we will be summing across data parallel groups,
@@ -127,30 +128,34 @@ def get_grad_norm_fp32(
             individ_norms = [grad_norms_list[i]**norm_type for i in range(len(grads_for_norm))] ## dhia
 
         else:
-            individual_norms = [torch.norm(grad, norm_type) for grad in grads_for_norm]
-            total_norm = sum(norm**norm_type for norm in individual_norms)
+            print("##### Dhia: norm type is not 2.0 ####")
+            individ_norms = [torch.norm(grad, norm_type) for grad in grads_for_norm]
+            total_norm = sum(norm**norm_type for norm in individ_norms)
             
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
             ) 
-            ## Dhia: i added this
-            for i in range(len(individ_norms)):
-                print(f"{i}th all reduce...")
-                torch.distributed.all_reduce(
-                    individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
-                )
-                torch.distributed.all_reduce(
-                    individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-                )
-                individ_norms[i] = individ_norms[i].item() ** (1 / norm_type)
-            ## Dhia: end of addition
 
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         total_norm = total_norm.item() ** (1.0 / norm_type)
+
+        ## Dhia: i added this
+        for i in range(len(individ_norms)):
+            if data_parallel_groups[i]:
+                print(f"{i}th data_parallel_groups all reduce...")
+                torch.distributed.all_reduce(
+                    individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
+                )
+            print(f"{i}th grad-stats-parallel-group all reduce now...")
+            torch.distributed.all_reduce(
+                individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+            )
+            individ_norms[i] = individ_norms[i].item() ** (1 / norm_type)
+        ## Dhia: end of addition
         
 
         # print("2", total_norm)
