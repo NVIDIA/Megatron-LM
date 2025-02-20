@@ -33,6 +33,8 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
+
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "release")
 
 mkdir -p $CHECKPOINT_SAVE_PATH
@@ -122,6 +124,11 @@ for i in $(seq 1 $N_REPEAT); do
 
     if [[ "$TEST_TYPE" == "release" ]]; then
         SKIP_PYTEST=0
+    fi
+
+    if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
+        echo "Skipping Pytest during checkpoint recording."
+        SKIP_PYTEST=1
     fi
 
     # Maybe run tests
