@@ -83,6 +83,10 @@ def launch_and_wait_for_completion(
                                         "RUN_NAME": run_name or "",
                                         "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
                                         "WANDB_EXPERIMENT": wandb_experiment or "",
+                                        "RECORD_CHECKPOINTS": str(
+                                            "Record checkpoints"
+                                            in os.getenv("CI_MERGE_REQUEST_LABELS", "")
+                                        ).lower(),
                                     }
                                 }
                             }
