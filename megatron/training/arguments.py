@@ -817,9 +817,14 @@ def validate_args(args, defaults={}):
     # Exit & Save triggers
     args.exit_trigger = os.path.join(args.trigger_path, "exit")
     args.save_trigger = os.path.join(args.trigger_path, "save")
-    if is_rank0():
+    if args.rank == 0:
         print(f'Exit trigger setup! run `touch {args.exit_trigger}` to stop training')
         print(f'Save trigger setup! run `touch {args.save_trigger}` to save a checkpoint')
+    
+    if args.profile and args.exit_signal_handler:
+        args.exit_signal_handler = False
+        if args.rank == 0:
+            print("WARNING: When using nsys profiling, the job will terminate upon receiving the SIGUSR2 signal. Disabling --exit-signal-handler`")
 
     # Goldfish loss
     if args.goldfish_loss:

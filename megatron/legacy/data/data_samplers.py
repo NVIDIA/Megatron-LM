@@ -9,7 +9,7 @@ import numpy as np
 from torch.utils.data import Dataset
 from megatron.training import get_args
 from megatron.core import mpu
-from pathlib import Path
+
 
 def build_pretraining_data_loader(dataset, consumed_samples):
     """Build dataloader given an input dataset."""
