@@ -218,6 +218,8 @@ class MegatronOptimizer(ABC):
             grads_for_norm, names = self.get_main_grads_for_grad_norm(return_names=True)
         else:
             grads_for_norm, names = [], []
+
+        print('####Now, we will call get_grad_norm_fp32, inside optimizer.py') 
         individ_norm, grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group() #, collect_individ_grad_norms
         )
@@ -226,10 +228,12 @@ class MegatronOptimizer(ABC):
             clip_grad_by_total_norm_fp32(
                 params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
             )
+
         individ_norm_dict = {
             name: norm 
             for name, norm in zip(names, individ_norm)
         }
+
         return individ_norm_dict, grad_norm
 
     def count_zeros(self) -> float:
@@ -503,9 +507,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = 0.0
-        individ_grad_norm = {}
+        individ_grad_norms = {}
         if self.config.clip_grad > 0.0:
-            individ_grad_norm, grad_norm = self.clip_grad_norm(self.config.clip_grad) # collect_individ_grad_norms
+            individ_grad_norms, grad_norm = self.clip_grad_norm(self.config.clip_grad) # collect_individ_grad_norms
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -521,7 +525,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         success = self.step_with_ready_grads()
 
         # Successful update.
-        return success, grad_norm, num_zeros_in_grad, individ_grad_norm
+        return success, grad_norm, num_zeros_in_grad, individ_grad_norms
 
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
@@ -862,8 +866,9 @@ class FP32Optimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = None
+        individ_grad_norms = {}
         if self.config.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.config.clip_grad)
+            individ_grad_norms, grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -879,7 +884,7 @@ class FP32Optimizer(MegatronOptimizer):
         success = self.step_with_ready_grads()
 
         # No overflow for FP32 optimizer.
-        return success, grad_norm, num_zeros_in_grad
+        return success, grad_norm, num_zeros_in_grad, individ_grad_norms
 
     def reload_model_params(self):
         pass
