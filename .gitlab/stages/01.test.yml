@@ -490,25 +490,34 @@ test:gh_release:
     PUBLISH_DRYRUN: 'yes'
   script:
     - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
-    - CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
-    - CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
+    - IS_PRERELEASE=$([[ "$RELEASE_NUMBER" == *rc* ]] && echo "true" || echo "false")
+    - >
+      if [[ "$IS_PRERELEASE" == "true" ]]; then
+        DATE=$(date +"%Y-%m-%d")
+        CHANGELOG="Prerelease: $NAME ($DATE)"
+      else
+        CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
+        CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
+      fi
     - >
       PAYLOAD=$(jq -nc \
-                  --arg CI_COMMIT_BRANCH "$CI_COMMIT_BRANCH" \
+                  --arg TAG_NAME "v${RELEASE_NUMBER}" \
+                  --arg CI_COMMIT_SHA "$CI_COMMIT_SHA" \
                   --arg NAME "$NAME" \
                   --arg BODY "$CHANGELOG" \
+                  --argjson PRERELEASE "$IS_PRERELEASE" \
                   '{
-                      "tag_name": $CI_COMMIT_BRANCH,
-                      "target_commitish": $CI_COMMIT_BRANCH,
+                      "tag_name": $TAG_NAME,
+                      "target_commitish": $CI_COMMIT_SHA,
                       "name": $NAME,
                       "body": $BODY,
                       "draft": false,
-                      "prerelease": false,
+                      "prerelease": $PRERELEASE,
                       "generate_release_notes": false
                   }'
               )
       echo -E "$PAYLOAD" > payload.txt
-
+    - cat payload.txt
     - >
       CMD=$(echo -E 'curl -L \
         -X POST \
