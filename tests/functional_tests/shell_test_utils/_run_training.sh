@@ -56,9 +56,9 @@ while IFS= read -r ARGUMENT; do
 done <<<"$ENV_VARS"
 
 # Run before script
-SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.BEFORE_SCRIPT')
-if [[ "$SCRIPT" != null ]]; then
-    eval "$SCRIPT"
+BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.BEFORE_SCRIPT')
+if [[ "$BEFORE_SCRIPT" != null ]]; then
+    eval "$BEFORE_SCRIPT"
 fi
 
 # Exit earlier to leave time for properly saving checkpoint
@@ -95,16 +95,25 @@ NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
 LAST_RANK=7
+export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
+mkdir -p $LOG_DIR
+
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
     --node_rank $SLURM_NODEID
-    --log-dir $OUTPUT_PATH
+    --log-dir $LOG_DIR
     --tee "0:3,7:3"
     --redirects "3"
 )
 
 # Start training
 torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS || EXIT_CODE=$?
+
+# Run after script
+AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.AFTER_SCRIPT')
+if [[ "$AFTER_SCRIPT" != null ]]; then
+    eval "$AFTER_SCRIPT"
+fi
