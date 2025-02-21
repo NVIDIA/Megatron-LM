@@ -1,3 +1,4 @@
+import glob
 import logging
 import os
 import pathlib
@@ -30,15 +31,18 @@ def main(pipeline_id: int):
     pipeline_bridges = [
         pipeline_bridge
         for pipeline_bridge in pipeline.bridges.list()
-        if pipeline_bridge.name.startswith("functional")
+        if pipeline_bridge.name.startswith("test:unit_tests")
         and pipeline_bridge.downstream_pipeline is not None
     ]
 
     ASSETS_DIR = pathlib.Path("tmp") / "results" / "iteration=0"
     for pipeline_bridge in pipeline_bridges:
         functional_pipeline = project.pipelines.get(pipeline_bridge.downstream_pipeline['id'])
-        environment = pipeline_bridge.name[len("functional:run_") :]
+
         functional_pipeline_jobs = functional_pipeline.jobs.list(get_all=True)
+        if "legacy" in pipeline_bridge.name:
+            continue
+
         logger.info("Starting with pipeline %s", pipeline_bridge.name)
         for functional_pipeline_job in functional_pipeline_jobs:
             job = project.jobs.get(functional_pipeline_job.id)
@@ -56,33 +60,33 @@ def main(pipeline_id: int):
 
             os.unlink(file_name)
             restart_dir = os.listdir(pathlib.Path("tmp") / "results" / "iteration=0")[-1]
-            golden_values_source = (
-                pathlib.Path(ASSETS_DIR)
-                / f"{restart_dir}"
-                / "assets"
-                / "basic"
-                / f"{job.name.replace('_', '-').lower()}-{environment}"
-                / f"golden_values_{environment}.json"
-            )
-            golden_values_target = (
-                pathlib.Path("tests")
-                / "functional_tests"
-                / 'test_cases'
-                / job.stage
-                / job.name
-                / f"golden_values_{environment}.json"
+            coverage_report_source = list(
+                glob.glob(
+                    str(
+                        pathlib.Path(ASSETS_DIR)
+                        / f"{restart_dir}"
+                        / "assets"
+                        / "basic"
+                        / "*"
+                        / "coverage_report"
+                    )
+                )
+            )[0]
+
+            coverage_report_target = (
+                pathlib.Path("coverage_results") / job.name.replace("/", "-") / "coverage_report"
             )
 
-            if golden_values_source.exists():
-                pathlib.Path(golden_values_target.parent).mkdir(parents=True, exist_ok=True)
+            if pathlib.Path(coverage_report_source).exists():
+                pathlib.Path(coverage_report_target.parent).mkdir(parents=True, exist_ok=True)
                 logger.info(
-                    "Move artifacts from %s to %s", golden_values_source, golden_values_target
+                    "Move artifacts from %s to %s", coverage_report_source, coverage_report_target
                 )
 
-                shutil.move(golden_values_source, golden_values_target)
+                shutil.move(coverage_report_source, coverage_report_target)
             else:
                 logger.info(
-                    "Golden values for %s does not exist. Skip.", str(f"{job.stage} / {job.name}")
+                    "coverage_report for %s does not exist. Skip.", str(f"{job.stage} / {job.name}")
                 )
 
             shutil.rmtree("tmp")
