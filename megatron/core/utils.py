@@ -97,6 +97,13 @@ def is_torch_min_version(version, check_equality=True):
         return get_torch_version() >= PkgVersion(version)
     return get_torch_version() > PkgVersion(version)
 
+def get_layer_name(name):
+    """Get a layer's name from its full Megatron name.
+        E.g.: get_layer_name('module.module.decoder.layers.0.self_attention.linear_qkv.weight')
+              = 'self_attention.linear_qkv'
+    """
+    main_name = name.split('.')[5:7]
+    return '.'.join(main_name)
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""

@@ -2,7 +2,7 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=00:59:59
-#SBATCH --job-name=Megatron-LM-Llama3.2-3B
+#SBATCH --job-name=Llama3.2-3B-Grads
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
 #SBATCH --nodes=1
@@ -77,8 +77,8 @@ ulimit -c 0
 ### Megatron Args ### Check megatron/training/arguments.py
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
-	--use-precision-aware-optimizer
-	--main-grads-dtype bf16
+	# --use-precision-aware-optimizer
+	--main-grads-dtype fp32
 )
 
 NETWORK_SIZE_ARGS=(
@@ -157,9 +157,9 @@ DISTRIBUTED_ARGS=(
 	--pipeline-model-parallel-size 1
 	--context-parallel-size 1
 	--wgrad-deferral-limit 50
-	--use-distributed-optimizer
-    --overlap-grad-reduce
-    --overlap-param-gather
+	# --use-distributed-optimizer
+    # --overlap-grad-reduce
+    # --overlap-param-gather
 )
 
 TOKENIZER_ARGS=(

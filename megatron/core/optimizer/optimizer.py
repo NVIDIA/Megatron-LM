@@ -46,6 +46,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
+from ..utils import get_layer_name
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
@@ -132,7 +133,6 @@ class MegatronOptimizer(ABC):
                     params.append(param)
                     if return_names:
                         names.append(name)
-        # print(names)
         if return_names:
             return params, names
         return params
@@ -219,22 +219,20 @@ class MegatronOptimizer(ABC):
         else:
             grads_for_norm, names = [], []
 
-        print('####Now, we will call get_grad_norm_fp32, inside optimizer.py') 
-        individ_norm, grad_norm = get_grad_norm_fp32(
+        individ_norms, grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group() #, collect_individ_grad_norms
         )
+        individ_norms_dict = {
+            get_layer_name(name): norm 
+            for name, norm in zip(names, individ_norms)
+        }
 
         if params:
             clip_grad_by_total_norm_fp32(
                 params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
             )
 
-        individ_norm_dict = {
-            name: norm 
-            for name, norm in zip(names, individ_norm)
-        }
-
-        return individ_norm_dict, grad_norm
+        return individ_norms_dict, grad_norm
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""

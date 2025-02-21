@@ -2,7 +2,7 @@
 
 #SBATCH --account=a-a06
 #SBATCH --time=00:59:59
-#SBATCH --job-name=Llama3.2-1B-Grads
+#SBATCH --job-name=Llama3.2-300m-Grads
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
 #SBATCH --nodes=1
@@ -13,16 +13,22 @@
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
+cp /iopsstor/scratch/cscs/dhia680/submit-llama3-300m.sh /iopsstor/scratch/cscs/dhia680/backup/grad-norms${SLURM_NNODES}.sh.bak
+
 echo "START TIME: $(date)"
 
 ################ Configs ################
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/Llama-3.1-70B/fineweb-edu-full-merge"
+# Use the FineWeb Edu dataset
+DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai/swissai-fineweb-edu-filterrobots"
 
-MBS=3
-GBS=252
-SEQ_LEN=8192
-TRAINING_STEPS=5000
-CHECKPOINT_STEPS=10000
+# global batch size = 256 * 4096 ~ 1M tokens
+# iteration time ~0.9 sec. Throughput ~ 140 TFLOPS/GPU/s
+# 8B tokens -> 8k iterations -> 8k * 0.9 sec = 1.8 hours
+MBS=2
+GBS=256
+SEQ_LEN=4096
+TRAINING_STEPS=8000
+CHECKPOINT_STEPS=1000
 
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
@@ -30,24 +36,25 @@ NSYS_PROFILER=false # Turn on the NSYS profiler # NOTE(tj.solergibert) When usin
 MOCK_DATA=false # Set to `true` to use mock data
 ###################
 
-# Directories, Logging & Artifacts
-PROJECT_NAME=TheMeg-Clariden
-EXP_NAME=Llama3-1B-NODES-$SLURM_NNODES
+# Megatron source and dataset cache WARNING (!) MUST BE ON IOPSSTOR (!)
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
-MEG_RUNS_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs # Path to store ALL training artifacts
-CKPT_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/$PROJECT_NAME/$EXP_NAME # Path to store checkpoints ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
-DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache # Path to store cache from datasets ⚠️ WARNING ⚠️ MUST be in /iopsstor/scratch ⚠️ WARNING ⚠️
+DATASET_CACHE_DIR=/iopsstor/scratch/cscs/$USER/datasets/cache
+
+# Logging directories & artifacts
+PROJECT_NAME=llama_300m_baseline
+EXP_NAME=llama3-300m-${SLURM_NNODES}n-${SEQ_LEN}sl-${GBS}gbsz_${SLURM_JOB_NAME}
+PROJECT_DIR=$MEGATRON_LM_DIR/logs/Meg-Runs/$PROJECT_NAME
+
 #########################################
 
-PROJECT_DIR=$MEG_RUNS_DIR/$PROJECT_NAME
 EXP_DIR=$PROJECT_DIR/$EXP_NAME
+CKPT_DIR=$EXP_DIR/checkpoints
 TRIGGER_DIR=$EXP_DIR/triggers
 DEBUG_DIR=$EXP_DIR/debug/$SLURM_JOB_ID
-LOGGING_DIR=$EXP_DIR/logging
-TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
-WANDB_DIR=$LOGGING_DIR  # Creates folder automatically
 COMPUTE_ENVIRONMENT_DIR=$DEBUG_DIR/compute_environment.txt
 GPU_MEM_LOGGING=$DEBUG_DIR/memory_logging.txt
+LOGGING_DIR=$EXP_DIR/logging
+TENSORBOARD_DIR=$LOGGING_DIR/tensorboard
 
 # Set up directories
 mkdir -p $CKPT_DIR
@@ -55,7 +62,6 @@ mkdir -p $PROJECT_DIR
 mkdir -p $TRIGGER_DIR
 mkdir -p $DEBUG_DIR
 mkdir -p $LOGGING_DIR
-ln -sfn $CKPT_DIR $EXP_DIR/checkpoint-dir-link
 
 # Clean triggers
 rm -f $TRIGGER_DIR/save
@@ -74,7 +80,7 @@ export OMP_NUM_THREADS=$((SLURM_CPUS_PER_TASK/SLURM_GPUS_PER_NODE))
 srun -l bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 ulimit -c 0
 
-### Megatron Args ### Check megatron/training/arguments.py
+#### Megatron Args #### Check megatron/training/arguments.py
 TRANSFORMER_ENGINE_ARGS=(
 	--transformer-impl transformer_engine
 	# --use-precision-aware-optimizer
@@ -82,12 +88,12 @@ TRANSFORMER_ENGINE_ARGS=(
 )
 
 NETWORK_SIZE_ARGS=(
-	--num-layers 16
+	--num-layers 6
 	--hidden-size 2048
-	--ffn-hidden-size 8192
-	--num-attention-heads 32
+	--ffn-hidden-size 6144
+	--num-attention-heads 16
 	--group-query-attention
-	--num-query-groups 8
+	--num-query-groups 4
 	--max-position-embeddings $SEQ_LEN
 	--position-embedding-type rope
 	--rotary-base 500000
@@ -137,13 +143,16 @@ INITIALIZATION_ARGS=(
 
 # NOTE(tj.solergibert) Check all the arguments in megatron/training/arguments.py#L1548 or https://github.com/NVIDIA/Megatron-LM/blob/0dd78ddcdb117ce4f2e9761449274d87af717674/megatron/training/arguments.py#L1548-L1606
 LEARNING_RATE_ARGS=(
-	--lr 0.00001
+	--lr 0.0003
+	--min-lr 0.00003  # x10 reduction
+	--lr-decay-style cosine
+	--lr-warmup-iters 500
 )
 
 CHECKPOINTING_ARGS=(
 	--save $CKPT_DIR
 	--save-interval $CHECKPOINT_STEPS
-	--load $CKPT_DIR
+	--load $CKPT_DIR  # delete this to NOT reload from the latest checkpoint
 	--ckpt-format torch_dist
 	--async-save
 )
@@ -157,14 +166,14 @@ DISTRIBUTED_ARGS=(
 	--pipeline-model-parallel-size 1
 	--context-parallel-size 1
 	--wgrad-deferral-limit 50
-	# --use-distributed-optimizer
-    # --overlap-grad-reduce
-    # --overlap-param-gather
+	# --use-distributed-optimizer false
+    # --overlap-grad-reduce false
+    # --overlap-param-gather false
 )
 
 TOKENIZER_ARGS=(
 	--tokenizer-type HuggingFaceTokenizer
-	--tokenizer-model nvidia/OpenMath2-Llama3.1-8B
+	--tokenizer-model tj-solergibert/swai
 )
 
 DATA_ARGS=(
@@ -210,9 +219,9 @@ TRAINING_CMD="torchrun ${TORCHRUN_ARGS[@]} $MEGATRON_LM_DIR/pretrain_gpt.py \
 if [ -n "$WANDB_API_KEY" ]; then
   echo "[$(date)] WANDB API key detected. Enabling WANDB logging."
   # Sync any previous run data if present
-  if [ -d "$LOG_EXP_DIR/wandb/latest-run" ]; then
+  if [ -d "$LOGGING_DIR/wandb/latest-run" ]; then
     echo "[$(date)] Syncing WANDB from previous run"
-    wandb sync "$LOG_EXP_DIR/wandb/latest-run"
+    wandb sync "$LOGGING_DIR/wandb/latest-run"
   fi
   # Add wandb-related args to TRAINING_CMD
   TRAINING_CMD="$TRAINING_CMD \
@@ -234,6 +243,9 @@ if [ "$NSYS_PROFILER" = true ]; then
     NSYS_LAUNCHER="nsys profile -s none --trace='nvtx,cudnn,cublas,cuda' --output=$DEBUG_DIR/nsys-trace.nsys-rep --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop"
     TRAINING_CMD="$NSYS_LAUNCHER $TRAINING_CMD --profile"
 fi
+
+# Save sbatch script
+cp $0 $DEBUG_DIR
 
 # Checkpoint Compute Environment
 echo -e "$(date)" > $COMPUTE_ENVIRONMENT_DIR 
