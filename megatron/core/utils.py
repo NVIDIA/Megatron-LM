@@ -102,8 +102,10 @@ def get_layer_name(name):
         E.g.: get_layer_name('module.module.decoder.layers.0.self_attention.linear_qkv.weight')
               = 'self_attention.linear_qkv'
     """
-    main_name = name.split('.')[5:7]
-    return '.'.join(main_name)
+    parts = name.split('.')[4:] if ('module.module.decoder.layers' in name) else name.split('.')[3:]
+    if parts[-1] == 'weight':
+        parts = parts[:-1]
+    return '.'.join(parts)
 
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""

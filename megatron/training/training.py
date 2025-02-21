@@ -282,9 +282,6 @@ def pretrain(
 
     args = get_args()
 
-    # Dhia: force add an argument (will add it to arguments.py later)
-    args.log_indiv_grad_norm = True
-
     timers = get_timers()
 
     if args.log_progress:
