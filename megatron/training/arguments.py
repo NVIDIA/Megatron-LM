@@ -1856,8 +1856,15 @@ def _add_distributed_args(parser):
                        help='If not set, all PP stages will launch gradient reduces simultaneously. '
                        'Otherwise, each PP stage will independently launch as needed.',
                        dest='align_grad_reduce')
+    group.add_argument('--ddp-num-buckets', type=int, default=None,
+                       help='Number of buckets for data-parallel communication')
     group.add_argument('--ddp-bucket-size', type=int, default=None,
                        help='Bucket size for data-parallel communication')
+    group.add_argument('--ddp-pad-buckets-for-high-nccl-busbw', action='store_true',
+                       default=False, help='If set, make sure the bucket size is divisible by a large power '
+                       'of 2 (2^16) to ensure NCCL collectives have high bus bandwidth at large DP counts, '
+                       'since NCCL message size (which for ring algorithms is bucket_size / dp_size) '
+                       'apparently needs to be divisible by a power of 2 for high busbw.')
     group.add_argument('--ddp-average-in-collective', action='store_true',
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',

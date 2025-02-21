@@ -556,13 +556,16 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
+    num_parameters = sum(
+        [sum([p.nelement() for p in model_module.parameters()])
+         for model_module in model]
+    )
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on (tensor, pipeline) '
               'model parallel rank ({}, {}): {}'.format(
             mpu.get_tensor_model_parallel_rank(),
             mpu.get_pipeline_model_parallel_rank(),
-            sum([sum([p.nelement() for p in model_module.parameters()])
-                 for model_module in model])), flush=True)
+            num_parameters), flush=True)
 
     # GPU allocation.
     for model_module in model:
@@ -588,7 +591,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     fp8_meta.amax_history[0][fp8_meta_index] = 0
 
     if wrap_with_ddp:
-        if getattr(args, "use_torch_fsdp2", False):
+        if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
         else:
@@ -603,17 +606,24 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
         kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
         kwargs['check_for_large_grads'] = args.check_for_large_grads
-        kwargs['bucket_size'] = args.ddp_bucket_size
+        if args.ddp_num_buckets is not None:
+            assert args.ddp_bucket_size is None, \
+                "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
+            assert args.ddp_num_buckets > 0, \
+                "--ddp-num-buckets must be greater than 0"
+            kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
+        else:
+            kwargs['bucket_size'] = args.ddp_bucket_size
+        kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
         kwargs['average_in_collective'] = args.ddp_average_in_collective
         ddp_config = DistributedDataParallelConfig(**kwargs)
 
-        overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
         model = [DP(config=config,
                      ddp_config=ddp_config,
                      module=model_chunk,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step)
+                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step)
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -741,7 +751,7 @@ def setup_model_and_optimizer(model_provider_func,
 
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
                 model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False))
+                skip_load_to_model_and_opt=HAVE_FSDP2 and args.use_torch_fsdp2)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -820,7 +830,7 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.empty_cache()
 
     # Vision gradients.
-    if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
@@ -840,7 +850,7 @@ def train_step(forward_step_func, data_iterator,
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
     # Vision momentum.
-    if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.update_momentum(args.curr_iteration)
 
