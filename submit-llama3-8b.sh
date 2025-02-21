@@ -26,6 +26,8 @@ SEQ_LEN=8192 # Sequence length
 TRAINING_STEPS=500
 CHECKPOINT_STEPS=250
 
+AUTO_JOB_REQUEUE=false # Set to `true` to continuously submit jobs to Slurm until training is complete. Enable it once you are sure of the cost involved in running this experiment.
+
 #### Debugging ####
 LOG_NCCL=false # Log NCCL_DEBUG=info. Every process will dump the logging into separate files, check `NCCL_DEBUG_FILE`
 NSYS_PROFILER=false # Turn on the NSYS profiler. Check the `--profile-*` args available in megatron/training/arguments.py
@@ -289,8 +291,9 @@ SRUN_ARGS=" \
 
 srun -lu bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 
-# NOTE(tj.solergibert) Resubmit the same script to the queue 
-echo "[$(date)] $(sbatch --dependency=singleton $0)"
+if [ "$AUTO_JOB_REQUEUE" = true ]; then
+	echo "[$(date)] $(sbatch --dependency=singleton $0)"
+fi
 
 srun --cpus-per-task $SLURM_CPUS_PER_TASK -lu bash -c "RANK=\$SLURM_PROCID LOCAL_RANK=\$SLURM_LOCALID $CMD_PREFIX $TRAINING_CMD"
 
