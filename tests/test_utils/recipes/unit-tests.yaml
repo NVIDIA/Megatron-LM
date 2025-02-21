@@ -82,11 +82,21 @@ spec:
     export NCCL_NVLS_ENABLE=0
 
     for i in $(seq $UNIT_TEST_REPEAT); do
-      CMD=$(echo torchrun ${{DISTRIBUTED_ARGS[@]}} -m pytest -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail ${{IGNORE_ARGS[@]}} -m "'${{MARKER_ARG}}'" $BUCKET)
+      CMD=$(echo torchrun ${{DISTRIBUTED_ARGS[@]}} -m pytest \
+        -xvs \
+        --cov-report=term \
+        --cov-branch \
+        --cov=megatron/core \
+        --cov-report xml:coverage.xml \
+        --no-cov-on-fail ${{IGNORE_ARGS[@]}} \
+        -m "'${{MARKER_ARG}}'" $BUCKET)
       
-      eval "$CMD"
-
+      eval "$CMD"    
     done
+
+    ls -al 
+    cp .coverage_0 {assets_dir}/coverage_report
+    cp coverage.xml {assets_dir}
 
 products:
   - test_case: [tests/unit_tests/data/]
