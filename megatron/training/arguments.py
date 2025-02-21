@@ -862,6 +862,10 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+
+    activation_flags = [args.swiglu, args.squared_relu, args.xielu, args.xiprelu, args.xiprelup]
+    if sum(activation_flags) > 1:
+        raise ValueError("Only one activation function can be selected at a time")
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -869,7 +873,6 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
         kw_args['activation_func'] = squared_relu
     if args.xielu:
         kw_args['activation_func'] = XIELU
@@ -877,6 +880,7 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['activation_func'] = XIPReLU
     if args.xiprelup:
         kw_args['activation_func'] = XIPReLUP
+        
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
