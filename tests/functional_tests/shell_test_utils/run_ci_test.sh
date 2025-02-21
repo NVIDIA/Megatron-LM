@@ -35,7 +35,7 @@ done
 
 RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
-TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "release")
+TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "release")
 
 mkdir -p $CHECKPOINT_SAVE_PATH
 mkdir -p $CHECKPOINT_LOAD_PATH
@@ -66,7 +66,12 @@ for i in $(seq 1 $N_REPEAT); do
     export RUN_NUMBER=1
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
-    export CHECKPOINT_LOAD_PATH=/tmp/checkpoints/
+
+    if [[ "$TEST_TYPE" = "frozen-start" ]]; then
+        export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
+    else
+        export CHECKPOINT_LOAD_PATH=/tmp/checkpoints/
+    fi
 
     if [[ "$TEST_TYPE" = "release" ]]; then
         export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
