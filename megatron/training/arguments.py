@@ -22,7 +22,7 @@ from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_torch_min_version
 from megatron.training.activations import squared_relu
-from megatron.training.utils import update_use_dist_ckpt, is_rank0
+from megatron.training.utils import update_use_dist_ckpt
 
 
 def parse_args(extra_args_provider=None, ignore_unknown_args=False):

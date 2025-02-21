@@ -161,8 +161,8 @@ DISTRIBUTED_ARGS=(
 	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 1
 	--use-distributed-optimizer
-    --overlap-grad-reduce
-    --overlap-param-gather
+	--overlap-grad-reduce
+	--overlap-param-gather
 )
 
 TOKENIZER_ARGS=(
@@ -284,10 +284,10 @@ printf '=%.0s' {1..100} >> $COMPUTE_ENVIRONMENT_DIR
 SRUN_ARGS=" \
 	-lu \
 	--cpus-per-task $SLURM_CPUS_PER_TASK \
-    --wait 60 \
-    --jobid $SLURM_JOB_ID \
+	--wait 60 \
+	--jobid $SLURM_JOB_ID \
 	--kill-on-bad-exit 1 \
-    "
+	"
 
 srun -lu bash -c 'echo $(hostname) $(nvidia-smi | grep -o "|\\s*[0-9]*MiB")' > $GPU_MEM_LOGGING
 

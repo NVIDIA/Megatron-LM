@@ -1679,7 +1679,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         ft_integration.shutdown()
         sys.exit(exit_code)
     
-    torch.distributed.barrier()
     if iteration >= args.train_iters and is_rank0():
         print(f"Training finished after {iteration} iterations; Canceling pending scheduled jobs.")
         Path(args.exit_trigger).touch()
