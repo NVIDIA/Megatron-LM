@@ -33,15 +33,21 @@ class DistributedDataParallelConfig:
     """
 
     check_for_nan_in_grad: bool = False
-    """ If true, check for NaNs and Infs in gradients _before_ communication collective."""
+    """If true, check for NaNs and Infs in gradients _before_ communication collective."""
 
     check_for_large_grads: bool = False
-    """ If true, check for unexpectedly large gradients _before_ communication collective."""
+    """If true, check for unexpectedly large gradients _before_ communication collective."""
 
     bucket_size: Optional[int] = None
     """Maximum number of parameters in each bucket. If unspecified, MCore uses a default
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
+
+    pad_buckets_for_high_nccl_busbw: bool = False
+    """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
+       ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
+       message size (which for ring algorithms is bucket_size / dp_size) apparently needs
+       to be divisible by a power of 2 for high busbw."""
 
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
