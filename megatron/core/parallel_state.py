@@ -968,7 +968,7 @@ def initialize_model_parallel(
             # to gurantee the overlapped UCC communications. If this environment variable is set to 1,
             # all the UCC communication will be serialized.
             assert (
-                os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] is not '1'
+                os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] != '1'
             ), "UCC-backend requires CUDA_DEVICE_MAX_CONNECTIONS > 1"
 
         # Setting up required environment variables for ucc backend
