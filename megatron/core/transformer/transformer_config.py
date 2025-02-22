@@ -68,6 +68,9 @@ class TransformerConfig(ModelParallelConfig):
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
     num_attention_heads if not provided."""
 
+    crossattn_emb_size: int = None
+    """Cross attention input embedding size"""
+
     hidden_dropout: float = 0.1
     """Dropout probability for transformer hidden state."""
 
@@ -122,6 +125,18 @@ class TransformerConfig(ModelParallelConfig):
 
     qk_layernorm: bool = False
     """Whether to apply LayerNorm to the query and key embeddings."""
+
+    qk_layernorm_per_head: bool = True
+    """Whether to apply LayerNorm to the query and key embeddings per head."""
+
+    qk_layernorm_separate_weights: bool = False
+    """Whether to initialize separate weights for each attention head in the QK Layernorm."""
+
+    qk_layernorm_self_attn: bool = True
+    """Whether or not to apply QK Layernorm to self attention."""
+
+    qk_layernorm_cross_attn: bool = True
+    """Whether or not to apply QK Layernorm to cross attention."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
