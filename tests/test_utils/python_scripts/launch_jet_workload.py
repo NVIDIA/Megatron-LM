@@ -289,10 +289,10 @@ def main(
                 UnicodeDecodeError,
             ) as e:
                 logger.error(e)
-                time.sleep((3**n_download_attempt) * 60)
+                time.sleep(2 * n_download_attempt * 15)
                 n_download_attempt += 1
                 no_log = True
-            except KeyError as e:
+            except (KeyError, IndexError) as e:
                 logger.error(e)
                 no_log = True
                 break
