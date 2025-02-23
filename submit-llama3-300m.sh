@@ -13,8 +13,6 @@
 #SBATCH --environment=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml	# Vanilla 25.01 PyTorch NGC Image 
 #SBATCH --no-requeue	# Prevent Slurm to requeue the job if the execution crashes (e.g. node failure) so we don't loose the logs
 
-cp /iopsstor/scratch/cscs/dhia680/submit-llama3-300m.sh /iopsstor/scratch/cscs/dhia680/backup/grad-norms${SLURM_NNODES}.sh.bak
-
 echo "START TIME: $(date)"
 
 ################ Configs ################

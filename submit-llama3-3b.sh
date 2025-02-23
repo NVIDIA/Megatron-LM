@@ -5,7 +5,7 @@
 #SBATCH --job-name=Llama3.2-3B-Grads
 #SBATCH --output=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.out
 #SBATCH --error=/iopsstor/scratch/cscs/%u/Megatron-LM/logs/slurm/training/R-%x-%j.err
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --cpus-per-task=288
@@ -155,7 +155,7 @@ MIXED_PRECISION_ARGS=(
 
 DISTRIBUTED_ARGS=(
 	--tensor-model-parallel-size 1
-	--pipeline-model-parallel-size 1
+	--pipeline-model-parallel-size 2
 	--context-parallel-size 1
 	--wgrad-deferral-limit 50
 	# --use-distributed-optimizer
