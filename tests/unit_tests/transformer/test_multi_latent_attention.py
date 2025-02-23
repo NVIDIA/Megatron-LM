@@ -18,9 +18,11 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttention:
 
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self, rope_type):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = MLATransformerConfig(
@@ -33,6 +35,7 @@ class TestParallelMLAAttention:
             qk_head_dim=128,
             v_head_dim=128,
             qk_pos_emb_head_dim=64,
+            rope_type=rope_type,
             rotary_base=10000,
             max_position_embeddings=32,
         )
