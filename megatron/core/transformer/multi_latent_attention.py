@@ -9,6 +9,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
+    RotaryEmbedding,
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
@@ -71,16 +72,28 @@ class MultiLatentAttention(Attention):
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
 
-        self.rotary_pos_emb = YarnRotaryEmbedding(
-            self.config.qk_pos_emb_head_dim,
-            rotary_base=self.config.rotary_base,
-            scaling_factor=self.config.rotary_scaling_factor,
-            original_max_position_embeddings=self.config.max_position_embeddings,
-            beta_fast=self.config.beta_fast,
-            beta_slow=self.config.beta_slow,
-            mscale=self.config.mscale,
-            mscale_all_dim=self.config.mscale_all_dim,
-        )
+        if self.config.rope_type == "rope":
+            self.rotary_pos_emb = RotaryEmbedding(
+                self.config.qk_pos_emb_head_dim,
+                rotary_percent=self.config.rotary_percent,
+                rotary_base=self.config.rotary_base,
+            )
+        elif self.config.rope_type == "yarn":
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                self.config.qk_pos_emb_head_dim,
+                rotary_base=self.config.rotary_base,
+                scaling_factor=self.config.rotary_scaling_factor,
+                original_max_position_embeddings=self.config.max_position_embeddings,
+                beta_fast=self.config.beta_fast,
+                beta_slow=self.config.beta_slow,
+                mscale=self.config.mscale,
+                mscale_all_dim=self.config.mscale_all_dim,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported RoPE type: {self.config.rope_type}, supported types are "
+                "'rope' and 'yarn'"
+            )
 
         self.core_attention = build_module(
             submodules.core_attention,
@@ -349,14 +362,17 @@ class MLASelfAttention(MultiLatentAttention):
         # k_no_pe: [s, b, n, 128], value: [s, b, n, 128]
         k_no_pe, value = torch.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
 
-        # rotary_pos_emb:[s, b, 1, 64]
-        rotary_pos_emb = self.rotary_pos_emb(max_seq_len=self.config.max_position_embeddings)
+        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            inference_params, None, hidden_states, self.config, packed_seq_params
+        )
 
-        if len(rotary_pos_emb) == 2:
-            mscale = rotary_pos_emb[1]
-            rotary_pos_emb = rotary_pos_emb[0]
+        # rotary_pos_emb:[s, b, 1, 64]
+        mscale = 1.0
+        if self.config.rope_type == "rope":
+            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
-            mscale = 1.0
+            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
 
         if inference_params is not None:
             # add offset to the sequence start for inference

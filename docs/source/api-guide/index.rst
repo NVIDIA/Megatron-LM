@@ -15,6 +15,7 @@ API Guide
    dist_optimizer
    distributed
    datasets
+   multi_latent_attention
    num_microbatches_calculator
    optimizer_param_scheduler
    encoder_decoder_parallelism
