@@ -7,14 +7,16 @@ from typing import Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -242,12 +244,12 @@ class MLASelfAttention(MultiLatentAttention):
                 submodules.linear_q_down_proj,
                 self.config.hidden_size,
                 self.config.q_lora_rank,
-                parallel_mode="duplicated",
                 config=self.config,
                 init_method=self.config.init_method,
                 bias=False,
                 skip_bias_add=False,
-                skip_weight_param_allocation=False,
+                gather_output=False,
+                is_expert=False,
             )
 
             self.linear_q_up_proj = build_module(
@@ -266,12 +268,12 @@ class MLASelfAttention(MultiLatentAttention):
             submodules.linear_kv_down_proj,
             self.config.hidden_size,
             self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
-            parallel_mode="duplicated",
             config=self.config,
             init_method=self.config.init_method,
             bias=False,
             skip_bias_add=False,
-            skip_weight_param_allocation=False,
+            gather_output=False,
+            is_expert=False,
         )
 
         self.linear_kv_up_proj = build_module(
@@ -320,8 +322,10 @@ class MLASelfAttention(MultiLatentAttention):
 
         if self.config.q_lora_rank is not None:
             q_compressed, _ = self.linear_q_down_proj(hidden_states)
-            q_compressed = self.q_layernorm(q_compressed)
-            q, _ = self.linear_q_up_proj(q_compressed)
+            q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+            if self.config.sequence_parallel:
+                q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+            q, _ = self.linear_q_up_proj(self.q_layernorm(q_compressed))
         else:
             # hidden_states:[s, b, 2048], q: [s, b, n * 192]
             q, _ = self.linear_q_proj(hidden_states)
@@ -338,16 +342,15 @@ class MLASelfAttention(MultiLatentAttention):
 
         # kv_combined: [s, b, 576]
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
 
         # kv_compressed:[s, b, 512], k_pos_emb: [s, b, 64]
         kv_compressed, k_pos_emb = torch.split(
             kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
 
-        # Gather the input from sequence parallel region
-        if parallel_state.get_tensor_model_parallel_world_size() > 1:
-            k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
-
+        if self.config.sequence_parallel:
+            kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
         # kv: [s, b, 2048]
         kv, _ = self.linear_kv_up_proj(self.kv_layernorm(kv_compressed))
 
