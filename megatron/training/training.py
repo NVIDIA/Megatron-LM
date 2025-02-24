@@ -565,8 +565,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                  for model_module in model])), flush=True)
 
     # GPU allocation.
-    for model_module in model:
-        model_module.cuda(torch.cuda.current_device())
+    # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
+    # in the fully_shard function of FSDP2 instead.
+    if not (args.use_torch_fsdp2 and args.use_cpu_initialization):
+        for model_module in model:
+            model_module.cuda(torch.cuda.current_device())
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
@@ -741,7 +744,7 @@ def setup_model_and_optimizer(model_provider_func,
 
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
                 model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False))
+                skip_load_to_model_and_opt=HAVE_FSDP2 and args.use_torch_fsdp2)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
