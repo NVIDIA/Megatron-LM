@@ -93,6 +93,10 @@ def _get_param_groups(
                 # Do not regularize biases and norm parameters.
                 no_wd = name.endswith(".bias") or len(param.shape) == 1
 
+            # TODO add more elegant way to disable weight decay for alpha_p and alpha_n
+           if any(keyword in name for keyword in ["alpha_p", "alpha_n", "power"]):
+                no_wd = True
+
             if scale_lr_cond is not None:
                 scale_lr = scale_lr_cond(name, param)
             else:
