@@ -61,7 +61,7 @@ test:build_image:
           ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
         fi
 
-        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
+        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
           ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
         fi
 
