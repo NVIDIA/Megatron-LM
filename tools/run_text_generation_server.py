@@ -123,14 +123,15 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
         fp32_residual_connection=args.fp32_residual_connection,
         params_dtype=args.params_dtype,
-        padded_vocab_size=args.padded_vocab_size
+        padded_vocab_size=args.padded_vocab_size,
+        inference_max_seq_length=args.inference_max_seq_length,
+        inference_max_batch_size=args.inference_max_batch_size
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
     text_generation_controller = SimpleTextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-    return MCoreEngine(text_generation_controller=text_generation_controller,
-                       max_batch_size=args.max_batch_size)
+    return MCoreEngine(text_generation_controller=text_generation_controller)
 
 
 def add_text_generate_args(parser):

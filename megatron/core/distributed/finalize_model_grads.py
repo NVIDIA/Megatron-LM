@@ -200,9 +200,8 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         grads = []
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
-                if (
-                    param.requires_grad
-                    and getattr(param, 'sequence_parallel', False)
+                if param.requires_grad and (
+                    getattr(param, 'sequence_parallel', False)
                     or 'q_layernorm' in name
                     or 'k_layernorm' in name
                 ):
@@ -240,6 +239,9 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
             if hasattr(module, 'expert_bias'):
                 tokens_per_expert_list.append(module.local_tokens_per_expert)
                 expert_bias_list.append(module.expert_bias)
+    # For hybrid models with both MoE and Dense layers, this list can be empty.
+    if len(expert_bias_list) == 0:
+        return
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
     stacked_updated_expert_bias = get_updated_expert_bias(

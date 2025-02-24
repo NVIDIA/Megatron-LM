@@ -106,6 +106,7 @@ def initialize_megatron(
             error_injection_rate=args.error_injection_rate,
             error_injection_type=RerunDiagnostic(args.error_injection_type),
         ),
+        result_rejected_tracker_filename=args.result_rejected_tracker_filename,
     )
 
     # torch.distributed initialization
@@ -309,6 +310,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 args.pipeline_model_parallel_size,
                 args.virtual_pipeline_model_parallel_size,
                 args.pipeline_model_parallel_split_rank,
+                pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 context_parallel_size=args.context_parallel_size,
                 hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
                 expert_model_parallel_size=args.expert_model_parallel_size,

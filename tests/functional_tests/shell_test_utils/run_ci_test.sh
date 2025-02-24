@@ -66,6 +66,11 @@ for i in $(seq 1 $N_REPEAT); do
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     export CHECKPOINT_LOAD_PATH=/tmp/checkpoints/
 
+    if [[ "$TEST_TYPE" = "release" ]]; then
+        export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
+        export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
+    fi
+
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
     if [[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]]; then
@@ -114,6 +119,10 @@ for i in $(seq 1 $N_REPEAT); do
         --train-iters $TRAIN_ITERS \
         --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
         "${EXTRACT_ARGS[@]}"
+
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        SKIP_PYTEST=0
+    fi
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then

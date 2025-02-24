@@ -109,6 +109,10 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
+        # To support both CUDA Graphs and key value with different hidden size
+        self.key_hidden_size = self.hidden_size_per_attention_head
+        self.val_hidden_size = self.hidden_size_per_attention_head
+
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -175,14 +179,14 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
             inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
-            self.hidden_size_per_attention_head,
+            dim,
             dtype=dtype,
             device=get_current_device(),
         )
@@ -217,10 +221,10 @@ class Attention(MegatronModule, ABC):
             inf_max_seq_length = inference_params.max_sequence_length
             inf_max_batch_size = inference_params.max_batch_size
             inference_key_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, key.dtype
+                inf_max_seq_length, inf_max_batch_size, self.key_hidden_size, key.dtype
             )
             inference_value_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, value.dtype
+                inf_max_seq_length, inf_max_batch_size, self.val_hidden_size, value.dtype
             )
             inference_params.key_value_memory_dict[self.layer_number] = (
                 inference_key_memory,
@@ -380,9 +384,9 @@ class Attention(MegatronModule, ABC):
         if (
             self.config.flash_decode
             and inference_params is not None
-            and self.layer_number
-            in inference_params.key_value_memory_dict  # Decode phase if key already exists
+            and inference_params.decode_mode
         ):
+            assert self.layer_number in inference_params.key_value_memory_dict
             assert inference_params.sequence_len_offset is not None
             inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
                 self.layer_number

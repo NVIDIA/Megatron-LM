@@ -1,5 +1,16 @@
 # Changelog
 
+## NVIDIA Megatron Core 0.10.0
+
+- Adding MLA to MCore
+- Enable FP8 for GroupedMLP
+- MoE Parallel Folding
+- Enhance MoE Architecture: Support MoE Layer Frequency Patterns and Configurable MoE FFN Hidden Size
+- Multimodal: NVLM training and evaluation support in MCore 
+- Mamba Hybrid
+  - Increase performance and reduce memory footprint of Triton language/compiler distributed caching
+  - Add more unit testing and fix bugs
+
 ## NVIDIA Megatron Core 0.9.0
 
 - Uneven pipeline parallelism
@@ -16,7 +27,6 @@
     - Qwen Model support
 - Known Issues
   - When using sequence parallel, during the transformer block forward pass, dropout is not using the appropriate rng context.
-
 
 ## NVIDIA Megatron Core 0.8.0
 

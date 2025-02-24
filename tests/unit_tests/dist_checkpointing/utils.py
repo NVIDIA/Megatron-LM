@@ -1,5 +1,4 @@
 from functools import partial
-from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
 from unittest import mock
 
@@ -14,6 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.tensor_parallel import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
 
@@ -162,7 +162,7 @@ def setup_model_and_optimizer(
     seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True
 ):
     dist_opt = dist_opt and xm is None
-    mock_args = SimpleNamespace()
+    mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         model = get_model(
@@ -233,7 +233,7 @@ def setup_moe_model_and_optimizer(
     use_glu=False,
 ):
     dist_opt = dist_opt and xm is None
-    mock_args = SimpleNamespace()
+    mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
         model = get_model(

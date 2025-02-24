@@ -32,7 +32,10 @@ class DistributedDataParallelConfig:
     """
 
     check_for_nan_in_grad: bool = False
-    """ If true, check for NaNs in gradients _before_ communication collective."""
+    """ If true, check for NaNs and Infs in gradients _before_ communication collective."""
+
+    check_for_large_grads: bool = False
+    """ If true, check for unexpectedly large gradients _before_ communication collective."""
 
     bucket_size: Optional[int] = None
     """Maximum number of parameters in each bucket. If unspecified, MCore uses a default

@@ -92,11 +92,12 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
     )
 
 
-def get_layer_spec_te(is_vit=False) -> ModuleSpec:
-    if not HAVE_TE:
-        return get_layer_spec(is_vit=is_vit)
-    
+def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
     attn_mask_type = AttnMaskType.no_mask if is_vit else AttnMaskType.causal
+    # Padding mask is needed for e.g. Context Parallel.
+    if padding:
+        assert not is_vit, "padding_causal mask not used with ViT"
+        attn_mask_type = AttnMaskType.padding_causal
 
     mlp = get_norm_mlp_module_spec_te()
     return ModuleSpec(

@@ -63,7 +63,8 @@ def add_text_generate_args(parser):
         help='Input prompts with each prompt within quotes and seperated by space',
     )
     group.add_argument(
-        "--max-batch-size", type=int, default=1, help='Max number of prompts to process at once'
+        "--max-batch-size", type=int, default=8, dest="inference_max_requests",
+        help='Max number of prompts to process at once'
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
     return parser
@@ -89,11 +90,13 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         fp32_residual_connection=args.fp32_residual_connection,
         params_dtype=args.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
+        inference_max_requests=args.inference_max_requests,
+        inference_max_seq_length=args.inference_max_seq_length,
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
     text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-    return MCoreEngine(text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size)
+    return MCoreEngine(text_generation_controller=text_generation_controller)
 
 
 async def generate(

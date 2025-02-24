@@ -57,6 +57,10 @@ from megatron.core.rerun_state_machine import (
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
+from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+)
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
@@ -468,7 +472,7 @@ def pretrain(
     one_logger and one_logger.log_metrics({
         'app_finish_time': one_logger_utils.get_timestamp_in_ms()
     })
-    
+
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -610,6 +614,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 kwargs[f.name] = getattr(args, f.name)
         kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
         kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+        kwargs['check_for_large_grads'] = args.check_for_large_grads
         kwargs['bucket_size'] = args.ddp_bucket_size
         kwargs['average_in_collective'] = args.ddp_average_in_collective
         ddp_config = DistributedDataParallelConfig(**kwargs)
@@ -783,6 +788,15 @@ def setup_model_and_optimizer(model_provider_func,
         exit()
 
     return model, optimizer, opt_param_scheduler
+
+
+def dummy_train_step(data_iterator):
+    """Single dummy training step."""
+    num_microbatches = get_num_microbatches()
+    for _ in range(num_microbatches):
+        # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
+        batch = get_batch_on_this_tp_rank(data_iterator)
+        batch = get_batch_on_this_cp_rank(batch)
 
 
 def train_step(forward_step_func, data_iterator,
@@ -1355,6 +1369,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     # Iterations.
     iteration = args.iteration
+    # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
+    rerun_state_machine = get_rerun_state_machine()
+    if rerun_state_machine.current_iteration != iteration:
+        print_rank_0(f"Setting rerun_state_machine.current_iteration to {iteration}...")
+        rerun_state_machine.current_iteration = iteration
 
     # Track E2E metrics at the start of training.
     one_logger_utils.on_train_start(iteration=iteration, consumed_train_samples=args.consumed_train_samples,
@@ -1498,6 +1517,18 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                          checkpointing_context, train_data_iterator=train_data_iterator)
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
+
+        # Completely skip iteration if needed.
+        if iteration in args.iterations_to_skip:
+            # Dummy train_step to fast forward train_data_iterator.
+            dummy_train_step(train_data_iterator)
+            iteration += 1
+            batch_size = mpu.get_data_parallel_world_size() * \
+                         args.micro_batch_size * \
+                         get_num_microbatches()
+            args.consumed_train_samples += batch_size
+            args.skipped_train_samples += batch_size
+            continue
 
         # Run training step.
         args.curr_iteration = iteration

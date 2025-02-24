@@ -2,6 +2,7 @@
 
 import os
 from importlib.metadata import version
+from inspect import signature
 
 import pytest
 import torch
@@ -9,8 +10,9 @@ import torch
 from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention, MultiLatentAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -53,6 +55,19 @@ class TestParallelMLAAttention:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_input_params_forward(self):
+        """
+        Test to ensure that MultiLatentAttention has all parameters
+        required by the Attention class's forward method.
+        """
+        # Extract parameters from the forward methods of both Attention and MultiLatentAttention
+        attn_params = set(signature(Attention.forward).parameters.keys())
+        mla_params = set(signature(MultiLatentAttention.forward).parameters.keys())
+
+        # Identify parameters that are in Attention but missing in MultiLatentAttention
+        missing_params = attn_params - mla_params
+        assert not missing_params, f"Missing parameters in MultiLatentAttention: {missing_params}"
 
     def test_constructor(self):
         assert isinstance(self.parallel_attention, MLASelfAttention)

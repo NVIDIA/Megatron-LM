@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_xla_model
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
@@ -117,7 +117,7 @@ class TestCPUTensors:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_cpu_tensors_dont_take_too_much_space(self, tmp_path_dist_ckpt):
-        large_cuda_tensor = torch.ones(1_000_000, dtype=torch.float, device='cuda')
+        large_cuda_tensor = torch.ones(1_000_000, dtype=torch.float, device=get_current_device())
         large_cpu_tensor = torch.ones(1_000_000, dtype=torch.float)
         # Create small tensors which are a view of a large tensor
         sharded_state_dict = {

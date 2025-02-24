@@ -41,6 +41,7 @@ def convert(output_path, tensor_parallel_size, use_te, version):
         elif "patch_generator" in name:
             if "embedder" in name:
                 new_name = "embedder.weight"
+                chunk_dim = 0
             elif "cls_token" in name:
                 new_name = "class_token"
             elif "pos_embed" in name:

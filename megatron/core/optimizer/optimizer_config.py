@@ -114,6 +114,34 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    #######################
+    # Optimizer Offload
+    #######################
+
+    optimizer_cpu_offload: bool = False
+    """If True, offload optimizer states tensor and compute to CPU."""
+
+    optimizer_offload_fraction: float = 0.0
+    """Specifies the fraction of optimizer states to offload from GPU memory to CPU."""
+
+    use_torch_optimizer_for_cpu_offload: bool = False
+    """If True, use torch.optim.Optimizer for CPU offload."""
+
+    overlap_cpu_optimizer_d2h_h2d: bool = False
+    """
+    When set to `True`, this flag enables overlapping of the CPU optimizer
+    update process with the data transfer operations. This can help improve
+    overall training efficiency by reducing idle time during data movement,
+    allowing the optimizer to perform updates while gradients and parameters
+    are being transferred between devices.
+    """
+
+    pin_cpu_grads: bool = True
+    """If True, pin the optimizer gradients to CPU memory."""
+
+    pin_cpu_params: bool = True
+    """If True, pin the optimizer parameters to CPU memory."""
+
     ################
     # Miscellaneous
     ################
@@ -142,8 +170,11 @@ class OptimizerConfig:
                 self.use_distributed_optimizer
             ), '--use-precision-aware-optimizer only supported with distributed optimizer'
 
-            # Only the FusedAdam in TE supports --use-precision-aware-optimizer.
+            # Only the FusedAdam in TE and HybridDeviceOptimizer supports
+            # --use-precision-aware-optimizer.
             # TODO: Remove this check when apex's FusedAdam is no longer used.
+            if self.optimizer_cpu_offload:
+                return
             try:
                 import inspect
 

@@ -33,7 +33,7 @@ try:
 except ImportError:
     HAVE_TE = False
 
-def model_forward(config: TransformerConfig, model: torch.nn.Module, micro_batch_size: int = 2):
+def model_forward( model: torch.nn.Module, config: TransformerConfig, micro_batch_size: int = 2):
     inference_params: InferenceParams = InferenceParams(
         max_batch_size=micro_batch_size, max_sequence_length=model.max_sequence_length
     )
@@ -110,7 +110,7 @@ class TestModelOptGPTModel:
     def test_inference(self):
         config: TransformerConfig = self.modelopt_gpt_model.config
         model = self.modelopt_gpt_model.to(device=get_current_device())
-        model_forward(config=config, model=model)
+        model_forward(model=model, config=config)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -159,7 +159,7 @@ class TestModelOptMambaModel:
     def test_inference(self):
         config: TransformerConfig = self.modelopt_mamba_model.config
         model = self.modelopt_mamba_model.to(device=get_current_device())
-        model_forward(config=config, model=model)
+        model_forward(model=model, config=config)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

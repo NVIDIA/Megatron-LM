@@ -2,7 +2,6 @@
 
 import filecmp
 import os
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -11,6 +10,7 @@ import torch.distributed
 
 from megatron.core.device_utils import get_xla_model
 from megatron.core.parallel_state import get_default_process_group
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import (
     _NON_PERSISTENT_CKPT_SUBDIR,
     load_checkpoint,
@@ -41,7 +41,7 @@ class TestNonPersistentSaveAndLoad:
         model, optimizer = setup_model_and_optimizer(1, tp, pp, dist_opt=dist_opt)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         with TempNamedDir(
             tmp_path_dist_ckpt / "test_non_persistent",
             sync=True, process_group=get_default_process_group()
@@ -143,9 +143,9 @@ class TestLegacySaveAndLoad:
         model, optimizer = setup_model_and_optimizer(1, tp, pp, dist_opt=dist_opt)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
-        with TempNamedDir(tmp_path_dist_ckpt / "test_legacy", sync=True,
-                          process_group=get_default_process_group()) as legacy_ckpt_dir, mock.patch(
+        mock_args = parse_args(ignore_unknown_args=True)
+        with TempNamedDir(tmp_path_dist_ckpt / "test_legacy", 
+                          sync=True, process_group=get_default_process_group()) as legacy_ckpt_dir, mock.patch(
             'megatron.training.checkpointing.get_args', new=lambda: mock_args
         ), mock.patch("megatron.training.checkpointing.update_num_microbatches"):
             init_basic_mock_args(mock_args, tp, pp)

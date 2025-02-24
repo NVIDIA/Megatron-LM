@@ -475,7 +475,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
-                save_modelopt_state(model, state_dict)
+                if ckpt_type == CheckpointType.LOCAL:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                else:
+                    save_modelopt_state(model, state_dict)
 
             end_ckpt = time()
             logger.debug(f"rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt ")
@@ -1197,7 +1200,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                 gen_sd_opt_param_scheduler = None
 
             # Determine if rerun state will be loaded
-            if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune):
+            if (
+                ckpt_tp_pp == run_tp_pp
+                and not release
+                and not args.finetune
+                and 'rerun_state_machine' in state_dict
+            ):
                 rerun_state_machine = get_rerun_state_machine()
                 gen_sd_rerun_state = rerun_state_machine.state_dict(
                     data_iterator=None, use_dist_ckpt=True
@@ -1211,8 +1219,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             # after the model instance has been created and before _load_base_checkpoint is called.
             if has_nvidia_modelopt:
                 if ckpt_type == CheckpointType.LOCAL:
-                    raise NotImplementedError('Local checkpointing does not support model opt')
-                if not args.use_dist_ckpt:
+                    print_rank_0('WARNING: Local checkpointing does not support nvidia_modelopt.')
+                elif ckpt_type == CheckpointType.GLOBAL:
                     restore_modelopt_state(model, state_dict)
                 else:
                     restore_sharded_modelopt_state(model, checkpoint_name)
@@ -1382,6 +1390,11 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
                  f'p {mpu.get_pipeline_model_parallel_rank() + 1}/{mpu.get_pipeline_model_parallel_world_size()} ] '
                  f'at iteration {iteration}')
+
+    # Additional callback for wandb (last rank)
+    if not torch.distributed.is_initialized() \
+       or is_last_rank():
+        wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

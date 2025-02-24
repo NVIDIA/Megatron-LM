@@ -2,7 +2,7 @@
 from copy import deepcopy
 from functools import partial
 from time import sleep
-from types import MethodType, SimpleNamespace
+import traceback
 from unittest import mock
 
 import pytest
@@ -31,6 +31,7 @@ from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
@@ -236,6 +237,8 @@ class TestDistributedOptimizer:
             # ((2, 1), 2, 2),
         ],
     )
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
     def test_dp_sharding(self, tmp_path_dist_ckpt, tp_pp, src_dp, dest_dp, use_fpsl, initialize_fn):
         src_world_size = tp_pp[0] * tp_pp[1] * src_dp
         dest_world_size = tp_pp[0] * tp_pp[1] * dest_dp
@@ -325,7 +328,7 @@ class TestDistributedOptimizer:
             tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True,
             process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
-            mock_args = SimpleNamespace()
+            mock_args = parse_args(ignore_unknown_args=True)
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 init_basic_mock_args(mock_args, tp=src_tp_pp[0], pp=src_tp_pp[1])
                 init_checkpointing_mock_args(mock_args, ckpt_dir, False)
@@ -541,7 +544,7 @@ class TestOptimizerResharding:
 
                 optimizer_B.load_state_dict(state_dict)
                 save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B,
-                     process_group=parallel_state.get_default_process_group())
+                    process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal

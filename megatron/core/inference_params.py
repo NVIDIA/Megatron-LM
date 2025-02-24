@@ -9,7 +9,9 @@ class InferenceParams:
         self.current_batch_size = max_batch_size  # Required for bookkeeping variable-sized batches
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
+        self.decode_mode = False
         self.key_value_memory_dict = {}
+        self.decode_mode = False
 
     def swap_key_value_dict(self, batch_idx):
         "swap between batches"
@@ -28,6 +30,29 @@ class InferenceParams:
                 new_inference_value_memory,
             )
 
+    def enable_prefill_mode(self):
+        """
+        Indicates the generation loop is in the prefill phase (still processing
+        input prompt tokens). This should be enabled if the generation loop is
+        encoding prompt tokens for *any* request in a batch.
+        """
+        self.decode_mode = False
+
+    def enable_decode_mode(self):
+        """
+        Indicates the generation loop is in the decode phase (generating new output
+        tokens). This should only be enabled if the generation loop has fully encoded
+        the prompts for *all* requests in a batch.
+        """
+        self.decode_mode = True
+
+    def reset(self):
+        """Resets the inference state for a new batch."""
+        self.current_batch_size = self.max_batch_size
+        self.sequence_len_offset = 0
+        self.batch_size_offset = 0
+        self.enable_prefill_mode()
+
     def __str__(self):
         return (
             f"InferenceParams(max_seq_len = {self.max_sequence_length}, "
@@ -36,6 +61,7 @@ class InferenceParams:
             f"sequence_len_offset = {self.sequence_len_offset}, "
             f"batch_size_offset = {self.batch_size_offset}, "
             f"key_value_memory_dict = {self.key_value_memory_dict.keys()})"
+            f"decode_mode = {self.decode_mode}"
         )
 
     def __eq__(self, other):
@@ -66,6 +92,9 @@ class InferenceParams:
 
             # Compare each key, value tensor in the tuple
             for self_tensor, other_tensor in zip(self_tensors, other_tensors):
-                if not self_tensor.shape == other_tensor.shape:
+                if (
+                    self_tensor.data_ptr() != other_tensor.data_ptr()
+                    or self_tensor.shape != other_tensor.shape
+                ):
                     return False
         return True

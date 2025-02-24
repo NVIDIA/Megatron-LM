@@ -19,6 +19,11 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
+    pipeline_model_parallel_comm_backend: Optional[str] = None
+    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
+       If None, the default backend will be used.
+    """
+
     pipeline_model_parallel_size: int = 1
     """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
 

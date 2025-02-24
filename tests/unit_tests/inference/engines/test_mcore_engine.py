@@ -30,9 +30,12 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 xm=get_xla_model()
 
 class TestMCoreEngine:
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1,pipeline_model_parallel_size=1)
-        model_parallel_device_manual_seed(123)          
+    def setup_engine(self, engine_max_batch_size=None):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+        model_parallel_device_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 12
         self.vocab_size = 100
@@ -56,6 +59,7 @@ class TestMCoreEngine:
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.hidden_size,
             inference_batch_times_seqlen_threshold=400,
+            inference_max_requests=self.batch_size,
             fp32_residual_connection=False,
             params_dtype=torch.float,
             padded_vocab_size=self.vocab_size,
@@ -67,14 +71,29 @@ class TestMCoreEngine:
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
         )
 
-        self.mcore_engine = MCoreEngine(
-            text_generation_controller=text_generation_controller, max_batch_size=4
-        )
+        if engine_max_batch_size is not None and engine_max_batch_size > self.batch_size:
+            with pytest.warns(UserWarning):
+                self.mcore_engine = MCoreEngine(
+                    text_generation_controller=text_generation_controller,
+                    max_batch_size=engine_max_batch_size,
+                )
+        else:
+            self.mcore_engine = MCoreEngine(
+                text_generation_controller=text_generation_controller,
+                max_batch_size=engine_max_batch_size,
+            )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_generate(self):
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.parametrize(
+        "batch_size,num_trials,empty_prompt",
+        [(4, 1, False), (4, 1, True), (4, 3, False), (2, 1, False), (8, 1, False)],
+    )
+    def test_generate(self, batch_size: int, num_trials: int, empty_prompt: bool):
+        self.setup_engine(engine_max_batch_size=batch_size)
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
         # Generating random length integer prompts
@@ -86,46 +105,28 @@ class TestMCoreEngine:
             random.choices(string.ascii_letters, k=random.randint(4, 10))
         )
 
-        prompts = ["What is AI?" * (i + 1) for i in range(self.batch_size)]
-        results: List[InferenceRequest] = self.mcore_engine.generate(
-            prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
-        )
+        for _ in range(num_trials):
+            if empty_prompt:
+                prompts = ["" for i in range(batch_size)]
+            else:
+                prompts = ["sample" * (i + 1) for i in range(batch_size)]
+            results: List[InferenceRequest] = self.mcore_engine.generate(
+                prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
+            )
 
-        for result in results:
-            assert (
-                result.status == Status.COMPLETED
-            ), f"Status should be completed but its {result.status}"
-            assert result.generated_length > 0, f"Generated length should be greater than zero"
-            assert result.generated_text is not None, f'Generated text should not be None'
-
-    def test_generate_empty_prompt(self):
-        self.mock_tokenizer.vocab_size = self.vocab_size
-        self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.bos = self.vocab_size - 2
-        # Generating random length integer prompts
-        self.mock_tokenizer.tokenize.return_value = [
-            random.randint(0, self.vocab_size - 1) for _ in range(random.randint(5, 10))
-        ]
-        # Generates some random string
-        self.mock_tokenizer.detokenize.return_value = ''.join(
-            random.choices(string.ascii_letters, k=random.randint(4, 10))
-        )
-
-        prompts = ["" for i in range(self.batch_size)]
-        results: List[InferenceRequest] = self.mcore_engine.generate(
-            prompts, add_BOS=True, sampling_params=SamplingParams(num_tokens_to_generate=10)
-        )
-
-        for result in results:
-            assert (
-                result.status == Status.COMPLETED
-            ), f"Status should be completed but its {result.status}"
-            assert result.generated_length > 0, f"Generated length should be greater than zero"
-            assert result.generated_text is not None, f'Generated text should not be None'
+            assert len(results) == batch_size
+            for result in results:
+                assert (
+                    result.status == Status.COMPLETED
+                ), f"Status should be completed but its {result.status}"
+                assert result.generated_length > 0, f"Generated length should be greater than zero"
+                assert result.generated_text is not None, f'Generated text should not be None'
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(xm, reason="Not suported for XLA")
     async def test_streaming(self):
+        self.setup_engine()
+
         async def collect_stream(stream_generator, num_tokens_to_generate):
             prev_log_probs = None
             prev_text = ""
@@ -220,34 +221,3 @@ class TestMCoreEngine:
                 f"result.generated_log_probs={result.generated_log_probs}, "
                 f"final_streamed_token.generated_log_probs={final_streamed_token.generated_log_probs}"
             )
-
-    def test_multiple_generations(self):
-        self.mock_tokenizer.vocab_size = self.vocab_size
-        self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.bos = self.vocab_size - 2
-        # Generating random length integer prompts
-        self.mock_tokenizer.tokenize.return_value = [
-            random.randint(0, self.vocab_size - 1) for _ in range(random.randint(5, 10))
-        ]
-        # Generates some random string
-        self.mock_tokenizer.detokenize.return_value = ''.join(
-            random.choices(string.ascii_letters, k=random.randint(4, 10))
-        )
-
-        num_trials = 3
-        for i in range(num_trials):
-            prompts = ["sample" * (i * self.batch_size + j + 1) for j in range(self.batch_size)]
-            results: List[InferenceRequest] = self.mcore_engine.generate(
-                prompts, add_BOS=True, sampling_params=SamplingParams(num_tokens_to_generate=10)
-            )
-
-            assert (
-                len(results) == self.batch_size
-            ), f"Number of returned results should equal batch size"
-
-            for result in results:
-                assert (
-                    result.status == Status.COMPLETED
-                ), f"Status should be completed but its {result.status}"
-                assert result.generated_length > 0, f"Generated length should be greater than zero"
-                assert result.generated_text is not None, f'Generated text should not be None'

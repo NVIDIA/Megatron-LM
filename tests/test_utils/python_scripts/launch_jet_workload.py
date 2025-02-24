@@ -306,7 +306,8 @@ def main(
             n_attempts += 1
             continue
 
-        print(f"Logs:\n{concat_logs}")
+        if test_type != "release":
+            print(f"Logs:\n{concat_logs}")
 
         success = pipeline.get_status() == PipelineStatus.SUCCESS
         logger.info("Pipeline terminated with status %s", pipeline.get_status().name)

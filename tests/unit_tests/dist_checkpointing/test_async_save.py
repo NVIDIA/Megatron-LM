@@ -108,5 +108,6 @@ class TestAsyncSave:
 
             finally:
                 FileSystemWriterAsync.write_preloaded_data = orig_fn
-
+                torch.distributed.barrier(group=parallel_state.get_default_process_group())
+                
         Utils.destroy_model_parallel()

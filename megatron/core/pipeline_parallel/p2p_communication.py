@@ -200,11 +200,17 @@ def _p2p_ops(
 ):
     reqs = {}
     even_send_odd_recv_group = group
-    if get_pipeline_model_parallel_world_size() == 2:
+    if (
+        get_pipeline_model_parallel_world_size() == 2
+        and torch.distributed.get_backend(group) != 'ucc'
+    ):
         # Use the global process group for one of the two p2p communications
         # to allow the overlap of the independent communications.
         # Using the global process group is compatible because the pipeline-parallel
         # communications set the source and destination by global rank.
+        # The only exception occurs when using the ‘ucc’ backend.
+        # Because the global communicator always uses the ‘nccl’ backend,
+        # we must ensure the else path is followed for the ‘ucc’ backend.
         even_recv_odd_send_group = torch.distributed.group.WORLD
     else:
         even_recv_odd_send_group = group
