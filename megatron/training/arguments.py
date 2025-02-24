@@ -409,7 +409,7 @@ def validate_args(args, defaults={}):
         assert not args.use_legacy_models, \
             '--overlap-param-gather only supported with MCore models'
 
-    if getattr(args, "use_torch_fsdp2", False):
+    if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), \
             'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert args.pipeline_model_parallel_size == 1, \
@@ -654,7 +654,7 @@ def validate_args(args, defaults={}):
     # model parallel memory optimization is enabled
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
-        if getattr(args, "use_torch_fsdp2", False):
+        if args.use_torch_fsdp2:
             warnings.warn(
                 "Using sequence parallelism with FSDP2 together. Try not to using them "
                 "together since they require different CUDA_MAX_CONNECTIONS settings "
@@ -1888,7 +1888,7 @@ def _add_distributed_args(parser):
     group.add_argument('--lazy-mpu-init', type=bool, required=False,
                        help='If set to True, initialize_megatron() '
                        'skips DDP initialization and returns function to '
-                       'complete it instead.Also turns on '
+                       'complete it instead. Also turns on '
                        '--use-cpu-initialization flag. This is for '
                        'external DDP manager.' )
     group.add_argument('--account-for-embedding-in-pipeline-split', action='store_true',
