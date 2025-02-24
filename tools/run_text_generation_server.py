@@ -5,6 +5,8 @@ import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
+
+from megatron.inference.text_generation import generate_and_post_process, beam_search_and_post_process
 from megatron.training import print_rank_0
 from megatron.core.models.gpt import GPTModel
 from megatron.training.arguments import core_transformer_config_from_args
@@ -21,6 +23,7 @@ from typing import Union
 import megatron
 
 import os
+import torch
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 import sys
 from argparse import Namespace
@@ -186,3 +189,19 @@ if __name__ == "__main__":
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(model, inference_engine, args)
         server.run("0.0.0.0",port=args.port)
+
+    while True:
+        choice = torch.tensor(1, dtype=torch.long, device="cuda")
+        torch.distributed.broadcast(choice, 0)
+        #print(f"I am rank {torch.distributed.get_rank()} and I got broadcasted")
+        if choice.item() == 0:
+            try:
+                generate_and_post_process(model)
+            except ValueError as ve:
+                pass
+        elif choice.item() == 1:
+            try:
+                beam_search_and_post_process(model)
+            except ValueError as ve:
+                pass
+
