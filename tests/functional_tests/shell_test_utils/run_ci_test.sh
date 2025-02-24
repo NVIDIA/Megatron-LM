@@ -113,20 +113,6 @@ for i in $(seq 1 $N_REPEAT); do
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi
 
-    # Save run results
-    export PYTHONPATH=$ROOT_DIR
-    if [[ "$TEST_TYPE" == "release" ]]; then
-        EXTRACT_ARGS=("--is-convergence-test")
-    else
-        EXTRACT_ARGS=("--is-normal-test")
-    fi
-
-    python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-        --logs-dir $TENSORBOARD_PATH \
-        --train-iters $TRAIN_ITERS \
-        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
-        "${EXTRACT_ARGS[@]}"
-
     if [[ "$TEST_TYPE" == "release" ]]; then
         SKIP_PYTEST=0
     fi
@@ -138,6 +124,20 @@ for i in $(seq 1 $N_REPEAT); do
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
+        # Save run results
+        export PYTHONPATH=$ROOT_DIR
+        if [[ "$TEST_TYPE" == "release" ]]; then
+            EXTRACT_ARGS=("--is-convergence-test")
+        else
+            EXTRACT_ARGS=("--is-normal-test")
+        fi
+
+        python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+            --logs-dir $TENSORBOARD_PATH \
+            --train-iters $TRAIN_ITERS \
+            --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+            "${EXTRACT_ARGS[@]}"
+
         export NVTE_ALLOW_NONDETERMINISTIC_ALGO
         if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" ]]; then
             ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"
