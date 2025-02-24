@@ -237,6 +237,7 @@ class Muon(torch.optim.Optimizer):
             ns_steps = group["ns_steps"]
             weight_decay = group["weight_decay"]
             matched_adamw_rms = group["matched_adamw_rms"]
+            params = group["params"]
 
             for p in params:
 
