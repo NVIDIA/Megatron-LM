@@ -1,9 +1,8 @@
-# TODO: Where to put eval output?
-# TODO: Support nodes>1 maybe?
-# TODO: Currently tp*pp>1 hangs :(
-# TODO: Need to update completions to use MCoreEngine
+#Recommended tasks: winogrande,piqa,social_iqa,openbookqa,arc_easy,commonsense_qa,triviaqa,mmlu_continuation,gsm8k,global_mmlu_ar,global_mmlu_bn,global_mmlu_de,global_mmlu_en,global_mmlu_es,global_mmlu_fr,global_mmlu_hi,global_mmlu_id,global_mmlu_it,global_mmlu_ja,global_mmlu_ko,global_mmlu_pt,global_mmlu_sw,global_mmlu_yo,global_mmlu_zh,wikitext,lambada
 
 # Define default variables.
+GPUS_PER_NODE=4
+
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_DIR=$PWD/"eval-logs"
 DEF_SBATCH_PATH=$PWD/evaluate.sbatch
@@ -12,14 +11,19 @@ DEF_LM_HARNESS_PATH="/capstor/store/cscs/swissai/a06/users/ahernnde/workspace/lm
 DEF_ACCOUNT=a-a06
 DEF_TOKENIZER=/users/fsimin/tokenizer_nemo/
 
-DEF_IT=latest
-DEF_TASKS=arc_easy
-DEF_LIMIT=1000
+ITERATION=latest
+TASKS=arc_easy
+LIMIT=null
+BS=1
+CONVERT_TO_HF=false
 
 # Usage function.
 usage () {
 	echo "Usage: submit_evaluation.sh <checkpoint-path> [options...]"
-	echo "Submits a slurm sbatch to run evaluation of the specified path. Specify either --size or --tp and --pp in order to convert the checkpoint to a more efficient distributed config for inference."
+	echo "Submits a slurm sbatch to run evaluation of the specified path. The checkpoint-path should either be a megatron checkpoint or a huggingface model. This is determining by looking for checkpoint-path/latest_checkpointed_iteration.txt."
+	echo "If a megatron checkpoint is given, you can add --convert-to-hf to convert the checkpoint to HF for faster inference (highly recommended if there is a HF implementation available). Otherwise the slower api endpoint will be used." 
+	echo "On all cases, specify either --size or --tp and --pp in order to convert the checkpoint to a more efficient distributed config for inference."
+	echo "If a hf checkpoint is given (or --convert-to-hf is set), DP will be enabled as long as TP*PP<NUM_GPUS_PER_NODE."
 	echo "In addition, there are a few environment variables you can set to specify some paths (optional)."
 	echo ""
 	echo "Arguments:"
@@ -27,12 +31,14 @@ usage () {
 	echo ""
 	echo "Options:"
 	echo "  --help: Prints this message and exits."
-	echo "  --size (choices={1, 3, 8, 70}): The size of the checkpoint to evaluate. If not set, --tp and --pp should be specified."
-	echo "  --tasks: lm-eval-harness tasks to run (default=$DEF_TASKS)."
-	echo "  --limit (int>0 or 'null'): lm-eval-harness limit samples per task (default=$DEF_LIMIT)."
+	echo "  --size (choices={1, 3, 8, 70}): The size of the checkpoint to evaluate. If not set, --tp and --pp should be specified. This only sets --tp and --pp for you."
+	echo "  --convert-to-hf: When set, if a megatron checkpoint is given, the model will be converted to HF."
+	echo "  --tasks: lm-eval-harness tasks to run (default=$TASKS)."
+	echo "  --limit (int>0 or 'null'): lm-eval-harness limit samples per task (default=$LIMIT)."
 	echo "  --tp (int>0): Target TP size for inference. Ignored if --size is set, required otherwise."
 	echo "  --pp (int>0): Target PP size for inference. Ignored if --size is set, required otherwise."
-	echo "  --iteration (int>0 | 'latest'): What iteration to evaluate (default=$DEF_IT)"
+	echo "  --bs (int>0): Batch size used for inference (default=$BS)."
+	echo "  --iteration (int>0 | 'latest'): What iteration to evaluate (default=$ITERATION)"
 	echo "  --wandb-project"
 	echo "  --wandb-entity"
 	echo "  --wandb-id"
@@ -98,8 +104,12 @@ while [[ $# -gt 0 ]]; do
 
 		--tasks)
 			TASKS=$2; shift 2;;
+		--bs)
+			BS=$2; shift 2;;
 		--limit)
 			LIMIT=$2; shift 2;;
+		--convert-to-hf)
+			CONVERT_TO_HF=true; shift;;
 		--iteration)
 			ITERATION=$2; shift 2;;
 		--wandb-project)
@@ -138,22 +148,16 @@ if [ -z ${PP+x} ]; then
 	exit 1
 fi
 
-if [ -z ${ITERATION+x} ]; then
-	ITERATION=$DEF_IT
-fi
-if [ -z ${TASKS+x} ]; then
-	TASKS=$DEF_TASKS
-fi
-if [ -z ${LIMIT+x} ]; then
-	LIMIT=$DEF_LIMIT
-fi
-
 # Build eval args depending on this scripts args.
 if [ $LIMIT != null ]; then
 	LIMIT_ARGS="--limit=$LIMIT"
 fi
 if [ $ITERATION = latest ]; then
-	ITERATION=$(cat $CHECKPOINT_PATH/latest_checkpointed_iteration.txt)
+	if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
+		ITERATION=$(cat $CHECKPOINT_PATH/latest_checkpointed_iteration.txt)
+	else
+		ITERATION=1
+	fi
 fi
 
 if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_ID+x} ]; then
@@ -164,32 +168,55 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=$ITERATION"
 fi
 
-# Make sure TP and PP settings make sense.
-GPUS_PER_NODE=4
-WORLD_SIZE=$(($TP*PP))
-if (( WORLD_SIZE > GPUS_PER_NODE )); then
-	echo "tp*pp > gpus_per_node not supported yet" >&2
-	exit 1
-fi
-if [ $WORLD_SIZE -eq 0 ]; then  # TODO: fix this optimization, not used for now as WORLD_SIZE>0 always.
-	echo "tp*pp = 1. DP optimization enabled"
-	NPROC_PER_NODE=$GPUS_PER_NODE
-	DP=$GPUS_PER_NODE
-else
-	NPROC_PER_NODE=$WORLD_SIZE
-	DP=1
-fi
-
 # Some useful variables.
 JOBNAME=evaluate_$(echo $CHECKPOINT_PATH | tr / _)
 ENDPOINT_PORT=5000
-MBS=1
-TORCHRUN_ARGS=(
-	--nproc-per-node $NPROC_PER_NODE
-	--nnodes 1
-	--master-addr localhost
-	--master-port $(($ENDPOINT_PORT + 1000))
-)
+
+COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS"
+if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF != true ]; then
+	echo Megatron checkpoint detected!
+	echo "WARNING! No conversion to HF will be done. Please specify HF implementation if available, otherwise evaluation will be slower."
+	WORLD_SIZE=$(($TP*PP))
+	if (( WORLD_SIZE > GPUS_PER_NODE )); then
+		echo "tp*pp > gpus_per_node not supported yet" >&2
+		exit 1
+	fi
+	read -r -d '' CMD_SERVER <<- EOM
+	# Launch inference endpoint.
+	echo Spinning inference endpoint
+	cd $MEGATRON_PATH
+	torchrun --nproc-per-node=$WORLD_SIZE --master-addr=localhost --master-port=$(($ENDPOINT_PORT + 1000)) tools/run_text_generation_server.py --tensor-model-parallel-size=$TP --pipeline-model-parallel-size=$PP --use-checkpoint-args --load=$CHECKPOINT_PATH --bf16 --micro-batch-size=$BS --max-batch-size=$BS --tokenizer-type=HuggingFaceTokenizer --tokenizer-model=$TOKENIZER --seed=42 --port=$ENDPOINT_PORT --ckpt-step=$ITERATION --finetune --max-tokens-to-oom=4194304 &
+
+	EOM
+	CMD_EVAL="lm_eval --model=local-completions --model_args=base_url=http://localhost:5000/completions,tokenized_requests=False,tokenizer=$TOKENIZER,num_concurrent=0,timeout=43200,max_retries=1,max_length=4096 $COMMON_EVAL_ARGS"
+else
+	if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
+		echo Megatron checkpoint detected!
+		echo Checkpoint will be converted to HF
+
+		read -r -d '' CMD_CONVERT <<- EOM
+		# Create tempfile.
+		HF_TEMP_PATH=\$(mktemp -d -p $SCRATCH/tmp)
+		TORCH_NODIST_PATH=\$(mktemp -d -p $SCRATCH/tmp)
+		function cleanup {
+			rm -rf \$HF_TEMP_PATH
+			rm -rf \$TORCH_NODIST_PATH
+		}
+		trap cleanup EXIT
+
+		# Convert from megatron to HF.
+		cd $MEGATRON_PATH
+		torchrun --nproc-per-node=$WORLD_SIZE --master-addr=localhost --master-port=$ENDPOINT_PORT tools/checkpoint/convert_torchdist.py --ckpt-step=$ITERATION --load=$CHECKPOINT_PATH --save=\$TORCH_NODIST_PATH
+		python tools/checkpoint/convert.py --load=\$TORCH_NODIST_PATH --save=\$HF_TEMP_PATH
+		EOM
+		HF_CHECKPOINT_PATH=\$HF_TEMP_PATH
+	else
+		echo Huggingface checkpoint detected!
+		HF_CHECKPOINT_PATH=$CHECKPOINT_PATH
+	fi
+
+	CMD_EVAL="accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096 $COMMON_EVAL_ARGS"
+fi
 
 # Now let's prepare the sbatch.
 cat > $SBATCH_PATH <<- EOM
@@ -217,15 +244,13 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	export CUDA_DEVICE_MAX_CONNECTIONS=1
 	set -e
 
-	# Step 1: Launch inference endpoint.
-	echo Spinning inference endpoint
-	cd $MEGATRON_PATH
-	torchrun ${TORCHRUN_ARGS[@]} tools/run_text_generation_server.py --tensor-model-parallel-size=$TP --pipeline-model-parallel-size=$PP --use-checkpoint-args --load=$CHECKPOINT_PATH --bf16 --micro-batch-size=$MBS --max-batch-size=$DP --tokenizer-type=HuggingFaceTokenizer --tokenizer-model=$TOKENIZER --seed=42 --port=$ENDPOINT_PORT --ckpt-step=$ITERATION --finetune &
+	$CMD_CONVERT
+	$CMD_SERVER
 
-	# Step 2: Launch lm-harness.
-	echo Running lm-eval-harness.
+	# Launch eval.
 	cd $LM_HARNESS_PATH
-	python lm_eval/__main__.py --model local-completions --tasks $TASKS --model_args base_url=http://localhost:5000/completions,tokenized_requests=False,tokenizer=$TOKENIZER,num_concurrent=8,timeout=43200 --batch_size=$DP --output=eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS
+	python -m pip install -e .[api]
+	HF_HOME=$SCRATCH/huggingface $CMD_EVAL
 "
 EOM
 
