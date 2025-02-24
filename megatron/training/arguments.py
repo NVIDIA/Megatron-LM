@@ -1281,6 +1281,15 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--muon-matched-adamw-rms', type=float, default=0.2,
+                       help="The RMS of the matched AdamW's, typically 0.2 ~ 0.4")
+    group.add_argument('--muon-momentum', type=float, default=0.95,
+                       help='Momentum beta for muon')
+    group.add_argument('--muon-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schultz iteartion steps for muon')
+    group.add_argument('--no-muon-nesterov', action='store_false',
+                       dest='muon_nesterov', default=True,
+                       help='If set, disable Nesterov momentum for muon')
     return parser
 
 
@@ -1485,7 +1494,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'muon'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
