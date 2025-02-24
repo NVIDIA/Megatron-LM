@@ -891,26 +891,32 @@ class MLATransformerConfig(TransformerConfig):
     v_head_dim: int = 128
     """Dimension of the head in the V projection."""
 
-    rotary_base: float = 10000
-    """Rotary base for the rotary embeddings."""
-
-    rotary_scaling_factor: float = 40
-    """Rotary scaling factor for the rotary embeddings."""
-
     normalization: str = "RMSNorm"
     """Default normalization layer for MLA models is RMSNorm."""
 
-    max_position_embeddings: int = 163840
-    """Maximum position embeddings for the original model."""
+    rope_type: str = "yarn"
+    """Type of RoPE to use. Default to yarn, options are rope and yarn."""
+
+    rotary_base: float = 10000
+    """Rotary base for the rotary embeddings, used by rope and yarn."""
+
+    rotary_percent: float = 1.0
+    """Rotary percent for the rotary embeddings, used by rope."""
+
+    rotary_scaling_factor: float = 40
+    """Rotary scaling factor for the rotary embeddings, used by yarn."""
+
+    max_position_embeddings: int = 4096
+    """Maximum position embeddings for the original model, used by yarn."""
 
     beta_fast: float = 32
-    """Beta fast for YaRN RoPE."""
+    """Beta fast for YaRN RoPE, used by yarn."""
 
     beta_slow: float = 1
-    """Beta slow for YaRN RoPE."""
+    """Beta slow for YaRN RoPE, used by yarn."""
 
     mscale: float = 0.707
-    """Mscale for YaRN RoPE in Multi-Latent Attention."""
+    """Mscale for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
     mscale_all_dim: float = 0.707
-    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention."""
+    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
