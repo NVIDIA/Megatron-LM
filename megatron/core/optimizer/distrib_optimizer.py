@@ -444,7 +444,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         model_chunks: List[MegatronModule],
         per_model_buffers: Dict[int, List[_ParamAndGradBuffer]],
         data_parallel_group: torch.distributed.ProcessGroup,
-        data_parallel_group_gloo: torch.distributed.ProcessGroup,
+        data_parallel_group_gloo: Optional[torch.distributed.ProcessGroup],
         data_parallel_group_idx: int,
         distributed_optimizer_instance_id: int,
     ):
@@ -888,6 +888,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # Data parallelism variables.
+        assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
         data_parallel_rank = torch.distributed.get_rank(self.data_parallel_group_gloo)
         data_parallel_group_gloo = self.data_parallel_group_gloo
@@ -1373,6 +1374,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # Data parallelism variables.
+        assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
         data_parallel_rank = torch.distributed.get_rank(self.data_parallel_group_gloo)
         data_parallel_group_gloo = self.data_parallel_group_gloo
@@ -1488,6 +1490,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return self.load_parameter_state_from_dp_zero_legacy(state_dict)
 
         # Data parallelism variables.
+        assert self.data_parallel_group_gloo is not None
         data_parallel_world_size = self.data_parallel_group_gloo.size()
         data_parallel_rank = torch.distributed.get_rank(self.data_parallel_group_gloo)
         data_parallel_group_gloo = self.data_parallel_group_gloo

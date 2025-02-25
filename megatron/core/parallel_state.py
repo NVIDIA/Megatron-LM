@@ -448,6 +448,7 @@ def initialize_model_parallel(
     encoder_pipeline_model_parallel_size: Optional[int] = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
+    create_gloo_process_groups: bool = True,
 ) -> None:
     # pylint: disable=line-too-long
     """Initialize model data parallel groups.
@@ -565,6 +566,10 @@ def initialize_model_parallel(
         get_position_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
             A function that takes in a list of ranks for a pipeline group, and returns
             those ranks that should have position embeddings.
+
+        create_gloo_process_groups (bool, default = True):
+            Create Gloo process groups if set to True. If set to False, Gloo process groups are
+            not created and calls to get Gloo process groups will result in assertion errors.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -774,9 +779,12 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('dp', nccl_comm_cfgs),
             group_desc='DATA_PARALLEL_GROUP',
         )
-        group_gloo = create_group(
-            ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
-        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
+            )
+        else:
+            group_gloo = None
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -798,13 +806,15 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
             group_desc='DATA_PARALLEL_GROUP_WITH_CP',
         )
-        group_with_cp_gloo = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            backend="gloo",
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
-        )
-
+        if create_gloo_process_groups:
+            group_with_cp_gloo = create_group(
+                ranks_with_cp,
+                timeout=timeout,
+                backend="gloo",
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+            )
+        else:
+            group_with_cp_gloo = None
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
@@ -826,12 +836,15 @@ def initialize_model_parallel(
                     pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
                     group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
                 )
-                intra_partial_data_parallel_group_with_cp_gloo = create_group(
-                    intra_partial_data_parallel_ranks_with_cp,
-                    timeout=timeout,
-                    backend="gloo",
-                    group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
-                )
+                if create_gloo_process_groups:
+                    intra_partial_data_parallel_group_with_cp_gloo = create_group(
+                        intra_partial_data_parallel_ranks_with_cp,
+                        timeout=timeout,
+                        backend="gloo",
+                        group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                    )
+                else:
+                    intra_partial_data_parallel_group_with_cp_gloo = None
 
                 if rank in intra_partial_data_parallel_ranks_with_cp:
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
@@ -1163,9 +1176,12 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('ep_dp', nccl_comm_cfgs),
             group_desc='EXPERT_DATA_PARALLEL_GROUP',
         )
-        group_gloo = create_group(
-            ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
-        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
+            )
+        else:
+            group_gloo = None
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo

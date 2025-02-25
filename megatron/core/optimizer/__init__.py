@@ -414,6 +414,7 @@ def get_megatron_optimizer(
     no_weight_decay_cond: Optional[Callable] = None,
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
+    use_gloo_process_groups: bool = True,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -428,6 +429,8 @@ def get_megatron_optimizer(
             should have a scaled learning rate. Defaults to None.
         lr_mult (float, optional): learning rate multiplier for parameters that
             satisfy scale_lr_cond. Defaults to 1.0.
+        use_gloo_process_groups (bool): if false, disable use of Gloo process groups
+            in underlying Megatron optimizers.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -475,6 +478,13 @@ def get_megatron_optimizer(
                 overlap_param_gather_with_optimizer_step
             )
 
+        # Pass Gloo process groups into optimizer only if needed.
+        if use_gloo_process_groups:
+            data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(
+                with_context_parallel=True, partial_data_parallel=True
+            )
+        else:
+            data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
@@ -485,9 +495,7 @@ def get_megatron_optimizer(
                 data_parallel_group=mpu.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=True
                 ),
-                data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
-                    with_context_parallel=True, partial_data_parallel=True
-                ),
+                data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
@@ -508,6 +516,11 @@ def get_megatron_optimizer(
         model_parallel_rank = torch.distributed.get_rank(
             mpu.get_expert_tensor_model_pipeline_parallel_group()
         )
+        # Pass Gloo process groups into optimizer only if needed.
+        if use_gloo_process_groups:
+            data_parallel_group_gloo = mpu.get_expert_data_parallel_group_gloo()
+        else:
+            data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
@@ -516,7 +529,7 @@ def get_megatron_optimizer(
                 per_model_buffers=moe_buffers,
                 model_parallel_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
                 data_parallel_group=mpu.get_expert_data_parallel_group(),
-                data_parallel_group_gloo=mpu.get_expert_data_parallel_group_gloo(),
+                data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
             )
         )

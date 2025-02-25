@@ -714,7 +714,8 @@ def setup_model_and_optimizer(model_provider_func,
     config = OptimizerConfig(**kwargs)
     config.timers = timers
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
+                                       scale_lr_cond, lr_mult,
+                                       use_gloo_process_groups=args.enable_gloo_process_groups)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.moe_use_upcycling:
