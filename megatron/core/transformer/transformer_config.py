@@ -267,12 +267,10 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared epxerts execute after the routed experts."""
 
-    moe_layer_freq: int = 1
+    moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
-    - A string containing a Python list expression that defines a custom pattern, e.g.:
-    "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
-    where 1 indicates an expert layer and 0 indicates a dense layer."""
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
     moe_ffn_hidden_size: Optional[int] = None
     """MoE Feed-Forward Network hidden size"""
