@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
 import torch
@@ -16,6 +16,7 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.moe.fused_a2a import fused_combine, fused_dispatch
 from megatron.core.transformer.moe.moe_utils import (
     get_capacity,
     permute,
@@ -102,6 +103,7 @@ class MoETokenDispatcher:
 
     def set_shared_experts(self, shared_experts):
         """Set shared expert to the dispatcher."""
+        assert self.config.moe_shared_expert_overlap
         self.shared_experts = shared_experts
 
 
@@ -541,7 +543,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                         self.tp_size * self.ep_size,
                         self.num_local_experts,
                         self.capacity,
-                        *global_input_tokens.size()[1:]
+                        *global_input_tokens.size()[1:],
                     )
                     .transpose(0, 1)
                     .contiguous()
@@ -590,7 +592,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                         self.num_local_experts,
                         self.tp_size * self.ep_size,
                         self.capacity,
-                        *hidden_states.size()[1:]
+                        *hidden_states.size()[1:],
                     )
                     .transpose(0, 1)
                     .contiguous()
@@ -641,3 +643,259 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
         return output, None
+
+
+class _DispatchManager(ABC):
+    """
+    A manager class to handle dispatch and combine processes for MoE models.
+
+    DispatcherManager handles token dispatching according to the routing_map of format
+    [num_local_tokens, world_size, num_instances]. The routing_map is a 3D tensor where each
+    element indicates whether a token should be sent to a specific rank.
+
+    num_instances is the maximum number of tokens instances dispatched into a target rank, it
+    can be the number of local experts, or the size of sub_group.
+    """
+
+    @abstractmethod
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        """Set up metadata of routing_map and probs."""
+        pass
+
+    @abstractmethod
+    def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Dispatch the hidden_states according to the routing_map."""
+        pass
+
+    @abstractmethod
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Combine the hidden_states after expert processing."""
+        pass
+
+    @abstractmethod
+    def get_dispached_metadata(self) -> torch.Tensor:
+        """Get the metadata of the dispatched hidden_states."""
+        pass
+
+    @abstractmethod
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Get the permuted hidden states by instances."""
+        pass
+
+    @abstractmethod
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Get the restored hidden states by instances."""
+        pass
+
+
+class _DeepepManager(_DispatchManager):
+    """
+    A manager class to handle fused all-to-all communication processes for MoE models using
+    DeepEP backend. See https://github.com/deepseek-ai/deepep for more details.
+
+    The workflow of the DeepEP dispatcher is:
+    (1) setup_metadata(): Process routing map and probabilities to prepare dispatch metadata
+    (2) dispatch():
+        - Use fused kernel to permute tokens and perform all-to-all communication in single step
+    (3) get_permuted_hidden_states_by_instances():
+        - Convert routing map and probabilities to multihot format
+        - Permute tokens using fused kernel
+    (4) get_restored_hidden_states_by_instances():
+        - Reverse permutation using fused kernel
+    (5) combine():
+        - Reverse process using fused kernel to unpermute and perform all-to-all in single step
+
+    This implementation uses fused communication kernels (fused_dispatch/fused_combine) that
+    combine permutation and communication operations for improved efficiency compared to
+    separate permute+alltoall steps.
+    """
+
+    def __init__(
+        self, group: torch.distributed.ProcessGroup, router_topk: int, permute_fusion: bool = False
+    ):
+        self.group = group
+        self.router_topk = router_topk
+
+        # Metadata
+        self.token_indices = None
+        self.token_probs = None
+        # Handle used for combine operation
+        self.handle = None
+
+        self.permute_fusion = permute_fusion
+
+        if fused_dispatch is None:
+            raise ImportError(
+                "DeepEP is not installed. Please install DeepEP package from "
+                "https://github.com/deepseek-ai/deepep."
+            )
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        self.num_instances = routing_map.shape[-1]
+
+        probs = probs.reshape(probs.shape[0], -1)
+        self.num_experts = probs.shape[-1]
+        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+
+    def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
+            fused_dispatch(
+                hidden_states, self.token_indices, self.token_probs, self.num_experts, self.group
+            )
+        )
+        self.handle = handle
+        self.tokens_per_expert = num_tokens_per_expert
+        self.dispatched_indices = dispatched_indices
+        self.dispatched_probs = dispatched_probs
+
+        return hidden_states
+
+    def _indices_to_multihot(self, indices, probs):
+        """
+        Converts a tensor of indices to a multihot vector efficiently in PyTorch.
+
+        Args:
+            indices (torch.Tensor): [num_tokens, topk] token indices, where -1 means masked out.
+            probs (torch.Tensor): [num_tokens, topk] token probabilities.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - routing_map: Multihot vector.
+                - probs: Multihot probabilities.
+        """
+        batch_size = indices.shape[0]
+        multihot_routing_map = torch.zeros(
+            (batch_size, self.num_instances), dtype=torch.long, device=indices.device
+        )
+
+        multihot_probs = torch.zeros(
+            (batch_size, self.num_instances), dtype=torch.float, device=indices.device
+        )
+
+        mask = indices != -1
+        valid_indices = indices[mask]
+        row_indices = torch.arange(batch_size, device=indices.device).repeat_interleave(
+            mask.sum(dim=1)
+        )
+        multihot_routing_map[row_indices, valid_indices] = 1
+        multihot_probs[row_indices, valid_indices] = probs[mask]
+        return multihot_routing_map.bool(), multihot_probs
+
+    def get_dispached_metadata(self) -> torch.Tensor:
+        return self.dispatched_indices, self.dispatched_probs
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        """
+        Get the number of tokens per expert.
+        """
+        return self.tokens_per_expert
+
+    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states, event = fused_combine(hidden_states, self.group, self.handle)
+        return hidden_states
+
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
+            self.dispatched_indices, self.dispatched_probs
+        )
+        self.hidden_shape_before_permute = hidden_states.shape
+        hidden_states, self.reversed_mapping_for_combine = permute(
+            hidden_states,
+            self.dispatched_routing_map,
+            num_out_tokens=sum(self.tokens_per_expert),
+            fused=self.permute_fusion,
+        )
+        return hidden_states
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
+        hidden_states = unpermute(
+            hidden_states,
+            self.reversed_mapping_for_combine,
+            restore_shape=self.hidden_shape_before_permute,
+            routing_map=self.dispatched_routing_map,
+            probs=self.dispatched_probs,
+            fused=self.permute_fusion,
+        )
+        return hidden_states.to(input_dtype)
+
+
+class MoEFlexTokenDispatcher(MoETokenDispatcher):
+    """
+    Flexible token dispatcher for MoE models with Efficient-A2A communication kernels.
+    """
+
+    def __init__(
+        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+    ):
+        super().__init__(config)
+
+        self.num_local_experts = num_local_experts
+        self.local_expert_indices = local_expert_indices
+        assert self.tp_size * self.ep_size > 1, "Flex token dispatcher requires TPxEP > 1"
+        assert (
+            self.config.moe_enable_deepep
+        ), "DeepEP is not enabled. Please set --moe-enable-deepep to use DeepEP backend."
+        self._comm_manager = _DeepepManager(
+            self.tp_ep_group,
+            self.tp_size * self.config.moe_router_topk,
+            permute_fusion=self.config.moe_permute_fusion,
+        )
+
+    def set_shared_experts(self, shared_experts):
+        raise NotImplementedError("Shared experts overlap not supported in flex token dispatcher")
+
+    def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
+        """
+        Initialize the routing map and probs to a unified format covering the TPxEP group.
+        This design decouples the communication group from underlying model parallelism groups,
+        such that the communication strategy of tokens can be agnostic of TP size and EP size.
+
+        This function expands the routing_map from shape [num_local_tokens, num_experts] to
+        [num_local_tokens, world_size, num_local_experts]. Each element in the routing_map
+        indicates whether a token should be sent to a specific rank. Specifically, the
+        routing_map is replicated across TP group since each TP ranks in a TP group should
+        receive the same tokens.
+        """
+        num_local_tokens = routing_map.shape[0]
+        world_size = self.tp_size * self.ep_size
+        # Organize routing map and probs to [num_local_tokens, world_size, num_local_experts]
+        routing_map = (
+            routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
+            .expand(-1, -1, self.tp_size, -1)
+            .reshape(num_local_tokens, world_size, self.num_local_experts)
+        ).contiguous()
+        probs = (
+            probs.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
+            .expand(-1, -1, self.tp_size, -1)
+            .reshape(num_local_tokens, world_size, self.num_local_experts)
+        ).contiguous()
+        return routing_map, probs
+
+    def token_permutation(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.hidden_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+
+        # Initialize metadata
+        routing_map, probs = self._initialize_metadata(routing_map, probs)
+
+        self._comm_manager.setup_metadata(routing_map, probs)
+        hidden_states = self._comm_manager.dispatch(hidden_states)
+        global_input_tokens = self._comm_manager.get_permuted_hidden_states_by_experts(
+            hidden_states
+        )
+        tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+
+        return global_input_tokens, tokens_per_expert
+
+    def token_unpermutation(
+        self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        assert bias is None, "Bias is not supported in MoEFlexTokenDispatcher"
+        hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
+        hidden_states = self._comm_manager.combine(hidden_states)
+
+        return hidden_states.view(self.hidden_shape), None
