@@ -351,7 +351,7 @@ class GPTDataset(MegatronDataset):
 
         if not path_to_cache or (
             not cache_hit
-            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() % torch.cuda.device_count() == 0)
         ):
 
             log_single_rank(
