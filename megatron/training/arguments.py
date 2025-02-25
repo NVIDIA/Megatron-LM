@@ -538,7 +538,7 @@ def validate_args(args, defaults={}):
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
-                     'max_position_embeddings']
+                     'max_position_embeddings', 'trigger_path']
     for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
@@ -813,6 +813,18 @@ def validate_args(args, defaults={}):
     elif args.replication_jump:
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
+
+    # Exit & Save triggers
+    args.exit_trigger = os.path.join(args.trigger_path, "exit")
+    args.save_trigger = os.path.join(args.trigger_path, "save")
+    if args.rank == 0:
+        print(f'Exit trigger setup! run `touch {args.exit_trigger}` to stop training')
+        print(f'Save trigger setup! run `touch {args.save_trigger}` to save a checkpoint')
+    
+    if args.profile and args.exit_signal_handler:
+        args.exit_signal_handler = False
+        if args.rank == 0:
+            print("WARNING: When using nsys profiling, the job will terminate upon receiving the SIGUSR2 signal. Disabling --exit-signal-handler`")
 
     # Goldfish loss
     if args.goldfish_loss:
@@ -1460,7 +1472,9 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
-                       'training if SIGTERM is received')
+                       'training if SIGUSR2 is received')
+    group.add_argument('--trigger-path', type=str, default=None,
+                       help = 'Path to check for exit & save triggers')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',

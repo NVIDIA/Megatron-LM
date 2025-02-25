@@ -4,6 +4,7 @@
 
 import dataclasses
 from datetime import datetime, timedelta
+from pathlib import Path
 import functools
 import gc
 import logging
@@ -54,6 +55,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
+from megatron.training.utils import is_rank0
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
@@ -272,116 +274,121 @@ def pretrain(
         non_loss_data_func (callable): A custom function to call during evaluation.
             It can run e.g. benchmarks.
     """
+    try:
+        # Initalize and get arguments, timers, and Tensorboard writer.
+        initialize_megatron(
+            extra_args_provider=extra_args_provider,
+            args_defaults=args_defaults,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks
+        )
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
-        extra_args_provider=extra_args_provider,
-        args_defaults=args_defaults,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks
-    )
+        args = get_args()
+        timers = get_timers()
 
-    args = get_args()
-    timers = get_timers()
+        if args.log_progress:
+            append_to_progress_log("Starting job")
 
-    if args.log_progress:
-        append_to_progress_log("Starting job")
+        # Initialize fault tolerance
+        # NOTE: ft_integration functions other than `setup` are no-op if the FT is not initialized
+        if args.enable_ft_package:
+            ft_integration.setup(args)
+            ft_integration.maybe_setup_simulated_fault()
 
-    # Initialize fault tolerance
-    # NOTE: ft_integration functions other than `setup` are no-op if the FT is not initialized
-    if args.enable_ft_package:
-        ft_integration.setup(args)
-        ft_integration.maybe_setup_simulated_fault()
+        # Set pytorch JIT layer fusion options and warmup JIT functions.
+        set_jit_fusion_options()
 
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+        # Adjust the startup time so it reflects the largest value.
+        # This will be closer to what scheduler will see (outside of
+        # image ... launches.
+        global _TRAIN_START_TIME
+        start_time_tensor = torch.tensor([_TRAIN_START_TIME],
+                                        dtype=torch.double,
+                                        device='cuda')
+        torch.distributed.all_reduce(start_time_tensor,
+                                    op=torch.distributed.ReduceOp.MIN)
+        _TRAIN_START_TIME = start_time_tensor.item()
 
-    # Adjust the startup time so it reflects the largest value.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches.
-    global _TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_TRAIN_START_TIME],
-                                     dtype=torch.double,
-                                     device='cuda')
-    torch.distributed.all_reduce(start_time_tensor,
-                                 op=torch.distributed.ReduceOp.MIN)
-    _TRAIN_START_TIME = start_time_tensor.item()
+        app_metrics = {}
+        app_metrics['app_start_time'] = round(_TRAIN_START_TIME * 1000.0)
+        app_metrics['app_model_init_start_time'] = round(_TRAIN_START_TIME * 1000.0)
 
-    app_metrics = {}
-    app_metrics['app_start_time'] = round(_TRAIN_START_TIME * 1000.0)
-    app_metrics['app_model_init_start_time'] = round(_TRAIN_START_TIME * 1000.0)
+        print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
+            time.time() - _TRAIN_START_TIME))
+        print_datetime('after megatron is initialized')
+        app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
-    print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
-        time.time() - _TRAIN_START_TIME))
-    print_datetime('after megatron is initialized')
-    app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        # Track E2E metrics on pretrain start
+        one_logger_utils.on_pretrain_start()
 
-    # Track E2E metrics on pretrain start
-    one_logger_utils.on_pretrain_start()
+        # Context used for persisting some state between checkpoint saves.
+        if args.non_persistent_ckpt_type == 'local':
+            try:
+                from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
+                    LocalCheckpointManager
+                from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import \
+                    parse_group_sequence, GroupWrapper
+                from nvidia_resiliency_ext.checkpointing.local.replication.strategies import \
+                    CliqueReplicationStrategy
+            except ModuleNotFoundError:
+                raise RuntimeError("The 'nvidia_resiliency_ext' module is required for local "
+                                "checkpointing but was not found. Please ensure it is installed.")
 
-    # Context used for persisting some state between checkpoint saves.
-    if args.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
-            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import \
-                parse_group_sequence, GroupWrapper
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import \
-                CliqueReplicationStrategy
-        except ModuleNotFoundError:
-            raise RuntimeError("The 'nvidia_resiliency_ext' module is required for local "
-                               "checkpointing but was not found. Please ensure it is installed.")
+            if args.replication:
+                repl_strategy = CliqueReplicationStrategy.from_replication_params(
+                    args.replication_jump,
+                    args.replication_factor
+                )
+            else:
+                repl_strategy = None
 
-        if args.replication:
-            repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                args.replication_jump,
-                args.replication_factor
-            )
+            checkpointing_context = {
+                'local_checkpoint_manager': LocalCheckpointManager(args.non_persistent_local_ckpt_dir,
+                                                                repl_strategy=repl_strategy
+                                                                )
+            }
         else:
-            repl_strategy = None
+            checkpointing_context = {}
 
-        checkpointing_context = {
-            'local_checkpoint_manager': LocalCheckpointManager(args.non_persistent_local_ckpt_dir,
-                                                               repl_strategy=repl_strategy
-                                                               )
-        }
-    else:
-        checkpointing_context = {}
+        # Model, optimizer, and learning rate.
+        timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+        app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, model_type, checkpointing_context=checkpointing_context)
 
-    # Model, optimizer, and learning rate.
-    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context)
+        timers('model-and-optimizer-setup').stop()
+        print_datetime('after model, optimizer, and learning rate '
+                    'scheduler are built')
+        app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        config = get_model_config(model[0])
 
-    timers('model-and-optimizer-setup').stop()
-    print_datetime('after model, optimizer, and learning rate '
-                   'scheduler are built')
-    app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-    config = get_model_config(model[0])
-
-    # Data stuff.
-    app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(
-        barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for i in range(len(model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
-            iterators = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
-    else:
-        train_data_iterator, valid_data_iterator, test_data_iterator \
-            = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-    timers('train/valid/test-data-iterators-setup').stop()
-    print_datetime('after dataloaders are built')
-    app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        # Data stuff.
+        app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        timers('train/valid/test-data-iterators-setup', log_level=0).start(
+            barrier=True)
+        if args.virtual_pipeline_model_parallel_size is not None:
+            train_data_iterator = []
+            valid_data_iterator = []
+            test_data_iterator = []
+            for i in range(len(model)):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                iterators = build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider)
+                train_data_iterator.append(iterators[0])
+                valid_data_iterator.append(iterators[1])
+                test_data_iterator.append(iterators[2])
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator \
+                = build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider)
+        timers('train/valid/test-data-iterators-setup').stop()
+        print_datetime('after dataloaders are built')
+        app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+    
+    except AssertionError:
+        print_rank_0("An error has been detected; Canceling pending scheduled jobs.")
+        Path(args.exit_trigger).touch()
+        raise
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(args.train_iters, args.skip_train, args.do_train,
@@ -446,13 +453,13 @@ def pretrain(
                                    verbose=True, write_to_tensorboard=not args.skip_train,
                                    non_loss_data_func=non_loss_data_func)
 
-    wandb_writer = get_wandb_writer()
-    if wandb_writer:
-        wandb_writer.finish()
-
     ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.finish()
 
     one_logger and one_logger.log_metrics({
         'app_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -1299,13 +1306,13 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
     saved_checkpoint = False
     if args.exit_signal_handler:
         signal_handler = get_signal_handler()
-        if any(signal_handler.signals_received()):
+        if signal_handler.signals_received():
             if args.save:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
                                          num_floating_point_operations_so_far,
                                          checkpointing_context, train_data_iterator=train_data_iterator)
-            print_datetime('exiting program after receiving SIGTERM.')
+            print_datetime('exiting program after receiving SIGUSR2.')
 
             return True
 
@@ -1357,6 +1364,21 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
+    
+    # Exit & Save triggers 
+    # NOTE(tj.solergibert) We `% args.log_interval` to not check too frequently os.path.isfile & the triggers are visible to all ranks
+    if iteration % args.log_interval == 0 and args.trigger_path is not None:
+        if os.path.isfile(args.save_trigger):
+            if args.save and not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                opt_param_scheduler,
+                                num_floating_point_operations_so_far,
+                                checkpointing_context, train_data_iterator=train_data_iterator)
+            torch.distributed.barrier()
+            if is_rank0():
+                os.remove(args.save_trigger)
+        if os.path.isfile(args.exit_trigger):
+            return True
 
     return False
 
@@ -1668,6 +1690,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             wandb_writer.finish()
         ft_integration.shutdown()
         sys.exit(exit_code)
+    
+    if iteration >= args.train_iters and is_rank0():
+        print(f"Training finished after {iteration} iterations; Canceling pending scheduled jobs.")
+        Path(args.exit_trigger).touch()
 
     return iteration, num_floating_point_operations_so_far
 
