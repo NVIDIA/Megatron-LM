@@ -764,12 +764,19 @@ def validate_args(args, defaults={}):
         args.attention_softmax_in_fp32 = True
 
     if args.result_rejected_tracker_filename is not None:
-        # Append to passed-in args.iterations_to_slip.
+        # Append to passed-in args.iterations_to_skip.
         iterations_to_skip_from_file = RerunStateMachine.get_skipped_iterations_from_tracker_file(
             args.result_rejected_tracker_filename
         )
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
+    # Make sure all functionality that requires Gloo process groups is disabled.
+    if not args.enable_gloo_process_groups:
+        if args.use_distributed_optimizer:
+            # If using distributed optimizer, must use distributed checkpointing.
+            # Legacy checkpointing uses Gloo process groups to collect full distributed
+            # optimizer state in the CPU memory of DP rank 0.
+            assert args.use_dist_ckpt
 
     # Checkpointing
     if args.ckpt_fully_parallel_save_deprecated and args.rank == 0:
@@ -1373,6 +1380,9 @@ def _add_training_args(parser):
                        help='List of iterations to skip, empty by default.')
     group.add_argument('--result-rejected-tracker-filename', type=str, default=None,
                        help='Optional name of file tracking `result_rejected` events.')
+    group.add_argument('--disable-gloo-process-groups', action='store_false',
+                       dest='enable_gloo_process_groups',
+                       help='Disables creation and usage of Gloo process groups.')
     group.add_argument('--use-pytorch-profiler', action='store_true',
                        help='Use the built-in pytorch profiler. '
                        'Useful if you wish to view profiles in tensorboard.',

@@ -370,16 +370,13 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [
-            parallel_state.get_data_parallel_group_gloo(),
-            parallel_state.get_expert_data_parallel_group_gloo(),
-        ],
+        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
         if len(params) == 0:
             continue
-        local_param_hashes = torch.stack(local_param_hashes)
+        local_param_hashes = torch.stack(local_param_hashes).cuda()
         all_param_hashes = [
             torch.zeros_like(local_param_hashes)
             for _ in range(torch.distributed.get_world_size(all_gather_group))

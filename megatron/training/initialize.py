@@ -341,6 +341,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                 encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
+                create_gloo_process_groups=args.enable_gloo_process_groups,
             )
             if args.rank == 0:
                 print(
