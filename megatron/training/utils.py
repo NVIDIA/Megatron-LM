@@ -66,7 +66,7 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return unwrapped_model
 
 
-def calc_params_l2_norm(model, force_create_fp32_copy=False):
+def calc_params_l2_norm(model, force_create_fp32_copy: bool = False):    
     """Calculate l2 norm of parameters """
     args = get_args()
     if not isinstance(model, list):
@@ -97,10 +97,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                             if getattr(param, 'main_param_sharded', False):
                                 if param.main_param is not None:
                                     sharded_params_data.append(param.main_param)
-                                else:
-                                    # Fallback to data if `.main_param`
-                                    # is available but is None
-                                    params_data.append(param.data)
                             else:
                                 params_data.append(param.main_param)
                         else:
@@ -173,7 +169,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         norm_2 += moe_norm_2
 
     return norm_2.item() ** 0.5
-
+    
 
 def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
@@ -514,3 +510,66 @@ def get_batch_on_this_tp_rank(data_iterator):
 
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
+
+def calc_params_l2_norm_per_param(model):
+    """
+    Calculate the L2 norm of each parameter individually, while properly synchronizing
+    over the different parallel groups (data, model, and expert/pipeline parallel groups).
+
+    Note: not memory efficient as the function operates in fp32.
+    """
+    args = get_args()
+    # Ensure uniform processing.
+    if not isinstance(model, list):
+        model = [model]
+    norm_dict = {}
+    dp_group = None  # Data parallel group reference.
+    
+    for model_chunk in model:
+        for name, param in model_chunk.named_parameters():
+            # Update data parallel group if not already set.
+            dp_group = get_data_parallel_group_if_dtensor(param, dp_group)
+            tensor = to_local_if_dtensor(param)
+            
+            # Case 1: MoE parameters not participating in typical all-reduce.
+            if not getattr(param, 'allreduce', True):
+                # For MoE parameters, always use the parameter's raw data (converted to fp32 if bf16).
+                value = tensor.data.float() if args.bf16 else tensor.data
+                local_norm_sq = torch.norm(value, p=2) ** 2
+                moe_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+                # Synchronize across the expert, model, and pipeline parallel group.
+                torch.distributed.all_reduce(
+                    local_norm_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=moe_group
+                )
+                final_norm = local_norm_sq.sqrt().item()
+                norm_dict[name] = final_norm
+            else:
+                if not param_is_not_shared(param):
+                    continue
+                if not param_is_not_tensor_parallel_duplicate(param):
+                    # do not skip but insert dummy tensor for sync
+                    # otherwise we deadlock
+                    param = torch.zeros_like(param)
+                param = to_local_if_dtensor(param)
+                value = param.data.float() if args.bf16 else param.data
+
+                local_norm_sq = torch.norm(value, p=2) ** 2
+                # First, all-reduce across the data parallel group.
+                if dp_group is not None:
+                    torch.distributed.all_reduce(
+                        local_norm_sq,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=dp_group
+                    )
+                # Next, all-reduce across the model parallel (tensor and pipeline) group.
+                torch.distributed.all_reduce(
+                    local_norm_sq,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=mpu.get_model_parallel_group()
+                )
+                final_norm = local_norm_sq.sqrt().item()
+                norm_dict[name] = final_norm
+
+    return norm_dict
