@@ -55,7 +55,7 @@ We also provide scripts to tokenize data using datatrove at scale and tools to c
 
 # Data
 >[!NOTE]
-> On the Alps supercomputer, you can find tokenized datasets in `/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai`
+> On the Alps supercomputer, you can find tokenized datasets in `/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai`
 
 ## Tokenization
 While Megatron provides data tokenization tools, we use `datatrove`, which enables us reading data in multiple formats (`json`, `parquet`, `csv`...), easy parallelization across multiple nodes, and efficient filtering and deduplication our data.

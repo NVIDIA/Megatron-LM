@@ -18,7 +18,7 @@ echo "START TIME: $(date)"
 
 ################ Configs ################
 # NOTE(tj.solergibert) Check the `Data` section in the README. Use `,` to specify multiple datasets e.g. "/path/to/dataset/A,/path/to/dataset/B,/path/to/dataset/C"
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai-v2/swissai-fineweb-edu-filterrobots-merge"
+DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge"
 
 MBS=1 # Micro batch size
 GBS=128 # Global batch size
