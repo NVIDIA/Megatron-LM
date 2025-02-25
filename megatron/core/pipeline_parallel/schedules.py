@@ -101,6 +101,9 @@ def get_forward_backward_func():
         step.
 
     """
+    print(f"[YOUNGEUNK] pp: {parallel_state.get_pipeline_model_parallel_world_size()},"
+        f" vpp: {parallel_state.get_virtual_pipeline_model_parallel_world_size()}"
+        )
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
