@@ -1,15 +1,18 @@
 #!/bin/bash
 
+# runs the following checkpoint conversions: 
+#   - torch_dist           ---> torch ,  if CKPT_IS_TORCH_DIST=true.
+#   - core (torch backend) ---> HF    ,  always.
+
 
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
 CKPT_PATH=/capstor/store/cscs/swissai/a06/users/schlag/llama3-1b-21n
 
-
-# Useful for: torch_dist -> torch
-CKPT_IS_TORCH_DIST=true  # false if the checkpoint is already in torch format
-TORCH_DIST_SCRIPT=$MEGATRON_LM_DIR/tools/checkpoint/torch-dist/torchdist_2_torch.py
+# [torch_dist -> torch] dependencies
+CKPT_IS_TORCH_DIST=true
+TORCH_DIST_SCRIPT=$MEGATRON_LM_DIR/scripts/conversion/torchdist_2_torch.py
 TORCH_CKPT_SAVE_PATH=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/torch/llama3-1b-21n
-# Useful for: core --> HF
+# [core (torch) --> HF] dependencies
 HF_SAVE_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/hf-checkpoints
 SAVE_DIR=$HF_SAVE_DIR/llama3-1b-21n
 mkdir -p $HF_SAVE_DIR
@@ -31,7 +34,7 @@ else
 fi
 
 
-# Run megatron core --> HF
+# Run core --> HF
 echo "Running core --> HF conversion..."
 python $MEGATRON_LM_DIR/tools/checkpoint/convert.py \
     --model-type GPT \
