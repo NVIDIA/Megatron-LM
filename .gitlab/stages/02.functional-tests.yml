@@ -67,6 +67,7 @@ functional:configure:
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job functional:configure"
         "--record-checkpoints ${RECORD_CHECKPOINTS}"
+        "--slurm-account ${CI_SLURM_ACCOUNT}"
       )
     - |
       export PYTHONPATH=$(pwd)
