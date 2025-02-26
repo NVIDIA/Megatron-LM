@@ -908,6 +908,40 @@ def get_evaluation_dataset(
             no_mask=False,
             vision_model_type=vision_model_type,
         )
+    elif task == "SPDocVQA":
+        keys = {"sample_id": "questionId", "image_id": "image", "question": "question", "answer": "answers"}
+
+        dataset = VQADataset(
+            input_image_path,
+            gt_path,
+            num_samples_per_partition,
+            num_partitions,
+            partition_id,
+            keys,
+            img_h,
+            img_w,
+            use_tiling,
+            max_num_tiles,
+            use_thumbnail,
+            vision_model_type,
+        )
+    elif task == "InfoVQA":
+        keys = {"sample_id": "questionId", "image_id": "image_local_name", "question": "question", "answer": "answers"}
+
+        dataset = VQADataset(
+            input_image_path,
+            gt_path,
+            num_samples_per_partition,
+            num_partitions,
+            partition_id,
+            keys,
+            img_h,
+            img_w,
+            use_tiling,
+            max_num_tiles,
+            use_thumbnail,
+            vision_model_type,
+        )
     else:
         raise NotImplementedError(f"unsupported task {task}")
 
