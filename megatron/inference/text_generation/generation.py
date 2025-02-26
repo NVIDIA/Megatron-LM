@@ -213,6 +213,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         for context_length in range(min_prompt_length, max_sequence_length):
 
             prefill = context_length == min_prompt_length
+            if not prefill:
+                forward_step.inference_params.enable_decode_mode()
 
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
