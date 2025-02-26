@@ -324,7 +324,8 @@ def main(
                 "Some NCCL operations have failed or timed out." in concat_logs
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
-                or "illegal instruction" in concat_logs in concat_logs
+                or "illegal instruction" in concat_logs
+                or "torch.distributed.DistNetworkError" in concat_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
