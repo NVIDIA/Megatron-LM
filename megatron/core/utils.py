@@ -2,6 +2,7 @@
 
 """Utility functions used throughout Megatron core"""
 import array
+import functools
 import hashlib
 import logging
 import math
@@ -269,21 +270,14 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
-
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
-
-    return init_
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
 
 
 def scaled_init_method_normal(sigma, num_layers):
     """Init method based on N(0, sigma/sqrt(2*num_layers)."""
     std = sigma / math.sqrt(2.0 * num_layers)
 
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=std)
-
-    return init_
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
@@ -440,6 +434,28 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
+    if hasattr(tensor, 'fully_shard_param_local_shard'):
+        assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
+        replica_id = (*replica_id[:2], 0)
+
+        sh_ten = ShardedTensor.from_rank_offsets_flat(
+            key,
+            tensor.fully_shard_param_local_shard,
+            tensor.shape,
+            *prepend_offsets,
+            (
+                tp_axis + prepend_axis_num,
+                parallel_state.get_tensor_model_parallel_rank(),
+                parallel_state.get_tensor_model_parallel_world_size(),
+            ),
+            flattened_range=slice(*tensor.fully_shard_param_local_index),
+            replica_id=replica_id,
+            prepend_axis_num=prepend_axis_num,
+            **kwargs,
+        )
+        setattr(sh_ten, 'is_data_parallel_fully_shard', True)
+        return sh_ten
+
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
@@ -472,6 +488,23 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     if replica_id is None:
         replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
+
+    if hasattr(tensor, 'fully_shard_param_local_shard'):
+        assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
+        replica_id = (*replica_id[:2], 0)
+
+        sh_ten = ShardedTensor.from_rank_offsets_flat(
+            key,
+            tensor.fully_shard_param_local_shard,
+            tensor.shape,
+            *prepend_offsets,
+            flattened_range=slice(*tensor.fully_shard_param_local_index),
+            replica_id=replica_id,
+            prepend_axis_num=prepend_axis_num,
+            **kwargs,
+        )
+        setattr(sh_ten, 'is_data_parallel_fully_shard', True)
+        return sh_ten
 
     return ShardedTensor.from_rank_offsets(
         key,
@@ -1427,6 +1460,19 @@ except (ImportError, ModuleNotFoundError):
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor"""
     return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
+
+
+def is_submodule(module, parent_module, strict=True):
+    """
+    Check if a module is a submodule of another module.
+    """
+    if strict:
+        if module is parent_module:
+            return False
+    for m in parent_module.modules():
+        if m is module:
+            return True
+    return False
 
 
 ########################

@@ -21,6 +21,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+# pylint: disable=missing-class-docstring
 @dataclass
 class MLPSubmodules:
     linear_fc1: Union[ModuleSpec, type] = None
@@ -129,6 +130,7 @@ class MLP(MegatronModule):
 
         return output, output_bias
 
+    # pylint: disable=missing-function-docstring
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -136,7 +138,9 @@ class MLP(MegatronModule):
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
             if self.config.gated_linear_unit and name == 'linear_fc1':
-                assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
+                # NOTE: In custom FSDP, we can have no weight in local.
+                if not self.config.use_custom_fsdp:
+                    assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
                 for k, v in sub_sd.items():
                     if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
@@ -144,6 +148,7 @@ class MLP(MegatronModule):
         return sharded_state_dict
 
 
+# pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
@@ -258,4 +263,5 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
         sh_ten_build_fn,
         sh_ten_merge_fn,
         original_sh_ten.replica_id,
+        flattened_range=original_sh_ten.flattened_range,
     )

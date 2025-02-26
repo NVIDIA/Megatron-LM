@@ -83,7 +83,12 @@ def _get_param_groups(
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
     for model_chunk in model_chunks:
-        for name, param in model_chunk.named_parameters():
+        if model_chunk.ddp_config.use_custom_fsdp:
+            named_parameters = model_chunk.optimizer_named_parameters()
+        else:
+            named_parameters = model_chunk.named_parameters()
+
+        for name, param in named_parameters:
             if not param.requires_grad:
                 continue
 
@@ -460,6 +465,42 @@ def get_megatron_optimizer(
 
     optimizers = []
     model_chunk_offset = 0
+    ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
+    if ddp_config.use_custom_fsdp:
+        for model_chunk, overlap_param_gather_with_optimizer_step in zip(
+            all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
+        ):
+            param_groups, buffers = _get_param_groups_and_buffers(
+                model_chunk,
+                model_chunk_offset=model_chunk_offset,
+                config=config,
+                no_weight_decay_cond=no_weight_decay_cond,
+                scale_lr_cond=scale_lr_cond,
+                lr_mult=lr_mult,
+                filter_fn=lambda g: True,
+                buffer_name='buffers',
+            )
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config,
+                    model_chunks=model_chunk,
+                    param_groups=param_groups,
+                    per_model_buffers=buffers,
+                    model_parallel_group=mpu.get_model_parallel_group(),
+                    data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
+                        with_context_parallel=True
+                    ),
+                    data_parallel_group_idx=model_parallel_rank,
+                )
+            )
+            model_chunk_offset += 1
+
+        if len(optimizers) == 1:
+            return optimizers[0]
+
+        return ChainedOptimizer(optimizers)
+
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
     ):

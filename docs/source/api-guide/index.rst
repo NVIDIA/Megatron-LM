@@ -8,6 +8,7 @@ API Guide
    tensor_parallel
    context_parallel
    pipeline_parallel
+   custom_fsdp
    fusions
    transformer
    moe
@@ -18,4 +19,5 @@ API Guide
    multi_latent_attention
    num_microbatches_calculator
    optimizer_param_scheduler
+   optimizer_cpu_offload
    encoder_decoder_parallelism
