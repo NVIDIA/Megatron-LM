@@ -123,7 +123,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         params_dtype=args.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
         inference_max_seq_length=args.inference_max_seq_length,
-        inference_max_batch_size=args.inference_max_batch_size
+        inference_max_requests=args.inference_max_batch_size
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
