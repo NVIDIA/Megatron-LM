@@ -35,6 +35,7 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     help="Name of job that created the downstream pipeline",
 )
 @click.option("--record-checkpoints", required=False, type=str, help="Values are 'true' or 'false'")
+@click.option("--slurm-account", required=True, type=str, help="Slurm account to use")
 @click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
 @click.option(
     "--run-name", required=False, type=str, help="Run name (only relevant for release tests)"
@@ -60,6 +61,7 @@ def main(
     container_tag: str,
     dependent_job: str,
     record_checkpoints: str,
+    slurm_account: str,
     tag: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
@@ -138,6 +140,7 @@ def main(
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
                 f"--record-checkpoints {record_checkpoints}",
+                f"--account {slurm_account}",
             ]
 
             if partition is not None:
