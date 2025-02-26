@@ -18,6 +18,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_softmax_with_capacity,
     z_loss_func,
 )
+from megatron.core.tensor_parallel.random import RecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -242,13 +243,15 @@ class TopKRouter(Router):
         aux_loss = load_balancing_loss_func(
             moe_aux_loss_coeff=moe_aux_loss_coeff, sequence_partition_group=sequence_partition_group
         )
-        save_to_aux_losses_tracker(
-            "load_balancing_loss",
-            aux_loss / moe_aux_loss_coeff,
-            self.layer_number,
-            self.config.num_layers,
-            reduce_group=sequence_partition_group,
-        )
+        # Disable loss aggregationg during the recompute forward pass
+        if not RecomputeContext.is_recompute:
+            save_to_aux_losses_tracker(
+                "load_balancing_loss",
+                aux_loss / moe_aux_loss_coeff,
+                self.layer_number,
+                self.config.num_layers,
+                reduce_group=sequence_partition_group,
+            )
         activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
 

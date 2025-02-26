@@ -346,6 +346,22 @@ def model_parallel_cuda_manual_seed(seed, te_rng_tracker=False, inference_rng_tr
     _CUDA_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
+class RecomputeContext:
+    """ Recompute context
+
+    This context let the internal modules to detect whether forward is in the
+    recompute pass.
+    """
+    is_recompute = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def enable_recompute(cls):
+        cls.is_recompute = True
+        yield cls
+        cls.is_recompute = False
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -407,7 +423,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Compute the forward pass.
         detached_inputs = detach_variable(inputs)
-        with torch.enable_grad():
+        with torch.enable_grad(), RecomputeContext.enable_recompute():
             outputs = ctx.run_function(*detached_inputs)
 
         # Set the states back to what it was at the start of this function.
