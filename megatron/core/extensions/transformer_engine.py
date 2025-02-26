@@ -49,6 +49,8 @@ def _get_extra_te_kwargs(config: TransformerConfig):
     if is_te_min_version("0.12.0"):
         if config.use_cpu_initialization:
             extra_transformer_engine_kwargs["device"] = 'cpu'
+        elif config.init_model_with_meta_device:
+            extra_transformer_engine_kwargs["device"] = "meta"
         else:
             extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
     return extra_transformer_engine_kwargs
@@ -1061,7 +1063,11 @@ if is_te_min_version("1.9.0.dev0"):
                 assert (
                     len(replica_id) == 3
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
-                sh_ten.replica_id = (*replica_id[:2], get_expert_data_parallel_rank())
+                if getattr(sh_ten, "is_data_parallel_fully_shard", False):
+                    edp_replica_id = 0
+                else:
+                    edp_replica_id = get_expert_data_parallel_rank()
+                sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):

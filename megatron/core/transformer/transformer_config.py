@@ -151,6 +151,12 @@ class TransformerConfig(ModelParallelConfig):
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
 
+    init_model_with_meta_device: bool = False
+    """
+    If True, initializes the model with the meta device. This is helpful for
+    training of very large models. This feature is only works when custom fsdp is turned on.
+    """
+
     ####################
     # mixed-precision
     ####################
@@ -446,6 +452,9 @@ class TransformerConfig(ModelParallelConfig):
 
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
+
+    use_custom_fsdp: bool = False
+    """ Whether to use custom fsdp for training. """
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

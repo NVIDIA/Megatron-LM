@@ -33,6 +33,7 @@ from megatron.training import (
     get_adlr_autoresume,
 )
 from megatron.core import DistributedDataParallel as DDP
+from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -46,9 +47,9 @@ from megatron.legacy.model.module import param_is_not_shared
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, Float16Module)
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
 except ImportError:
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, Float16Module)
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
 
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
@@ -77,6 +78,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     sharded_params_data = []
     data_parallel_group = None
 
+    custom_fsdp_all_param_is_shared = False
     for model_chunk in model:
         for param in model_chunk.parameters():
             data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
@@ -84,6 +86,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             if not is_not_tp_duplicate:
                 continue
             assert is_not_tp_duplicate
+            if hasattr(param, "fully_shard_param_local_shard"):
+                param = param.fully_shard_param_local_shard
+                assert [getattr(p, "fully_shard_param_local_shard", None) is not None for p in model_chunk.parameters()]
+                custom_fsdp_all_param_is_shared = True
+                if param.numel() == 0:
+                    continue
             if not getattr(param, 'allreduce', True):
                 # TODO: Implement memory optimization for MoE parameters.
                 assert param_is_not_shared(param)
@@ -144,6 +152,11 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         norm_2 += sharded_norm_2
 
+    if custom_fsdp_all_param_is_shared:
+        torch.distributed.all_reduce(norm_2,
+                                     op=torch.distributed.ReduceOp.SUM,
+                                     group=mpu.get_data_parallel_group())
+
     # Sum across all model-parallel GPUs (tensor + pipeline).
     torch.distributed.all_reduce(
         norm_2,
@@ -160,6 +173,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False # no per-parameter norm.
         )
         moe_norm_2 = moe_norm * moe_norm
+
+        if custom_fsdp_all_param_is_shared:
+            torch.distributed.all_reduce(moe_norm_2,
+                                        op=torch.distributed.ReduceOp.SUM,
+                                        group=mpu.get_expert_data_parallel_group())
+
         # Sum across expert tensor, model and pipeline parallel GPUs.
         torch.distributed.all_reduce(
             moe_norm_2,

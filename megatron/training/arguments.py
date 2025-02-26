@@ -401,6 +401,13 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print(f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}")
 
+    if args.data_parallel_sharding_strategy == "optim_grads_params":
+        args.overlap_param_gather = True
+        args.overlap_grad_reduce = True
+
+    if args.data_parallel_sharding_strategy == "optim_grads":
+        args.overlap_grad_reduce = True
+
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
             '--overlap-param-gather only supported with distributed optimizer'
@@ -451,6 +458,19 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer, \
             '--fp8-param-gather only supported with distributed optimizer'
 
+    if args.use_custom_fsdp:
+        assert args.use_distributed_optimizer, \
+            '--use-custom-fsdp only supported with distributed optimizer'
+
+        if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
+            warnings.warn('Please make sure your TransformerEngine support FSDP + gradient accumulation fusion')
+            assert args.gradient_accumulation_fusion is False, \
+                "optim_grads_params optim_grads are not supported with gradient accumulation fusion"
+
+        if args.data_parallel_sharding_strategy == "optim_grads_params":
+            assert args.check_weight_hash_across_dp_replicas_interval is None, \
+                'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
+
     # Parameters dtype.
     args.params_dtype = torch.float
     if args.fp16:
@@ -468,12 +488,13 @@ def validate_args(args, defaults={}):
         args.params_dtype = torch.bfloat16
         # bfloat16 requires gradient accumulation and all-reduce to
         # be done in fp32.
-
         if args.accumulate_allreduce_grads_in_fp32:
             assert args.main_grads_dtype == torch.float32, \
                 "--main-grads-dtype can only be fp32 when --accumulate-allreduce-grads-in-fp32 is set"
-
-        if not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
+    
+        if args.grad_reduce_in_bf16:
+            args.accumulate_allreduce_grads_in_fp32 = False
+        elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
@@ -661,11 +682,11 @@ def validate_args(args, defaults={}):
     if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1" and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.sequence_parallel:
-            raise RuntimeError(
+            warnings.warn(
                 "Using sequence parallelism requires setting the environment variable "
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1")
         if args.async_tensor_model_parallel_allreduce:
-            raise RuntimeError(
+            warnings.warn(
                 "Using async gradient all reduce requires setting the environment "
                 "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
@@ -1766,6 +1787,8 @@ def _add_mixed_precision_args(parser):
                        help='Run model in fp16 mode.')
     group.add_argument('--bf16', action='store_true',
                        help='Run model in bfloat16 mode.')
+    group.add_argument('--grad-reduce-in-bf16', action='store_true',
+                       help='Reduce gradients in bfloat16.')
     group.add_argument('--loss-scale', type=float, default=None,
                        help='Static loss scaling, positive power of 2 '
                        'values can improve fp16 convergence. If None, dynamic'
@@ -1895,6 +1918,19 @@ def _add_distributed_args(parser):
                        'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--use-custom-fsdp', action='store_true',
+                       help='Use the Megatron FSDP code path in DDP.')
+    group.add_argument('--init-model-with-meta-device', action='store_true')
+    group.add_argument('--data-parallel-sharding-strategy', type=str, default='no_shard',
+                       choices=['no_shard', 'optim', 'optim_grads', 'optim_grads_params'],
+                       help='Sharding strategy of data parallelism.')
+    group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
+                       help='If not set, fuse the division in gradient reduce.')
+    group.add_argument('--suggested-communication-unit-size', type=int, default=400_000_000,
+                       help='When batch communication is needed across multiple buckets, '
+                       'this environment variable guides the size of communication unit size.')
+    group.add_argument('--keep-fp8-transpose-cache-when-using-custom-fsdp', action='store_true',
+                       help='If set, keep the fp8 transpose cache when using custom FSDP.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--use-torch-fsdp2', action='store_true',
