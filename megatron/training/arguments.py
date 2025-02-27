@@ -1000,7 +1000,7 @@ def _add_inference_args(parser):
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
-                       help='Maximum sequence length allocated for prefill during inference.',
+                       help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
     return parser
 
