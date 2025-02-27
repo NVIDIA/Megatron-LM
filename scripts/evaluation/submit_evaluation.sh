@@ -1,21 +1,20 @@
-#Recommended tasks: winogrande,piqa,social_iqa,openbookqa,arc_easy,commonsense_qa,triviaqa,mmlu_continuation,gsm8k,global_mmlu_ar,global_mmlu_bn,global_mmlu_de,global_mmlu_en,global_mmlu_es,global_mmlu_fr,global_mmlu_hi,global_mmlu_id,global_mmlu_it,global_mmlu_ja,global_mmlu_ko,global_mmlu_pt,global_mmlu_sw,global_mmlu_yo,global_mmlu_zh,wikitext,lambada
-
 # Define default variables.
 GPUS_PER_NODE=4
 
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
-DEF_LOGS_DIR=$PWD/"eval-logs"
-DEF_SBATCH_PATH=$PWD/evaluate.sbatch
-DEF_CONTAINER_PATH="/capstor/store/cscs/swissai/a06/containers/NeMo/nemo-latest.toml"
-DEF_LM_HARNESS_PATH="/capstor/store/cscs/swissai/a06/users/ahernnde/workspace/lm-evaluation-harness"
+DEF_LOGS_ROOT=$PWD/eval-logs
+DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NeMo/nemo-latest.toml
+DEF_LM_HARNESS_PATH=/capstor/store/cscs/swissai/a06/users/ahernnde/workspace/lm-evaluation-harness
 DEF_ACCOUNT=a-a06
-DEF_TOKENIZER=/users/fsimin/tokenizer_nemo/
+DEF_TOKENIZER=tj-solergibert/swai
 
 ITERATION=latest
-TASKS=arc_easy
+TASKS=winogrande,piqa,social_iqa,openbookqa,arc_easy,commonsense_qa,triviaqa,mmlu_continuation,gsm8k,global_mmlu_ar,global_mmlu_bn,global_mmlu_de,global_mmlu_en,global_mmlu_es,global_mmlu_fr,global_mmlu_hi,global_mmlu_id,global_mmlu_it,global_mmlu_ja,global_mmlu_ko,global_mmlu_pt,global_mmlu_sw,global_mmlu_yo,global_mmlu_zh,wikitext,lambada,hellaswag
 LIMIT=null
 BS=1
 CONVERT_TO_HF=false
+
+TASK_GROUPS="mmlu_continuation global_mmlu"
 
 # Usage function.
 usage () {
@@ -25,12 +24,14 @@ usage () {
 	echo "On all cases, specify either --size or --tp and --pp in order to convert the checkpoint to a more efficient distributed config for inference."
 	echo "If a hf checkpoint is given (or --convert-to-hf is set), DP will be enabled as long as TP*PP<NUM_GPUS_PER_NODE."
 	echo "In addition, there are a few environment variables you can set to specify some paths (optional)."
+	echo "If setting any of the --wandb arguments, make sure to also export your WANDB_API_KEY."
 	echo ""
 	echo "Arguments:"
 	echo "  <checkpoint-path>: Path of the megatron checkpoint to evaluate."
 	echo ""
 	echo "Options:"
 	echo "  --help: Prints this message and exits."
+	echo "  --name: Name of the eval run. If not set, the path will be used as name"
 	echo "  --size (choices={1, 3, 8, 70}): The size of the checkpoint to evaluate. If not set, --tp and --pp should be specified. This only sets --tp and --pp for you."
 	echo "  --convert-to-hf: When set, if a megatron checkpoint is given, the model will be converted to HF."
 	echo "  --tasks: lm-eval-harness tasks to run (default=$TASKS)."
@@ -45,8 +46,7 @@ usage () {
 	echo ""
 	echo "Variables:"
 	echo "  MEGATRON_PATH: Megatron root (default=$DEF_MEGATRON_PATH)."
-	echo "  LOGS_DIR: Slurm logs directry (default=$DEF_LOGS_DIR)."
-	echo "  SBATCH_PATH: Where to save the sbatch file (default=$DEF_SBATCH_PATH)."
+	echo "  LOGS_DIR: Logs root directry where wandb logs, slurm logs and .sbatches will go (default=$DEF_LOGS_ROOT)."
 	echo "  CONTAINER_PATH: Container path (default=$DEF_CONTAINER_PATH)."
 	echo "  LM_HARNESS_PATH: lm-eval-harness root (default=$DEF_LM_HARNESS_PATH)."
 	echo "  ACCOUNT: Slurm account (default=$DEF_ACCOUNT)."
@@ -57,11 +57,8 @@ usage () {
 if [ -z ${MEGATRON_PATH+x} ]; then
 	MEGATRON_PATH=$DEF_MEGATRON_PATH
 fi
-if [ -z ${LOGS_DIR+x} ]; then
-	LOGS_DIR=$DEF_LOGS_DIR
-fi
-if [ -z ${SBATCH_PATH+x} ]; then
-	SBATCH_PATH=$DEF_SBATCH_PATH
+if [ -z ${LOGS_ROOT+x} ]; then
+	LOGS_ROOT=$DEF_LOGS_ROOT
 fi
 if [ -z ${CONTAINER_PATH+x} ]; then
 	CONTAINER_PATH=$DEF_CONTAINER_PATH
@@ -108,6 +105,8 @@ while [[ $# -gt 0 ]]; do
 			BS=$2; shift 2;;
 		--limit)
 			LIMIT=$2; shift 2;;
+		--name)
+			NAME=$2; shift 2;;
 		--convert-to-hf)
 			CONVERT_TO_HF=true; shift;;
 		--iteration)
@@ -160,19 +159,39 @@ if [ $ITERATION = latest ]; then
 	fi
 fi
 
+mkdir -p $LOGS_ROOT/slurm $LOGS_ROOT/sbatch $LOGS_ROOT/lmharness
+if [ -z ${NAME+x} ]; then
+	NAME=$(echo $CHECKPOINT_PATH | tr / _)
+fi
+NAME=${NAME}_it$ITERATION
+LOGS_DIR=$LOGS_ROOT/slurm
+SBATCH_PATH=$LOGS_ROOT/sbatch/$NAME.sbatch
+WANDB_DIR=$LOGS_ROOT
+EVAL_DIR=$LOGS_ROOT/lmharness
+
 if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_ID+x} ]; then
 	if [ -z ${WANDB_ENTITY+x} ] || [ -z ${WANDB_PROJECT+x} ] || [ -z ${WANDB_ID+x} ]; then
 		echo "Either all --wandb-entity, --wandb-project and --wandb-id should be set, or neither" >&2
 		exit 1
 	fi
 	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=$ITERATION"
+	read -r -d '' WANDB_COMMAND <<- EOM
+	# Wandb sync just in case wandb died in lm-harness.
+	for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
+		WANDB_RESUME=allow wandb sync -e $WANDB_ENTITY -p $WANDB_PROJECT --id $WANDB_ID \\\$path
+	done
+
+	# Update eval_table.
+	cd $MEGATRON_PATH
+	WANDB_RESUME=allow python scripts/evaluation/update_wandb_eval_table.py --entity=$WANDB_ENTITY --project=$WANDB_PROJECT --runid=$WANDB_ID --groups $TASK_GROUPS
+	EOM
 fi
 
 # Some useful variables.
-JOBNAME=evaluate_$(echo $CHECKPOINT_PATH | tr / _)
+JOBNAME=evaluate_$NAME
 ENDPOINT_PORT=5000
 
-COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS"
+COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS"
 if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF != true ]; then
 	echo Megatron checkpoint detected!
 	echo "WARNING! No conversion to HF will be done. Please specify HF implementation if available, otherwise evaluation will be slower."
@@ -196,20 +215,22 @@ else
 
 		read -r -d '' CMD_CONVERT <<- EOM
 		# Create tempfile.
-		HF_TEMP_PATH=\$(mktemp -d -p $SCRATCH/tmp)
-		TORCH_NODIST_PATH=\$(mktemp -d -p $SCRATCH/tmp)
+		cd
+		mkdir -p $SCRATCH/.tmp
+		HF_TEMP_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)
+		TORCH_NODIST_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)
 		function cleanup {
-			rm -rf \$HF_TEMP_PATH
-			rm -rf \$TORCH_NODIST_PATH
+			rm -rf \\\$HF_TEMP_PATH
+			rm -rf \\\$TORCH_NODIST_PATH
 		}
 		trap cleanup EXIT
 
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
-		torchrun --nproc-per-node=$WORLD_SIZE --master-addr=localhost --master-port=$ENDPOINT_PORT tools/checkpoint/convert_torchdist.py --ckpt-step=$ITERATION --load=$CHECKPOINT_PATH --save=\$TORCH_NODIST_PATH
-		python tools/checkpoint/convert.py --load=\$TORCH_NODIST_PATH --save=\$HF_TEMP_PATH
+		torchrun scripts/conversion/convert_torchdist_to_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=$ITERATION --ckpt-convert-save=\\\$TORCH_NODIST_PATH
+		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
-		HF_CHECKPOINT_PATH=\$HF_TEMP_PATH
+		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
 	else
 		echo Huggingface checkpoint detected!
 		HF_CHECKPOINT_PATH=$CHECKPOINT_PATH
@@ -231,9 +252,8 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=6:00:00
 #SBATCH --exclusive
-#SBATCH --dependency=singleton
 
 # Step 0: Some useful logs.
 export MASTER_ADDR=\$(hostname)
@@ -242,6 +262,8 @@ srun -l bash -c 'echo \$(hostname) \$(nvidia-smi | grep -o "|\\s*[0-9]*MiB")'
 
 srun -l --unbuffered numactl --membind=0-3 bash -c "
 	export CUDA_DEVICE_MAX_CONNECTIONS=1
+	export WANDB_DIR=$WANDB_DIR
+	export HF_HOME=$SCRATCH/huggingface
 	set -e
 
 	$CMD_CONVERT
@@ -250,7 +272,9 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	# Launch eval.
 	cd $LM_HARNESS_PATH
 	python -m pip install -e .[api]
-	HF_HOME=$SCRATCH/huggingface $CMD_EVAL
+	$CMD_EVAL
+
+	$WANDB_COMMAND
 "
 EOM
 
