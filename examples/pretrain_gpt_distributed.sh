@@ -6,7 +6,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_SOCKET_IFNAME=ens3
 export GLOO_SOCKER_IFNAME=ens3
 
-GPUS_PER_NODE=1 # testing 241205
+GPUS_PER_NODE=2 # testing 241205
  
 # #single node
 # MASTER_ADDR=localhost
