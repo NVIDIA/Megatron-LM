@@ -751,7 +751,8 @@ class ParallelAttention(MegatronModule):
             assert batch_end <= inference_key_memory.size(1)
             sequence_start = inference_params.sequence_len_offset
             sequence_end = sequence_start + key_layer.size(0)
-            assert sequence_end <= inference_key_memory.size(0)
+            assert sequence_end <= inference_key_memory.size(0), ("Current sequence length is "
+            "longer than expected maximum sequence length! Increase inference_max_seq_length.")
             # Copy key and values.
             inference_key_memory[sequence_start:sequence_end,
                                  batch_start:batch_end, ...] = key_layer
