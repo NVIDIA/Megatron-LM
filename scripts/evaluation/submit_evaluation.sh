@@ -227,8 +227,8 @@ else
 
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
-		torchrun scripts/conversion/convert_torchdist_to_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=$ITERATION --ckpt-convert-save=\\\$TORCH_NODIST_PATH
-		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
+		torchrun scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=$ITERATION --ckpt-convert-save=\\\$TORCH_NODIST_PATH
+		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
 	else
