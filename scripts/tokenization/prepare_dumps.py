@@ -28,9 +28,10 @@ def get_parquet_files(path_to_folder: List) -> List:
 
 
 def filter_in(list_of_files: List, list_of_folders: List) -> List:
+    return_list_of_files = []
     for folder in list_of_folders:
-        list_of_files = [file for file in list_of_files if folder in file]
-    return list_of_files
+        return_list_of_files.extend([file for file in list_of_files if (folder in file and file not in return_list_of_files)])
+    return return_list_of_files
 
 
 def filter_out(list_of_files: List, list_of_folders: List) -> List:
@@ -73,8 +74,8 @@ def get_args():
     parser.add_argument(
         "--n-dumps",
         type=int,
-        default=10,
-        help="Total number of dumps to split the files into. Default: 8",
+        default=None,
+        help="Total number of dumps to split the files into. If None it will automatically compute this value based on the amount and size of parquet files",
     )
     args = parser.parse_args()
 
@@ -98,7 +99,7 @@ def main(args):
         f"Total number of files filtered to tokenize: {len(parquet_files)} ({sum(size_of_parquet_files) / 1e9:.2f} GB)"
     )
 
-    number_of_dumps = args.n_dumps
+    number_of_dumps = args.n_dumps if args.n_dumps else int(sum(size_of_parquet_files) / 150e9) + 1
     if number_of_dumps > len(parquet_files):
         number_of_dumps = len(parquet_files)
 

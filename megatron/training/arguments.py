@@ -21,7 +21,7 @@ from megatron.core.models.retro.utils import (
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import is_torch_min_version
-from megatron.training.activations import squared_relu
+from megatron.training.activations import squared_relu, XIELU, XIPReLU, XIPReLUP
 from megatron.training.utils import update_use_dist_ckpt
 
 
@@ -814,6 +814,28 @@ def validate_args(args, defaults={}):
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
 
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, f"goldfish_h (context width) must be a positive integer. ({args.goldfish_h})"
+        
+    # Cross document attention
+    if not args.cross_document_attention:
+            assert args.reset_position_ids, (
+                'reset_position_ids must be True when cross_document_attention is False '
+                'to maintain proper document-level position encoding'
+            )
+            assert args.reset_attention_mask, (
+                'reset_attention_mask must be True when cross_document_attention is False '
+                'to prevent cross-document attention'
+            )
+
+    # BOD hiding
+    if args.bod_hiding:
+        assert args.reset_attention_mask, (
+            'reset_attention_mask must be True when bod_hiding is True'
+        )
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -862,6 +884,10 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+
+    activation_flags = [args.swiglu, args.squared_relu, args.xielu, args.xiprelu, args.xiprelup]
+    if sum(activation_flags) > 1:
+        raise ValueError("Only one activation function can be selected at a time")
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -869,8 +895,14 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
         kw_args['activation_func'] = squared_relu
+    if args.xielu:
+        kw_args['activation_func'] = XIELU
+    if args.xiprelu:
+        kw_args['activation_func'] = XIPReLU
+    if args.xiprelup:
+        kw_args['activation_func'] = XIPReLUP
+        
     if args.init_method_xavier_uniform:
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
@@ -1081,6 +1113,12 @@ def _add_network_size_args(parser):
                        'reasons.')
     group.add_argument('--squared-relu', action='store_true',
                        help='Use squared relu activation instead of default gelu')
+    group.add_argument('--xielu', action='store_true',
+                       help='Use xielu activation instead of default gelu')
+    group.add_argument('--xiprelu', action='store_true',
+                       help='Use xiprelu activation instead of default gelu')
+    group.add_argument('--xiprelup', action='store_true',
+                       help='Use xiprelup activation instead of default gelu')
     group.add_argument('--swiglu', action='store_true',
                        help='Use gated linear units and SiLU activation instead of default gelu')
     group.add_argument('--onnx-safe', type=bool, required=False,
@@ -1162,6 +1200,8 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--log-params-norm-per-param', action='store_true',
+                       help='If set, calculate and log norm for each parameter individually.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-throughput', action='store_true',
@@ -1998,15 +2038,25 @@ def _add_data_args(parser):
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
+                       help='Reset position ids after beginning of document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
-                       'end-of-document token.')
+                       help='Reset self attention mask after beginning of document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--bod-hiding', action='store_true',
+                       help='If set, prevents tokens from attending to BOD tokens and masks BOD tokens in loss computation.')
+    group.add_argument('--goldfish-loss', action='store_true',
+                       help='Enable goldfish loss during pretraining.')
+    group.add_argument('--goldfish-k', type=int, default=50,
+                       help='Dropout factor k for goldfish loss masking, where dropout probability is 1/k.')
+    group.add_argument('--goldfish-h', type=int, default=50,                        
+                        help='Context width for hashing in goldfish loss masking. Controls how many preceding tokens determine masking.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--no-cross-document-attention', action='store_false',
+                       help='If set, restricts attention to only tokens within the same document during training.',
+                       dest='cross_document_attention')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--s3-cache-path', type=str, default=None,
