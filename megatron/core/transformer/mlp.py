@@ -19,6 +19,7 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.activations import XIELU, XIPReLU, XIPReLUP
 
 
 @dataclass
@@ -76,7 +77,14 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.activation_func == XIELU:
+            self.activation_func = XIELU(config=self.config)
+        elif self.config.activation_func == XIPReLU:
+            self.activation_func = XIPReLU(config=self.config)
+        elif self.config.activation_func == XIPReLUP:
+            self.activation_func = XIPReLUP(config=self.config)
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -223,7 +231,7 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                 )
             if flattened_range.stop > chunk_numel:
                 # Non-empty `v` chunk
-                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
+                tensor_v = t[-(flattened_range.stop - chunk_numel):]
                 flattened_range_v = slice(
                     max(chunk_numel, flattened_range.start) - chunk_numel,
                     flattened_range.stop - chunk_numel,
