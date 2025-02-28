@@ -96,19 +96,14 @@ class AdEMAMix(torch.optim.Optimizer):
                     # state["step"] = torch.zeros((1,), dtype=torch.float32, device=p.device)
                     if beta1 != 0.0:  # save memory in case beta1 is 0.0
                         state["exp_avg_fast"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    else:
-                        state["exp_avg_fast"] = None
                     state["exp_avg_slow"] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state["exp_avg_sq"]   = torch.zeros_like(p, memory_format=torch.preserve_format)
 
-                # Now retrieve the states
-                # step_t        = state["step"]
-                exp_avg_fast  = state["exp_avg_fast"]
+                if beta1 != 0.0:
+                    exp_avg_fast  = state["exp_avg_fast"]
                 exp_avg_slow  = state["exp_avg_slow"]
                 exp_avg_sq    = state["exp_avg_sq"]
 
-                # step_t.add_(1.0)
-                # step_val = step_t.item()
                 bias_correction1 = 1.0 - (beta1 ** step)
                 bias_correction2 = 1.0 - (beta2 ** step)
 
