@@ -489,9 +489,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        ## assert isinstance(
-        ##    optimizer, Adam
-        ## ), "Only Adam currently supported, due to checkpointing requirements."
         if isinstance(optimizer, Adam):
             self.optimizer_name = 'adam'
             self.optimizer_keys = ("param", "exp_avg", "exp_avg_sq")
