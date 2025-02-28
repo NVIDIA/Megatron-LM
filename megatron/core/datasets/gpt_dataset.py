@@ -231,7 +231,7 @@ class GPTDataset(MegatronDataset):
         if self.config.goldfish_loss:
 
             # Init the hash table once only
-            if self._goldfish_hash_table is None:
+            if not self._goldfish_hash_table:
                 self._goldfish_hash_table = _create_hash_table(device=labels.device)
 
             # Apply the goldfish mask
