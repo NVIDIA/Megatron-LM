@@ -706,10 +706,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             if self.optimizer_name == 'adam':
                                 tensors = {"exp_avg": init_shard(), "exp_avg_sq": init_shard()}
                             elif self.optimizer_name == 'ademamix':
-                                if len(self.optimizer_keys) == 4: # beta1 != 0
-                                    tensors = {"exp_avg_slow": init_shard(), "exp_avg_fast": init_shard(), "exp_avg_sq": init_shard()}
-                                else: # beta1 == 0
-                                    tensors = {"exp_avg_slow": init_shard(), "exp_avg_sq": init_shard()}
+                                tensors = {"exp_avg_slow": init_shard(), "exp_avg_sq": init_shard()}
+                                if "exp_avg_fast" in self.optimizer_keys:
+                                    tensors["exp_avg_fast"] =  init_shard()
                             if self.config.use_precision_aware_optimizer:
                                 tensors["master_param"] = init_shard()
                             state_dict_state.append((state_order, tensors))
