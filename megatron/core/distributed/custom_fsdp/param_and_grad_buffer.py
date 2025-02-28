@@ -16,21 +16,12 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.fp8_utils import is_float8tensor, quantize_param_fragment
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
-from megatron.core.utils import (
-    is_float8tensor,
-    is_submodule,
-    is_te_min_version,
-    log_on_each_pipeline_stage,
-)
+from megatron.core.utils import is_submodule, is_te_min_version, log_on_each_pipeline_stage
 
 try:
     from transformer_engine.pytorch import fp8_model_init
-
-    # This will be used when "--use-fp8-params" is enabled.
-    # When BF16/FP16 parameters don't exist, we need to cast the FP32 main parameters to
-    # FP8 directly in the optimizer.
-    from transformer_engine.pytorch.cpp_extensions import cast_to_fp8
 except:
     pass
 
@@ -1385,13 +1376,7 @@ class ParamAndGradBuffer:
                     # TODO: The following code maintains the logic of the point-1
                     # above. It can be deleted if it is not necessary.
                     main_weight = main_weight.to(param.dtype)
-                    cast_to_fp8(
-                        main_weight.view(1, -1),
-                        param._fp8_meta['scaling_fwd'],
-                        param._fp8_meta_index,
-                        param._fp8_dtype,
-                        out=model_param.view(1, -1),
-                    )
+                    quantize_param_fragment(input_=main_weight, out=model_param, param=param)
                 else:
                     model_param.data.copy_(main_weight.view(model_param.shape))
 
