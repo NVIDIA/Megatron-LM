@@ -172,6 +172,9 @@ TOKENIZER_ARGS=(
 DATA_ARGS=(
 	--split 100,0,0
 	--seq-length $SEQ_LEN
+	--reset-position-ids
+	--reset-attention-mask
+	--eod-mask-loss
 	--num-workers 1
 	--num-dataset-builder-threads 1
 )
