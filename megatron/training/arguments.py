@@ -538,7 +538,7 @@ def validate_args(args, defaults={}):
 
     # Check required arguments.
     required_args = ['num_layers', 'hidden_size', 'num_attention_heads',
-                     'max_position_embeddings']
+                     'max_position_embeddings', 'trigger_path']
     for req_arg in required_args:
         _check_arg_is_not_none(args, req_arg)
 
@@ -813,6 +813,40 @@ def validate_args(args, defaults={}):
     elif args.replication_jump:
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
+
+    # Exit & Save triggers
+    args.exit_trigger = os.path.join(args.trigger_path, "exit")
+    args.save_trigger = os.path.join(args.trigger_path, "save")
+    if args.rank == 0:
+        print(f'Exit trigger setup! run `touch {args.exit_trigger}` to stop training')
+        print(f'Save trigger setup! run `touch {args.save_trigger}` to save a checkpoint')
+    
+    if args.profile and args.exit_signal_handler:
+        args.exit_signal_handler = False
+        if args.rank == 0:
+            print("WARNING: When using nsys profiling, the job will terminate upon receiving the SIGUSR2 signal. Disabling --exit-signal-handler`")
+
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, f"goldfish_h (context width) must be a positive integer. ({args.goldfish_h})"
+        
+    # Cross document attention
+    if not args.cross_document_attention:
+            assert args.reset_position_ids, (
+                'reset_position_ids must be True when cross_document_attention is False '
+                'to maintain proper document-level position encoding'
+            )
+            assert args.reset_attention_mask, (
+                'reset_attention_mask must be True when cross_document_attention is False '
+                'to prevent cross-document attention'
+            )
+
+    # BOD hiding
+    if args.bod_hiding:
+        assert args.reset_attention_mask, (
+            'reset_attention_mask must be True when bod_hiding is True'
+        )
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1178,6 +1212,8 @@ def _add_logging_args(parser):
 
     group.add_argument('--log-params-norm', action='store_true',
                        help='If set, calculate and log parameters norm.')
+    group.add_argument('--log-params-norm-per-param', action='store_true',
+                       help='If set, calculate and log norm for each parameter individually.')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-throughput', action='store_true',
@@ -1436,7 +1472,9 @@ def _add_training_args(parser):
                        help='Exit the program after this many minutes.')
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
-                       'training if SIGTERM is received')
+                       'training if SIGUSR2 is received')
+    group.add_argument('--trigger-path', type=str, default=None,
+                       help = 'Path to check for exit & save triggers')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
     group.add_argument('--no-masked-softmax-fusion',
@@ -2014,15 +2052,25 @@ def _add_data_args(parser):
     group.add_argument('--num-workers', type=int, default=2,
                        help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
-                       help='Reset posistion ids after end-of-document token.')
+                       help='Reset position ids after beginning of document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
-                       help='Reset self attention maske after '
-                       'end-of-document token.')
+                       help='Reset self attention mask after beginning of document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--bod-hiding', action='store_true',
+                       help='If set, prevents tokens from attending to BOD tokens and masks BOD tokens in loss computation.')
+    group.add_argument('--goldfish-loss', action='store_true',
+                       help='Enable goldfish loss during pretraining.')
+    group.add_argument('--goldfish-k', type=int, default=50,
+                       help='Dropout factor k for goldfish loss masking, where dropout probability is 1/k.')
+    group.add_argument('--goldfish-h', type=int, default=50,                        
+                        help='Context width for hashing in goldfish loss masking. Controls how many preceding tokens determine masking.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
+    group.add_argument('--no-cross-document-attention', action='store_false',
+                       help='If set, restricts attention to only tokens within the same document during training.',
+                       dest='cross_document_attention')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--s3-cache-path', type=str, default=None,
