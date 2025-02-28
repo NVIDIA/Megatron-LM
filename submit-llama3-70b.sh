@@ -18,7 +18,7 @@ echo "START TIME: $(date)"
 
 ################ Configs ################
 # NOTE(tj.solergibert) Check the `Data` section in the README. Use `,` to specify multiple datasets e.g. "/path/to/dataset/A,/path/to/dataset/B,/path/to/dataset/C"
-DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai-v2/swissai-fineweb-edu-filterrobots-merge"
+DATASETS="/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge"
 
 MBS=1 # Micro batch size
 GBS=1024 # Global batch size
@@ -101,7 +101,6 @@ LOGGING_ARGS=(
 	--log-throughput
 	--log-progress
 	--tensorboard-dir $TENSORBOARD_DIR
-	--log-timers-to-tensorboard
 	--no-log-loss-scale-to-tensorboard
 	--log-memory-to-tensorboard
 )
@@ -173,7 +172,7 @@ DISTRIBUTED_ARGS=(
 
 TOKENIZER_ARGS=(
 	--tokenizer-type HuggingFaceTokenizer
-	--tokenizer-model tj-solergibert/swai
+	--tokenizer-model alehc/swissai-tokenizer
 )
 
 DATA_ARGS=(
