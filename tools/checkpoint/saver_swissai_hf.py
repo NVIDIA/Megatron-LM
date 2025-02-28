@@ -166,7 +166,7 @@ def save_checkpoint(queue: mp.Queue, args):
             architectures=["SwissAIForCausalLM"],
             transformers_version="4.33.1",
             qk_norm=md.checkpoint_args.qk_layernorm,
-            post_norm=md.checkpoint_args.post_layer_norm,
+            post_norm=md.checkpoint_args.post_layer_norm if hasattr(md.checkpoint_args, "post_layer_norm") else False
         )
         if args.hf_tokenizer:
             llama_conf.eos_token_id = tokenizer.eos_token_id
