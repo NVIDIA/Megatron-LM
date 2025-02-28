@@ -7,9 +7,10 @@ import torch
 
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+from ..fp8_utils import is_float8tensor
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import is_float8tensor, log_single_rank
+from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets

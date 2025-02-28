@@ -35,8 +35,13 @@ from ..dist_checkpointing.mapping import (
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from ..fp8_utils import (
+    get_fp8_scale_and_amax,
+    is_float8tensor,
+    is_mxfp8tensor,
+    quantize_param_fragment,
+)
 from ..transformer.module import MegatronModule
-from ..utils import is_float8tensor
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -44,14 +49,6 @@ from .optimizer import (
     _zero_grad_group_helper,
 )
 from .optimizer_config import OptimizerConfig
-
-try:
-    # This will be used when "--fp8-param-gather" is enabled.
-    # When BF16/FP16 parameters don't exist, we need to cast the FP32 main parameters to
-    # FP8 directly in the optimizer.
-    from transformer_engine.pytorch.cpp_extensions import cast_to_fp8
-except:
-    pass
 
 logger = getLogger(__name__)
 
@@ -374,6 +371,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 .float()
                             )
                             model_param.clear_high_precision_init_val()
+                        elif is_mxfp8tensor(model_param):
+                            raise ValueError(
+                                "Distributed optimizer currently does not support MXFP8 parameters."
+                            )
                         else:
                             shard_main_param = shard_model_param.clone().float()
 
@@ -2000,12 +2001,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # be deleted if it is not necessary.
                         shard_main_param = shard_main_param.to(model_param.dtype)
 
-                        cast_to_fp8(
-                            shard_main_param.view(1, -1),
-                            model_param._fp8_meta['scaling_fwd'],
-                            model_param._fp8_meta_index,
-                            model_param._fp8_dtype,
-                            out=shard_model_param.view(1, -1),
+                        quantize_param_fragment(
+                            shard_main_param, out=shard_model_param, param=model_param
                         )
                     else:
                         shard_model_param.data.copy_(shard_main_param)
@@ -2080,10 +2077,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             scale_invs = []
             for param in buffer.params:
                 if is_float8tensor(param):
-                    fp8_meta = param._fp8_meta['scaling_fwd']
-                    fp8_meta_index = param._fp8_meta_index
-                    amaxes.append(fp8_meta.amax_history[0][fp8_meta_index].view(1))
-                    scales.append(fp8_meta.scale[fp8_meta_index].view(1))
+                    scale, amax = get_fp8_scale_and_amax(param)
+                    amaxes.append(amax.view(1))
+                    scales.append(scale.view(1))
                     scale_invs.append(param._scale_inv.view(1))
                     # Reset transpose cache
                     param._reset_caches()

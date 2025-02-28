@@ -21,10 +21,11 @@ from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
 )
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import is_float8tensor, is_submodule, log_single_rank
+from megatron.core.utils import is_submodule, log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -678,10 +679,16 @@ class RegisterFSDPBackwardFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, post_backward, *inputs: torch.Tensor):
+        """
+        Forward pass of the RegisterFSDPBackwardFunction function.
+        """
         ctx.post_backward = post_backward
         return inputs
 
     @staticmethod
     def backward(ctx, *grads: torch.Tensor):
+        """
+        Backward pass of the RegisterFSDPBackwardFunction function.
+        """
         ctx.post_backward()
         return (None,) + grads
