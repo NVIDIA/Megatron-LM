@@ -497,10 +497,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer_keys = ("param", "exp_avg", "exp_avg_sq")
         elif isinstance(optimizer, AdEMAMix):
             self.optimizer_name = 'ademamix'
+            self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_sq")
             if config.adam_beta1 != 0.0:
                 self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_fast", "exp_avg_sq")
-            else:
-                self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_sq")
         else:
             raise Exception(f"Unrecognized optimizer {type(optimizer)}, only Adam and AdEMAMix are supported for now.")
 
