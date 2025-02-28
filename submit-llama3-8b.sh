@@ -101,7 +101,6 @@ LOGGING_ARGS=(
 	--log-throughput
 	--log-progress
 	--tensorboard-dir $TENSORBOARD_DIR
-	--log-timers-to-tensorboard
 	--no-log-loss-scale-to-tensorboard
 	--log-memory-to-tensorboard
 )
@@ -167,7 +166,7 @@ DISTRIBUTED_ARGS=(
 
 TOKENIZER_ARGS=(
 	--tokenizer-type HuggingFaceTokenizer
-	--tokenizer-model tj-solergibert/swai
+	--tokenizer-model alehc/swissai-tokenizer
 )
 
 DATA_ARGS=(
