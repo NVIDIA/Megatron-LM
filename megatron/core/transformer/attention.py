@@ -2,6 +2,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Tuple, Union
+import inspect
 
 import torch
 from torch import Tensor

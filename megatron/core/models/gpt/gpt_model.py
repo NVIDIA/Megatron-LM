@@ -79,6 +79,7 @@ class GPTModel(LanguageModule):
         rope_scaling_factor: float = 8.0,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
+        final_layernorm: bool = True,
     ) -> None:
         super().__init__(config=config)
 
@@ -94,6 +95,7 @@ class GPTModel(LanguageModule):
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+        self.final_layernorm = final_layernorm
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -135,6 +137,7 @@ class GPTModel(LanguageModule):
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            post_layer_norm=self.final_layernorm,
         )
 
         # Output
