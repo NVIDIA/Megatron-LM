@@ -1579,6 +1579,11 @@ def _add_training_args(parser):
                        choices=['nccl', 'ucc'],
                        help='Select a communicator backend for pipeline parallel communication. '
                        'If None, the default backend will be used.')
+    group.add_argument('--z-loss-weight', type=float, default=None,
+                       help='Coefficient for z-loss. If None, z-loss is not computed. '
+                       'If >=0, z-loss is enforced, and z-loss and ce-loss are also '
+                       'logged separately.',
+                       dest='z_loss_weight')
 
     return parser
 

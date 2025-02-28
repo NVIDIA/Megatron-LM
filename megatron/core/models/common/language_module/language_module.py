@@ -76,9 +76,9 @@ class LanguageModule(MegatronModule):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         if self.config.cross_entropy_loss_fusion:
-            loss = fused_vocab_parallel_cross_entropy(logits, labels)
+            loss = fused_vocab_parallel_cross_entropy(logits, labels, z_loss_weight=self.config.z_loss_weight)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels, z_loss_weight=self.config.z_loss_weight)
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
