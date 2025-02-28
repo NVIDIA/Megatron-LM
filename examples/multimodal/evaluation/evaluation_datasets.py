@@ -742,6 +742,85 @@ class AI2DDataset(torch.utils.data.Dataset):
         )
 
 
+class RDTableBenchDataset(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        input_image_path,
+        gt_path,
+        num_samples_per_partition,
+        num_partitions,
+        partition_id,
+        img_h,
+        img_w,
+        use_tiling,
+        max_num_tiles,
+        use_thumbnail,
+        vision_model_type,
+    ):
+        gt_paths = sorted(glob.glob(os.path.join(gt_path, "*.html")))
+        gt = []
+        for gt_path in gt_paths:
+            img_path = os.path.join(input_image_path, os.path.basename(gt_path).replace(".html", ".jpg"))
+            with open(gt_path) as f:
+                html = f.read()
+            gt.append({
+                "answer": html,
+                "image": img_path,
+            })
+
+        if num_partitions > 0:
+            start_idx, end_idx = _get_partition_bounds(
+                len(gt), num_samples_per_partition, num_partitions, partition_id
+            )
+            gt = gt[start_idx:end_idx]
+
+        self._input_image_path = input_image_path
+        self._gt = gt
+        self._img_h = img_h
+        self._img_w = img_w
+        self._use_tiling = use_tiling
+        self._max_num_tiles = max_num_tiles
+        self._use_thumbnail = use_thumbnail
+        self._vision_model_type = vision_model_type
+
+    def __len__(self):
+        return len(self._gt)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self._input_image_path, self._gt[idx]['image'])
+
+        img = Image.open(img_path)
+        imgs = get_visual_transform(
+            img,
+            self._img_h,
+            self._img_w,
+            self._use_tiling,
+            self._max_num_tiles,
+            self._use_thumbnail,
+            augment=False,
+            vision_model_type=self._vision_model_type,
+        )
+
+        tile_count = torch.tensor([len(imgs)], dtype=torch.int)
+
+        metadata = ""
+
+        prompt = (
+            "Convert the image to an HTML table. The output should begin with <table> and end with </table>. "
+            "Specify rowspan and colspan attributes when they are greater than 1. Do not specify any other attributes. "
+            "Only use table related HTML tags, no additional formatting is required."
+        )
+
+        return (
+            torch.stack(imgs),
+            tile_count,
+            idx,
+            prompt,
+            self._gt[idx]["answer"],
+            metadata,
+        )
+
+
 def get_evaluation_dataset(
     task,
     input_image_path,
@@ -866,7 +945,7 @@ def get_evaluation_dataset(
             num_frames,
             vision_model_type,
         )
-    elif task == "OCRBench":
+    elif task in ["OCRBench", "OCRBench_v2"]:
         dataset = OCRBenchDataset(
             input_image_path,
             gt_path,
@@ -935,6 +1014,20 @@ def get_evaluation_dataset(
             num_partitions,
             partition_id,
             keys,
+            img_h,
+            img_w,
+            use_tiling,
+            max_num_tiles,
+            use_thumbnail,
+            vision_model_type,
+        )
+    elif task == "RD_TableBench":
+        dataset = RDTableBenchDataset(
+            input_image_path,
+            gt_path,
+            num_samples_per_partition,
+            num_partitions,
+            partition_id,
             img_h,
             img_w,
             use_tiling,

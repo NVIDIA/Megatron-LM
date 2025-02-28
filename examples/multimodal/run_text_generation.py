@@ -70,10 +70,12 @@ def add_text_generation_args(parser):
             "MMMU",
             "VideoMME",
             "OCRBench",
+            "OCRBench_v2",
             "MathVista",
             "AI2D",
             "InfoVQA",
             "SPDocVQA",
+            "RD_TableBench",
         ],
         help="Generation task to run",
     )
@@ -263,6 +265,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 elif config.task == "VideoMME":
                     output_name = "response"
                     output = question
+                elif config.task in ["OCRBench_v2", "RD_TableBench"]:
+                    output_name = "predict"
                 else:
                     raise NotImplementedError("no output name defined for", config.task)
 
@@ -275,13 +279,14 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     output["prompt"] = prompt
                     output[output_name] = generated
 
-                if config.task == "captioning":
+                if config.task in ["captioning", "RD_TableBench"]:
                     output["ground_truth"] = answers
                 elif config.task in (
                     "TextVQA",
                     "VQAv2",
                     "ChartQA",
                     "OCRBench",
+                    "OCRBench_v2",
                     "MathVista",
                     "AI2D",
                     "InfoVQA",
@@ -499,7 +504,7 @@ def get_conversation(task, question):
                 "content": f"{IMAGE_TOKEN}\n{question}\nAnswer the question using a single word or phrase.",
             },
         ]
-    elif task in ("OCRBench", "MathVista", "AI2D"):
+    elif task in ("OCRBench", "OCRBench_v2", "MathVista", "AI2D", "RD_TableBench"):
         conversation = [
             {"role": "system", "content": "Answer the questions."},
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
@@ -556,8 +561,6 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
 
     # Remove possible garbage.
     generated = generated.strip()
-    generated = generated.split("\n\n")[0]
-    generated = generated.split("\n")[0]
 
     return prompt, generated
 
