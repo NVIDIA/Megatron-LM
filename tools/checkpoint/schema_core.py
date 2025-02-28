@@ -61,6 +61,10 @@ class CoreLocalSchema(CoreSchema):
             "self_attn_qkv_bias" : "self_attention.linear_qkv.bias",
             "self_attn_proj_weight" : "self_attention.linear_proj.weight",
             "self_attn_proj_bias" : "self_attention.linear_proj.bias",
+            "self_attn_q_layernorm_weight" : "self_attention.q_layernorm.weight",
+            "self_attn_q_layernorm_bias" : "self_attention.q_layernorm.bias",
+            "self_attn_k_layernorm_weight" : "self_attention.k_layernorm.weight",
+            "self_attn_k_layernorm_bias" : "self_attention.k_layernorm.bias",
 
             # MLP.
             "mlp_norm_weight" : "pre_mlp_layernorm.weight",
@@ -86,6 +90,10 @@ class CoreTESchema(CoreSchema):
 
             "self_attn_proj_weight" : "self_attention.linear_proj.weight",
             "self_attn_proj_bias" : "self_attention.linear_proj.bias",
+            "self_attn_q_layernorm_weight" : "self_attention.q_layernorm.weight",
+            "self_attn_q_layernorm_bias" : "self_attention.q_layernorm.bias",
+            "self_attn_k_layernorm_weight" : "self_attention.k_layernorm.weight",
+            "self_attn_k_layernorm_bias" : "self_attention.k_layernorm.bias",
 
             # MLP.
             "mlp_norm_weight" : "mlp.linear_fc1.layer_norm_weight",
@@ -113,6 +121,10 @@ class CoreMoETESchema(CoreSchema):
 
             "self_attn_proj_weight" : "self_attention.linear_proj.weight",
             "self_attn_proj_bias" : "self_attention.linear_proj.bias",
+            "self_attn_q_layernorm_weight" : "self_attention.q_layernorm.weight",
+            "self_attn_q_layernorm_bias" : "self_attention.q_layernorm.bias",
+            "self_attn_k_layernorm_weight" : "self_attention.k_layernorm.weight",
+            "self_attn_k_layernorm_bias" : "self_attention.k_layernorm.bias",
 
             # MLP.
             "mlp_norm_weight" : "pre_mlp_layernorm.weight",

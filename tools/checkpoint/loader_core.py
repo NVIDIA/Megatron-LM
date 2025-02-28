@@ -297,6 +297,16 @@ def _load_checkpoint(queue, args):
                 if md.linear_bias:
                     message["dense bias"] = layer["self_attn_proj_bias"]
                     message["mlp l1 bias"] = layer["mlp_fc2_bias"]
+                
+                # Add QK normalization parameters if they exist
+                if layer.get("self_attn_q_layernorm_weight") is not None:
+                    message["q norm weight"] = layer["self_attn_q_layernorm_weight"]
+                    if norm_has_bias:
+                        message["q norm bias"] = layer["self_attn_q_layernorm_bias"]
+                if layer.get("self_attn_k_layernorm_weight") is not None:
+                    message["k norm weight"] = layer["self_attn_k_layernorm_weight"]
+                    if norm_has_bias:
+                        message["k norm bias"] = layer["self_attn_k_layernorm_bias"]
 
                 # Grab all parallel tensors for this layer
                 qkv_weight = []
