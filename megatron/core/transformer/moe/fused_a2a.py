@@ -108,7 +108,7 @@ class FusedDispatch(torch.autograd.Function):
             allocate_on_comm_stream=False,
         )
 
-        ctx.buffer = buffer
+        ctx.group = group
         ctx.handle = handle
         ctx.event = event
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
@@ -120,7 +120,7 @@ class FusedDispatch(torch.autograd.Function):
         ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
     ):
         """Backward pass of fused dispatch."""
-        buffer = ctx.buffer
+        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         handle = ctx.handle
 
         grad_x, grad_token_probs, event = buffer.combine(
@@ -145,14 +145,14 @@ class FusedCombine(torch.autograd.Function):
             x, handle=handle, async_finish=False, previous_event=None, allocate_on_comm_stream=False
         )
         ctx.handle = handle
-        ctx.buffer = buffer
+        ctx.group = group
 
         return combined_x, event
 
     @staticmethod
     def backward(ctx, grad_output, previous_event=None):
         """Backward pass of fused combine."""
-        buffer = ctx.buffer
+        buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         grad_x, _, _, _, _, event = buffer.dispatch(
             grad_output.contiguous(),
             handle=ctx.handle,
