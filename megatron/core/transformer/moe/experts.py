@@ -779,15 +779,20 @@ class SequentialMLP(MegatronModule):
     """
 
     def __init__(self, num_local_experts, config: TransformerConfig, submodules: MLPSubmodules):
-        super().__init__(config=config)
+
+        if config.moe_ffn_hidden_size == config.ffn_hidden_size:
+            super().__init__(config=config)
+        else:
+            # Local SequentialMLP can still be used here by overriding the ffn_hidden_size
+            # with a deepcopied config.
+            sequential_mlp_config = deepcopy(config)
+            sequential_mlp_config.ffn_hidden_size = config.moe_ffn_hidden_size
+            super().__init__(config=sequential_mlp_config)
+
         self.add_bias = config.add_bias_linear
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
 
-        assert (
-            self.config.moe_ffn_hidden_size == self.config.ffn_hidden_size
-        ), "Please use GroupedMLP or TEGroupedMLP when moe_ffn_hidden_size is \
-                different from ffn_hidden_size"
         for _ in range(self.num_local_experts):
             expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
