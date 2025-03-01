@@ -161,10 +161,15 @@ class DistributedDataParallel(_BaseDataParallel):
                         )
                     else:
                         # For non-expert parameters, gradient_scaling_factor is 1.
-                        # For expert parameters, gradient_scaling_factor is 1/ep_size.
+                        # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
                         assert (gradient_scaling_factor == 1) or (
                             gradient_scaling_factor
-                            == (1.0 / parallel_state.get_expert_model_parallel_world_size())
+                            == (
+                                parallel_state.get_expert_data_parallel_world_size()
+                                / parallel_state.get_data_parallel_world_size(
+                                    with_context_parallel=True
+                                )
+                            )
                         )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
@@ -199,6 +204,9 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
                 assert (
+                    parallel_state.get_expert_model_parallel_world_size() == 1
+                ), "Partial DistOpt cannot support MoE models with expert parallelism."
+                assert (
                     self.ddp_config.use_distributed_optimizer
                 ), 'Partial DistOpt cannot be used without DistOpt'
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
@@ -229,10 +237,31 @@ class DistributedDataParallel(_BaseDataParallel):
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
         else:
+            # The goal is to scale reduced gradients by 1/dp_size.
+            # This can be achieved in two ways:
+            #
+            # Case 1: average_in_collective=True
+            # - Non-expert parameters:
+            #   1. No pre-scaling (gradient_scaling_factor=1.0)
+            #   2. Do average reduction over dp group (equals to sum then divide by dp_size)
+            #   3. Final result is scaled by 1/dp_size as desired
+            #
+            # - Expert parameters:
+            #   1. Scale by edp_size/dp_size before reduction
+            #   2. Do average reduction over edp group (equals to sum then divide by edp_size)
+            #   3. Resulted scaling: (edp_size/dp_size) * (1/edp_size) = 1/dp_size as desired
+            #   (edp_size = expert data parallel world size)
+            #
+            # Case 2: average_in_collective=False
+            # - Both expert and non-expert parameters:
+            #   1. Scale gradients by 1/dp_size before reduction
+            #   2. Do sum reduction across data parallel ranks
+            #   3. Final result is scaled by 1/dp_size as desired
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = (
-                    1.0 / parallel_state.get_expert_model_parallel_world_size()
+                    parallel_state.get_expert_data_parallel_world_size()
+                    / parallel_state.get_data_parallel_world_size(with_context_parallel=True)
                 )
             else:
                 data_parallel_world_size = parallel_state.get_data_parallel_world_size(
