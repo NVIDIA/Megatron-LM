@@ -1929,6 +1929,14 @@ def get_expert_data_parallel_rank():
         return 0
 
 
+def get_expert_data_parallel_world_size():
+    """Return world size for the expert data parallel group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(group=get_expert_data_parallel_group())
+    else:
+        return 0
+
+
 ### End of expert-related functions region
 
 

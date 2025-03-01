@@ -363,6 +363,7 @@ class _ParamAndGradBucketGroup:
             and self.ddp_config.num_distributed_optimizer_instances > 1
         ):
 
+            assert self.inter_distributed_optimizer_instance_group is not None
             # Create a new coalescing manager for the inter-instance all-reduce.
             with stream_context, _coalescing_manager(
                 self.inter_distributed_optimizer_instance_group, async_ops=async_op
