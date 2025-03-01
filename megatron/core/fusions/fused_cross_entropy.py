@@ -12,6 +12,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.tensor_parallel.cross_entropy import VocabParallelCrossEntropy
 from megatron.core.tensor_parallel.utils import VocabUtility
+from megatron.core.transformer.moe.moe_utils import save_to_aux_losses_tracker
 
 
 @jit_fuser
@@ -47,16 +48,13 @@ def calculate_predicted_logits(
 @jit_fuser
 def calculate_cross_entropy_loss(
     exp_logits: torch.Tensor, predicted_logits_sum_exp_logits: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     split_val = predicted_logits_sum_exp_logits.size()[0] // 2
     predicted_logits, sum_exp_logits = torch.split(predicted_logits_sum_exp_logits, split_val)
 
-    exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
-        exp_logits, predicted_logits, sum_exp_logits
-    )
-
-    return exp_logits, loss
+    return VocabParallelCrossEntropy.calculate_cross_entropy_loss(
+        exp_logits, predicted_logits, sum_exp_logits) 
 
 
 @jit_fuser
@@ -82,7 +80,7 @@ def calculate_gradients(
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target):
+    def forward(ctx, vocab_parallel_logits, target, z_loss_weight=None):
 
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         torch.distributed.all_reduce(
@@ -111,10 +109,28 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             group=get_tensor_model_parallel_group(),
         )
 
-        exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)
+        exp_logits, loss, log_sum_exp_logits = calculate_cross_entropy_loss(
+            exp_logits, predicted_logits_sum_exp_logits)
 
-        # Store softmax, target-mask and masked-target for backward pass.
-        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)
+        cloned_z_loss, cloned_ce_loss, log_z = None, None, None
+        if z_loss_weight is not None:
+            # before computing the actual loss for backprop (with added zloss),
+            # we store the original cross-entropy loss for logging purposes
+            cloned_ce_loss = loss.clone().detach()
+            save_to_aux_losses_tracker("ce-loss", torch.mean(cloned_ce_loss),
+                            1, 1, reduce_pp=False)
+            # z_loss = 10^(-4) * log(Z)^2
+            log_z = log_sum_exp_logits + logits_max
+            z_loss = torch.square(log_z)
+            cloned_z_loss = z_loss.clone().detach()
+            save_to_aux_losses_tracker("z-loss", torch.mean(cloned_z_loss),
+                                       1, 1, reduce_pp=False)
+            loss = loss + z_loss_weight * z_loss
+
+        ctx.z_loss_weight = z_loss_weight
+
+        # Store softmax, target-mask, masked-target, and log_z for backward pass.
+        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d, log_z)
 
         return loss
 
@@ -122,14 +138,19 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
     def backward(ctx, grad_output):
 
         # Retreive tensors from the forward path.
-        softmax, target_mask, masked_target_1d = ctx.saved_tensors
+        softmax, target_mask, masked_target_1d, log_z = ctx.saved_tensors
+        z_loss_weight = ctx.z_loss_weight
+
+        if z_loss_weight is not None:
+            # z-loss term adds the (2 * z_loss * log_z) factor.
+            softmax *= (1.0 + 2.0 * z_loss_weight * log_z).unsqueeze(-1)
 
         grad_input = calculate_gradients(softmax, grad_output, target_mask, masked_target_1d)
 
-        return grad_input, None
+        return grad_input, None, None
 
 
-def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target):
+def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target, z_loss_weight=None):
     """
     Performs cross entropy loss when logits are split across tensor parallel ranks
 
@@ -139,5 +160,7 @@ def fused_vocab_parallel_cross_entropy(vocab_parallel_logits, target):
 
         target: correct vocab ids of dimseion [sequence_length, micro_batch_size]
 
+        z_loss_weight: weight of the z_loss term, default is 1e-4
+
     """
-    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target)
+    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, z_loss_weight)
