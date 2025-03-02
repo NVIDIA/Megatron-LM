@@ -73,7 +73,9 @@ class CoreLocalSchema(CoreSchema):
             "mlp_fc1_bias" : "mlp.linear_fc1.bias",
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",
             "mlp_fc2_bias" : "mlp.linear_fc2.bias",
-
+            # xielu weights
+            "mlp_xielu_alpha_p" : "mlp.activation_func.alpha_p",
+            "mlp_xielu_alpha_n" : "mlp.activation_func.alpha_n",
         })
 
 
@@ -102,6 +104,9 @@ class CoreTESchema(CoreSchema):
             "mlp_fc1_bias" : "mlp.linear_fc1.bias",
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",
             "mlp_fc2_bias" : "mlp.linear_fc2.bias",
+            # xielu weights
+            "mlp_xielu_alpha_p" : "mlp.activation_func.alpha_p",
+            "mlp_xielu_alpha_n" : "mlp.activation_func.alpha_n",
 
         })
 
@@ -134,7 +139,10 @@ class CoreMoETESchema(CoreSchema):
 
             **{f"mlp_fc1_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc1.weight" for expert_idx in range(num_local_experts) },
             **{f"mlp_fc2_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc2.weight" for expert_idx in range(num_local_experts) },
-
+            
+            # xielu weights
+            **{f"mlp_xielu_alpha_p.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.activation_func.alpha_p.weight" for expert_idx in range(num_local_experts) },
+            **{f"mlp_xielu_alpha_n.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.activation_func.alpha_n.weight" for expert_idx in range(num_local_experts) },
         })
 
 

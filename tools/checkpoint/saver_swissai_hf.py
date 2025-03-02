@@ -244,6 +244,8 @@ def save_checkpoint(queue: mp.Queue, args):
             elif activation == "xielu":
                 state_dict |= {
                     f"model.layers.{i_layer}.mlp.up_proj.weight": message["mlp l0 weight"],
+                    f"model.layers.{i_layer}.mlp.act_fn.alpha_p": message["mlp xielu alpha p"],
+                    f"model.layers.{i_layer}.mlp.act_fn.alpha_n": message["mlp xielu alpha n"],
                 }
             if md.checkpoint_args.add_bias_linear: # only works for swiglu for now, but we never use biases anyway
                 state_dict |= {
