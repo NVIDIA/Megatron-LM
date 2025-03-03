@@ -154,7 +154,7 @@ def save_checkpoint(queue: mp.Queue, args):
             num_hidden_layers=md.checkpoint_args.num_layers,
             num_attention_heads=md.checkpoint_args.num_attention_heads,
             num_key_value_heads=md.checkpoint_args.num_query_groups,
-            hidden_act=activation,
+            hidden_act='silu' if activation == 'swiglu' else 'xielu',
             max_position_embeddings=md.checkpoint_args.max_position_embeddings,
             rms_norm_eps=md.checkpoint_args.norm_epsilon,
             tie_word_embeddings=not md.checkpoint_args.untie_embeddings_and_output_weights,
