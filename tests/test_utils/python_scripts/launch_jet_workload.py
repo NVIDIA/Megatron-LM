@@ -7,6 +7,7 @@ import signal
 import sys
 import tempfile
 import time
+import zipfile
 from typing import List, Optional
 
 import click
@@ -273,11 +274,10 @@ def main(
             record_checkpoints=record_checkpoints,
         )
 
-        main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
-
         n_download_attempt = 0
         while n_download_attempt < 3:
             try:
+                main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
                 jet_log = main_job.get_logs()
                 logs = extract_logs_to_string(logs=jet_log)
                 download_job_assets(logs=jet_log, iteration=n_iteration)
@@ -287,6 +287,7 @@ def main(
                 requests.exceptions.ConnectionError,
                 json.decoder.JSONDecodeError,
                 UnicodeDecodeError,
+                zipfile.BadZipFile,
             ) as e:
                 logger.error(e)
                 time.sleep(2 * n_download_attempt * 15)
