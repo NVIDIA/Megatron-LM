@@ -497,7 +497,7 @@ class RerunStateMachine:
                 )
                 rank: int = _safe_get_rank()
                 node: str = os.uname()[1]
-                device: int = torch.cuda.current_device()
+                device: torch.device = get_current_device()
                 full_message: str = (
                     f"Rank {rank}, node {node}, device {device}, "
                     f"iteration {self.current_iteration}: "
@@ -938,7 +938,7 @@ class RerunStateMachine:
             try:
                 rank: int = _safe_get_rank()
                 node: str = os.uname()[1]
-                device: int = torch.cuda.current_device()
+                device: torch.device = get_current_device()
                 with open(self.result_rejected_tracker_filename, 'a') as f:
                     print(
                         f"ts={datetime.datetime.now()} node={node} device={device} "

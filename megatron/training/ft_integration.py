@@ -45,6 +45,8 @@ from typing import Any, Optional
 
 import torch
 
+from megatron.core.device_utils import get_current_device
+
 from . import global_vars
 from .utils import is_rank0, print_rank_0
 
@@ -326,7 +328,7 @@ def maybe_setup_simulated_fault() -> None:
     rank = torch.distributed.get_rank()
     rand_rank = rng.randint(0, torch.distributed.get_world_size() - 1)
     rank_to_fail = rank_to_fail if rank_to_fail is not None else rand_rank
-    rank_to_fail = torch.tensor([rank_to_fail], device=torch.cuda.current_device())
+    rank_to_fail = torch.tensor([rank_to_fail], device=get_current_device())
     torch.distributed.broadcast(rank_to_fail, 0)
     rank_to_fail = int(rank_to_fail.item())
 

@@ -279,6 +279,7 @@ class CheckpointFunction(torch.autograd.Function):
     2) the states in the model parallel tracker are also properly tracked/set/reset.
     """
 
+    # pylint: disable=missing-function-docstring
     @staticmethod
     def forward(ctx, run_function, distribute_saved_activations, *args):
         """Forward pass."""
@@ -311,6 +312,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         return outputs
 
+    # pylint: disable=missing-function-docstring
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
@@ -349,7 +351,9 @@ class CheckpointFunction(torch.autograd.Function):
             outputs = (outputs,)
 
         # filter out non tensor outputs for backward pass
-        outputs, args = zip(*filter(lambda x: torch.is_tensor(x[0]), zip(outputs, args)))
+        outputs, args = zip(
+            *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
+        )
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
         return (None, None) + grads

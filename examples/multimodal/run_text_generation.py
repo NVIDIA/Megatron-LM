@@ -73,6 +73,8 @@ def add_text_generation_args(parser):
             "OCRBench",
             "MathVista",
             "AI2D",
+            "InfoVQA",
+            "SPDocVQA",
         ],
         help="Generation task to run",
     )
@@ -253,6 +255,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "OCRBench",
                     "MathVista",
                     "AI2D",
+                    "InfoVQA",
+                    "SPDocVQA",
                 ):
                     output_name = "answer"
                 elif config.task in ("MMMU"):
@@ -281,6 +285,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "OCRBench",
                     "MathVista",
                     "AI2D",
+                    "InfoVQA",
+                    "SPDocVQA",
                 ):
                     if isinstance(answers, str):
                         answers = [answers]
@@ -486,7 +492,7 @@ def get_conversation(task, question):
                 "content": f"{IMAGE_TOKEN}\nProvide a one-sentence caption for provided image.",
             },
         ]
-    elif task in ("TextVQA", "VQAv2", "ChartQA"):
+    elif task in ("TextVQA", "VQAv2", "ChartQA", "InfoVQA", "SPDocVQA"):
         conversation = [
             {"role": "system", "content": "Answer the questions."},
             {

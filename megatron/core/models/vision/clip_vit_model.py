@@ -205,6 +205,9 @@ def get_num_image_embeddings(
         keep_class_token = not disable_vision_class_token
     elif vision_model_type.startswith("radio"):
         keep_class_token = not disable_vision_class_token
+    elif vision_model_type.startswith("huggingface"):
+        # TODO: Temp, what do we do in this sitaution?
+        keep_class_token = True
     else:
         raise ValueError(f"unsupported vision model: {vision_model_type}")
 

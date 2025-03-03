@@ -123,6 +123,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.encoder_pipeline_model_parallel_size = 0
     args.enable_ft_package = False
     args.use_torch_fsdp2 = False
+    args.init_model_with_meta_device = False
     return args
 
 
@@ -159,7 +160,14 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
 
 
 def setup_model_and_optimizer(
-    seed, tp, pp, initialize_fn=initialize_gpt_model, bf16=True, dist_opt=True
+    seed,
+    tp,
+    pp,
+    initialize_fn=initialize_gpt_model,
+    bf16=True,
+    dist_opt=True,
+    use_custom_fsdp=False,
+    data_parallel_sharding_strategy="optim_grads_params",
 ):
     dist_opt = dist_opt and xm is None
     mock_args = parse_args(ignore_unknown_args=True)

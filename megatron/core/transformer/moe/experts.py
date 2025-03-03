@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 import itertools
 from copy import deepcopy
 from functools import partial, wraps
@@ -425,7 +426,11 @@ class GroupedMLP(MegatronModule):
                                     ),
                                     non_flat_local_shape,
                                     *sharded_offsets,
-                                    (prepend_axis_num, expert_global_idx, num_global_experts),
+                                    (
+                                        prepend_axis_num,
+                                        expert_global_idx,  # pylint: disable=E0606
+                                        num_global_experts,
+                                    ),
                                     (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size * 2),
                                     replica_id=replica_id,
                                     prepend_axis_num=prepend_axis_num,
@@ -554,12 +559,36 @@ class GroupedMLP(MegatronModule):
                 tp_axis = 0
                 with_glu = False
                 wkey = f'{prefix}experts.linear_fc2.weight'
+
+            """
+            When MCore Custom FSDP `optim_grads_params` is enabled, it is necessary to save the tensor local shard.
+            This local shard is accessible through the `fully_shard_param_local_shard` attribute of the tensor.
+
+            This attribute contains the local shard of the fully sharded parameter, which is essential for
+            correctly saving and loading the model state when using `optim_grads_params` with FSDP.
+
+            Example:
+                >>> # Assuming `tensor` is a fully sharded parameter
+                >>> local_shard = tensor.fully_shard_param_local_shard
+                >>> # Save the local shard as needed
+            """
+            this_replica_id = list(copy.deepcopy(replica_id))
+            if hasattr(tensor, 'fully_shard_param_local_shard'):
+                if tensor.fully_shard_param_local_shard.numel() == 0:
+                    continue
+                flattened_range = slice(*tensor.fully_shard_param_local_index)
+                tensor = tensor.fully_shard_param_local_shard
+                this_replica_id[-1] = 0
+            else:
+                flattened_range = None
+
             sharded_state_dict[f'{prefix}{name}'] = ShardedTensorFactory(
                 wkey,
                 tensor,
                 partial(sh_ten_build_fn, tp_axis=tp_axis, with_glu=with_glu),
                 partial(sh_ten_merge_fn, tp_axis=tp_axis, with_glu=with_glu),
-                replica_id,
+                tuple(this_replica_id),
+                flattened_range=flattened_range,
             )
 
         replica_id = (
@@ -846,6 +875,12 @@ class SequentialMLP(MegatronModule):
                 assert (
                     len(replica_id) == 3
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+
+                is_custom_fsdp_shard_tensor = getattr(sh_ten, "is_data_parallel_fully_shard", False)
+                if is_custom_fsdp_shard_tensor:
+                    sh_ten.replica_id = (*replica_id[:2], 0)
+                    continue
+
                 sh_ten.replica_id = (
                     *replica_id[:2],
                     parallel_state.get_expert_data_parallel_rank(),

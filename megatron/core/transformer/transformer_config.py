@@ -152,6 +152,12 @@ class TransformerConfig(ModelParallelConfig):
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
 
+    init_model_with_meta_device: bool = False
+    """
+    If True, initializes the model with the meta device. This is helpful for
+    training of very large models. This feature is only works when custom fsdp is turned on.
+    """
+
     ####################
     # mixed-precision
     ####################
@@ -268,12 +274,10 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared epxerts execute after the routed experts."""
 
-    moe_layer_freq: int = 1
+    moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
-    - A string containing a Python list expression that defines a custom pattern, e.g.:
-    "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
-    where 1 indicates an expert layer and 0 indicates a dense layer."""
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
     moe_ffn_hidden_size: Optional[int] = None
     """MoE Feed-Forward Network hidden size"""
@@ -359,7 +363,10 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_dispatcher_type: str = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
-    Options are 'allgather' and 'alltoall'."""
+    Options are 'allgather','alltoall' and 'flex'."""
+
+    moe_enable_deepep: bool = False
+    """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -450,6 +457,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    use_custom_fsdp: bool = False
+    """ Whether to use custom fsdp for training. """
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -514,6 +524,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
 
+        if self.moe_enable_deepep:
+            if self.moe_token_dispatcher_type != "flex":
+                raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
+
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
@@ -529,10 +543,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_capacity_factor is not None:
-            if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:
-                raise ValueError(
-                    'moe_expert_capacity_factor only works with alltoall token dispatcher'
-                )
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
             if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
@@ -912,26 +922,32 @@ class MLATransformerConfig(TransformerConfig):
     v_head_dim: int = 128
     """Dimension of the head in the V projection."""
 
-    rotary_base: float = 10000
-    """Rotary base for the rotary embeddings."""
-
-    rotary_scaling_factor: float = 40
-    """Rotary scaling factor for the rotary embeddings."""
-
     normalization: str = "RMSNorm"
     """Default normalization layer for MLA models is RMSNorm."""
 
-    max_position_embeddings: int = 163840
-    """Maximum position embeddings for the original model."""
+    rope_type: str = "yarn"
+    """Type of RoPE to use. Default to yarn, options are rope and yarn."""
+
+    rotary_base: float = 10000
+    """Rotary base for the rotary embeddings, used by rope and yarn."""
+
+    rotary_percent: float = 1.0
+    """Rotary percent for the rotary embeddings, used by rope."""
+
+    rotary_scaling_factor: float = 40
+    """Rotary scaling factor for the rotary embeddings, used by yarn."""
+
+    max_position_embeddings: int = 4096
+    """Maximum position embeddings for the original model, used by yarn."""
 
     beta_fast: float = 32
-    """Beta fast for YaRN RoPE."""
+    """Beta fast for YaRN RoPE, used by yarn."""
 
     beta_slow: float = 1
-    """Beta slow for YaRN RoPE."""
+    """Beta slow for YaRN RoPE, used by yarn."""
 
     mscale: float = 0.707
-    """Mscale for YaRN RoPE in Multi-Latent Attention."""
+    """Mscale for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
     mscale_all_dim: float = 0.707
-    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention."""
+    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""

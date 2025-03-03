@@ -3,7 +3,7 @@
 """Utilities for transformer layers."""
 from functools import lru_cache
 from operator import itemgetter
-from typing import Any, Dict, Iterable, Iterator, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 from megatron.core.device_utils import get_current_device
 import torch
@@ -33,6 +33,7 @@ def get_default_causal_mask(sq: int) -> torch.Tensor:
     return torch.triu(torch.ones(sq, sq, device=get_current_device()), diagonal=1).bool()
 
 
+# pylint: disable=missing-function-docstring
 def attention_mask_func(attention_scores, attention_mask):
     attention_scores.masked_fill_(attention_mask, -10000.0)
     return attention_scores
@@ -44,11 +45,14 @@ def gelu_impl(x):
     return 0.5 * x * (1.0 + torch.tanh(0.7978845608028654 * x * (1.0 + 0.044715 * x * x)))
 
 
+# pylint: disable=missing-function-docstring
 def openai_gelu(x):
     return gelu_impl(x)
 
 
-# This is actually Python equivalent of torch.nn.functional.gelu(), also with type hints for ONNX exporter
+# This is actually Python equivalent of torch.nn.functional.gelu(), also with
+# type hints for ONNX exporter
+# pylint: disable=missing-function-docstring
 @jit_fuser
 def erf_gelu(x):
     return (
@@ -126,6 +130,9 @@ def make_sharded_object_for_checkpoint(
             ShardedObject
         replica_id (Union[None, int, Tuple[int, ...]]): replica id
     """
+    is_obj_fully_sharded = hasattr(obj, 'fully_shard_param_local_index')
+    assert not is_obj_fully_sharded, f"Fully sharded object not supported: {key}"
+
     if replica_id is None:
         replica_id = (
             0,

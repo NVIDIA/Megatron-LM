@@ -40,7 +40,7 @@ megatron/core/inference/
 ; [Context Parallelism] @mcore-reviewers/context-parallelism
 ; 
 
-[CI] @mcore-reviewers/ci
+[CI][2] @mcore-reviewers/ci
 .gitlab/
 .github/
 .gitlab-ci.yml

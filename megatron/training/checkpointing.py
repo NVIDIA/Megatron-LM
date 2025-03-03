@@ -332,7 +332,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     start_ckpt = time()
     args = get_args()
 
-    if not is_empty_async_queue():
+    if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
 
     # Prepare E2E metrics at start of save checkpoint
@@ -1123,7 +1123,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
             raise FileNotFoundError("No checkpoint found in load directory or pretrained directory")
         args.finetune = True
 
-    model = unwrap_model(model)
+    ddp_model = model
+    model = unwrap_model(ddp_model)
 
     load_kwargs = {}
     is_dist_ckpt = False
@@ -1288,12 +1289,12 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
     # Model.
     strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:
-        if len(model) == 1:
-            model[0].load_state_dict(state_dict['model'], strict=strict)
+        if len(ddp_model) == 1:
+            ddp_model[0].load_state_dict(state_dict['model'], strict=strict)
         else:
-            for i in range(len(model)):
+            for i in range(len(ddp_model)):
                 mpu.set_virtual_pipeline_model_parallel_rank(i)
-                model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
+                ddp_model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()

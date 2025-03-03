@@ -159,15 +159,17 @@ class BlendedMegatronDatasetBuilder(object):
                     # Check blend size
                     assert dataset.size is None or dataset.size == dataset.dataset_index.shape[0]
                     # Check blend access of mid-level datasets
-                    _, sizes = numpy.unique(dataset.dataset_index, return_counts=True)
-                    for i, dataset_and_size in enumerate(zip(dataset.datasets, sizes)):
-                        if len(dataset_and_size[0]) < dataset_and_size[1]:
+                    dataset_indices, dataset_sizes = numpy.unique(
+                        dataset.dataset_index, return_counts=True
+                    )
+                    for i, (index, size) in enumerate(zip(dataset_indices, dataset_sizes)):
+                        if len(dataset.datasets[index]) < size:
                             raise IndexError(
                                 f"The {dataset.split.name} blend oversamples the contributing "
-                                f"datasets and, e.g., requests {dataset_and_size[1]} samples from "
-                                f"{type(dataset_and_size[0]).__name__} {i} with size "
-                                f"{len(dataset_and_size[0])}. This is unexpected. Please file an "
-                                f"issue."
+                                f"datasets  and, e.g., requests {size} samples from "
+                                f"{type(dataset.datasets[index]).__name__} {i} with size "
+                                f"{len(dataset.datasets[index])}. This is unexpected. "
+                                f"Please file an issue."
                             )
 
         return datasets

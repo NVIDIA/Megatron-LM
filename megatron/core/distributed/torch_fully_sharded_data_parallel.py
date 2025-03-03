@@ -27,6 +27,7 @@ from ..models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
+from .distributed_data_parallel_config import DistributedDataParallelConfig
 
 xm = get_xla_model()
 
@@ -39,6 +40,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
     Args:
         config: Transformer config object.
+        ddp_config: DistributedDataParallel config object.
         module: Underlying model.
         sub_modules_to_wrap: List of sub_modules to shard with FSDP.
             Parameters within each sub_module will be all-gathered just-in-time.
@@ -53,6 +55,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
     def __init__(
         self,
         config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         sub_modules_to_wrap: List[torch.nn.Module] = [
             TransformerLayer,
@@ -60,7 +63,6 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
         ],
-        **kwargs
     ):
 
         assert (

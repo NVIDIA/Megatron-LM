@@ -61,7 +61,7 @@ test:build_image:
           ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
         fi
 
-        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly-a100" ]]; then
+        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
           ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
         fi
 
@@ -69,6 +69,7 @@ test:build_image:
 
         DOCKER_BUILDKIT=1 docker build \
           --secret id=JET_INDEX_URLS \
+          --secret id=LOGGER_INDEX_URL \
           --target $STAGE \
           -f $FILE \
           -t ${IMAGE}:${CI_PIPELINE_ID} \
@@ -94,7 +95,13 @@ test:unit_tests_configure:
   needs:
     - test:build_image
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   before_script:
     - git rm -r tests/test_utils/local_recipes || true
     - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
@@ -217,8 +224,13 @@ test:notify_unit_tests:
   needs:
     - test:unit_tests_pyt(DEV)_mcore(latest)
     - test:unit_tests_pyt(LTS)_mcore(latest)
-  tags:
-    - mcore-docker-node-small
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   script:
     - apk add bash
     - apk add --update coreutils
@@ -241,7 +253,13 @@ test:notify_unit_tests:
 test:docs_build:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   needs: [test:build_image]
   script:
     - cd ..
@@ -253,7 +271,13 @@ test:docs_build:
 test:formatting:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   needs: [test:build_image]
   variables:
     GIT_STRATEGY: 'clone'
@@ -282,7 +306,13 @@ test:formatting:
 
 test:copyright:
   extends: [.test_rules]
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs: [test:build_image]
   script:
@@ -296,7 +326,13 @@ secret_detection:
 
 # Inherit and modify template
 test:secret_detection:
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   extends: ['.secret-analyzer']
   variables:
     GIT_DEPTH: 0
@@ -320,7 +356,17 @@ test:pypi_build_wheel:
   image:
     name: quay.io/pypa/manylinux_2_28_x86_64
     entrypoint: ['']
-  tags: [mcore-docker-node-small]
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: '2376'
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/builder-small
+    - team/megatron
   variables:
     PUBLISH_DRYRUN: 'yes'
     PY_ENV: pytorch_24.10
@@ -352,9 +398,21 @@ test:pypi_build_wheel:
 
 test:pypi_test_wheel:
   extends: [.test_rules]
-  image: python:3.11
+  image: 
+    name: python:3.11
+    entrypoint: ['']
   needs: [test:pypi_build_wheel]
-  tags: [mcore-docker-node-small]
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: '2376'
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/builder-small
+    - team/megatron
   variables:
     PUBLISH_DRYRUN: 'yes'
   script:
@@ -378,7 +436,13 @@ test:pypi_test_wheel:
 test:pypi_push_wheel:
   extends: [.test_rules]
   image: python:3.11
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   needs: [test:pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: 'yes'
@@ -398,12 +462,8 @@ test:pypi_push_wheel:
     - ls -al dist/
     - ls -al wheelhouse/
     - pip install twine
-    - >
-      for i in 1 2 3 4 5; do 
-        twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* dist/* && break || sleep $(( 60*2**i )); 
-      done
-
-
+    - twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* dist/*
+  
   rules:
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -414,31 +474,46 @@ test:pypi_push_wheel:
 test:gh_release:
   extends: [.test_rules]
   needs: [test:pypi_test_wheel]
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   image: badouralix/curl-jq
   variables:
     PUBLISH_DRYRUN: 'yes'
   script:
     - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
-    - CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
-    - CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
+    - IS_PRERELEASE=$([[ "$RELEASE_NUMBER" == *rc* ]] && echo "true" || echo "false")
+    - >
+      if [[ "$IS_PRERELEASE" == "true" ]]; then
+        DATE=$(date +"%Y-%m-%d")
+        CHANGELOG="Prerelease: $NAME ($DATE)"
+      else
+        CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
+        CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
+      fi
     - >
       PAYLOAD=$(jq -nc \
-                  --arg CI_COMMIT_BRANCH "$CI_COMMIT_BRANCH" \
+                  --arg TAG_NAME "v${RELEASE_NUMBER}" \
+                  --arg CI_COMMIT_SHA "$CI_COMMIT_SHA" \
                   --arg NAME "$NAME" \
                   --arg BODY "$CHANGELOG" \
+                  --argjson PRERELEASE "$IS_PRERELEASE" \
                   '{
-                      "tag_name": $CI_COMMIT_BRANCH,
-                      "target_commitish": $CI_COMMIT_BRANCH,
+                      "tag_name": $TAG_NAME,
+                      "target_commitish": $CI_COMMIT_SHA,
                       "name": $NAME,
                       "body": $BODY,
                       "draft": false,
-                      "prerelease": false,
+                      "prerelease": $PRERELEASE,
                       "generate_release_notes": false
                   }'
               )
       echo -E "$PAYLOAD" > payload.txt
-
+    - cat payload.txt
     - >
       CMD=$(echo -E 'curl -L \
         -X POST \
@@ -450,7 +525,7 @@ test:gh_release:
       ')
 
     - >
-      if [[ "$IS_DRY_RUN" == "true" ]]; then
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo -E "$CMD"
       else
         eval "$CMD"
@@ -461,7 +536,13 @@ test:notify_release:
   needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
   extends: [.test_rules]
   image: badouralix/curl-jq
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   variables:
     PUBLISH_DRYRUN: 'yes'
   script:
@@ -494,3 +575,30 @@ test:notify_release:
         eval "$CMD"
       fi
 
+test:generate_coverage_report:
+  extends: [.test_rules]
+  needs:
+    - test:unit_tests_pyt(DEV)_mcore(latest)
+    - test:unit_tests_pyt(LTS)_mcore(latest)
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - python tests/test_utils/python_scripts/download_coverage_results.py --pipeline-id ${CI_PIPELINE_ID}
+    - coverage combine --keep $(ls coverage_results/*/coverage_report)
+    - coverage report
+    - coverage xml
+  coverage: '/TOTAL.+ ([0-9]{1,3}%)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml

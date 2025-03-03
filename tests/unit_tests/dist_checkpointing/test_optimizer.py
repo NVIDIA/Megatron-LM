@@ -498,10 +498,11 @@ class TestOptimizerResharding:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        ('use_dist_opt', 'bf16'),
+        ('use_dist_opt', 'bf16', 'use_custom_fsdp'),
         (
-            (False, True),  # regular BF16
-            (True, True),  # DistOpt BF16
+            (False, True, False),  # regular BF16
+            (True, True, False),  # DistOpt BF16
+            (True, True, True),  # DistOpt + custom FSDP BF16
             # (False, False), # FP32
         ),
     )
@@ -510,7 +511,7 @@ class TestOptimizerResharding:
         [((2, 4), (2, 4)), ((2, 4), (2, 2)), ((2, 4), (4, 2)), ((8, 1), (1, 2))],
     )
     def test_optimizer_resharding(
-        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16, use_custom_fsdp
     ):
         use_dist_opt = use_dist_opt and xm is None
         Utils.initialize_model_parallel(*src_tp_pp)
@@ -522,6 +523,9 @@ class TestOptimizerResharding:
                 tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True,
                 process_group=parallel_state.get_default_process_group()
             ) as ckpt_dir_B:
+                extra_kwargs = {}
+                if use_custom_fsdp:
+                    extra_kwargs['use_custom_fsdp'] = True
 
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2, tp=src_tp_pp[0], pp=src_tp_pp[1], bf16=bf16, dist_opt=use_dist_opt
@@ -553,6 +557,13 @@ class TestOptimizerResharding:
                 plain_state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
+
+                if use_custom_fsdp and hasattr(torch.nn.parameter.Parameter, "main_grad"):
+                    # Custom fsdp adds the `main_grad` attribute function to the
+                    # torch Parameter, remove this attribute function so that
+                    # it doesn't conflict with the code in the non-custom fsdp
+                    # test branch.
+                    delattr(torch.nn.parameter.Parameter, "main_grad")
 
     @pytest.mark.parametrize(('use_dist_opt', 'bf16'), ((True, True),))  # DistOpt BF16
     @pytest.mark.parametrize(('use_te', 'use_grouped_mlp'), ((False, False), (False, True)))

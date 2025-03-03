@@ -38,6 +38,7 @@ from megatron.training.checkpointing import checkpoint_exists
 from megatron.legacy.model import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
 
@@ -144,6 +145,10 @@ def num_floating_point_operations(args, batch_size):
         if args.moe_shared_expert_intermediate_size is None
         else args.moe_shared_expert_intermediate_size
     )
+    if args.num_experts is None:
+        ffn_hidden_size = args.ffn_hidden_size
+    else:
+        ffn_hidden_size = args.moe_ffn_hidden_size
 
     # The 12x term below comes from the following factors; for more details, see
     # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
@@ -173,7 +178,7 @@ def num_floating_point_operations(args, batch_size):
             )
             # MLP.
             + (
-                (args.ffn_hidden_size / args.hidden_size)
+                (ffn_hidden_size / args.hidden_size)
                 * num_experts_routed_to
                 * gated_linear_multiplier
             )
@@ -466,7 +471,7 @@ def pretrain(
         wandb_writer.finish()
 
     ft_integration.on_checkpointing_start()
-    maybe_finalize_async_save(blocking=True)
+    maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     one_logger and one_logger.log_metrics({
@@ -514,47 +519,54 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args.model_type = model_type
 
     # Build model.
-    if mpu.get_pipeline_model_parallel_world_size() > 1 and \
-       args.virtual_pipeline_model_parallel_size is not None:
-        assert model_type != ModelType.encoder_and_decoder, \
-            "Interleaved schedule not supported for model with both encoder and decoder"
-        model = []
-        for i in range(args.virtual_pipeline_model_parallel_size):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
-            # Set pre_process and post_process only after virtual rank is set.
+    def build_model():
+        if mpu.get_pipeline_model_parallel_world_size() > 1 and \
+        args.virtual_pipeline_model_parallel_size is not None:
+            assert model_type != ModelType.encoder_and_decoder, \
+                "Interleaved schedule not supported for model with both encoder and decoder"
+            model = []
+            for i in range(args.virtual_pipeline_model_parallel_size):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                # Set pre_process and post_process only after virtual rank is set.
+                pre_process = mpu.is_pipeline_first_stage()
+                post_process = mpu.is_pipeline_last_stage()
+                this_model = model_provider_func(
+                    pre_process=pre_process,
+                    post_process=post_process
+                )
+                this_model.model_type = model_type
+                model.append(this_model)
+        else:
             pre_process = mpu.is_pipeline_first_stage()
             post_process = mpu.is_pipeline_last_stage()
-            this_model = model_provider_func(
-                pre_process=pre_process,
-                post_process=post_process
-            )
-            this_model.model_type = model_type
-            model.append(this_model)
+            add_encoder = True
+            add_decoder = True
+            if model_type == ModelType.encoder_and_decoder:
+                if mpu.get_pipeline_model_parallel_world_size() > 1:
+                    rank = mpu.get_pipeline_model_parallel_rank()
+                    first_decoder_rank = args.encoder_pipeline_model_parallel_size
+                    world_size = mpu.get_pipeline_model_parallel_world_size()
+                    pre_process = rank == 0 or rank == first_decoder_rank
+                    post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
+                    add_encoder = mpu.is_inside_encoder(rank)
+                    add_decoder = mpu.is_inside_decoder(rank)
+                model = model_provider_func(
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    add_encoder=add_encoder,
+                    add_decoder=add_decoder)
+            else:
+                model = model_provider_func(
+                    pre_process=pre_process,
+                    post_process=post_process
+                )
+            model.model_type = model_type
+        return model
+    if args.init_model_with_meta_device:
+        with torch.device('meta'):
+            model = build_model()
     else:
-        pre_process = mpu.is_pipeline_first_stage()
-        post_process = mpu.is_pipeline_last_stage()
-        add_encoder = True
-        add_decoder = True
-        if model_type == ModelType.encoder_and_decoder:
-            if mpu.get_pipeline_model_parallel_world_size() > 1:
-                rank = mpu.get_pipeline_model_parallel_rank()
-                first_decoder_rank = args.encoder_pipeline_model_parallel_size
-                world_size = mpu.get_pipeline_model_parallel_world_size()
-                pre_process = rank == 0 or rank == first_decoder_rank
-                post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
-                add_encoder = mpu.is_inside_encoder(rank)
-                add_decoder = mpu.is_inside_decoder(rank)
-            model = model_provider_func(
-                pre_process=pre_process,
-                post_process=post_process,
-                add_encoder=add_encoder,
-                add_decoder=add_decoder)
-        else:
-            model = model_provider_func(
-                pre_process=pre_process,
-                post_process=post_process
-            )
-        model.model_type = model_type
+        model = build_model()
 
     if not isinstance(model, list):
         model = [model]
@@ -568,17 +580,23 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
 
     # Print number of parameters.
+    num_parameters = sum(
+        [sum([p.nelement() for p in model_module.parameters()])
+         for model_module in model]
+    )
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on (tensor, pipeline) '
               'model parallel rank ({}, {}): {}'.format(
             mpu.get_tensor_model_parallel_rank(),
             mpu.get_pipeline_model_parallel_rank(),
-            sum([sum([p.nelement() for p in model_module.parameters()])
-                 for model_module in model])), flush=True)
+            num_parameters), flush=True)
 
     # GPU allocation.
-    for model_module in model:
-        model_module.to(get_current_device())
+    # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
+    # in the fully_shard function of FSDP2 instead.
+    if torch.cuda.is_available() and not (args.use_torch_fsdp2 and args.use_cpu_initialization) and not args.init_model_with_meta_device:
+        for model_module in model:
+            model_module.cuda(get_current_device())
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
@@ -600,9 +618,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                     fp8_meta.amax_history[0][fp8_meta_index] = 0
 
     if wrap_with_ddp:
-        if getattr(args, "use_torch_fsdp2", False):
+        if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
+        elif args.use_custom_fsdp:
+            DP = custom_FSDP
         else:
             DP = DDP
 
@@ -615,17 +635,41 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
         kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
         kwargs['check_for_large_grads'] = args.check_for_large_grads
-        kwargs['bucket_size'] = args.ddp_bucket_size
+        if args.ddp_num_buckets is not None:
+            assert args.ddp_bucket_size is None, \
+                "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
+            assert args.ddp_num_buckets > 0, \
+                "--ddp-num-buckets must be greater than 0"
+            kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
+        else:
+            kwargs['bucket_size'] = args.ddp_bucket_size
+        kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
         kwargs['average_in_collective'] = args.ddp_average_in_collective
+        if args.use_custom_fsdp and args.use_precision_aware_optimizer:
+            kwargs["preserve_fp32_weights"] = False
         ddp_config = DistributedDataParallelConfig(**kwargs)
 
-        overlap_param_gather_with_optimizer_step = getattr(args, 'overlap_param_gather_with_optimizer_step', False)
+        if not getattr(args, "use_torch_fsdp2", False):
+            # In the custom FSDP and DDP use path, we need to initialize the bucket size.
+
+            # If bucket_size is not provided as an input, use sane default.
+            # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
+            # ring-reduce implementations are large enough to remain bandwidth-bound rather than
+            # latency-bound.
+            if ddp_config.bucket_size is None:
+                ddp_config.bucket_size = max(
+                    40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+                )
+            # Set bucket_size to infinity if overlap_grad_reduce is False.
+            if not ddp_config.overlap_grad_reduce:
+                ddp_config.bucket_size = None
+
         model = [DP(config=config,
                      ddp_config=ddp_config,
                      module=model_chunk,
                      # Turn off bucketing for model_chunk 2 onwards, since communication for these
                      # model chunks is overlapped with compute anyway.
-                     disable_bucketing=(model_chunk_idx > 0) or overlap_param_gather_with_optimizer_step)
+                     disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step)
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
@@ -713,7 +757,8 @@ def setup_model_and_optimizer(model_provider_func,
     config = OptimizerConfig(**kwargs)
     config.timers = timers
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
-                                       scale_lr_cond, lr_mult)
+                                       scale_lr_cond, lr_mult,
+                                       use_gloo_process_groups=args.enable_gloo_process_groups)
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.moe_use_upcycling:
@@ -753,7 +798,7 @@ def setup_model_and_optimizer(model_provider_func,
 
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
                 model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False))
+                skip_load_to_model_and_opt=HAVE_FSDP2 and args.use_torch_fsdp2)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -832,7 +877,7 @@ def train_step(forward_step_func, data_iterator,
         torch.cuda.empty_cache()
 
     # Vision gradients.
-    if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
@@ -852,7 +897,7 @@ def train_step(forward_step_func, data_iterator,
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
     # Vision momentum.
-    if getattr(args, 'vision_pretraining', False) and args.vision_pretraining_type == "dino":
+    if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
         unwrapped_model.update_momentum(args.curr_iteration)
 
@@ -978,12 +1023,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
-        if args.record_memory_history and is_last_rank() and torch.cuda.is_available():
-            snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
-            with open(args.memory_snapshot_path , 'wb') as f:
-                dump(snapshot, f)
-
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
                              iteration)
@@ -1066,6 +1105,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
 
     if iteration % args.log_interval == 0:
+        if args.record_memory_history and is_last_rank():
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            with open(args.memory_snapshot_path, 'wb') as f:
+                dump(snapshot, f)
+
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
@@ -1202,13 +1247,13 @@ def save_checkpoint_and_time(iteration, model, optimizer, opt_param_scheduler,
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    if args.use_distributed_optimizer and args.overlap_param_gather:
+    if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
     save_checkpoint(iteration, model, optimizer, opt_param_scheduler,
                     num_floating_point_operations_so_far, checkpointing_context,
                     non_persistent_ckpt=non_persistent_ckpt, train_data_iterator=train_data_iterator,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict)
-    if args.use_distributed_optimizer and args.overlap_param_gather:
+    if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
@@ -1232,7 +1277,7 @@ def post_training_step_callbacks(model, optimizer, opt_param_scheduler, iteratio
     args = get_args()
 
     # Bring CPU and GPU back in sync if on right iteration.
-    if args.train_sync_interval and iteration % args.train_sync_interval == 0:
+    if torch.cuda.is_available() and args.train_sync_interval and iteration % args.train_sync_interval == 0:
         torch.cuda.synchronize()
 
     # Straggler detector.
@@ -1243,13 +1288,13 @@ def post_training_step_callbacks(model, optimizer, opt_param_scheduler, iteratio
     # Check weight hash across DP replicas.
     if args.check_weight_hash_across_dp_replicas_interval is not None and \
             iteration % args.check_weight_hash_across_dp_replicas_interval == 0:
-        if args.use_distributed_optimizer and args.overlap_param_gather:
+        if should_disable_forward_pre_hook(args):
             disable_forward_pre_hook(model)
         assert check_param_hashes_across_dp_replicas(model, cross_check=True), \
             "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
-        if args.use_distributed_optimizer and args.overlap_param_gather:
+        if should_disable_forward_pre_hook(args):
             enable_forward_pre_hook(model)
 
     # Autoresume.
@@ -1387,8 +1432,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss
     config.timers = timers
- 
-    if isinstance(model[0], DDP) and args.overlap_grad_reduce:
+    if isinstance(model[0], (custom_FSDP, DDP)) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, \
             ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce')
@@ -1474,7 +1518,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
-    if args.use_distributed_optimizer and args.overlap_param_gather:
+    if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model, param_sync=False)
         # Also remove param_sync_func temporarily so that sync calls made in
         # `forward_backward_func` are no-ops.
@@ -1562,7 +1606,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 # Enable forward pre-hook after training step has successfully run. All subsequent
                 # forward passes will use the forward pre-hook / `param_sync_func` in
                 # `forward_backward_func`.
-                if args.use_distributed_optimizer and args.overlap_param_gather:
+                if should_disable_forward_pre_hook(args):
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
@@ -1610,7 +1654,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.eval_interval and iteration % args.eval_interval == 0 and \
             args.do_valid:
             timers('interval-time').stop()
-            if args.use_distributed_optimizer and args.overlap_param_gather:
+            if should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model)
                 pre_hook_enabled = False
             if args.manual_gc and args.manual_gc_eval:
@@ -1631,7 +1675,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc and args.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
-            if args.use_distributed_optimizer and args.overlap_param_gather:
+            if should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
             timers('interval-time', log_level=0).start(barrier=True)
@@ -1660,8 +1704,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         disable_forward_pre_hook(model)
 
     ft_integration.on_checkpointing_start()
-    maybe_finalize_async_save(blocking=True)
+    # This will finalize all unfinalized async request and terminate
+    # a persistent async worker if persistent ckpt worker is enabled
+    maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+    if args.enable_ft_package and ft_integration.get_rank_monitor_client() is not None:
+        ft_integration.get_rank_monitor_client().shutdown_workload_monitoring()
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
@@ -1988,3 +2036,8 @@ def build_train_valid_test_data_iterators(
         test_data_iterator = None
 
     return train_data_iterator, valid_data_iterator, test_data_iterator
+
+
+def should_disable_forward_pre_hook(args):
+    """Block forward pre-hook for certain configurations."""
+    return not args.use_custom_fsdp and args.use_distributed_optimizer and args.overlap_param_gather

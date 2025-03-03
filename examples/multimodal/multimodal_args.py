@@ -10,7 +10,9 @@ def add_multimodal_extra_args(parser):
     group.add_argument('--freeze-LM', action='store_true', default=False)
     group.add_argument('--freeze-ViT', action='store_true', default=False)
     group.add_argument('--language-model-type', type=str, required=True)
+    group.add_argument('--language-huggingface-model-name-or-path', type=str)
     group.add_argument('--vision-model-type', type=str, default="clip")
+    group.add_argument('--vision-huggingface-model-name-or-path', type=str)
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
@@ -76,6 +78,12 @@ def add_multimodal_extra_args(parser):
     )
     group.add_argument(
         "--use-loss-scaling", action="store_true", default=False, help="Scale loss based on conversation turn length (in tokens)."
+    )
+    group.add_argument(
+        "--use-area-weighted-aspect-ratio", action="store_true", default=False,
+        help=(
+            "When --use-tiling is True, find the aspect ratio to use based on the original ",
+            "image aspect ratio and the area covered by the tiles.")
     )
 
     return parser

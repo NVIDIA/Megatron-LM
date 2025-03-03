@@ -208,7 +208,7 @@ class RotaryEmbedding(nn.Module):
         elif inference_params is not None:
             rotary_seq_len = inference_params.max_sequence_length
         else:
-            if transformer.input_tensor is not None:
+            if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)
             else:
                 rotary_seq_len = transformer_input.size(0)

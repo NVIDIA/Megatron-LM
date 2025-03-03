@@ -12,6 +12,7 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.tensor_parallel.random import (
     DeviceRNGStatesTracker,
     get_all_rng_states,
@@ -560,14 +561,14 @@ class _CudaGraphRunner(torch.nn.Module):
                         wgrad = torch.zeros(
                             param.main_grad.shape,
                             dtype=param.dtype,
-                            device=torch.cuda.current_device(),
+                            device=get_current_device(),
                             requires_grad=False,
                         )
                     else:
                         wgrad = torch.empty(
                             param.main_grad.shape,
                             dtype=param.dtype,
-                            device=torch.cuda.current_device(),
+                            device=get_current_device(),
                             requires_grad=False,
                         )
                 else:
@@ -738,11 +739,8 @@ class CudaGraphManager(torch.nn.Module):
         super().__init__()
 
         rng_tracker = get_device_rng_tracker()
-        assert (
-            (HAVE_TE_GRAPHS and isinstance(rng_tracker, TECudaRNGStatesTracker))
-            or (
-                isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng
-            ),
+        assert (HAVE_TE_GRAPHS and isinstance(rng_tracker, TECudaRNGStatesTracker)) or (
+            isinstance(rng_tracker, DeviceRNGStatesTracker) and rng_tracker.use_cudagraphable_rng
         ), "RNG tracker does not support cudagraphs!"
 
         self.cudagraph_runners = []

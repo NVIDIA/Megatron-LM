@@ -20,7 +20,13 @@ publish:release_branch:
   extends: [.publish_common_freeze]
   image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
   needs: [test:build_image]
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   variables:
     GIT_STRATEGY: 'none'
   script:
@@ -99,17 +105,22 @@ publish:notify_release:
 publish:docs:
   extends: [.publish_common_release]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: [mcore-docker-node-small]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   script:
     - cd ..
     - rm -rf documentation && git clone https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
     - cd documentation/megatron-lm
-    - git fetch
+      git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
     - git fetch origin $CI_COMMIT_SHA
     - git checkout $CI_COMMIT_SHA
     - cd ..
     - git add megatron-lm
     - >
       git commit -m 'feat: Bump mcore'
-
     - git push

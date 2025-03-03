@@ -7,13 +7,13 @@ from typing import Union
 import torch
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import MoEAlltoAllSEQTokenDispatcher
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
+    MoEFlexTokenDispatcher,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -78,7 +78,7 @@ class MoELayer(BaseMoELayer):
     """
 
     def __init__(
-        self, config: TransformerConfig, submodules: MLPSubmodules = None, layer_number: int = None
+        self, config: TransformerConfig, submodules: MoESubmodules = None, layer_number: int = None
     ):
         self.submodules = submodules
         super(MoELayer, self).__init__(config=config, layer_number=layer_number)
@@ -98,6 +98,10 @@ class MoELayer(BaseMoELayer):
             )
         elif config.moe_token_dispatcher_type == "alltoall_seq":
             self.token_dispatcher = MoEAlltoAllSEQTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices, config=self.config
+            )
+        elif config.moe_token_dispatcher_type == "flex":
+            self.token_dispatcher = MoEFlexTokenDispatcher(
                 self.num_local_experts, self.local_expert_indices, config=self.config
             )
         else:
@@ -136,7 +140,7 @@ class MoELayer(BaseMoELayer):
             if self.use_shared_expert and not self.shared_expert_overlap:
                 # if shared_expert_overlap is True, the expert calculation happens in
                 # the token_dispatcher to overlap communications and computations
-                output += self.shared_experts(hidden_states)
+                output = output + self.shared_experts(hidden_states)
             return output, mlp_bias
 
         if self.moe_layer_recompute:

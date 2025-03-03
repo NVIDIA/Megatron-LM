@@ -67,6 +67,7 @@ class TestVLMTextGenerationController:
         vision_layer_spec = copy.deepcopy(language_layer_spec)
         vision_projection_spec = copy.deepcopy(language_layer_spec.submodules.mlp.submodules)
 
+        language_config.language_model_type = "dummy"
         vision_config.vision_model_type = "clip"
         self.model = LLaVAModel(
             language_transformer_config=language_config,

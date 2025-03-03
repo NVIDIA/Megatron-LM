@@ -64,6 +64,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             # record stack information for the trace events
             trace_alloc_record_context=True)
 
+        def oom_observer(device, alloc, device_alloc, device_free):
+            # snapshot right after an OOM happened
+            print('saving allocated state during OOM')
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+
     print_rank_0('building GPT model ...')
     # Experimental loading arguments from yaml
     if args.yaml_cfg is not None:

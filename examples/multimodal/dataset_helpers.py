@@ -8,7 +8,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
-from image_processing import get_visual_transform
+from image_processing import find_closest_aspect_ratio, find_closest_area_weighted_aspect_ratio, get_visual_transform
 from PIL import Image
 from torchvision.transforms import ToPILImage
 import numpy as np
@@ -183,6 +183,10 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # larger than the decoder_seq_length.
         self.num_tiles_degradation_map = {12:8, 8:6, 6:4, 4:2, 2:1, 1:1}
 
+        self.find_closest_aspect_ratio_fn = (
+            find_closest_area_weighted_aspect_ratio if self.args.use_area_weighted_aspect_ratio
+            else find_closest_aspect_ratio)
+
     def _get_total_seq_length(self, input_ids, num_tiles):
         """Calculate expected sequence length given text tokens length and number of tiles."""
         total_num_images = len(num_tiles)
@@ -241,7 +245,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         imgs = get_visual_transform(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-            self.args.vision_model_type,
+            self.args.vision_model_type, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
         )
         num_tiles = [len(imgs)]
 
@@ -287,7 +291,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
 
         imgs = get_visual_transform(
             sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles, self.args.use_thumbnail, augment,
-            self.args.vision_model_type,
+            self.args.vision_model_type, find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
         )
         num_tiles = [len(imgs)]
 
@@ -336,10 +340,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         augment = sample.__subflavors__['augmentation'] if 'augmentation' in sample.__subflavors__ else False
         has_video = sample.__subflavors__['has_video'] if 'has_video' in sample.__subflavors__ else False
 
-        target_aspect_ratio = None
+        # If the target aspect ratio are provided by the dataset, we use them instead of computing
+        # them with the self.find_closest_aspect_ratio_fn function.
+        local_find_closest_aspect_ratio_fn = self.find_closest_aspect_ratio_fn
         if type(sample).__name__ == "OfflineTargetAspectRatioSample":
             target_aspect_ratio = tuple(sample.target_aspect_ratio[0])
             assert target_aspect_ratio is not None, "Sample of type OfflineTargetAspectRatioSample needs to define the target aspect ratio."
+            local_find_closest_aspect_ratio_fn = lambda *args, **kwargs: target_aspect_ratio
 
         has_image = False
         # We infer whether the sample has image or not.
@@ -417,7 +424,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                     img_tiles = get_visual_transform(
                         img, self.img_h, self.img_w, self.args.use_tiling, max_num_tiles,
                         self.args.use_thumbnail, augment, self.args.vision_model_type,
-                        target_aspect_ratio=target_aspect_ratio)
+                        find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
                     imgs += img_tiles
                     num_tiles += [len(img_tiles)]
                 if max_num_tiles == 1:
@@ -448,7 +455,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 video_chw = to_pil(video_chw)
                 imgs += get_visual_transform(
                     video_chw, self.img_h, self.img_w, use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment, self.args.vision_model_type)
+                    self.args.use_thumbnail, augment, self.args.vision_model_type,
+                    find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
             num_tiles = [len(imgs)]
         else:
             imgs = num_tiles = []
@@ -548,11 +556,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 imgs += get_visual_transform(
                     video_frame_hwc, self.img_h, self.img_w,
                     self.args.use_tiling, self.args.max_num_tiles,
-                    self.args.use_thumbnail, augment, self.args.vision_model_type)
+                    self.args.use_thumbnail, augment, self.args.vision_model_type,
+                    find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn)
         else:
             imgs = get_visual_transform(
                 sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
                 self.args.use_thumbnail, augment, self.args.vision_model_type,
+                find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
             )
 
         num_tiles = [len(imgs)]
@@ -626,6 +636,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         imgs = get_visual_transform(
                 sample.image, self.img_h, self.img_w, self.args.use_tiling, self.args.max_num_tiles,
                 self.args.use_thumbnail, augment, self.args.vision_model_type,
+                find_closest_aspect_ratio_fn=self.find_closest_aspect_ratio_fn
             )
         num_tiles = [len(imgs)]
 

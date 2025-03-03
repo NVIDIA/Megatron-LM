@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import sys
+import traceback
 
 import pytest
 import torch
@@ -141,6 +142,7 @@ class TestGPTModel:
         ('tp_pp_ep', 'enable_vp', 'enable_grouped_gemm'), [((1, 1, 2), (False), (False))]
     )
     def test_upcycling(self, tp_pp_ep, enable_vp, enable_grouped_gemm):
+
         tp = tp_pp_ep[0]
         pp = tp_pp_ep[1]
         ep = tp_pp_ep[2]
@@ -173,6 +175,12 @@ class TestGPTModel:
         moe_model = unwrap_model(moe_model)
         dense_model = unwrap_model(dense_model)
 
+        for m in moe_model:
+            m.to(device=get_current_device())
+
+        for d in dense_model:
+            d.to(device=get_current_device())
+
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).to(device=get_current_device())
         position_ids = (
@@ -199,3 +207,4 @@ class TestGPTModel:
         )
 
         torch.allclose(dense_logits, moe_logits, rtol=1e-03, atol=1e-03)
+
