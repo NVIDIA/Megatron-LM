@@ -723,7 +723,9 @@ def forward_backward_pipelining_with_interleaving(
     print_rank_0(f"[YOUNGEUNK] total_num_microbatches: {total_num_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}")
-    print_rank_0(f"[YOUNGEUNK] config.concurrent_execution_based_a2a_hiding: {config.concurrent_execution_based_a2a_hiding}")
+    print_rank_0(
+        f"[YOUNGEUNK] config.concurrent_execution_based_a2a_hiding: {config.concurrent_execution_based_a2a_hiding}"
+    )
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
     # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
@@ -1006,7 +1008,9 @@ def forward_backward_pipelining_with_interleaving(
     def forward_backward_step_helper(forward_k, backward_k, checkpoint_activations_microbatch):
         # YOUNGEUNK
         # TODO: need to decompose the forward and backward helper functions and merge it
-        print_rank_0(f"[YOUNGEUNK][forward_backward_step_helper] concurrent execution based A2A hiding: {config.concurrent_execution_based_a2a_hiding}")
+        print_rank_0(
+            f"[YOUNGEUNK][forward_backward_step_helper] concurrent execution based A2A hiding: {config.concurrent_execution_based_a2a_hiding}"
+        )
         output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
         input_tensor_grad = backward_step_helper(backward_k)
         return output_tensor, input_tensor_grad
