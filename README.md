@@ -165,3 +165,9 @@ To submit your contribution you have to provide a fresh wandb project with the r
   ```
   python scripts/copy_wandb_project.py -se myusername -de myusername -sp Megatron-Clariden -dp contrib_linear_attention -r f5v94x1q  
   ```
+
+## Convert your models to huggingface
+
+To release your models or evalaute them, you can use the megatron to huggingface utility.
+See `tools/checkpoint/do-convert.sh` for an end-to-end megatron->hf conversion example.
+See `scripts/conversion/README.md` for more information.
