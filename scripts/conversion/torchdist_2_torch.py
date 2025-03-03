@@ -19,7 +19,7 @@ def main():
         "no_load_rng": True,
         "no_load_optim": True,
         "no_save_optim": True,
-        "untie_embeddings_and-output_weights": True,
+        "untie_embeddings_and_output_weights": True,
         "exit_on_missing_checkpoint":True,
         # fake args
         "micro_batch_size": 1,
