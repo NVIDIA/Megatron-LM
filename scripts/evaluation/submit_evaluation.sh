@@ -3,10 +3,11 @@ GPUS_PER_NODE=4
 
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_ROOT=$PWD/eval-logs
-DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NeMo/nemo-latest.toml
+DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml
 DEF_LM_HARNESS_PATH=/capstor/store/cscs/swissai/a06/users/ahernnde/workspace/lm-evaluation-harness
+DEF_TRANSFORMERS_PATH=/capstor/store/cscs/swissai/a06/users/ahernnde/workspace/transformers
 DEF_ACCOUNT=a-a06
-DEF_TOKENIZER=tj-solergibert/swai
+DEF_TOKENIZER=alehc/swissai-tokenizer
 
 ITERATION=latest
 TASKS=winogrande,piqa,social_iqa,openbookqa,arc_easy,commonsense_qa,triviaqa,mmlu_continuation,gsm8k,global_mmlu_ar,global_mmlu_bn,global_mmlu_de,global_mmlu_en,global_mmlu_es,global_mmlu_fr,global_mmlu_hi,global_mmlu_id,global_mmlu_it,global_mmlu_ja,global_mmlu_ko,global_mmlu_pt,global_mmlu_sw,global_mmlu_yo,global_mmlu_zh,wikitext,lambada,hellaswag
@@ -68,6 +69,9 @@ if [ -z ${ACCOUNT+x} ]; then
 fi
 if [ -z ${LM_HARNESS_PATH+x} ]; then
 	LM_HARNESS_PATH=$DEF_LM_HARNESS_PATH
+fi
+if [ -z ${TRANSFORMERS_PATH+x} ]; then
+	TRANSFORMERS_PATH=$DEF_TRANSFORMERS_PATH
 fi
 if [ -z ${TOKENIZER+x} ]; then
 	TOKENIZER=$DEF_TOKENIZER
@@ -203,7 +207,6 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF
 	read -r -d '' CMD_SERVER <<- EOM
 	# Launch inference endpoint.
 	echo Spinning inference endpoint
-	cd $MEGATRON_PATH
 	torchrun --nproc-per-node=$WORLD_SIZE --master-addr=localhost --master-port=$(($ENDPOINT_PORT + 1000)) tools/run_text_generation_server.py --tensor-model-parallel-size=$TP --pipeline-model-parallel-size=$PP --use-checkpoint-args --load=$CHECKPOINT_PATH --bf16 --micro-batch-size=$BS --max-batch-size=$BS --tokenizer-type=HuggingFaceTokenizer --tokenizer-model=$TOKENIZER --seed=42 --port=$ENDPOINT_PORT --ckpt-step=$ITERATION --finetune --max-tokens-to-oom=4194304 &
 
 	EOM
@@ -227,8 +230,9 @@ else
 
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
+		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
 		torchrun scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=$ITERATION --ckpt-convert-save=\\\$TORCH_NODIST_PATH
-		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
+		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=swissai_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
 	else
@@ -252,7 +256,7 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=6:00:00
+#SBATCH --time=06:00:00
 #SBATCH --exclusive
 
 # Step 0: Some useful logs.
@@ -265,6 +269,10 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	export WANDB_DIR=$WANDB_DIR
 	export HF_HOME=$SCRATCH/huggingface
 	set -e
+
+	# Install new transformers.
+	cd $TRANSFORMERS_PATH
+	python -m pip install -e .
 
 	$CMD_CONVERT
 	$CMD_SERVER

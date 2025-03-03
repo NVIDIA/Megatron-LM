@@ -170,7 +170,7 @@ def save_checkpoint(queue: mp.Queue, args):
         )
         if args.hf_tokenizer:
             llama_conf.eos_token_id = tokenizer.eos_token_id
-            llama_conf.bos_token_id = tokenizer.eos_token_id
+            llama_conf.bos_token_id = tokenizer.bos_token_id
         
         print(f"saving config.json to {tmp_save_dir}")
         llama_conf.save_pretrained(tmp_save_dir)
