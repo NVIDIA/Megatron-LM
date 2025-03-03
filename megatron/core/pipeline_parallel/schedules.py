@@ -18,6 +18,7 @@ from megatron.core.utils import (
     get_model_type,
     get_model_xattn,
     print_rank_0,
+    print_rank_i,
 )
 
 # Types
@@ -1008,9 +1009,6 @@ def forward_backward_pipelining_with_interleaving(
     def forward_backward_step_helper(forward_k, backward_k, checkpoint_activations_microbatch):
         # YOUNGEUNK
         # TODO: need to decompose the forward and backward helper functions and merge it
-        print_rank_0(
-            f"[YOUNGEUNK][forward_backward_step_helper] concurrent execution based A2A hiding: {config.concurrent_execution_based_a2a_hiding}"
-        )
         output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
         input_tensor_grad = backward_step_helper(backward_k)
         return output_tensor, input_tensor_grad
@@ -1199,6 +1197,7 @@ def forward_backward_pipelining_with_interleaving(
                 if recv_next:
                     output_tensor_grads[num_model_chunks - 1].append(bwd_recv_buffer[-1])
 
+    print_rank_0(f"[YOUNGEUNK] Done with warmup")
     # Run 1F1B in steady state.
     for k in range(num_microbatches_remaining):
         # Forward pass.
@@ -1333,7 +1332,7 @@ def forward_backward_pipelining_with_interleaving(
         else:  # No p2p overlap.
             # TODO: The new A2A hiding block goes here.
             if config.concurrent_execution_based_a2a_hiding:
-                output_tensor, input_tensor = forward_backward_step_helper(
+                output_tensor, input_tensor_grad = forward_backward_step_helper(
                     forward_k, backward_k, checkpoint_activations_microbatch
                 )
             else:
