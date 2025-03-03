@@ -17,6 +17,7 @@ from megatron.core.utils import (
     get_model_config,
     get_model_type,
     get_model_xattn,
+    print_rank_0,
 )
 
 # Types
@@ -101,9 +102,10 @@ def get_forward_backward_func():
         step.
 
     """
-    print(f"[YOUNGEUNK] pp: {parallel_state.get_pipeline_model_parallel_world_size()},"
+    print_rank_0(
+        f"[YOUNGEUNK] pp: {parallel_state.get_pipeline_model_parallel_world_size()},"
         f" vpp: {parallel_state.get_virtual_pipeline_model_parallel_world_size()}"
-        )
+    )
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
@@ -581,6 +583,7 @@ def forward_backward_pipelining_with_interleaving(
     ), "interleaved pipeline parallelism expected each model chunk to have a data iterator"
 
     config = get_model_config(model[0])
+    # print_rank_0(f"[YOUNGEUNK] config: {config}")
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
@@ -649,6 +652,12 @@ def forward_backward_pipelining_with_interleaving(
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
 
+    print_rank_0(
+        f"[YOUNGEUNK] config.microbatch_group_size_per_vp_stage: {config.microbatch_group_size_per_vp_stage}"
+    )
+    print_rank_0(f"[YOUNGEUNK] num_microbatches: {num_microbatches}")
+    print_rank_0(f"[YOUNGEUNK] pipeline_parallel_size: {pipeline_parallel_size}")
+
     if (
         config.microbatch_group_size_per_vp_stage > num_microbatches
         or config.microbatch_group_size_per_vp_stage < pipeline_parallel_size
@@ -696,15 +705,24 @@ def forward_backward_pipelining_with_interleaving(
         # all workers, followed by more microbatches after depending on
         # stage ID (more forward passes for earlier stages, later stages can
         # immediately start with 1F1B).
-        num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
-        num_warmup_microbatches += (
-            num_model_chunks - 1
-        ) * config.microbatch_group_size_per_vp_stage
+        num_warmup_microbatches = (num_model_chunks - 1) * config.microbatch_group_size_per_vp_stage
+        num_warmup_microbatches += (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
+        num_warmup_microbatches += 1
         if num_warmup_microbatches >= total_num_microbatches:
             num_warmup_microbatches = total_num_microbatches
             all_warmup_microbatches = True
     num_microbatches_remaining = total_num_microbatches - num_warmup_microbatches
+    # [YOUNGEUNK] pp: 8, vpp: 4
+    # [YOUNGEUNK] config.microbatch_group_size_per_vp_stage: 8
+    # [YOUNGEUNK] num_microbatches: 128
+    # [YOUNGEUNK] pipeline_parallel_size: 8
+    # [YOUNGEUNK] total_num_microbatches: 512
+    # [YOUNGEUNK] num_warmup_microbatches: 38
+    # [YOUNGEUNK] num_microbatches_remaining: 474
 
+    print_rank_0(f"[YOUNGEUNK] total_num_microbatches: {total_num_microbatches}")
+    print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}")
+    print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}")
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
     # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
@@ -730,23 +748,20 @@ def forward_backward_pipelining_with_interleaving(
     # microbatch_id         | 0 1 2 0 1 2 3 4 3 4
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
     schedule_table = []
+    # print_rank_0(f"[YOUNGEUNK] config.microbatch_group_size_per_vp_stage: {config.microbatch_group_size_per_vp_stage}") # 8
+    # print_rank_0(f"[YOUNGEUNK] num_microbatches: {num_microbatches}") # 128
+    # print_rank_0(f"[YOUNGEUNK] pipeline_parallel_size: {pipeline_parallel_size}") # 8
+    # print_rank_0(f"[YOUNGEUNK] total_num_microbatches: {total_num_microbatches}") # 512
+    # print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}") # 38
+    # print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}") # 474
     for min_microbatch_id_in_group in range(
         0, num_microbatches, config.microbatch_group_size_per_vp_stage
     ):
         if (
             min_microbatch_id_in_group + config.microbatch_group_size_per_vp_stage
-            >= num_microbatches
+            < num_microbatches
         ):
-            # Construct schedule for the last microbatch group
-            schedule_table.extend(
-                [
-                    (microbatch_id, model_chunk_id)
-                    for model_chunk_id in range(len(model))
-                    for microbatch_id in range(min_microbatch_id_in_group, num_microbatches)
-                ]
-            )
-        else:
-            # Construct schedule for other microbatch groups
+            # Construct schedule non-last microbatch groups
             schedule_table.extend(
                 [
                     (microbatch_id, model_chunk_id)
@@ -755,6 +770,15 @@ def forward_backward_pipelining_with_interleaving(
                         min_microbatch_id_in_group,
                         min_microbatch_id_in_group + config.microbatch_group_size_per_vp_stage,
                     )
+                ]
+            )
+        else:
+            # Construct schedule for the last microbatch group
+            schedule_table.extend(
+                [
+                    (microbatch_id, model_chunk_id)
+                    for model_chunk_id in range(len(model))
+                    for microbatch_id in range(min_microbatch_id_in_group, num_microbatches)
                 ]
             )
 
@@ -767,10 +791,14 @@ def forward_backward_pipelining_with_interleaving(
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
     # Both tables are indexed with virtual_microbatch_id.
     microbatch_id_table, model_chunk_id_table = zip(*schedule_table)
+    # print_rank_0(f"[YOUNGEUNK] PRINT schedule_table")
+    # print_rank_0(f"[YOUNGEUNK] microbatch_id_table: {microbatch_id_table}")
+    # print_rank_0(f"[YOUNGEUNK] model_chunk_id_table: {model_chunk_id_table}")
 
     def get_model_chunk_id(virtual_microbatch_id, forward):
         """Helper method to get the model chunk ID given the iteration number."""
         model_chunk_id = model_chunk_id_table[virtual_microbatch_id % total_num_microbatches]
+        assert virtual_microbatch_id <= total_num_microbatches
         if not forward:
             model_chunk_id = num_model_chunks - model_chunk_id - 1
         return model_chunk_id
@@ -858,13 +886,12 @@ def forward_backward_pipelining_with_interleaving(
 
         return recv, next_model_chunk_id
 
-    def forward_step_helper(
-        virtual_microbatch_id, microbatch_id, checkpoint_activations_microbatch
-    ):
+    def forward_step_helper(virtual_microbatch_id, checkpoint_activations_microbatch):
         """Helper method to run forward step with model split into chunks
         (run set_virtual_pipeline_model_parallel_rank() before calling
         forward_step())."""
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=True)
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
         parallel_state.set_virtual_pipeline_model_parallel_rank(model_chunk_id)
 
         # launch param synchronization for next model chunk
@@ -1002,7 +1029,7 @@ def forward_backward_pipelining_with_interleaving(
     send_prev_wait_handle = None
     recv_next_wait_handles = []
 
-    for k in range(num_warmup_microbatches):
+    for k in range(num_warmup_microbatches):  # This is number of virtual microbatches
         cur_model_chunk_id = get_model_chunk_id(k, forward=True)
         parallel_state.set_virtual_pipeline_model_parallel_rank(cur_model_chunk_id)
 
@@ -1026,6 +1053,8 @@ def forward_backward_pipelining_with_interleaving(
         if config.overlap_p2p_comm_warmup_flush and not parallel_state.is_pipeline_first_stage(
             ignore_virtual=True
         ):
+            # Recv from previous stage in non-first stages
+            # This is always index 0 in the recv_buffer since it is not the first stage
             fwd_recv_buffer[k % fwd_recv_buffer_size], fwd_wait_recv_handles = (
                 p2p_communication.send_forward_recv_forward(
                     output_tensor=None,  # No output_tensor to send.
@@ -1048,12 +1077,12 @@ def forward_backward_pipelining_with_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        microbatch_id = get_microbatch_id_in_model_chunk(k, forward=True)
-        output_tensor = forward_step_helper(k, microbatch_id, checkpoint_activations_microbatch)
+        output_tensor = forward_step_helper(k, checkpoint_activations_microbatch)
 
         # Don't send tensor downstream if on last stage.
         if parallel_state.is_pipeline_last_stage():
             output_tensor = None
+            # The output_tensor for the loss calculation is already in output_tensors[num_model_chunks - 1], which is stored in the forward_step_helper
 
         # Send and receive tensors as appropriate (send tensors computed
         # in this iteration; receive tensors for next iteration).
@@ -1071,7 +1100,7 @@ def forward_backward_pipelining_with_interleaving(
                 (input_tensor, output_tensor_grad) = (
                     p2p_communication.send_forward_backward_recv_forward_backward(
                         output_tensor,
-                        input_tensor_grad,
+                        input_tensor_grad,  # This is None
                         recv_prev=recv_prev,
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
@@ -1189,9 +1218,7 @@ def forward_backward_pipelining_with_interleaving(
 
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
-            output_tensor = forward_step_helper(
-                forward_k, microbatch_id, checkpoint_activations_microbatch
-            )
+            output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
 
             # Determine if current stage has anything to send in either direction,
             # otherwise set tensor to None.
@@ -1290,9 +1317,7 @@ def forward_backward_pipelining_with_interleaving(
                 )
                 bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
         else:  # No p2p overlap.
-            output_tensor = forward_step_helper(
-                forward_k, microbatch_id, checkpoint_activations_microbatch
-            )
+            output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
 
             # Backward pass.
             backward_k = k
