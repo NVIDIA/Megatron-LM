@@ -36,8 +36,8 @@ class XIELU(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5, eps=-1e-6):
         super(XIELU, self).__init__(config)
         self.config = config
-        self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
-        self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_n_init - beta, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
+        self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=torch.bfloat16)) - 1.0).unsqueeze(0))
+        self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_n_init - beta, dtype=torch.bfloat16)) - 1.0).unsqueeze(0))
         self.beta = beta
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
 
@@ -82,8 +82,8 @@ class XIPReLU(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, beta=0.5):
         super(XIPReLU, self).__init__(config)
         self.config = config
-        self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
-        self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_n_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
+        self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=torch.bfloat16)) - 1.0).unsqueeze(0))
+        self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_n_init, dtype=torch.bfloat16)) - 1.0).unsqueeze(0))
         self.beta = beta
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
@@ -127,9 +127,9 @@ class XIPReLUP(MegatronModule):
     def __init__(self, config=None, alpha_p_init=0.8, alpha_n_init=0.8, power_init=2, beta=0.5, eps=1e-6):
         super(XIPReLUP, self).__init__(config)
         self.config = config
-        self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
-        self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_n_init, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
-        self.power = nn.Parameter(torch.log(torch.exp(torch.tensor(power_init - 1.0, dtype=torch.bfloat16, device='cuda')) - 1.0).unsqueeze(0))
+        self.alpha_p = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_p_init, dtype=torch.bfloat16)) - 1.0).unsqueeze(0))
+        self.alpha_n = nn.Parameter(torch.log(torch.exp(torch.tensor(alpha_n_init, dtype=torch.bfloat16)) - 1.0).unsqueeze(0))
+        self.power = nn.Parameter(torch.log(torch.exp(torch.tensor(power_init - 1.0, dtype=torch.bfloat16)) - 1.0).unsqueeze(0))
         self.beta = beta
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
 
