@@ -103,6 +103,8 @@ def save_checkpoint(queue: mp.Queue, args):
         raise ValueError("wrong model_type in metadata. must be GPT")
     if md.checkpoint_args.position_embedding_type != "rope":
         raise ValueError("LLama model must use RoPE")
+    if md.checkpoint_args.use_rope_scaling:
+        raise ValueError("LLama model must use llama3 RoPE scaling")
     if not md.checkpoint_args.swiglu:
         raise ValueError("LLama model must use gated linear layers")
     if md.checkpoint_args.normalization != "RMSNorm":
@@ -155,17 +157,24 @@ def save_checkpoint(queue: mp.Queue, args):
             rms_norm_eps=md.checkpoint_args.norm_epsilon,
             tie_word_embeddings=not md.checkpoint_args.untie_embeddings_and_output_weights,
             rope_theta=md.checkpoint_args.rotary_base,
+            rope_scaling={"rope_type": "llama3",
+                          "factor": md.checkpoint_args.rope_scaling_factor,
+                          "original_max_position_embeddings": md.checkpoint_args.max_position_embeddings,
+                          "factor": md.checkpoint_args.rope_scaling_factor,
+                          "high_freq_factor": 4.0,
+                          "low_freq_factor": 1.0},  # high/low freq factor: Set defaults, thay aren't used in megatron.
             attention_bias=md.checkpoint_args.add_qkv_bias,
             mlp_bias=md.checkpoint_args.add_bias_linear,
             torch_dtype=torch_dtype,
             model_type="llama",
             architectures=["LlamaForCausalLM"],
-            transformers_version="4.33.1",
+            attention_dropout=md.checkpoint_args.attention_dropout,
+            hidden_dropout=md.checkpoint_args.hidden_dropout,
         )
         if args.hf_tokenizer:
             llama_conf.eos_token_id = tokenizer.eos_token_id
-            llama_conf.bos_token_id = tokenizer.eos_token_id
-        
+            llama_conf.bos_token_id = tokenizer.bos_token_id
+
         print(f"saving config.json to {tmp_save_dir}")
         llama_conf.save_pretrained(tmp_save_dir)
 
