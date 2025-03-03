@@ -1868,6 +1868,8 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-p2p-communication-warmup-flush', action='store_true',
                        default=False, help='if set, overlap pipeline parallel communication in warmup and flush',
                        dest='overlap_p2p_comm_warmup_flush')
+    group.add_argument('--concurrent-execution-based-a2a-hiding', action='store_true',
+                       default=False, help='if set, use concurrent execution based A2A hiding')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')

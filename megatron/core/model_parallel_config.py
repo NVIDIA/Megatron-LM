@@ -307,6 +307,9 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
+    concurrent_execution_based_a2a_hiding: bool = False
+    """If true, use concurrent execution based A2A hiding."""
+
     ###################
     # CPU Offloading
     ###################

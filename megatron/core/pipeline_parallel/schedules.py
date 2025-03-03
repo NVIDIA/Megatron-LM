@@ -707,7 +707,7 @@ def forward_backward_pipelining_with_interleaving(
         # immediately start with 1F1B).
         num_warmup_microbatches = (num_model_chunks - 1) * config.microbatch_group_size_per_vp_stage
         num_warmup_microbatches += (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
-        num_warmup_microbatches += 1
+        num_warmup_microbatches += 1 if config.concurrent_execution_based_a2a_hiding else 0
         if num_warmup_microbatches >= total_num_microbatches:
             num_warmup_microbatches = total_num_microbatches
             all_warmup_microbatches = True
@@ -723,6 +723,7 @@ def forward_backward_pipelining_with_interleaving(
     print_rank_0(f"[YOUNGEUNK] total_num_microbatches: {total_num_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}")
+    print_rank_0(f"[YOUNGEUNK] config.concurrent_execution_based_a2a_hiding: {config.concurrent_execution_based_a2a_hiding}")
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
     # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
@@ -1002,6 +1003,14 @@ def forward_backward_pipelining_with_interleaving(
 
         return input_tensor_grad
 
+    def forward_backward_step_helper(forward_k, backward_k, checkpoint_activations_microbatch):
+        # YOUNGEUNK
+        # TODO: need to decompose the forward and backward helper functions and merge it
+        print_rank_0(f"[YOUNGEUNK][forward_backward_step_helper] concurrent execution based A2A hiding: {config.concurrent_execution_based_a2a_hiding}")
+        output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
+        input_tensor_grad = backward_step_helper(backward_k)
+        return output_tensor, input_tensor_grad
+
     # Run warmup forward passes.
     parallel_state.set_virtual_pipeline_model_parallel_rank(0)
     input_tensors[0].append(p2p_communication.recv_forward(tensor_shape, config))
@@ -1082,7 +1091,8 @@ def forward_backward_pipelining_with_interleaving(
         # Don't send tensor downstream if on last stage.
         if parallel_state.is_pipeline_last_stage():
             output_tensor = None
-            # The output_tensor for the loss calculation is already in output_tensors[num_model_chunks - 1], which is stored in the forward_step_helper
+            # The output_tensor for the loss calculation is already in output_tensors[num_model_chunks - 1],
+            # which is stored in the forward_step_helper
 
         # Send and receive tensors as appropriate (send tensors computed
         # in this iteration; receive tensors for next iteration).
@@ -1189,6 +1199,7 @@ def forward_backward_pipelining_with_interleaving(
     for k in range(num_microbatches_remaining):
         # Forward pass.
         forward_k = k + num_warmup_microbatches
+        backward_k = k
 
         # Decide to checkpoint all layers' activations of the current micro-batch.
         if max_outstanding_backprops is not None:
@@ -1260,7 +1271,6 @@ def forward_backward_pipelining_with_interleaving(
             # assert fwd_wait_handles is not None
 
             # Backward pass.
-            backward_k = k
             backward_model_chunk_id = get_model_chunk_id(backward_k, forward=False)
             parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
             if not parallel_state.is_pipeline_last_stage():
@@ -1317,11 +1327,15 @@ def forward_backward_pipelining_with_interleaving(
                 )
                 bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
         else:  # No p2p overlap.
-            output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
-
-            # Backward pass.
-            backward_k = k
-            input_tensor_grad = backward_step_helper(backward_k)
+            # TODO: The new A2A hiding block goes here.
+            if config.concurrent_execution_based_a2a_hiding:
+                output_tensor, input_tensor = forward_backward_step_helper(
+                    forward_k, backward_k, checkpoint_activations_microbatch
+                )
+            else:
+                output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
+                # Backward pass.
+                input_tensor_grad = backward_step_helper(backward_k)
 
             # Send output_tensor and input_tensor_grad, receive input_tensor
             # and output_tensor_grad.
