@@ -117,16 +117,6 @@ When resuming a run, the application will attempt to load the checkpoint referen
 ## Backup codebase
 If we set `BACKUP_CODEBASE` to `true` in the launcher scripts we will copy the Megatron-LM codebase specified in `MEGATRON_LM_DIR` to the experiment folder so we can use it across multiple runs
 
-# Evaluation
-
-You can use `scripts/evaluation/submit_evaluation.sh` to run lm-harness benchmarks on existing checkpoints.
-Example:
-```
-WANDB_API_KEY=<key> TOKENIZER=<tokenizer> bash scripts/evaluation/submit_evaluation.sh <ckp-path> --size <model-size> --wandb-entity <entity> --wandb-project <project> --wandb-id <runid> --iteration <it> --tasks hellaswag
-```
-
-For more information see `src/evaluation/README.md` and `bash scripts/evaluation/submit_evaluation.sh --help`.
-
 # Contribute
 You can submit issues and create branches on `https://github.com/swiss-ai/Megatron-LM`. The main branch is protected so you won't be able to directly commit to it.
 1. Pull the latest version
