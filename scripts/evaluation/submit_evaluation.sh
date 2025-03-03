@@ -1,4 +1,4 @@
-# Define default variables.
+# Define default variables :D.
 GPUS_PER_NODE=4
 
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
