@@ -22,6 +22,7 @@ def get_model_and_buffers(
     use_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
     average_in_collective: bool,
+    num_distributed_optimizer_instances: int = 1,
 ):
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
@@ -29,6 +30,7 @@ def get_model_and_buffers(
         overlap_grad_reduce=overlap_grad_reduce,
         bucket_size=bucket_size,
         average_in_collective=average_in_collective,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
     model = TestModel(
         input_dim=input_dim,
@@ -46,8 +48,9 @@ def get_model_and_buffers(
     )
     assert len(model.buffers) == 1
     param_and_grad_buffer = model.buffers[0]
+    bucket_groups = model.bucket_groups
 
-    return model, param_and_grad_buffer
+    return model, param_and_grad_buffer, bucket_groups
 
 
 @pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
@@ -66,7 +69,7 @@ def test_bucket_sizes(
     input_dim = 95
     output_dim = 95
     num_layers = 10
-    _, param_and_grad_buffer = get_model_and_buffers(
+    _, param_and_grad_buffer, _ = get_model_and_buffers(
         input_dim=input_dim,
         output_dim=output_dim,
         num_layers=num_layers,
@@ -160,16 +163,25 @@ def test_bucket_sizes(
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
-@pytest.mark.flaky
+@pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
+# @pytest.mark.flaky
 def test_grad_sync(
-    use_distributed_optimizer: bool, overlap_grad_reduce: bool, average_in_collective: bool
+    use_distributed_optimizer: bool,
+    overlap_grad_reduce: bool,
+    average_in_collective: bool,
+    num_distributed_optimizer_instances: int,
 ):
-    Utils.initialize_model_parallel()
+    Utils.initialize_model_parallel(
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances
+    )
+    # Skip test if num_distributed_optimizer_instances > 1 and not using distributed optimizer
+    if num_distributed_optimizer_instances > 1 and not use_distributed_optimizer:
+        pytest.skip("Multiple optimizer instances require distributed optimizer to be enabled")
 
     input_dim = 100
     output_dim = 100
     num_layers = 10
-    model, param_and_grad_buffer = get_model_and_buffers(
+    model, param_and_grad_buffer, bucket_groups = get_model_and_buffers(
         input_dim=input_dim,
         output_dim=output_dim,
         num_layers=num_layers,
@@ -179,8 +191,8 @@ def test_grad_sync(
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
         average_in_collective=average_in_collective,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
-    bucket_groups = partition_buckets([param_and_grad_buffer])
     param_to_bucket_group = {}
     for bucket_group in bucket_groups:
         for param in bucket_group.params:
@@ -196,7 +208,10 @@ def test_grad_sync(
     if (
         use_distributed_optimizer
         and (not average_in_collective)
-        and parallel_state.get_data_parallel_rank() != 0
+        and parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, partial_data_parallel=True
+        )
+        != 0
     ):
         expected_grad_data_value_after_collective /= parallel_state.get_data_parallel_world_size()
 
@@ -208,7 +223,11 @@ def test_grad_sync(
             contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
         )
         finish_grad_sync_context = contextlib.nullcontext()
-        if i < (len(params) - 1) and overlap_grad_reduce:
+        if (
+            i < (len(params) - 1)
+            and overlap_grad_reduce
+            and num_distributed_optimizer_instances == 1
+        ):
             # Can't finish grad sync until all params have been registered ready.
             finish_grad_sync_context = pytest.raises(AssertionError)
 
