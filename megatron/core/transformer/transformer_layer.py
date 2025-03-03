@@ -182,9 +182,11 @@ class TransformerLayerSubmodules:
 
     Args:
         input_layernorm (Union[ModuleSpec, type]): Specification for the input layer normalization.
+
         self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
         self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after self-attention.
+        
         pre_cross_attn_layernorm (Union[ModuleSpec, type]): Specification for the layer
             normalization before cross-attention.
         cross_attention (Union[ModuleSpec, type]): Specification for the cross-attention mechanism.
@@ -200,6 +202,7 @@ class TransformerLayerSubmodules:
     """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
+
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
 
@@ -386,8 +389,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Optional Input Layer norm
         input_layernorm_output = self.input_layernorm(hidden_states)
 
+        if not self.config.post_layer_norm:
+            input_layernorm_output = self.input_layernorm(hidden_states)
+        else:
+            input_layernorm_output = hidden_states
+
         # Self attention.
-        attention_output_with_bias = self.self_attention(
+        attention_output, bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
             inference_params=inference_params,
@@ -398,6 +406,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
+
+        if self.config.post_layer_norm:
+            attention_output = self.input_layernorm(attention_output)
+            assert bias is None
+        attention_output_with_bias = (attention_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -434,10 +447,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        if not self.config.post_layer_norm:
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        else:
+            pre_mlp_layernorm_output = hidden_states
 
         # MLP.
-        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+        mlp_output, bias = self.mlp(pre_mlp_layernorm_output)
+        if self.config.post_layer_norm:
+            mlp_output = self.pre_mlp_layernorm(mlp_output)
+        mlp_output_with_bias = (mlp_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?

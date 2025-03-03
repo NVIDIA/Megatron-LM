@@ -6,18 +6,18 @@
 
 
 MEGATRON_LM_DIR=/iopsstor/scratch/cscs/$USER/Megatron-LM
-CKPT_PATH=/capstor/store/cscs/swissai/a06/users/schlag/llama3-1b-21n
+CKPT_PATH=/iopsstor/scratch/cscs/schlag/experiments/merge-for-v2/Megatron-LM/logs/Meg-Runs/apertus2_baselines/apertus2-1b-21n-4096sl-504gbsz-ademamix-wsd-xielu-crossDocAttn-goldfish-beta2-qkNorm-untie/checkpoints
 
 # [torch_dist -> torch] dependencies
 CKPT_IS_TORCH_DIST=true
 TORCH_DIST_SCRIPT=$MEGATRON_LM_DIR/scripts/conversion/torchdist_2_torch.py
-TORCH_CKPT_SAVE_PATH=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/torch/llama3-1b-21n
+TORCH_CKPT_SAVE_PATH=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/test2-apertus2-1b-21n
 # [core (torch) --> HF] dependencies
 HF_SAVE_DIR=/iopsstor/scratch/cscs/$USER/Meg-Checkpoints/hf-checkpoints
-SAVE_DIR=$HF_SAVE_DIR/llama3-1b-21n
+SAVE_DIR=$HF_SAVE_DIR/test2-apertus2-1b-21n
 mkdir -p $HF_SAVE_DIR
 LOADER=core
-SAVER=llama_hf
+SAVER=swissai_hf
 
 
 # Run torch_dist --> torch

@@ -117,6 +117,7 @@ def _load_checkpoint(queue, args):
     check_for_arg('disable_bias_linear', False)
     check_for_arg('params_dtype')
     check_for_arg('swiglu', False)
+    check_for_arg('xielu', False)
 
     # Determine how to make our models
     if args.model_type == 'GPT':
@@ -298,6 +299,24 @@ def _load_checkpoint(queue, args):
                 if md.linear_bias:
                     message["dense bias"] = layer["self_attn_proj_bias"]
                     message["mlp l1 bias"] = layer["mlp_fc2_bias"]
+                
+                # Add QK normalization parameters if they exist
+                if layer.get("self_attn_q_layernorm_weight") is not None:
+                    message["q norm weight"] = layer["self_attn_q_layernorm_weight"]
+                    if norm_has_bias:
+                        message["q norm bias"] = layer["self_attn_q_layernorm_bias"]
+                if layer.get("self_attn_k_layernorm_weight") is not None:
+                    message["k norm weight"] = layer["self_attn_k_layernorm_weight"]
+                    if norm_has_bias:
+                        message["k norm bias"] = layer["self_attn_k_layernorm_bias"]
+                # add Xielu weights
+                if layer.get("mlp_xielu_alpha_p") is not None:
+                    # somehow the xielu weights are on the GPU
+                    # so we need to move them to the CPU. it might be related to the change
+                    # needed in L912 of checkpointing.py, where we now load the weights with weights_only=False
+                    message["mlp xielu alpha p"] = layer["mlp_xielu_alpha_p"].cpu()
+                if layer.get("mlp_xielu_alpha_n") is not None:
+                    message["mlp xielu alpha n"] = layer["mlp_xielu_alpha_n"].cpu()
 
                 # Grab all parallel tensors for this layer
                 qkv_weight = []
