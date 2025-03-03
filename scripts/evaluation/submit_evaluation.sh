@@ -4,8 +4,6 @@ GPUS_PER_NODE=4
 DEF_MEGATRON_PATH=$(dirname $(dirname $( cd -- "$(dirname "$0")" >/dev/null 2>&1 ; pwd -P )))  # Grandparent of current file location.
 DEF_LOGS_ROOT=$PWD/eval-logs
 DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.toml
-DEF_LM_HARNESS_PATH=/capstor/store/cscs/swissai/a06/users/ahernnde/workspace/lm-evaluation-harness
-DEF_TRANSFORMERS_PATH=/capstor/store/cscs/swissai/a06/users/ahernnde/workspace/transformers
 DEF_ACCOUNT=a-a06
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
@@ -41,6 +39,7 @@ usage () {
 	echo "  --pp (int>0): Target PP size for inference. Ignored if --size is set, required otherwise."
 	echo "  --bs (int>0): Batch size used for inference (default=$BS)."
 	echo "  --iteration (int>0 | 'latest'): What iteration to evaluate (default=$ITERATION)"
+	echo "  --revision: Only used when input is HF checkpoint. Sets the HF revision."
 	echo "  --wandb-project"
 	echo "  --wandb-entity"
 	echo "  --wandb-id"
@@ -66,12 +65,6 @@ if [ -z ${CONTAINER_PATH+x} ]; then
 fi
 if [ -z ${ACCOUNT+x} ]; then
 	ACCOUNT=$DEF_ACCOUNT
-fi
-if [ -z ${LM_HARNESS_PATH+x} ]; then
-	LM_HARNESS_PATH=$DEF_LM_HARNESS_PATH
-fi
-if [ -z ${TRANSFORMERS_PATH+x} ]; then
-	TRANSFORMERS_PATH=$DEF_TRANSFORMERS_PATH
 fi
 if [ -z ${TOKENIZER+x} ]; then
 	TOKENIZER=$DEF_TOKENIZER
@@ -115,6 +108,8 @@ while [[ $# -gt 0 ]]; do
 			CONVERT_TO_HF=true; shift;;
 		--iteration)
 			ITERATION=$2; shift 2;;
+		--revision)
+			REVISION=$2; shift 2;;
 		--wandb-project)
 			WANDB_PROJECT=$2; shift 2;;
 		--wandb-entity)
@@ -175,7 +170,7 @@ EVAL_DIR=$LOGS_ROOT/lmharness
 
 if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_ID+x} ]; then
 	if [ -z ${WANDB_ENTITY+x} ] || [ -z ${WANDB_PROJECT+x} ] || [ -z ${WANDB_ID+x} ]; then
-		echo "Either all --wandb-entity, --wandb-project and --wandb-id should be set, or neither" >&2
+		echo "Either all --wandb-entity, --wandb-project and --wandb-id should be set, or none" >&2
 		exit 1
 	fi
 	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=$ITERATION"
@@ -217,17 +212,6 @@ else
 		echo Checkpoint will be converted to HF
 
 		read -r -d '' CMD_CONVERT <<- EOM
-		# Create tempfile.
-		cd
-		mkdir -p $SCRATCH/.tmp
-		HF_TEMP_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)
-		TORCH_NODIST_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)
-		function cleanup {
-			rm -rf \\\$HF_TEMP_PATH
-			rm -rf \\\$TORCH_NODIST_PATH
-		}
-		trap cleanup EXIT
-
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
 		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
@@ -238,9 +222,12 @@ else
 	else
 		echo Huggingface checkpoint detected!
 		HF_CHECKPOINT_PATH=$CHECKPOINT_PATH
+		if [ ! -z ${REVISION+x} ]; then
+			MAYBE_REVISION=",revision=$REVISION"
+		fi
 	fi
 
-	CMD_EVAL="accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096 $COMMON_EVAL_ARGS"
+	CMD_EVAL="accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION $COMMON_EVAL_ARGS"
 fi
 
 # Now let's prepare the sbatch.
@@ -270,16 +257,34 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	export HF_HOME=$SCRATCH/huggingface
 	set -e
 
-	# Install new transformers.
-	cd $TRANSFORMERS_PATH
+	# Create tempdirs.
+	cd
+	mkdir -p $SCRATCH/.tmp
+	HF_TEMP_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To store hf conversion (if needed).
+	TORCH_NODIST_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To store torch no dist checkpoint converted (if needed).
+	REPOS_PATH=\\\$(mktemp -d -p $SCRATCH/.tmp)  # To git clone repos.
+	function cleanup {
+		rm -rf \\\$HF_TEMP_PATH
+		rm -rf \\\$TORCH_NODIST_PATH
+		rm -rf \\\$REPOS_PATH
+	}
+	trap cleanup EXIT
+
+	# Install custom transformers and lm-harness.
+	cd \\\$REPOS_PATH
+	git clone https://github.com/swiss-ai/transformers.git
+	cd transformers
+	git checkout swissai-model
 	python -m pip install -e .
+	cd ..
+	git clone https://github.com/AleHD/lm-evaluation-harness.git
+	cd lm-evaluation-harness
+	python -m pip install -e .[api]
 
 	$CMD_CONVERT
 	$CMD_SERVER
 
 	# Launch eval.
-	cd $LM_HARNESS_PATH
-	python -m pip install -e .[api]
 	$CMD_EVAL
 
 	$WANDB_COMMAND
