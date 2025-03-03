@@ -17,7 +17,10 @@
     - [Data mixtures](#data-mixtures)
 - [Checkpointing](#checkpointing)
     - [Resuming from a checkpoint](#resuming-from-a-checkpoint)
+- [Fault Tolerance](#fault-tolerance)
 - [QOL Improvements](#qol-improvements)
+    - [Exit & Save triggers](#exit--save-triggers)
+    - [Debugging](#debugging)
     - [Backup codebase](#backup-codebase)
 - [Contribute](#contribute)
     - [Copy Your Wandb Logs to a New Project](#copy-your-wandb-logs-to-a-new-project)
@@ -52,7 +55,7 @@ We also provide scripts to tokenize data using datatrove at scale and tools to c
 
 # Data
 >[!NOTE]
-> On the Alps supercomputer, you can find tokenized datasets in `/capstor/store/cscs/swissai/a06/datasets_tokenized/nemo/sai`
+> On the Alps supercomputer, you can find tokenized datasets in `/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai`
 
 ## Tokenization
 While Megatron provides data tokenization tools, we use `datatrove`, which enables us reading data in multiple formats (`json`, `parquet`, `csv`...), easy parallelization across multiple nodes, and efficient filtering and deduplication our data.
@@ -112,7 +115,31 @@ With each checkpoint save, the file `latest_checkpointed_iteration.txt` will be 
 
 When resuming a run, the application will attempt to load the checkpoint referenced in the `latest_checkpointed_iteration.txt` file from the `--load` directory. To load a checkpoint from a different iteration, you will need to manually modify the reference inside `latest_checkpointed_iteration.txt`.
 
+# Fault Tolerance
+Training of LLMs often spans several weeks or even months. However, compute clusters typically enforce job time limits of 12 to 24 hours. This results in frequent training interruptions, either due to these time limits or hardware crashes.
+
+To avoid constantly monitoring the training process, we have designed a fault-tolerance system that ensures seamless continuity of training. The system handles:
+
+- Maintaining Continuous Job Execution. The launcher ensures there is always one active job running and another queued. This is achieved using the `sbatch --dependency=singleton` flag, which guarantees that only one job with the specified name (owned by the user) can be running or suspended at any given time.
+- Graceful Exit Before Time Limit. The launcher saves a checkpoint and exits gracefully a few minutes before the job time limit is reached. This allows checkpoint frequency to remain independent of the Slurm time limit while utilizing the full time window for training. This is achieved with `#SBATCH --signal=SIGUSR2@600`, which sends a `SIGUSR2` signal 600 seconds before the time limit. The signal is captured during the run to trigger the checkpoint save and exit.
+- Automatic Recovery: Automatically resumes training from the most recent checkpoint, recovering model weights, optimizer states, Dataloader states and WANDB logging.
+
+>[!NOTE]
+> To avoid wasting resources, we have disabled by default the first feature that keeps one job running while another remains in the queue. Set `AUTO_JOB_REQUEUE=true` to enable it once you are sure of the cost involved in running this experiment
+
+Additionally, to prevent a job from getting stuck failing continuously, we have added some guardrails at critical points in the application to ensure that the job can be executed correctly; otherwise, we will cancel all jobs.
+
 # QOL Improvements
+## Exit & Save triggers
+By default, Slurm only allows the job owner to interact with a running job, which creates challenges during long runs when multiple team members are responsible for monitoring the process. To address this limitation, we have implemented a mechanism based on the presence of specific files (triggers):
+ - **Save Trigger**: When the save trigger file is detected, the system will schedule a checkpoint save.
+ - **Exit Trigger**: When the exit trigger file is detected, the system will gracefully exit the run and cancel all remaining jobs.
+This allows team members (not just the job owner) to intervene when necessary. The verification of these files will be carried out every `args.log_interval` steps.
+
+## Debugging
+We have incorporated two very useful debugging utilities into the launcher:  
+- **NCCL Debug**: Set `LOG_NCCL=true` to store all `NCCL_DEBUG=INFO` logs in the job’s `$DEBUG_DIR` folder, with separate files per GPU and per node (check `NCCL_DEBUG_FILE`).  
+- **NSYS Profiler**: Set `NSYS_PROFILER=true` to extract traces of a job using the NSYS profiler. Check the `--profile-*` arguments available in [`megatron/training/arguments.py`](megatron/training/arguments.py).
 ## Backup codebase
 If we set `BACKUP_CODEBASE` to `true` in the launcher scripts we will copy the Megatron-LM codebase specified in `MEGATRON_LM_DIR` to the experiment folder so we can use it across multiple runs
 

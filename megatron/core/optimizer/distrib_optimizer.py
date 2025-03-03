@@ -21,6 +21,8 @@ except ImportError:
 
         HAVE_APEX_OR_TE = False
 
+from .ademamix import AdEMAMix
+
 from .. import tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing import ShardedTensor
@@ -487,9 +489,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
 
-        assert (
-            isinstance(optimizer, Adam) or optimizer is None
-        ), "Only Adam currently supported, due to checkpointing requirements."
+        ## assert isinstance(
+        ##    optimizer, Adam
+        ## ), "Only Adam currently supported, due to checkpointing requirements."
+        if isinstance(optimizer, Adam):
+            self.optimizer_name = 'adam'
+            self.optimizer_keys = ("param", "exp_avg", "exp_avg_sq")
+        elif isinstance(optimizer, AdEMAMix):
+            self.optimizer_name = 'ademamix'
+            if config.adam_beta1 != 0.0:
+                self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_fast", "exp_avg_sq")
+            else:
+                self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_sq")
+        else:
+            raise Exception(f"Unrecognized optimizer {type(optimizer)}, only Adam and AdEMAMix are supported for now.")
 
         # when freezing sub-models we have no real optimizer
         # but still need a stub DistributedOptimizer class
@@ -693,8 +706,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             init_shard = lambda: torch.empty(
                                 (numel,), dtype=torch.float32, device=torch.cuda.current_device()
                             )
-
-                            tensors = {"exp_avg": init_shard(), "exp_avg_sq": init_shard()}
+                            
+                            if self.optimizer_name == 'adam':
+                                tensors = {"exp_avg": init_shard(), "exp_avg_sq": init_shard()}
+                            elif self.optimizer_name == 'ademamix':
+                                if len(self.optimizer_keys) == 4: # beta1 != 0
+                                    tensors = {"exp_avg_slow": init_shard(), "exp_avg_fast": init_shard(), "exp_avg_sq": init_shard()}
+                                else: # beta1 == 0
+                                    tensors = {"exp_avg_slow": init_shard(), "exp_avg_sq": init_shard()}
                             if self.config.use_precision_aware_optimizer:
                                 tensors["master_param"] = init_shard()
                             state_dict_state.append((state_order, tensors))
@@ -871,7 +890,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         key: torch.zeros(
                             (buffer_numel_unpadded,), dtype=torch.float32, device="cpu"
                         )
-                        for key in ("param", "exp_avg", "exp_avg_sq")
+                        for key in self.optimizer_keys
                     }
                     world_tensors["numel_unpadded"] = buffer_numel_unpadded
                 offset_in_world_tensors = 0
@@ -889,7 +908,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     local_shards = {
                         key: torch.zeros((gbuf_local_numel,), dtype=torch.float32, device="cpu")
-                        for key in ("param", "exp_avg", "exp_avg_sq")
+                        for key in self.optimizer_keys
                     }
 
                     # Build contiguous DP rank shards (for param + optim states).
@@ -1338,7 +1357,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         t.numel() for t in state_dict[gbuf_idx][torch.float32]["param"]
                     ]
                     assert sum(model_numels) == sum(checkpoint_numels)
-                for key in ("param", "exp_avg", "exp_avg_sq"):
+                for key in self.optimizer_keys:
                     legacy_world_tensors = self._update_legacy_world_tensors(
                         state_dict[gbuf_idx][torch.float32][key],
                         [
@@ -1458,7 +1477,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         f"({buffer_numel_unpadded}) and checkpoint ({checkpoint_numel_unpadded})"
                     )
                 recv_tensors = {}
-                for key in ("param", "exp_avg", "exp_avg_sq"):
+                for key in self.optimizer_keys:
                     offset_in_world_tensors = 0
                     for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                         # Compute local DP contiguous shard's size.
@@ -1620,7 +1639,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
-            for key in ['param', 'exp_avg', 'exp_avg_sq']:
+            for key in self.optimizer_keys:
                 tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)

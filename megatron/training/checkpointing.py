@@ -423,6 +423,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
+        state_dict['tokens_so_far'] = args.consumed_train_samples * args.seq_length
         if ckpt_type == CheckpointType.GLOBAL:
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -1053,6 +1054,18 @@ def load_args_from_checkpoint(
     # Checkpoint args.
     _set_arg('ckpt_format')
 
+    # OP architecture.
+    _set_arg('qk_layernorm', force=True)
+    _set_arg('use_torchqknorm', force=True)
+    _set_arg('no_persist_layer_norm', force=True)
+    _set_arg('attn_layernorm', force=True)
+    _set_arg('mlp_layernorm', force=True)
+    _set_arg('final_layernorm', force=True)
+    _set_arg('post_layernorm', force=True)
+
+    _set_arg('qknorm_impl', force=True)
+    _set_arg('xielu', force=True)
+
     # Model parallelism args.
     if args.use_mp_args_from_checkpoint_args:
         if checkpoint_version < 3.0:
@@ -1222,8 +1235,8 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
 
     # Checkpoint not loaded.
     if state_dict is None:
-        # Iteration and num_floating_point_operations_so_far default to 0.
-        return 0, 0
+        # Iteration, num_floating_point_operations_so_far and tokens_so_far default to 0.
+        return 0, 0, 0
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
@@ -1242,6 +1255,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
                              'iteration from checkpoint {}, exiting'.format(checkpoint_name))
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
+    tokens_so_far = state_dict.get('tokens_so_far', 0)
 
     # Check arguments.
     assert args.consumed_train_samples == 0
@@ -1373,7 +1387,7 @@ def load_checkpoint(model, optimizer, opt_param_scheduler, load_arg='load', stri
         is_local_chkpt = (ckpt_type == CheckpointType.LOCAL)
         ft_integration.on_checkpoint_loaded(is_local_chkpt=is_local_chkpt)
 
-    return iteration, num_floating_point_operations_so_far
+    return iteration, num_floating_point_operations_so_far, tokens_so_far
 
 
 def load_biencoder_checkpoint(model, only_query_model=False,

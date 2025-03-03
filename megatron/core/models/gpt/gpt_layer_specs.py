@@ -7,6 +7,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -45,10 +46,10 @@ except ImportError:
 try:
     import apex  # pylint: disable=unused-import
 
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+    from megatron.core.fusions.fused_layer_norm import FusedApexNorm
 
     HAVE_APEX = True
-    LNImpl = FusedLayerNorm
+    LNImpl = FusedApexNorm
 except ImportError:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
@@ -62,6 +63,10 @@ def get_gpt_layer_with_transformer_engine_spec(
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
+    attn_layernorm: bool = True,
+    mlp_layernorm: bool = True,
+    qknorm_impl: str = 'te',
+    post_layer_norm: bool = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
@@ -89,6 +94,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        mlp_layernorm=mlp_layernorm, 
+        post_layer_norm=post_layer_norm
     )
 
     if multi_latent_attention:
@@ -130,7 +137,33 @@ def get_gpt_layer_with_transformer_engine_spec(
         # TENorm significantly harms convergence when used
         # for QKLayerNorm if TE Version < 1.9;
         # we instead use the Apex implementation.
-        qk_norm = TENorm if is_te_min_version("1.9.0") else FusedLayerNorm
+        if qknorm_impl == "te":
+            qk_norm = TENorm if is_te_min_version("1.9.0") else FusedApexNorm
+        elif qknorm_impl == "apex":
+            qk_norm = FusedApexNorm
+        elif qknorm_impl == "torch":
+            qk_norm = WrappedTorchNorm
+        else:
+            raise KeyError(f"Unknown qknorm_impl {qknorm_impl}")
+
+        # Determine where to handle attention layernorm.
+        if attn_layernorm and post_layer_norm: # Post-layer normalization case: input_layernorm module will be used.
+            linear_qkv = TEColumnParallelLinear
+            input_layernorm = TENorm
+        elif attn_layernorm:  # standard pre-norm case: TELayerNormColumnParallelLinear handles it.
+            linear_qkv = TELayerNormColumnParallelLinear
+            input_layernorm = IdentityOp
+        else:  # no layernorms at all.
+            linear_qkv = TEColumnParallelLinear
+            input_layernorm = IdentityOp
+
+        # Determine how to handle mlp norm.
+        if mlp_layernorm and post_layer_norm:
+            pre_mlp_layernorm = TENorm
+        else:
+            # even when mlp_layernorm but not post_layer_norm, we have the identity op
+            # because mlp.fc1 will fuse the layernorm :)
+            pre_mlp_layernorm = IdentityOp
 
         return ModuleSpec(
             module=TransformerLayer,
@@ -139,15 +172,16 @@ def get_gpt_layer_with_transformer_engine_spec(
                     module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
-                        linear_qkv=TELayerNormColumnParallelLinear,
+                        linear_qkv=linear_qkv,
                         core_attention=TEDotProductAttention,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=qk_norm if qk_layernorm else IdentityOp,
                         k_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     ),
                 ),
+                input_layernorm=input_layernorm,
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=TENorm if num_experts else IdentityOp,
+                pre_mlp_layernorm=pre_mlp_layernorm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
             ),
@@ -268,6 +302,8 @@ def get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
+    mlp_layernorm: bool = True,
+    post_layer_norm: bool = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
@@ -278,12 +314,20 @@ def get_mlp_module_spec(
             ' and will be removed soon. Please update your code accordingly.'
         )
 
+    if use_te:
+        if mlp_layernorm and not post_layer_norm:
+            fc1 = TELayerNormColumnParallelLinear
+        else:
+            fc1 = TEColumnParallelLinear
+    else:  # No OP arguments can be given without te.
+        fc1 = ColumnParallelLinear
+        
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         return ModuleSpec(
             module=MLP,
             submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
+                linear_fc1=fc1,
                 linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
             ),
         )
