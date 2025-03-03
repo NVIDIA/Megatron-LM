@@ -1510,7 +1510,7 @@ def _add_training_args(parser):
     group.add_argument('--exit-signal-handler', action='store_true',
                        help='Dynamically save the checkpoint and shutdown the '
                        'training if SIGUSR2 is received')
-    group.add_argument('--trigger-path', type=str, default=None,
+    group.add_argument('--trigger-path', type=str, default="/dev/null",
                        help = 'Path to check for exit & save triggers')
     group.add_argument('--tensorboard-dir', type=str, default=None,
                        help='Write TensorBoard logs to this directory.')
