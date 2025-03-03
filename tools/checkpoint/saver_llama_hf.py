@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 import torch
 import torch.multiprocessing as mp
-from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM, GenerationConfig
+from transformers import AutoModelForCausalLM, SwissAIConfig, SwissAIForCausalLM, GenerationConfig
 
 sys.path.append(os.path.abspath(
     os.path.join(os.path.dirname(__file__),
@@ -21,7 +21,7 @@ except ModuleNotFoundError:
     exit(1)
 
 def add_arguments(parser):
-    group = parser.add_argument_group(title="Llama-2 HF saver.")
+    group = parser.add_argument_group(title="Llama HF saver.")
     group.add_argument(
         "--hf-tokenizer",
         type=str,
@@ -103,10 +103,19 @@ def save_checkpoint(queue: mp.Queue, args):
         raise ValueError("wrong model_type in metadata. must be GPT")
     if md.checkpoint_args.position_embedding_type != "rope":
         raise ValueError("LLama model must use RoPE")
-    if not md.checkpoint_args.swiglu:
-        raise ValueError("LLama model must use gated linear layers")
+    if md.checkpoint_args.use_rope_scaling:
+        raise ValueError("LLama model must use llama3 RoPE scaling")
     if md.checkpoint_args.normalization != "RMSNorm":
+        raise ValueError("LLama model must not use mlp bias")
+    if md.checkpoint_args.add_bias_linear:
         raise ValueError("LLama model must use RMSNorm")
+    if md.checkpoint_args.swiglu:
+        activation = "swiglu"
+    elif md.checkpoint_args.xielu:
+        activation = "xielu"
+    else:
+        raise ValueError("SwissAI model must use xielu or swiglu")
+
     torch_dtype = torch.float32
     if md.checkpoint_args.bf16:
         torch_dtype = torch.bfloat16
@@ -143,29 +152,54 @@ def save_checkpoint(queue: mp.Queue, args):
             tokenizer.save_pretrained(args.save_dir)
 
         ### save config.json
-        llama_conf = LlamaConfig(
+        llama_conf = SwissAIConfig(
             vocab_size=md.true_vocab_size if md.true_vocab_size else md.checkpoint_args.padded_vocab_size,
             hidden_size=md.checkpoint_args.hidden_size,
             intermediate_size=md.checkpoint_args.ffn_hidden_size,
             num_hidden_layers=md.checkpoint_args.num_layers,
             num_attention_heads=md.checkpoint_args.num_attention_heads,
             num_key_value_heads=md.checkpoint_args.num_query_groups,
-            hidden_act="silu",
+            hidden_act="silu" if activation == "swiglu" else "xielu",
             max_position_embeddings=md.checkpoint_args.max_position_embeddings,
             rms_norm_eps=md.checkpoint_args.norm_epsilon,
             tie_word_embeddings=not md.checkpoint_args.untie_embeddings_and_output_weights,
             rope_theta=md.checkpoint_args.rotary_base,
+            #rope_scaling={"type": "llama3",
+            #              "factor": md.checkpoint_args.rope_scaling_factor,
+            #              "original_max_position_embeddings": md.checkpoint_args.max_position_embeddings,
+            #              "factor": md.checkpoint_args.rope_scaling_factor,
+            #              "high_freq_factor": 4.0,
+            #              "low_freq_factor": 1.0},  # high/low freq factor: Set defaults, thay aren't used in megatron.
             attention_bias=md.checkpoint_args.add_qkv_bias,
             mlp_bias=md.checkpoint_args.add_bias_linear,
             torch_dtype=torch_dtype,
-            model_type="llama",
-            architectures=["LlamaForCausalLM"],
-            transformers_version="4.33.1",
+            attention_dropout=md.checkpoint_args.attention_dropout,
+            hidden_dropout=md.checkpoint_args.hidden_dropout,
+            model_type="swissai",
+            architectures=["SwissAIForCausalLM"],
+            qk_norm=md.checkpoint_args.qk_layernorm,
+            post_norm=md.checkpoint_args.post_layer_norm if hasattr(md.checkpoint_args, "post_layer_norm") else False
         )
         if args.hf_tokenizer:
             llama_conf.eos_token_id = tokenizer.eos_token_id
-            llama_conf.bos_token_id = tokenizer.eos_token_id
-        
+            llama_conf.bos_token_id = tokenizer.bos_token_id
+
+        # Prepare qkv slices.
+        head_size = llama_conf.hidden_size // llama_conf.num_attention_heads
+        heads_per_group = llama_conf.num_attention_heads // llama_conf.num_key_value_heads
+        qkv_total_heads = llama_conf.num_attention_heads + 2 * llama_conf.num_key_value_heads
+        q_slice = torch.cat(
+            [
+                torch.arange(
+                    (heads_per_group + 2) * i,
+                    (heads_per_group + 2) * i + heads_per_group,
+                )
+                for i in range(llama_conf.num_key_value_heads)
+            ]
+        )
+        k_slice = torch.arange(heads_per_group, qkv_total_heads, (heads_per_group + 2))
+        v_slice = torch.arange(heads_per_group + 1, qkv_total_heads, (heads_per_group + 2))
+
         print(f"saving config.json to {tmp_save_dir}")
         llama_conf.save_pretrained(tmp_save_dir)
 
@@ -214,16 +248,13 @@ def save_checkpoint(queue: mp.Queue, args):
         )
 
         ### save every transformer layer
-        head_size = llama_conf.hidden_size // llama_conf.num_attention_heads
-        heads_per_group = llama_conf.num_attention_heads // llama_conf.num_key_value_heads
-        qkv_total_heads = llama_conf.num_attention_heads + 2 * llama_conf.num_key_value_heads
         for i_layer in range(llama_conf.num_hidden_layers):
             message = queue_get(f"transformer layer {i_layer}")
             state_dict = {
-                f"model.layers.{i_layer}.input_layernorm.weight": message[
+                f"model.layers.{i_layer}.attention_layernorm.weight": message[
                     "input norm weight"
                 ],
-                f"model.layers.{i_layer}.post_attention_layernorm.weight": message[
+                f"model.layers.{i_layer}.feedforward_layernorm.weight": message[
                     "post norm weight"
                 ],
                 f"model.layers.{i_layer}.mlp.gate_proj.weight": message["mlp l0 weight W"],
@@ -231,26 +262,17 @@ def save_checkpoint(queue: mp.Queue, args):
                 f"model.layers.{i_layer}.self_attn.o_proj.weight": message["dense weight"],
                 f"model.layers.{i_layer}.mlp.down_proj.weight": message["mlp l1 weight"]
             }
-            if md.checkpoint_args.add_bias_linear:
+            if activation == "swiglu":
                 state_dict |= {
-                    f"model.layers.{i_layer}.self_attn.o_proj.bias": message["dense bias"],
-                    f"model.layers.{i_layer}.mlp.gate_proj.bias": message["mlp l0 bias W"],
-                    f"model.layers.{i_layer}.mlp.up_proj.bias": message["mlp l0 bias V"],
-                    f"model.layers.{i_layer}.mlp.down_proj.bias": message["mlp l1 bias"],
+                    f"model.layers.{i_layer}.mlp.gate_proj.weight": message["mlp l0 weight W"],
+                    f"model.layers.{i_layer}.mlp.up_proj.weight": message["mlp l0 weight V"],
                 }
-            q_slice = torch.cat(
-                [
-                    torch.arange(
-                        (heads_per_group + 2) * i,
-                        (heads_per_group + 2) * i + heads_per_group,
-                    )
-                    for i in range(llama_conf.num_key_value_heads)
-                ]
-            )
-            k_slice = torch.arange(heads_per_group, qkv_total_heads, (heads_per_group + 2))
-            v_slice = torch.arange(
-                heads_per_group + 1, qkv_total_heads, (heads_per_group + 2)
-            )
+            elif activation == "xielu":
+                state_dict |= {
+                    f"model.layers.{i_layer}.mlp.up_proj.weight": message["mlp l0 weight"],
+                    f"model.layers.{i_layer}.mlp.act_fn.alpha_p": message["mlp xielu alpha p"],
+                    f"model.layers.{i_layer}.mlp.act_fn.alpha_n": message["mlp xielu alpha n"],
+                }
             qkv_weights = message["qkv weight"]
             qkv_weights = qkv_weights.reshape(
                 [qkv_total_heads, head_size, llama_conf.hidden_size]
@@ -280,6 +302,12 @@ def save_checkpoint(queue: mp.Queue, args):
                         v_slice
                     ].reshape(-1, llama_conf.hidden_size)
                 }
+            if md.checkpoint_args.qk_layernorm:
+                state_dict |= {
+                    f"model.layers.{i_layer}.self_attn.q_norm.weight": message["q norm weight"],
+                    f"model.layers.{i_layer}.self_attn.k_norm.weight": message["k norm weight"],
+                }
+
             index_dict, ref_state_dict = save_layer(
                 state_dict,
                 index_dict,
@@ -327,7 +355,7 @@ def save_checkpoint(queue: mp.Queue, args):
         del state_dict
         gc.collect()
         print(f"Loading the converted pytorch checkpoint in a Llama HF model from {tmp_save_dir}")
-        model = LlamaForCausalLM.from_pretrained(
+        model = SwissAIForCausalLM.from_pretrained(
             str(tmp_save_dir), torch_dtype=torch.bfloat16, low_cpu_mem_usage=False # last arg requires a recent version of accelerate
         )
 

@@ -1003,7 +1003,7 @@ def load_args_from_checkpoint(
     # Model args.
     _set_arg('num_layers')
     _set_arg('hidden_size')
-    _set_arg('ffn_hidden_size')
+    _set_arg('ffn_hidden_size', force=True)
     _set_arg('seq_length')
     _set_arg('num_attention_heads')
     _set_arg('num_query_groups', force=True)
@@ -1026,6 +1026,8 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+
+    _set_arg('norm_epsilon', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
