@@ -8,7 +8,7 @@ DEF_ACCOUNT=a-a06
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
 ITERATION=latest
-TASKS=winogrande,piqa,social_iqa,openbookqa,arc_easy,commonsense_qa,triviaqa,mmlu_continuation,gsm8k,global_mmlu_ar,global_mmlu_bn,global_mmlu_de,global_mmlu_en,global_mmlu_es,global_mmlu_fr,global_mmlu_hi,global_mmlu_id,global_mmlu_it,global_mmlu_ja,global_mmlu_ko,global_mmlu_pt,global_mmlu_sw,global_mmlu_yo,global_mmlu_zh,wikitext,lambada,hellaswag
+TASKS=scripts/evaluation/swissai_eval
 LIMIT=null
 BS=1
 CONVERT_TO_HF=false
@@ -22,6 +22,7 @@ usage () {
 	echo "If a megatron checkpoint is given, you can add --convert-to-hf to convert the checkpoint to HF for faster inference (highly recommended if there is a HF implementation available). Otherwise the slower api endpoint will be used." 
 	echo "On all cases, specify either --size or --tp and --pp in order to convert the checkpoint to a more efficient distributed config for inference."
 	echo "If a hf checkpoint is given (or --convert-to-hf is set), DP will be enabled as long as TP*PP<NUM_GPUS_PER_NODE."
+	echo "You will need to specify a way to compute the consumed tokens at the iteration you are evaluating. This is either by specifying --iteration and --tokens-per-iter at the same time, or alternatively by --consumed-tokens (the latter only available in HF checkpoints)."
 	echo "In addition, there are a few environment variables you can set to specify some paths (optional)."
 	echo "If setting any of the --wandb arguments, make sure to also export your WANDB_API_KEY."
 	echo ""
@@ -40,6 +41,8 @@ usage () {
 	echo "  --bs (int>0): Batch size used for inference (default=$BS)."
 	echo "  --iteration (int>0 | 'latest'): What iteration to evaluate (default=$ITERATION)"
 	echo "  --revision: Only used when input is HF checkpoint. Sets the HF revision."
+	echo "  --tokens-per-iter (int>0): If specified with --iteration, the total consumed_tokens will be calculated by iteration*tokens_per_iter. Cannot be specified if consumed_tokens is also specified"
+	echo "  --consumed-tokens (int>0): When --iteration or --tokens-per-iter are not set, you need to specify this to set the total number of tokens the checkpoint has seen up to now."
 	echo "  --wandb-project"
 	echo "  --wandb-entity"
 	echo "  --wandb-id"
@@ -110,6 +113,10 @@ while [[ $# -gt 0 ]]; do
 			ITERATION=$2; shift 2;;
 		--revision)
 			REVISION=$2; shift 2;;
+		--tokens-per-iter)
+			TOKENS_PER_ITER=$2; shift 2;;
+		--consumed-tokens)
+			CONSUMED_TOKENS=$2; shift 2;;
 		--wandb-project)
 			WANDB_PROJECT=$2; shift 2;;
 		--wandb-entity)
@@ -158,11 +165,34 @@ if [ $ITERATION = latest ]; then
 	fi
 fi
 
+# Determine the CONSUMED_TOKENS.
+if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
+	# In the case of Megatron checkpoints, CONSUMED_TOKENS is exlusively computed using --iteration and --tokens-per-iter.
+	if [ -z ${TOKENS_PER_ITER+x} ]; then
+		echo When using megatron checkpoints, you need to set --tokens-per-iter to accurately compute the consumed tokens >&2
+		exit 1
+	fi
+	if [ ! -z ${CONSUMED_TOKENS+x} ]; then
+		echo When using megatron checkpoints, you cannot set --consumed-tokens, please set --tokens-per-iter instead >&2
+		exit 1
+	fi
+	CONSUMED_TOKENS=$((ITERATION*TOKENS_PER_ITER))
+else
+	# The huggingface checkpoints can get CONSUMED_TOKENS either by --tokens-per-iter or --consumed-tokens
+	if [ -z ${CONSUMED_TOKENS+x} ]; then
+		if [ -z ${TOKENS_PER_ITER+x} ]; then
+			echo Neither of --consumed-tokens or --tokens-per-iter set, aborting >&2
+			exit 1
+		fi
+		CONSUMED_TOKENS=$((ITERATION*TOKENS_PER_ITER))
+	fi
+fi
+
 mkdir -p $LOGS_ROOT/slurm $LOGS_ROOT/sbatch $LOGS_ROOT/lmharness
 if [ -z ${NAME+x} ]; then
 	NAME=$(echo $CHECKPOINT_PATH | tr / _)
 fi
-NAME=${NAME}_it$ITERATION
+#NAME=${NAME}_it$ITERATION
 LOGS_DIR=$LOGS_ROOT/slurm
 SBATCH_PATH=$LOGS_ROOT/sbatch/$NAME.sbatch
 WANDB_DIR=$LOGS_ROOT
@@ -173,7 +203,7 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 		echo "Either all --wandb-entity, --wandb-project and --wandb-id should be set, or none" >&2
 		exit 1
 	fi
-	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=$ITERATION"
+	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=$ITERATION,consumed_tokens=$CONSUMED_TOKENS"
 	read -r -d '' WANDB_COMMAND <<- EOM
 	# Wandb sync just in case wandb died in lm-harness.
 	for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
@@ -205,7 +235,7 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF
 	torchrun --nproc-per-node=$WORLD_SIZE --master-addr=localhost --master-port=$(($ENDPOINT_PORT + 1000)) tools/run_text_generation_server.py --tensor-model-parallel-size=$TP --pipeline-model-parallel-size=$PP --use-checkpoint-args --load=$CHECKPOINT_PATH --bf16 --micro-batch-size=$BS --max-batch-size=$BS --tokenizer-type=HuggingFaceTokenizer --tokenizer-model=$TOKENIZER --seed=42 --port=$ENDPOINT_PORT --ckpt-step=$ITERATION --finetune --max-tokens-to-oom=4194304 &
 
 	EOM
-	CMD_EVAL="lm_eval --model=local-completions --model_args=base_url=http://localhost:5000/completions,tokenized_requests=False,tokenizer=$TOKENIZER,num_concurrent=0,timeout=43200,max_retries=1,max_length=4096 $COMMON_EVAL_ARGS"
+	CMD_EVAL="WANDB_RESUME=allow lm_eval --model=local-completions --model_args=base_url=http://localhost:5000/completions,tokenized_requests=False,tokenizer=$TOKENIZER,num_concurrent=0,timeout=43200,max_retries=1,max_length=4096 $COMMON_EVAL_ARGS"
 else
 	if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
 		echo Megatron checkpoint detected!
@@ -227,7 +257,7 @@ else
 		fi
 	fi
 
-	CMD_EVAL="accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION $COMMON_EVAL_ARGS"
+	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION $COMMON_EVAL_ARGS"
 fi
 
 # Now let's prepare the sbatch.
@@ -245,6 +275,7 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
 #SBATCH --time=01:00:00
 #SBATCH --exclusive
+#SBATCH --dependency=singleton
 
 # Step 0: Some useful logs.
 export MASTER_ADDR=\$(hostname)
@@ -277,8 +308,10 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	git checkout swissai-model
 	python -m pip install -e .
 	cd ..
-	git clone https://github.com/AleHD/lm-evaluation-harness.git
-	cd lm-evaluation-harness
+	#git clone https://github.com/AleHD/lm-evaluation-harness.git
+	#cd lm-evaluation-harness
+	#python -m pip install -e .[api]
+	cd /capstor/store/cscs/swissai/a06/users/ahernnde/workspace/lm-evaluation-harness/
 	python -m pip install -e .[api]
 
 	$CMD_CONVERT

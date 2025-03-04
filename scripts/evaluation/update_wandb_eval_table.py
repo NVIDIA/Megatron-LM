@@ -14,21 +14,21 @@ def main(entity: str, project: str, runid: str, groups: list[str]):
     run = api.run(f"{entity}/{project}/{runid}")
     history = defaultdict(dict)
     for row in run.scan_history():
-        if "OptimizerStep" not in row:
+        if "ConsumedTokens" not in row:
             continue
-        optstep = row["OptimizerStep"]
+        optstep = row["ConsumedTokens"]
         for name, value in row.items():
             if not name.startswith("_") and name not in ignore_cols and value is not None and not math.isnan(value):
                 history[optstep][name] = value
     history = pd.DataFrame(list(history.values()))
-    last_step = np.max(history["OptimizerStep"])
-    last_row = history[history["OptimizerStep"] == last_step]
+    last_step = np.max(history["ConsumedTokens"])
+    last_row = history[history["ConsumedTokens"] == last_step]
     assert last_row.shape[0] == 1
     last_row = last_row.iloc[0, :]
     last_row = last_row.dropna()
 
     # Get task -> list of metrics dict.
-    names = list(filter(lambda col: col != "OptimizerStep", last_row.index))
+    names = list(filter(lambda col: col != "ConsumedTokens", last_row.index))
     last_row = last_row[names]
     tasks = defaultdict(list)
     tasks_maybe_stranded = defaultdict(lambda: defaultdict(list))
@@ -50,7 +50,7 @@ def main(entity: str, project: str, runid: str, groups: list[str]):
             tasks[task].append(metric)
 
     # Build metrics row.
-    data = {"OptimizerStep": last_step}
+    data = {"ConsumedTokens": last_step}
     for task, metrics in tasks.items():
         for metric in metrics:
             data[f"{task}/{metric}"] = last_row[f"{task}/{metric}"]
