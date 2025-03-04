@@ -132,7 +132,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
-def custom_backward(output, grad_output):
+def custom_backward(output, grad_output): # YOUNGEUNK: we might need to add "inputs" argument for the finegrained backward pass
     '''Directly call C++ autograd engine.
 
     To make the 'deallocate_output_tensor' (above) optimization work, the C++
@@ -278,11 +278,19 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
+            # print_rank_0(f"[YOUNGEUNK] data_iterator: {data_iterator}")
+            # print_rank_0(f"[YOUNGEUNK] Type of data_iterator: {type(data_iterator)}")
+            # print_rank_0(f"[YOUNGEUNK] data_iterator attributes: {dir(data_iterator)}")
+            # print_rank_0(f"[YOUNGEUNK] model: {model}")
             output_tensor, loss_func = forward_step_func(data_iterator, model)
         else:
+            print_rank_0(f"[YOUNGEUNK] forward_step_func [else]")
+            assert False, "[YOUNGEUNK] Temporary assertion"
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
+    # import inspect
+    # print_rank_0(inspect.getsource(forward_step_func))
 
     num_tokens = torch.tensor(0, dtype=torch.int)
     if parallel_state.is_pipeline_last_stage():
@@ -369,8 +377,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
     if config.deallocate_pipeline_outputs:
+        # print_rank_0(f"[YOUNGEUNK] custom_backward call!?")
         custom_backward(output_tensor[0], output_tensor_grad[0])
     else:
+        print_rank_0(f"[YOUNGEUNK] torch.autograd.backward call")
         torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
@@ -401,6 +411,27 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     return input_tensor_grad
 
+def concurrent_forward_backward_step(
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches,
+    forward_input_tensor,
+    forward_data_store,
+    collect_non_loss_data,
+    is_first_microbatch,
+    current_microbatch,
+    encoder_decoder_xattn,
+    backward_input_tensor,
+    output_tensor,
+    output_tensor_grad,
+    model_type,
+    config
+):
+    """
+    This function is used to perform concurrent forward and backward passes.
+    """
+    pass
 
 def check_first_val_step(first_val_step, forward_only, cond):
     """Check if it is the first validation step."""
@@ -708,7 +739,7 @@ def forward_backward_pipelining_with_interleaving(
         # immediately start with 1F1B).
         num_warmup_microbatches = (num_model_chunks - 1) * config.microbatch_group_size_per_vp_stage
         num_warmup_microbatches += (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
-        num_warmup_microbatches += 1 if config.concurrent_execution_based_a2a_hiding else 0
+        num_warmup_microbatches += 1 if config.combined_1f1b else 0
         if num_warmup_microbatches >= total_num_microbatches:
             num_warmup_microbatches = total_num_microbatches
             all_warmup_microbatches = True
@@ -725,8 +756,9 @@ def forward_backward_pipelining_with_interleaving(
     print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}")
     print_rank_0(
-        f"[YOUNGEUNK] config.concurrent_execution_based_a2a_hiding: {config.concurrent_execution_based_a2a_hiding}"
+        f"[YOUNGEUNK] config.combined_1f1b: {config.combined_1f1b}"
     )
+    print_rank_0(f"[YOUNGEUNK] config.overlap_p2p_comm: {config.overlap_p2p_comm}")
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
     # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'
@@ -1009,6 +1041,7 @@ def forward_backward_pipelining_with_interleaving(
     def forward_backward_step_helper(forward_k, backward_k, checkpoint_activations_microbatch):
         # YOUNGEUNK
         # TODO: need to decompose the forward and backward helper functions and merge it
+        # eventually calls concurrent_forward_backward_step()
         output_tensor = forward_step_helper(forward_k, checkpoint_activations_microbatch)
         input_tensor_grad = backward_step_helper(backward_k)
         return output_tensor, input_tensor_grad
@@ -1331,7 +1364,7 @@ def forward_backward_pipelining_with_interleaving(
                 bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
         else:  # No p2p overlap.
             # TODO: The new A2A hiding block goes here.
-            if config.concurrent_execution_based_a2a_hiding:
+            if config.combined_1f1b:
                 output_tensor, input_tensor_grad = forward_backward_step_helper(
                     forward_k, backward_k, checkpoint_activations_microbatch
                 )
