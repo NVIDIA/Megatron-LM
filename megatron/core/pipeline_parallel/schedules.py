@@ -437,27 +437,34 @@ def combined_forward_backward_step(
     """
     This function is used to perform concurrent forward and backward passes.
     """
-    # TODO: Implement submodel-based call of forward and backward steps
-    parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
-    forward_output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            forward_model_chunk,
-            num_microbatches,
-            forward_input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            checkpoint_activations_microbatch,
-            is_first_microbatch,
-            current_microbatch=forward_current_microbatch,
-            encoder_decoder_xattn=encoder_decoder_xattn,
+    if config.combined_1f1b_recipe == 'golden':
+        # print_rank_0(f"[YOUNGEUNK] golden recipe")
+        parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
+        forward_output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                forward_model_chunk,
+                num_microbatches,
+                forward_input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                checkpoint_activations_microbatch,
+                is_first_microbatch,
+                current_microbatch=forward_current_microbatch,
+                encoder_decoder_xattn=encoder_decoder_xattn,
+            )
+        
+        parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
+        backward_input_tensor_grad = backward_step(
+            backward_input_tensor, backward_output_tensor, backward_output_tensor_grad, model_type, config
         )
-    
-    parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
-    backward_input_tensor_grad = backward_step(
-        backward_input_tensor, backward_output_tensor, backward_output_tensor_grad, model_type, config
-    )
+    elif config.combined_1f1b_recipe == 'a2a':
+        # TODO: Implement submodel-based call of forward and backward steps
+        # print_rank_0(f"[YOUNGEUNK] a2a recipe")
+        pass
+    else:
+        raise ValueError(f"Invalid combined 1F1B recipe: {config.combined_1f1b_recipe}")
     return forward_output_tensor, num_tokens, backward_input_tensor_grad
 
 def check_first_val_step(first_val_step, forward_only, cond):
@@ -740,7 +747,6 @@ def forward_backward_pipelining_with_interleaving(
         raise RuntimeError(msg)
     
     if config.combined_1f1b:
-        assert config.combined_1f1b_recipe == 'a2a', "Only a2a recipe is supported for combined 1F1B"
         assert config.overlap_p2p_comm == False, "Overlap p2p communication should be disabled for combined 1F1B"
 
     model_type = get_model_type(model[0])
