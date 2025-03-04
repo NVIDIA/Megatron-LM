@@ -257,8 +257,6 @@ def save_checkpoint(queue: mp.Queue, args):
                 f"model.layers.{i_layer}.feedforward_layernorm.weight": message[
                     "post norm weight"
                 ],
-                f"model.layers.{i_layer}.mlp.gate_proj.weight": message["mlp l0 weight W"],
-                f"model.layers.{i_layer}.mlp.up_proj.weight": message["mlp l0 weight V"],
                 f"model.layers.{i_layer}.self_attn.o_proj.weight": message["dense weight"],
                 f"model.layers.{i_layer}.mlp.down_proj.weight": message["mlp l1 weight"]
             }

@@ -216,7 +216,7 @@ else
 		cd $MEGATRON_PATH
 		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
 		torchrun scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=$ITERATION --ckpt-convert-save=\\\$TORCH_NODIST_PATH
-		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=swissai_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
+		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
 	else
@@ -243,7 +243,7 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=06:00:00
+#SBATCH --time=01:00:00
 #SBATCH --exclusive
 
 # Step 0: Some useful logs.
