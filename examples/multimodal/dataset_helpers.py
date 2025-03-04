@@ -326,13 +326,17 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         assert not self.is_packing_enabled, error_msg
         encoded_samples = []
         current_length = 0
-        for sample in samples.samples:
-            encoded_sample = self.encode_llava_sft(sample, truncate_for_sample_list_packing=True)
-            if current_length + encoded_sample.total_len > self.packing_seq_length:
-                break
-            else:
-                encoded_samples.append(encoded_sample)
-                current_length += encoded_sample.total_len
+        for idx, sample in enumerate(samples.samples):
+            try:
+                encoded_sample = self.encode_llava_sft(sample, truncate_for_sample_list_packing=True)
+                if current_length + encoded_sample.total_len > self.packing_seq_length:
+                    print(f"Encoding list of samples: stopped at {idx+1} samples to stick to {self.packing_seq_length}. Last sample key: {sample.__key__}")
+                    break
+                else:
+                    encoded_samples.append(encoded_sample)
+                    current_length += encoded_sample.total_len
+            except Exception as e:
+                print(e)
         return self.pack_selected_samples(encoded_samples)
 
     def encode_llava_sft(self, sample: Union[SimilarityInterleavedSample, OfflineTargetAspectRatioSample], truncate_for_sample_list_packing=False):
