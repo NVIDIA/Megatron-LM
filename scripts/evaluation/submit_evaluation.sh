@@ -7,7 +7,7 @@ DEF_CONTAINER_PATH=/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt
 DEF_ACCOUNT=a-a06
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
-ITERATION=latest
+ITERATIONS=(latest)
 TASKS=scripts/evaluation/swissai_eval
 LIMIT=null
 BS=1
@@ -39,8 +39,8 @@ usage () {
 	echo "  --tp (int>0): Target TP size for inference. Ignored if --size is set, required otherwise."
 	echo "  --pp (int>0): Target PP size for inference. Ignored if --size is set, required otherwise."
 	echo "  --bs (int>0): Batch size used for inference (default=$BS)."
-	echo "  --iteration (int>0 | 'latest'): What iteration to evaluate (default=$ITERATION)"
-	echo "  --revision: Only used when input is HF checkpoint. Sets the HF revision."
+	echo "  --iterations (int>0 | 'latest'): Comma-separated list of iteration to evaluate (default=$ITERATIONS)"
+	echo "  --revisions: Only used when input is HF checkpoint. Comma-sperated list of HF revisions to try. Must be the same length as --iterations"
 	echo "  --tokens-per-iter (int>0): If specified with --iteration, the total consumed_tokens will be calculated by iteration*tokens_per_iter. Cannot be specified if consumed_tokens is also specified"
 	echo "  --consumed-tokens (int>0): When --iteration or --tokens-per-iter are not set, you need to specify this to set the total number of tokens the checkpoint has seen up to now."
 	echo "  --wandb-project"
@@ -109,10 +109,10 @@ while [[ $# -gt 0 ]]; do
 			NAME=$2; shift 2;;
 		--convert-to-hf)
 			CONVERT_TO_HF=true; shift;;
-		--iteration)
-			ITERATION=$2; shift 2;;
-		--revision)
-			REVISION=$2; shift 2;;
+		--iterations)
+			IFS=',' read -ra ITERATIONS <<< "$2"; shift 2;;
+		--revisions)
+			IFS=',' read -ra REVISIONS <<< "$2"; shift 2;;
 		--tokens-per-iter)
 			TOKENS_PER_ITER=$2; shift 2;;
 		--consumed-tokens)
@@ -157,13 +157,17 @@ fi
 if [ $LIMIT != null ]; then
 	LIMIT_ARGS="--limit=$LIMIT"
 fi
-if [ $ITERATION = latest ]; then
-	if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
-		ITERATION=$(cat $CHECKPOINT_PATH/latest_checkpointed_iteration.txt)
-	else
-		ITERATION=1
+
+# Handle "latest" in iterations
+for i in "${!ITERATIONS[@]}"; do
+	if [ "${ITERATIONS[$i]}" = "latest" ]; then
+		if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
+			ITERATIONS[$i]=$(cat $CHECKPOINT_PATH/latest_checkpointed_iteration.txt)
+		else
+			ITERATIONS[$i]=1
+		fi
 	fi
-fi
+done
 
 # Determine the CONSUMED_TOKENS.
 if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
@@ -176,7 +180,7 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ]; then
 		echo When using megatron checkpoints, you cannot set --consumed-tokens, please set --tokens-per-iter instead >&2
 		exit 1
 	fi
-	CONSUMED_TOKENS=$((ITERATION*TOKENS_PER_ITER))
+	CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
 else
 	# The huggingface checkpoints can get CONSUMED_TOKENS either by --tokens-per-iter or --consumed-tokens
 	if [ -z ${CONSUMED_TOKENS+x} ]; then
@@ -184,7 +188,7 @@ else
 			echo Neither of --consumed-tokens or --tokens-per-iter set, aborting >&2
 			exit 1
 		fi
-		CONSUMED_TOKENS=$((ITERATION*TOKENS_PER_ITER))
+		CONSUMED_TOKENS="\\\$((IT*$TOKENS_PER_ITER))"
 	fi
 fi
 
@@ -203,7 +207,7 @@ if [ ! -z ${WANDB_ENTITY+x} ] || [ ! -z ${WANDB_PROJECT+x} ] || [ ! -z ${WANDB_I
 		echo "Either all --wandb-entity, --wandb-project and --wandb-id should be set, or none" >&2
 		exit 1
 	fi
-	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=$ITERATION,consumed_tokens=$CONSUMED_TOKENS"
+	WANDB_ARGS="--wandb_args entity=$WANDB_ENTITY,project=$WANDB_PROJECT,id=$WANDB_ID,resume=allow,step=\\\$IT,consumed_tokens=\\\$CONSUMED_TOKENS"
 	read -r -d '' WANDB_COMMAND <<- EOM
 	# Wandb sync just in case wandb died in lm-harness.
 	for path in $WANDB_DIR/wandb/run-*-$WANDB_ID; do
@@ -222,6 +226,10 @@ ENDPOINT_PORT=5000
 
 COMMON_EVAL_ARGS="--trust_remote_code --batch_size=$BS --tasks=$TASKS --output=$EVAL_DIR/eval_\$SLURM_JOBID $LIMIT_ARGS $WANDB_ARGS"
 if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF != true ]; then
+	if [ ${#ITERATIONS[@]} -ge 1 ]; then
+		echo Non converted megatron checkpoints only support a single iteration. >&2
+	fi
+
 	echo Megatron checkpoint detected!
 	echo "WARNING! No conversion to HF will be done. Please specify HF implementation if available, otherwise evaluation will be slower."
 	WORLD_SIZE=$(($TP*PP))
@@ -232,7 +240,7 @@ if [ -f $CHECKPOINT_PATH/latest_checkpointed_iteration.txt ] && [ $CONVERT_TO_HF
 	read -r -d '' CMD_SERVER <<- EOM
 	# Launch inference endpoint.
 	echo Spinning inference endpoint
-	torchrun --nproc-per-node=$WORLD_SIZE --master-addr=localhost --master-port=$(($ENDPOINT_PORT + 1000)) tools/run_text_generation_server.py --tensor-model-parallel-size=$TP --pipeline-model-parallel-size=$PP --use-checkpoint-args --load=$CHECKPOINT_PATH --bf16 --micro-batch-size=$BS --max-batch-size=$BS --tokenizer-type=HuggingFaceTokenizer --tokenizer-model=$TOKENIZER --seed=42 --port=$ENDPOINT_PORT --ckpt-step=$ITERATION --finetune --max-tokens-to-oom=4194304 &
+	torchrun --nproc-per-node=$WORLD_SIZE --master-addr=localhost --master-port=$(($ENDPOINT_PORT + 1000)) tools/run_text_generation_server.py --tensor-model-parallel-size=$TP --pipeline-model-parallel-size=$PP --use-checkpoint-args --load=$CHECKPOINT_PATH --bf16 --micro-batch-size=$BS --max-batch-size=$BS --tokenizer-type=HuggingFaceTokenizer --tokenizer-model=$TOKENIZER --seed=42 --port=$ENDPOINT_PORT --ckpt-step=${ITERATIONS[0]} --finetune --max-tokens-to-oom=4194304 &
 
 	EOM
 	CMD_EVAL="WANDB_RESUME=allow lm_eval --model=local-completions --model_args=base_url=http://localhost:5000/completions,tokenized_requests=False,tokenizer=$TOKENIZER,num_concurrent=0,timeout=43200,max_retries=1,max_length=4096 $COMMON_EVAL_ARGS"
@@ -245,20 +253,45 @@ else
 		# Convert from megatron to HF.
 		cd $MEGATRON_PATH
 		export PYTHONPATH=$MEGATRON_PATH:\\\$PYTHONPATH
-		torchrun scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=$ITERATION --ckpt-convert-save=\\\$TORCH_NODIST_PATH
+		torchrun scripts/conversion/torchdist_2_torch.py --bf16 --load=$CHECKPOINT_PATH --ckpt-step=\\\$IT --ckpt-convert-save=\\\$TORCH_NODIST_PATH
 		python tools/checkpoint/convert.py --model-type=GPT --loader=core --saver=llama_hf --load-dir=\\\$TORCH_NODIST_PATH/torch --save-dir=\\\$HF_TEMP_PATH --hf-tokenizer=$TOKENIZER
 		EOM
 		HF_CHECKPOINT_PATH=\\\$HF_TEMP_PATH
 	else
 		echo Huggingface checkpoint detected!
 		HF_CHECKPOINT_PATH=$CHECKPOINT_PATH
-		if [ ! -z ${REVISION+x} ]; then
-			MAYBE_REVISION=",revision=$REVISION"
+		if [ ! -z ${REVISIONS+x} ]; then
+			MAYBE_REVISION=",revision=\\\$REVISION"
+			MAYBE_REVISION_CMD="REVISIONS=(${REVISIONS[@]})"
+			MAYBE_GRAB_REVISION="REVISION=\\\${REVISIONS[\\\$i]}"
 		fi
 	fi
 
 	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION $COMMON_EVAL_ARGS"
 fi
+
+# The big loop.
+read -r -d '' CMD_LOOP <<- EOM
+ITERATIONS=(${ITERATIONS[@]})
+$MAYBE_REVISION_CMD
+for (( i=0; i<\\\${#ITERATIONS[@]}; i++ ));
+do
+	rm -rf \\\$HF_TEMP_PATH
+	mkdir \\\$HF_TEMP_PATH
+	rm -rf \\\$TORCH_NODIST_PATH
+	mkdir \\\$TORCH_NODIST_PATH
+
+	IT=\\\${ITERATIONS[\\\$i]}
+	$MAYBE_GRAB_REVISION
+	CONSUMED_TOKENS=$CONSUMED_TOKENS
+
+	$CMD_CONVERT
+	$CMD_SERVER
+	cd $MEGATRON_PATH
+	$CMD_EVAL
+done
+EOM
+
 
 # Now let's prepare the sbatch.
 cat > $SBATCH_PATH <<- EOM
@@ -273,7 +306,7 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
 
@@ -312,12 +345,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	cd lm-evaluation-harness
 	python -m pip install -e .[api]
 
-	$CMD_CONVERT
-	$CMD_SERVER
-
-	# Launch eval.
-	cd $MEGATRON_PATH
-	$CMD_EVAL
+	$CMD_LOOP
 
 	$WANDB_COMMAND
 "

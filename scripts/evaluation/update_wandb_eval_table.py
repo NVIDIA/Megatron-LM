@@ -33,6 +33,8 @@ def main(entity: str, project: str, runid: str, groups: list[str]):
     tasks = defaultdict(list)
     tasks_maybe_stranded = defaultdict(lambda: defaultdict(list))
     for col in names:
+        if col == "OptimizerStep":
+            continue
         task, metric = col.split("/")
         belongs_here = "stderr" not in metric and metric != "acc_norm"
 
@@ -50,7 +52,7 @@ def main(entity: str, project: str, runid: str, groups: list[str]):
             tasks[task].append(metric)
 
     # Build metrics row.
-    data = {"ConsumedTokens": last_step}
+    data = {"ConsumedTokens": last_step, "OptimizerStep": last_row["OptimizerStep"]}
     for task, metrics in tasks.items():
         for metric in metrics:
             data[f"{task}/{metric}"] = last_row[f"{task}/{metric}"]
