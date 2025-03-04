@@ -310,6 +310,9 @@ class ModelParallelConfig:
     combined_1f1b: bool = False
     """If true, use combined 1F1B for communication hiding."""
 
+    combined_1f1b_recipe: str = 'a2a'
+    """Recipe to use for combined 1F1B. Currently only 'a2a' is supported."""
+
     ###################
     # CPU Offloading
     ###################

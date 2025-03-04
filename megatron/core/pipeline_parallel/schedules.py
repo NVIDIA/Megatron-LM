@@ -281,7 +281,7 @@ def forward_step(
             # print_rank_0(f"[YOUNGEUNK] data_iterator: {data_iterator}")
             # print_rank_0(f"[YOUNGEUNK] Type of data_iterator: {type(data_iterator)}")
             # print_rank_0(f"[YOUNGEUNK] data_iterator attributes: {dir(data_iterator)}")
-            # print_rank_0(f"[YOUNGEUNK] model: {model}")
+            print_rank_0(f"[YOUNGEUNK] model: {model}")
             output_tensor, loss_func = forward_step_func(data_iterator, model)
         else:
             print_rank_0(f"[YOUNGEUNK] forward_step_func [else]")
@@ -711,7 +711,11 @@ def forward_backward_pipelining_with_interleaving(
         msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
         msg += 'and reduces throughput.'
         raise RuntimeError(msg)
-
+    
+    if config.combined_1f1b:
+        assert config.combined_1f1b_recipe == 'a2a', "Only a2a recipe is supported for combined 1F1B"
+        assert config.overlap_p2p_comm == False, "Overlap p2p communication should be disabled for combined 1F1B"
+        
     model_type = get_model_type(model[0])
     if model_type == ModelType.encoder_and_decoder:
         raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
@@ -758,6 +762,7 @@ def forward_backward_pipelining_with_interleaving(
     print_rank_0(
         f"[YOUNGEUNK] config.combined_1f1b: {config.combined_1f1b}"
     )
+    print_rank_0(f"[YOUNGEUNK] config.combined_1f1b_recipe: {config.combined_1f1b_recipe}")
     print_rank_0(f"[YOUNGEUNK] config.overlap_p2p_comm: {config.overlap_p2p_comm}")
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.

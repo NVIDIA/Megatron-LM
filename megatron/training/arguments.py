@@ -507,8 +507,13 @@ def validate_args(args, defaults={}):
             'combined 1F1B is only supported with pipeline model parallelism'
         assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
             'virtual pipeline parallel should be enabled for combined 1F1B'
-        assert args.overlap_p2p_comm == False, \
-            'overlap p2p communication should be disabled for combined 1F1B'
+        if args.overlap_p2p_comm:
+            # Combined 1F1B overlaps also overlaps p2p communication, 
+            # however, it uses the code path of args.overlap_p2p_comm == False
+            args.overlap_p2p_comm = False
+        if args.combined_1f1b_recipe == 'a2a':
+            assert args.expert_model_parallel_size > 1, \
+                'Combined 1f1b recipe a2a is only supported with expert model parallelism'
 
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
