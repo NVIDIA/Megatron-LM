@@ -308,16 +308,15 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	git checkout swissai-model
 	python -m pip install -e .
 	cd ..
-	#git clone https://github.com/AleHD/lm-evaluation-harness.git
-	#cd lm-evaluation-harness
-	#python -m pip install -e .[api]
-	cd /capstor/store/cscs/swissai/a06/users/ahernnde/workspace/lm-evaluation-harness/
+	git clone https://github.com/AleHD/lm-evaluation-harness.git
+	cd lm-evaluation-harness
 	python -m pip install -e .[api]
 
 	$CMD_CONVERT
 	$CMD_SERVER
 
 	# Launch eval.
+	cd $MEGATRON_PATH
 	$CMD_EVAL
 
 	$WANDB_COMMAND
