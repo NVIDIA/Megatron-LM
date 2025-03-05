@@ -11,12 +11,21 @@ from megatron.core.parallel_state import (
 )
 
 from .utils import VocabUtility
+from megatron.core.transformer.moe.moe_utils import save_to_aux_losses_tracker
 
 
 class VocabParallelCrossEntropy:
     """
     Computes the Cross Entropy Loss splitting the Vocab size across tensor parallel
-    ranks. This implementation is used in both fused and unfused cross entropy implementations
+    ranks. This implementation is used in both fused and unfused cross entropy implementations.
+    From T5X (https://github.com/google-research/t5x/blob/main/t5x/losses.py):
+    If z_loss_weight >= 0, then an auxiliary loss equal to z_loss_weight*log(z)^2
+    will be added to the cross entropy loss (z = softmax normalization constant).
+    This z loss is also encouraged in https://arxiv.org/abs/2309.14322.
+    The two uses of z_loss are:
+    1. To keep the logits from drifting too far from zero, which can cause
+        unacceptable roundoff errors in bfloat16.
+    2. To encourage the logits to be normalized log-probabilities.
     """
 
     @staticmethod
@@ -70,16 +79,17 @@ class VocabParallelCrossEntropy:
     @staticmethod
     def calculate_cross_entropy_loss(
         exp_logits: torch.Tensor, predicted_logits: torch.Tensor, sum_exp_logits: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Calculates cross entropy loss."""
 
         # Loss = log(sum(exp(logits))) - predicted-logit.
-        loss = torch.log(sum_exp_logits) - predicted_logits
+        log_sum_exp_logits = torch.log(sum_exp_logits)
+        loss = log_sum_exp_logits - predicted_logits
 
         # Normalize and optionally smooth logits
         exp_logits.div_(sum_exp_logits.unsqueeze(dim=-1))
 
-        return exp_logits, loss
+        return exp_logits, loss, log_sum_exp_logits
 
     @staticmethod
     def prepare_gradient_calculation_operands(
@@ -121,7 +131,7 @@ class VocabParallelCrossEntropy:
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, label_smoothing=0.0):
+    def forward(ctx, vocab_parallel_logits, target, label_smoothing=0.0, z_loss_weight=None):
         """Vocab parallel cross entropy forward function."""
 
         vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
@@ -156,10 +166,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             op=torch.distributed.ReduceOp.SUM,
             group=get_tensor_model_parallel_group(),
         )
-
-        exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
-            exp_logits, predicted_logits, sum_exp_logits
-        )
+        
+        exp_logits, loss, log_sum_exp_logits = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
+            exp_logits, predicted_logits, sum_exp_logits)
 
         vocab_size = exp_logits.size(-1)
         if label_smoothing > 0:
@@ -181,10 +190,24 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             mean_log_probs = log_probs.mean(dim=-1)
             loss = (1.0 - smoothing) * loss - smoothing * mean_log_probs
 
-        ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
+        log_z = None
+        if z_loss_weight is not None:
+            # before computing the actual loss for backprop (with added zloss),
+            # we store the original cross-entropy loss for logging purposes
+            save_to_aux_losses_tracker("ce-loss", torch.mean(loss),
+                            1, 1, reduce_pp=False)
+            # z_loss = 10^(-4) * log(Z)^2
+            log_z = log_sum_exp_logits + logits_max
+            z_loss = torch.square(log_z)
+            save_to_aux_losses_tracker("z-loss", torch.mean(z_loss),
+                                       1, 1, reduce_pp=False)
+            loss = loss + z_loss_weight * z_loss
 
-        # Store softmax, target-mask and masked-target for backward pass.
-        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)
+        ctx.label_smoothing, ctx.vocab_size, ctx.z_loss_weight = (
+            label_smoothing, vocab_size, z_loss_weight)
+
+        # Store softmax, target-mask, masked-target, and log_z for backward pass.
+        ctx.save_for_backward(exp_logits, target_mask, masked_target_1d, log_z)
 
         return loss
 
@@ -193,12 +216,21 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         """Vocab parallel cross entropy backward function."""
 
         # Retreive tensors from the forward path.
-        softmax, target_mask, masked_target_1d = ctx.saved_tensors
-        label_smoothing, vocab_size = ctx.label_smoothing, ctx.vocab_size
+        softmax, target_mask, masked_target_1d, log_z = ctx.saved_tensors
+        label_smoothing, vocab_size, z_loss_weight = (
+            ctx.label_smoothing, ctx.vocab_size, ctx.z_loss_weight)
 
-        (grad_2d, arange_1d, softmax_update, grad_input) = (
-            VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
-        )
+        if z_loss_weight is not None:
+            # z-loss term adds the (2 * z_loss * log_z) factor.
+            softmax *= (1.0 + 2.0 * z_loss_weight * log_z).unsqueeze(-1)
+
+
+        (
+            grad_2d,
+            arange_1d,
+            softmax_update,
+            grad_input,
+        ) = VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
 
         if label_smoothing > 0:
             smoothing = label_smoothing * vocab_size / (vocab_size - 1)
@@ -213,10 +245,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
                 grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
             )
 
-        return grad_input, None, None
+        return grad_input, None, None, None
 
 
-def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0):
+def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=0.0, z_loss_weight=None):
     """
     Performs cross entropy loss when logits are split across tensor parallel ranks
 
@@ -228,5 +260,7 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits, target, label_smoothing=
 
         label_smoothing: smoothing factor, must be in range [0.0, 1.0)
                          default is no smoothing (=0.0)
+        
+        z_loss_weight: weight of the z_loss term, default is 1e-4
     """
-    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing)
+    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing, z_loss_weight)

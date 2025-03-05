@@ -1092,6 +1092,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         moe_loss_scale = 1 / get_num_microbatches()
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
 
+    if args.z_loss_weight is not None:
+        loss_scale = 1 / get_num_microbatches()
+        track_moe_metrics(loss_scale, iteration, writer, wandb_writer, total_loss_dict)
+
     if iteration % args.log_interval == 0:
         if args.record_memory_history and is_last_rank():
             snapshot = torch.cuda.memory._snapshot()

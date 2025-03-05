@@ -545,6 +545,7 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: torch.distributed.ProcessGroup = None,
     avg_group: torch.distributed.ProcessGroup = None,
+    reduce_pp: bool = True,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -566,6 +567,7 @@ def save_to_aux_losses_tracker(
     tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
     tracker[name]["reduce_group"] = reduce_group
     tracker[name]["avg_group"] = avg_group
+    tracker[name]["reduce_pp"] = reduce_pp
 
 
 def clear_aux_losses_tracker():
@@ -583,9 +585,10 @@ def reduce_aux_losses_tracker_across_ranks():
     for name in tracker:
         values = tracker[name]["values"]
         # Collect aux losses across PP.
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        if tracker[name].get('reduce_pp'):
+            torch.distributed.all_reduce(
+                values, group=parallel_state.get_pipeline_model_parallel_group()
+            )
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
@@ -602,7 +605,7 @@ def track_moe_metrics(
     # Aux loss logging
     reduce_aux_losses_tracker_across_ranks()
     tracker = parallel_state.get_moe_layer_wise_logging_tracker()
-    if writer is not None:
+    if writer or wandb_writer:
         aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
         for name, loss_list in aux_losses.items():
             if total_loss_dict is not None:
@@ -611,13 +614,14 @@ def track_moe_metrics(
                 else:
                     total_loss_dict[name] += loss_list.mean()
 
-            # currently when using add_scalars,
-            # torch.utils.add_scalars makes each timer its own run, which
-            # polutes the runs list, so we just add each as a scalar
-            writer.add_scalar(name, loss_list.mean(), iteration)
-            if per_layer_logging:
-                for i, loss in enumerate(loss_list.tolist()):
-                    writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
+            if writer is not None:
+                    # currently when using add_scalars,
+                    # torch.utils.add_scalars makes each timer its own run, which
+                    # polutes the runs list, so we just add each as a scalar
+                    writer.add_scalar(name, loss_list.mean(), iteration)
+                    if per_layer_logging:
+                        for i, loss in enumerate(loss_list.tolist()):
+                            writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
 
             # W&B logging lacks support for logging multiple scalars simultaneously.
             # As a workaround, we log each scalar individually first, then we can create
