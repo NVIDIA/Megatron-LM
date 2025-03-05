@@ -3,6 +3,7 @@ import logging
 from collections import Counter, defaultdict
 from enum import Enum
 from pathlib import Path
+from pathlib_abc import PathBase
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -202,7 +203,7 @@ def validate_integrity_and_strict_load(
 
 
 def verify_checkpoint_and_load_strategy(
-    checkpoint_dir: str,
+    checkpoint_dir: str | PathBase,
     sharded_strategy: Union[LoadShardedStrategy, Tuple[str, int], None] = None,
     common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
 ) -> Tuple[LoadShardedStrategy, LoadCommonStrategy]:
@@ -219,7 +220,9 @@ def verify_checkpoint_and_load_strategy(
             if compatible with the checkpoint content. If None, the default common load strategy
             for the checkpoint backend will be returned.
     """
-    if not Path(checkpoint_dir).exists():
+    if isinstance(checkpoint_dir, str):
+        checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
     saved_config = maybe_load_config(checkpoint_dir)
