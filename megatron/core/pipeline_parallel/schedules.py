@@ -1,6 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
+from functools import partial
 from typing import Iterator, List, Union
 
 import torch
@@ -411,6 +412,44 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     return input_tensor_grad
 
+def combined_forward_backward_core_func(
+    set_forward_virtual_pipeline_model_parallel_rank,
+    forward_model_chunk,
+    forward_step_func,
+    data_iterator,
+    checkpoint_activations_microbatch,
+    set_backward_virtual_pipeline_model_parallel_rank,
+    backward_output_tensor,
+    backward_output_tensor_grad,
+    config            
+):
+    """
+    This function is used to perform concurrent forward and backward passes.
+    """
+    # TODO: write a function that executes merged forward-backward core functions
+    # unwrapped_forward_gpt_model = return_target_submodule(forward_model_chunk, "GPTModel")
+    # CORE FORWARD ===============
+    set_forward_virtual_pipeline_model_parallel_rank()
+    if config.enable_autocast:
+        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+    else:
+        context_manager = contextlib.nullcontext()
+    with context_manager:
+        if checkpoint_activations_microbatch is None:
+            forward_output_tensor, loss_func = forward_step_func(data_iterator, forward_model_chunk)
+        else:
+            forward_output_tensor, loss_func = forward_step_func(
+                data_iterator, forward_model_chunk, checkpoint_activations_microbatch
+            )
+    # CORE BACKWARD ===============
+    set_backward_virtual_pipeline_model_parallel_rank()
+    if config.deallocate_pipeline_outputs:
+        custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
+    else:
+        torch.autograd.backward(backward_output_tensor[0], grad_tensors=backward_output_tensor_grad[0])
+    
+    return forward_output_tensor, loss_func
+                                
 def combined_forward_backward_step(
     # FORWARD ARGUMENTS
     forward_model_chunk_id,
@@ -444,9 +483,12 @@ def combined_forward_backward_step(
         else:
             return return_target_submodule(module.module, target_class_name)
     
+    set_forward_virtual_pipeline_model_parallel_rank = partial(parallel_state.set_virtual_pipeline_model_parallel_rank, forward_model_chunk_id)
+    set_backward_virtual_pipeline_model_parallel_rank = partial(parallel_state.set_virtual_pipeline_model_parallel_rank, backward_model_chunk_id)
+
     if config.combined_1f1b_recipe == 'golden':
         # print_rank_0(f"[YOUNGEUNK] golden recipe")
-        parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
+        set_forward_virtual_pipeline_model_parallel_rank()
         forward_return = forward_step(
                 forward_step_func,
                 data_iterator,
@@ -462,14 +504,14 @@ def combined_forward_backward_step(
                 encoder_decoder_xattn=encoder_decoder_xattn,
             )
         
-        parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
+        set_backward_virtual_pipeline_model_parallel_rank()
         backward_return = backward_step(
             backward_input_tensor, backward_output_tensor, backward_output_tensor_grad, model_type, config
         )
     elif config.combined_1f1b_recipe == 'a2a':
         # TODO: Implement submodel-based call of forward and backward steps
         # setups for forward =========
-        parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
+        set_forward_virtual_pipeline_model_parallel_rank()
         if is_first_microbatch and hasattr(forward_model_chunk, 'set_is_first_microbatch'):
             forward_model_chunk.set_is_first_microbatch()
         if forward_current_microbatch is not None:
@@ -484,7 +526,7 @@ def combined_forward_backward_step(
         set_input_tensor(forward_input_tensor)
         
         # setups for backward =========
-        parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
+        set_backward_virtual_pipeline_model_parallel_rank()
         # Retain the grad on the input_tensor.
         unwrap_backward_input_tensor_grad = False
         if not isinstance(backward_input_tensor, list):
@@ -503,30 +545,21 @@ def combined_forward_backward_step(
         if backward_output_tensor_grad[0] is None and config.grad_scale_func is not None:
             backward_output_tensor[0] = config.grad_scale_func(backward_output_tensor[0])
 
-        # CORE FORWARD ===============
-        # TODO: write a function that executes merged forward-backward core functions
-        # unwrapped_forward_gpt_model = return_target_submodule(forward_model_chunk, "GPTModel")
-        parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
-        if config.enable_autocast:
-            context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
-        else:
-            context_manager = contextlib.nullcontext()
-        with context_manager:
-            if checkpoint_activations_microbatch is None:
-                forward_output_tensor, loss_func = forward_step_func(data_iterator, forward_model_chunk)
-            else:
-                forward_output_tensor, loss_func = forward_step_func(
-                    data_iterator, forward_model_chunk, checkpoint_activations_microbatch
-                )
-        # CORE BACKWARD ===============
-        parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
-        if config.deallocate_pipeline_outputs:
-            custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
-        else:
-            torch.autograd.backward(backward_output_tensor[0], grad_tensors=backward_output_tensor_grad[0])
+        # CORE FORWARD-BACKWARD ===============
+        forward_output_tensor, loss_func = combined_forward_backward_core_func(
+            set_forward_virtual_pipeline_model_parallel_rank,
+            forward_model_chunk,
+            forward_step_func,
+            data_iterator,
+            checkpoint_activations_microbatch,
+            set_backward_virtual_pipeline_model_parallel_rank,
+            backward_output_tensor,
+            backward_output_tensor_grad,
+            config            
+        )
 
         # warpup forward =============
-        parallel_state.set_virtual_pipeline_model_parallel_rank(forward_model_chunk_id)
+        set_forward_virtual_pipeline_model_parallel_rank()
         num_tokens = torch.tensor(0, dtype=torch.int)
         if parallel_state.is_pipeline_last_stage():
             if not collect_non_loss_data:
@@ -571,7 +604,7 @@ def combined_forward_backward_step(
         else:
             forward_return = [forward_output_tensor], num_tokens
         # warpup backward =============
-        parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
+        set_backward_virtual_pipeline_model_parallel_rank()
         # Collect the grad of the input_tensor.
         backward_input_tensor_grad = [None]
         if backward_input_tensor is not None:
