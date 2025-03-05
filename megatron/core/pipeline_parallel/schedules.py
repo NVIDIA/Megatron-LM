@@ -419,6 +419,7 @@ def combined_forward_backward_core_func(
     data_iterator,
     checkpoint_activations_microbatch,
     set_backward_virtual_pipeline_model_parallel_rank,
+    backward_model_chunk,
     backward_output_tensor,
     backward_output_tensor_grad,
     config            
@@ -428,6 +429,7 @@ def combined_forward_backward_core_func(
     """
     # TODO: write a function that executes merged forward-backward core functions
     # unwrapped_forward_gpt_model = return_target_submodule(forward_model_chunk, "GPTModel")
+    # unwrapped_backward_gpt_model = return_target_submodule(backward_model_chunk, "GPTModel")
     # CORE FORWARD ===============
     set_forward_virtual_pipeline_model_parallel_rank()
     if config.enable_autocast:
@@ -553,6 +555,7 @@ def combined_forward_backward_step(
             data_iterator,
             checkpoint_activations_microbatch,
             set_backward_virtual_pipeline_model_parallel_rank,
+            backward_model_chunk,
             backward_output_tensor,
             backward_output_tensor_grad,
             config            
