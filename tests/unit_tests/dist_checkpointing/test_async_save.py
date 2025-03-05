@@ -69,6 +69,7 @@ class TestAsyncSave:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.parametrize('async_save', [False, True])
     @pytest.mark.parametrize('worker_fn', [write_data_os_err_mock_fn])
     def test_errors_are_reported(self, tmp_path_dist_ckpt, async_save, worker_fn):
