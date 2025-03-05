@@ -510,7 +510,7 @@ def combined_forward_backward_step(
         backward_return = backward_step(
             backward_input_tensor, backward_output_tensor, backward_output_tensor_grad, model_type, config
         )
-    elif config.combined_1f1b_recipe == 'a2a':
+    elif config.combined_1f1b_recipe == 'ep_a2a':
         # TODO: Implement submodel-based call of forward and backward steps
         # setups for forward =========
         set_forward_virtual_pipeline_model_parallel_rank()

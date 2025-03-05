@@ -511,9 +511,9 @@ def validate_args(args, defaults={}):
             # Combined 1F1B overlaps also overlaps p2p communication, 
             # however, it uses the code path of args.overlap_p2p_comm == False
             args.overlap_p2p_comm = False
-        if args.combined_1f1b_recipe == 'a2a':
+        if args.combined_1f1b_recipe == 'ep_a2a':
             assert args.expert_model_parallel_size > 1, \
-                'Combined 1f1b recipe a2a is only supported with expert model parallelism'
+                'Combined 1f1b recipe ep_a2a is only supported with expert model parallelism'
 
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
@@ -1885,8 +1885,8 @@ def _add_distributed_args(parser):
                        dest='overlap_p2p_comm_warmup_flush')
     group.add_argument('--combined-1f1b', action='store_true',
                        default=False, help='if set, use combined 1F1B for communication hiding')
-    group.add_argument('--combined-1f1b-recipe', default='a2a',
-                       choices=['a2a', 'golden'],
+    group.add_argument('--combined-1f1b-recipe', default='ep_a2a',
+                       choices=['ep_a2a', 'golden'],
                        help='Target communication to hide with the combined 1F1B.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
