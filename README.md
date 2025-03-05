@@ -13,7 +13,7 @@ Check out our paper at [arxiv](https://arxiv.org/abs/2411.05288).
 
 Run
 ```shell
-VOCAB_PARALLEL=1 VOCAB_SIZE=256k pretrain_gpt.sh
+VOCAB_PARALLEL=1 VOCAB_SIZE=256k bash pretrain_gpt.sh
 ```
 
 This script comes with a dataset with varying vocabulary sizes of 32k, 64k, 128k and 256k. Change the vocabulary size by setting `VOCAB_SIZE` to either `32k`, `64k`, `128k` or `256k`.

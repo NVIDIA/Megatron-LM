@@ -5,6 +5,8 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=8
 
+pip install sentencepiece
+
 DIR=`pwd`
 DATETIME=`date +'date_%y-%m-%d_time_%H-%M-%S'`
 mkdir -p $DIR/logs
@@ -35,7 +37,7 @@ if [ -z "$GPUS_PER_NODE" ]; then
 fi
 
 if [ -z "$EXIT_INTERVAL" ]; then
-  EXIT_INTERVAL=1000
+  EXIT_INTERVAL=30
 fi
 
 WORLD_SIZE_IN_GPUS=$(( $WORLD_SIZE * $GPUS_PER_NODE ))
@@ -106,8 +108,8 @@ options=" \
   --adam-beta2 0.95 \
   --init-method-std 0.006 \
   --no-barrier-with-level-1-timing \
-  --profile-step-start 22 \
-  --profile-step-end 23 \
+  --profile-step-start 17 \
+  --profile-step-end 19 \
   --profile-ranks $profile_ranks \
   --use-flash-attn \
   --sequence-parallel \
