@@ -198,7 +198,7 @@ class RotaryEmbedding(nn.Module):
         if packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.
-            return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
+            return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv).item()
         elif inference_params is not None:
             rotary_seq_len = inference_params.max_sequence_length
         else:
