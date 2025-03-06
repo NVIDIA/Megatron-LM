@@ -179,7 +179,13 @@ class TopKRouter(Router):
 
         if self.training:
             # Apply load balancing loss
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            if self.score_function == "softmax":
+                scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            elif self.score_function == "sigmoid":
+                scores = torch.sigmoid(logits)
+                scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+            else:
+                raise ValueError(f"Unsupported score function: {self.score_function}")
             aux_loss_func = partial(
                 switch_load_balancing_loss_func,
                 probs=scores,
