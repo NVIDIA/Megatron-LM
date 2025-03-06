@@ -2,6 +2,7 @@
 
 import contextlib
 from functools import partial
+import inspect
 from typing import Iterator, List, Union
 
 import torch
@@ -436,6 +437,7 @@ def combined_forward_backward_core_func(
 
     if config.combined_1f1b_recipe == 'ep_a2a':
         # TODO: write a function that executes merged forward-backward core functions
+        forward_gptmodel = return_target_submodule(forward_model_chunk, "GPTModel")
         forward_embedding = return_target_submodule(forward_model_chunk, "LanguageModelEmbedding")
         forward_decoder = return_target_submodule(forward_model_chunk, "TransformerBlock")
         backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")        
@@ -444,7 +446,6 @@ def combined_forward_backward_core_func(
         assert backward_decoder is not None
 
         # data_iterator can be None or DataIterator
-        
         # TODO: decompose forward_step_func and backward_step_func and execute each layers them one by one in a interleaved manner
         # if forward_embedding:
         #   Do the embedding forward
@@ -459,9 +460,25 @@ def combined_forward_backward_core_func(
         # which can be problematic considering integration with the NeMo
         # 3. Not sure if I can assume that the GPTModel is always composed of (embedding) + decoder
 
-        # Following part is just temporary =====
-        forward_output_tensor, loss_func = forward_step_func(*forward_inputs)
+        # Temporary implementaion ignoring the concerns above
+        # tokens, labels, loss_mask, attention_mask, position_ids = megatron.pretrain_gpt.get_batch(data_iterator)
+        # forward_output_tensor = forward_model_chunk(tokens, position_ids, attention_mask, labels=labels)
+        # custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
+        forward_step_func_module = inspect.getmodule(forward_step_func)
+        assert hasattr(forward_step_func_module, 'get_batch'), "combined_forward_backward_core_func: assumes that forward_step_func has get_batch()"
+        assert hasattr(forward_step_func_module, 'loss_func'), "combined_forward_backward_core_func: assumes that forward_step_func has loss_func()"
+        # extract get_batch function from the module
+        get_batch_func = forward_step_func_module.get_batch
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
+
+        loss_func = partial(forward_step_func_module.loss_func, loss_mask)
+
+        forward_output_tensor = forward_gptmodel(tokens, position_ids, attention_mask, labels=labels)
         custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
+
+        # Following part is just temporary =====
+        # forward_output_tensor, loss_func = forward_step_func(*forward_inputs)
+        # custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
         # ======================================
     else:
         raise NotImplementedError(f"combined_forward_backward_core_func for recipe:{config.combined_1f1b_recipe} is not implemented")
