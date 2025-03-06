@@ -453,6 +453,12 @@ def combined_forward_backward_core_func(
         # if backward_embedding:
         #   Do the embedding backward
 
+        # CONCERNS
+        # 1. forward_step_func is a function that contains get_batch() and the model() calls it could be dangerous to assume that will not change forever
+        # 2. Even if I assume it is fixed forever, there still is a problem that get_batch() function is implemented outside of mcore, 
+        # which can be problematic considering integration with the NeMo
+        # 3. Not sure if I can assume that the GPTModel is always composed of (embedding) + decoder
+
         # Following part is just temporary =====
         forward_output_tensor, loss_func = forward_step_func(*forward_inputs)
         custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
