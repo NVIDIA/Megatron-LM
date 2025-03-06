@@ -1322,7 +1322,7 @@ try:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
-        if is_te_min_version("1.11.0", check_equality=False):
+        if is_te_min_version("1.12.0", check_equality=True):
             return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens, cp_size, cp_rank)
         else:
             return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens)
