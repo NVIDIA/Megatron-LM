@@ -2020,7 +2020,8 @@ def _add_tokenizer_args(parser):
                                 'Llama2Tokenizer',
                                 'TikTokenizer',
                                 'MultimodalTokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer',
+                                'NullMultimodalTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')

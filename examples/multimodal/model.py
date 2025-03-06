@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 import warnings
+import logging
 from copy import deepcopy
 
 import torch
@@ -10,6 +11,7 @@ from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.core.utils import log_single_rank
 
 
 def model_provider(
@@ -48,8 +50,10 @@ def model_provider(
     )
     old_seq_length = args.seq_length
     args.seq_length = args.encoder_seq_length = num_image_embeddings
-    if torch.distributed.get_rank() == 0 and old_seq_length != args.seq_length:
-        warnings.warn(
+    if old_seq_length != args.seq_length:
+        log_single_rank(
+            logging.getLogger(__name__),
+            logging.WARNING,
             f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
         )
 
