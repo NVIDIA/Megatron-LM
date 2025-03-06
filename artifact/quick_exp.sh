@@ -2,7 +2,7 @@
 
 LOCAL_GPU_NUM=$(nvidia-smi --list-gpus | wc -l)
 
-export EXIT_INTERVAL=20
+export EXIT_INTERVAL=10
 export LOG_INTERVAL=1
 # disable timer for schedule
 export SCHEDULE_TIMER_START=1000
@@ -24,9 +24,18 @@ export VOCAB_SIZE=256k
 
 export IMM_SIZE=12288
 export GLOBAL_BATCH_SIZE=128
-# export GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 3 * $MICRO_BATCH_SIZE ))
 
-export LOGS_DIR='./8g-logs'
+export LOGS_DIR='./quick-logs'
+
+B=${GLOBAL_BATCH_SIZE}
+S=${SEQ_LENGTH}
+H=${HIDDEN_SIZE}
+FH=${IMM_SIZE}
+V=256000
+L=${LAYERS}
+FLOP=$(( 3 * (2*$B*$S*$H*$V + $L * (8*$B*$S*$H*$H + 4*$B*$S*$S*$H + 4*$B*$S*$H*$FH)) ))
+export TFLOP_PER_DEVICE=$(( $FLOP / 1000000000000 / $PIPELINE_SIZE ))
+export DEVICE_TFLOPS=312
 
 print_help() {
     echo "Usage: quick_exp.sh run [baseline|redis|interlaced|vocab-1|vocab-2] or quick_exp.sh show-result"
@@ -49,7 +58,8 @@ extract_memory() {
     fi
 
     # Extract all memory values
-    local memory_values=($(grep "memory (MB)" "$log_file" | grep -o "max allocated: [0-9.]\+" | awk '{print $3}'))
+    local memory_values=($(grep "memory (MB)" "$log_file" | grep -o "max reserved: [0-9.]\+" | awk '{print $3}'))
+    # local memory_values=($(grep "memory (MB)" "$log_file" | grep -o "max allocated: [0-9.]\+" | awk '{print $3}'))
     
     # Check if number of values matches PIPELINE_SIZE
     if [ ${#memory_values[@]} -ne $PIPELINE_SIZE ]; then
@@ -58,10 +68,11 @@ extract_memory() {
     fi
 
     # Print all memory values
-    echo "Memory values:"
-    for i in "${!memory_values[@]}"; do
-        echo "GPU $i: ${memory_values[$i]} MB"
-    done
+    if [ ! -z "${DEBUG}" ]; then
+        for i in "${!memory_values[@]}"; do
+            echo "GPU Mem: ${memory_values[$i]} MB"
+        done
+    fi
 
     # Find min and max
     local min=${memory_values[0]}
@@ -76,7 +87,9 @@ extract_memory() {
         fi
     done
 
-    echo "Min: $min, Max: $max"
+    # echo "Min: $min, Max: $max"
+    local peak_mem_gb=$(awk "BEGIN {print $max/1024}")
+    echo "Peak Memory: ${peak_mem_gb} GB"
 }
 
 extract_time() {
@@ -88,22 +101,28 @@ extract_time() {
         return 1
     fi
 
-    # Extract iteration time for iteration 20
-    local time_value=$(grep "iteration.*20/" "$log_file" | grep -o "elapsed time per iteration (ms): [0-9.]\+" | awk '{print $NF}')
+    # Extract iteration time for iteration 10
+    local time_value=$(grep "iteration.*10/" "$log_file" | grep -o "elapsed time per iteration (ms): [0-9.]\+" | awk '{print $NF}')
     
     if [ -z "$time_value" ]; then
-        echo "Error: Could not find iteration 20 timing information"
+        echo "Error: Could not find iteration 10 timing information"
         return 1
     fi
 
-    echo "Iteration time: ${time_value} ms"
+    TFLOPS=$(awk "BEGIN {print $TFLOP_PER_DEVICE / ($time_value / 1000)}")
+    if [ ! -z "${DEBUG}" ]; then
+        echo "Iteration time: ${time_value} ms"
+        echo "TFLOPS ${TFLOPS}"
+    fi
+    MFU=$(awk "BEGIN {print $TFLOPS / $DEVICE_TFLOPS }")
+    echo "MFU: $(awk "BEGIN {print $MFU * 100}") %"
 }
 
 show_results() {
     # Show results from logs directory
     for method in baseline redis interlaced vocab-1 vocab-2; do
         if [ -f "${LOGS_DIR}/${method}/stdout.log" ]; then
-            echo "=== Results for ${method} ==="
+            echo "Method: ${method}"
             extract_memory "$method"
             extract_time "$method"
             echo

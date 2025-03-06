@@ -2,7 +2,7 @@
 
 LOCAL_GPU_NUM=$(nvidia-smi --list-gpus | wc -l)
 
-export EXIT_INTERVAL=20
+export EXIT_INTERVAL=10
 export LOG_INTERVAL=1
 # disable timer for schedule
 export SCHEDULE_TIMER_START=1000
@@ -24,7 +24,7 @@ EXP_SETTING_FILE=$1
 
 while read -r line; do
     # csv column header: Name	B	s	h	v	l	imm	heads	dp	pp	tp	layers_last	micro_bs	method
-    echo $line
+    # echo $line
     name=$(echo $line | cut -d ',' -f 1)
     if [ -z "$name" ]; then
         continue
@@ -78,6 +78,10 @@ while read -r line; do
     export RUN_NAME=${AIP_RUN_NAME}
 
     mkdir -p "${LOGS_DIR}/${RUN_NAME}"
+    if [ -f "${LOGS_DIR}/${RUN_NAME}/stdout.log" ] && grep -q "iteration.*10/" "${LOGS_DIR}/${RUN_NAME}/stdout.log"; then
+        echo "Skipping ${RUN_NAME} - already completed"
+        continue
+    fi
     echo "running: ${RUN_NAME}"
     bash pretrain_gpt.sh > ${LOGS_DIR}/${RUN_NAME}/stdout.log 2> >(tee ${LOGS_DIR}/${RUN_NAME}/stderr.log >&2)
 done < $1
