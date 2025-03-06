@@ -44,6 +44,35 @@ except:
     _torch_version = PkgVersion("0.0.0")
 _te_version = None
 
+def return_target_submodule(module, target_class_name):
+    """
+    Recursively search for a module of the specified target class name.
+    
+    Args:
+        module: The module to search through
+        target_class_name: Class name to match (string)
+    
+    Returns:
+        The first module instance matching the target class name, or None if not found
+    """
+    # Check if the current module is of the target class
+    if module.__class__.__name__ == target_class_name:
+        return module
+    
+    # Special case for handling DDP and other wrappers with .module attribute
+    if hasattr(module, "module"):
+        found_module = return_target_submodule(module.module, target_class_name)
+        if found_module is not None:
+            return found_module
+    
+    # Check all child modules (this is the key addition)
+    for name, child in module.named_children():
+        found_module = return_target_submodule(child, target_class_name)
+        if found_module is not None:
+            return found_module
+    
+    # Not found anywhere
+    return None
 
 def print_all_ranks(message):
     """If distributed is initialized, print only on rank 0."""

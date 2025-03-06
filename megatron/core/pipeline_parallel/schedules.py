@@ -20,6 +20,7 @@ from megatron.core.utils import (
     get_model_xattn,
     print_rank_0,
     print_rank_i,
+    return_target_submodule,
 )
 
 # Types
@@ -427,28 +428,37 @@ def combined_forward_backward_core_func(
     """
     This function is used to perform concurrent forward and backward passes.
     """
-    # TODO: write a function that executes merged forward-backward core functions
-    # unwrapped_forward_gpt_model = return_target_submodule(forward_model_chunk, "GPTModel")
-    # unwrapped_backward_gpt_model = return_target_submodule(backward_model_chunk, "GPTModel")
-    # CORE FORWARD ===============
     set_forward_virtual_pipeline_model_parallel_rank()
-    if config.enable_autocast:
-        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+    if checkpoint_activations_microbatch is None:
+        forward_inputs = data_iterator, forward_model_chunk
     else:
-        context_manager = contextlib.nullcontext()
-    with context_manager:
-        if checkpoint_activations_microbatch is None:
-            forward_output_tensor, loss_func = forward_step_func(data_iterator, forward_model_chunk)
-        else:
-            forward_output_tensor, loss_func = forward_step_func(
-                data_iterator, forward_model_chunk, checkpoint_activations_microbatch
-            )
-    # CORE BACKWARD ===============
-    set_backward_virtual_pipeline_model_parallel_rank()
-    if config.deallocate_pipeline_outputs:
+        forward_inputs = data_iterator, forward_model_chunk, checkpoint_activations_microbatch
+
+    if config.combined_1f1b_recipe == 'ep_a2a':
+        # TODO: write a function that executes merged forward-backward core functions
+        forward_embedding = return_target_submodule(forward_model_chunk, "LanguageModelEmbedding")
+        forward_decoder = return_target_submodule(forward_model_chunk, "TransformerBlock")
+        backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")        
+        backward_decoder = return_target_submodule(backward_model_chunk, "TransformerBlock")        
+        assert forward_decoder is not None
+        assert backward_decoder is not None
+
+        # data_iterator can be None or DataIterator
+        
+        # TODO: decompose forward_step_func and backward_step_func and execute each layers them one by one in a interleaved manner
+        # if forward_embedding:
+        #   Do the embedding forward
+        # from megatron.core.transformer.transformer_block import combined_1f1b_decoder_computation
+        # forward_outputs, backward_outputs = combined_1f1b_decoder_computation(forward_decoder, forward_inputs, backward_decoders, backward_inputs, overlap_recipe=config.combined_1f1b_recipe)
+        # if backward_embedding:
+        #   Do the embedding backward
+
+        # Following part is just temporary =====
+        forward_output_tensor, loss_func = forward_step_func(*forward_inputs)
         custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
+        # ======================================
     else:
-        torch.autograd.backward(backward_output_tensor[0], grad_tensors=backward_output_tensor_grad[0])
+        raise NotImplementedError(f"combined_forward_backward_core_func for recipe:{config.combined_1f1b_recipe} is not implemented")
     
     return forward_output_tensor, loss_func
                                 
@@ -479,11 +489,6 @@ def combined_forward_backward_step(
     """
     This function is used to perform concurrent forward and backward passes.
     """
-    def return_target_submodule(module, target_class_name):
-        if module.__class__.__name__ == target_class_name:
-            return module
-        else:
-            return return_target_submodule(module.module, target_class_name)
     
     set_forward_virtual_pipeline_model_parallel_rank = partial(parallel_state.set_virtual_pipeline_model_parallel_rank, forward_model_chunk_id)
     set_backward_virtual_pipeline_model_parallel_rank = partial(parallel_state.set_virtual_pipeline_model_parallel_rank, backward_model_chunk_id)
@@ -548,18 +553,24 @@ def combined_forward_backward_step(
             backward_output_tensor[0] = config.grad_scale_func(backward_output_tensor[0])
 
         # CORE FORWARD-BACKWARD ===============
-        forward_output_tensor, loss_func = combined_forward_backward_core_func(
-            set_forward_virtual_pipeline_model_parallel_rank,
-            forward_model_chunk,
-            forward_step_func,
-            data_iterator,
-            checkpoint_activations_microbatch,
-            set_backward_virtual_pipeline_model_parallel_rank,
-            backward_model_chunk,
-            backward_output_tensor,
-            backward_output_tensor_grad,
-            config            
-        )
+        if config.enable_autocast:
+            context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+        else:
+            context_manager = contextlib.nullcontext()
+
+        with context_manager:
+            forward_output_tensor, loss_func = combined_forward_backward_core_func(
+                set_forward_virtual_pipeline_model_parallel_rank,
+                forward_model_chunk,
+                forward_step_func,
+                data_iterator,
+                checkpoint_activations_microbatch,
+                set_backward_virtual_pipeline_model_parallel_rank,
+                backward_model_chunk,
+                backward_output_tensor,
+                backward_output_tensor_grad,
+                config            
+            )
 
         # warpup forward =============
         set_forward_virtual_pipeline_model_parallel_rank()
