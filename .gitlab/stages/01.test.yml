@@ -70,6 +70,7 @@ test:build_image:
         DOCKER_BUILDKIT=1 docker build \
           --secret id=JET_INDEX_URLS \
           --secret id=LOGGER_INDEX_URL \
+          --secret id=EXPERIMENTAL_FLASH_ATTN \
           --target $STAGE \
           -f $FILE \
           -t ${IMAGE}:${CI_PIPELINE_ID} \
@@ -78,11 +79,11 @@ test:build_image:
           --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
           --build-arg MCORE_REF=$CI_COMMIT_SHA \
           --build-arg MCORE_BACKWARDS_REF=$MCORE_BACKWARDS_REF \
-          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
-          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:main \
           --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
           --push \
           ${ADDITIONAL_PARAMS[@]} .
