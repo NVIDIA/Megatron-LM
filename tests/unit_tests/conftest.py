@@ -5,9 +5,29 @@ import pytest
 import torch
 import torch.distributed
 
+from megatron.core import config
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+def pytest_addoption(parser):
+    """
+    Additional command-line arguments passed to pytest.
+    For now:
+        --experimental: Enable the Mcore experimental flag (DEFAULT: False)
+    """
+    parser.addoption(
+        '--experimental',
+        action='store_true',
+        help="pass that argument to enable experimental flag during testing (DEFAULT: False)",
+    )
+
+
+@pytest.fixture(autouse=True)
+def experimental(request):
+    """Simple fixture setting the experimental flag [CPU | GPU]"""
+    config.ENABLE_EXPERIMENTAL = request.config.getoption("--experimental") is True
 
 
 def pytest_sessionfinish(session, exitstatus):
