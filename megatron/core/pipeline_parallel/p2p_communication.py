@@ -190,6 +190,19 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
             tensor_send_next.size(), device=torch.cuda.current_device(), dtype=torch.int64
         )
 
+
+    if config.use_ring_exchange_p2p:
+
+        def _ring_exchange_wrapper(**kwargs):
+            torch.distributed.ring_exchange(**kwargs)
+            return []
+
+        p2p_func = _ring_exchange_wrapper
+    elif config.batch_p2p_comm:
+        p2p_func = _batched_p2p_ops
+    else:
+        p2p_func = _p2p_ops
+        
     if config.use_ring_exchange_p2p:
         torch.distributed.ring_exchange(
             tensor_send_prev=send_prev_shape_tensor,
@@ -198,8 +211,8 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
             tensor_recv_next=recv_next_shape_tensor,
             group=get_pipeline_model_parallel_group(),
         )
-    elif config.batch_p2p_comm:
-        reqs = _batched_p2p_ops(
+    else:
+        reqs = p2p_func(
             tensor_send_prev=send_prev_shape_tensor,
             tensor_recv_prev=recv_prev_shape_tensor,
             tensor_send_next=send_next_shape_tensor,
@@ -210,19 +223,6 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
         )
         if len(reqs) > 0:
             for req in reqs:
-                req.wait()
-    else:
-        reqs = _p2p_ops(
-            tensor_send_prev=send_prev_shape_tensor,
-            tensor_recv_prev=recv_prev_shape_tensor,
-            tensor_send_next=send_next_shape_tensor,
-            tensor_recv_next=recv_next_shape_tensor,
-            group=get_pipeline_model_parallel_group(),
-            prev_pipeline_rank=get_pipeline_model_parallel_prev_rank(),
-            next_pipeline_rank=get_pipeline_model_parallel_next_rank(),
-        )
-        if len(reqs) > 0:
-            for req in reqs.values():
                 req.wait()
 
         # To protect against race condition when using batch_isend_irecv().
