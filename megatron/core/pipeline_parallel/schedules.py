@@ -438,48 +438,67 @@ def combined_forward_backward_core_func(
     if config.combined_1f1b_recipe == 'ep_a2a':
         # TODO: write a function that executes merged forward-backward core functions
         forward_gptmodel = return_target_submodule(forward_model_chunk, "GPTModel")
-        forward_embedding = return_target_submodule(forward_model_chunk, "LanguageModelEmbedding")
-        forward_decoder = return_target_submodule(forward_model_chunk, "TransformerBlock")
         backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")        
         backward_decoder = return_target_submodule(backward_model_chunk, "TransformerBlock")        
-        assert forward_decoder is not None
+        assert forward_gptmodel is not None
         assert backward_decoder is not None
 
         # data_iterator can be None or DataIterator
         # TODO: decompose forward_step_func and backward_step_func and execute each layers them one by one in a interleaved manner
-        # if forward_embedding:
-        #   Do the embedding forward
+        # do pre-decoder forward
         # from megatron.core.transformer.transformer_block import combined_1f1b_decoder_computation
         # forward_outputs, backward_outputs = combined_1f1b_decoder_computation(forward_decoder, forward_inputs, backward_decoders, backward_inputs, overlap_recipe=config.combined_1f1b_recipe)
+        # do post-decoder forward
         # if backward_embedding:
         #   Do the embedding backward
 
         # CONCERNS
         # 1. forward_step_func is a function that contains get_batch() and the model() calls it could be dangerous to assume that will not change forever
-        # 2. Even if I assume it is fixed forever, there still is a problem that get_batch() function is implemented outside of mcore, 
-        # which can be problematic considering integration with the NeMo
+        # 2. NeMo should have the similar structure of forward_step_func() to retrieve get_batch() and loss_func()
         # 3. Not sure if I can assume that the GPTModel is always composed of (embedding) + decoder
 
-        # Temporary implementaion ignoring the concerns above
-        # tokens, labels, loss_mask, attention_mask, position_ids = megatron.pretrain_gpt.get_batch(data_iterator)
-        # forward_output_tensor = forward_model_chunk(tokens, position_ids, attention_mask, labels=labels)
-        # custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
+        # Draft implementation ignoring the concerns above
         forward_step_func_module = inspect.getmodule(forward_step_func)
+        # print_rank_0(f"[YOUNGEUNK] forward_step_func_module: {list(forward_step_func_module.__dict__.keys())}")
         assert hasattr(forward_step_func_module, 'get_batch'), "combined_forward_backward_core_func: assumes that forward_step_func has get_batch()"
         assert hasattr(forward_step_func_module, 'loss_func'), "combined_forward_backward_core_func: assumes that forward_step_func has loss_func()"
+        
         # extract get_batch function from the module
         get_batch_func = forward_step_func_module.get_batch
+        # Data fetching
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
 
-        loss_func = partial(forward_step_func_module.loss_func, loss_mask)
+        # Pre-decoder forward
+        forward_decoder_input, forward_rotary_pos_emb, forward_rotary_pos_cos, forward_rotary_pos_sin, forward_sequence_len_offset = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
 
-        forward_output_tensor = forward_gptmodel(tokens, position_ids, attention_mask, labels=labels)
+        # Decoder forward -> this should be in combined_1f1b_decoder_computation in the future
+        forward_decoder_output = forward_gptmodel.decoder(
+            hidden_states=forward_decoder_input,
+            attention_mask=attention_mask,
+            inference_params=None,
+            rotary_pos_emb=forward_rotary_pos_emb,
+            rotary_pos_cos=forward_rotary_pos_cos,
+            rotary_pos_sin=forward_rotary_pos_sin,
+            packed_seq_params=None,
+            sequence_len_offset=forward_sequence_len_offset,
+        )
+
+        # Post-decoder forward
+        forward_output_tensor = forward_gptmodel.post_decoder_forward(
+            hidden_states=forward_decoder_output,
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=forward_decoder_input,
+            labels=labels,
+        )
+
+        # Backward pass
+        # TODO: decompose backward path into finer-grained calls
         custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
-
-        # Following part is just temporary =====
-        # forward_output_tensor, loss_func = forward_step_func(*forward_inputs)
-        # custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
-        # ======================================
+        
+        # Loss function for return
+        loss_func = partial(forward_step_func_module.loss_func, loss_mask)
     else:
         raise NotImplementedError(f"combined_forward_backward_core_func for recipe:{config.combined_1f1b_recipe} is not implemented")
     

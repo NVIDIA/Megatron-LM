@@ -192,28 +192,18 @@ class GPTModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def forward(
+    def pre_decoder_forward(
         self,
         input_ids: Tensor,
         position_ids: Tensor,
-        attention_mask: Tensor,
         decoder_input: Tensor = None,
-        labels: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
-        runtime_gather_output: Optional[bool] = None,
-    ) -> Tensor:
-        """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
-        processing layer (optional).
-
-        It either returns the Loss values if labels are given  or the final hidden units
-
-        Args:
-            runtime_gather_output (bool): Gather output at runtime. Default None means
-                `parallel_output` arg in the constructor will be used.
+    ):
+        """Prepares the input for the decoder by handling embeddings and positional encodings.
+            This function is for combined 1f1b overlap implementation.
         """
+
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
@@ -259,20 +249,22 @@ class GPTModel(LanguageModule):
             )
         else:
             sequence_len_offset = None
+        
+        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
 
-        # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            **(extra_block_kwargs or {}),
-        )
-
+    def post_decoder_forward(
+        self,
+        hidden_states: Tensor,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        runtime_gather_output: Optional[bool] = None,
+    ):
+        """Processes the decoder output to generate logits and compute loss if needed.
+            This function is for combined 1f1b overlap implementation.
+        """
         if not self.post_process:
             return hidden_states
 
@@ -301,6 +293,53 @@ class GPTModel(LanguageModule):
             return logits.transpose(0, 1).contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
+
+        return loss
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+    ) -> Tensor:
+        """Forward function of the GPT Model This function passes the input tensors
+        through the embedding layer, and then the decoeder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
+        """
+
+        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = self.pre_decoder_forward(
+            input_ids, position_ids, decoder_input, inference_params, packed_seq_params
+        )
+
+        # Run decoder.
+        hidden_states = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            **(extra_block_kwargs or {}),
+        )
+
+        # Post-decoder forward
+        loss = self.post_decoder_forward(
+            hidden_states, input_ids, position_ids, attention_mask, decoder_input, labels, runtime_gather_output
+        )
 
         return loss
 
