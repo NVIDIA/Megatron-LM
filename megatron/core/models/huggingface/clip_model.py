@@ -5,18 +5,18 @@ from transformers import AutoModel
 from megatron.core.models.huggingface import HuggingFaceModule
 
 
-class ClipHuggingFaceModel(HuggingFaceModule):
+class SiglipHuggingFaceModel(HuggingFaceModule):
     """
-    Wrapper for CLIP HuggingFace models
+    Wrapper for Siglip HuggingFace models.
     """
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = AutoModel.from_pretrained(config.huggingface_model_name_or_path)
+        self.model = AutoModel.from_pretrained(config.vision_model_type.split("hf://")[1])
 
     def forward(self, *args, **kwargs):
-        """Forward function"""
+        """Siglip forward."""
         x = self.model(*args, **kwargs)
-        x = x['last_hidden_state']
+        x = x["last_hidden_state"]
 
         return x
