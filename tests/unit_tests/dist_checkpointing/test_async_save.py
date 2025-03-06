@@ -13,7 +13,9 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-def write_data_os_err_mock_fn(local_proc_idx, write_bucket, results_queue, count_queue, use_fsync):
+def write_data_os_err_mock_fn(
+    transform_list, local_proc_idx, write_bucket, results_queue, count_queue, use_fsync
+):
     """Raises an error on worker #2 during storage save"""
     try:
         if local_proc_idx == 2:
