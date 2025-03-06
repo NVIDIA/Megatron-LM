@@ -64,6 +64,18 @@ if [ -z "$EVAL_INTERVAL" ]; then
   EVAL_INTERVAL=10000
 fi
 
+if [ -z "$SCHEDULE_TIMER_START" ]; then
+  SCHEDULE_TIMER_START=10
+fi
+
+if [ -z "$SCHEDULE_TIMER_END" ]; then
+  SCHEDULE_TIMER_END=20
+fi
+
+if [ -z "$LOG_INTERVAL" ]; then
+  LOG_INTERVAL=10
+fi
+
 if [ -z "$TP_SIZE" ]; then
   TP_SIZE=1
 fi
@@ -95,7 +107,7 @@ options=" \
   --lr 6.0e-5 \
   --min-lr 6.0e-6 \
   --lr-decay-style cosine \
-  --log-interval 10 \
+  --log-interval ${LOG_INTERVAL} \
   --eval-iters 40 \
   --eval-interval $EVAL_INTERVAL \
   --data-path ${DATASET} \
@@ -108,9 +120,11 @@ options=" \
   --adam-beta2 0.95 \
   --init-method-std 0.006 \
   --no-barrier-with-level-1-timing \
-  --profile-step-start 17 \
-  --profile-step-end 19 \
+  --profile-step-start 7 \
+  --profile-step-end 8 \
   --profile-ranks $profile_ranks \
+  --schedule-timer-start ${SCHEDULE_TIMER_START} \
+  --schedule-timer-end ${SCHEDULE_TIMER_END} \
   --use-flash-attn \
   --sequence-parallel \
   --untie-embeddings-and-output-weights \

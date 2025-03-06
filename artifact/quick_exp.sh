@@ -1,14 +1,18 @@
 #!/bin/bash
 
-# LOCAL_GPU_NUM=$(nvidia-smi --list-gpus | wc -l)
+LOCAL_GPU_NUM=$(nvidia-smi --list-gpus | wc -l)
 
 export EXIT_INTERVAL=20
+export LOG_INTERVAL=1
+# disable timer for schedule
+export SCHEDULE_TIMER_START=1000
+export SCHEDULE_TIMER_END=1000
 
-export GPUS_PER_NODE=4
-# if [ $LOCAL_GPU_NUM -ne $GPUS_PER_NODE ]; then
-#     echo "Error: Expect 8 GPUs. Found $LOCAL_GPU_NUM"
-#     exit 1
-# fi
+export GPUS_PER_NODE=8
+if [ $LOCAL_GPU_NUM -ne $GPUS_PER_NODE ]; then
+    echo "Error: Expect 8 GPUs. Found $LOCAL_GPU_NUM"
+    exit 1
+fi
 
 export PIPELINE_SIZE=$(( $GPUS_PER_NODE ))
 export LAYERS=32
@@ -22,10 +26,14 @@ export IMM_SIZE=12288
 export GLOBAL_BATCH_SIZE=128
 # export GLOBAL_BATCH_SIZE=$(( $PIPELINE_SIZE * 3 * $MICRO_BATCH_SIZE ))
 
-export LOGS_DIR='./profile-logs'
+export LOGS_DIR='./8g-logs'
+
+print_help() {
+    echo "Usage: quick_exp.sh run [baseline|redis|interlaced|vocab-1|vocab-2] or quick_exp.sh show-result"
+}
 
 if [ -z "$1" ]; then
-    echo "Usage: quick_exp.sh run [baseline|interlaced|vocab-1|vocab-2] or quick_exp.sh show-result"
+    print_help
     exit 1
 fi
 
@@ -93,7 +101,7 @@ extract_time() {
 
 show_results() {
     # Show results from logs directory
-    for method in baseline interlaced vocab-1 vocab-2; do
+    for method in baseline redis interlaced vocab-1 vocab-2; do
         if [ -f "${LOGS_DIR}/${method}/stdout.log" ]; then
             echo "=== Results for ${method} ==="
             extract_memory "$method"
@@ -112,11 +120,12 @@ fi
 
 if [ "$COMMAND" != "run" ]; then
     echo "Invalid command. Use 'run' or 'show-result'"
+    print_help
     exit 1
 fi
 
 if [ -z "$2" ]; then
-    echo "Please specify method: baseline, interlaced, vocab-1, or vocab-2"
+    echo "Please specify method: baseline, redis, interlaced, vocab-1, or vocab-2"
     exit 1
 fi
 
@@ -125,6 +134,10 @@ METHOD=$2
 case "$METHOD" in
     "baseline")
         # Baseline case - no additional exports needed
+        ;;
+    "redis")
+        export ENABLE_LAYER_REDISTRIBUTION=1
+        export FINAL_STAGE_LAYERS=0
         ;;
     "interlaced")
         export VOCAB_PARALLEL=1
@@ -138,7 +151,8 @@ case "$METHOD" in
         export VOCAB_PARALLEL=1
         ;;
     *)
-        echo "Invalid method. Please use: baseline, interlaced, vocab-1, or vocab-2"
+        echo "Invalid method. Please use: baseline, redis, interlaced, vocab-1, or vocab-2"
+        print_help
         exit 1
         ;;
 esac
