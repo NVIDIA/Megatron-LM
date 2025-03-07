@@ -133,6 +133,9 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    z_loss_weight: float = None
+    """Scaling coefficient for the z-loss. A starting value of 1e-4 is recommended."""
+
     ####################
     # initialization
     ####################
