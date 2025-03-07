@@ -17,7 +17,7 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
     TransformerBlock,
-    combined_1f1b_transformer_block_computation,
+    combined_1f1b_transformer_block_execution,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -431,7 +431,7 @@ def combined_1f1b_model_execution(
 
         # Backward pass
         # TODO: decompose backward path into finer-grained calls
-        # and merge decoder fwd/bwd into a single combined_1f1b_transformer_block_computation call
+        # and merge decoder fwd/bwd into a single combined_1f1b_transformer_block_execution call
         backward_function(backward_output_tensor[0], backward_output_tensor_grad[0])
 
         return forward_output_tensor

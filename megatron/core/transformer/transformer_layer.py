@@ -231,11 +231,11 @@ class BaseTransformerLayer(ABC):
         pass
 
 
-def combined_1f1b_transformer_layer_computation(
+def combined_1f1b_transformer_layer_execution(
     forward_layer, backward_layer, forward_inputs, backward_inputs
 ):
-    # TODO: Implement combined_1f1b_transformer_layer_computation
-    # The core overlap computation should be implemented here
+    # TODO: Implement combined_1f1b_transformer_layer_execution
+    # The core overlap execution should be implemented here
     pass
 
 
