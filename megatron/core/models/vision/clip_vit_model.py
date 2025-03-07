@@ -203,9 +203,15 @@ def get_num_image_embeddings(
         keep_class_token = not disable_vision_class_token
     elif vision_model_type.startswith("radio"):
         keep_class_token = not disable_vision_class_token
-    elif vision_model_type.startswith("huggingface"):
-        # TODO: Temp, what do we do in this sitaution?
-        keep_class_token = True
+    elif vision_model_type.startswith("hf://"):
+        from megatron.core.models.huggingface.module import get_hf_model_type
+
+        model_type = get_hf_model_type(vision_model_type)
+
+        if "siglip" in model_type:
+            keep_class_token = False
+        else:
+            raise NotImplementedError(f"unsupported huggingface vision model: {vision_model_type}")
     else:
         raise ValueError(f"unsupported vision model: {vision_model_type}")
 

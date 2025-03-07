@@ -9,7 +9,7 @@ from collections import defaultdict
 
 import numpy as np
 import torch
-from image_processing import get_visual_transform
+from image_processing import ImageTransform
 from PIL import Image
 
 from megatron.training import print_rank_0
@@ -63,7 +63,7 @@ class VQADataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
-        self._vision_model_type = vision_model_type
+        self._transform_img = ImageTransform(img_h, vision_model_type)
 
     def __len__(self):
         return len(self._samples)
@@ -79,7 +79,7 @@ class VQADataset(torch.utils.data.Dataset):
                 img_file = img_file.replace('.jpg', '.png')
 
         img = Image.open(img_file)
-        imgs = get_visual_transform(
+        imgs = self._transform_img(
             img,
             self._img_h,
             self._img_w,
@@ -87,7 +87,6 @@ class VQADataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
-            vision_model_type=self._vision_model_type,
         )
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
 
@@ -145,7 +144,7 @@ class CaptioningDataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
-        self._vision_model_type = vision_model_type
+        self._transform_img = ImageTransform(img_h, vision_model_type)
 
     def __len__(self):
         return len(self._image_files)
@@ -155,7 +154,7 @@ class CaptioningDataset(torch.utils.data.Dataset):
         image_id = int(img_file.split("_")[-1].split(".")[0])
 
         img = Image.open(img_file)
-        imgs = get_visual_transform(
+        imgs = self._transform_img(
             img,
             self._img_h,
             self._img_w,
@@ -163,7 +162,6 @@ class CaptioningDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
-            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -247,7 +245,7 @@ class MMMUDataset(torch.utils.data.Dataset):
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._prompt_style = prompt_style
-        self._vision_model_type = vision_model_type
+        self._transform_img = ImageTransform(img_h, vision_model_type)
 
     def __len__(self):
         return len(self._dataset)
@@ -263,7 +261,7 @@ class MMMUDataset(torch.utils.data.Dataset):
             sample = construct_prompt(sample, self._config)
 
             img = sample["image"]
-            sample_imgs = get_visual_transform(
+            sample_imgs = self._transform_img(
                 img,
                 self._img_h,
                 self._img_w,
@@ -271,7 +269,6 @@ class MMMUDataset(torch.utils.data.Dataset):
                 self._max_num_tiles,
                 self._use_thumbnail,
                 augment=False,
-                vision_model_type=self._vision_model_type,
             )
             sample_num_tiles = [len(sample_imgs)]
 
@@ -321,7 +318,7 @@ class MMMUDataset(torch.utils.data.Dataset):
                 img = sample[img_key]
                 assert img is not None, f"{img_str} is in prompt but not in sample images"
 
-                imgs = get_visual_transform(
+                imgs = self._transform_img(
                     img,
                     self._img_h,
                     self._img_w,
@@ -329,7 +326,6 @@ class MMMUDataset(torch.utils.data.Dataset):
                     adjusted_max_num_tiles,
                     self._use_thumbnail,
                     augment=False,
-                    vision_model_type=self._vision_model_type,
                 )  # List of tiles.
 
                 sample_imgs.extend(imgs)
@@ -358,7 +354,7 @@ class MMMUDataset(torch.utils.data.Dataset):
                     img_str, "<image>", 1
                 )
 
-                imgs = get_visual_transform(
+                imgs = self._transform_img(
                     img,
                     self._img_h,
                     self._img_w,
@@ -366,7 +362,6 @@ class MMMUDataset(torch.utils.data.Dataset):
                     adjusted_max_num_tiles,
                     self._use_thumbnail,
                     augment=False,
-                    vision_model_type=self._vision_model_type,
                 )  # List of tiles.
 
                 sample_imgs.extend(imgs)
@@ -446,7 +441,7 @@ class VideoMMEDataset(torch.utils.data.Dataset):
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._num_frames = num_frames
-        self._vision_model_type = vision_model_type
+        self._transform_img = ImageTransform(img_h, vision_model_type)
 
     def __len__(self):
         return len(self._ground_truth)
@@ -468,9 +463,9 @@ class VideoMMEDataset(torch.utils.data.Dataset):
             from torchvision.transforms import ToPILImage
             to_pil = ToPILImage()
             img = to_pil(img)
-            imgs += get_visual_transform(
+            imgs += self._transform_img(
                 img, self._img_h, self._img_w, self._use_tiling, self._max_num_tiles,
-                self._use_thumbnail, augment=False, vision_model_type=self._vision_model_type
+                self._use_thumbnail, augment=False,
             )
 
         for question in gt["questions"]:
@@ -533,7 +528,7 @@ class OCRBenchDataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
-        self._vision_model_type = vision_model_type
+        self._transform_img = ImageTransform(img_h, vision_model_type)
 
     def __len__(self):
         return len(self._gt)
@@ -542,7 +537,7 @@ class OCRBenchDataset(torch.utils.data.Dataset):
         img_path = os.path.join(self._input_image_path, self._gt[idx]['image_path'])
 
         img = Image.open(img_path)
-        imgs = get_visual_transform(
+        imgs = self._transform_img(
             img,
             self._img_h,
             self._img_w,
@@ -550,7 +545,6 @@ class OCRBenchDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
-            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -612,7 +606,7 @@ class MathVistaDataset(torch.utils.data.Dataset):
         self._use_tiling = use_tiling
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
-        self._vision_model_type = vision_model_type
+        self._transform_img = ImageTransform(img_h, vision_model_type)
 
     def __len__(self):
         return len(self._dataset["pid"])
@@ -621,7 +615,7 @@ class MathVistaDataset(torch.utils.data.Dataset):
         # Already a PIL object.
         img = self._dataset['decoded_image'][idx]
 
-        imgs = get_visual_transform(
+        imgs = self._transform_img(
             img,
             self._img_h,
             self._img_w,
@@ -629,7 +623,6 @@ class MathVistaDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
-            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)
@@ -706,7 +699,7 @@ class AI2DDataset(torch.utils.data.Dataset):
         self._max_num_tiles = max_num_tiles
         self._use_thumbnail = use_thumbnail
         self._no_mask = no_mask
-        self._vision_model_type = vision_model_type
+        self._transform_img = ImageTransform(img_h, vision_model_type)
 
     def __len__(self):
         return len(self._gt)
@@ -717,7 +710,7 @@ class AI2DDataset(torch.utils.data.Dataset):
             img_path.replace("AI2D_TEST", "AI2D_TEST_NO_MASK_IMAGES")
 
         img = Image.open(img_path)
-        imgs = get_visual_transform(
+        imgs = self._transform_img(
             img,
             self._img_h,
             self._img_w,
@@ -725,7 +718,6 @@ class AI2DDataset(torch.utils.data.Dataset):
             self._max_num_tiles,
             self._use_thumbnail,
             augment=False,
-            vision_model_type=self._vision_model_type,
         )
 
         tile_count = torch.tensor([len(imgs)], dtype=torch.int)

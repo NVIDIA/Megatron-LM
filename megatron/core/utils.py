@@ -15,13 +15,16 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
-from functools import reduce
+from functools import reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 from packaging.version import Version as PkgVersion
+
+from megatron.core import config
+from megatron.core.package_info import __version__ as mcore_version
 
 try:
     from torch.distributed._tensor import DTensor
@@ -39,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 try:
     _torch_version = PkgVersion(torch.__version__)
-except:
+except Exception:
     # This is a WAR for building docs, where torch is not actually imported
     _torch_version = PkgVersion("0.0.0")
 _te_version = None
@@ -90,6 +93,121 @@ def print_rank_0(message):
     assert torch.distributed.is_initialized(), "torch.distributed is not initialized"
     if torch.distributed.get_rank() == 0:
         print(message, flush=True)
+
+class ExperimentalNotEnabledError(Exception):
+    """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
+
+
+def experimental_fn(introduced_with_version: str):
+    """A decorator that marks a function as experimental.
+    Experimental functions may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental functions have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental function
+            was called without enabling the experimental flag.
+    """
+
+    def validator(func: Callable, max_lifetime: int = 3) -> Callable:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            logger.warning(
+                "{} has reached end of life. Please migrate to a non-experimental function.",
+                func.__name__,
+            )
+
+        @wraps(func)
+        def wrapped_func(*args, **kwargs):
+
+            if config.ENABLE_EXPERIMENTAL is not True:
+                raise ExperimentalNotEnabledError(f"Flag {config.ENABLE_EXPERIMENTAL} not enabled.")
+
+            logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+
+            return func(*args, **kwargs)
+
+        return wrapped_func
+
+    return validator
+
+
+def experimental_cls(introduced_with_version: str):
+    """A decorator that marks a Class as experimental.
+    Experimental Classes may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental classes have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental class
+            was called without enabling the experimental flag.
+    """
+
+    def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            logger.warning(
+                "{} has reached end of life. Please migrate to a non-experimental function.",
+                cls.__name__,
+            )
+
+        def wrapped_func():
+
+            if config.ENABLE_EXPERIMENTAL is not True:
+                raise ExperimentalNotEnabledError(f"Flag {config.ENABLE_EXPERIMENTAL} not enabled.")
+
+            logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+
+            return cls
+
+        return wrapped_func
+
+    return validator
+
 
 def get_torch_version():
     """Get pytorch version from __version__; if not available use pip's. Use caching."""

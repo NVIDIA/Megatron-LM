@@ -10,9 +10,7 @@ def add_multimodal_extra_args(parser):
     group.add_argument('--freeze-LM', action='store_true', default=False)
     group.add_argument('--freeze-ViT', action='store_true', default=False)
     group.add_argument('--language-model-type', type=str, required=True)
-    group.add_argument('--language-huggingface-model-name-or-path', type=str)
     group.add_argument('--vision-model-type', type=str, default="clip")
-    group.add_argument('--vision-huggingface-model-name-or-path', type=str)
     group.add_argument("--disable-vision-class-token", action="store_true", default=False)
     group.add_argument(
         "--allow-missing-vision-projection-checkpoint", action="store_true", default=False
