@@ -13,6 +13,7 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+from megatron.core.transformer.transformer_block import combined_1f1b_transformer_block_computation
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -437,7 +438,9 @@ def combined_forward_backward_core_func(
 
     if config.combined_1f1b_recipe == 'ep_a2a':
         # TODO: write a function that executes merged forward-backward core functions
+        # TODO: need to handle Float16Module's forward part
         forward_gptmodel = return_target_submodule(forward_model_chunk, "GPTModel")
+        backward_gptmodel = return_target_submodule(backward_model_chunk, "GPTModel")
         backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")        
         backward_decoder = return_target_submodule(backward_model_chunk, "TransformerBlock")        
         assert forward_gptmodel is not None
@@ -472,6 +475,9 @@ def combined_forward_backward_core_func(
         forward_decoder_input, forward_rotary_pos_emb, forward_rotary_pos_cos, forward_rotary_pos_sin, forward_sequence_len_offset = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
 
         # Decoder forward -> this should be in combined_1f1b_decoder_computation in the future
+        # TODO: This is a placeholder for now 
+        combined_1f1b_transformer_block_computation(forward_gptmodel.decoder, backward_gptmodel.decoder, None, None)
+
         forward_decoder_output = forward_gptmodel.decoder(
             hidden_states=forward_decoder_input,
             attention_mask=attention_mask,
