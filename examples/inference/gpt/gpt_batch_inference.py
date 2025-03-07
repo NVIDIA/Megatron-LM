@@ -182,16 +182,14 @@ def main():
     if torch.distributed.get_rank() == 0:
         for idx, result in enumerate(results):
             print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
-            result_dict = {
+            result = {
                 'id': result.request_id,
                 'input_prompt': result.prompt,
                 'generated_text': result.generated_text,
                 'generated_tokens': result.generated_tokens,
                 'latency': latency,
             }
-            if sampling_params.return_log_probs:
-                result_dict['logprobs'] = result.prompt_log_probs + result.generated_log_probs
-            print(result_dict)
+            print(result)
 
     torch.distributed.destroy_process_group()
 
