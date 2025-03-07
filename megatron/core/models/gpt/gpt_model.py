@@ -258,8 +258,6 @@ class GPTModel(LanguageModule):
         else:
             sequence_len_offset = None
 
-        # Store decoder_input for the manual backward pass
-        self.decoder_input = decoder_input
         return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
 
     def post_decoder_forward(
@@ -275,8 +273,6 @@ class GPTModel(LanguageModule):
         """Processes the decoder output to generate logits and compute loss if needed.
         This function is for combined 1f1b overlap implementation.
         """
-        # Store hidden_states for the manual backward pass
-        self.hidden_states = hidden_states
 
         if not self.post_process:
             return hidden_states
