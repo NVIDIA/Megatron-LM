@@ -230,10 +230,14 @@ class BaseTransformerLayer(ABC):
     def __init__(self):
         pass
 
-def combined_1f1b_transformer_layer_computation(forward_layer, backward_layer, forward_inputs, backward_inputs):
-    # TODO: Implement combined_1f1b_transformer_layer_computation   
-    # The core overlap computation should be implemented here   
+
+def combined_1f1b_transformer_layer_computation(
+    forward_layer, backward_layer, forward_inputs, backward_inputs
+):
+    # TODO: Implement combined_1f1b_transformer_layer_computation
+    # The core overlap computation should be implemented here
     pass
+
 
 class TransformerLayer(MegatronModule, BaseTransformerLayer):
     """A single transformer layer.

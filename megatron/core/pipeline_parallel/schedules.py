@@ -1,8 +1,8 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
-from functools import partial
 import inspect
+from functools import partial
 from typing import Iterator, List, Union
 
 import torch
@@ -136,7 +136,9 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
-def custom_backward(output, grad_output): # YOUNGEUNK: we might need to add "inputs" argument for the finegrained backward pass
+def custom_backward(
+    output, grad_output
+):  # YOUNGEUNK: we might need to add "inputs" argument for the finegrained backward pass
     '''Directly call C++ autograd engine.
 
     To make the 'deallocate_output_tensor' (above) optimization work, the C++
@@ -415,6 +417,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     return input_tensor_grad
 
+
 def combined_forward_backward_core_func(
     set_forward_virtual_pipeline_model_parallel_rank,
     forward_model_chunk,
@@ -425,7 +428,7 @@ def combined_forward_backward_core_func(
     backward_model_chunk,
     backward_output_tensor,
     backward_output_tensor_grad,
-    config            
+    config,
 ):
     """
     This function is used to perform concurrent forward and backward passes.
@@ -440,15 +443,15 @@ def combined_forward_backward_core_func(
         # TODO: write a function that executes merged forward-backward core functions
         # TODO: need to handle all possible wrapper module's forward impl (e.g., Float16Module/DDPModule)
         # thinking of using pre_core_forward and post_core_forward methods
-        # But the DDP is tricky to handle, since it implements all the things with forward_hooks(). 
+        # But the DDP is tricky to handle, since it implements all the things with forward_hooks().
         # I guess in 1F1B stage DDP hooks are not called, but needs a confirmation
         # The forward/backward hooks of wrapper modules are not going to be called in current implementation.
         # Maybe need to call them manually in somewhere
 
         forward_gptmodel = return_target_submodule(forward_model_chunk, "GPTModel")
         backward_gptmodel = return_target_submodule(backward_model_chunk, "GPTModel")
-        backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")        
-        backward_decoder = return_target_submodule(backward_model_chunk, "TransformerBlock")        
+        backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")
+        backward_decoder = return_target_submodule(backward_model_chunk, "TransformerBlock")
         assert forward_gptmodel is not None
         assert backward_decoder is not None
 
@@ -469,23 +472,39 @@ def combined_forward_backward_core_func(
         # Draft implementation ignoring the concerns above
         forward_step_func_module = inspect.getmodule(forward_step_func)
         # print_rank_0(f"[YOUNGEUNK] forward_step_func_module: {list(forward_step_func_module.__dict__.keys())}")
-        assert hasattr(forward_step_func_module, 'get_batch'), "combined_forward_backward_core_func: assumes that forward_step_func has get_batch()"
-        assert hasattr(forward_step_func_module, 'loss_func'), "combined_forward_backward_core_func: assumes that forward_step_func has loss_func()"
-        
+        assert hasattr(
+            forward_step_func_module, 'get_batch'
+        ), "combined_forward_backward_core_func: assumes that forward_step_func has get_batch()"
+        assert hasattr(
+            forward_step_func_module, 'loss_func'
+        ), "combined_forward_backward_core_func: assumes that forward_step_func has loss_func()"
+
         # extract get_batch function from the module
         get_batch_func = forward_step_func_module.get_batch
         # Data fetching
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
 
-        # Pre-core forward to handle warpper module's forward of GPTModel
-        tokens, labels, loss_mask, attention_mask, position_ids = forward_model_chunk.pre_core_forward(tokens, labels, loss_mask, attention_mask, position_ids)
+        # Pre-core forward to handle warpper module's forward of GPTModel (e.g., Float16Module)
+        tokens, labels, loss_mask, attention_mask, position_ids = (
+            forward_model_chunk.pre_core_forward(
+                tokens, labels, loss_mask, attention_mask, position_ids
+            )
+        )
 
         # Pre-decoder forward
-        forward_decoder_input, forward_rotary_pos_emb, forward_rotary_pos_cos, forward_rotary_pos_sin, forward_sequence_len_offset = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
+        (
+            forward_decoder_input,
+            forward_rotary_pos_emb,
+            forward_rotary_pos_cos,
+            forward_rotary_pos_sin,
+            forward_sequence_len_offset,
+        ) = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
 
         # Decoder forward -> this should be in combined_1f1b_decoder_computation in the future
-        # TODO: This is a placeholder for now 
-        combined_1f1b_transformer_block_computation(forward_gptmodel.decoder, backward_gptmodel.decoder, None, None)
+        # TODO: This is a placeholder for now
+        combined_1f1b_transformer_block_computation(
+            forward_gptmodel.decoder, backward_gptmodel.decoder, None, None
+        )
 
         forward_decoder_output = forward_gptmodel.decoder(
             hidden_states=forward_decoder_input,
@@ -508,20 +527,23 @@ def combined_forward_backward_core_func(
             labels=labels,
         )
 
-        # Post-core forward to handle wrapper module's forward of GPTModel
+        # Post-core forward to handle wrapper module's forward of GPTModel (e.g., Float16Module)
         (forward_output_tensor,) = forward_gptmodel.post_core_forward(forward_output_tensor)
 
         # Backward pass
         # TODO: decompose backward path into finer-grained calls
         custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
-        
+
         # Loss function for return
         loss_func = partial(forward_step_func_module.loss_func, loss_mask)
     else:
-        raise NotImplementedError(f"combined_forward_backward_core_func for recipe:{config.combined_1f1b_recipe} is not implemented")
-    
+        raise NotImplementedError(
+            f"combined_forward_backward_core_func for recipe:{config.combined_1f1b_recipe} is not implemented"
+        )
+
     return forward_output_tensor, loss_func
-                                
+
+
 def combined_forward_backward_step(
     # FORWARD ARGUMENTS
     forward_model_chunk_id,
@@ -544,36 +566,44 @@ def combined_forward_backward_step(
     backward_output_tensor_grad,
     model_type,
     # COMMON ARGUMENTS
-    config
+    config,
 ):
     """
     This function is used to perform concurrent forward and backward passes.
     """
-    
-    set_forward_virtual_pipeline_model_parallel_rank = partial(parallel_state.set_virtual_pipeline_model_parallel_rank, forward_model_chunk_id)
-    set_backward_virtual_pipeline_model_parallel_rank = partial(parallel_state.set_virtual_pipeline_model_parallel_rank, backward_model_chunk_id)
+
+    set_forward_virtual_pipeline_model_parallel_rank = partial(
+        parallel_state.set_virtual_pipeline_model_parallel_rank, forward_model_chunk_id
+    )
+    set_backward_virtual_pipeline_model_parallel_rank = partial(
+        parallel_state.set_virtual_pipeline_model_parallel_rank, backward_model_chunk_id
+    )
 
     if config.combined_1f1b_recipe == 'golden':
         # print_rank_0(f"[YOUNGEUNK] golden recipe")
         set_forward_virtual_pipeline_model_parallel_rank()
         forward_return = forward_step(
-                forward_step_func,
-                data_iterator,
-                forward_model_chunk,
-                num_microbatches,
-                forward_input_tensor,
-                forward_data_store,
-                config,
-                collect_non_loss_data,
-                checkpoint_activations_microbatch,
-                is_first_microbatch,
-                current_microbatch=forward_current_microbatch,
-                encoder_decoder_xattn=encoder_decoder_xattn,
-            )
-        
+            forward_step_func,
+            data_iterator,
+            forward_model_chunk,
+            num_microbatches,
+            forward_input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            checkpoint_activations_microbatch,
+            is_first_microbatch,
+            current_microbatch=forward_current_microbatch,
+            encoder_decoder_xattn=encoder_decoder_xattn,
+        )
+
         set_backward_virtual_pipeline_model_parallel_rank()
         backward_return = backward_step(
-            backward_input_tensor, backward_output_tensor, backward_output_tensor_grad, model_type, config
+            backward_input_tensor,
+            backward_output_tensor,
+            backward_output_tensor_grad,
+            model_type,
+            config,
         )
     elif config.combined_1f1b_recipe == 'ep_a2a':
         # TODO: Implement submodel-based call of forward and backward steps
@@ -583,7 +613,7 @@ def combined_forward_backward_step(
             forward_model_chunk.set_is_first_microbatch()
         if forward_current_microbatch is not None:
             set_current_microbatch(forward_model_chunk, forward_current_microbatch)
-        
+
         unwrap_forward_output_tensor = False
         if not isinstance(forward_input_tensor, list):
             forward_input_tensor = [forward_input_tensor]
@@ -591,7 +621,7 @@ def combined_forward_backward_step(
 
         set_input_tensor = get_attr_wrapped_model(forward_model_chunk, "set_input_tensor")
         set_input_tensor(forward_input_tensor)
-        
+
         # setups for backward =========
         set_backward_virtual_pipeline_model_parallel_rank()
         # Retain the grad on the input_tensor.
@@ -629,7 +659,7 @@ def combined_forward_backward_step(
                 backward_model_chunk,
                 backward_output_tensor,
                 backward_output_tensor_grad,
-                config            
+                config,
             )
 
         # warpup forward =============
@@ -705,6 +735,7 @@ def combined_forward_backward_step(
     else:
         raise ValueError(f"Invalid combined 1F1B recipe: {config.combined_1f1b_recipe}")
     return *forward_return, backward_return
+
 
 def check_first_val_step(first_val_step, forward_only, cond):
     """Check if it is the first validation step."""
@@ -984,9 +1015,11 @@ def forward_backward_pipelining_with_interleaving(
         msg += 'Otherwise, it introduces dependency bubbles in the pipeline '
         msg += 'and reduces throughput.'
         raise RuntimeError(msg)
-    
+
     if config.combined_1f1b:
-        assert config.overlap_p2p_comm == False, "Overlap p2p communication should be disabled for combined 1F1B"
+        assert (
+            config.overlap_p2p_comm == False
+        ), "Overlap p2p communication should be disabled for combined 1F1B"
 
     model_type = get_model_type(model[0])
     if model_type == ModelType.encoder_and_decoder:
@@ -1031,9 +1064,7 @@ def forward_backward_pipelining_with_interleaving(
     print_rank_0(f"[YOUNGEUNK] total_num_microbatches: {total_num_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}")
-    print_rank_0(
-        f"[YOUNGEUNK] config.combined_1f1b: {config.combined_1f1b}"
-    )
+    print_rank_0(f"[YOUNGEUNK] config.combined_1f1b: {config.combined_1f1b}")
     print_rank_0(f"[YOUNGEUNK] config.combined_1f1b_recipe: {config.combined_1f1b_recipe}")
     print_rank_0(f"[YOUNGEUNK] config.overlap_p2p_comm: {config.overlap_p2p_comm}")
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -1341,14 +1372,18 @@ def forward_backward_pipelining_with_interleaving(
                     get_model_chunk_id(param_sync_virtual_microbatch_id, forward=True) + 1
                 )
                 if 1 < param_sync_chunk_id < num_model_chunks:
-                    print_rank_0(f"[YOUNGEUNK][SHOULD NOT BE CALLED] grad_sync_virtual_microbatch_id: {grad_sync_virtual_microbatch_id}")
+                    print_rank_0(
+                        f"[YOUNGEUNK][SHOULD NOT BE CALLED] grad_sync_virtual_microbatch_id: {grad_sync_virtual_microbatch_id}"
+                    )
                     config.param_sync_func[param_sync_chunk_id](
                         model[param_sync_chunk_id].parameters()
                     )
 
         # forward step
         if parallel_state.is_pipeline_first_stage():
-            if len(input_tensors[forward_model_chunk_id]) == len(output_tensors[forward_model_chunk_id]):
+            if len(input_tensors[forward_model_chunk_id]) == len(
+                output_tensors[forward_model_chunk_id]
+            ):
                 input_tensors[forward_model_chunk_id].append(None)
 
         # For non-depth-first pipeline schedules, the first rank would buffer multiple received
@@ -1357,7 +1392,9 @@ def forward_backward_pipelining_with_interleaving(
         # the next inputs. To index the proper buffered inputs for forword_step, we use
         # forward_microbatch_id offset with number of released microbatches that have completed backprop.
         forward_offset = num_released_microbatches(forward_k, forward_model_chunk_id)
-        forward_input_tensor = input_tensors[forward_model_chunk_id][forward_microbatch_id - forward_offset]
+        forward_input_tensor = input_tensors[forward_model_chunk_id][
+            forward_microbatch_id - forward_offset
+        ]
 
         # ============================== pre-forward-step ================================
         # ============================== pre-backward-step ================================
@@ -1368,16 +1405,12 @@ def forward_backward_pipelining_with_interleaving(
         parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
 
         # launch grad synchronization (default)
-        if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
-            backward_k
-        ):
+        if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(backward_k):
             enable_grad_sync()
             synchronized_model_chunks.add(backward_model_chunk_id)
 
         # launch grad synchronization (default)
-        if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
-            backward_k
-        ):
+        if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(backward_k):
             enable_grad_sync()
             synchronized_model_chunks.add(backward_model_chunk_id)
 
@@ -1389,30 +1422,30 @@ def forward_backward_pipelining_with_interleaving(
         backward_output_tensor_grad = output_tensor_grads[backward_model_chunk_id].pop(0)
         # ============================== pre-backward-step ================================
         # ============================== foward_backward_step =============================
-        forward_output_tensor, num_tokens, backward_input_tensor_grad = combined_forward_backward_step(
-            forward_model_chunk_id=forward_model_chunk_id,
-            forward_step_func=forward_step_func,
-            data_iterator=data_iterator[forward_model_chunk_id],
-            forward_model_chunk=model[forward_model_chunk_id],
-            num_microbatches=num_microbatches,
-            forward_input_tensor=forward_input_tensor,
-            forward_data_store=forward_data_store,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=check_first_val_step(
-                first_val_step,
-                forward_only,
-                is_first_microbatch_for_model_chunk(forward_k),
-            ),
-            forward_current_microbatch=forward_microbatch_id,
-            encoder_decoder_xattn=False,
-            backward_model_chunk_id=backward_model_chunk_id,
-            backward_model_chunk=model[backward_model_chunk_id],
-            backward_input_tensor=backward_input_tensor,
-            backward_output_tensor=backward_output_tensor,
-            backward_output_tensor_grad=backward_output_tensor_grad,
-            model_type=model_type,
-            config=config,
+        forward_output_tensor, num_tokens, backward_input_tensor_grad = (
+            combined_forward_backward_step(
+                forward_model_chunk_id=forward_model_chunk_id,
+                forward_step_func=forward_step_func,
+                data_iterator=data_iterator[forward_model_chunk_id],
+                forward_model_chunk=model[forward_model_chunk_id],
+                num_microbatches=num_microbatches,
+                forward_input_tensor=forward_input_tensor,
+                forward_data_store=forward_data_store,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=check_first_val_step(
+                    first_val_step, forward_only, is_first_microbatch_for_model_chunk(forward_k)
+                ),
+                forward_current_microbatch=forward_microbatch_id,
+                encoder_decoder_xattn=False,
+                backward_model_chunk_id=backward_model_chunk_id,
+                backward_model_chunk=model[backward_model_chunk_id],
+                backward_input_tensor=backward_input_tensor,
+                backward_output_tensor=backward_output_tensor,
+                backward_output_tensor_grad=backward_output_tensor_grad,
+                model_type=model_type,
+                config=config,
+            )
         )
         # ============================== foward_backward_step =============================
         # ============================== post-forward-step =============================
@@ -1439,7 +1472,9 @@ def forward_backward_pipelining_with_interleaving(
             if grad_sync_virtual_microbatch_id >= 0 and is_last_microbatch_for_model_chunk(
                 grad_sync_virtual_microbatch_id
             ):
-                print_rank_0(f"[YOUNGEUNK][SHOULD NOT BE CALLED] grad_sync_virtual_microbatch_id: {grad_sync_virtual_microbatch_id}")
+                print_rank_0(
+                    f"[YOUNGEUNK][SHOULD NOT BE CALLED] grad_sync_virtual_microbatch_id: {grad_sync_virtual_microbatch_id}"
+                )
                 grad_sync_chunk_id = get_model_chunk_id(
                     grad_sync_virtual_microbatch_id, forward=False
                 )

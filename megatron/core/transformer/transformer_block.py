@@ -15,10 +15,13 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    BaseTransformerLayer,
+    TransformerLayer,
+    combined_1f1b_transformer_layer_computation,
+)
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import is_te_min_version, make_viewless_tensor
-from megatron.core.transformer.transformer_layer import combined_1f1b_transformer_layer_computation
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -151,13 +154,19 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 
     return num_layers_to_build
 
-def combined_1f1b_transformer_block_computation(forward_decoder, backward_decoder, forward_inputs, backward_inputs):
+
+def combined_1f1b_transformer_block_computation(
+    forward_decoder, backward_decoder, forward_inputs, backward_inputs
+):
     # TODO: Implement combined_1f1b_transformer_block_computation
     assert len(forward_decoder.layers) == len(backward_decoder.layers)
     # This function should call combined_1f1b_transformer_layer_computation() in a loop
     for i in range(len(forward_decoder.layers)):
-        combined_1f1b_transformer_layer_computation(forward_decoder.layers[i], backward_decoder.layers[i], None, None)
+        combined_1f1b_transformer_layer_computation(
+            forward_decoder.layers[i], backward_decoder.layers[i], None, None
+        )
     pass
+
 
 @dataclass
 class TransformerBlockSubmodules:

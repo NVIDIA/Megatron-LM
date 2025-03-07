@@ -47,40 +47,43 @@ except Exception:
     _torch_version = PkgVersion("0.0.0")
 _te_version = None
 
+
 def return_target_submodule(module, target_class_name):
     """
     Recursively search for a module of the specified target class name.
-    
+
     Args:
         module: The module to search through
         target_class_name: Class name to match (string)
-    
+
     Returns:
         The first module instance matching the target class name, or None if not found
     """
     # Check if the current module is of the target class
     if module.__class__.__name__ == target_class_name:
         return module
-    
+
     # Special case for handling DDP and other wrappers with .module attribute
     if hasattr(module, "module"):
         found_module = return_target_submodule(module.module, target_class_name)
         if found_module is not None:
             return found_module
-    
+
     # Check all child modules (this is the key addition)
     for name, child in module.named_children():
         found_module = return_target_submodule(child, target_class_name)
         if found_module is not None:
             return found_module
-    
+
     # Not found anywhere
     return None
+
 
 def print_all_ranks(message):
     """If distributed is initialized, print only on rank 0."""
     assert torch.distributed.is_initialized(), "torch.distributed is not initialized"
     print(f"[RANK {torch.distributed.get_rank()}]" + message, flush=True)
+
 
 def print_rank_i(i, message):
     """If distributed is initialized, print only on rank 0."""
@@ -88,11 +91,13 @@ def print_rank_i(i, message):
     if torch.distributed.get_rank() == i:
         print(f"[RANK {i}]" + message, flush=True)
 
+
 def print_rank_0(message):
     """If distributed is initialized, print only on rank 0."""
     assert torch.distributed.is_initialized(), "torch.distributed is not initialized"
     if torch.distributed.get_rank() == 0:
         print(message, flush=True)
+
 
 class ExperimentalNotEnabledError(Exception):
     """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
