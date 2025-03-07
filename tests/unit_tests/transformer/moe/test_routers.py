@@ -27,6 +27,8 @@ class TestTop2Router:
             moe_router_load_balancing_type="aux_loss",
             moe_router_topk=2,
             moe_aux_loss_coeff=0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
         )
         transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
@@ -67,7 +69,7 @@ class TestTop2Router:
 
         # Without aux loss
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.cuda().bfloat16()
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() == 0
@@ -85,6 +87,42 @@ class TestTop2Router:
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() > 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_router_dtype(self):
+        self.router = self.router.cuda()
+        self.sequential_mlp = self.sequential_mlp.cuda()
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size), dtype=torch.bfloat16)
+        hidden_states = hidden_states.cuda()
+
+        # Test with default setting (bf16)
+        self.router.config.moe_router_dtype = None
+        with torch.no_grad():
+            scores, routing_map = self.router(hidden_states)
+            out = self.sequential_mlp(hidden_states)
+            assert scores.dtype == torch.bfloat16, "Router output should be bf16 by default"
+            assert out[0].dtype == torch.bfloat16
+
+        # Test with fp32 enabled
+        self.router.config.moe_router_dtype = 'fp32'
+        with torch.no_grad():
+            scores, routing_map = self.router(hidden_states)
+            out = self.sequential_mlp(hidden_states)
+            assert scores.dtype == torch.float32, "Router output should be fp32 when enabled"
+            assert out[0].dtype == torch.bfloat16
+            self.sequential_mlp.config.moe_token_dispatcher_type = "alltoall"
+            out = self.sequential_mlp(hidden_states)
+            assert out[0].dtype == torch.bfloat16
+            self.sequential_mlp.config.moe_token_dispatcher_type = "allgather"
+
+        # Test with fp64 enabled
+        self.router.config.moe_router_dtype = 'fp64'
+        with torch.no_grad():
+            scores, routing_map = self.router(hidden_states)
+            out = self.sequential_mlp(hidden_states)
+            assert scores.dtype == torch.float64, "Router output should be fp64 when enabled"
+            assert out[0].dtype == torch.bfloat16
 
 
 class TestGroupLimitedRouter:
@@ -160,9 +198,9 @@ class TestGroupLimitedRouter:
             batch_size = 2
             num_tokens = seq_len * batch_size
             # hidden_states shape: [seq_len, batch_size, hidden_size]
-            hidden_states = torch.randn(
-                (seq_len, batch_size, self.router.config.hidden_size)
-            ).cuda()
+            hidden_states = (
+                torch.randn((seq_len, batch_size, self.router.config.hidden_size)).cuda().bfloat16()
+            )
             scores, routing_map = self.router(hidden_states)
             assert scores.shape == (num_tokens, self.router.config.num_moe_experts), scores.shape
             assert routing_map.shape == (
@@ -211,7 +249,7 @@ class TestAuxLossFreeTop2Router:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_forward_aux_free(self):
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.cuda().bfloat16()
         self.router = self.router.cuda()
 
         # First forward pass

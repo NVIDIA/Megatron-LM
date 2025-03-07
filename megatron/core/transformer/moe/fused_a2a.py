@@ -98,7 +98,7 @@ class FusedDispatch(torch.autograd.Function):
         ) = buffer.dispatch(
             x,
             topk_idx=token_indices,
-            topk_weights=token_probs.float(),
+            topk_weights=token_probs,  # DeepEP only supports float32 probs
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             is_token_in_rank=is_token_in_rank,

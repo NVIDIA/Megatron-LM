@@ -42,6 +42,7 @@ class TestMoELayerInit:
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
             moe_grouped_gemm=grouped_gemm,
+            moe_ffn_hidden_size=128,
             add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
