@@ -1,7 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention, TENorm
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.post_training.modelopt.layers import Norm
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
@@ -35,7 +36,7 @@ def get_mamba_stack_modelopt_spec(
     mamba_layer = ModuleSpec(
         module=MambaLayer,
         submodules=MambaLayerSubmodules(
-            norm=TENorm,
+            norm=Norm,
             mixer=ModuleSpec(
                 module=MambaMixer,
                 submodules=MambaMixerSubmodules(
@@ -51,7 +52,7 @@ def get_mamba_stack_modelopt_spec(
     attention_layer = ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=TENorm,
+            input_layernorm=Norm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -69,7 +70,7 @@ def get_mamba_stack_modelopt_spec(
     mlp_layer = ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            pre_mlp_layernorm=TENorm,
+            pre_mlp_layernorm=Norm,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(
