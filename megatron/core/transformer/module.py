@@ -172,6 +172,19 @@ class Float16Module(MegatronModule):
     def set_input_tensor(self, input_tensor):
         return self.module.set_input_tensor(input_tensor)
 
+    # All the modules that wraps GPTModel should have pre_core_forward and post_core_forward methods to use combined_1f1b execution
+    def pre_core_forward(self, *inputs):
+        if parallel_state.is_pipeline_first_stage():
+            inputs = fp32_to_float16(inputs, self.float16_convertor)
+        inputs = self.module.pre_core_forward(inputs)
+        return inputs
+
+    def post_core_forward(self, *outputs):
+        outputs = self.module.post_core_forward(outputs)
+        if parallel_state.is_pipeline_last_stage():
+            outputs = float16_to_fp32(outputs)
+        return outputs
+
     def forward(self, *inputs, **kwargs):
         if parallel_state.is_pipeline_first_stage():
             inputs = fp32_to_float16(inputs, self.float16_convertor)

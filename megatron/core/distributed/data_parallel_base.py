@@ -94,3 +94,12 @@ class _BaseDataParallel(MegatronModule):
         the keys returned by this module’s state_dict() function.
         """
         self.module.load_state_dict(state_dict, strict=strict)
+
+    # Used for combined 1f1b execution, pre_core_forward and post_core_forward are required by the wrapper functions of GPTModel
+    def pre_core_forward(self, *inputs):
+        inputs = self.module.pre_core_forward(*inputs)
+        return inputs
+
+    def post_core_forward(self, *outputs):
+        outputs = self.module.post_core_forward(outputs)
+        return outputs

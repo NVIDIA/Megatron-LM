@@ -438,7 +438,13 @@ def combined_forward_backward_core_func(
 
     if config.combined_1f1b_recipe == 'ep_a2a':
         # TODO: write a function that executes merged forward-backward core functions
-        # TODO: need to handle Float16Module's forward part
+        # TODO: need to handle all possible wrapper module's forward impl (e.g., Float16Module/DDPModule)
+        # thinking of using pre_core_forward and post_core_forward methods
+        # But the DDP is tricky to handle, since it implements all the things with forward_hooks(). 
+        # I guess in 1F1B stage DDP hooks are not called, but needs a confirmation
+        # The forward/backward hooks of wrapper modules are not going to be called in current implementation.
+        # Maybe need to call them manually in somewhere
+
         forward_gptmodel = return_target_submodule(forward_model_chunk, "GPTModel")
         backward_gptmodel = return_target_submodule(backward_model_chunk, "GPTModel")
         backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")        
@@ -471,6 +477,9 @@ def combined_forward_backward_core_func(
         # Data fetching
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
 
+        # Pre-core forward to handle warpper module's forward of GPTModel
+        forward_model_chunk.pre_core_forward(tokens, labels, loss_mask, attention_mask, position_ids)
+
         # Pre-decoder forward
         forward_decoder_input, forward_rotary_pos_emb, forward_rotary_pos_cos, forward_rotary_pos_sin, forward_sequence_len_offset = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
 
@@ -498,6 +507,9 @@ def combined_forward_backward_core_func(
             decoder_input=forward_decoder_input,
             labels=labels,
         )
+
+        # Post-core forward to handle wrapper module's forward of GPTModel
+        forward_output_tensor = forward_gptmodel.post_core_forward(forward_output_tensor)[0]
 
         # Backward pass
         # TODO: decompose backward path into finer-grained calls

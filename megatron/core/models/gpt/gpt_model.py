@@ -192,6 +192,14 @@ class GPTModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
+    # Used for combined 1f1b execution, pre_core_forward and post_core_forward are required by the wrapper functions of GPTModel
+    # pre_core_forward and post_core_forward of GPTModel should work as identity functions
+    def pre_core_forward(self, *inputs):
+        return inputs
+
+    def post_core_forward(self, *outputs):
+        return outputs
+
     def pre_decoder_forward(
         self,
         input_ids: Tensor,
