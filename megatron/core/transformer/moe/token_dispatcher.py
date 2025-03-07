@@ -218,9 +218,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         permuted_probs = self.local_probs.T.contiguous().masked_select(
             self.local_map.T.contiguous()
         )
-        hidden_states = hidden_states * permuted_probs.unsqueeze(-1)
+        # Here may change permuted_tokens to higher precision if probs use fp32/fp64.
+        weighted_hidden_states = hidden_states * permuted_probs.unsqueeze(-1)
         unpermuted_local_hidden = unpermute(
-            hidden_states,
+            weighted_hidden_states,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.local_map,
@@ -230,9 +231,9 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         unpermuted_local_bias = None
         if self.add_bias:
             assert bias is not None
-            bias = bias * permuted_probs.unsqueeze(-1)
+            weighted_bias = bias * permuted_probs.unsqueeze(-1)
             unpermuted_local_bias = unpermute(
-                bias,
+                weighted_bias,
                 self.reversed_local_input_permutation_mapping,
                 restore_shape=self.hidden_shape_before_permute,
                 routing_map=self.local_map,
@@ -261,6 +262,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         if self.add_bias:
             output_bias_total = output_bias_total.view(self.hidden_shape)
 
+        # Restore the dtype of the output to the original dtype.
+        output_total = output_total.to(hidden_states.dtype)
+        if bias is not None:
+            output_bias_total = output_bias_total.to(bias.dtype)
         return output_total, output_bias_total
 
 
@@ -725,6 +730,7 @@ class _DeepepManager(_DispatchManager):
         self.permute_fusion = permute_fusion
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
+        self.router_dtype = router_dtype
 
         # Metadata
         self.token_indices = None
@@ -751,6 +757,11 @@ class _DeepepManager(_DispatchManager):
             self.token_indices = self.token_indices.masked_fill(mask, -1)
 
     def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # DeepEP only supports float32 probs
+        if self.token_probs.dtype != torch.float32:
+            if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
+                print("DeepEP only supports float32 probs, please set --moe-router-dtype=fp32")
+            self.token_probs = self.token_probs.float()  # downcast or upcast
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
                 hidden_states, self.token_indices, self.token_probs, self.num_experts, self.group
@@ -823,8 +834,9 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        input_dtype = hidden_states.dtype
         assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
+        if self.router_dtype == "fp64":
+            self.dispatched_probs = self.dispatched_probs.to(torch.float64)
         hidden_states = unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,
@@ -833,7 +845,7 @@ class _DeepepManager(_DispatchManager):
             probs=self.dispatched_probs,
             fused=self.permute_fusion,
         )
-        return hidden_states.to(input_dtype)
+        return hidden_states
 
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
@@ -862,10 +874,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             capacity_factor=self.config.moe_expert_capacity_factor,
             num_experts=self.tp_size * self.config.num_moe_experts,
             num_local_experts=self.num_local_experts,
+            router_dtype=self.config.moe_router_dtype,
         )
 
     def set_shared_experts(self, shared_experts):
-        raise NotImplementedError("Shared experts overlap not supported in flex token dispatcher")
+        raise NotImplementedError(
+            "Shared expert overlap is not supported in Flex Token Dispatcher."
+        )
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
         """
