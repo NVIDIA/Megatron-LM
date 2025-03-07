@@ -381,5 +381,45 @@ def save_checkpoint(queue: mp.Queue, args):
     )
     print(f"Saving chat config to {args.save_dir}")
     generation_config.save_pretrained(args.save_dir)
+
+    if args.test_logits:
+        print("Testing final logits")
+        message = queue_get("logits_check")
+        ref_output = message["output"].cuda()
+        model = model.cuda().float()
+        with torch.no_grad():
+            output = model(input_ids=message["tokens"].cuda(), position_ids=message["position_ids"].cuda()).logits
+        del model
+        del message
+        assert output.size() == ref_output.size()
+
+        # Check one: Both models agree on next-token predictions in "most cases":
+        threshold = 0.99  # they must agree on at least this proportion of cases.
+        preds_ref = torch.max(ref_output, dim=-1)[1]
+        preds_new = torch.max(output, dim=-1)[1]
+        agree = torch.sum(preds_ref == preds_new)/preds_ref.numel()
+        print(f"Converted model agrees on {100*agree:.2f}% of predictions")
+        assert agree >= threshold
+
+        # Check two: atol and rtol on all logits.
+        threshold = 0.95
+        atol = 1e-05
+        rtol = 0.016
+        output = torch.flatten(output).cpu()
+        ref_output = torch.flatten(ref_output).cpu()
+        abs_diff = torch.abs(output - ref_output)
+        rel_diff = abs_diff/torch.abs(ref_output)
+        rel_diff_inf_mask = torch.isinf(rel_diff)
+        rel_diff_no_inf = rel_diff[~rel_diff_inf_mask]
+        close_mask = abs_diff <= atol + rtol*torch.abs(ref_output)
+        close = torch.sum(close_mask)/output.numel()
+        print(f"Converted logits are close on {100*close:.2f}% of values")
+        print(f"Max absolute difference: {torch.max(abs_diff)}")
+        print(f"Mean absolute difference: {torch.mean(abs_diff)}")
+        print(f"Max relative difference: {torch.max(rel_diff)}")
+        print(f"Mean relative difference (no inf): {torch.mean(rel_diff_no_inf)}")
+        print(f"Relative difference inf proportion: {torch.mean(rel_diff_inf_mask.float())}")
+        assert close >= threshold
+
     queue_get()  # Recv final "exit" message so saver exits gracefully.
 

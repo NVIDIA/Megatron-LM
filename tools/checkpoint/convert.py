@@ -127,6 +127,7 @@ def main():
     parser.add_argument('--no-checking', action='store_false',
                         help='Do not perform checking on the name and ordering of weights',
                         dest='checking')
+    parser.add_argument('--test-logits', action='store_true')
 
     known_args, _ = parser.parse_known_args()
 
@@ -150,6 +151,10 @@ def main():
     args = parser.parse_args()
 
     # Initialize queue
+    if args.test_logits:
+        # We need to change start method as loader process will use cuda during verification.
+        # See https://github.com/pytorch/pytorch/issues/40403.
+        mp.set_start_method("spawn")
     queue = mp.Queue(maxsize=args.max_queue_size)
 
     # Start saver process.

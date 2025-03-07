@@ -5,6 +5,7 @@ import os
 import sys
 import torch
 import types
+from torch.utils.data import DataLoader
 
 from schema_core import get_model_schema
 from utils import print_memory_usage
@@ -31,7 +32,6 @@ def add_arguments(parser):
 
 
 def _load_checkpoint(queue, args):
-
     # Search in directory above this
     sys.path.append(os.path.abspath(
         os.path.join(os.path.dirname(__file__),
@@ -47,6 +47,9 @@ def _load_checkpoint(queue, args):
         from megatron.core import mpu
         from megatron.core.enums import ModelType
         from megatron.legacy import fused_kernels
+        from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+        from megatron.training.tokenizer.tokenizer import _NullTokenizer
+        from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
     except ModuleNotFoundError:
         print("Unable to import Megatron, please specify the path to Megatron using --megatron-path. Exiting.")
         queue.put("exit")
@@ -209,6 +212,10 @@ def _load_checkpoint(queue, args):
     vp_size = margs.virtual_pipeline_model_parallel_size
     if vp_size is None:
         vp_size = 1
+
+    if args.test_logits:
+        assert tp_size == vp_size == vp_size == 1
+        assert args.model_type == "GPT"
 
     # Layernorm has bias; RMSNorm does not.
     if hasattr(checkpoint_args, 'normalization'):
@@ -412,6 +419,46 @@ def _load_checkpoint(queue, args):
                 "bias": binary_head["bias"],
             }
             queue_put("binary head", message)
+
+    # Send logits if needed.
+    if args.test_logits:
+        # Get fake data.
+        tok = _NullTokenizer(vocab_size=1024)
+        tok.bod = 1
+        config = GPTDatasetConfig(
+            random_seed=0,
+            sequence_length=md.seq_length,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+            tokenizer=tok,
+            goldfish_loss=False,
+            bod_hiding=False,
+        )
+        datasets = BlendedMegatronDatasetBuilder(
+            MockGPTDataset, [1000, None, None], lambda: True, config
+        ).build()
+        loader = DataLoader(datasets[0], batch_size=4, shuffle=False)
+        data = next(iter(loader))
+
+        # Get logits and send the message.
+        device = "cuda"
+        tokens = data["tokens"].to(device)
+        position_ids = data["position_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        model = model.to(device).float()
+        with torch.no_grad():
+            output = model(tokens, position_ids, attention_mask)
+        del model
+        message = {"tokens": tokens.cpu(), "position_ids": position_ids.cpu(),
+                   "attention_mask": attention_mask.cpu(), "output": output.cpu()}
+        del tokens
+        del position_ids
+        del attention_mask
+        del output
+        torch.cuda.empty_cache()
+        queue_put("logits_check", message)
+
 
     # Done.
     queue.put("done")
