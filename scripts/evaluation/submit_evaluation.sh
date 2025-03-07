@@ -8,10 +8,11 @@ DEF_ACCOUNT=a-a06
 DEF_TOKENIZER=alehc/swissai-tokenizer
 
 ITERATIONS=(latest)
-TASKS=scripts/evaluation/swissai_eval
+TASKS=swissai_eval
 LIMIT=null
-BS=1
+BS=auto
 CONVERT_TO_HF=false
+ATTN_IMPL=flash_attention_2
 
 TASK_GROUPS="mmlu_continuation global_mmlu"
 
@@ -39,6 +40,7 @@ usage () {
 	echo "  --tp (int>0): Target TP size for inference. Ignored if --size is set, required otherwise."
 	echo "  --pp (int>0): Target PP size for inference. Ignored if --size is set, required otherwise."
 	echo "  --bs (int>0): Batch size used for inference (default=$BS)."
+	echo "  --attn-impl (choices={flash_attention_2,sdpa}): Attention implementation to use (default=$ATTN_IMPL)."
 	echo "  --iterations (int>0 | 'latest'): Comma-separated list of iteration to evaluate (default=$ITERATIONS)"
 	echo "  --revisions: Only used when input is HF checkpoint. Comma-sperated list of HF revisions to try. Must be the same length as --iterations"
 	echo "  --tokens-per-iter (int>0): If specified with --iteration, the total consumed_tokens will be calculated by iteration*tokens_per_iter. Cannot be specified if consumed_tokens is also specified"
@@ -103,6 +105,8 @@ while [[ $# -gt 0 ]]; do
 			TASKS=$2; shift 2;;
 		--bs)
 			BS=$2; shift 2;;
+		--attn-impl)
+			ATTN_IMPL=$2; shift 2;;
 		--limit)
 			LIMIT=$2; shift 2;;
 		--name)
@@ -266,8 +270,7 @@ else
 			MAYBE_GRAB_REVISION="REVISION=\\\${REVISIONS[\\\$i]}"
 		fi
 	fi
-
-	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION $COMMON_EVAL_ARGS"
+	CMD_EVAL="WANDB_RESUME=allow accelerate launch -m lm_eval --cache_requests true --model=hf --model_args=pretrained=$HF_CHECKPOINT_PATH,tokenizer=$TOKENIZER,max_length=4096$MAYBE_REVISION,attn_implementation=$ATTN_IMPL $COMMON_EVAL_ARGS"
 fi
 
 # The big loop.
@@ -306,7 +309,7 @@ cat > $SBATCH_PATH <<- EOM
 #SBATCH --ntasks-per-node=1
 #SBATCH --output=$LOGS_DIR/${JOBNAME}_%j.out
 #SBATCH --error=$LOGS_DIR/${JOBNAME}_%j.err
-#SBATCH --time=02:00:00
+#SBATCH --time=23:59:00
 #SBATCH --exclusive
 #SBATCH --dependency=singleton
 
@@ -341,7 +344,7 @@ srun -l --unbuffered numactl --membind=0-3 bash -c "
 	git checkout swissai-model
 	python -m pip install -e .
 	cd ..
-	git clone https://github.com/AleHD/lm-evaluation-harness.git
+	git clone https://github.com/swiss-ai/lm-evaluation-harness.git
 	cd lm-evaluation-harness
 	python -m pip install -e .[api]
 
