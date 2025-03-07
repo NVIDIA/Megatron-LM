@@ -13,7 +13,6 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
-from megatron.core.transformer.transformer_block import combined_1f1b_transformer_block_computation
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -383,10 +382,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
     if config.deallocate_pipeline_outputs:
-        # print_rank_0(f"[YOUNGEUNK] custom_backward call!?")
         custom_backward(output_tensor[0], output_tensor_grad[0])
     else:
-        print_rank_0(f"[YOUNGEUNK] torch.autograd.backward call")
         torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
@@ -423,8 +420,8 @@ def combined_forward_backward_core_func(
     forward_model_chunk,
     forward_step_func,
     data_iterator,
-    checkpoint_activations_microbatch,
-    set_backward_virtual_pipeline_model_parallel_rank,
+    checkpoint_activations_microbatch, # unused
+    set_backward_virtual_pipeline_model_parallel_rank, # unused
     backward_model_chunk,
     backward_output_tensor,
     backward_output_tensor_grad,
@@ -434,112 +431,55 @@ def combined_forward_backward_core_func(
     This function is used to perform concurrent forward and backward passes.
     """
     set_forward_virtual_pipeline_model_parallel_rank()
-    if checkpoint_activations_microbatch is None:
-        forward_inputs = data_iterator, forward_model_chunk
-    else:
-        forward_inputs = data_iterator, forward_model_chunk, checkpoint_activations_microbatch
+    
+    target_core_model_name = "GPTModel" # currently GPTModel is only supported for combined_1f1b
+    from megatron.core.models.gpt.gpt_model import combined_1f1b_model_execution
+    forward_core_model = return_target_submodule(forward_model_chunk, target_core_model_name)
+    backward_core_model = return_target_submodule(backward_model_chunk, target_core_model_name)
+    assert forward_core_model is not None
+    assert backward_core_model is not None
+    # CONCERNS
+    # 1. forward_step_func is a function that contains get_batch() and the model() calls it could be dangerous to assume that will not change forever
+    # 2. NeMo should have the similar structure of forward_step_func() to retrieve get_batch() and loss_func()
+    # 3. Not sure if I can assume that the GPTModel is always composed of (embedding) + decoder
 
-    if config.combined_1f1b_recipe == 'ep_a2a':
-        # TODO: write a function that executes merged forward-backward core functions
-        # TODO: need to handle all possible wrapper module's forward impl (e.g., Float16Module/DDPModule)
-        # thinking of using pre_core_forward and post_core_forward methods
-        # But the DDP is tricky to handle, since it implements all the things with forward_hooks().
-        # I guess in 1F1B stage DDP hooks are not called, but needs a confirmation
-        # The forward/backward hooks of wrapper modules are not going to be called in current implementation.
-        # Maybe need to call them manually in somewhere
+    backward_function = custom_backward if config.deallocate_pipeline_outputs else torch.autograd.backward
+    
+    forward_step_func_module = inspect.getmodule(forward_step_func)
 
-        forward_gptmodel = return_target_submodule(forward_model_chunk, "GPTModel")
-        backward_gptmodel = return_target_submodule(backward_model_chunk, "GPTModel")
-        backward_embedding = return_target_submodule(backward_model_chunk, "LanguageModelEmbedding")
-        backward_decoder = return_target_submodule(backward_model_chunk, "TransformerBlock")
-        assert forward_gptmodel is not None
-        assert backward_decoder is not None
+    assert hasattr(
+        forward_step_func_module, 'get_batch'
+    ), "combined_forward_backward_core_func: assumes that forward_step_func has get_batch()"
+    assert hasattr(
+        forward_step_func_module, 'loss_func'
+    ), "combined_forward_backward_core_func: assumes that forward_step_func has loss_func()"
 
-        # data_iterator can be None or DataIterator
-        # TODO: decompose forward_step_func and backward_step_func and execute each layers them one by one in a interleaved manner
-        # do pre-decoder forward
-        # from megatron.core.transformer.transformer_block import combined_1f1b_decoder_computation
-        # forward_outputs, backward_outputs = combined_1f1b_decoder_computation(forward_decoder, forward_inputs, backward_decoders, backward_inputs, overlap_recipe=config.combined_1f1b_recipe)
-        # do post-decoder forward
-        # if backward_embedding:
-        #   Do the embedding backward
+    # extract get_batch function from the module
+    get_batch_func = forward_step_func_module.get_batch
+    # Data fetching
+    tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
 
-        # CONCERNS
-        # 1. forward_step_func is a function that contains get_batch() and the model() calls it could be dangerous to assume that will not change forever
-        # 2. NeMo should have the similar structure of forward_step_func() to retrieve get_batch() and loss_func()
-        # 3. Not sure if I can assume that the GPTModel is always composed of (embedding) + decoder
-
-        # Draft implementation ignoring the concerns above
-        forward_step_func_module = inspect.getmodule(forward_step_func)
-        # print_rank_0(f"[YOUNGEUNK] forward_step_func_module: {list(forward_step_func_module.__dict__.keys())}")
-        assert hasattr(
-            forward_step_func_module, 'get_batch'
-        ), "combined_forward_backward_core_func: assumes that forward_step_func has get_batch()"
-        assert hasattr(
-            forward_step_func_module, 'loss_func'
-        ), "combined_forward_backward_core_func: assumes that forward_step_func has loss_func()"
-
-        # extract get_batch function from the module
-        get_batch_func = forward_step_func_module.get_batch
-        # Data fetching
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
-
-        # Pre-core forward to handle warpper module's forward of GPTModel (e.g., Float16Module)
-        tokens, labels, loss_mask, attention_mask, position_ids = (
-            forward_model_chunk.pre_core_forward(
-                tokens, labels, loss_mask, attention_mask, position_ids
-            )
+    # Pre-core forward to handle warpper module's forward of GPTModel (e.g., Float16Module)
+    forward_inputs = (
+        forward_model_chunk.pre_core_forward(
+            tokens, labels, loss_mask, attention_mask, position_ids
         )
+    )
+    backward_inputs = (backward_output_tensor, backward_output_tensor_grad,)
 
-        # Pre-decoder forward
-        (
-            forward_decoder_input,
-            forward_rotary_pos_emb,
-            forward_rotary_pos_cos,
-            forward_rotary_pos_sin,
-            forward_sequence_len_offset,
-        ) = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
+    forward_output_tensor = combined_1f1b_model_execution(
+        forward_core_model,
+        backward_core_model,
+        forward_inputs,
+        backward_inputs,
+        backward_function,
+        config,
+    )
+    # Post-core forward to handle wrapper module's forward of GPTModel (e.g., Float16Module)
+    (forward_output_tensor,) = forward_core_model.post_core_forward(forward_output_tensor)
 
-        # Decoder forward -> this should be in combined_1f1b_decoder_computation in the future
-        # TODO: This is a placeholder for now
-        combined_1f1b_transformer_block_computation(
-            forward_gptmodel.decoder, backward_gptmodel.decoder, None, None
-        )
-
-        forward_decoder_output = forward_gptmodel.decoder(
-            hidden_states=forward_decoder_input,
-            attention_mask=attention_mask,
-            inference_params=None,
-            rotary_pos_emb=forward_rotary_pos_emb,
-            rotary_pos_cos=forward_rotary_pos_cos,
-            rotary_pos_sin=forward_rotary_pos_sin,
-            packed_seq_params=None,
-            sequence_len_offset=forward_sequence_len_offset,
-        )
-
-        # Post-decoder forward
-        forward_output_tensor = forward_gptmodel.post_decoder_forward(
-            hidden_states=forward_decoder_output,
-            input_ids=tokens,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            decoder_input=forward_decoder_input,
-            labels=labels,
-        )
-
-        # Post-core forward to handle wrapper module's forward of GPTModel (e.g., Float16Module)
-        (forward_output_tensor,) = forward_gptmodel.post_core_forward(forward_output_tensor)
-
-        # Backward pass
-        # TODO: decompose backward path into finer-grained calls
-        custom_backward(backward_output_tensor[0], backward_output_tensor_grad[0])
-
-        # Loss function for return
-        loss_func = partial(forward_step_func_module.loss_func, loss_mask)
-    else:
-        raise NotImplementedError(
-            f"combined_forward_backward_core_func for recipe:{config.combined_1f1b_recipe} is not implemented"
-        )
+    # Loss function for return
+    loss_func = partial(forward_step_func_module.loss_func, loss_mask)
 
     return forward_output_tensor, loss_func
 

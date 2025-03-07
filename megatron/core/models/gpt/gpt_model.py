@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional
+from typing import Callable, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -17,7 +17,7 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+from megatron.core.transformer.transformer_block import combined_1f1b_transformer_block_computation
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -327,7 +327,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
         """
-
+        # Pre-decoder forward
         decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
             self.pre_decoder_forward(
                 input_ids, position_ids, decoder_input, inference_params, packed_seq_params
@@ -385,3 +385,56 @@ class GPTModel(LanguageModule):
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict
+
+def combined_1f1b_model_execution(
+    forward_gptmodel,
+    backward_gptmodel,
+    forward_inputs,
+    backward_inputs,
+    backward_function,
+    config,
+) -> Tuple:
+    # TODO: Implement the combined 1f1b execution for GPTModel
+    tokens, labels, loss_mask, attention_mask, position_ids = forward_inputs
+    backward_output_tensor, backward_output_tensor_grad = backward_inputs
+
+    if config.combined_1f1b_recipe == 'ep_a2a':
+        # Forward pass
+        # Pre-decoder forward
+        (
+            forward_decoder_input,
+            forward_rotary_pos_emb,
+            forward_rotary_pos_cos,
+            forward_rotary_pos_sin,
+            forward_sequence_len_offset,
+        ) = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
+
+        forward_decoder_output = forward_gptmodel.decoder(
+            hidden_states=forward_decoder_input,
+            attention_mask=attention_mask,
+            inference_params=None,
+            rotary_pos_emb=forward_rotary_pos_emb,
+            rotary_pos_cos=forward_rotary_pos_cos,
+            rotary_pos_sin=forward_rotary_pos_sin,
+            packed_seq_params=None,
+            sequence_len_offset=forward_sequence_len_offset,
+        )
+
+        # Post-decoder forward
+        forward_output_tensor = forward_gptmodel.post_decoder_forward(
+            hidden_states=forward_decoder_output,
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=forward_decoder_input,
+            labels=labels,
+        )
+
+        # Backward pass
+        # TODO: decompose backward path into finer-grained calls
+        # and merge decoder fwd/bwd into a single combined_1f1b_transformer_block_computation call
+        backward_function(backward_output_tensor[0], backward_output_tensor_grad[0])
+
+        return forward_output_tensor
+    else:
+        raise ValueError(f"Unsupported overlap recipe: {config.combined_1f1b_recipe}")
