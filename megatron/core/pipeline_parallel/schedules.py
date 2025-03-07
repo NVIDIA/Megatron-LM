@@ -106,10 +106,6 @@ def get_forward_backward_func():
         step.
 
     """
-    print_rank_0(
-        f"[YOUNGEUNK] pp: {parallel_state.get_pipeline_model_parallel_world_size()},"
-        f" vpp: {parallel_state.get_virtual_pipeline_model_parallel_world_size()}"
-    )
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     if pipeline_model_parallel_size > 1:
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
@@ -135,9 +131,7 @@ def deallocate_output_tensor(out, deallocate_pipeline_outputs=False):
     out.data = torch.empty((1,), device=out.device, dtype=out.dtype)
 
 
-def custom_backward(
-    output, grad_output
-):  # YOUNGEUNK: we might need to add "inputs" argument for the finegrained backward pass
+def custom_backward(output, grad_output):
     '''Directly call C++ autograd engine.
 
     To make the 'deallocate_output_tensor' (above) optimization work, the C++
@@ -420,8 +414,8 @@ def combined_forward_backward_core_func(
     forward_model_chunk,
     forward_step_func,
     data_iterator,
-    checkpoint_activations_microbatch, # unused
-    set_backward_virtual_pipeline_model_parallel_rank, # unused
+    checkpoint_activations_microbatch,  # unused
+    set_backward_virtual_pipeline_model_parallel_rank,  # unused
     backward_model_chunk,
     backward_output_tensor,
     backward_output_tensor_grad,
@@ -431,9 +425,10 @@ def combined_forward_backward_core_func(
     This function is used to perform concurrent forward and backward passes.
     """
     set_forward_virtual_pipeline_model_parallel_rank()
-    
-    target_core_model_name = "GPTModel" # currently GPTModel is only supported for combined_1f1b
+
+    target_core_model_name = "GPTModel"  # currently GPTModel is only supported for combined_1f1b
     from megatron.core.models.gpt.gpt_model import combined_1f1b_model_execution
+
     forward_core_model = return_target_submodule(forward_model_chunk, target_core_model_name)
     backward_core_model = return_target_submodule(backward_model_chunk, target_core_model_name)
     assert forward_core_model is not None
@@ -443,8 +438,10 @@ def combined_forward_backward_core_func(
     # 2. NeMo should have the similar structure of forward_step_func() to retrieve get_batch() and loss_func()
     # 3. Not sure if I can assume that the GPTModel is always composed of (embedding) + decoder
 
-    backward_function = custom_backward if config.deallocate_pipeline_outputs else torch.autograd.backward
-    
+    backward_function = (
+        custom_backward if config.deallocate_pipeline_outputs else torch.autograd.backward
+    )
+
     forward_step_func_module = inspect.getmodule(forward_step_func)
 
     assert hasattr(
@@ -460,12 +457,10 @@ def combined_forward_backward_core_func(
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
 
     # Pre-core forward to handle warpper module's forward of GPTModel (e.g., Float16Module)
-    forward_inputs = (
-        forward_model_chunk.pre_core_forward(
-            tokens, labels, loss_mask, attention_mask, position_ids
-        )
+    forward_inputs = forward_model_chunk.pre_core_forward(
+        tokens, labels, loss_mask, attention_mask, position_ids
     )
-    backward_inputs = (backward_output_tensor, backward_output_tensor_grad,)
+    backward_inputs = (backward_output_tensor, backward_output_tensor_grad)
 
     forward_output_tensor = combined_1f1b_model_execution(
         forward_core_model,
@@ -520,7 +515,6 @@ def combined_forward_backward_step(
     )
 
     if config.combined_1f1b_recipe == 'golden':
-        # print_rank_0(f"[YOUNGEUNK] golden recipe")
         set_forward_virtual_pipeline_model_parallel_rank()
         forward_return = forward_step(
             forward_step_func,
@@ -859,7 +853,6 @@ def forward_backward_pipelining_with_interleaving(
     ), "interleaved pipeline parallelism expected each model chunk to have a data iterator"
 
     config = get_model_config(model[0])
-    # print_rank_0(f"[YOUNGEUNK] config: {config}")
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
@@ -928,12 +921,6 @@ def forward_backward_pipelining_with_interleaving(
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
 
-    print_rank_0(
-        f"[YOUNGEUNK] config.microbatch_group_size_per_vp_stage: {config.microbatch_group_size_per_vp_stage}"
-    )
-    print_rank_0(f"[YOUNGEUNK] num_microbatches: {num_microbatches}")
-    print_rank_0(f"[YOUNGEUNK] pipeline_parallel_size: {pipeline_parallel_size}")
-
     if (
         config.microbatch_group_size_per_vp_stage > num_microbatches
         or config.microbatch_group_size_per_vp_stage < pipeline_parallel_size
@@ -993,14 +980,6 @@ def forward_backward_pipelining_with_interleaving(
             num_warmup_microbatches = total_num_microbatches
             all_warmup_microbatches = True
     num_microbatches_remaining = total_num_microbatches - num_warmup_microbatches
-    # [YOUNGEUNK] pp: 8, vpp: 4
-    # [YOUNGEUNK] config.microbatch_group_size_per_vp_stage: 8
-    # [YOUNGEUNK] num_microbatches: 128
-    # [YOUNGEUNK] pipeline_parallel_size: 8
-    # [YOUNGEUNK] total_num_microbatches: 512
-    # [YOUNGEUNK] num_warmup_microbatches: 38
-    # [YOUNGEUNK] num_microbatches_remaining: 474
-
     print_rank_0(f"[YOUNGEUNK] total_num_microbatches: {total_num_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}")
     print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}")
@@ -1032,12 +1011,6 @@ def forward_backward_pipelining_with_interleaving(
     # microbatch_id         | 0 1 2 0 1 2 3 4 3 4
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
     schedule_table = []
-    # print_rank_0(f"[YOUNGEUNK] config.microbatch_group_size_per_vp_stage: {config.microbatch_group_size_per_vp_stage}") # 8
-    # print_rank_0(f"[YOUNGEUNK] num_microbatches: {num_microbatches}") # 128
-    # print_rank_0(f"[YOUNGEUNK] pipeline_parallel_size: {pipeline_parallel_size}") # 8
-    # print_rank_0(f"[YOUNGEUNK] total_num_microbatches: {total_num_microbatches}") # 512
-    # print_rank_0(f"[YOUNGEUNK] num_warmup_microbatches: {num_warmup_microbatches}") # 38
-    # print_rank_0(f"[YOUNGEUNK] num_microbatches_remaining: {num_microbatches_remaining}") # 474
     for min_microbatch_id_in_group in range(
         0, num_microbatches, config.microbatch_group_size_per_vp_stage
     ):
@@ -1287,7 +1260,6 @@ def forward_backward_pipelining_with_interleaving(
         return input_tensor_grad
 
     def forward_backward_step_helper(forward_k, backward_k, checkpoint_activations_microbatch):
-        # YOUNGEUNK
         # TODO: need to decompose the forward and backward helper functions and merge it
         # eventually calls combined_forward_backward_step()
         # ============================== pre-forward-step ================================

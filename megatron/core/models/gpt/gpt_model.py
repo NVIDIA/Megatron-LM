@@ -15,9 +15,12 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_block import (
+    TransformerBlock,
+    combined_1f1b_transformer_block_computation,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_block import combined_1f1b_transformer_block_computation
+
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -386,13 +389,9 @@ class GPTModel(LanguageModule):
 
         return sharded_state_dict
 
+
 def combined_1f1b_model_execution(
-    forward_gptmodel,
-    backward_gptmodel,
-    forward_inputs,
-    backward_inputs,
-    backward_function,
-    config,
+    forward_gptmodel, backward_gptmodel, forward_inputs, backward_inputs, backward_function, config
 ) -> Tuple:
     # TODO: Implement the combined 1f1b execution for GPTModel
     tokens, labels, loss_mask, attention_mask, position_ids = forward_inputs
