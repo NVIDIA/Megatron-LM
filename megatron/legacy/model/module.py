@@ -186,11 +186,11 @@ class Float16Module(MegatronModule):
     def pre_core_forward(self, *inputs):
         if mpu.is_pipeline_first_stage():
             inputs = fp32_to_float16(inputs, self.float16_convertor)
-        inputs = self.module.pre_core_forward(inputs)
+        inputs = self.module.pre_core_forward(*inputs)
         return inputs
 
     def post_core_forward(self, *outputs):
-        outputs = self.module.post_core_forward(outputs)
+        outputs = self.module.post_core_forward(*outputs)
         if mpu.is_pipeline_last_stage():
             outputs = float16_to_fp32(outputs)
         return outputs

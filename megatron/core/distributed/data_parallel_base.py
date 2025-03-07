@@ -101,5 +101,5 @@ class _BaseDataParallel(MegatronModule):
         return inputs
 
     def post_core_forward(self, *outputs):
-        outputs = self.module.post_core_forward(outputs)
+        outputs = self.module.post_core_forward(*outputs)
         return outputs

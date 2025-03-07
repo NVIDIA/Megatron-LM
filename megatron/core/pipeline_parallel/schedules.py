@@ -478,7 +478,7 @@ def combined_forward_backward_core_func(
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch_func(data_iterator)
 
         # Pre-core forward to handle warpper module's forward of GPTModel
-        forward_model_chunk.pre_core_forward(tokens, labels, loss_mask, attention_mask, position_ids)
+        tokens, labels, loss_mask, attention_mask, position_ids = forward_model_chunk.pre_core_forward(tokens, labels, loss_mask, attention_mask, position_ids)
 
         # Pre-decoder forward
         forward_decoder_input, forward_rotary_pos_emb, forward_rotary_pos_cos, forward_rotary_pos_sin, forward_sequence_len_offset = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
@@ -509,7 +509,7 @@ def combined_forward_backward_core_func(
         )
 
         # Post-core forward to handle wrapper module's forward of GPTModel
-        forward_output_tensor = forward_gptmodel.post_core_forward(forward_output_tensor)[0]
+        (forward_output_tensor,) = forward_gptmodel.post_core_forward(forward_output_tensor)
 
         # Backward pass
         # TODO: decompose backward path into finer-grained calls
