@@ -11,6 +11,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.endpoints.common import send_do_generate, send_do_beam_search, LOCK
 from megatron.inference.endpoints.completions import MegatronCompletions
 from megatron.inference.text_generation import beam_search_and_post_process
+from megatron.inference.text_generation.mcore_engine_server import run_mcore_engine
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -196,26 +197,7 @@ class MegatronGenerate(Resource):
                 else:
                     send_do_generate()  # Tell other ranks we're doing generate
 
-                    sampling_params = SamplingParams(
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                        return_segments=True,
-                        return_log_probs=logprobs,
-                        num_tokens_to_generate=tokens_to_generate,
-                    )
-                    result = list(
-                        self.engine.generate(
-                            prompts=prompts, common_inference_params=sampling_params
-                        )
-                    )
-                    response_dict = {"text": [x.prompt + x.generated_text for x in result]}
-                    if sampling_params.return_log_probs:
-                        response_logprobs = [x.prompt_log_probs + x.generated_log_probs for x in
-                                             result]
-                        response_dict["logprobs"] = response_logprobs
-                    if sampling_params.return_segments:
-                        response_dict["segments"] = [x.segments for x in result]
+                    response_dict = run_mcore_engine(self.engine, prompts, temperature, top_k, top_p, logprobs, tokens_to_generate)
 
                     return jsonify(response_dict)
 
