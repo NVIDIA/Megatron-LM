@@ -286,11 +286,13 @@ def forward_step(
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
                     output_tensor /= num_tokens
+                    output_tensor *= parallel_state.get_context_parallel_world_size()
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
                 assert len(outputs) == 2
                 output_tensor, loss_reduced = outputs
+                output_tensor *= parallel_state.get_context_parallel_world_size()
                 output_tensor /= num_microbatches
             forward_data_store.append(loss_reduced)
         else:
@@ -642,6 +644,8 @@ def forward_backward_pipelining_with_interleaving(
     forward_data_store = []
     if not forward_only:
         output_tensor_grads = [[] for _ in range(len(model))]
+    else:
+        output_tensor_grads = None
 
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()

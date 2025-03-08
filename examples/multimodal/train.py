@@ -257,9 +257,11 @@ def loss_func(loss_mask, output_tensor):
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
-    # We multiply by context parallel size because later there will be a divide by CP(+DP) size.
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
     return (
-        loss[0] * args.context_parallel_size,
+        loss[0].clone(),
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])}
     )
