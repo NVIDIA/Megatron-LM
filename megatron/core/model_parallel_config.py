@@ -217,6 +217,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
+    cross_entropy_fusion_impl: str = 'native'
+    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
+       from Transformer Engine library is used. Defaults to 'native'.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
