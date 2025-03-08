@@ -10,16 +10,22 @@ import modelopt.torch.distill as mtd
 import modelopt.torch.opt as mto
 import yaml
 
-from megatron.core.inference.modelopt_support.gpt.model_specs import get_gpt_layer_modelopt_spec
-from megatron.core.inference.modelopt_support.gpt.state_dict_hooks import (
+from megatron.core.post_training.modelopt.gpt.model_specs import (
+    get_gpt_modelopt_spec,
+)
+from megatron.core.post_training.modelopt.mamba.model_specs import (
+    get_mamba_stack_modelopt_spec,
+)
+from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_legacy_state_dict_pre_hook,
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.mamba import MambaModel as MCoreMambaModel
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.core.transformer.spec_utils import import_module
-from megatron.inference.algos import distillation
-from megatron.inference.checkpointing import load_modelopt_checkpoint, load_modelopt_state
+from megatron.post_training.algos import distillation
+from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
@@ -147,30 +153,57 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         )
 
     if args.spec is not None:
-        transformer_layer_spec = import_module(args.spec)
-    else:
-        transformer_layer_spec = get_gpt_layer_modelopt_spec(
-            num_experts=args.num_experts,
-            moe_grouped_gemm=args.moe_grouped_gemm,
+        raise ValueError( "ModelOpt integration does not support custom args.spec.")
+        
+    if args.export_model_type == "GPTModel":
+        transformer_layer_spec = get_gpt_modelopt_spec(
+            config=config,
+            local_core_attention=args.export_force_local_attention,
             remap_te_layernorm=args.export_te_mcore_model,
-            qk_layernorm=False,
+            real_quant_cfg=args.export_real_quant_cfg,
         )
+        model_kwargs = {
+            "transformer_layer_spec": transformer_layer_spec,
+            "vocab_size": args.padded_vocab_size,
+            "max_sequence_length": args.max_position_embeddings,
+            "pre_process": pre_process,
+            "post_process": post_process,
+            "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "parallel_output": parallel_output,
+            "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_percent": args.rotary_percent,
+            "rotary_base": args.rotary_base,
+            "rope_scaling": args.use_rope_scaling,
+        }
+        model = MCoreGPTModel(config=config, **model_kwargs)
+    elif args.export_model_type == "MambaModel":
+        mamba_stack_spec = get_mamba_stack_modelopt_spec(
+            remap_te_layernorm=args.export_te_mcore_model,
+        )
+        model = MCoreMambaModel(
+            config=config,
+            mamba_stack_spec=mamba_stack_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            hybrid_attention_ratio=args.hybrid_attention_ratio,
+            hybrid_mlp_ratio=args.hybrid_mlp_ratio,
+            hybrid_override_pattern=args.hybrid_override_pattern,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base
+        )
+    else:
+        raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))
 
-    model_kwargs = {
-        "transformer_layer_spec": transformer_layer_spec,
-        "vocab_size": args.padded_vocab_size,
-        "max_sequence_length": args.max_position_embeddings,
-        "pre_process": pre_process,
-        "post_process": post_process,
-        "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
-        "parallel_output": parallel_output,
-        "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
-        "position_embedding_type": args.position_embedding_type,
-        "rotary_percent": args.rotary_percent,
-        "rotary_base": args.rotary_base,
-        "rope_scaling": args.use_rope_scaling,
-    }
-    model = MCoreGPTModel(config=config, **model_kwargs)
+    # import modelopt.torch.speculative as mtsp
+    # config = {"eagle_num_layers": 1}
+    # model = mtsp.convert(model, [("eagle", config)])
 
     # Load modelopt_state
     modelopt_state = load_modelopt_state(model=model) if args.load else {}
@@ -213,9 +246,5 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
             assert distill_cfg is not None
             # Additional tweaks needed for MCore/Nemo.
             distillation.adjust_distillation_model_for_mcore(model, distill_cfg)
-
-    # Print models on all pp ranks.
-    if get_tensor_model_parallel_rank() == 0:
-        print(str(model))
 
     return model

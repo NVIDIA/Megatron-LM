@@ -24,6 +24,11 @@ def init_persistent_async_worker():
     _async_calls_queue = AsyncCallsQueue(persistent=True, process_group=mpu.get_default_process_group())
 
 
+def init_temporal_async_worker():
+    global _async_calls_queue
+    _async_calls_queue = AsyncCallsQueue(process_group=mpu.get_default_process_group())
+
+
 def schedule_async_save(async_request: AsyncRequest):
     """Schedule the async save request.
 

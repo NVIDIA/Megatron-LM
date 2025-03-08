@@ -4,36 +4,30 @@ import tempfile
 
 import pytest
 import torch
+from packaging.version import Version
 
 from megatron.core import InferenceParams, dist_checkpointing
 from megatron.core.device_utils import get_current_device
-from megatron.core.inference.modelopt_support.gpt.model_specs import get_gpt_layer_modelopt_spec
-from megatron.core.inference.modelopt_support.gpt.state_dict_hooks import (
-    mcore_gpt_load_te_state_dict_pre_hook,
-)
-from megatron.core.inference.modelopt_support.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_local_spec
 )
-
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
-from megatron.core.parallel_state import get_default_process_group
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
+    mcore_gpt_load_te_state_dict_pre_hook,
+)
+from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.utils import get_te_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
 
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
-
-def model_forward( model: torch.nn.Module, config: TransformerConfig, micro_batch_size: int = 2):
+def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch_size: int = 2):
     inference_params: InferenceParams = InferenceParams(
         max_batch_size=micro_batch_size, max_sequence_length=model.max_sequence_length
     )
@@ -68,55 +62,94 @@ def model_forward( model: torch.nn.Module, config: TransformerConfig, micro_batc
 
 class TestModelOptGPTModel:
 
+    _test_inference = True
+
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_device_manual_seed(123)
+        self._dist_checkpoint_name = "standard_gpt_model"
+
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
-        self.gpt_model = GPTModel(
+        self.default_model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec(),
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
         )
         # Ensure that a GPTModel can be built with the modelopt spec.
-        self.modelopt_gpt_model = GPTModel(
+        self.modelopt_model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_modelopt_spec(remap_te_layernorm=True, local_core_attention=not HAVE_TE),
+            transformer_layer_spec=get_gpt_modelopt_spec(
+                transformer_config, remap_te_layernorm=True
+            ),
             vocab_size=100,
             max_sequence_length=4,
         )
 
-    def test_load_te_state_dict_pre_hook(self):
-        handle = self.modelopt_gpt_model._register_load_state_dict_pre_hook(
-            mcore_gpt_load_te_state_dict_pre_hook
-        )
-        self.modelopt_gpt_model.load_state_dict(self.gpt_model.state_dict())
-        handle.remove()
-
     def test_sharded_state_dict_restore(self, tmp_path_dist_ckpt):
-        te_fused_sharded_state_dict = self.gpt_model.sharded_state_dict()
-        modelopt_sharded_state_dict = self.modelopt_gpt_model.sharded_state_dict()
+        """Save with the default TE spec and restore using the ModelOpt spec."""
+        _dist_checkpoint_name = "default_model"
+        te_fused_sharded_state_dict = self.default_model.sharded_state_dict()
+        modelopt_sharded_state_dict = self.modelopt_model.sharded_state_dict()
 
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_sharded_state_dict_restore', sync=True,
-            process_group=get_default_process_group()
-        ) as tmpdirname:
-            dist_checkpointing.save(te_fused_sharded_state_dict, tmpdirname, process_group=get_default_process_group())
-            state_dict = dist_checkpointing.load(modelopt_sharded_state_dict, tmpdirname, process_group=get_default_process_group())
-            self.modelopt_gpt_model.load_state_dict(state_dict)
+        with TempNamedDir(tmp_path_dist_ckpt / _dist_checkpoint_name, sync=True) as tmpdirname:
+            dist_checkpointing.save(te_fused_sharded_state_dict, tmpdirname)
+            state_dict = dist_checkpointing.load(modelopt_sharded_state_dict, tmpdirname)
+            self.modelopt_model.load_state_dict(state_dict)
 
     def test_inference(self):
-        config: TransformerConfig = self.modelopt_gpt_model.config
-        model = self.modelopt_gpt_model.to(device=get_current_device())
-        model_forward(model=model, config=config)
+        if not self._test_inference:
+            return
+        config: TransformerConfig = self.modelopt_model.config
+        model = self.modelopt_model.to(device=get_current_device())
+        model_forward(model, config)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
 
-class TestModelOptMambaModel:
+class TestModelOptMLAMoE(TestModelOptGPTModel):
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_device_manual_seed(123)
+
+        # Early version of TE DotProductAttention does not support
+        # q, k, v to have different shapes.
+        self._test_inference = get_te_version() > Version("1.10")
+
+        transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=512,
+            num_attention_heads=8,
+            add_bias_linear=False,
+            num_moe_experts=2,
+            moe_layer_freq=[0, 1],
+            moe_ffn_hidden_size=128,
+            moe_shared_expert_intermediate_size=128,
+            qk_layernorm=True,
+            use_cpu_initialization=True,
+        )
+        default_spec = get_gpt_decoder_block_spec(transformer_config, use_transformer_engine=True)
+        self.default_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=default_spec,
+            vocab_size=100,
+            max_sequence_length=8,
+        )
+        modelopt_spec = get_gpt_modelopt_spec(transformer_config, remap_te_layernorm=True)
+        # Ensure that a GPTModel can be built with the modelopt spec.
+        self.modelopt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=modelopt_spec,
+            vocab_size=100,
+            max_sequence_length=8,
+        )
+
+
+class TestModelOptMambaModel(TestModelOptGPTModel):
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -126,7 +159,7 @@ class TestModelOptMambaModel:
         )
 
         # A Hybrid MambaModel using fused-TE spec (default)
-        self.mamba_model = MambaModel(
+        self.default_model = MambaModel(
             config=transformer_config,
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=100,
@@ -135,55 +168,31 @@ class TestModelOptMambaModel:
         )
 
         # A Hybrid MambaModel using ModelOpt spec (local + TENorm).
-        self.modelopt_mamba_model = MambaModel(
+        self.modelopt_model = MambaModel(
             config=transformer_config,
-            mamba_stack_spec=get_mamba_stack_modelopt_spec(remap_te_layernorm=True, local_core_attention=not HAVE_TE),
+            mamba_stack_spec=get_mamba_stack_modelopt_spec(remap_te_layernorm=True),
             vocab_size=100,
             max_sequence_length=4,
             hybrid_override_pattern="M*-",
         )
 
-    @pytest.mark.skipif(not HAVE_TE, reason="Requires Transformer Engine")
-    def test_sharded_state_dict_restore(self, tmp_path_dist_ckpt):
-        te_fused_sharded_state_dict = self.mamba_model.sharded_state_dict()
-        modelopt_sharded_state_dict = self.modelopt_mamba_model.sharded_state_dict()
 
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_sharded_state_dict_restore', sync=True
-        ) as tmpdirname:
-            dist_checkpointing.save(te_fused_sharded_state_dict, tmpdirname)
-            state_dict = dist_checkpointing.load(modelopt_sharded_state_dict, tmpdirname)
-            self.modelopt_mamba_model.load_state_dict(state_dict)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel code not ported to XLA")
-    def test_inference(self):
-        config: TransformerConfig = self.modelopt_mamba_model.config
-        model = self.modelopt_mamba_model.to(device=get_current_device())
-        model_forward(model=model, config=config)
-
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
-
-
-def test_get_gpt_layer_modelopt_spec_interface():
+def test_get_gpt_modelopt_spec_interface():
     # Get the function signature
-    sig = inspect.signature(get_gpt_layer_modelopt_spec)
+    sig = inspect.signature(get_gpt_modelopt_spec)
 
     # Define the expected signature
     expected_params = {
-        "num_experts": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "config": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "local_core_attention": inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        "moe_grouped_gemm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "remap_te_layernorm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        "qk_layernorm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "real_quant_cfg": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
     expected_defaults = {
-        "num_experts": None,
         "local_core_attention": False,
-        "moe_grouped_gemm": False,
         "remap_te_layernorm": False,
-        "qk_layernorm": False,
+        "real_quant_cfg": "None",
     }
 
     # Check parameter kinds

@@ -19,7 +19,7 @@ except ImportError:
     except ImportError:
         HAVE_FSDP = False
 
-from megatron.core.utils import is_float8tensor
+from megatron.core.fp8_utils import is_float8tensor
 
 from .. import parallel_state, tensor_parallel
 from ..models.common.embeddings.language_model_embedding import LanguageModelEmbedding

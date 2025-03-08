@@ -784,7 +784,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         cu_lengths = torch.tensor([[0]], dtype=torch.int32)
         max_lengths = torch.tensor([[0]], dtype=torch.int32)
 
-        if self.is_packing_enabled:
+        if isinstance(samples[0], ImageTaskSamplePacked):
             cu_lengths = torch.stack([s.cu_lengths for s in samples])
             max_lengths = torch.tensor([s.max_length for s in samples], dtype=torch.int32)
 

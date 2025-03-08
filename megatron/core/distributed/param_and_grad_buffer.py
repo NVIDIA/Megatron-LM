@@ -14,7 +14,8 @@ from torch.distributed import _coalescing_manager
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..utils import is_float8tensor, is_torch_min_version, log_on_each_pipeline_stage
+from ..fp8_utils import is_float8tensor
+from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
 logger = logging.getLogger(__name__)
@@ -365,6 +366,7 @@ class _ParamAndGradBucketGroup:
             and self.ddp_config.num_distributed_optimizer_instances > 1
         ):
 
+            assert self.inter_distributed_optimizer_instance_group is not None
             # Create a new coalescing manager for the inter-instance all-reduce.
             with stream_context, _coalescing_manager(
                 self.inter_distributed_optimizer_instance_group, async_ops=async_op

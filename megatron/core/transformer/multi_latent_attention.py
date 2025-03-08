@@ -398,6 +398,12 @@ class MLASelfAttention(MultiLatentAttention):
             sequence_start = inference_params.sequence_len_offset
             sequence_end = sequence_start + q_len
             rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
+        else:
+            # Shorten rotary_pos_emb to the seuqence length when inference_params
+            # is not provided. This makes sure we can run forward directly with
+            # any sequence length. During training, the sequence length is always
+            # the full rotary_pos_emb length.
+            rotary_pos_emb = rotary_pos_emb[0:q_len]
 
         # [s, b, 64] -> [s, b, 1, 64]
         k_pos_emb = torch.unsqueeze(k_pos_emb, 2)

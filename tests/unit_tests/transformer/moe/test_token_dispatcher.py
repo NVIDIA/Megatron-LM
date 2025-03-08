@@ -2,12 +2,15 @@
 
 import copy
 from megatron.core.device_utils import get_current_device, get_xla_model
+import dataclasses
+
 import pytest
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
@@ -77,7 +80,7 @@ class MoEModelTestContainer:
         # init moe layer
         self.moe_layer = self.new_moe_layer()
 
-    def new_moe_layer(self):
+    def new_moe_layer(self, **kargs):
         transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
         )
@@ -138,7 +141,8 @@ class MoEModelTestContainer:
     @pytest.mark.internal
     def dispatcher_capacity_test(self):
         moe_layer = self.moe_layer
-        hidden_states = torch.randn((256, moe_layer.config.hidden_size))
+        num_tokens = 16
+        hidden_states = torch.randn((num_tokens, moe_layer.config.hidden_size))
         hidden_states = hidden_states.to(device=get_current_device())
         hidden_states.requires_grad = True
         probs, indices = moe_layer.router(hidden_states)
@@ -152,6 +156,19 @@ class MoEModelTestContainer:
         (permuted_local_hidden_states, tokens_per_expert) = (
             moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
         )
+
+        # Check tokens per expert not exceed the capacity.
+        capacity = get_capacity(
+            num_tokens * self.config.moe_router_topk,
+            self.config.num_moe_experts,
+            self.config.moe_expert_capacity_factor,
+        )
+        assert torch.all(
+            tokens_per_expert
+            <= capacity
+            * self.config.expert_model_parallel_size
+            * self.config.tensor_model_parallel_size
+        ), "Tokens per expert exceed the capacity"
 
         permuted_local_hidden_states /= moe_layer.config.tensor_model_parallel_size
 
@@ -170,30 +187,21 @@ class MoEModelTestContainer:
 
     @pytest.mark.internal
     def dispatcher_drop_and_pad_test(self):
-        "Test if the tokens are dropped and padded correctly"
-        moe_layer = self.moe_layer
-        moe_layer_2 = copy.deepcopy(moe_layer)
-        hidden_states = torch.randn((256, moe_layer.config.hidden_size)).to(device=get_current_device())
+        """Test if the tokens are dropped and padded correctly.
+
+        Since the probs of padded tokens are 0, the combined results for
+        dispatching with or without padding should be the same.
+        """
+        moe_layer = self.new_moe_layer(moe_pad_expert_input_to_capacity=False)
+
+        num_tokens = 16
+        hidden_states = torch.randn((num_tokens, moe_layer.config.hidden_size)).to(device=get_current_device())
         hidden_states.requires_grad = True
-
-        moe_layer.config.moe_pad_expert_input_to_capacity = False
-        moe_layer.token_dispatcher.drop_and_pad = False
-
-        # Uncomment these lines to help bug location.
-        # hidden_states = torch.ones((8, moe_layer.config.hidden_size)).to(device=get_current_device())
-        # hidden_states = hidden_states * torch.range(1, 8).unsqueeze(1).to(device=get_current_device())
-        # hidden_states.requires_grad = True
-        # indices_1 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).to(device=get_current_device())
-        # probs_1 = torch.ones_like(indices_1)
-        # indices_2 = torch.tensor([[0, 0], [1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6], [7, 7]]).to(device=get_current_device())
-        # probs_2 = torch.ones_like(indices_2)
-        # num_local_tokens_per_expert = torch.tensor([2, 2, 2, 2, 2, 2, 2, 2]).to(device=get_current_device())
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
         (permuted_input_1, tokens_per_expert) = moe_layer.token_dispatcher.token_permutation(
             hidden_states, probs_1, indices_1
         )
-        torch.distributed.barrier()
         forward_answer, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
             permuted_input_1
         )
@@ -209,10 +217,8 @@ class MoEModelTestContainer:
         moe_layer.config.moe_pad_expert_input_to_capacity = True
         # End
 
-        moe_layer_2 = self.new_moe_layer()
+        moe_layer_2 = self.new_moe_layer(moe_pad_expert_input_to_capacity=True)
         moe_layer_2.load_state_dict(moe_layer.state_dict())
-        moe_layer_2.config.moe_pad_expert_input_to_capacity = True
-        moe_layer_2.token_dispatcher.drop_and_pad = True
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
         (permuted_input_2, tokens_per_expert) = moe_layer_2.token_dispatcher.token_permutation(
@@ -221,7 +227,19 @@ class MoEModelTestContainer:
         restored_hidden_states, restored_bias = moe_layer_2.token_dispatcher.token_unpermutation(
             permuted_input_2
         )
-        torch.distributed.barrier()
+
+        # # Check tokens per expert equals to the capacity.
+        capacity = get_capacity(
+            num_tokens * self.config.moe_router_topk,
+            self.config.num_moe_experts,
+            self.config.moe_expert_capacity_factor,
+        )
+        assert torch.all(
+            tokens_per_expert
+            == capacity
+            * self.config.expert_model_parallel_size
+            * self.config.tensor_model_parallel_size
+        ), "Tokens per expert should be the same as the capacity"
         assert torch.allclose(
             restored_hidden_states, forward_answer
         ), "Restored hidden states does not match"
@@ -353,28 +371,3 @@ class TestFlexDispatcher:
             moe_enable_deepep=True,
         )
         container.dispatcher_capacity_test()
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
-    @pytest.mark.timeout(120)
-    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
-    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
-    def test_capacity_padding_forward_backward(self, tp_size, ep_size, permute_fusion):
-        container = MoEModelTestContainer(
-            tp_size=tp_size,
-            ep_size=ep_size,
-            pp_size=1,
-            num_moe_experts=8,
-            moe_router_topk=2,
-            moe_router_load_balancing_type="aux_loss",
-            moe_token_dispatcher_type="flex",
-            moe_token_drop_policy="probs",
-            moe_expert_capacity_factor=0.6,
-            moe_pad_expert_input_to_capacity=True,
-            moe_permute_fusion=permute_fusion,
-            hidden_size=4,
-            moe_enable_deepep=True,
-        )
-        container.dispatcher_drop_and_pad_test()

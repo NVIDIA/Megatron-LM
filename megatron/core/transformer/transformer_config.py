@@ -528,6 +528,12 @@ class TransformerConfig(ModelParallelConfig):
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
 
+        if self.moe_token_dispatcher_type == "flex":
+            if self.moe_pad_expert_input_to_capacity:
+                raise ValueError(
+                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
+                )
+
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(

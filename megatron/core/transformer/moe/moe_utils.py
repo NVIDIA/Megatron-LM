@@ -449,7 +449,8 @@ def topk_softmax_with_capacity(
         topk (int): The number of experts to select for each token.
         capacity_factor (float): The capacity factor of each expert. Will drop tokens if the number
                                of tokens exceeds the capacity.
-        pad_to_capacity (bool): Whether to need padding in token drop mode.
+        pad_to_capacity (bool): Whether to need padding in token drop mode. The probs for padded
+                               tokens will be 0.
         drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
                            If "prob", the tokens with the lowest probabilities will be dropped.
                            If "position", tokens at the end of each batch will be dropped.

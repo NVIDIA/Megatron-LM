@@ -123,6 +123,7 @@ test:unit_tests_configure:
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job test:unit_tests_configure"
+        "--slurm-account ${CI_SLURM_ACCOUNT}"
       )
     - |
       export PYTHONPATH=$(pwd)
@@ -417,7 +418,7 @@ test:pypi_test_wheel:
     PUBLISH_DRYRUN: 'yes'
   script:
     - rm -rf megatron
-    - pip install wheelhouse/*cp311*.whl
+    - pip install --no-cache-dir wheelhouse/*cp311*.whl
 
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
     - >
@@ -602,3 +603,9 @@ test:generate_coverage_report:
       coverage_report:
         coverage_format: cobertura
         path: coverage.xml
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success

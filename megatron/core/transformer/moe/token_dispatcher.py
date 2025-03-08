@@ -719,18 +719,26 @@ class _DeepepManager(_DispatchManager):
     """
 
     def __init__(
-        self, group: torch.distributed.ProcessGroup, router_topk: int, permute_fusion: bool = False
+        self,
+        group: torch.distributed.ProcessGroup,
+        router_topk: int,
+        permute_fusion: bool = False,
+        capacity_factor: float = None,
+        num_experts: int = None,
+        num_local_experts: int = None,
     ):
         self.group = group
         self.router_topk = router_topk
+        self.capacity_factor = capacity_factor
+        self.permute_fusion = permute_fusion
+        self.num_experts = num_experts
+        self.num_local_experts = num_local_experts
 
         # Metadata
         self.token_indices = None
         self.token_probs = None
         # Handle used for combine operation
         self.handle = None
-
-        self.permute_fusion = permute_fusion
 
         if fused_dispatch is None:
             raise ImportError(
@@ -739,11 +747,16 @@ class _DeepepManager(_DispatchManager):
             )
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
-        self.num_instances = routing_map.shape[-1]
+        num_tokens = routing_map.shape[0]
 
-        probs = probs.reshape(probs.shape[0], -1)
-        self.num_experts = probs.shape[-1]
+        routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        probs = probs.reshape(num_tokens, self.num_experts)
+        # Convert the format of routing map from multihot to indices.
         self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+        # Mask the indices of dropped tokens with -1
+        if self.capacity_factor is not None:
+            mask = self.token_probs == 0
+            self.token_indices = self.token_indices.masked_fill(mask, -1)
 
     def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
@@ -760,7 +773,7 @@ class _DeepepManager(_DispatchManager):
 
     def _indices_to_multihot(self, indices, probs):
         """
-        Converts a tensor of indices to a multihot vector efficiently in PyTorch.
+        Converts a tensor of indices to a multihot vector.
 
         Args:
             indices (torch.Tensor): [num_tokens, topk] token indices, where -1 means masked out.
@@ -773,11 +786,11 @@ class _DeepepManager(_DispatchManager):
         """
         batch_size = indices.shape[0]
         multihot_routing_map = torch.zeros(
-            (batch_size, self.num_instances), dtype=torch.long, device=indices.device
+            (batch_size, self.num_local_experts), dtype=torch.long, device=indices.device
         )
 
         multihot_probs = torch.zeros(
-            (batch_size, self.num_instances), dtype=torch.float, device=indices.device
+            (batch_size, self.num_local_experts), dtype=torch.float, device=indices.device
         )
 
         mask = indices != -1
@@ -800,6 +813,8 @@ class _DeepepManager(_DispatchManager):
 
     def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states, event = fused_combine(hidden_states, self.group, self.handle)
+        # Release the handle after combine operation
+        self.handle = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -845,10 +860,16 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         assert (
             self.config.moe_enable_deepep
         ), "DeepEP is not enabled. Please set --moe-enable-deepep to use DeepEP backend."
+        assert (
+            self.config.moe_pad_expert_input_to_capacity is False
+        ), "Flex token dispatcher does not support --moe-pad-expert-input-to-capacity"
         self._comm_manager = _DeepepManager(
-            self.tp_ep_group,
-            self.tp_size * self.config.moe_router_topk,
+            group=self.tp_ep_group,
+            router_topk=self.tp_size * self.config.moe_router_topk,
             permute_fusion=self.config.moe_permute_fusion,
+            capacity_factor=self.config.moe_expert_capacity_factor,
+            num_experts=self.tp_size * self.config.num_moe_experts,
+            num_local_experts=self.num_local_experts,
         )
 
     def set_shared_experts(self, shared_experts):

@@ -30,8 +30,8 @@ from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_model_config,
     StragglerDetector,
-    is_float8tensor,
 )
+from megatron.core.fp8_utils import is_float8tensor
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -596,7 +596,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # in the fully_shard function of FSDP2 instead.
     if torch.cuda.is_available() and not (args.use_torch_fsdp2 and args.use_cpu_initialization) and not args.init_model_with_meta_device:
         for model_module in model:
-            model_module.cuda(get_current_device())
+            model_module.to(device=get_current_device())
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
