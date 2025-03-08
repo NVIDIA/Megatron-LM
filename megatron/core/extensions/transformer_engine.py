@@ -1357,3 +1357,17 @@ except ImportError:
     fused_permute = None
     fused_unpermute = None
     fused_sort_chunks_by_index = None
+
+try:
+
+    from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
+
+    def te_parallel_cross_entropy(logits: torch.Tensor, labels: torch.Tensor):
+        """Wrapper function for TE's Cross Entropy Loss kernel"""
+        return parallel_cross_entropy(
+            logits, labels, 0.0, False, get_tensor_model_parallel_group(check_initialized=False)
+        )
+
+except ImportError:
+
+    te_parallel_cross_entropy = None
