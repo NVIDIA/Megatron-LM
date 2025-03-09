@@ -40,9 +40,9 @@ DISTRIBUTED_ARGS="
 
 # test (testing expert model parallel size 2 241205)
 GPT_ARGS="
-    --num-layers 2 \
-    --hidden-size 512 \
-    --num-attention-heads 8 \
+    --num-layers 12 \
+    --hidden-size 768 \
+    --num-attention-heads 12 \
     --seq-length 512 \
     --max-position-embeddings 512 \
     --micro-batch-size 4 \
