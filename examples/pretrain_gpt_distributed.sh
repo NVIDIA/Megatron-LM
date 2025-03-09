@@ -6,7 +6,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_SOCKET_IFNAME=ens3
 export GLOO_SOCKER_IFNAME=ens3
 
-GPUS_PER_NODE=4 # testing 241205
+GPUS_PER_NODE=1 # testing 241205
  
 # #single node
 # MASTER_ADDR=localhost
@@ -19,7 +19,7 @@ GPUS_PER_NODE=4 # testing 241205
 # # multinode
 MASTER_ADDR=10.0.2.15
 MASTER_PORT=23456
-NNODES=2
+NNODES=4
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
@@ -40,9 +40,9 @@ DISTRIBUTED_ARGS="
 
 # test (testing expert model parallel size 2 241205)
 GPT_ARGS="
-    --num-layers 12 \
-    --hidden-size 768 \
-    --num-attention-heads 12 \
+    --num-layers 2 \
+    --hidden-size 512 \
+    --num-attention-heads 8 \
     --seq-length 512 \
     --max-position-embeddings 512 \
     --micro-batch-size 4 \
@@ -56,7 +56,7 @@ GPT_ARGS="
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --use-mcore-models \
-    --num-experts 8 \
+    --num-experts 4 \
     --expert-model-parallel-size 1 \
     --use-distributed-optimizer \
 "
