@@ -56,8 +56,8 @@ GPT_ARGS="
     --lr-warmup-fraction .01 \
     --clip-grad 1.0 \
     --use-mcore-models \
-    --num-experts 16 \
-    --expert-model-parallel-size 2 \
+    --num-experts 8 \
+    --expert-model-parallel-size 1 \
     --use-distributed-optimizer \
 "
 # Arguments should vary by commit version
