@@ -60,7 +60,12 @@ class MLP(MegatronModule):
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
-        ffn_hidden_size = self.config.ffn_hidden_size
+        if is_expert and self.config.moe_ffn_hidden_size != None:
+            # Experts read ffn_hidden_size from config.moe_ffn_hidden_size
+            ffn_hidden_size = self.config.moe_ffn_hidden_size
+        else:
+            # Normal MLPs read ffn_hidden_size from config.ffn_hidden_size
+            ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 

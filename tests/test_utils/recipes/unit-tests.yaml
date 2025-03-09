@@ -46,7 +46,14 @@ spec:
       MARKER_ARG+=" and $element"
     done
 
-    IGNORE_TEST_CASES=$(cat /opt/megatron-lm/tests/test_utils/recipes/unit-tests.yaml | yq eval 'with(.products[].test_case; del(.[] | select(. == env(BUCKET)))) | .products[].test_case[]' | tr " " "\n")
+    IGNORE_TEST_CASES=$(cat /opt/megatron-lm/tests/test_utils/recipes/unit-tests.yaml | \
+      yq eval '
+        with(.products[].test_case; del(.[] | select(. == env(BUCKET)))) 
+        | .products[].test_case[]
+      ' \
+      | tr " " "\n"
+    )
+
     IGNORE_ARGS=()
     while IFS= read -r test_case; do
       if [[ $test_case == *\** ]]; then
@@ -82,6 +89,7 @@ spec:
     export NCCL_NVLS_ENABLE=0
 
     for i in $(seq $UNIT_TEST_REPEAT); do
+      echo "Running prod test suite."
       CMD=$(echo torchrun ${{DISTRIBUTED_ARGS[@]}} -m pytest \
         -xvs \
         --cov-report=term \
@@ -89,9 +97,18 @@ spec:
         --cov=megatron/core \
         --cov-report xml:coverage.xml \
         --no-cov-on-fail ${{IGNORE_ARGS[@]}} \
-        -m "'${{MARKER_ARG}}'" $BUCKET)
-      
-      eval "$CMD"    
+        -m "'not experimental and ${{MARKER_ARG}}'" $BUCKET)
+      eval "$CMD"
+
+      if [[ "$TAG" == "latest" ]]; then
+        CMD=$(echo torchrun ${{DISTRIBUTED_ARGS[@]}} -m pytest \
+          -xvs \
+          --experimental \
+          -m "'experimental and ${{MARKER_ARG}}'" $BUCKET)
+        
+        eval "$CMD"
+      fi
+          
     done
 
     ls -al 

@@ -3,8 +3,11 @@
 from typing import Callable
 
 import torch
+import transformer_engine as te
 
+from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
@@ -18,6 +21,53 @@ except Exception:
     has_nvidia_modelopt = False
 
 
+class Norm:
+    """
+    A conditional wrapper to initialize an instance of Transformer-Engine's
+    `LayerNorm` or `RMSNorm` based on input. If there is an additional _extra_state,
+    insert _state_dict_hook and _load_state_dict_pre_hook to handle the state_dict
+    mismatch issue.
+    """
+
+    def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+        if config.normalization == "LayerNorm":
+            instance = te.pytorch.LayerNorm(
+                hidden_size=hidden_size,
+                eps=eps,
+                sequence_parallel=config.sequence_parallel,
+                zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                **_get_extra_te_kwargs(config),
+            )
+        elif config.normalization == "RMSNorm":
+            assert hasattr(
+                te.pytorch, "RMSNorm"
+            ), "Transformer-Engine >= v0.11 required to use this feature"
+            instance = te.pytorch.RMSNorm(
+                hidden_size=hidden_size,
+                eps=eps,
+                sequence_parallel=config.sequence_parallel,
+                zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                **_get_extra_te_kwargs(config),
+            )
+        else:
+            raise Exception('Only LayerNorm and RMSNorm are curently supported')
+
+        def _state_dict_hook(self, state_dict, prefix, local_metadata):
+            if "_extra_state" in state_dict:
+                state_dict.pop("_extra_state")
+
+        def _load_state_dict_pre_hook(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        ):
+            state_dict[prefix + "_extra_state"] = None
+
+        if "_extra_state" in instance.state_dict():
+            instance._register_state_dict_hook(_state_dict_hook)
+            instance._register_load_state_dict_pre_hook(_load_state_dict_pre_hook)
+
+        return instance
+
+
 class Linear(torch.nn.Linear):
     """Local Linear impl as a replacement of TELinear."""
 
@@ -26,14 +76,13 @@ class Linear(torch.nn.Linear):
         input_size: int,
         output_size: int,
         *,
-        parallel_mode: str,
         config: ModelParallelConfig,
         init_method: Callable,
-        bias: bool,
-        skip_bias_add: bool,
-        skip_weight_param_allocation: bool,
-        tp_comm_buffer_name: str = None,
+        bias: bool = True,
+        skip_bias_add: bool = False,
+        skip_weight_param_allocation: bool = False,
         is_expert: bool = False,
+        **kwargs,
     ):
         self.config = config
 

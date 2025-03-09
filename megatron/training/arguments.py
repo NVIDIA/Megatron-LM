@@ -451,6 +451,8 @@ def validate_args(args, defaults={}):
             '--use-torch-fsdp2 requires --untie-embeddings-and-output-weights'
         assert not args.fp16, \
             '--use-torch-fsdp2 not supported with fp16 yet'
+        assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
+            'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -473,8 +475,8 @@ def validate_args(args, defaults={}):
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
     if args.fp8_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--fp8-param-gather only supported with distributed optimizer'
+        assert args.use_distributed_optimizer or args.use_torch_fsdp2, \
+            '--fp8-param-gather only supported with distributed optimizer or torch fsdp2'
 
     if args.use_custom_fsdp:
         assert args.use_distributed_optimizer, \
@@ -488,6 +490,9 @@ def validate_args(args, defaults={}):
         if args.data_parallel_sharding_strategy == "optim_grads_params":
             assert args.check_weight_hash_across_dp_replicas_interval is None, \
                 'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
+        
+        assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
+            'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -687,26 +692,20 @@ def validate_args(args, defaults={}):
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
-    if args.sequence_parallel:
-        args.async_tensor_model_parallel_allreduce = False
-        if args.use_torch_fsdp2:
-            warnings.warn(
-                "Using sequence parallelism with FSDP2 together. Try not to using them "
-                "together since they require different CUDA_MAX_CONNECTIONS settings "
-                "for best performance. sequence parallelism requires setting the "
-                "environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while FSDP2 "
-                "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
-
-    if torch.cuda.is_available() and os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1" and get_device_arch_version() < 10:
+    if torch.cuda.is_available() and args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1 and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
-        if args.sequence_parallel:
+        if args.use_torch_fsdp2 or args.use_custom_fsdp:
+            fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Custom-FSDP"
             warnings.warn(
-                "Using sequence parallelism requires setting the environment variable "
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-        if args.async_tensor_model_parallel_allreduce:
-            warnings.warn(
-                "Using async gradient all reduce requires setting the environment "
-                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+                f"Using tensor model parallelism or context parallelism with {fsdp_impl} together. "
+                "Try not to using them together since they require different CUDA_MAX_CONNECTIONS "
+                "settings for best performance. sequence parallelism requires setting the "
+                f"environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while {fsdp_impl} "
+                "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
+        else:
+            assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
+                "Using tensor model parallelism or context parallelism require setting the environment variable " \
+                "CUDA_DEVICE_MAX_CONNECTIONS to 1"
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -2062,7 +2061,8 @@ def _add_tokenizer_args(parser):
                                 'Llama2Tokenizer',
                                 'TikTokenizer',
                                 'MultimodalTokenizer',
-                                'NullTokenizer'],
+                                'NullTokenizer',
+                                'NullMultimodalTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
@@ -2330,6 +2330,13 @@ def _add_moe_args(parser):
                        choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+    group.add_argument('--moe-router-dtype', type=str, 
+                       choices=['fp32', 'fp64'], 
+                       default=None,
+                       help='Data type for routing computation and expert output weighted averaging. '
+                            'Fp32/fp64 enhances numerical stability, especially with numerous experts. '
+                            'The perf impact should be negligible when used with permute fusion. '
+                            'None means no changes for dtype.')
     group.add_argument('--moe-router-score-function', type=str,
                        choices=['softmax', 'sigmoid'],
                        default='softmax',

@@ -86,6 +86,7 @@ class MultiLatentAttention(Attention):
                 rotary_base=self.config.rotary_base,
             )
         elif self.config.rope_type == "yarn":
+            assert not self.config.apply_rope_fusion, "MLA Yarn RoPE does not support RoPE fusion"
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=self.config.rotary_base,

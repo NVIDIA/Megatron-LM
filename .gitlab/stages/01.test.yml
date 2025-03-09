@@ -70,6 +70,7 @@ test:build_image:
         DOCKER_BUILDKIT=1 docker build \
           --secret id=JET_INDEX_URLS \
           --secret id=LOGGER_INDEX_URL \
+          --secret id=EXPERIMENTAL_FLASH_ATTN \
           --target $STAGE \
           -f $FILE \
           -t ${IMAGE}:${CI_PIPELINE_ID} \
@@ -78,11 +79,11 @@ test:build_image:
           --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
           --build-arg MCORE_REF=$CI_COMMIT_SHA \
           --build-arg MCORE_BACKWARDS_REF=$MCORE_BACKWARDS_REF \
-          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
-          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:main \
           --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
+          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
           --push \
           ${ADDITIONAL_PARAMS[@]} .
@@ -355,14 +356,20 @@ test:secret_detection:
 test:pypi_build_wheel:
   extends: [.test_rules]
   image:
-    name: quay.io/pypa/manylinux_2_28_x86_64
+    name: ${IMAGE}
     entrypoint: ['']
   services:
     - name: docker:24.0.5-dind
       variables:
         HEALTHCHECK_TCP_PORT: '2376'
+  parallel:
+    matrix:
+      - PLATFORM: arm64
+        IMAGE: quay.io/pypa/manylinux_2_28_aarch64
+      - PLATFORM: amd64
+        IMAGE: quay.io/pypa/manylinux_2_28_x86_64
   tags: 
-    - arch/amd64
+    - arch/${PLATFORM}
     - env/prod
     - origin/jet-fleet
     - owner/jet-core
@@ -379,7 +386,6 @@ test:pypi_build_wheel:
         sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
 
-
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
     - auditwheel repair dist/*.whl
@@ -388,7 +394,7 @@ test:pypi_build_wheel:
     - pushd megatron/core
     - EXPECTED_RELEASE_NUMBER=$(/opt/python/cp311-cp311/bin/python -c "import package_info; print(package_info.__version__)")
     - popd
-    - echo "EXPECTED_RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
+    - echo "EXPECTED_RELEASE_NUMBER_$PLATFORM=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
     paths:
       - megatron/core/package_info.py
@@ -403,12 +409,16 @@ test:pypi_test_wheel:
     name: python:3.11
     entrypoint: ['']
   needs: [test:pypi_build_wheel]
+  parallel:
+    matrix:
+      - PLATFORM: arm64
+      - PLATFORM: amd64
   services:
     - name: docker:24.0.5-dind
       variables:
         HEALTHCHECK_TCP_PORT: '2376'
   tags: 
-    - arch/amd64
+    - arch/${PLATFORM}
     - env/prod
     - origin/jet-fleet
     - owner/jet-core
@@ -418,14 +428,23 @@ test:pypi_test_wheel:
     PUBLISH_DRYRUN: 'yes'
   script:
     - rm -rf megatron
-    - pip install --no-cache-dir wheelhouse/*cp311*.whl
+
+    - >
+      if [[ "$PLATFORM" == "arm64" ]]; then
+        pip install --no-cache-dir wheelhouse/*cp311*aarch64.whl
+      else
+        pip install --no-cache-dir wheelhouse/*cp311*x86_64.whl
+      fi
 
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
+
     - >
-      echo "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
+      if [[ "$PLATFORM" == "arm64" ]]; then
+        test "$EXPECTED_RELEASE_NUMBER_arm64" == "$RELEASE_NUMBER"
+      else
+        test "$EXPECTED_RELEASE_NUMBER_amd64" == "$RELEASE_NUMBER"
+      fi
 
-
-    - test "$EXPECTED_RELEASE_NUMBER" == "$RELEASE_NUMBER"
     - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
     reports:

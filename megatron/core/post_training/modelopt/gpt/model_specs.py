@@ -3,12 +3,13 @@
 import warnings
 from typing import Optional
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention, TENorm
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.post_training.modelopt.layers import (
     BlockwiseFP8WeightTransformerLayer,
     FP8WeightTransformerLayer,
+    Norm,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -68,7 +69,7 @@ def get_gpt_layer_modelopt_spec(
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=TENorm,
+            input_layernorm=Norm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -76,12 +77,12 @@ def get_gpt_layer_modelopt_spec(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=core_attention,
                     linear_proj=RowParallelLinear,
-                    q_layernorm=TENorm if qk_layernorm else IdentityOp,
-                    k_layernorm=TENorm if qk_layernorm else IdentityOp,
+                    q_layernorm=Norm if qk_layernorm else IdentityOp,
+                    k_layernorm=Norm if qk_layernorm else IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=TENorm,
+            pre_mlp_layernorm=Norm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             # Map TE-layernorm-fusion keys back
@@ -135,10 +136,10 @@ def get_gpt_modelopt_spec(
         attn_submodules = MLASelfAttentionSubmodules(
             linear_q_proj=ColumnParallelLinear,
             linear_q_down_proj=ColumnParallelLinear,
-            q_layernorm=TENorm,
+            q_layernorm=Norm,
             linear_q_up_proj=ColumnParallelLinear,
             linear_kv_down_proj=ColumnParallelLinear,
-            kv_layernorm=TENorm,
+            kv_layernorm=Norm,
             linear_kv_up_proj=ColumnParallelLinear,
             core_attention=core_attention,
             linear_proj=RowParallelLinear,
@@ -149,8 +150,8 @@ def get_gpt_modelopt_spec(
             linear_qkv=ColumnParallelLinear,
             core_attention=core_attention,
             linear_proj=RowParallelLinear,
-            q_layernorm=TENorm if config.qk_layernorm else IdentityOp,
-            k_layernorm=TENorm if config.qk_layernorm else IdentityOp,
+            q_layernorm=Norm if config.qk_layernorm else IdentityOp,
+            k_layernorm=Norm if config.qk_layernorm else IdentityOp,
         )
 
     dense_mlp_spec = get_mlp_module_spec(use_te=False)
@@ -158,14 +159,14 @@ def get_gpt_modelopt_spec(
     dense_layer_spec = ModuleSpec(
         module=transformer_layer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=TENorm,
+            input_layernorm=Norm,
             self_attention=ModuleSpec(
                 module=attn_module,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=attn_submodules,
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=TENorm,
+            pre_mlp_layernorm=Norm,
             mlp=dense_mlp_spec,
             mlp_bda=get_bias_dropout_add,
             # Map TE-layernorm-fusion keys back
@@ -186,14 +187,14 @@ def get_gpt_modelopt_spec(
     moe_layer_spec = ModuleSpec(
         module=transformer_layer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=TENorm,
+            input_layernorm=Norm,
             self_attention=ModuleSpec(
                 module=attn_module,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=attn_submodules,
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=TENorm,
+            pre_mlp_layernorm=Norm,
             mlp=moe_mlp_spec,
             mlp_bda=get_bias_dropout_add,
             # Map TE-layernorm-fusion keys back
@@ -238,6 +239,6 @@ def get_gpt_modelopt_spec(
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
-    block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=Norm)
 
     return block_spec

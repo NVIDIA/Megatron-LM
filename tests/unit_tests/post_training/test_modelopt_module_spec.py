@@ -78,6 +78,7 @@ class TestModelOptGPTModel:
             vocab_size=100,
             max_sequence_length=4,
         )
+
         # Ensure that a GPTModel can be built with the modelopt spec.
         self.modelopt_model = GPTModel(
             config=transformer_config,
@@ -102,9 +103,8 @@ class TestModelOptGPTModel:
     def test_inference(self):
         if not self._test_inference:
             return
-        config: TransformerConfig = self.modelopt_model.config
-        model = self.modelopt_model.to(device=get_current_device())
-        model_forward(model, config)
+        model_forward(self.modelopt_model.to(device=get_current_device()), self.modelopt_model.config)
+        model_forward(self.default_model.to(device=get_current_device()), self.default_model.config)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

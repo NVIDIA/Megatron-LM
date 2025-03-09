@@ -319,7 +319,6 @@ class Attention(MegatronModule, ABC):
             "Flash Decoding requires the flash_attn_with_kvcache kernel, "
             "available in the flash-attn package."
         )
-        cache_seqlens = sequence_len_offset - 1
         q = query_layer.permute(1, 0, 2, 3)
         k = key_layer.permute(1, 0, 2, 3)
         v = value_layer.permute(1, 0, 2, 3)
@@ -339,7 +338,7 @@ class Attention(MegatronModule, ABC):
             v=v,
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=sequence_len_offset,
             rotary_interleaved=False,
         )
         return out
