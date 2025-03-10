@@ -543,16 +543,24 @@ class TextGenerationController:
                 .tolist()
             )
             request.status = Status.COMPLETED
+            segments = None
+            if not sampling_params.return_segments:
+                tokens = batch_prompt_tokens_with_generations[idx]
+                tokens = tokens[:input_prompt_length + generated_sequence_lengths[idx]]
+                text = self.tokenizer.detokenize(tokens)
+            else:
+                text, segments = self.detokenize_generations(
+                    batch_prompt_tokens_with_generations[idx],
+                    input_prompt_length + generated_sequence_lengths,
+                    sampling_params.return_segments,
+            	)
 
-            text, segments = self.detokenize_generations(
-                batch_prompt_tokens_with_generations[idx],
-                input_prompt_length + generated_sequence_lengths,
-                sampling_params.return_segments,
-            )
-            request.text = text  # Inference server returns prompts & generations together
-            if sampling_params.return_segments:
+            if segments:
                 request.segments = segments[0]
+
+            request.text = text  # Inference server returns prompts & generations together
             request.generated_text = text[len(request.prompt) :]
+
         return active_requests
 
     def prep_inference_input(
