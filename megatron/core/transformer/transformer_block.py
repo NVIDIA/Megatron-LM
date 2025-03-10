@@ -15,7 +15,11 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    BaseTransformerLayer,
+    TransformerLayer,
+    combined_1f1b_transformer_layer_execution,
+)
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import is_te_min_version, make_viewless_tensor
 
@@ -149,6 +153,19 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
         assert num_layers_to_build >= 0, "Not enough layers in the last virtual pipeline stage"
 
     return num_layers_to_build
+
+
+def combined_1f1b_transformer_block_execution(
+    forward_decoder, backward_decoder, forward_inputs, backward_inputs
+):
+    # TODO: Implement combined_1f1b_transformer_block_execution
+    assert len(forward_decoder.layers) == len(backward_decoder.layers)
+    # This function should call combined_1f1b_transformer_layer_execution() in a loop
+    for i in range(len(forward_decoder.layers)):
+        combined_1f1b_transformer_layer_execution(
+            forward_decoder.layers[i], backward_decoder.layers[i], None, None
+        )
+    pass
 
 
 @dataclass
