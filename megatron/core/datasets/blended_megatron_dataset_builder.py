@@ -454,7 +454,8 @@ class BlendedMegatronDatasetBuilder(object):
 
         # TODO(MaxiBoether): it's a bit suboptimal that we need to handle this explicitly currently
         # however, I don't see a straightforward way to integrate the codepath fully.
-        if self.cls == GPTDatasetFolder and os.path.isdir(dataset_path):
+        if self.cls == GPTDatasetFolder:
+            assert os.path.isdir(dataset_path), f"Not a directory: {dataset_path}"
             mid_level_datasets = []
             for i, _split in enumerate(Split):
                 if split[i] is None:
