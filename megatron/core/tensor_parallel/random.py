@@ -5,7 +5,6 @@
 
 import contextlib
 import logging
-from functools import partial
 from typing import Union
 
 import torch
@@ -131,9 +130,10 @@ class CudaRNGStatesTracker:
     cuda state.
     """
 
-    def __init__(self, use_cudagraphable_rng=False):
+    def __init__(self, use_cudagraphable_rng=False, is_inference_rng_tracker=False):
         self.reset()
         self.use_cudagraphable_rng = use_cudagraphable_rng
+        self.is_inference_rng_tracker = is_inference_rng_tracker
 
         if self.use_cudagraphable_rng:
             assert (
@@ -251,8 +251,13 @@ def initialize_rng_tracker(
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
         base_tracker = TECudaRNGStatesTracker
+        tracker_kwargs = {"is_inference_rng_tracker": inference_rng_tracker}
     else:
-        base_tracker = partial(CudaRNGStatesTracker, use_cudagraphable_rng=use_cudagraphable_rng)
+        base_tracker = CudaRNGStatesTracker
+        tracker_kwargs = {
+            "use_cudagraphable_rng": use_cudagraphable_rng,
+            "is_inference_rng_tracker": inference_rng_tracker,
+        }
 
     if inference_rng_tracker:
 
@@ -275,7 +280,7 @@ def initialize_rng_tracker(
     else:
         tracker_class = base_tracker
 
-    _CUDA_RNG_STATE_TRACKER = tracker_class()
+    _CUDA_RNG_STATE_TRACKER = tracker_class(**tracker_kwargs)
     _CUDA_RNG_STATE_TRACKER_INITIALIZED = True
 
 
