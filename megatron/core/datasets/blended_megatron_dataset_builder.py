@@ -3,8 +3,10 @@
 import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
+import os
 from typing import Any, Callable, Iterable, List, Optional, Type, Union
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetFolder
 import numpy
 import torch
 
@@ -449,6 +451,29 @@ class BlendedMegatronDatasetBuilder(object):
                 if split[i] is not None and synchronize_ranks:
                     torch.distributed.barrier()
             return [None] * len(Split)
+
+        # TODO(MaxiBoether): it's a bit suboptimal that we need to handle this explicitly currently
+        # however, I don't see a straightforward way to integrate the codepath fully.
+        if self.cls == GPTDatasetFolder and os.path.isdir(dataset_path):
+            mid_level_datasets = []
+            for i, _split in enumerate(Split):
+                if split[i] is None:
+                    mid_level_datasets.append(None)
+                else:
+                    mid_level_datasets.append(
+                        self.build_generic_dataset(
+                            self.cls,
+                            self.is_built_on_rank,
+                            synchronize_ranks,
+                            None, # indexed_dataset (unused)
+                            dataset_path, # folder_path
+                            None, # indexed_indices (unused)
+                            sizes[i],
+                            _split,
+                            self.config,
+                        )
+                    )
+            return mid_level_datasets
 
         # Build the low level dataset
         low_level_dataset = self.cls.build_low_level_dataset(dataset_path, self.config)

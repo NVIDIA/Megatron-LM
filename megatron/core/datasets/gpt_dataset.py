@@ -1,11 +1,15 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import copy
+import glob
 import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
+from megatron.core.datasets.blended_dataset import BlendedDataset
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 import numpy
 import torch
 
@@ -16,6 +20,7 @@ from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.utils import Split
 from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
+from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
@@ -587,6 +592,94 @@ class GPTDataset(MegatronDataset):
                 num_tokens += num_tokens_per_epoch
         return num_epochs
 
+def is_dataset_built_on_rank():
+    return (
+        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
+    ) and mpu.get_tensor_model_parallel_rank() == 0
+
+class GPTDatasetFolder(MegatronDataset):
+    """Dataset representing a folder of bin files.
+
+    In a nutshell, this is a wrapper around a BlendedDataset and builds individual GPTDatasets
+    for each prefix in a directory and handles sampling based on natural distribution.
+    """
+
+    def __init__(
+        self,
+        indexed_dataset, # unused but kept for API compatibility
+        folder_path: str,
+        indexed_indices, # unused but kept for API compatibility
+        num_samples: int | None,
+        index_split: Split,
+        config: GPTDatasetConfig,
+    ) -> None:
+        self.folder_path = folder_path
+        self.num_samples = num_samples
+        self.index_split = index_split
+        self.config = config
+        self.built_anew_on_cache_miss = False
+        del indexed_dataset
+        del indexed_indices
+
+        # Find all bin files in the directory
+        bin_files = glob.glob(os.path.join(folder_path, "**/*.bin"), recursive=True)
+        self.bin_prefixes = sorted([f[:-4] for f in bin_files])  # Remove .bin extension
+
+        if not self.bin_prefixes:
+            raise ValueError(f"No .bin files found in directory: {folder_path}")
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Building GPTDatasetFolder from {folder_path} with {len(self.bin_prefixes)} bin files"
+        )
+
+        self.internal_dataset = self._build_internal_dataset()
+
+    def _build_internal_dataset(self):
+        folder_config = copy.deepcopy(self.config)
+        folder_config.blend = (self.bin_prefixes, None) # natural weights within bin files
+
+        # TODO(MaxiBoether): validate this
+        split_matrix = [None, None, None]  # [train, valid, test]
+        split_matrix[self.index_split.value] = (0.0, 1.0)  # Use entire dataset for our split
+        folder_config.split_matrix = split_matrix
+
+        # Set up sizes for just this split
+        sizes = [None, None, None]  # [train, valid, test]
+        sizes[self.index_split.value] = self.num_samples
+
+        builder = BlendedMegatronDatasetBuilder(
+            GPTDataset,
+            sizes,
+            is_dataset_built_on_rank, # TODO(MaxiBoether): validate dp + how to handle this function??
+            folder_config
+        )
+
+        datasets = builder.build()
+        internal_dataset = datasets[self.index_split.value]
+
+        if internal_dataset.built_anew_on_cache_miss or any(
+            dataset.built_anew_on_cache_miss for dataset in internal_dataset.datasets
+            if hasattr(dataset, 'built_anew_on_cache_miss')
+        ):
+            self.built_anew_on_cache_miss = True
+
+        return internal_dataset
+
+    @staticmethod
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> None:
+        return None # No-op
+
+    @staticmethod
+    def numel_low_level_dataset(low_level_dataset) -> int:
+        return 0 # No-op
+
+    def __len__(self) -> int:
+        return len(self.internal_dataset) if self.internal_dataset else 0
+
+    def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
+        return self.internal_dataset[idx]
 
 def _build_document_index(
     documents: numpy.ndarray,
