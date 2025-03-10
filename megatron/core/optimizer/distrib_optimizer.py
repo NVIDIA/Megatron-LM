@@ -493,6 +493,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer_name = 'adam'
             self.optimizer_keys = ("param", "exp_avg", "exp_avg_sq")
         elif isinstance(optimizer, AdEMAMix):
+            HAVE_APEX_OR_TE = True # NOTE(tj.solergibert) AdEMAMix has the same signature as Apex & TE Fused Adam optimizer 
             self.optimizer_name = 'ademamix'
             self.optimizer_keys = ("param", "exp_avg_slow", "exp_avg_sq")
             if config.adam_beta1 != 0.0:
@@ -615,7 +616,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE or self.optimizer_name == "ademamix":
+        if not HAVE_APEX_OR_TE:
             steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
             assert len(steps) == 1
             step = steps[0]
@@ -624,7 +625,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
         for param_group in state_dict["optimizer"]["param_groups"]:
             del param_group["params"]
-            if not HAVE_APEX_OR_TE or self.optimizer_name == "ademamix":
+            if not HAVE_APEX_OR_TE:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
 
@@ -722,7 +723,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state_dict_state = inner_state_dict["state"]
 
         # Extract 'step', for non-Apex/TE support.
-        if not HAVE_APEX_OR_TE or self.optimizer_name == "ademamix":
+        if not HAVE_APEX_OR_TE:
             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
             assert len(steps) == 1
             step = torch.tensor(steps[0], dtype=torch.float)
