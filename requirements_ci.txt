@@ -1,0 +1,8 @@
+nltk
+wrapt
+pytest
+pytest_asyncio
+pytest-cov
+pytest_mock
+pytest-random-order
+wandb

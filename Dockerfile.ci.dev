@@ -48,10 +48,12 @@ RUN \
     --mount=type=bind,source=megatron/core/package_info.py,target=megatron/core/package_info.py \
     --mount=type=bind,source=megatron/core/README.md,target=megatron/core/README.md \
     --mount=type=bind,source=megatron/core/requirements.txt,target=megatron/core/requirements.txt \
+    --mount=type=bind,source=requirements_mlm.txt,target=requirements_mlm.txt \
+    --mount=type=bind,source=requirements_ci.txt,target=requirements_ci.txt \
     --mount=type=bind,source=megatron/core/__init__.py,target=megatron/core/__init__.py <<"EOF" bash -ex
 pip install -U pip
 pip install --no-cache-dir causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl
-PY_ENV=pytorch_24.10 pip install --no-cache-dir .
+PY_ENV=pytorch_24.10 pip install --no-cache-dir . -r requirements_mlm.txt -r requirements_ci.txt
 EOF
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
