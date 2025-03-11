@@ -208,6 +208,26 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.apply_rope_fusion = False
         config.qk_layernorm = False
         config.layernorm_epsilon = 1e-6
+    elif config.vision_model_type == "radio-g":
+        config.num_layers = 40
+        config.num_attention_heads = 24
+        config.add_bias_linear = True
+        config.add_qkv_bias = True
+        config.hidden_size = 1536
+        config.ffn_hidden_size = 4096
+        config.gated_linear_unit = True
+        config.activation_func = torch.nn.functional.silu
+        config.kv_channels = 64
+        config.num_query_groups = 24
+        config.layernorm_zero_centered_gamma = False
+        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.normalization = 'LayerNorm'
+        config.apply_rope_fusion = False
+        config.qk_layernorm = False
+        config.layernorm_epsilon = 1e-6
     elif config.vision_model_type.startswith("hf://"):
         import transformers
         hf_config = transformers.AutoConfig.from_pretrained(config.vision_model_type.split("hf://")[1])

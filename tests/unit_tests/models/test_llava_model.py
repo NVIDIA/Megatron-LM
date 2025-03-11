@@ -462,64 +462,70 @@ class TestLLaVAModel:
             assert param.requires_grad
 
 
-class TestLLaVAModelSigLIP:
-    @pytest.mark.internal  # The model is under active development and its methods may change.
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+@pytest.fixture(scope='class', params=["siglip", "radio-g"])
+def setup_and_teardown_llava_model(request):
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
 
-        language_config = TransformerConfig(
-            num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=False
-        )
-        vision_config = TransformerConfig(
-            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=False
-        )
-        vision_projection_config = TransformerConfig(
-            num_layers=2,
-            hidden_size=128,
-            ffn_hidden_size=72,
-            num_attention_heads=1,
-            use_cpu_initialization=False,
-        )
+    language_config = TransformerConfig(
+        num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=False
+    )
+    vision_config = TransformerConfig(
+        num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=False
+    )
+    vision_projection_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        ffn_hidden_size=72,
+        num_attention_heads=1,
+        use_cpu_initialization=False,
+    )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        vision_layer_spec = deepcopy(language_layer_spec)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    vision_layer_spec = deepcopy(language_layer_spec)
+    vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
-        language_config.language_model_type = "dummy"
-        vision_config.vision_model_type = "siglip"
-        self.model = LLaVAModel(
-            language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
-            language_vocab_size=2048,
-            language_max_sequence_length=4096,
-            vision_transformer_config=vision_config,
-            vision_transformer_layer_spec=vision_layer_spec,
-            drop_vision_class_token=False,
-            vision_projection_config=vision_projection_config,
-            vision_projection_layer_spec=vision_projection_spec,
-            img_h=336,
-            img_w=336,
-            patch_dim=14,
-        )
+    language_config.language_model_type = "dummy"
+    vision_model_type = request.param
+    vision_config.vision_model_type = vision_model_type
+    model = LLaVAModel(
+        language_transformer_config=language_config,
+        language_transformer_layer_spec=language_layer_spec,
+        language_vocab_size=2048,
+        language_max_sequence_length=4096,
+        vision_transformer_config=vision_config,
+        vision_transformer_layer_spec=vision_layer_spec,
+        drop_vision_class_token=False,
+        vision_projection_config=vision_projection_config,
+        vision_projection_layer_spec=vision_projection_spec,
+        img_h=336,
+        img_w=336,
+        patch_dim=14,
+    )
 
-    @pytest.mark.internal
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
+    yield model, vision_model_type
 
-    @pytest.mark.internal
-    def test_constructor(self):
-        assert isinstance(self.model, LLaVAModel)
+    Utils.destroy_model_parallel()
 
-        num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 1832456
+
+class TestLLaVAModelVisionEncoders:
+    num_weights_by_encoder = {"siglip": 1832456, "radio-g": 2844552}
 
     @pytest.mark.internal
-    def test_set_input_tensor(self):
+    def test_constructor(self, setup_and_teardown_llava_model):
+        model, vision_model_type = setup_and_teardown_llava_model
+        assert isinstance(model, LLaVAModel)
+
+        num_weights = sum([p.numel() for p in model.parameters()])
+        assert num_weights == self.num_weights_by_encoder[vision_model_type]
+
+    @pytest.mark.internal
+    def test_set_input_tensor(self, setup_and_teardown_llava_model):
+        model, _ = setup_and_teardown_llava_model
         expected_shape = (1, 2, 3, 4)
         input_tensor = torch.zeros(expected_shape)
-        self.model.set_input_tensor(input_tensor)
-        assert self.model.vision_model.decoder.input_tensor.shape == expected_shape
+        model.set_input_tensor(input_tensor)
+        assert model.vision_model.decoder.input_tensor.shape == expected_shape
 
 
 def create_test_args(cp_size, sequence_parallel):
