@@ -9,7 +9,7 @@
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
-test:build_image:
+.build_image:
   extends: [.test_rules, .dind_rules]
   tags:
     - arch/amd64
@@ -21,20 +21,6 @@ test:build_image:
       variables:
         HEALTHCHECK_TCP_PORT: '2376'
   timeout: 45m
-  parallel:
-    matrix:
-      - IMAGE: CI_MCORE_LTS_IMAGE
-        FILE: Dockerfile.ci.lts
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
-      - IMAGE: CI_MCORE_DEV_IMAGE
-        FILE: Dockerfile.ci.dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.10-py3
-      - IMAGE: CI_NEMO_IMAGE
-        FILE: Dockerfile.ci.dev
-        BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
-      - IMAGE: UTILITY_IMAGE
-        FILE: Dockerfile.linting
-        BASE_IMAGE: python:3.10
   variables:
     DOCKER_HOST: tcp://docker:2376
     DOCKER_TLS_CERTDIR: '/certs'
@@ -58,7 +44,9 @@ test:build_image:
 
         if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" ]]; then
           ADDITIONAL_PARAMS+=("--pull")
-          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main")
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main,mode=max")
+        else
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID},mode=max")
         fi
 
         if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
@@ -79,17 +67,36 @@ test:build_image:
           --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
           --build-arg MCORE_REF=$CI_COMMIT_SHA \
           --build-arg MCORE_BACKWARDS_REF=$MCORE_BACKWARDS_REF \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID} \
           --cache-from type=registry,ref=${IMAGE}-buildcache:main \
-          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
-          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
-          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_PIPELINE_ID} \
-          --cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-noop} \
           --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
           --push \
+          --progress plain \
           ${ADDITIONAL_PARAMS[@]} .
         '
   retry:
     max: 2
+
+test:build_image:
+  extends: [.build_image]
+  parallel:
+    matrix:
+      - IMAGE: CI_MCORE_LTS_IMAGE
+        FILE: Dockerfile.ci.lts
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+      - IMAGE: CI_MCORE_DEV_IMAGE
+        FILE: Dockerfile.ci.dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.10-py3
+      - IMAGE: UTILITY_IMAGE
+        FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
+
+test:build_nemo_image:
+  extends: [.build_image]
+  variables:
+    IMAGE: CI_NEMO_IMAGE
+    FILE: Dockerfile.ci.dev
+    BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
 
 test:unit_tests_configure:
   extends: [.test_rules]
@@ -428,7 +435,7 @@ test:pypi_test_wheel:
     PUBLISH_DRYRUN: 'yes'
   script:
     - rm -rf megatron
-
+    - pip install -U --no-cache-dir pip
     - >
       if [[ "$PLATFORM" == "arm64" ]]; then
         pip install --no-cache-dir wheelhouse/*cp311*aarch64.whl
