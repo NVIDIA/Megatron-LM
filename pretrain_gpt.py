@@ -282,10 +282,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         if os.path.isdir(example_path):
             print_rank_0(f"> Using directory-based sampling.")
             dataset_type = GPTDatasetFolder
+            if not all(os.path.isdir(path) for path in config.blend[0]):
+                raise RuntimeError(f"Path 0 {example_path} is a directory, but not every specified path is a directory.")
         else:
             print_rank_0(f"> Using file-based sampling.")
             dataset_type = GPTDataset
-            assert os.path.isfile(example_path) or os.path.isfile(f"{example_path}.bin")
+            if not all(os.path.isfile(f"{path}.bin") for path in config.blend[0]):
+                raise RuntimeError(f"<path>.bin does not exist for all specified paths.")
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
@@ -296,7 +299,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         config
     ).build()
 
-    print_rank_0("> finished creating GPT datasets ...")
+    print_rank_0("> finished creating datasets ...")
 
     return train_ds, valid_ds, test_ds
 

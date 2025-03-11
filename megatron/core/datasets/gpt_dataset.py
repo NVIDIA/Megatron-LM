@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from concurrent.futures import ThreadPoolExecutor
 import copy
 import glob
 import logging
@@ -609,7 +610,7 @@ class GPTDatasetFolder(MegatronDataset):
         indexed_dataset, # unused but kept for API compatibility
         folder_path: str,
         indexed_indices, # unused but kept for API compatibility
-        num_samples: int | None,
+        num_samples: int | None, # currently also not supported
         index_split: Split,
         config: GPTDatasetConfig,
     ) -> None:
@@ -634,52 +635,110 @@ class GPTDatasetFolder(MegatronDataset):
             f"Building GPTDatasetFolder from {folder_path} with {len(self.bin_prefixes)} bin files"
         )
 
-        self.internal_dataset = self._build_internal_dataset()
+        self.datasets = self._build_datasets_parallel()
+        
+        self._dataset_sizes = [len(dataset) for dataset in self.datasets]
+        total_samples_available = sum(self._dataset_sizes)
 
-    def _build_internal_dataset(self):
-        folder_config = copy.deepcopy(self.config)
-        folder_config.blend = (self.bin_prefixes, None) # natural weights within bin files
+        if num_samples is not None and num_samples < total_samples_available:
+            raise RuntimeError(f"The GPTDatasetFolder currently only supports using all available samples.")
 
-        # TODO(MaxiBoether): validate this
-        split_matrix = [None, None, None]  # [train, valid, test]
-        split_matrix[self.index_split.value] = (0.0, 1.0)  # Use entire dataset for our split
-        folder_config.split_matrix = split_matrix
+        self.total_samples = total_samples_available
+        
+        self._build_index_mappings()
 
-        # Set up sizes for just this split
-        sizes = [None, None, None]  # [train, valid, test]
-        sizes[self.index_split.value] = self.num_samples
-
-        builder = BlendedMegatronDatasetBuilder(
-            GPTDataset,
-            sizes,
-            is_dataset_built_on_rank, # TODO(MaxiBoether): validate dp + how to handle this function??
-            folder_config
-        )
-
-        datasets = builder.build()
-        internal_dataset = datasets[self.index_split.value]
-
-        if internal_dataset.built_anew_on_cache_miss or any(
-            dataset.built_anew_on_cache_miss for dataset in internal_dataset.datasets
-            if hasattr(dataset, 'built_anew_on_cache_miss')
-        ):
-            self.built_anew_on_cache_miss = True
-
-        return internal_dataset
-
+    def _build_datasets_parallel(self) -> list[GPTDataset]:
+        datasets = []
+        def build_dataset(prefix):
+            try:
+                indexed_dataset = IndexedDataset(prefix, multimodal=False, mmap=self.config.mmap_bin_files)
+                num_elements = GPTDataset.numel_low_level_dataset(indexed_dataset)
+                indexed_indices = numpy.arange(start=0, stop=num_elements, step=1, dtype=numpy.int32)
+                
+                dataset = GPTDataset(
+                    indexed_dataset=indexed_dataset,
+                    dataset_path=prefix,
+                    indexed_indices=indexed_indices,
+                    num_samples=None,  # Use all samples from dataset
+                    index_split=self.index_split,
+                    config=self.config
+                )
+                
+                built_anew_on_cache_miss = hasattr(dataset, "built_anew_on_cache_miss") and dataset.built_anew_on_cache_miss
+                
+                return dataset, built_anew_on_cache_miss
+            except Exception as e:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Failed to build dataset for {prefix}: {str(e)}"
+                )
+                return None
+        
+        num_threads = getattr(self.config, "num_dataset_builder_threads", 1)
+        
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = [executor.submit(build_dataset, prefix) for prefix in self.bin_prefixes]
+            for future in futures:
+                try:
+                    dataset, built_anew_on_cache_miss = future.result()
+                    self.built_anew_on_cache_miss |= built_anew_on_cache_miss
+                    if dataset is not None:
+                        datasets.append(dataset)
+                except Exception as e:
+                    log_single_rank(
+                        logger,
+                        logging.ERROR,
+                        f"Error building dataset: {str(e)}"
+                    )
+        
+        if not datasets:
+            raise ValueError(f"Failed to build any datasets from {self.folder_path}")
+        
+        return datasets
+    
+    def _build_index_mappings(self):
+        # global idx => (dataset_idx, local_idx)
+        numpy_random_state = numpy.random.RandomState(self.config.random_seed)
+        self.dataset_indices = numpy.zeros(self.total_samples, dtype=numpy.int32)
+        self.local_indices = numpy.zeros(self.total_samples, dtype=numpy.int32)
+        
+        idx = 0
+        for dataset_idx, size in enumerate(self._dataset_sizes):
+            if size > 0:
+                # Set dataset indices
+                self.dataset_indices[idx:idx + size] = dataset_idx
+                
+                # Set local indices (sequential)
+                self.local_indices[idx:idx + size] = numpy.arange(size, dtype=numpy.int32)
+                
+                idx += size
+        
+        self.shuffle_index = numpy.arange(self.total_samples, dtype=numpy.int32)
+        numpy_random_state.shuffle(self.shuffle_index)
+    
     @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> None:
-        return None # No-op
-
+        return None # Noop
+    
     @staticmethod
     def numel_low_level_dataset(low_level_dataset) -> int:
-        return 0 # No-op
-
+        return 0 # Noop
+    
     def __len__(self) -> int:
-        return len(self.internal_dataset) if self.internal_dataset else 0
-
+        return self.total_samples
+    
     def __getitem__(self, idx: Optional[int]) -> Dict[str, torch.Tensor]:
-        return self.internal_dataset[idx]
+        if idx is None:
+            if len(self.datasets) > 0: # forward None call
+                return self.datasets[0][None]
+            else:
+                raise ValueError("No datasets available in this folder")
+        
+        idx = self.shuffle_index[idx]
+        dataset_idx = self.dataset_indices[idx]
+        local_idx = self.local_indices[idx]
+        return self.datasets[dataset_idx][local_idx]
 
 def _build_document_index(
     documents: numpy.ndarray,
