@@ -723,6 +723,7 @@ class _DeepepManager(_DispatchManager):
         capacity_factor: float = None,
         num_experts: int = None,
         num_local_experts: int = None,
+        router_dtype: str = None
     ):
         self.group = group
         self.router_topk = router_topk
