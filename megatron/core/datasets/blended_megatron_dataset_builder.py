@@ -455,7 +455,7 @@ class BlendedMegatronDatasetBuilder(object):
         if self.cls == GPTDatasetFolder:
             if not os.path.isdir(dataset_path):
                 raise RuntimeError(f"Not a directory: {dataset_path}")
-            
+
             mid_level_datasets = []
             for i, _split in enumerate(Split):
                 if split[i] is None:
