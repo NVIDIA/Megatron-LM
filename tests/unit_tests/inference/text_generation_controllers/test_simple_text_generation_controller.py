@@ -3,6 +3,7 @@ import os
 import random
 import string
 import time
+from argparse import Namespace
 from collections import OrderedDict
 from typing import Dict, List
 from unittest import mock
@@ -10,6 +11,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -26,6 +28,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -46,6 +49,7 @@ class TestTextGenerationController:
             num_attention_heads=4,
             use_cpu_initialization=True,
             attention_backend=AttnBackend.local,
+            params_dtype=dtype,
         )
 
         gpt_model = GPTModel(
@@ -54,7 +58,11 @@ class TestTextGenerationController:
             vocab_size=self.vocab_size,
             max_sequence_length=self.sequence_length,
             parallel_output=True,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
         ).cuda()
+        if dtype == torch.bfloat16:
+            gpt_model = Float16Module(gpt_model, Namespace(fp16=False, bf16=True))
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.hidden_size,
