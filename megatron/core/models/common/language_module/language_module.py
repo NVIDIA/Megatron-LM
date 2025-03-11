@@ -9,6 +9,11 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+try:
+    from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
+except ImportError:
+    te_parallel_cross_entropy = None
+    
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
@@ -77,7 +82,14 @@ class LanguageModule(MegatronModule):
         # [b s] => [s b]
         labels = labels.transpose(0, 1).contiguous()
         if self.config.cross_entropy_loss_fusion:
-            loss = fused_vocab_parallel_cross_entropy(logits, labels)
+            if self.config.cross_entropy_fusion_impl == 'te':
+                if te_parallel_cross_entropy is not None:
+                    labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+                    loss = te_parallel_cross_entropy(logits, labels)
+                else:
+                    raise RuntimeError("Trying to use a TE block when it's not present.")
+            elif self.config.cross_entropy_fusion_impl == 'native':
+                loss = fused_vocab_parallel_cross_entropy(logits, labels)
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 

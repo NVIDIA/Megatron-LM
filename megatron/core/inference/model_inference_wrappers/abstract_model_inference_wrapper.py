@@ -107,8 +107,13 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+        runtime_gather_output = inference_input.get("runtime_gather_output")
         return self.model(
-            tokens, position_ids, attention_mask, inference_params=self.inference_params
+            tokens,
+            position_ids,
+            attention_mask,
+            inference_params=self.inference_params,
+            runtime_gather_output=runtime_gather_output,
         )
 
     def _get_batch_size_and_seq_len(
@@ -218,6 +223,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
+        runtime_gather_output = inference_input.get("runtime_gather_output")
         micro_batch_size = max(
             1,
             self.inference_wrapper_config.inference_batch_times_seqlen_threshold // tokens.size(1),
@@ -260,6 +266,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
                     "tokens": tokens2use,
                     "position_ids": position_ids2use,
                     "attention_mask": attention_mask,
+                    "runtime_gather_output": runtime_gather_output,
                 }
             )
 

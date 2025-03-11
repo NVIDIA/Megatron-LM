@@ -248,6 +248,9 @@ class DistributedDataParallel(_BaseDataParallel):
             return buffers, bucket_groups
 
         if config.calculate_per_token_loss:
+            assert (
+                not self.ddp_config.average_in_collective
+            ), "Cannot average in collective when calculating per-token loss!"
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
         else:

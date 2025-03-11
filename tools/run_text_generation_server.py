@@ -1,45 +1,39 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT"""
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             os.path.pardir)))
-from megatron.core.device_utils import get_current_device
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.core.models.gpt import GPTModel
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.yaml_arguments import core_transformer_config_from_yaml
-from megatron.inference.text_generation_server import MegatronServer
-from megatron.core.transformer.spec_utils import import_module
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
 
-from contextlib import nullcontext
-from typing import Union
-import megatron
-
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 import os
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 import sys
 from argparse import Namespace
+from contextlib import nullcontext
+from typing import Union
+
+import torch
+
+import megatron
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.module import MegatronModule
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                             os.path.pardir, os.path.pardir)))
+from megatron.core.transformer.spec_utils import import_module
+from megatron.inference.text_generation.mcore_engine_server import GPTInferenceWrapperServer, run_mcore_engine
+from megatron.inference.text_generation_server import MegatronServer
+from megatron.training import print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
-from megatron.training import get_args
-from megatron.training import get_tokenizer
-from megatron.training.checkpointing import load_checkpoint
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)))
+
 from megatron.core import mpu
+from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
-from megatron.training import get_model
 
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
@@ -73,7 +67,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             num_tokentypes=0,
             parallel_output=False,
             pre_process=pre_process,
-            post_process=post_process
+            post_process=post_process,
         )
     else:
         if args.spec is not None:
@@ -125,13 +119,14 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         params_dtype=args.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
         inference_max_seq_length=args.inference_max_seq_length,
-        inference_max_requests=args.inference_max_batch_size
+        inference_max_requests=args.inference_max_batch_size,
     )
 
-    inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
-    text_generation_controller = SimpleTextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-    return MCoreEngine(text_generation_controller=text_generation_controller)
+    inference_wrapped_model = GPTInferenceWrapperServer(model, inference_wrapper_config)
+    text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+    return MCoreEngine(
+        text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
+    )
 
 
 def add_text_generate_args(parser):
@@ -188,4 +183,13 @@ if __name__ == "__main__":
 
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(inference_engine, args)
-        server.run("0.0.0.0",port=args.port)
+        server.run("0.0.0.0", port=args.port)
+
+    while True:
+        choice = torch.tensor(1, dtype=torch.long, device='cuda')
+        torch.distributed.broadcast(choice, 0)
+        if choice.item() == 0:
+            try:
+                run_mcore_engine(inference_engine)
+            except ValueError as ve:
+                pass

@@ -54,7 +54,7 @@ def _allreduce_loss(loss):
     # Reduce loss for logging.
     averaged_loss = average_losses_across_data_parallel_group([loss])
 
-    return loss * args.context_parallel_size, averaged_loss[0]
+    return loss, averaged_loss[0]
 
 
 def loss_func(loss_mask: torch.Tensor, model: GPTModel, output_tensor: torch.Tensor):
