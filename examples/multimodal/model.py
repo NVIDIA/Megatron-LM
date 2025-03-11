@@ -120,6 +120,15 @@ def model_provider(
             vision_transformer_layer_spec = get_layer_spec(
                 is_vit=True, normalization=vision_config.normalization
             )
+    elif vision_model_type == "radio-g":
+        if use_te:
+            from radio.radio_g import get_radio_g_layer_spec_te
+            vision_transformer_layer_spec = get_radio_g_layer_spec_te()  # TENorm detects LayerNorm/RMS automatically.
+        else:
+            from radio.radio_g import get_radio_g_layer_spec
+            vision_transformer_layer_spec = get_radio_g_layer_spec(
+                normalization=vision_config.normalization
+            )
     elif vision_model_type == "internvit":
         from nvlm.internvit import get_internvit_layer_spec
         vision_transformer_layer_spec = get_internvit_layer_spec(use_te=use_te)

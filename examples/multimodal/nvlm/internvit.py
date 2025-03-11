@@ -36,6 +36,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_bias_dropout_add_layer_scaling
+
 
 class InternViTRMSNorm(MegatronModule):
 
@@ -146,47 +148,6 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     )
 
 
-# Handle InternViT's layer scaling.
-def _bias_dropout_add_func_internvit(ls, x_with_bias, residual, prob, training):
-    x, bias = x_with_bias  # unpack
-    residual = residual if residual.dtype == x.dtype else residual.to(x.dtype)
-    if bias is not None:
-        x = x + bias
-        out = torch.nn.functional.dropout(x, p=prob, training=training)
-        out = residual + out * ls
-        return out
-    else:
-        out = torch.nn.functional.dropout(x, p=prob, training=training)
-        out = residual + out * ls
-        return out
-
-
-def bias_dropout_add_unfused_internvit(ls, training):
-    """Bias-dropout-add as in Megatron but with added LayerScaling handling."""
-
-    def _bias_dropout_add(x_with_bias, residual, prob):
-        return _bias_dropout_add_func_internvit(ls, x_with_bias, residual, prob, training)
-
-    return _bias_dropout_add
-
-
-def get_bias_dropout_add_internvit(ls, training, fused):
-    """Bias-dropout-add as in Megatron but with added LayerScaling handling."""
-    assert not fused, "Fused bias-dropout-add not implemented for InternViT."
-    return bias_dropout_add_unfused_internvit(ls, training)
-
-
-# Add InternViT specialties to our default TransformerLayer.
-class InternViTTransformerLayer(TransformerLayer):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ls1 = torch.nn.Parameter(torch.ones(self.config.hidden_size))
-        self.ls2 = torch.nn.Parameter(torch.ones(self.config.hidden_size))
-
-        self.self_attn_bda = partial(self.self_attn_bda, self.ls1)
-        self.mlp_bda = partial(self.mlp_bda, self.ls2)
-
-
 # Override a few things that are special in InternViT and not supported by the SelfAttention class.
 class InternViTSelfAttention(SelfAttention):
     def __init__(
@@ -257,7 +218,7 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
     mlp = get_mlp_module_spec(use_te)  # no norm
 
     return ModuleSpec(
-        module=InternViTTransformerLayer,
+        module=LayerScalingTransformerLayer,
         submodules=TransformerLayerSubmodules(
             input_layernorm=InternViTRMSNorm,
             self_attention=ModuleSpec(
@@ -271,9 +232,9 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
                     k_layernorm=InternViTRMSNorm,
                 ),
             ),
-            self_attn_bda=get_bias_dropout_add_internvit,
+            self_attn_bda=get_bias_dropout_add_layer_scaling,
             pre_mlp_layernorm=InternViTRMSNorm,
             mlp=mlp,
-            mlp_bda=get_bias_dropout_add_internvit,
+            mlp_bda=get_bias_dropout_add_layer_scaling,
         ),
     )
