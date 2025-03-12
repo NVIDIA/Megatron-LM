@@ -224,6 +224,6 @@ functional:upload_statistics:
     - export DASHBOARD_ENDPOINT
     - python tests/test_utils/python_scripts/dashboard.py --pipeline-id ${CI_PIPELINE_ID}
   rules:
-    - if: $UNIT_TEST == "yes" || $FUNCTIONAL_TEST == "yes"
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && ($UNIT_TEST == "yes" || $FUNCTIONAL_TEST == "yes")
       allow_failure: true
     - when: never
