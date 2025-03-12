@@ -1,0 +1,199 @@
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+.pre_rules:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: always
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - when: never
+  stage: .pre
+
+.dind_rules:
+  image: docker:26.1.4-dind
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+  before_script:
+    - docker system prune -a --filter "until=36h" -f || true
+    - echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+
+pre:mirror_to_github:
+  rules:
+    - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
+    - when: never
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  stage: .pre
+  image: python:3.10
+  variables:
+    GIT_STRATEGY: 'clone'
+  script:
+    - git checkout $CI_COMMIT_BRANCH
+    - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
+    - git push -u github $CI_COMMIT_BRANCH
+
+pre:create_ci_branches:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+    - when: never
+  parallel:
+    matrix:
+      - branch: ci-unit-test-extended
+      - branch: ci-rebuild-mcore-nemo-image
+      - branch: ci-mr
+      - branch: ci-nightly
+      - branch: ci-weekly
+      - branch: ci-pre-release
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  stage: .pre
+  image: python:3.10
+  variables:
+    GIT_STRATEGY: 'clone'
+  script:
+    - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
+    - git switch --force-create $branch
+    - git push --force -u origin $branch
+
+pre:label_merge_request:
+  extends: [.pre_rules]
+  image: golang:1.22
+  tags:
+    - mcore-docker-node-small
+  before_script:
+    - git clone -b nv https://${GITLAB_ENDPOINT}/okoenig/gitlab-mr-labeler.git
+    - cd gitlab-mr-labeler
+    - go install .
+    - cd ..
+    - go install github.com/itchyny/gojq/cmd/gojq@latest
+    - |
+      echo LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" | gojq '.labels | join(",")') > labels
+  script:
+    - gitlab-mr-labeler -f .gitlab/labeler-config.yml -t ${PROJECT_ACCESS_TOKEN_MCORE} --debug true
+  after_script:
+    - |
+      source labels
+      curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" --data-urlencode "add_labels=$LABELS" -X PUT
+
+pre:maybe_cherry_pick_commit:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+    - when: never
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  stage: .pre
+  image: nentangso/alpine-git-curl-jq
+  variables:
+    GIT_STRATEGY: 'clone'
+  script:
+    - set -x
+    - set +e
+    - SHA=$(git rev-list --no-merges -n 1 HEAD)
+    - MESSAGE=$(git log -n 1 --pretty=format:%s $SHA)
+    - MR_ID=$(echo $MESSAGE | awk -F'!' '{print $2}' | awk '{print $1}' )
+    - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
+    - |
+      MR=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${MR_ID}")
+
+      LABELS=$(echo -E $MR | jq '.labels | join(",")' | tr -d '"')
+      AUTHOR_ID=$(echo -E $MR | jq '.author.id' | tr -d '"')
+      AUTHOR_NAME=$(echo -E $MR | jq '.author.username' | tr -d '"')
+      TITLE=$(echo -E $MR | jq '.title' | tr -d '"')
+      MILESTONE_ID=$(echo -E $MR | jq '.milestone.id' | tr -d '"')
+      TARGET_BRANCHES=$(echo "$LABELS" | grep -o 'core_[^,]*')
+
+      if [[ $TARGET_BRANCHES == "" ]]; then
+        echo Nothing to cherry pick
+        exit 0
+      fi
+
+      echo $TARGET_BRANCHES | while read -r RELEASE_BRANCH ; do
+        TARGET_BRANCH_EXISTS_OK=$([[ "$(git ls-remote --heads origin refs/heads/$RELEASE_BRANCH)" != "" ]] && echo true || echo false)
+
+        if [[ "$TARGET_BRANCH_EXISTS_OK" == "false" ]]; then
+          echo Release branch does not yet exist, will not  cherry-pick
+          continue
+        fi
+        
+        (
+          git fetch origin $RELEASE_BRANCH:$RELEASE_BRANCH
+          git switch --force-create cherry-pick-$MR_ID-$RELEASE_BRANCH $RELEASE_BRANCH
+          git cherry-pick $SHA
+          git push -u origin --force cherry-pick-$MR_ID-$RELEASE_BRANCH
+          git checkout ${CI_DEFAULT_BRANCH:-main}
+        )
+
+        CHERRYPICK_SUCCESSFUL=$?
+
+        if [[ $CHERRYPICK_SUCCESSFUL -eq 0 ]]; then
+          curl \
+            --header "PRIVATE-TOKEN: $PAT" \
+            --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+            -d "source_branch=cherry-pick-$MR_ID-$RELEASE_BRANCH" \
+            -d "target_branch=$RELEASE_BRANCH" \
+            -d "title=Cherry pick \`$TITLE ($MR_ID)\` into \`$RELEASE_BRANCH\`" \
+            -d "labels=cherry-pick" \
+            -d "reviewer_ids=$AUTHOR_ID" \
+            -d "milestone_id=$MILESTONE_ID" \
+            -d "description=[🤖]: Hi @$AUTHOR_NAME 👋,<br><br>we've cherry picked \`$TITLE ($MR_ID)\` into \`$RELEASE_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
+
+        else
+          URL=https://${GITLAB_ENDPOINT}/ADLR/megatron-lm/-/merge_requests/$MR_ID
+
+          MESSAGE='{
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "beep boop 🤖: Cherry-pick of <'$URL'|!'$MR_ID'> failed\ncc '$SLACK_ADMIN'"
+                }
+              }
+            ]
+          }'
+
+          curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK}
+
+        fi
+
+      done
+  interruptible: false
+
+pre:check_milestone:
+  extends: [.pre_rules]
+  image: badouralix/curl-jq
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - |
+      MILESTONE=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" | jq '.milestone')
+    - |
+      if [[ "$MILESTONE" == "null" ]]; then
+        echo Please assign a Milestone to this MR!
+        exit 1
+      fi

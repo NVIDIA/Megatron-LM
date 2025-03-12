@@ -12,9 +12,9 @@ NUM_NODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-CHECKPOINT_PATH=$0 #<Specify path>
-TENSORBOARD_LOGS_PATH=$1 #<Specify path>
-VOCAB_FILE=$2 #<Specify path to file>/bert-vocab.json
+CHECKPOINT_PATH=$1 #<Specify path>
+TENSORBOARD_LOGS_PATH=$2 #<Specify path>
+VOCAB_FILE=$3 #<Specify path to file>/bert-vocab.json
 DATA_PATH=$4 #<Specify path and file prefix>_text_document
 
 DISTRIBUTED_ARGS=(
@@ -30,6 +30,7 @@ BERT_MODEL_ARGS=(
     --num-attention-heads 16 
     --seq-length 512 
     --max-position-embeddings 512 
+    --attention-backend auto # Can use (flash/fused/unfused/local)
 )
 
 TRAINING_ARGS=(
@@ -46,7 +47,6 @@ TRAINING_ARGS=(
     --weight-decay 1e-2 
     --lr-warmup-fraction .01 
     --clip-grad 1.0 
-    --use-mcore-models
 )
 
 MODEL_PARALLEL_ARGS=(
@@ -76,3 +76,4 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_bert.py \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${DATA_ARGS[@]} \
     ${EVAL_AND_LOGGING_ARGS[@]}
+    

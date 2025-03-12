@@ -4,8 +4,6 @@ import types
 from dataclasses import dataclass, field
 from typing import Tuple, Union
 
-import torch
-
 
 @dataclass
 class ModuleSpec:
@@ -103,7 +101,6 @@ def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):
         # improve the error message since we hide the module name in the line above
         import sys
 
-        tb = sys.exc_info()[2]
         raise type(e)(f"{str(e)} when instantiating {module.__name__}").with_traceback(
             sys.exc_info()[2]
         )

@@ -1,12 +1,10 @@
 """Setup for pip package."""
 
 import importlib.util
-import os
 import subprocess
-import sys
-
+import os
 import setuptools
-from setuptools.command.install import install
+from setuptools import Extension
 
 spec = importlib.util.spec_from_file_location('package_info', 'megatron/core/package_info.py')
 package_info = importlib.util.module_from_spec(spec)
@@ -25,24 +23,21 @@ __repository_url__ = package_info.__repository_url__
 __version__ = package_info.__version__
 
 
-if os.path.exists('megatron/core/README.md'):
-    with open("megatron/core/README.md", "r", encoding='utf-8') as fh:
-        long_description = fh.read()
-    long_description_content_type = "text/markdown"
-
-else:
-    long_description = 'See ' + __homepage__
-    long_description_content_type = "text/plain"
+with open("megatron/core/README.md", "r", encoding='utf-8') as fh:
+    long_description = fh.read()
+long_description_content_type = "text/markdown"
 
 
-###############################################################################
-#                             Dependency Loading                              #
-# %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% #
+def req_file(filename, folder="requirements"):
+    environment = os.getenv("PY_ENV", "pytorch_24.10")
 
+    content = []
+    with open(os.path.join(folder, environment, filename), encoding='utf-8') as f:
+        content += f.readlines()
 
-def req_file(filename, folder="megatron/core"):
-    with open(os.path.join(folder, filename), encoding='utf-8') as f:
-        content = f.readlines()
+    with open(os.path.join("megatron", "core", "requirements.txt"), encoding='utf-8') as f:
+        content += f.readlines()
+
     # you may also want to remove whitespace characters
     # Example: `\n` at the end of each line
     return [x.strip() for x in content]
@@ -50,21 +45,9 @@ def req_file(filename, folder="megatron/core"):
 
 install_requires = req_file("requirements.txt")
 
-
 ###############################################################################
 #                             Extension Making                                #
 # %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% #
-
-
-class Install(install):
-    def run(self):
-        command = ["make", "-C", os.path.join("megatron", "core", "datasets")]
-        if subprocess.run(command).returncode != 0:
-            sys.exit(1)
-        super().run()
-
-
-cmdclass_override = {"install": Install}
 
 ###############################################################################
 
@@ -121,10 +104,25 @@ setuptools.setup(
         'Natural Language :: English',
         'Operating System :: OS Independent',
     ],
-    packages=setuptools.find_packages(include=['megatron.core', 'megatron.core.*'],),
-    cmdclass=cmdclass_override,
+    packages=setuptools.find_namespace_packages(include=["megatron.core", "megatron.core.*"]),
+    ext_modules=[
+        Extension(
+            "megatron.core.datasets.helpers_cpp",
+            sources=["megatron/core/datasets/helpers.cpp"],
+            language="c++",
+            extra_compile_args=(
+                subprocess.check_output(["python3", "-m", "pybind11", "--includes"])
+                .decode("utf-8")
+                .strip()
+                .split()
+            )
+            + ['-O3', '-Wall', '-std=c++17'],
+            optional=True,
+        )
+    ],
     # Add in any packaged data.
     include_package_data=True,
     # PyPI package information.
     keywords=__keywords__,
+    install_requires=install_requires,
 )

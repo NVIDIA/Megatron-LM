@@ -3,37 +3,46 @@
 
 import os
 import torch
-from torch import Tensor
 from functools import partial
-from typing import Union
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_timers
-from megatron import get_tokenizer
-from megatron.core import mpu, tensor_parallel
+from contextlib import nullcontext
+import inspect
+
+from typing import List, Optional, Tuple, Union
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
+from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.blended_megatron_dataset_config import GPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import GPTDataset
-import megatron.model
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
 from megatron.training import pretrain
+from megatron.core.utils import StragglerDetector
 from megatron.core.transformer.spec_utils import import_module
-from megatron.utils import (
-    get_ltor_masks_and_position_ids,
+from megatron.training.utils import (
     get_batch_on_this_cp_rank,
-    average_losses_across_data_parallel_group
+    get_batch_on_this_tp_rank,
+    get_blend_and_blend_per_split,
 )
-from megatron.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
-    gpt_layer_with_transformer_engine_spec_moe
 )
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.model.GPTModel]:
+
+stimer = StragglerDetector()
+
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
-    If you set the use_mcore_models to True, it will return the mcore GPT model and if not the legacy GPT model.
+    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
@@ -41,45 +50,92 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 
 
     Returns:
-        Union[GPTModel, megatron.model.GPTModel]: The returned model
+        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     args = get_args()
+    use_te = args.transformer_impl == "transformer_engine"
+
+    if args.record_memory_history:
+        torch.cuda.memory._record_memory_history(True,
+            # keep 100,000 alloc/free events from before the snapshot
+            trace_alloc_max_entries=100000,
+
+            # record stack information for the trace events
+            trace_alloc_record_context=True)
+
+        def oom_observer(device, alloc, device_alloc, device_free):
+            # snapshot right after an OOM happened
+            print('saving allocated state during OOM')
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(get_args())
-
-    if args.use_mcore_models:
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            if args.num_experts is None:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-            else:
-                transformer_layer_spec = gpt_layer_with_transformer_engine_spec_moe
-
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=True,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent
-        )
+    # Experimental loading arguments from yaml
+    if args.yaml_cfg is not None:
+        config = core_transformer_config_from_yaml(args, "language_model")
     else:
-        assert(args.context_parallel_size == 1), "Context parallelism is only supported with Megatron Core!"
+        config = core_transformer_config_from_args(args)
 
-        model = megatron.model.GPTModel(
+    if args.use_legacy_models:
+        model = megatron.legacy.model.GPTModel(
             config,
             num_tokentypes=0,
             parallel_output=True,
             pre_process=pre_process,
-            post_process=post_process
+            post_process=post_process,
         )
+    else: # using core models
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
+        else:
+            if args.num_experts:
+                # Define the decoder block spec
+                transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te)
+            else:
+                # Define the decoder layer spec
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts, args.moe_grouped_gemm,
+                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+
+        build_model_context = nullcontext
+        build_model_context_args = {}
+        if args.fp8_param_gather:
+            try:
+                from transformer_engine.pytorch import fp8_model_init
+
+                build_model_context = fp8_model_init
+                build_model_context_args["enabled"] = True
+
+                # Check if fp8_model_init supports preserve_high_precision_init_val
+                if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
+                    build_model_context_args["preserve_high_precision_init_val"] = True
+            except:
+                raise RuntimeError("--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
+
+        with build_model_context(**build_model_context_args):
+            model = GPTModel(
+                config=config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=args.padded_vocab_size,
+                max_sequence_length=args.max_position_embeddings,
+                pre_process=pre_process,
+                post_process=post_process,
+                fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+                parallel_output=True,
+                share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+                position_embedding_type=args.position_embedding_type,
+                rotary_percent=args.rotary_percent,
+                rotary_base=args.rotary_base,
+                rope_scaling=args.use_rope_scaling
+            )
 
     return model
 
@@ -91,75 +147,85 @@ def get_batch(data_iterator):
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
-    args = get_args()
-    tokenizer = get_tokenizer()
+    # get batches based on the TP rank you are on
+    batch = get_batch_on_this_tp_rank(data_iterator)
 
-    # Items and their type.
-    keys = ['text']
-    datatype = torch.int64
-
-    # Broadcast data.
-    if data_iterator is not None:
-        data = next(data_iterator)
-    else:
-        data = None
-    data_b = tensor_parallel.broadcast_data(keys, data, datatype)
-
-    # Unpack.
-    tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
-
-    # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
-        tokens,
-        tokenizer.eod,
-        args.reset_position_ids,
-        args.reset_attention_mask,
-        args.eod_mask_loss)
-
-    batch = {
-        'tokens': tokens,
-        'labels': labels,
-        'loss_mask': loss_mask,
-        'attention_mask': attention_mask,
-        'position_ids': position_ids
-    }
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
     return batch.values()
 
-def loss_func(loss_mask: Tensor, output_tensor: Tensor):
+
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
+
+
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
 
     Args:
-        loss_mask (Tensor): Used to mask out some portions of the loss
-        output_tensor (Tensor): The tensor with the losses
-    """    
+        loss_mask (torch.Tensor): Used to mask out some portions of the loss
+        output_tensor (torch.Tensor): The tensor with the losses
+
+    Returns:
+        the loss scalar for this micro-batch
+        the number of non-padded tokens in this microbatch
+        a dict containing reporting metrics on the loss and number of tokens across
+            the data parallel ranks
+    """
     args = get_args()
 
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
+    total_tokens = loss_mask.sum()
+    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+
     if args.context_parallel_size > 1:
-        loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), loss_mask.sum().view(1)])
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
-        loss = loss[0] / loss[1]
-    else:
-        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
+    rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
-        global_rank = torch.distributed.get_rank()
-        assert not loss.isnan(), (
-            f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isnan,
+            message="found NaN in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
         )
-
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
+    # Check for spiky loss
+    if args.check_for_spiky_loss:
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
+            message="Spiky loss",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=False,
+        )
     # Reduce loss for logging.
-    averaged_loss = average_losses_across_data_parallel_group([loss])
+    reporting_loss = loss.clone().detach()
+    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
-    return loss * args.context_parallel_size, {'lm loss': averaged_loss[0]}
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
+    local_num_tokens = loss[1].clone().detach().to(torch.int)
+    return (
+        loss[0].clone(),
+        local_num_tokens,
+        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+    )
 
 
 def forward_step(data_iterator, model: GPTModel):
@@ -174,30 +240,48 @@ def forward_step(data_iterator, model: GPTModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator)
+    global stimer
+    with stimer(bdata=True):
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+            data_iterator)
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    with stimer:
+        output_tensor = model(tokens, position_ids, attention_mask,
+                              labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 
 
 def is_dataset_built_on_rank():
-    return (mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()) and mpu.get_tensor_model_parallel_rank() == 0
+    return (
+        mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
+    ) and mpu.get_tensor_model_parallel_rank() == 0
 
 
 def core_gpt_dataset_config_from_args(args):
+    tokenizer = get_tokenizer()
+
+    # Sometimes --data-path is too long, instead we parse it from a file.
+    blend: Optional[Tuple[List[str], Optional[List[float]]]]
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
+
     return GPTDatasetConfig(
-        is_built_on_rank=is_dataset_built_on_rank,
         random_seed=args.seed,
         sequence_length=args.seq_length,
-        blend=args.data_path,
-        blend_per_split=[args.train_data_path, args.valid_data_path, args.test_data_path],
+        blend=blend,
+        blend_per_split=blend_per_split,
         split=args.split,
+        num_dataset_builder_threads=args.num_dataset_builder_threads,
         path_to_cache=args.data_cache_path,
-        return_document_ids=args.retro_return_doc_ids
+        mmap_bin_files=args.mmap_bin_files,
+        tokenizer=tokenizer,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
+        s3_cache_path=args.s3_cache_path,
     )
 
 
@@ -209,12 +293,20 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """
     args = get_args()
 
+    config = core_gpt_dataset_config_from_args(args)
+
+    if args.mock_data:
+        dataset_type = MockGPTDataset
+    else:
+        dataset_type = GPTDataset
+
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        GPTDataset,
+        dataset_type,
         train_val_test_num_samples,
-        core_gpt_dataset_config_from_args(args)
+        is_dataset_built_on_rank,
+        config
     ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
@@ -227,8 +319,10 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    pretrain(train_valid_test_datasets_provider,
-             model_provider,
-             ModelType.encoder_or_decoder,
-             forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+    pretrain(
+        train_valid_test_datasets_provider,
+        model_provider,
+        ModelType.encoder_or_decoder,
+        forward_step,
+        args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+    )

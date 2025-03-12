@@ -8,8 +8,8 @@ sys.path.append(
 )
 
 from megatron.core.datasets.indexed_dataset import (
-    MMapIndexedDataset,
-    MMapIndexedDatasetBuilder,
+    IndexedDataset,
+    IndexedDatasetBuilder,
     get_bin_path,
     get_idx_path,
 )
@@ -77,8 +77,8 @@ def main():
     builder = None
     for prefix in sorted(prefixes):
         if builder is None:
-            dataset = MMapIndexedDataset(os.path.join(args.input, prefix), multimodal=args.multimodal)
-            builder = MMapIndexedDatasetBuilder(
+            dataset = IndexedDataset(os.path.join(args.input, prefix), multimodal=args.multimodal)
+            builder = IndexedDatasetBuilder(
                 get_bin_path(args.output_prefix), dtype=dataset.index.dtype, multimodal=args.multimodal
             )
             del dataset

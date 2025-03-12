@@ -12,10 +12,10 @@ NUM_NODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-CHECKPOINT_PATH=$0 #<Specify path>
-TENSORBOARD_DIR=$1 #<Specify path>
-VOCAB_FILE=$2 #<Specify path to file>/bert-large-cased-vocab.txt
-DATA_PATH=$3 #<Specify path and file prefix>_text_document
+CHECKPOINT_PATH=$1 #<Specify path>
+TENSORBOARD_DIR=$2 #<Specify path>
+VOCAB_FILE=$3 #<Specify path to file>/bert-large-cased-vocab.txt
+DATA_PATH=$4 #<Specify path and file prefix>_text_document
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -51,7 +51,7 @@ T5_ARGS="
     --transformer-impl transformer_engine \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
-    --use-mcore-models \
+    --attention-backend auto \
 "
 
 DATA_ARGS="

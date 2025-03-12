@@ -12,11 +12,11 @@ NUM_NODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-CHECKPOINT_PATH=$0 #<Specify path>
-TENSORBOARD_LOGS_PATH=$1 #<Specify path>
-VOCAB_FILE=$2 #<Specify path to file>/gpt2-vocab.json
-MERGE_FILE=$3 #<Specify path to file>/gpt2-merges.txt
-DATA_PATH=$4 #<Specify path and file prefix>_text_document
+CHECKPOINT_PATH=$1 #<Specify path>
+TENSORBOARD_LOGS_PATH=$2 #<Specify path>
+VOCAB_FILE=$3 #<Specify path to file>/gpt2-vocab.json
+MERGE_FILE=$4 #<Specify path to file>/gpt2-merges.txt
+DATA_PATH=$5 #<Specify path and file prefix>_text_document
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
@@ -31,6 +31,7 @@ GPT_MODEL_ARGS=(
     --num-attention-heads 96 
     --seq-length 2048 
     --max-position-embeddings 2048 
+    --attention-backend auto # Can use (flash/fused/unfused/local)
 )
 
 TRAINING_ARGS=(
@@ -49,7 +50,6 @@ TRAINING_ARGS=(
     --min-lr 6.0e-6
     --lr-warmup-fraction .001 
     --lr-decay-iters 430000 
-    --use-mcore-models
 )
 
 MODEL_PARALLEL_ARGS=(

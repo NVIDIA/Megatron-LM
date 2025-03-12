@@ -1,0 +1,87 @@
+ENV_VARS:
+  NCCL_IB_SL: 1
+  NCCL_IB_TIMEOUT: 19
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+  NCCL_P2P_NET_CHUNKSIZE: 2097152
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+TEST_TYPE: "release"
+MODEL_ARGS:
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 8
+  --pipeline-model-parallel-size: 1
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  # Training args
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --disable-bias-linear: true
+  --micro-batch-size: 4
+  --rampup-batch-size: "384 384 97656250"
+  --global-batch-size: 1152
+  --train-samples: 4882812
+  --manual-gc: true
+  # Transformer Engine args
+  --transformer-impl: transformer_engine
+  # Data args
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --tokenizer-type: GPTSentencePieceTokenizer
+  --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
+  --data-path: $DATA_BLEND
+  --split: 99,1,0
+  --no-mmap-bin-files: true
+  --num-workers: 6
+  # Add network size args
+  --apply-layernorm-1p: true
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
+  --rotary-percent: 0.5
+  --squared-relu: true
+  --num-layers: 32
+  --hidden-size: 6144
+  --num-attention-heads: 48
+  --group-query-attention: true
+  --num-query-groups: 8
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  # Add learning rate args
+  --lr-decay-samples: 1949218748
+  --lr-warmup-samples: 3906252
+  --lr: 4.5e-4
+  --min-lr: 4.5e-5
+  --decoupled-lr: 5.0e-4
+  --decoupled-min-lr: 4.5e-5
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  # Add validation args
+  --eval-iters: 32
+  --eval-interval: 2000
+  # Add checkpointing args
+  --load: ${OUTPUT_PATH}/checkpoints
+  --save: ${OUTPUT_PATH}/checkpoints
+  --save-interval: 1000
+  # Add initialization args
+  --init-method-std: 0.0134
+  # Add logging args
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 100
+  --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
+  --wandb-project: megatron-core-release-runs
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
+  # Add mixed precision args
+  --bf16: true

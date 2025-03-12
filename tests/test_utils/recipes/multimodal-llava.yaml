@@ -1,0 +1,71 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{environment}'
+  model: multimodal-llava
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 8
+  platforms: dgx_a100
+  time_limit:
+  n_repeat:
+  test_case:
+  scope:
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "DATA_PATH='-'"
+        "DATA_CACHE_PATH='-'"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/{name}/checkpoints"
+        "TRAINING_SCRIPT_PATH=pretrain_vlm.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "N_REPEAT={n_repeat}"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [multimodal_llava_mr_mcore_te_tp1_pp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [multimodal_llava_mr_mcore_te_tp2_pp3_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_etp3_dgx_a100_1N7G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_freeze_vit_freeze_lm_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_freeze_vit_freeze_lm_dist_opt_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [multimodal_llava_mr_mcore_te_tp4_pp1_resume_torch_etp3_dgx_a100_1N7G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]

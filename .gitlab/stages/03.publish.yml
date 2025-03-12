@@ -1,0 +1,126 @@
+.publish_common_freeze:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
+      when: manual
+    - when: never
+
+.publish_common_release:
+  stage: publish
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^core_r/ && $PUBLISH == "yes" && $PUBLISH_SCOPE == "release"
+      when: manual
+    - if: $PUBLISH == "yes" && $PUBLISH_SCOPE == "release"
+      when: manual
+      variables:
+        PUBLISH_DRYRUN: 'yes'
+    - when: never
+
+publish:release_branch:
+  extends: [.publish_common_freeze]
+  image: ${CI_MCORE_LTS_IMAGE}:${CI_PIPELINE_ID}
+  needs: [test:build_image]
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  variables:
+    GIT_STRATEGY: 'none'
+  script:
+    - git fetch origin $CI_DEFAULT_BRANCH
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
+    - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = ''" megatron/core/package_info.py
+    - VERSION=$(python -c "from megatron import core; print(core.__version__)")
+    - RELEASE_BRANCH=core_r$VERSION
+    - git switch --force-create $RELEASE_BRANCH origin/$CI_DEFAULT_BRANCH
+    - |
+      MESSAGE='{
+        "blocks": [
+          {
+            "type": "section",
+            "text": {
+              "type": "mrkdwn",
+              "text": "Releasebot 🤖: Megatron Core has been frozen 🎉 to branch `'"$RELEASE_BRANCH"'`"
+            }
+          }
+        ]
+      }'
+    - >
+      curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+
+
+    - git switch --force-create bot/chore/bump-version
+    - git add megatron/core/package_info.py
+    - >
+      git commit -m "chore: adjust version version"
+
+
+    - git push -u origin bot/chore/bump-version
+    - >
+      curl \
+        --header "PRIVATE-TOKEN: $PAT" \
+        --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+        -d "source_branch=bot/chore/bump-version" \
+        -d "target_branch=$RELEASE_BRANCH" \
+        -d "title=chore: Fix version of \`$RELEASE_BRANCH\`" \
+        -d "description=[🤖]: Hi @okoenig 👋,<br><br>we've adjusted the version number of \`$RELEASE_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
+
+publish:pypi_build_wheel:
+  extends: [test:pypi_build_wheel, .publish_common_release]
+  dependencies: []
+  variables:
+    PUBLISH_DRYRUN: 'no'
+
+publish:pypi_test_wheel:
+  extends: [test:pypi_test_wheel, .publish_common_release]
+  needs: [publish:pypi_build_wheel]
+  variables:
+    PUBLISH_DRYRUN: 'no'
+
+publish:pypi_push_wheel:
+  extends: [test:pypi_push_wheel, .publish_common_release]
+  needs: [publish:pypi_test_wheel]
+  dependencies: [publish:pypi_test_wheel]
+  variables:
+    PUBLISH_DRYRUN: 'no'
+
+publish:gh_release:
+  extends: [test:gh_release, .publish_common_release]
+  dependencies: [publish:pypi_test_wheel]
+  needs: [publish:pypi_test_wheel]
+  variables:
+    PUBLISH_DRYRUN: 'no'
+
+publish:notify_release:
+  needs: [publish:pypi_push_wheel, publish:gh_release]
+  extends: [test:notify_release, .publish_common_release]
+  variables:
+    PUBLISH_DRYRUN: 'no'
+
+publish:docs:
+  extends: [.publish_common_release]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags: 
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - cd ..
+    - rm -rf documentation && git clone https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
+    - cd documentation/megatron-lm
+      git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    - git fetch origin $CI_COMMIT_SHA
+    - git checkout $CI_COMMIT_SHA
+    - cd ..
+    - git add megatron-lm
+    - >
+      git commit -m 'feat: Bump mcore'
+    - git push

@@ -1,4 +1,0 @@
-DEVELOPER GUIDE 
-===============
-
-COMING SOON

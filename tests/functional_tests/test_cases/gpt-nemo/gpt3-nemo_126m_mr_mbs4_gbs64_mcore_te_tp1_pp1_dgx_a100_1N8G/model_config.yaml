@@ -1,0 +1,32 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  SKIP_PYTEST: 1
+MODEL_ARGS:
+  trainer.num_nodes: 1
+  trainer.devices: 8
+  trainer.max_steps: 50
+  trainer.val_check_interval: 50
+  trainer.limit_val_batches: 50
+  trainer.max_epochs: 'null'
+  trainer.precision: bf16
+  model.num_layers: 12
+  model.hidden_size: 768
+  model.num_attention_heads: 12
+  model.micro_batch_size: 4
+  model.global_batch_size: 64
+  model.tensor_model_parallel_size: 1
+  model.pipeline_model_parallel_size: 1
+  model.virtual_pipeline_model_parallel_size: 'null'
+  model.encoder_seq_length: 2048
+  model.max_position_embeddings: 2048
+  model.ffn_hidden_size: 3072
+  model.mcore_gpt: 'True'
+  model.apply_query_key_layer_scaling: 'True'
+  model.megatron_amp_O2: 'True'
+  model.data.data_prefix: '[]'
+  model.data.data_impl: mock
+  model.data.splits_string: '[99990,8,2]'
+  model.optim.name: distributed_fused_adam
+  model.optim.weight_decay: 0.1
+  exp_manager.create_checkpoint_callback: 'False'
+TEST_TYPE: regular

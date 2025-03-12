@@ -1,0 +1,15 @@
+__module__: megatron.energon
+__class__: Metadataset
+splits:
+  train:
+    datasets:
+      - weight: 1.
+        path: <path_to_pretraining_dataset_in_energon_format>
+        subflavors:
+          augmentation: false
+  val:
+    datasets:
+      - weight: 1.
+        path: <path_to_pretraining_dataset_in_energon_format>
+        subflavors:
+          augmentation: false

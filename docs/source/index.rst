@@ -7,23 +7,17 @@ Megatron Core User Guide
 ===================================
 
 **Megatron Core** is a Python library that has the core components required to build your language models. 
-A reference implementation of megatorn core can be found in  `NeMo <https://github.com/NVIDIA/NeMo/tree/main>`_ It offers a *simple* and
+A reference implementation of Megatron Core can be found in  `NeMo <https://github.com/NVIDIA/NeMo/tree/main>`_ It offers a *simple* and
 *intuitive* API.
 
 .. toctree::
    :maxdepth: 2
    :caption: User Guide
 
-   user-guide
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Developer Guide
-
-   developer-guide
+   user-guide/index
 
 .. toctree::
    :maxdepth: 3
    :caption: API Guide
    
-   modules
+   api-guide/index

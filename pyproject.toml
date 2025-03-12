@@ -6,10 +6,57 @@ requires = [
     "pybind11",
 ]
 
+[project]
+name = "megatron-core"
+dynamic = ["dependencies", "version"]
+description = "Megatron Core - a library for efficient and scalable training of transformer based models"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
+keywords = [
+    "NLP",
+    "NLU",
+    "deep",
+    "gpu",
+    "language",
+    "learning",
+    "learning",
+    "machine",
+    "nvidia",
+    "pytorch",
+    "torch",
+    "transformer",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities",
+]
+
+[project.urls]
+Download = "https://github.com/NVIDIA/Megatron-LM/releases"
+Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
+
 [tool.isort]
 profile = "black"  # black-compatible
 line_length = 100  # should match black parameters
-py_version = 38  # python 3.8 as a target version
+py_version = 310  # python 3.8 as a target version
 known_first_party = ["megatron"]  # FIRSTPARTY section
 known_third_party = ["transformer_engine"]  # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
@@ -21,4 +68,5 @@ line_length = 100
 skip_string_normalization = true
 # recongized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
-required_version = "19.10b0"  
+required_version = "24"  
+skip_magic_trailing_comma = true

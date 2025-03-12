@@ -14,9 +14,10 @@ _MAX_DATA_DIM = 5
 def _check_data_types(keys, data, target_dtype):
     """Check that all the keys have the same target data type."""
     for key in keys:
-        assert data[key].dtype == target_dtype, (
-            '{} has data type {} which '
-            'is different than {}'.format(key, data[key].dtype, target_dtype)
+        assert (
+            data[key].dtype == target_dtype
+        ), '{} has data type {} which ' 'is different than {}'.format(
+            key, data[key].dtype, target_dtype
         )
 
 
@@ -36,7 +37,7 @@ def _build_key_size_numel_dictionaries(keys, data):
             offset += max_dim
 
     # Move to GPU and broadcast.
-    sizes_cuda = torch.cuda.LongTensor(sizes)
+    sizes_cuda = torch.tensor(sizes, dtype=torch.long, device='cuda')
     torch.distributed.broadcast(
         sizes_cuda, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
     )
@@ -68,7 +69,7 @@ def broadcast_data(keys, data, datatype):
     """Broadcast data from rank zero of each model parallel group to the
     members of the same model parallel group.
 
-    Arguments:
+    Args:
         keys: list of keys in the data disctionary to be broadcasted
         data: data dictionary of string keys and cpu tensor values.
         datatype: torch data type of all tensors in data associated

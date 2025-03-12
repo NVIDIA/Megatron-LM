@@ -2,7 +2,9 @@
 
 import torch
 
-###### BIAS GELU FUSION/ NO AUTOGRAD ################
+from megatron.core.jit import jit_fuser
+
+# BIAS GELU FUSION/ NO AUTOGRAD ################
 # 1/sqrt(2*pi)-> 0.3989423
 # 1/sqrt(2)   -> 0.70710678
 # sqrt(2/pi)  -> 0.79788456
@@ -11,7 +13,7 @@ import torch
 # x * 0.5 * (1.0 + torch.erf(x * 0.70710678))
 
 
-@torch.jit.script
+@jit_fuser
 def bias_gelu(bias, y):
     x = bias + y
     return x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
@@ -20,7 +22,7 @@ def bias_gelu(bias, y):
 # gradient of tanh approximation of gelu
 # gradient of actual gelu is:
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
-@torch.jit.script
+@jit_fuser
 def bias_gelu_back(g, bias, y):
     x = bias + y
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
@@ -43,6 +45,11 @@ class GeLUFunction(torch.autograd.Function):
         input, bias = ctx.saved_tensors
         tmp = bias_gelu_back(grad_output, bias, input)
         return tmp, tmp
+
+    # This is required to make Sphinx happy :-(
+    @classmethod
+    def apply(cls, *args, **kwargs):
+        return super().apply(*args, **kwargs)
 
 
 bias_gelu_impl = GeLUFunction.apply

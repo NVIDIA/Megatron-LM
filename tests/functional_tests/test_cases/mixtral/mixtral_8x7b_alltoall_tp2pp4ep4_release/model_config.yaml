@@ -1,0 +1,96 @@
+ENV_VARS:
+  NCCL_IB_SL: 1
+  NCCL_IB_TIMEOUT: 19
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_FWD_LAYERNORM_SM_MARGIN: 16
+  NVTE_BWD_LAYERNORM_SM_MARGIN: 16
+  NCCL_P2P_NET_CHUNKSIZE: 2097152
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+TEST_TYPE: "release"
+MODEL_ARGS:
+  # Distributed args
+  --distributed-timeout-minutes: 60
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 4
+  --use-distributed-optimizer: true
+  --overlap-grad-reduce: true
+  --overlap-param-gather: true
+  --no-ckpt-fully-parallel-save: true
+  # Training args
+  --use-mcore-models: true
+  --sequence-parallel: true
+  --use-flash-attn: true
+  --disable-bias-linear: true
+  --micro-batch-size: 1
+  --global-batch-size: 1024
+  --train-samples: 24414063
+  --exit-duration-in-mins: 230
+  # Transformer Engine args
+  --transformer-impl: transformer_engine
+  # Data args
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --tokenizer-type: GPTSentencePieceTokenizer
+  --tokenizer-model: ${DATA_PATH}/utils/nemotron_2_256k.model
+  --data-path: $DATA_BLEND
+  --split: 99,1,0
+  --no-mmap-bin-files: true
+  --num-workers: 6
+  # Add network size args
+  --untie-embeddings-and-output-weights: true
+  --position-embedding-type: rope
+  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
+  --rotary-percent: 0.5
+  --normalization: RMSNorm
+  --swiglu: true
+  --num-layers: 32
+  --hidden-size: 4096
+  --ffn-hidden-size: 14336
+  --num-attention-heads: 32
+  --group-query-attention: true
+  --num-query-groups: 8
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  --make-vocab-size-divisible-by: 128
+  # Add regularization args
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --clip-grad: 1.0
+  --weight-decay: 0.1
+  # Add learning rate args
+  --lr-decay-samples: 1949218748
+  --lr-warmup-samples: 3906252
+  --lr: 3.0e-4
+  --min-lr: 3.0e-5
+  --lr-decay-style: cosine
+  --adam-beta1: 0.9
+  --adam-beta2: 0.95
+  # Add MoE args
+  --expert-model-parallel-size: 4
+  --num-experts: 8
+  --moe-router-load-balancing-type: aux_loss
+  --moe-router-topk: 2
+  --moe-grouped-gemm: true
+  --moe-aux-loss-coeff: 1e-2
+  --moe-token-dispatcher-type: alltoall
+  # Add validation args
+  --eval-iters: 32
+  --eval-interval: 200
+  # Add checkpointing args
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 5000
+  # Add initialization args
+  --init-method-std: 0.010
+  # Add logging args
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-throughput: true
+  --log-interval: 1
+  --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
+  --wandb-project: megatron-core-release-runs
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
+  # Add mixed precision args
+  --bf16: true

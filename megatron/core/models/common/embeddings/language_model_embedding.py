@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Literal, Optional
+from typing import Literal
 
 import torch
 from torch import Tensor
@@ -8,23 +8,21 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import (
-    make_sharded_tensor_for_checkpoint,
-    make_tp_sharded_tensor_for_checkpoint,
-)
 
 
 class LanguageModelEmbedding(MegatronModule):
     """Language model embeddings.
 
-    Arguments:
+    Args:
         config (TransformerConfig): config object with all necessary configs for TransformerBlock
         vocab_size (int): vocabulary size
         max_sequence_length (int): maximum size of sequence. This
                              is used for positional embedding
         add_position_embedding (bool): Add a position embedding.
         embedding_dropout_prob (float): dropout probability for embeddings
-        num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head . Defaults to 0.
+        num_tokentypes (int): Set to 0 without binary head, and 2 with a binary head. Defaults to 0.
+        scatter_to_sequence_parallel (bool): Set to False to disable scatter of embedding
+            across sequence parallel region. Defaults to True.
     """
 
     def __init__(
@@ -32,8 +30,9 @@ class LanguageModelEmbedding(MegatronModule):
         config: TransformerConfig,
         vocab_size: int,
         max_sequence_length: int,
-        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
         num_tokentypes: int = 0,
+        scatter_to_sequence_parallel: bool = True,
     ):
         super().__init__(config=config)
 
@@ -42,12 +41,20 @@ class LanguageModelEmbedding(MegatronModule):
         self.max_sequence_length: int = max_sequence_length
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
         self.num_tokentypes = num_tokentypes
+        self.scatter_to_sequence_parallel = scatter_to_sequence_parallel
+        self.reduce_scatter_embeddings = (
+            (not self.add_position_embedding)
+            and self.num_tokentypes <= 0
+            and self.config.sequence_parallel
+            and self.scatter_to_sequence_parallel
+        )
 
         # Word embeddings (parallel).
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
             init_method=self.config.init_method,
+            reduce_scatter_embeddings=self.reduce_scatter_embeddings,
             config=self.config,
         )
 
@@ -85,11 +92,13 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.shared = True
 
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
-        """Forward pass of the embedding module
+        """Forward pass of the embedding module.
+
         Args:
             input_ids (Tensor): The input tokens
             position_ids (Tensor): The position id's used to calculate position embeddings
-            tokentype_ids (int): The token type ids. Used when args.bert_binary_head is set to True. Defaults to None
+            tokentype_ids (int): The token type ids. Used when args.bert_binary_head is
+                set to True. Defaults to None
 
         Returns:
             Tensor: The output embeddings
@@ -101,8 +110,9 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             embeddings = word_embeddings
 
-        # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-        embeddings = embeddings.transpose(0, 1).contiguous()
+        if not self.reduce_scatter_embeddings:
+            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
+            embeddings = embeddings.transpose(0, 1).contiguous()
 
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
@@ -118,11 +128,12 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Dropout.
         if self.config.sequence_parallel:
-            embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
+            if not self.reduce_scatter_embeddings and self.scatter_to_sequence_parallel:
+                embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
             # Has a small runtime cost (~0.5%).
-            if self.config.clone_scatter_output_in_embedding:
+            if self.config.clone_scatter_output_in_embedding and self.scatter_to_sequence_parallel:
                 embeddings = embeddings.clone()
             with tensor_parallel.get_cuda_rng_tracker().fork():
                 embeddings = self.embedding_dropout(embeddings)
@@ -130,34 +141,3 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = self.embedding_dropout(embeddings)
 
         return embeddings
-
-    def sharded_state_dict(self, prefix=''):
-
-        sharded_state_dict = {}
-
-        word_embeddings_prefix = f'{prefix}word_embeddings.'
-        word_embeddings_state_dict = self.word_embeddings.state_dict(
-            prefix=word_embeddings_prefix, keep_vars=True
-        )
-
-        sharded_word_embeddings_key = f'{word_embeddings_prefix}weight'
-        sharded_word_embeddings_tensor = make_tp_sharded_tensor_for_checkpoint(
-            tensor=word_embeddings_state_dict[sharded_word_embeddings_key],
-            key=sharded_word_embeddings_key,
-            allow_shape_mismatch=True,
-        )
-        sharded_state_dict[sharded_word_embeddings_key] = sharded_word_embeddings_tensor
-
-        if self.add_position_embedding:
-            position_embeddings_prefix = f'{prefix}position_embeddings.'
-            position_embeddings_state_dict = self.position_embeddings.state_dict(
-                prefix=position_embeddings_prefix, keep_vars=True
-            )
-            sharded_position_embeddings_key = f'{position_embeddings_prefix}weight'
-            sharded_position_embeddings_tensor = make_sharded_tensor_for_checkpoint(
-                tensor=position_embeddings_state_dict[sharded_position_embeddings_key],
-                key=sharded_position_embeddings_key,
-            )
-            sharded_state_dict[sharded_position_embeddings_key] = sharded_position_embeddings_tensor
-
-        return sharded_state_dict
