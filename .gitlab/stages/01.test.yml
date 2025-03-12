@@ -19,13 +19,13 @@ include:
   services:
     - name: docker:24.0.5-dind
       variables:
-        HEALTHCHECK_TCP_PORT: '2376'
+        HEALTHCHECK_TCP_PORT: "2376"
   timeout: 45m
   variables:
     DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_CERTDIR: '/certs'
+    DOCKER_TLS_CERTDIR: "/certs"
     DOCKER_TLS_VERIFY: 1
-    DOCKER_CERT_PATH: '$DOCKER_TLS_CERTDIR/client'
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
     TAG: purpose/builder-large
     STAGE: jet
     MCORE_BACKWARDS_REF: core_r0.11.0
@@ -46,7 +46,7 @@ include:
           ADDITIONAL_PARAMS+=("--pull")
           ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main,mode=max")
         else
-          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID},mode=max")
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-$CI_COMMIT_REF_SLUG},mode=max")
         fi
 
         if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
@@ -103,7 +103,7 @@ test:unit_tests_configure:
   needs:
     - test:build_image
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -233,7 +233,7 @@ test:notify_unit_tests:
   needs:
     - test:unit_tests_pyt(DEV)_mcore(latest)
     - test:unit_tests_pyt(LTS)_mcore(latest)
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -262,7 +262,7 @@ test:notify_unit_tests:
 test:docs_build:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -280,7 +280,7 @@ test:docs_build:
 test:formatting:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -289,7 +289,7 @@ test:formatting:
     - team/megatron
   needs: [test:build_image]
   variables:
-    GIT_STRATEGY: 'clone'
+    GIT_STRATEGY: "clone"
   script:
     - |
       if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
@@ -315,7 +315,7 @@ test:formatting:
 
 test:copyright:
   extends: [.test_rules]
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -335,14 +335,14 @@ secret_detection:
 
 # Inherit and modify template
 test:secret_detection:
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  extends: ['.secret-analyzer']
+  extends: [".secret-analyzer"]
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
@@ -364,18 +364,18 @@ test:pypi_build_wheel:
   extends: [.test_rules]
   image:
     name: ${IMAGE}
-    entrypoint: ['']
+    entrypoint: [""]
   services:
     - name: docker:24.0.5-dind
       variables:
-        HEALTHCHECK_TCP_PORT: '2376'
+        HEALTHCHECK_TCP_PORT: "2376"
   parallel:
     matrix:
       - PLATFORM: arm64
         IMAGE: quay.io/pypa/manylinux_2_28_aarch64
       - PLATFORM: amd64
         IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-  tags: 
+  tags:
     - arch/${PLATFORM}
     - env/prod
     - origin/jet-fleet
@@ -383,7 +383,7 @@ test:pypi_build_wheel:
     - purpose/builder-small
     - team/megatron
   variables:
-    PUBLISH_DRYRUN: 'yes'
+    PUBLISH_DRYRUN: "yes"
     PY_ENV: pytorch_24.10
   script:
     - echo $PUBLISH_DRYRUN
@@ -392,6 +392,7 @@ test:pypi_build_wheel:
         PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
         sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
       fi
+
 
     - /opt/python/cp310-cp310/bin/python -m build
     - /opt/python/cp311-cp311/bin/python -m build
@@ -412,9 +413,9 @@ test:pypi_build_wheel:
 
 test:pypi_test_wheel:
   extends: [.test_rules]
-  image: 
+  image:
     name: python:3.11
-    entrypoint: ['']
+    entrypoint: [""]
   needs: [test:pypi_build_wheel]
   parallel:
     matrix:
@@ -423,8 +424,8 @@ test:pypi_test_wheel:
   services:
     - name: docker:24.0.5-dind
       variables:
-        HEALTHCHECK_TCP_PORT: '2376'
-  tags: 
+        HEALTHCHECK_TCP_PORT: "2376"
+  tags:
     - arch/${PLATFORM}
     - env/prod
     - origin/jet-fleet
@@ -432,7 +433,7 @@ test:pypi_test_wheel:
     - purpose/builder-small
     - team/megatron
   variables:
-    PUBLISH_DRYRUN: 'yes'
+    PUBLISH_DRYRUN: "yes"
   script:
     - rm -rf megatron
     - pip install -U --no-cache-dir pip
@@ -443,6 +444,7 @@ test:pypi_test_wheel:
         pip install --no-cache-dir wheelhouse/*cp311*x86_64.whl
       fi
 
+
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
 
     - >
@@ -451,6 +453,7 @@ test:pypi_test_wheel:
       else
         test "$EXPECTED_RELEASE_NUMBER_amd64" == "$RELEASE_NUMBER"
       fi
+
 
     - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
   artifacts:
@@ -463,7 +466,7 @@ test:pypi_test_wheel:
 test:pypi_push_wheel:
   extends: [.test_rules]
   image: python:3.11
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -472,7 +475,7 @@ test:pypi_push_wheel:
     - team/megatron
   needs: [test:pypi_test_wheel]
   variables:
-    PUBLISH_DRYRUN: 'yes'
+    PUBLISH_DRYRUN: "yes"
   timeout: 3m
   script:
     - >
@@ -486,11 +489,12 @@ test:pypi_push_wheel:
         export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
       fi
 
+
     - ls -al dist/
     - ls -al wheelhouse/
     - pip install twine
     - twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* dist/*
-  
+
   rules:
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
@@ -501,7 +505,7 @@ test:pypi_push_wheel:
 test:gh_release:
   extends: [.test_rules]
   needs: [test:pypi_test_wheel]
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -510,7 +514,7 @@ test:gh_release:
     - team/megatron
   image: badouralix/curl-jq
   variables:
-    PUBLISH_DRYRUN: 'yes'
+    PUBLISH_DRYRUN: "yes"
   script:
     - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
     - IS_PRERELEASE=$([[ "$RELEASE_NUMBER" == *rc* ]] && echo "true" || echo "false")
@@ -522,6 +526,8 @@ test:gh_release:
         CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
         CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
       fi
+
+
     - >
       PAYLOAD=$(jq -nc \
                   --arg TAG_NAME "v${RELEASE_NUMBER}" \
@@ -540,6 +546,8 @@ test:gh_release:
                   }'
               )
       echo -E "$PAYLOAD" > payload.txt
+
+
     - cat payload.txt
     - >
       CMD=$(echo -E 'curl -L \
@@ -550,6 +558,7 @@ test:gh_release:
         https://api.github.com/repos/NVIDIA/Megatron-LM/releases \
         -d @payload.txt
       ')
+
 
     - >
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
@@ -563,7 +572,7 @@ test:notify_release:
   needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
   extends: [.test_rules]
   image: badouralix/curl-jq
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -571,7 +580,7 @@ test:notify_release:
     - purpose/utility
     - team/megatron
   variables:
-    PUBLISH_DRYRUN: 'yes'
+    PUBLISH_DRYRUN: "yes"
   script:
     - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
     - >
@@ -602,13 +611,14 @@ test:notify_release:
         eval "$CMD"
       fi
 
+
 test:generate_coverage_report:
   extends: [.test_rules]
   needs:
     - test:unit_tests_pyt(DEV)_mcore(latest)
     - test:unit_tests_pyt(LTS)_mcore(latest)
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -623,7 +633,7 @@ test:generate_coverage_report:
     - coverage combine --keep $(ls coverage_results/*/coverage_report)
     - coverage report
     - coverage xml
-  coverage: '/TOTAL.+ ([0-9]{1,3}%)/'
+  coverage: "/TOTAL.+ ([0-9]{1,3}%)/"
   artifacts:
     reports:
       coverage_report:

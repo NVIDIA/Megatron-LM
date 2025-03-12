@@ -115,6 +115,7 @@ for i in $(seq 1 $N_REPEAT); do
 
     if [[ "$TEST_TYPE" == "release" ]]; then
         SKIP_PYTEST=0
+        TRAIN_ITERS=10000000
     fi
 
     if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then

@@ -4,6 +4,7 @@ ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
+  SKIP_PYTEST: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
@@ -36,7 +37,7 @@ MODEL_ARGS:
   # Add network size args
   --untie-embeddings-and-output-weights: true
   --position-embedding-type: rope
-  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
+  --no-rope-fusion: true #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 1.0
   --normalization: RMSNorm
   --swiglu: true
