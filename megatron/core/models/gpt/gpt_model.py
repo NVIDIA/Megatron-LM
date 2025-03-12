@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from collections import OrderedDict
-from typing import Dict, Literal, Optional
+from typing import Callable, Dict, Literal, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -15,7 +15,10 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_block import (
+    TransformerBlock,
+    combined_1f1b_transformer_block_execution,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -192,28 +195,26 @@ class GPTModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def forward(
+    # Used for combined 1f1b execution, pre_core_forward and post_core_forward are required by the wrapper functions of GPTModel
+    # pre_core_forward and post_core_forward of GPTModel should work as identity functions
+    def pre_core_forward(self, *inputs):
+        return inputs
+
+    def post_core_forward(self, *outputs):
+        return outputs
+
+    def pre_decoder_forward(
         self,
         input_ids: Tensor,
         position_ids: Tensor,
-        attention_mask: Tensor,
         decoder_input: Tensor = None,
-        labels: Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
-        runtime_gather_output: Optional[bool] = None,
-    ) -> Tensor:
-        """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
-        processing layer (optional).
-
-        It either returns the Loss values if labels are given  or the final hidden units
-
-        Args:
-            runtime_gather_output (bool): Gather output at runtime. Default None means
-                `parallel_output` arg in the constructor will be used.
+    ):
+        """Prepares the input for the decoder by handling embeddings and positional encodings.
+        This function is for combined 1f1b overlap implementation.
         """
+
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
@@ -261,18 +262,21 @@ class GPTModel(LanguageModule):
         else:
             sequence_len_offset = None
 
-        # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_params=inference_params,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            **(extra_block_kwargs or {}),
-        )
+        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+
+    def post_decoder_forward(
+        self,
+        hidden_states: Tensor,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        runtime_gather_output: Optional[bool] = None,
+    ):
+        """Processes the decoder output to generate logits and compute loss if needed.
+        This function is for combined 1f1b overlap implementation.
+        """
 
         if not self.post_process:
             return hidden_states
@@ -311,6 +315,61 @@ class GPTModel(LanguageModule):
 
         return loss
 
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+    ) -> Tensor:
+        """Forward function of the GPT Model This function passes the input tensors
+        through the embedding layer, and then the decoeder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
+        """
+        # Pre-decoder forward
+        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+            self.pre_decoder_forward(
+                input_ids, position_ids, decoder_input, inference_params, packed_seq_params
+            )
+        )
+
+        # Run decoder.
+        hidden_states = self.decoder(
+            hidden_states=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            **(extra_block_kwargs or {}),
+        )
+
+        # Post-decoder forward
+        loss = self.post_decoder_forward(
+            hidden_states,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            runtime_gather_output,
+        )
+
+        return loss
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
     ) -> ShardedStateDict:
@@ -336,3 +395,52 @@ class GPTModel(LanguageModule):
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict
+
+
+def combined_1f1b_model_execution(
+    forward_gptmodel, backward_gptmodel, forward_inputs, backward_inputs, backward_function, config
+) -> Tuple:
+    # TODO: Implement the combined 1f1b execution for GPTModel
+    tokens, labels, loss_mask, attention_mask, position_ids = forward_inputs
+    backward_output_tensor, backward_output_tensor_grad = backward_inputs
+
+    if config.combined_1f1b_recipe == 'ep_a2a':
+        # Forward pass
+        # Pre-decoder forward
+        (
+            forward_decoder_input,
+            forward_rotary_pos_emb,
+            forward_rotary_pos_cos,
+            forward_rotary_pos_sin,
+            forward_sequence_len_offset,
+        ) = forward_gptmodel.pre_decoder_forward(tokens, position_ids)
+
+        forward_decoder_output = forward_gptmodel.decoder(
+            hidden_states=forward_decoder_input,
+            attention_mask=attention_mask,
+            inference_params=None,
+            rotary_pos_emb=forward_rotary_pos_emb,
+            rotary_pos_cos=forward_rotary_pos_cos,
+            rotary_pos_sin=forward_rotary_pos_sin,
+            packed_seq_params=None,
+            sequence_len_offset=forward_sequence_len_offset,
+        )
+
+        # Post-decoder forward
+        forward_output_tensor = forward_gptmodel.post_decoder_forward(
+            hidden_states=forward_decoder_output,
+            input_ids=tokens,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=forward_decoder_input,
+            labels=labels,
+        )
+
+        # Backward pass
+        # TODO: decompose backward path into finer-grained calls
+        # and merge decoder fwd/bwd into a single combined_1f1b_transformer_block_execution call
+        backward_function(backward_output_tensor[0], backward_output_tensor_grad[0])
+
+        return forward_output_tensor
+    else:
+        raise ValueError(f"Unsupported overlap recipe: {config.combined_1f1b_recipe}")

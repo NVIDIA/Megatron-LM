@@ -506,6 +506,21 @@ def validate_args(args, defaults={}):
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
 
+    if args.combined_1f1b:
+        assert args.distributed_backend == 'nccl', \
+            'combined 1F1B is only supported with NCCL backend'
+        assert args.pipeline_model_parallel_size > 1, \
+            'combined 1F1B is only supported with pipeline model parallelism'
+        assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
+            'virtual pipeline parallel should be enabled for combined 1F1B'
+        if args.overlap_p2p_comm:
+            # Combined 1F1B overlaps also overlaps p2p communication, 
+            # however, it uses the code path of args.overlap_p2p_comm == False
+            args.overlap_p2p_comm = False
+        if args.combined_1f1b_recipe == 'ep_a2a':
+            assert args.expert_model_parallel_size > 1, \
+                'Combined 1f1b recipe ep_a2a is only supported with expert model parallelism'
+
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
               flush=True)
@@ -1873,6 +1888,11 @@ def _add_distributed_args(parser):
     group.add_argument('--overlap-p2p-communication-warmup-flush', action='store_true',
                        default=False, help='if set, overlap pipeline parallel communication in warmup and flush',
                        dest='overlap_p2p_comm_warmup_flush')
+    group.add_argument('--combined-1f1b', action='store_true',
+                       default=False, help='if set, use combined 1F1B for communication hiding')
+    group.add_argument('--combined-1f1b-recipe', default='ep_a2a',
+                       choices=['ep_a2a', 'golden'],
+                       help='Target communication to hide with the combined 1F1B.')
     group.add_argument('--distributed-backend', default='nccl',
                        choices=['nccl', 'gloo'],
                        help='Which backend to use for distributed training.')
