@@ -1417,6 +1417,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     timers = get_timers()
     one_logger = get_one_logger()
 
+    if args.run_workload_inspector_server:
+        try:
+            from workload_inspector.utils.webserver import run_server
+            import threading
+            threading.Thread(target=run_server, daemon=True, args=(torch.distributed.get_rank(), )).start()
+        except ModuleNotFoundError:
+            print_rank_0("workload inspector module not found.")
+
     # Write args to tensorboard
     write_args_to_tensorboard()
 
