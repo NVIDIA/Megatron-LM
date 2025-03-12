@@ -149,16 +149,22 @@ def experimental_cls(introduced_with_version: str):
                 cls.__name__,
             )
 
-        def wrapped_func():
+        def wrapped_func(cls):
 
-            if config.ENABLE_EXPERIMENTAL is not True:
-                raise ExperimentalNotEnabledError(f"Flag {config.ENABLE_EXPERIMENTAL} not enabled.")
+            def check_experimental(self, name):
+                if config.ENABLE_EXPERIMENTAL is not True:
+                    raise ExperimentalNotEnabledError(
+                        f"Flag {config.ENABLE_EXPERIMENTAL} not enabled."
+                    )
+                logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
 
-            logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+                return self().__getattribute__(name)
+
+            cls.__getattribute__ = check_experimental
 
             return cls
 
-        return wrapped_func
+        return wrapped_func(cls)
 
     return validator
 
