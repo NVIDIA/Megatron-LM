@@ -12,7 +12,7 @@ from megatron.inference.text_generation.communication import broadcast_float_lis
 from megatron.inference.text_generation.tokenization import tokenize_prompts
 
 
-class GPTInferenceWrapperServer(GPTInferenceWrapper):
+class ModelInferenceWrapperServer(GPTInferenceWrapper):
     def __init__(self, model, inference_wrapper_config):
         super().__init__(model, inference_wrapper_config)
 
