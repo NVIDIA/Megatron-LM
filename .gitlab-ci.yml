@@ -10,44 +10,44 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
     - if: $CI_COMMIT_REF_PROTECTED == "true"
       variables:
-        FUNCTIONAL_TEST: 'no'
+        FUNCTIONAL_TEST: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 15
-        FUNCTIONAL_TEST: 'yes'
+        FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        FUNCTIONAL_TEST_CLUSTER_A100: ''
-        FUNCTIONAL_TEST_CLUSTER_H100: ''
-        PUBLISH: 'no'
+        FUNCTIONAL_TEST_CLUSTER_A100: ""
+        FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 15
-        FUNCTIONAL_TEST: 'yes'
+        FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        FUNCTIONAL_TEST_CLUSTER_A100: ''
-        FUNCTIONAL_TEST_CLUSTER_H100: ''
-        PUBLISH: 'no'
+        FUNCTIONAL_TEST_CLUSTER_A100: ""
+        FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 15
-        FUNCTIONAL_TEST: 'yes'
+        FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 9000
-        FUNCTIONAL_TEST_CLUSTER_A100: ''
-        FUNCTIONAL_TEST_CLUSTER_H100: ''
-        PUBLISH: 'no'
+        FUNCTIONAL_TEST_CLUSTER_A100: ""
+        FUNCTIONAL_TEST_CLUSTER_H100: ""
+        PUBLISH: "no"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
-        FUNCTIONAL_TEST: 'no'
-        PUBLISH: 'no'
+        FUNCTIONAL_TEST: "no"
+        PUBLISH: "no"
     - when: never
   auto_cancel:
     on_new_commit: interruptible
@@ -66,66 +66,67 @@ default:
 
 variables:
   UNIT_TEST:
-    value: 'yes'
+    value: "yes"
     options:
-      - 'yes'
-      - 'no'
+      - "yes"
+      - "no"
     description: To run the funtional test suite
   UNIT_TEST_REPEAT:
-    value: '1'
-    description: 'Number of repetitions'
+    value: "1"
+    description: "Number of repetitions"
   UNIT_TEST_TIMEOUT:
-    value: '30'
+    value: "30"
     description: Timeout (minutes) for Unit tests (all repeats)
   FUNCTIONAL_TEST:
-    value: 'yes'
+    value: "yes"
     options:
-      - 'yes'
-      - 'no'
+      - "yes"
+      - "no"
     description: To run the funtional test suite
   FUNCTIONAL_TEST_SCOPE:
-    value: 'mr'
+    value: "mr"
     options:
-      - 'mr'
-      - 'nightly'
-      - 'weekly'
-      - 'pre-release'
-      - 'release'
-    description: 'Testsuite to run (only for FUNCTIONAL_TEST=yes)'
+      - "mr"
+      - "nightly"
+      - "weekly"
+      - "pre-release"
+      - "release"
+    description: "Testsuite to run (only for FUNCTIONAL_TEST=yes)"
   FUNCTIONAL_TEST_REPEAT:
-    value: '5'
-    description: 'Number of repetitions per test'
+    value: "5"
+    description: "Number of repetitions per test"
   FUNCTIONAL_TEST_TIME_LIMIT:
-    value: '2700'
-    description: 'Timeout in seconds per test'
+    value: "2700"
+    description: "Timeout in seconds per test"
   FUNCTIONAL_TEST_CASES:
-    value: 'all'
+    value: "all"
     description: "Comma-separated list of test_cases to run. Use 'all' to run the full suite."
   FUNCTIONAL_TEST_CLUSTER_A100:
-    value: 'dgxa100_dracooci'
+    value: "dgxa100_dracooci"
     options:
-      - 'dgxa100_dracooci'
-      - 'dgxa100_dracooci-ord'
-    description: 'Cluster for A100 workloads'
+      - "dgxa100_dracooci"
+      - "dgxa100_dracooci-ord"
+    description: "Cluster for A100 workloads"
   FUNCTIONAL_TEST_CLUSTER_H100:
-    value: 'dgxh100_eos'
+    value: "dgxh100_eos"
     options:
-      - 'dgxh100_coreweave'
-      - 'dgxh100_eos'
-    description: 'Cluster for H100 workloads'
+      - "dgxh100_coreweave"
+      - "dgxh100_eos"
+    description: "Cluster for H100 workloads"
   FUNCTIONAL_TEST_NAME:
-    description: 'Name of functional test run (only for pre-release and release)'
+    description: "Name of functional test run (only for pre-release and release)"
+    value: "$$CI_COMMIT_SHA"
   PUBLISH:
-    value: 'no'
+    value: "no"
     options:
-      - 'yes'
-      - 'no'
+      - "yes"
+      - "no"
     description: Build and publish a wheel to PyPi
   PUBLISH_SCOPE:
-    value: 'code-freeze'
+    value: "code-freeze"
     options:
-      - 'code-freeze'
-      - 'release'
+      - "code-freeze"
+      - "release"
     description: Type of publish (freeze or final release)
 
   # CI wide variables
