@@ -11,7 +11,6 @@ import torch
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TELayerNormColumnParallelLinear,
-    TELinear,
     TERowParallelLinear,
 )
 from megatron.core.tensor_parallel import (
@@ -19,6 +18,7 @@ from megatron.core.tensor_parallel import (
     RowParallelLinear,
 )
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.custom_layers.synced_linear import SyncedLinear
 from megatron.core.transformer.module import MegatronModule
 
 
@@ -29,20 +29,20 @@ LORA_LAYERS_DEFAULT_CONFIG = {
     "skip_bias_add": True,
 }
 COLUMN_PARALLEL_LAYERS = [
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
     partial(ColumnParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_),
 ]
 ROW_PARALLEL_LAYERS = [
     partial(RowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(SyncedLinear, init_method=torch.nn.init.zeros_, broadcast_weights=False),
 ]
 TE_COLUMN_PARALLEL_LAYERS = [
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(SyncedLinear, init_method=KAIMING_INIT_METHOD),
     partial(TEColumnParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, gather_output=False),
 ]
 TE_ROW_PARALLEL_LAYERS = [
     partial(TERowParallelLinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=KAIMING_INIT_METHOD, input_is_parallel=True),
-    partial(TELinear, **LORA_LAYERS_DEFAULT_CONFIG, init_method=torch.nn.init.zeros_, parallel_mode=None, skip_weight_param_allocation=False),
+    partial(SyncedLinear, init_method=torch.nn.init.zeros_, broadcast_weights=False),
 ]
 LORA_LAYERS_MAPPING = {
     ColumnParallelLinear: COLUMN_PARALLEL_LAYERS,
@@ -56,6 +56,10 @@ LORA_LAYERS_MAPPING = {
 class LoraAdapter(MegatronModule):
     def __init__(self, base_layer: torch.nn.Module, *, config: TransformerConfig, rank: int, alpha: float, dropout: float, is_expert: bool = False):
         super(LoraAdapter, self).__init__(config)
+
+        if config.sequence_parallel and torch.distributed.get_rank() == 0:
+            LOGGER.warning("Sequence parallelism is not fully supported and may slow down the training. Use it at your own risk.")
+
         self.lora_alpha = alpha
         self.base_layer = base_layer
         self.base_layer.weight.requires_grad = False
@@ -83,7 +87,7 @@ class LoraAdapter(MegatronModule):
         self.lora_a = lora_a_class(input_size=input_size, output_size=rank, **layer_config)
         self.lora_b = lora_b_class(input_size=rank, output_size=output_size, **layer_config)
         self.lora_dropout = torch.nn.Dropout(p=dropout, inplace=False)
-    
+
     def _remap_base_layer_for_training(self, _: torch.nn.Module, state_dict: dict, prefix: str, *args) -> None:
         extra_prefix = "base_layer."
         keys = list(state_dict.keys())

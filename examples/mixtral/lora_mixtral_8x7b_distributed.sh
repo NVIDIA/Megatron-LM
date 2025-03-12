@@ -100,7 +100,6 @@ MODEL_PARALLEL_ARGS=(
     --pipeline-model-parallel-size 1
     --expert-model-parallel-size 8
     --use-distributed-optimizer
-    --sequence-parallel
 )
 
 LOGGING_ARGS=(
