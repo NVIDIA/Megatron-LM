@@ -26,7 +26,7 @@ functional:configure:
     - job: test:build_nemo_image
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  tags: 
+  tags:
     - arch/amd64
     - env/prod
     - origin/jet-fleet
@@ -121,16 +121,16 @@ functional:run_dev:
 functional:run_nemo:
   extends: [.functional_tests_rules]
   trigger:
-    project: 'dl/joc/nemo-ci'
+    project: "dl/joc/nemo-ci"
     branch: main-mirror
     strategy: depend
   inherit:
     variables: true
   variables:
     MCORE_COMMIT: $CI_COMMIT_SHA
-    TEST_LLM_MODULE: 'True'
-    TEST_ALIGNER_MODULE: 'False'
-    TEST_DATA_CURATOR_MODULE: 'False'
+    TEST_LLM_MODULE: "True"
+    TEST_ALIGNER_MODULE: "False"
+    TEST_DATA_CURATOR_MODULE: "False"
     TESTS_TO_RUN_ON_THIS_COMMIT: nightly
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
@@ -145,7 +145,12 @@ functional:notify:
     - functional:run_lts
     - functional:run_dev
   tags:
-    - mcore-docker-node-small
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   variables:
     WEBHOOK_URL: ${MCORE_NOTIFICATION_HOOK}
     RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
@@ -173,7 +178,12 @@ functional:download_golden_values:
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags:
-    - mcore-docker-node-small
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   script:
     - env
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
@@ -185,5 +195,35 @@ functional:download_golden_values:
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
       when: manual
+      allow_failure: true
+    - when: never
+
+functional:upload_statistics:
+  stage: functional_tests
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  needs:
+    - job: test:unit_tests_pyt(DEV)_mcore(legacy)
+    - job: test:unit_tests_pyt(LTS)_mcore(legacy)
+    - job: test:unit_tests_pyt(DEV)_mcore(latest)
+    - job: test:unit_tests_pyt(LTS)_mcore(latest)
+    - job: functional:run_lts
+      optional: true
+    - job: functional:run_dev
+      optional: true
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export DASHBOARD_ENDPOINT
+    - python tests/test_utils/python_scripts/dashboard.py --pipeline-id ${CI_PIPELINE_ID}
+  rules:
+    - if: $UNIT_TEST == "yes" || $FUNCTIONAL_TEST == "yes"
       allow_failure: true
     - when: never
