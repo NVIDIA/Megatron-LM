@@ -53,6 +53,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_mla_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
+    parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
@@ -1155,6 +1156,11 @@ def _add_straggler_detector_args(parser):
                        help='Number of ranks to report with high/low estimated throughput')
     return parser
 
+def _add_workload_inspector_server_args(parser):
+    group = parser.add_argument_group(title='workload inspector')
+    group.add_argument('--run-workload-inspector-server', action='store_true',
+                       help='If set, enables workload inspector server for on-demand profiling.')
+    return parser
 
 def _add_one_logger_args(parser):
     group = parser.add_argument_group(title='one logger')
