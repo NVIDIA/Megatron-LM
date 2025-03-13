@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import InferenceParams
 from megatron.core import parallel_state as ps
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
@@ -133,7 +133,7 @@ class TestLLaVAModel:
         num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).cuda()
 
         use_inference_kv_cache = False
-        inference_params = None
+        inference_context = None
 
         embeddings, labels, loss_mask = self.model._preprocess_data(
             image_embeddings,
@@ -142,7 +142,7 @@ class TestLLaVAModel:
             loss_mask,
             labels,
             use_inference_kv_cache,
-            inference_params,
+            inference_context,
             image_token_index,
             num_image_tiles,
         )
@@ -372,7 +372,7 @@ class TestLLaVAModel:
         assert logits.shape == torch.Size((5, max_seq_len, 8192))
 
         # Try without labels and with inference params.
-        inference_params = InferenceParams(5, max_seq_len)
+        inference_context = StaticInferenceContext(5, max_seq_len)
         logits, _ = self.model.forward(
             img,
             input_ids,
@@ -381,12 +381,12 @@ class TestLLaVAModel:
             labels=None,
             loss_mask=None,
             num_image_tiles=num_image_tiles,
-            inference_params=inference_params,
+            inference_context=inference_context,
         )
         assert logits.shape == torch.Size((5, max_seq_len, 8192))
 
         # Check KV cache got populated correctly.
-        kv_dict = inference_params.key_value_memory_dict
+        kv_dict = inference_context.key_value_memory_dict
 
         assert kv_dict["image_tokens_count"] == 577 * 7
         for layer_no in range(1, 4):  # 3 layers in the model.

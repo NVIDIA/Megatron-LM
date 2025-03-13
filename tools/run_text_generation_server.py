@@ -18,8 +18,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 import torch
 
 import megatron
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
 from megatron.core.models.gpt import GPTModel
@@ -129,7 +128,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)
     text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-    return MCoreEngine(
+    return StaticInferenceEngine(
         text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
     )
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import os
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -9,8 +11,8 @@ import time
 import tqdm
 import warnings
 from argparse import Namespace
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -34,43 +36,25 @@ from megatron.training import get_model
 import asyncio
 from typing import AsyncIterator, List
 
+from .utils import add_common_inference_args, build_requests
 
 
-def add_text_generate_args(parser):
-    """Text generation arguments."""
-    group = parser.add_argument_group(title='text generation')
+def add_static_inference_args(parser):
+    """Static inference arguments."""
 
-    group.add_argument("--temperature", type=float, default=1.0, help='Sampling temperature.')
-    group.add_argument("--top_k", type=int, default=1, help='Top k sampling.')
-    group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
-    group.add_argument(
-        "--return-log-probs",
-        action='store_true',
-        default=False,
-        help='Return the log probabilities of the final output tokens',
-    )
-    group.add_argument(
-        "--num-tokens-to-generate",
-        type=int,
-        default=30,
-        help='Number of tokens to generate for each prompt',
-    )
-    group.add_argument(
-        "--prompts",
-        metavar='N',
-        type=str,
-        nargs='+',
-        help='Input prompts with each prompt within quotes and seperated by space',
-    )
+    add_common_inference_args(parser)
+
+    group = parser.add_argument_group(title='Static inference')
     group.add_argument(
         "--max-batch-size", type=int, default=8, dest="inference_max_requests",
         help='Max number of prompts to process at once'
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
+
     return parser
 
 
-def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
+def get_inference_engine(args: Namespace, model: MegatronModule) -> StaticInferenceEngine:
     """Utility to get the relevant backend for running inference
 
     This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
@@ -94,13 +78,19 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         inference_max_seq_length=args.inference_max_seq_length,
     )
 
-    inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
+    inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+    inference_wrapped_model = GPTInferenceWrapper(
+        model,
+        inference_wrapper_config,
+        inference_context
+    )
     text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-    return MCoreEngine(text_generation_controller=text_generation_controller)
+    return StaticInferenceEngine(text_generation_controller=text_generation_controller)
 
 
 async def generate(
-    inference_engine: MCoreEngine,
+    inference_engine: StaticInferenceEngine,
     sampling_params: SamplingParams,
     prompts: List[str],
 ) -> List[InferenceRequest]:
@@ -114,7 +104,7 @@ async def generate(
 
     request_ids: List[str] = [
         inference_engine.add_request(
-            prompt=prompt, inference_parameters=sampling_params, streaming=True
+            prompt=prompt, sampling_params=sampling_params, streaming=True
         )
         for prompt in prompts
     ]
@@ -140,7 +130,7 @@ def main():
     # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
     # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
     initialize_megatron(
-        extra_args_provider=add_text_generate_args,
+        extra_args_provider=add_static_inference_args,
         args_defaults={
             'no_load_rng': True,
             'no_load_optim': True,
@@ -166,18 +156,21 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
 
+    requests = build_requests(args, get_tokenizer())
+    prompts = [ r.prompt_text for r in requests ]
+
     if args.enable_cuda_graph:
         print(f"Running warmup for CUDA graphs...")
         inference_engine.generate(
-                prompts=args.prompts, sampling_params=sampling_params
+                prompts=prompts, sampling_params=sampling_params
             )
 
     start_time = time.perf_counter()
     if args.stream:
-        results: List[InferenceRequest] = asyncio.run(generate(inference_engine, sampling_params, args.prompts))
+        results: List[InferenceRequest] = asyncio.run(generate(inference_engine, sampling_params, prompts))
     else:
         results: List[InferenceRequest] = inference_engine.generate(
-            prompts=args.prompts, sampling_params=sampling_params,
+            prompts=prompts, sampling_params=sampling_params,
         )
     end_time = time.perf_counter()
     latency = end_time - start_time
@@ -193,6 +186,44 @@ def main():
                 'latency': latency,
             }
             print(result)
+
+    # Print unique prompts + outputs.
+    if torch.distributed.get_rank() == 0:
+
+        print("~~~~ Unique prompts + outputs. ~~~~")
+
+        # Map results by their prompt.
+        from collections import defaultdict
+        unique_prompt_map = defaultdict(list)
+        for result_idx, result in enumerate(results):
+            unique_prompt_map[result.prompt].append(result_idx)
+
+        # Print unique prompts + outputs.
+        for unique_idx, (prompt_text, result_idxs) in enumerate(unique_prompt_map.items()):
+            result_idx = result_idxs[0]
+            result = results[result_idx]
+            print(f"{unique_idx}/{len(unique_prompt_map)} [{len(result_idxs)}]. {prompt_text} ... %s" % result.generated_text.replace("\n", "\\n"))
+
+
+    stats = torch.cuda.memory_stats()
+    print("static | cg %d | %s | reqs %d [ batch %d ] ... mem %.1f/%.1f ... time %.3f." % (
+        args.enable_cuda_graph,
+        (
+            f"<user prompts>"
+            if args.prompts else
+            "<auto prompts> %s, %d, %.1e, %.1e" % (
+                "(%s)" % " ".join(map(str, args.num_tokens_to_prompt)),
+                args.num_tokens_to_generate,
+                args.incoming_requests_duration,
+                args.incoming_requests_per_sec,
+            )
+        ),
+        len(requests),
+        args.inference_max_requests,
+        stats["allocated_bytes.all.peak"] / (1024**3),
+        stats["reserved_bytes.all.peak"] / (1024**3),
+        latency,
+    ))
 
     torch.distributed.destroy_process_group()
 

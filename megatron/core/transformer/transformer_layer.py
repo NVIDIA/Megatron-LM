@@ -1,4 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -6,16 +7,19 @@ from typing import Dict, Optional, Union
 
 import torch
 import torch.distributed
+from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
 
 
 def get_transformer_layer_offset(config: TransformerConfig):
@@ -247,12 +251,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
 
+        # Enable cuda graphs.
         if config.enable_cuda_graph:
-            if not self.training:
-                # Cudagraphs for inference are only enabled with the flash decoding kernel
-                assert (
-                    self.config.flash_decode
-                ), "--flash-decode is required to use CUDA graphs during inference"
             self.cudagraph_manager = CudaGraphManager(config)
 
         self.submodules_config = submodules
@@ -344,17 +344,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
     def forward(
         self,
-        hidden_states,
-        attention_mask=None,
-        context=None,
-        context_mask=None,
-        rotary_pos_emb=None,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
-        attention_bias=None,
-        inference_params=None,
-        packed_seq_params=None,
-        sequence_len_offset=None,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -370,8 +372,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             context_mask (Tensor, optional): Mask tensor for cross-attention.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
             attention_bias (Tensor, optional): Bias tensor for Q * K.T.
-            inference_params (object, optional): Parameters for inference-time optimizations.
+            inference_context (object, optional): Parameters for inference-time optimizations.
             packed_seq_params (object, optional): Parameters for packed sequence processing.
+            sequence_len_offset (Tensor, optional): Offset along sequence dimension
+                during inference.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -379,6 +383,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Residual connection.
         residual = hidden_states
@@ -390,7 +396,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
@@ -417,7 +423,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             pre_cross_attn_layernorm_output,
             attention_mask=context_mask,
             key_value_states=context,
-            inference_params=inference_params,
+            inference_context=inference_context,
         )
 
         if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
@@ -459,6 +465,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # CUDA graph requires returned values to be Tensors
         if self.config.external_cuda_graph and self.training:
             return output
+
         return output, context
 
     def sharded_state_dict(
@@ -486,14 +493,18 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
     def __call__(self, *args, **kwargs):
         # Training and validation mode CUDA graphs
-        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_params') is None:
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
             return self.cudagraph_manager(self, args, kwargs)
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif (
-            not self.training
-            and hasattr(self, 'cudagraph_manager')
-            and kwargs.get('inference_params') is not None
-            and kwargs['inference_params'].decode_mode
+        elif not self.training and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs['attention_mask'] is None
+            and (
+                kwargs.get('inference_context') is not None
+                and kwargs['inference_context'].is_decode_only()
+                or kwargs.get('inference_params') is not None
+                and kwargs['inference_params'].is_decode_only()
+            )
         ):
             assert (
                 kwargs.get('attention_mask') is None

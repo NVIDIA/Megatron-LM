@@ -2,14 +2,15 @@
 
 import logging
 import math
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 from torch import Tensor, nn
 
-from megatron.core.inference_params import InferenceParams
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecate_inference_params
 
 logger = logging.getLogger(__name__)
 
@@ -135,15 +136,17 @@ class RelativePositionEmbedding(nn.Module):
 
     @staticmethod
     def get_relative_seq_len(
-        inference_params: InferenceParams,
+        inference_context: BaseInferenceContext,
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> float:
         """Function to get the rotary sequence length.
 
         Args:
-            inference_params : Used during Inference time
+            inference_context (BaseInferenceContext): Used during Inference time
             transformer (TransformerBlock): The transformer block (decoder/encoder) used
                 by the model
             transformer_input (Tensor): Input tensor to the transformer
@@ -152,8 +155,11 @@ class RelativePositionEmbedding(nn.Module):
         Returns:
             float: The rotary sequence length
         """
-        if inference_params is not None:
-            relative_seq_len = inference_params.max_sequence_length
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if inference_context is not None:
+            relative_seq_len = inference_context.max_sequence_length
         else:
             if transformer.input_tensor is not None:
                 relative_seq_len = transformer.input_tensor.size(0)

@@ -284,9 +284,13 @@ def initialize_rng_tracker(
     _CUDA_RNG_STATE_TRACKER_INITIALIZED = True
 
 
-def get_cuda_rng_tracker(use_te_rng_tracker=False, inference_rng_tracker=False):
+def get_cuda_rng_tracker(
+    use_te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Get cuda rng tracker."""
-    initialize_rng_tracker(use_te_rng_tracker, inference_rng_tracker)
+    initialize_rng_tracker(use_te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
     return _CUDA_RNG_STATE_TRACKER
 
 
@@ -312,7 +316,12 @@ def get_all_rng_states() -> bool:
         return {}
 
 
-def model_parallel_cuda_manual_seed(seed, te_rng_tracker=False, inference_rng_tracker=False):
+def model_parallel_cuda_manual_seed(
+    seed: int,
+    te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Initialize model parallel cuda seed.
 
     This function should be called after the model parallel is
@@ -336,7 +345,7 @@ def model_parallel_cuda_manual_seed(seed, te_rng_tracker=False, inference_rng_tr
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker)
+    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)

@@ -1,6 +1,8 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import abc
 import math
+import warnings
 from typing import Any, Dict, Iterable, Optional, Union
 
 import torch
@@ -10,10 +12,10 @@ from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
 )
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference_params import InferenceParams
 from megatron.core.models.gpt.gpt_model import GPTModel
 
 
@@ -22,21 +24,24 @@ class AbstractModelInferenceWrapper(abc.ABC):
     """Abstract inference wrapper
 
     Extend this to create a version for your model.
+
+    The wrapper prepares the model for inference, provides the required input data and runs the forward pass.
+
+    Args:
+        model (Union[GPTModel, LegacyGPTModel]): The actual GPT model (MCore
+            or MLM).
+        inference_wrapper_config (InferenceWrapperConfig): Has info like
+            hidden size, vocab size etc.
+        inference_context (BaseInferenceContext): Context for managing KV
+            cache and other inference params.
     """
 
     def __init__(
         self,
         model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]
         inference_wrapper_config: InferenceWrapperConfig,
+        inference_context: Optional[BaseInferenceContext] = None,
     ):
-        """Constructor for the model inference wrapper
-
-        The wrapper prepares the model for inference, provides the required input data and runs the forward pass.
-
-        Args:
-            model (Union[GPTModel, LegacyGPTModel]): The actual GPT model (MCore or MLM)
-            inference_wrapper_config (InferenceWrapperConfig): Has info like hidden size, vocab size etc.
-        """
         assert not isinstance(
             model, Iterable
         ), 'interleaving schedule is not supported for inference'
@@ -48,9 +53,31 @@ class AbstractModelInferenceWrapper(abc.ABC):
             else self.inference_wrapper_config.params_dtype
         )
 
-        max_batch_size = self.inference_wrapper_config.inference_max_requests
-        max_sequence_length = self.inference_wrapper_config.inference_max_seq_length
-        self.inference_params = InferenceParams(max_batch_size, max_sequence_length)
+        if inference_context is None:
+            warnings.warn(
+                "`inference_context` must be passed in as an argument starting in `megatron-core` 0.13."
+            )
+            from megatron.core.inference.contexts import StaticInferenceContext
+
+            inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        self.inference_context = inference_context
+
+    @property
+    def inference_params(self):
+        """Getter for deprecated `inference_params`."""
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be removed in `megatron-core` 0.13."
+        )
+        return self.inference_context
+
+    @inference_params.setter
+    def inference_params(self, value):
+        """Setter for deprecated `inference_params`."""
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be removed in `megatron-core` 0.13."
+        )
+        self.inference_context = value
 
     def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
         """A utility function for preparing model for inference
@@ -68,7 +95,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
 
-        self.inference_params.reset()
+        self.inference_context.reset()
 
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
@@ -96,7 +123,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         Args:
             inference_input(Dict[str, Any]): The input data.
-            inference_params(InferenceParams): The inference parameters.
 
         Returns:
             The model output logits.
@@ -109,7 +135,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             tokens,
             position_ids,
             attention_mask,
-            inference_params=self.inference_params,
+            inference_context=self.inference_context,
             runtime_gather_output=runtime_gather_output,
         )
 
@@ -154,7 +180,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         logits = self._forward(inference_input)
         logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
-        self.inference_params.sequence_len_offset += tokens.size(1)
+        if self.inference_context.is_static_batching():
+            self.inference_context.sequence_len_offset += tokens.size(1)
 
         return logits
 
@@ -188,7 +215,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if not parallel_state.is_pipeline_last_stage():
             send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
 
-        self.inference_params.sequence_len_offset += seq_len
+        self.inference_context.sequence_len_offset += seq_len
 
         logits = None
         if parallel_state.is_pipeline_last_stage():
@@ -221,7 +248,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         attention_mask = inference_input["attention_mask"]
         runtime_gather_output = inference_input.get("runtime_gather_output")
         materialize_only_last_token_logits = (
-            self.inference_params.materialize_only_last_token_logits
+            self.inference_context.materialize_only_last_token_logits
         )
 
         micro_batch_size = max(
@@ -266,6 +293,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
                     "tokens": tokens2use,
                     "position_ids": position_ids2use,
                     "attention_mask": attention_mask,
+                    "inference_context": self.inference_context,
                     "runtime_gather_output": runtime_gather_output,
                 }
             )
@@ -273,7 +301,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if not parallel_state.is_pipeline_last_stage():
                 send_to_next_pipeline_rank(output_tensor)
 
-            self.inference_params.batch_size_offset += current_micro_batch_size
+            self.inference_context.batch_size_offset += current_micro_batch_size
 
             if parallel_state.is_pipeline_last_stage():
                 output_tensor = tensor_parallel.gather_from_tensor_model_parallel_region(
@@ -288,8 +316,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             logits = logits.to(self.inference_wrapper_config.params_dtype)
 
         # Once done with all micro batches, we reset batch size offset and seq len offset
-        self.inference_params.sequence_len_offset += seq_len
-        self.inference_params.batch_size_offset = 0
+        self.inference_context.sequence_len_offset += seq_len
+        self.inference_context.batch_size_offset = 0
 
         # NOTE: Only returns the logits on the last pipeline stage
         return logits

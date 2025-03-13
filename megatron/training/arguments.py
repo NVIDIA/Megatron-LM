@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -824,6 +824,10 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size > 1, \
             "--inference-batch-times-seqlen-threshold requires setting --pipeline-model-parallel-size > 1."
 
+    if args.inference_dynamic_batching:
+        assert args.inference_dynamic_batching_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
+
     # MoE upcycling check
     if args.moe_use_upcycling:
         assert args.save is not None, "When using upcycling, the --save option must be specified."
@@ -1002,6 +1006,36 @@ def _add_inference_args(parser):
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
+    group.add_argument('--inference-dynamic-batching',
+                       action='store_true', default=False,
+                       help='Enable dynamic batching mode.')
+    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
+                       type=float, default=40.,
+                       help='Total buffer size (GB) allocated for the chunked KV '
+                       'memory.')
+    group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
+                       type=float, default=0.2,
+                       help='Space is reserved within the inference context '
+                       'memory buffer to guarantee that a minimum number of '
+                       'active requests will always be able to run to '
+                       'completion. This is to avoid the context being blocked '
+                       'by paused requests.')
+    group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
+                       type=float, default=None,
+                       help='Scaling factor over the memory buffer size for auto '
+                       'computing `max_requests` and `max_tokens`. This scaling '
+                       'factor is used for fitting more requests and tokens in '
+                       'the memory buffer than it can safely hold, which in turn '
+                       'increases throughput.')
+    group.add_argument('--inference-dynamic-batching-max-requests-override',
+                       type=int, default=None,
+                       help='If set, this overrides the max requests as computed '
+                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+    group.add_argument('--inference-dynamic-batching-max-tokens-override',
+                       type=int, default=None,
+                       help='If set, this overrides the max tokens as computed '
+                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+
     return parser
 
 

@@ -177,7 +177,7 @@ class VLMForwardStep(ForwardStep):
             tokens,
             position_ids,
             attention_mask,
-            inference_params=self.inference_params,
+            inference_context=self.inference_context,
         )
 
     def __call__(self, tokens, position_ids, attention_mask):
@@ -187,7 +187,7 @@ class VLMForwardStep(ForwardStep):
         # Update the sequence length offset by the number of image tokens.
         num_tokens = tokens.size(1)
         if num_tokens > 1:
-            self.inference_params.sequence_len_offset += self.inference_params.key_value_memory_dict[
+            self.inference_context.sequence_len_offset += self.inference_context.key_value_memory_dict[
                 "image_tokens_count"
             ]
 

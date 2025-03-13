@@ -61,9 +61,21 @@ def _set_capture_end():
 def _check_supported_type(arg):
     """Check if arg is a supported type for cudagraph input/outputs."""
 
-    from megatron.core import InferenceParams  # guard against circular import
+    from megatron.core.inference.contexts import (  # guard against circular import
+        DynamicInferenceContext,
+        StaticInferenceContext,
+    )
 
-    _SUPPORTED_TYPES = {torch.Tensor, type(None), bool, int, str, float, InferenceParams}
+    _SUPPORTED_TYPES = {
+        torch.Tensor,
+        type(None),
+        bool,
+        int,
+        str,
+        float,
+        StaticInferenceContext,
+        DynamicInferenceContext,
+    }
     assert type(arg) in _SUPPORTED_TYPES or is_dataclass(
         arg
     ), f"Cudagraphs recieved an arg of type {type(arg)} which is not supported."
@@ -866,7 +878,7 @@ class CudaGraphManager(torch.nn.Module):
             runner = self.get_cudagraph_runner(megatron_module)
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
-            if 'inference_params' in kwargs.keys() and kwargs['inference_params']:
+            if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
                 # Inference generation mode
                 runner = self.get_cudagraph_runner(megatron_module)
                 runner.eval()

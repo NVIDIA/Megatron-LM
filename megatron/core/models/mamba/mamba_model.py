@@ -4,14 +4,16 @@ from typing import Literal, Optional
 
 from torch import Tensor
 
-from megatron.core import InferenceParams, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecate_inference_params
 
 
 class MambaModel(LanguageModule):
@@ -164,8 +166,10 @@ class MambaModel(LanguageModule):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """Forward function of the Mamba model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -175,6 +179,8 @@ class MambaModel(LanguageModule):
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Decoder embedding.
         if decoder_input is not None:
@@ -189,7 +195,7 @@ class MambaModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
+                inference_context, self.decoder, decoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -207,7 +213,7 @@ class MambaModel(LanguageModule):
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
         )
 
@@ -220,8 +226,8 @@ class MambaModel(LanguageModule):
             output_weight = self.shared_embedding_or_output_weight()
         if (
             not self.training
-            and inference_params is not None
-            and inference_params.materialize_only_last_token_logits
+            and inference_context is not None
+            and inference_context.materialize_only_last_token_logits
         ):
             hidden_states = hidden_states[-1, :, :]
 

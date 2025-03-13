@@ -6,8 +6,7 @@ import torch
 
 import pretrain_t5
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -91,7 +90,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     text_generation_controller = EncoderDecoderTextGenerationController(
         inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
     )
-    return MCoreEngine(
+    return StaticInferenceEngine(
         text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
     )
 
