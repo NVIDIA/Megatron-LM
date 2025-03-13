@@ -73,10 +73,10 @@ TE_FP8="${TE_FP8:-0}"  # 0: disable FP8, 1: enable FP8
 GEMM_TUNING="${GEMM_TUNING:-1}"
 MCORE="${MCORE:-1}"
 OPTIMIZER="${OPTIMIZER:-adam}"
-FSDP="${FSDP:-1}"
+FSDP="${FSDP:-0}"
 RECOMPUTE="${RECOMPUTE:-0}"
 ROPE_FUSION="${ROPE_FUSION:-1}" # 1: use rope-fusion, 0: no-rope-fusion
-MOCK_DATA="${MOCK_DATA:-0}" # 1: use mock data, 0: use real data
+MOCK_DATA="${MOCK_DATA:-1}" # 1: use mock data, 0: use real data
 
 if [ "$FSDP" -eq 1 ]; then
     if [ "$TP" -gt 1 ]; then
@@ -95,7 +95,7 @@ TOKENIZER_MODEL="${TOKENIZER_MODEL:-"$DATA_DIR/tokenizer_llama3"}"
 # Download the tokenizer model
 if ! [ -d "$TOKENIZER_MODEL" ]; then
   mkdir -p $TOKENIZER_MODEL
-  export HF_TOKEN="hf_xxxx"     #set huggingface access token to be able to download tokenizer
+  HF_TOKEN="${HF_TOKEN:-hf_xxxx}" #set huggingface access token to be able to download tokenizer
   wget --header="Authorization: Bearer $HF_TOKEN" -O $TOKENIZER_MODEL/special_tokens_map.json https://huggingface.co/meta-llama/Llama-3.1-8B/resolve/main/special_tokens_map.json
   wget --header="Authorization: Bearer $HF_TOKEN" -O $TOKENIZER_MODEL/tokenizer.json https://huggingface.co/meta-llama/Llama-3.1-8B/resolve/main/tokenizer.json
   wget --header="Authorization: Bearer $HF_TOKEN" -O $TOKENIZER_MODEL/tokenizer.model https://huggingface.co/meta-llama/Llama-3.1-8B/resolve/main/original/tokenizer.model
@@ -179,8 +179,9 @@ GPT_ARGS="
     --bf16 \
     --no-masked-softmax-fusion \
 "
+
 if [ "$RECOMPUTE" -eq 1 ]; then
-    GPT_ARGS="$GPT_ARGS --recompute-num-layers 80 \
+    GPT_ARGS="$GPT_ARGS --recompute-num-layers $NUM_LAYERS \
         --recompute-granularity full \
         --recompute-method block \
         "
@@ -221,11 +222,13 @@ DATA_ARGS="
     --eval-iters 10 \
     --num-workers $ds_works \
 "
+# For multi-node runs DATA_CACHE_PATH should point to a common path accessible by all the nodes (for eg, an NFS directory)
+DATA_CACHE_PATH="/home/cache"
 
 if [ "$MOCK_DATA" -eq 1 ];then
-    DATA_ARGS="$DATA_ARGS --mock-data"
+    DATA_ARGS="$DATA_ARGS --mock-data --data-cache-path $DATA_CACHE_PATH"
 else
-    DATA_ARGS="$DATA_ARGS --data-path $DATA_PATH"
+    DATA_ARGS="$DATA_ARGS --data-path $DATA_PATH --data-cache-path ${DATA_CACHE_PATH}"
 fi
 
 OUTPUT_ARGS="
@@ -357,3 +360,8 @@ TGS=$(awk -v bs="$BS" -v sl="$SEQ_LENGTH" -v tpi="$TIME_PER_ITER" -v ws="$WORLD_
 echo "tokens/GPU/s: $TGS" |& tee -a $TRAIN_LOG
 rm tmp.txt
 
+# Extract memory usage
+grep -Eo 'mem usages: [^|]*' "$TRAIN_LOG" | sed -E 's/.*mem usages: ([0-9\.]+).*/\1/' > tmp.txt
+MEMUSAGE=$(python3 mean_log_value.py tmp.txt)
+echo "mem usages: $MEMUSAGE" |& tee -a "$TRAIN_LOG"
+rm tmp.txt
