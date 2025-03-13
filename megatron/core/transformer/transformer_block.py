@@ -7,17 +7,18 @@ from typing import List, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import is_te_min_version, make_viewless_tensor
+from megatron.core.utils import deprecate_inference_params, is_te_min_version, make_viewless_tensor
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -323,7 +324,7 @@ class TransformerBlock(MegatronModule):
                         context_mask=context_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         attention_bias=attention_bias,
-                        inference_params=None,
+                        inference_context=None,
                         packed_seq_params=packed_seq_params,
                     )
                 return hidden_states, context
@@ -409,10 +410,14 @@ class TransformerBlock(MegatronModule):
         context_mask: Tensor,
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
-        inference_params: InferenceParams,
+        inference_context: BaseInferenceContext,
         packed_seq_params: PackedSeqParams,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """Get optional tensor arguments for CUDA graph."""
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         optional_inputs = {}
         optional_inputs['is_first_microbatch'] = self.current_microbatch == 0
@@ -435,16 +440,18 @@ class TransformerBlock(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,
-        context: Tensor = None,
-        context_mask: Tensor = None,
-        rotary_pos_emb: Tensor = None,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        attention_bias: Tensor = None,
-        inference_params: InferenceParams = None,
-        packed_seq_params: PackedSeqParams = None,
-        sequence_len_offset: Tensor = None,
+        attention_mask: Optional[Tensor],
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -463,7 +470,7 @@ class TransformerBlock(MegatronModule):
             attention_bias (Tensor): Bias tensor for Q * K.T of shape in shape broadcastable
                 to [b, num_head, sq, skv], e.g. [1, 1, sq, skv].
                 Used as an alternative to apply attention mask for TE cuDNN attention.
-            inference_params (InferenceParams, optional): Parameters for inference-time
+            inference_context (BaseInferenceContext, optional): Parameters for inference-time
                 optimizations.
             packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
                 processing.
@@ -473,13 +480,15 @@ class TransformerBlock(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
 
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
         # Update the inference parameters with the current batch size in case it is variable
-        if inference_params and not self.training:
-            inference_params.current_batch_size = hidden_states.size(1)
+        if inference_context and not self.training:
+            inference_context.current_batch_size = hidden_states.size(1)
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -555,7 +564,7 @@ class TransformerBlock(MegatronModule):
                                 rotary_pos_cos=rotary_pos_cos,
                                 rotary_pos_sin=rotary_pos_sin,
                                 attention_bias=attention_bias,
-                                inference_params=inference_params,
+                                inference_context=inference_context,
                                 packed_seq_params=packed_seq_params,
                                 sequence_len_offset=sequence_len_offset,
                             )
@@ -564,11 +573,11 @@ class TransformerBlock(MegatronModule):
                             # `self.current_microbatch`. TransformerEngine versions>=1.10
                             # allow keyword arguments with CUDA graph. However, CUDA graph
                             # acccepts only Tensor inputs and Tensor outputs. Hence,
-                            # `inference_params` and `packed_seq_params` are excluded from
+                            # `inference_context` and `packed_seq_params` are excluded from
                             # input list while output is limited to `hidden_states`.
                             cg_index = self.current_microbatch % len(self.cuda_graphs[l_no])
                             assert not any(
-                                [inference_params, packed_seq_params]
+                                [inference_context, packed_seq_params]
                             ), "CUDA graph accepts only Tensor inputs."
                             optional_inputs = self.get_cuda_graph_optional_args(
                                 attention_mask,
@@ -576,7 +585,7 @@ class TransformerBlock(MegatronModule):
                                 context_mask,
                                 rotary_pos_emb,
                                 attention_bias,
-                                inference_params,
+                                inference_context,
                                 packed_seq_params,
                             )
                             hidden_states = self.cuda_graphs[l_no][cg_index](

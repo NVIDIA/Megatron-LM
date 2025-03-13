@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -74,7 +75,11 @@ class TestTextGenerationController:
             padded_vocab_size=self.vocab_size,
         )
 
-        inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        inference_wrapped_model = GPTInferenceWrapper(
+            gpt_model, inference_wrapper_config, inference_context
+        )
 
         self.mock_tokenizer = mock.Mock()
 
@@ -182,7 +187,7 @@ class TestTextGenerationController:
             inference_request = InferenceRequest(
                 request_id=request_id,
                 prompt=prompt,
-                inference_parameters=SamplingParams(
+                sampling_params=SamplingParams(
                     num_tokens_to_generate=10, return_log_probs=True, return_segments=True
                 ),
                 arrival_time=time.time(),
@@ -238,9 +243,7 @@ class TestTextGenerationController:
             inference_request = InferenceRequest(
                 request_id=i,
                 prompt=prompt,
-                inference_parameters=SamplingParams(
-                    num_tokens_to_generate=1, return_log_probs=True
-                ),
+                sampling_params=SamplingParams(num_tokens_to_generate=1, return_log_probs=True),
                 arrival_time=time.time(),
                 prompt_tokens=[self.mock_tokenizer.bos],
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
@@ -284,9 +287,7 @@ class TestTextGenerationController:
             inference_request = InferenceRequest(
                 request_id=i,
                 prompt=prompt,
-                inference_parameters=SamplingParams(
-                    num_tokens_to_generate=4096, return_log_probs=True
-                ),
+                sampling_params=SamplingParams(num_tokens_to_generate=4096, return_log_probs=True),
                 arrival_time=time.time(),
                 prompt_tokens=[self.mock_tokenizer.bos],
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,

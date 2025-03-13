@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer.module import MegatronModule
@@ -24,6 +25,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import deprecate_inference_params
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -266,18 +268,30 @@ class MambaMixer(MegatronModule):
             tp_comm_buffer_name='fc2',
         )
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(
+        self,
+        hidden_states,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ):
         """
         hidden_states: (nL, B, D) / (L B D)
         Returns: same shape as hidden_states
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         _, batch, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
-        if inference_params is not None:
+        if inference_context is not None:
+            assert (
+                inference_context.is_static_batching()
+            ), "Mamba does not currently support dynamic inference batching."
             assert not self.config.sequence_parallel
-            conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
-            if inference_params.seqlen_offset > 0:
+            conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
+            if inference_context.seqlen_offset > 0:
                 # The states are updated inplace
                 out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out, out_bias
@@ -290,7 +304,7 @@ class MambaMixer(MegatronModule):
         # transpose: l b pd --> b l pd
         xz = rearrange(xz, "l b d -> b l d").contiguous()
 
-        if self.use_mem_eff_path and inference_params is None:
+        if self.use_mem_eff_path and inference_context is None:
             assert ssm_state is None
 
             if self.conv1d.bias is not None:
@@ -551,9 +565,14 @@ class MambaMixer(MegatronModule):
         )
         return conv_state, ssm_state
 
-    def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
+    def _get_states_from_cache(
+        self, inference_context, batch_size, initialize_states=False, *, inference_params=None
+    ):
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         assert self.layer_number is not None
-        if self.layer_number not in inference_params.key_value_memory_dict:
+        if self.layer_number not in inference_context.key_value_memory_dict:
             conv_state = torch.zeros(
                 batch_size,
                 self.conv1d.weight.shape[0],
@@ -569,9 +588,9 @@ class MambaMixer(MegatronModule):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            inference_params.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
+            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
         else:
-            conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_number]
+            conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
             # TODO: What if batch size changes between generation, and we reuse the same states?
             if initialize_states:
                 conv_state.zero_()

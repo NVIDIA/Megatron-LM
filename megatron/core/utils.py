@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from functools import reduce, wraps
@@ -228,6 +229,17 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
+
+
+def deprecate_inference_params(inference_context, inference_params):
+    """Print warning for deprecated `inference_params`."""
+    if inference_context is None and inference_params is not None:
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be "
+            "removed in `megatron-core` 0.13."
+        )
+        return inference_params
+    return inference_context
 
 
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):

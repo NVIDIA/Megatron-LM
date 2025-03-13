@@ -8,7 +8,7 @@
 import math
 from dataclasses import dataclass
 from functools import partial
-from typing import Union
+from typing import Optional, Union
 
 from torch import Tensor, nn
 
@@ -16,6 +16,7 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -24,7 +25,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
 
 
 # https://github.com/huggingface/transformers/blob/c28d04e9e252a1a099944e325685f14d242ecdcd/src/transformers/models/gpt2/modeling_gpt2.py#L454
@@ -229,8 +230,10 @@ class MambaStack(MegatronModule):
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
-        inference_params=None,
-        rotary_pos_emb: Tensor = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """
         Forward function of the MambaStack class.
@@ -241,28 +244,34 @@ class MambaStack(MegatronModule):
         Args:
             hidden_states (Tensor): the input tensor.
             attention_mask (Tensor): the attention mask.
-            inference_params (InferenceParams): the inference parameters.
+            inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
         Returns:
             Tensor: the output tensor.
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
-        if inference_params:
-            # NOTE(bnorick): match InferenceParams attributes for
-            # mamba_ssm.utils.generation.InferenceParams,
+        if inference_context:
+            assert (
+                inference_context.is_static_batching()
+            ), "Mamba currently does not support dynamic inference batching."
+            # NOTE(bnorick): match BaseInferenceContext attributes for
+            # mamba_ssm.utils.generation.BaseInferenceContext,
             # this hack supports eval
-            inference_params.max_seqlen = inference_params.max_sequence_length
-            inference_params.seqlen_offset = inference_params.sequence_len_offset
+            inference_context.max_seqlen = inference_context.max_sequence_length
+            inference_context.seqlen_offset = inference_context.sequence_len_offset
 
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
                 attention_mask,
-                inference_params=inference_params,
+                inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb,
             )
 

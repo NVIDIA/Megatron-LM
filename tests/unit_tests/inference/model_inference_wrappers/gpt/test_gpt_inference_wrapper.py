@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -59,7 +60,11 @@ class TestGPTInferenceWrapper:
             padded_vocab_size=self.vocab_size,
         )
 
-        self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        self.inference_wrapped_model = GPTInferenceWrapper(
+            gpt_model, inference_wrapper_config, inference_context
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -76,7 +81,7 @@ class TestGPTInferenceWrapper:
         )
 
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
-        self.inference_wrapped_model.inference_params.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 
@@ -112,7 +117,7 @@ class TestGPTInferenceWrapper:
             .cuda()
         )
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
-        self.inference_wrapped_model.inference_params.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 
@@ -147,7 +152,7 @@ class TestGPTInferenceWrapper:
             .cuda()
         )
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
-        self.inference_wrapped_model.inference_params.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 
