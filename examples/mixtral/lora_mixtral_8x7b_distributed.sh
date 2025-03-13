@@ -102,6 +102,7 @@ MODEL_PARALLEL_ARGS=(
     --use-distributed-optimizer
 )
 
+mkdir -p $CHECKPOINT_PATH/tensorboard
 LOGGING_ARGS=(
     --eval-interval 1000
     --eval-iters 10
@@ -118,7 +119,6 @@ LOGGING_ARGS=(
     --no-load-rng
 )
 
-mkdir -p $CHECKPOINT_PATH/logs
 torchrun ${DISTRIBUTED_ARGS[@]} lora_mixtral.py \
     ${MODEL_ARGS[@]} \
     ${MOE_ARGS[@]} \
@@ -126,4 +126,4 @@ torchrun ${DISTRIBUTED_ARGS[@]} lora_mixtral.py \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \
     ${LOGGING_ARGS[@]} \
-    $4 |& tee $SAVE_PATH/output_`date +"%Y%m%d_%H%M"`.log
+    $4 |& tee $CHECKPOINT_PATH/output_`date +"%Y%m%d_%H%M"`.log
