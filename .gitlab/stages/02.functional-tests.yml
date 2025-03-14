@@ -3,7 +3,7 @@
   rules:
     - if: $FUNCTIONAL_TEST == "yes" && ($CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true")
       allow_failure: true
-    - if: $FUNCTIONAL_TEST == "yes"
+    - if: $FUNCTIONAL_TEST == "yes" || ($CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS !~ /docs-only/)
     - when: never
 
 default:
