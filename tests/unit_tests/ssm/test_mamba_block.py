@@ -65,11 +65,11 @@ class TestMambaBlock:
         block = self.get_mamba_block(hybrid_override_pattern)
         layers = block.layers
         # Note that this matches the order specified by hybrid_override_pattern in setup_method
-        assert type(layers[0]) == MambaLayer
-        assert type(layers[1]) == TransformerLayer
-        assert type(layers[1].self_attention) == SelfAttention
-        assert type(layers[2]) == TransformerLayer
-        assert type(layers[2].mlp) == MLP
+        assert isinstance(layers[0], MambaLayer)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
+        assert isinstance(layers[2], TransformerLayer)
+        assert isinstance(layers[2].mlp, MLP)
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = '+'
