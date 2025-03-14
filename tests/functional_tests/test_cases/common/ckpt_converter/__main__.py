@@ -12,6 +12,7 @@ from copy import deepcopy
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from megatron.core import parallel_state
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
@@ -878,7 +879,7 @@ def test_all_pipelines():
 
     # Run pipelines.
     results = []
-    for pipeline in pipelines:
+    for pipeline in tqdm(pipelines, "ckpt pipelines"):
         t = time.time()
         mses = pipeline.run()
         elapsed_time = time.time() - t

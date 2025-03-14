@@ -82,7 +82,7 @@ class MegatronCheckpointLoaderBase:
 
         margs.use_legacy_models = False
         margs.transformer_impl = self.args.loader_transformer_impl
-        if args.loader_transformer_impl == "local" and margs.normalization == "RMSNorm":
+        if self.args.loader_transformer_impl == "local" and margs.normalization == "RMSNorm":
             margs.no_persist_layer_norm = True
 
         self.margs = margs

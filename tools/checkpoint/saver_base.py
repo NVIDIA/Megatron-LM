@@ -128,7 +128,7 @@ class MegatronCheckpointSaverBase:
         if not self.build_tokenizer:
             margs.tokenizer_model = None
         margs.transformer_impl = self.args.saver_transformer_impl
-        if args.saver_transformer_impl == "local" and margs.normalization == "RMSNorm":
+        if self.args.saver_transformer_impl == "local" and margs.normalization == "RMSNorm":
             margs.no_persist_layer_norm = True
 
         self.margs = margs
