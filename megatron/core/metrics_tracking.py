@@ -16,6 +16,7 @@ class Tracker:
         if metrics is None:
             metrics = []
         assert set(metrics) <= self.known_metrics
+        self.enabled = False
         self.metrics = metrics
         self.args = args
 
@@ -48,9 +49,15 @@ class Tracker:
         self._shapes = torch.full((len(self.expected_names),), -1, dtype=torch.int64, device="cuda")
         self.gathered_final_metrics = None
 
+    def disable(self):
+        self.enabled = False
+
+    def enable(self):
+        self.enabled = True
+
     def update(self, x: torch.Tensor, name: str, layer: int):
         # x.shape = [seq, mbs, ...].
-        if len(self.metrics) == 0:
+        if len(self.metrics) == 0 or not self.enabled:
             return
         assert self.gathered_final_metrics is None, "Call tracker.reset() before doing tracker.update() after an aggregation"
 
@@ -84,6 +91,7 @@ class Tracker:
     def aggregate(self):
         if len(self.metrics) == 0:
             return
+        assert self.enabled, "Can't aggregate metrics disabled"
         assert self.gathered_final_metrics is None, "Tracker has already aggregated metrics"
         assert torch.all(self._shapes > 1)
 
@@ -170,7 +178,7 @@ class Tracker:
                 metric = self._inv_final_metrics_map[metric_id]
                 yield f"{metric}/{name}_avg", avg_metrics_across_layers[metric_id][name_id]
                 for layer in range(self.gathered_final_metrics.size(0)):
-                    yield f"{metric}/{name}_{layer}", values[layer][metric_id][name_id]
+                    yield f"{metric}/{name}_layer{layer:03d}", values[layer][metric_id][name_id]
 
 
 _TRACKER: Optional[Tracker] = None

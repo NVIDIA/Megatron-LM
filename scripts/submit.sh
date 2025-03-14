@@ -13,6 +13,7 @@ CODE_PATH=$STORE/users/ahernnde/workspace/AleHD-Megatron-LM
 
 DEF_TOKENS=50
 TOKENS=$DEF_TOKENS
+NODES=1
 
 # Usage function.
 usage () {
@@ -78,9 +79,6 @@ else
 fi
 shift
 
-# Default values.
-NODES=1
-
 # Now get the general options.
 SUFFIX=""
 TIME=1-00:00:00
@@ -88,7 +86,7 @@ while [[ $# -gt 0 ]]; do
 	case $1 in
 		--debug)
 			SCRIPT_VERSION=$SCRIPT_VERSION-debug;
-			TIME=00:15:00
+			TIME=00:30:00
 			shift;;
 		--nodes)
 			NODES=$2; shift 2;;
@@ -118,6 +116,9 @@ if [[ $FP8 = true ]]; then
 	fi
 fi
 
+WARMUP=$((5*ITERS/2))  # 5BT.
+EVAL_INTERVAL=$((ITERS/2))  # 500MT.
+EVAL_ITERS=$((ITERS/100))  # 10MT.
 if [[ $TOKENS != $DEF_TOKENS ]]; then
 	SUFFIX=$SUFFIX-${TOKENS}BT
 fi
@@ -132,6 +133,7 @@ SUFFIX=$SUFFIX$EXTRA_NAME
 NAME=llama${SIZE}$SUFFIX
 ROOT_PATH=$SCRATCH/op$SCRIPT_VERSION/$NAME
 SAVE_PATH=$ROOT_PATH/checkpoints
+mkdir -p $SAVE_PATH
 
 #= WRAPPING UP: Set up the _ARGS variables that are going to be used in the end =#
 ENVS="CUDA_DEVICE_MAX_CONNECTIONS=1 OMP_NUM_THREADS=\\\$SLURM_CPUS_PER_TASK WANDB_RESUME=allow WANDB_RUN_ID=$NAME"
@@ -189,25 +191,28 @@ DISTRIBUTED_ARGS=(
 DATA_ARGS=(
 	--data-path \$DATA_PATHS
 	--data-cache-path $SCRATCH/data/cache
-	--split 9990,8,2
+	--split 99,1,0
 )
 
 LOGGING=(
 	--log-interval 1
 	--save-interval $SAVE_FREQ
-	--eval-interval 100
 	--save $SAVE_PATH
 	--load $SAVE_PATH
 	--tensorboard-dir $ROOT_PATH/tensorboard
-	--eval-iters 32
+	--eval-interval $EVAL_INTERVAL
+	--eval-iters $EVAL_ITERS
 	--wandb-project $WANDB_PROJECT
 	--wandb-exp-name $NAME
+	--wandb-save-dir $ROOT_PATH/wandb
+	--timing-log-level 1
+	--tensorboard-log-interval 1
 	--log-progress
 	--log-throughput
 	--log-timers-to-tensorboard
-	--timing-log-level 1
 	--log-validation-ppl-to-tensorboard
 	--log-params-norm-per-param
+	--log-num-zeros-in-grad
 	--log-intermediate-metrics mean rms kurtosis
 	--log-params-norm
 	--log-memory-to-tensorboard
@@ -217,9 +222,8 @@ SCHEDULER_ARGS=(
 	--lr-decay-style WSD
 	--lr-wsd-decay-style 1-sqrt
 	--lr-wsd-decay-iters $(($ITERS/5))
-	--lr-warmup-iters $(($ITERS/20))
+	--lr-warmup-iters $WARMUP
 )
-
 
 EXTRA_ARGS+=(
 	--use-distributed-optimizer

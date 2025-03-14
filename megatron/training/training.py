@@ -970,10 +970,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
 
-    tracker = get_tracker()
-    timers("tracker-aggregate", log_level=0).start(barrier=True)
-    tracker.aggregate()
-    timers("tracker-aggregate").stop()
+    if iteration % args.tensorboard_log_interval == 0:
+        tracker = get_tracker()
+        timers("tracker-aggregate", log_level=0).start(barrier=True)
+        tracker.aggregate()
+        timers("tracker-aggregate").stop()
 
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if args.record_memory_history and is_last_rank():
@@ -1580,6 +1581,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
+        # Determine if we should enable the tracker (i.e. if we are going to log this iteration.
+        if iteration % args.tensorboard_log_interval == 0:
+            tracker = get_tracker()
+            tracker.enable()
+
         # Run training step.
         args.curr_iteration = iteration
         ft_integration.on_training_step_start()
@@ -1659,6 +1665,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad)
+        tracker.disable()  # We won't track any activation metrics during evaluation iterations.
 
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and \
@@ -1970,16 +1977,23 @@ def build_train_valid_test_data_loaders(
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
-        train_ds, _, _ = build_train_valid_test_datasets(
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
             build_train_valid_test_datasets_provider)
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
             train_ds, args.consumed_train_samples)
 
+        if args.skip_train:
+            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
+        else:
+            valid_dataloader = build_pretraining_data_loader(
+                valid_ds, args.consumed_valid_samples)
+        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = False
-        do_test = False
+        do_valid = valid_dataloader is not None and args.eval_iters > 0
+        do_test = test_dataloader is not None and args.eval_iters > 0
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)],
             dtype=torch.long, device='cuda')
