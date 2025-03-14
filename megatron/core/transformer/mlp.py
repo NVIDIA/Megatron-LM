@@ -20,6 +20,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.activations import XIELU, XIPReLU, XIPReLUP
+from megatron.core.metrics_tracking import get_tracker
 
 
 @dataclass
@@ -57,6 +58,7 @@ class MLP(MegatronModule):
         self.config: TransformerConfig = config
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
+        self.layer_number = None
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
@@ -104,6 +106,9 @@ class MLP(MegatronModule):
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
+        tracker = get_tracker()
+        tracker.update(intermediate_parallel, "mlp_intermediate", self.layer_number - 1)
+
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
                 if self.config.gated_linear_unit:
@@ -135,6 +140,8 @@ class MLP(MegatronModule):
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
 
+        tracker.update(output, "mlp_out", self.layer_number - 1)
+
         return output, output_bias
 
     def sharded_state_dict(
@@ -150,6 +157,9 @@ class MLP(MegatronModule):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
+
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = layer_number
 
 
 def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
