@@ -385,6 +385,8 @@ test:pypi_build_wheel:
   variables:
     PUBLISH_DRYRUN: "yes"
     PY_ENV: pytorch_24.10
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
   script:
     - echo $PUBLISH_DRYRUN
     - >
@@ -434,6 +436,8 @@ test:pypi_test_wheel:
     - team/megatron
   variables:
     PUBLISH_DRYRUN: "yes"
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
   script:
     - rm -rf megatron
     - pip install -U --no-cache-dir pip
