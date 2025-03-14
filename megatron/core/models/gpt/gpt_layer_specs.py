@@ -67,6 +67,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     mlp_layernorm: bool = True,
     qknorm_impl: str = 'te',
     post_layer_norm: bool = False,
+    pre_layer_norm: bool = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
@@ -95,7 +96,8 @@ def get_gpt_layer_with_transformer_engine_spec(
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
         mlp_layernorm=mlp_layernorm, 
-        post_layer_norm=post_layer_norm
+        post_layer_norm=post_layer_norm,
+        pre_layer_norm=pre_layer_norm,
     )
 
     if multi_latent_attention:
@@ -146,25 +148,6 @@ def get_gpt_layer_with_transformer_engine_spec(
         else:
             raise KeyError(f"Unknown qknorm_impl {qknorm_impl}")
 
-        # Determine where to handle attention layernorm.
-        if attn_layernorm and post_layer_norm: # Post-layer normalization case: input_layernorm module will be used.
-            linear_qkv = TEColumnParallelLinear
-            input_layernorm = TENorm
-        elif attn_layernorm:  # standard pre-norm case: TELayerNormColumnParallelLinear handles it.
-            linear_qkv = TELayerNormColumnParallelLinear
-            input_layernorm = IdentityOp
-        else:  # no layernorms at all.
-            linear_qkv = TEColumnParallelLinear
-            input_layernorm = IdentityOp
-
-        # Determine how to handle mlp norm.
-        if mlp_layernorm and post_layer_norm:
-            pre_mlp_layernorm = TENorm
-        else:
-            # even when mlp_layernorm but not post_layer_norm, we have the identity op
-            # because mlp.fc1 will fuse the layernorm :)
-            pre_mlp_layernorm = IdentityOp
-
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -172,18 +155,20 @@ def get_gpt_layer_with_transformer_engine_spec(
                     module=SelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=SelfAttentionSubmodules(
-                        linear_qkv=linear_qkv,
+                        linear_qkv=TELayerNormColumnParallelLinear if attn_layernorm and pre_layer_norm else TEColumnParallelLinear,
                         core_attention=TEDotProductAttention,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=qk_norm if qk_layernorm else IdentityOp,
                         k_layernorm=qk_norm if qk_layernorm else IdentityOp,
                     ),
                 ),
-                input_layernorm=input_layernorm,
+                input_layernorm=IdentityOp,
+                pre_mlp_layernorm=IdentityOp, 
                 self_attn_bda=get_bias_dropout_add,
-                pre_mlp_layernorm=pre_mlp_layernorm,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                post_attention_layernorm=TENorm if attn_layernorm and post_layer_norm else IdentityOp,
+                post_mlp_layernorm=TENorm if mlp_layernorm and post_layer_norm else IdentityOp,
             ),
         )
 
@@ -304,6 +289,7 @@ def get_mlp_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     mlp_layernorm: bool = True,
     post_layer_norm: bool = False,
+    pre_layer_norm: bool = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
@@ -315,7 +301,7 @@ def get_mlp_module_spec(
         )
 
     if use_te:
-        if mlp_layernorm and not post_layer_norm:
+        if mlp_layernorm and pre_layer_norm:
             fc1 = TELayerNormColumnParallelLinear
         else:
             fc1 = TEColumnParallelLinear
