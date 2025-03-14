@@ -23,6 +23,7 @@ from megatron.core.parallel_state import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import divide
+from megatron.core.metrics_tracking import get_tracker
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -615,6 +616,12 @@ class SelfAttention(Attention):
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
+
+        tracker = get_tracker()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        true_layer_number = self.layer_number + pp_rank*self.config.num_layers//pp_size
+        tracker.update(mixed_qkv, "qkv", true_layer_number - 1)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (

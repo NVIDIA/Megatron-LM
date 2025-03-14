@@ -26,6 +26,7 @@ from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
 from megatron.core.parallel_state import create_group
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
+from megatron.core.metrics_tracking import init_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +116,8 @@ def initialize_megatron(
         if args.rank == 0:
             print("> setting random seeds to {} ...".format(args.seed))
         _set_random_seed(args.seed, args.data_parallel_random_init, args.te_rng_tracker, args.inference_rng_tracker)
+
+        init_tracker(args, args.log_intermediate_metrics)
 
     if skip_mpu_initialization:
         return None

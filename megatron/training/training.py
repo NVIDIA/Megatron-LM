@@ -71,6 +71,7 @@ from megatron.core.num_microbatches_calculator import (
     get_current_running_global_batch_size,
     get_num_microbatches,
     update_num_microbatches)
+from megatron.core.metrics_tracking import get_tracker
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
@@ -968,6 +969,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
        (iteration % args.tensorboard_log_interval == 0):
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
+
+    tracker = get_tracker()
+    timers("tracker-aggregate", log_level=0).start(barrier=True)
+    tracker.aggregate()
+    timers("tracker-aggregate").stop()
+
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if args.record_memory_history and is_last_rank():
             snapshot = torch.cuda.memory._snapshot()
@@ -1063,6 +1070,20 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+        for key, value in tracker.get_final_metrics():
+            writer.add_scalar(key, value, iteration)
+            if wandb_writer:
+                wandb_writer.log({key: value}, iteration)
+        if args.log_timers_to_tensorboard:
+            elapsed = timers("tracker-aggregate").elapsed(barrier=True)
+            if writer:
+                writer.add_scalar("tracker-agg-time", elapsed, iteration)
+            if wandb_writer:
+                wandb_writer.log({"tracker-agg-time": elapsed}, iteration)
+
+    tracker.reset()
+
+
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)

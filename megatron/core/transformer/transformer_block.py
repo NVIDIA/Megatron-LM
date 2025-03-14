@@ -18,6 +18,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import is_te_min_version, make_viewless_tensor
+from megatron.core.metrics_tracking import get_tracker
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -529,6 +530,7 @@ class TransformerBlock(MegatronModule):
         else:
             fp8_context = nullcontext()
 
+        tracker = get_tracker()
         with rng_context, fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -543,6 +545,9 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
+                    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+                    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+                    true_l_no = l_no + pp_rank*self.config.num_layers//pp_size
                     with self.offload_context:
                         layer.use_cudagraph = True
                         if (len(self.cuda_graphs) == 0) or (not self.training):
@@ -559,6 +564,7 @@ class TransformerBlock(MegatronModule):
                                 packed_seq_params=packed_seq_params,
                                 sequence_len_offset=sequence_len_offset,
                             )
+                            tracker.update(hidden_states, "activation", true_l_no)
                         else:
                             # CUDA graph replay for layer `l_no` and microbatch
                             # `self.current_microbatch`. TransformerEngine versions>=1.10
@@ -582,6 +588,8 @@ class TransformerBlock(MegatronModule):
                             hidden_states = self.cuda_graphs[l_no][cg_index](
                                 hidden_states, **optional_inputs
                             )
+
+                            tracker.update(hidden_states, "activation", true_l_no)
 
                     if (
                         torch.is_grad_enabled()
