@@ -223,7 +223,7 @@ class MambaModel(LanguageModule):
             and inference_params is not None
             and inference_params.materialize_only_last_token_logits
         ):
-            hidden_states = hidden_states[-1, :, :]
+            hidden_states = hidden_states[-1, :, :].unsqueeze(0)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output

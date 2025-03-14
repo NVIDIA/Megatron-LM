@@ -3,7 +3,8 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 import argparse
-from pretrain_gpt import model_provider
+from pretrain_gpt import model_provider as gpt_model_provider
+from pretrain_mamba import model_provider as mamba_model_provider
 import random
 import torch
 import sys
@@ -74,6 +75,9 @@ def add_text_generate_args(parser):
         help='Max number of prompts to process at once',
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
+    group.add_argument(
+        "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
+    )
     return parser
 
 
@@ -187,13 +191,18 @@ def main():
         },
     )
 
+    args = get_args()
+
     # Set up model and load checkpoint
+    if args.model_provider == "gpt":
+        model_provider = gpt_model_provider
+    elif args.model_provider == "mamba":
+        model_provider = mamba_model_provider
+
     model = get_model(model_provider, wrap_with_ddp=False)
     tokenizer = get_tokenizer()
     load_checkpoint(model, None, None)
     model = model[0]
-
-    args = get_args()
 
     assert (args.prompts is None) ^ (
         args.num_input_tokens is None
