@@ -41,7 +41,7 @@ if [[ $1 -eq 300 ]]; then
 	# batch_size: ~0.52M.
 	# tok/sec/gpu: ~83k  (2nodes, bf16).
 	# 50B ETA: ~21h (2nodes, bf16).
-	# ckpt freq: ~4h.
+	# ckpt freq: ~2h.
 	LAYERS=16
 	HIDDEN_SIZE=1024
 	FFN_SIZE=4096
@@ -53,12 +53,12 @@ if [[ $1 -eq 300 ]]; then
 	LR=0.001
 	INIT_STD=0.001
 	SIZE=320M
-	SAVE_FREQ=20000
+	SAVE_FREQ=10000
 elif [[ $1 -eq 1 ]]; then 
 	# batch_size: ~1.05M.
 	# tok/sec/gpu: 36.5k (8nodes, bf16).
 	# 50B ETA: ~12h (8nodes, bf16).
-	# ckpt freq: ~2h30m (8nodes, bf16).
+	# ckpt freq: ~1h15m (8nodes, bf16).
 	LAYERS=16
 	HIDDEN_SIZE=2048
 	FFN_SIZE=8192
@@ -70,7 +70,7 @@ elif [[ $1 -eq 1 ]]; then
 	LR=0.0005
 	INIT_STD=0.001
 	SIZE=1B
-	SAVE_FREQ=10000
+	SAVE_FREQ=5000
 else
 	>&2 echo "Invalid llama size: $1"
 	usage
