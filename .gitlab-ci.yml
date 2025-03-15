@@ -116,6 +116,12 @@ variables:
   FUNCTIONAL_TEST_NAME:
     description: "Name of functional test run (only for pre-release and release)"
     value: "$$CI_COMMIT_SHA"
+  FUNCTIONAL_TEST_RECORD_CHECKPOINTS:
+    description: "Record golden checkpoints"
+    value: "no"
+    options:
+      - "yes"
+      - "no"
   PUBLISH:
     value: "no"
     options:
