@@ -104,7 +104,7 @@ class DType(Enum):
         Returns:
             Type[numpy.number]: The dtype to use for the index
         """
-        if cardinality is not None and cardinality < 65500:
+        if cardinality is not None and cardinality < 65535:
             return numpy.uint16
         else:
             return numpy.int32
