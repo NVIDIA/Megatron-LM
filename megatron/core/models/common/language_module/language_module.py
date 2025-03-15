@@ -8,7 +8,11 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
+
+try:
+    from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
+except:
+    te_parallel_cross_entropy = None
 from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
