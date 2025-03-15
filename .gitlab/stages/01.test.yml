@@ -346,7 +346,7 @@ test:secret_detection:
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
-  allow_failure: true
+  allow_failure: false
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - when: never
@@ -386,6 +386,8 @@ test:pypi_build_wheel:
     PY_ENV: pytorch_24.10
     KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
     KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 4
+    KUBERNETES_SERVICE_CPU_LIMIT: 8
   before_script:
     - git fetch origin $PUBLISH_COMMIT
     - git checkout $PUBLISH_COMMIT
@@ -415,6 +417,8 @@ test:pypi_build_wheel:
       - dist/
     reports:
       dotenv: build.env
+  retry:
+    max: 2
 
 test:pypi_test_wheel:
   extends: [.test_rules]
@@ -440,6 +444,8 @@ test:pypi_test_wheel:
   variables:
     KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
     KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 4
+    KUBERNETES_SERVICE_CPU_LIMIT: 8
     GIT_STRATEGY: none
   script:
     - rm -rf megatron - PUBLISH_DRYRUN=${PUBLISH_DRYRUN:-'yes'}
@@ -469,6 +475,8 @@ test:pypi_test_wheel:
     paths:
       - wheelhouse/
       - dist/
+  retry:
+    max: 2
 
 test:pypi_push_wheel:
   extends: [.test_rules]
