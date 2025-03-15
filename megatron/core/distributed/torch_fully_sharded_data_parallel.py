@@ -66,7 +66,8 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             with_context_parallel=True
         )
 
-        kwargs = {"mesh": DeviceMesh.from_group(self.data_parallel_group, "cuda")}
+        self.device_mesh = DeviceMesh.from_group(self.data_parallel_group, "cuda")
+        kwargs = {"mesh": self.device_mesh}
 
         def save_custom_attrs(module):
             custom_attrs = {}

@@ -662,7 +662,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             this=model_data, that=main_data, overflow_buf=self._dummy_overflow_buf
         )
 
-    def state_dict(self):
+    def state_dict(self, is_loading: bool = False):
+        if is_loading:
+            self.init_state_fn(self.optimizer, self.config)
+
         state_dict = {}
         state_dict['optimizer'] = self.optimizer.state_dict()
         if self.grad_scaler:
