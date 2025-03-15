@@ -174,6 +174,11 @@ class MultiLatentAttention(Attention):
             inference_context, query, key, value, rotary_pos_emb=None
         )
 
+        # TODO: Currently, TE can only accept contiguous tensors for MLA
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+
         # ==================================
         # core attention computation
         # ==================================
@@ -422,9 +427,5 @@ class MLASelfAttention(MultiLatentAttention):
         # key: [s, b, n, 192]
         k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
-
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
 
         return query, key, value

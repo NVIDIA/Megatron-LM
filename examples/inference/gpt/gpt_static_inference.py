@@ -164,7 +164,6 @@ def main():
         inference_engine.generate(
                 prompts=prompts, sampling_params=sampling_params
             )
-
     start_time = time.perf_counter()
     if args.stream:
         results: List[InferenceRequest] = asyncio.run(generate(inference_engine, sampling_params, prompts))
