@@ -91,7 +91,15 @@ def get_failed_stage(pipeline_id: int) -> pd.DataFrame:
         .jobs.list(get_all=True)
     )
 
-    failed_stages = list(set([job.stage for job in pipeline_jobs if job.status == "failed"]))
+    failed_stages = list(
+        set(
+            [
+                job.stage
+                for job in pipeline_jobs
+                if job.status == "failed" and job.allow_failure == "false"
+            ]
+        )
+    )
 
     if "build" in failed_stages:
         return "build"
@@ -140,7 +148,9 @@ def get_analytics_per_pipeline(pipeline_id: int) -> pd.DataFrame:
             pd.Timestamp(functional_tests_analytics['finished_at'].max())
             - pd.Timestamp(functional_tests_analytics['started_at'].min())
         ).total_seconds()
-        analytics["functional_tests_stage_failed"] = int(get_failed_stage(pipeline_id) == "test")
+        analytics["functional_tests_stage_failed"] = int(
+            get_failed_stage(pipeline_id) == "functional_tests"
+        )
 
     return pd.DataFrame([analytics])
 
