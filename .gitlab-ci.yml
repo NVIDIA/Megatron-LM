@@ -122,6 +122,12 @@ variables:
       - "yes"
       - "no"
     description: Build and publish a wheel to PyPi
+  PUBLISH_COMMIT:
+    value: "$CI_COMMIT_SHA"
+    description: Which commit to publish
+  PUBLISH_VERSION_BUMP_BRANCH:
+    value: "$CI_COMMIT_BRANCH"
+    description: Which branch to target for version bump
   PUBLISH_SCOPE:
     value: "code-freeze"
     options:
