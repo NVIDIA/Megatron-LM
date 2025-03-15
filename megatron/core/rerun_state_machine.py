@@ -720,13 +720,13 @@ class RerunStateMachine:
 
         return value >= self.max_values[context] * threshold
 
-    def state_dict(self, data_iterator: DataIteratorArgType, use_dist_ckpt: bool) -> dict[str, Any]:
+    def state_dict(self, data_iterator: DataIteratorArgType, ckpt_format: str) -> dict[str, Any]:
         """Method that returns a state dict to be checkpointed.
 
         Args:
             data_iterator: the data iterator that needs to be checkpointed (or None
                 if this checkpoint is not requested by the rerun state machine).
-            use_dist_ckpt: generate a distributed checkpoint.
+            ckpt_format: the checkpoint format to use.
         Returns:
             A state dict representing the rerun state machine.
 
@@ -737,7 +737,7 @@ class RerunStateMachine:
                 ...
                 rerun_state_machine = get_rerun_state_machine()
                 checkpoint['rerun_state_machine'] = (
-                    rerun_state_machine.state_dict(data_iterator, False)
+                    rerun_state_machine.state_dict(data_iterator, "torch_dist")
                 )
                 ...
                 return checkpoint
@@ -774,7 +774,7 @@ class RerunStateMachine:
                 # No need to save saved_results and stats (resets when job resumes).
             },
         }
-        if use_dist_ckpt:
+        if ckpt_format == "torch_dist":
             pp_rank = mpu.get_pipeline_model_parallel_rank()
             pp_size = mpu.get_pipeline_model_parallel_world_size()
             tp_rank = mpu.get_tensor_model_parallel_rank()

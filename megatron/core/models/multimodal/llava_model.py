@@ -344,6 +344,10 @@ class LLaVAModel(MegatronModule):
                     partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
                 )
 
+            self.vision_projection.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
+            )
+
         self.img_seq_len = get_num_image_embeddings(
             img_h,
             img_w,

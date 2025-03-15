@@ -76,7 +76,6 @@ class TestLocalCheckpointing:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
         rng_state = None
-        use_dist_ckpt = True
         iteration = None
         optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
         mock_args = parse_args(ignore_unknown_args=True)
@@ -90,7 +89,6 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            use_dist_ckpt=use_dist_ckpt,
             iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )
@@ -129,7 +127,6 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            use_dist_ckpt=True,
             iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )
