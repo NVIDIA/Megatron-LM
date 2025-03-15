@@ -2,6 +2,7 @@ import os
 import time
 import urllib.request as req
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mock
 import numpy as np
@@ -10,10 +11,27 @@ import torch
 
 import megatron.core.utils as util
 import megatron.training.utils as training_util
+from megatron.core import config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+success_string = "hello,world"
+
+
+@util.experimental_cls(introduced_with_version="0.1.0")
+class A:
+
+    def __init__(self):
+        pass
+
+    def some_method(self):
+        return success_string
+
+    @classmethod
+    def some_static_method(cls):
+        return success_string
 
 
 def test_divide_properly():
@@ -23,6 +41,41 @@ def test_divide_properly():
 def test_divide_improperly():
     with pytest.raises(AssertionError):
         util.divide(4, 5)
+
+
+def test_experimental_cls_init():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+        # Check that initialization works
+        a = A()
+        assert a.__class__.__qualname__ == "A"
+        assert a.some_method() == success_string
+        assert a.is_experimental is True
+
+
+def test_experimental_cls_static():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+        # Check that static methods work
+        assert A.__class__.__qualname__ == "A"
+        assert A.some_static_method() == success_string
+        assert A.is_experimental is True
+
+
+def test_experimental_cls_exception_init():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
+    ):
+        a = A()
+        assert a.some_method() == success_string
+        assert a.is_experimental is False
+
+
+def test_experimental_cls_exception_static():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
+    ):
+        assert A.some_static_method() == success_string
+
+    assert A.is_experimental is False
 
 
 def test_global_memory_buffer():
