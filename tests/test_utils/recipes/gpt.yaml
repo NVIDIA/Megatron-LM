@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}'
+  name: "{test_case}_{environment}"
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -13,7 +13,6 @@ spec:
   artifacts:
     /workspace/data/gpt3_data: text/the_pile/shard00
     /workspace/checkpoints/gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G_dev/22410107
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/22410107
     /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G_dev/22629512
     /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G_dev/22629512
     /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G_dev/22629512
@@ -65,38 +64,6 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_resume_torch_dist_te_4experts2parallel]
-    products:
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
     products:
       - environment: [dev, lts]
@@ -145,10 +112,6 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_4experts]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_overlap_grad_reduce]
     products:
       - environment: [dev, lts]
@@ -165,14 +128,6 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts]
-  #   products:
-  #     - environment: [dev, lts]
-  #       scope: [nightly]
-  # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_fsdp2_resume_torch_dist_te]
-  #   products:
-  #     - environment: [dev, lts]
-  #       scope: [nightly]
   #######################################################################
   # Weekly tests: Run both DEV and LTS unless something is flaky        #
   #######################################################################
@@ -254,10 +209,6 @@ products:
       #   scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_reshard_2x1x4_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -457,48 +408,6 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_top2router_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -678,20 +587,6 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  # TODO: Enable this test once the compatibility issue is fixed
-  # - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
-
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
   # - test_case: [gpt3_mr_mcore_te_tp2_pp1_fsdp2_resume_torch_dist_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev]
@@ -741,10 +636,6 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -753,10 +644,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
+
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
     products:
       - environment: [dev]
