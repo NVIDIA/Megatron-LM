@@ -1,12 +1,30 @@
 # Changelog
 
+## NVIDIA Megatron Core 0.11.0
+
+- Add multi datacenter training support though N/S connection
+- MoE
+  - Features
+    - Support DeepSeek-V3 fine-tuning
+      - Aux-loss-free load balancing strategy
+      - Node-limited routing and Device-limited routing support.
+      - Tensor Parallelism support for MLA and Sequence Auxiliary Loss
+      - MTP (with TP and PP support) is coming soon.
+    - Permutation / Unpermutation fusion kernel from TransformerEngine.
+    - Uneven virtual pipeline parallel split support in first and last PP stage.
+  - Bug fixes:
+    - Fix the grad scale when TP != expert-TP and average_in_collective is enabled in DDP.
+    - Fix TEGroupedMLP distckpt compatibility issue with FP8 padding/unpadding.
+  - Known Issues:
+    - When training the Dense+MoE hybrid model, the process will hang if any PP rank does not have expert params.
+
 ## NVIDIA Megatron Core 0.10.0
 
 - Adding MLA to MCore
 - Enable FP8 for GroupedMLP
 - MoE Parallel Folding
 - Enhance MoE Architecture: Support MoE Layer Frequency Patterns and Configurable MoE FFN Hidden Size
-- Multimodal: NVLM training and evaluation support in MCore 
+- Multimodal: NVLM training and evaluation support in MCore
 - Mamba Hybrid
   - Increase performance and reduce memory footprint of Triton language/compiler distributed caching
   - Add more unit testing and fix bugs
@@ -55,7 +73,7 @@
 
 - MoE (Mixture of Experts)
   - Performance optimization
-    - Communication optimization for multi GPU and Single GPU 
+    - Communication optimization for multi GPU and Single GPU
     - 23% improvement (323 TFLOPS/GPU) over MCore 0.5.0 on Mixtral with Hopper BF16
     - GroupedMLP enhancement for Hopper
     - DP Overlapping. Support overlapping computation with gradient reduction and parameter gathering.

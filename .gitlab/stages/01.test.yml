@@ -383,11 +383,14 @@ test:pypi_build_wheel:
     - purpose/builder-small
     - team/megatron
   variables:
-    PUBLISH_DRYRUN: "yes"
     PY_ENV: pytorch_24.10
     KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
     KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
+  before_script:
+    - git fetch origin $PUBLISH_COMMIT
+    - git checkout $PUBLISH_COMMIT
   script:
+    - PUBLISH_DRYRUN=${PUBLISH_DRYRUN:-'yes'}
     - echo $PUBLISH_DRYRUN
     - >
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
@@ -435,11 +438,11 @@ test:pypi_test_wheel:
     - purpose/builder-small
     - team/megatron
   variables:
-    PUBLISH_DRYRUN: "yes"
     KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
     KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
+    GIT_STRATEGY: none
   script:
-    - rm -rf megatron
+    - rm -rf megatron - PUBLISH_DRYRUN=${PUBLISH_DRYRUN:-'yes'}
     - pip install -U --no-cache-dir pip
     - >
       if [[ "$PLATFORM" == "arm64" ]]; then
@@ -459,7 +462,7 @@ test:pypi_test_wheel:
       fi
 
 
-    - echo "RELEASE_NUMBER=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
+    - echo "RELEASE_NUMBER=$RELEASE_NUMBER" | tee -a build.env
   artifacts:
     reports:
       dotenv: build.env
@@ -479,9 +482,10 @@ test:pypi_push_wheel:
     - team/megatron
   needs: [test:pypi_test_wheel]
   variables:
-    PUBLISH_DRYRUN: "yes"
+    GIT_STRATEGY: none
   timeout: 3m
   script:
+    - PUBLISH_DRYRUN=${PUBLISH_DRYRUN:-'yes'}
     - >
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
         REPOSITORY=testpypi
@@ -516,10 +520,12 @@ test:gh_release:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  image: badouralix/curl-jq
-  variables:
-    PUBLISH_DRYRUN: "yes"
+  image: nentangso/alpine-git-curl-jq
+  before_script:
+    - git fetch origin $PUBLISH_COMMIT
+    - git checkout $PUBLISH_COMMIT
   script:
+    - PUBLISH_DRYRUN=${PUBLISH_DRYRUN:-'yes'}
     - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
     - IS_PRERELEASE=$([[ "$RELEASE_NUMBER" == *rc* ]] && echo "true" || echo "false")
     - >
@@ -535,7 +541,7 @@ test:gh_release:
     - >
       PAYLOAD=$(jq -nc \
                   --arg TAG_NAME "v${RELEASE_NUMBER}" \
-                  --arg CI_COMMIT_SHA "$CI_COMMIT_SHA" \
+                  --arg CI_COMMIT_SHA "$PUBLISH_COMMIT" \
                   --arg NAME "$NAME" \
                   --arg BODY "$CHANGELOG" \
                   --argjson PRERELEASE "$IS_PRERELEASE" \
@@ -549,7 +555,7 @@ test:gh_release:
                       "generate_release_notes": false
                   }'
               )
-      echo -E "$PAYLOAD" > payload.txt
+      echo -E "$PAYLOAD" | tee -a payload.txt
 
 
     - cat payload.txt
@@ -583,9 +589,8 @@ test:notify_release:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  variables:
-    PUBLISH_DRYRUN: "yes"
   script:
+    - PUBLISH_DRYRUN=${PUBLISH_DRYRUN:-'yes'}
     - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
     - >
       MESSAGE='{
@@ -609,6 +614,68 @@ test:notify_release:
         --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
       )
       
+      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
+        echo "$CMD"
+      else
+        eval "$CMD"
+      fi
+
+
+test:version_bump:
+  needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
+  extends: [.test_rules]
+  image: nentangso/alpine-git-curl-jq
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  before_script:
+    - git fetch origin $PUBLISH_COMMIT
+    - git checkout $PUBLISH_COMMIT
+  script:
+    - PUBLISH_DRYRUN=${PUBLISH_DRYRUN:-'yes'}
+    - MAJOR=$(cat megatron/core/package_info.py | awk '/^MAJOR = /' | awk -F"= " '{print $2}')
+    - MINOR=$(cat megatron/core/package_info.py | awk '/^MINOR = /' | awk -F"= " '{print $2}')
+    - PATCH=$(cat megatron/core/package_info.py | awk '/^PATCH = /' | awk -F"= " '{print $2}')
+    - PRERELEASE=$(cat megatron/core/package_info.py | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
+
+    - >
+      if [[ "$PRERELEASE" != "" ]]; then
+        NEXT_PATCH=$PATCH
+        NEXT_PRERELEASE=rc$((${PRERELEASE#rc} + 1))
+      else
+        NEXT_PATCH=$((${PATCH} + 1))
+        NEXT_PRERELEASE=$NEXT_PRERELEASE
+      fi
+
+
+    - sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" megatron/core/package_info.py
+    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = $NEXT_PRERELEASE" megatron/core/package_info.py
+
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
+    - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+    - git switch --force-create bot/chore/bump-version
+    - git add megatron/core/package_info.py
+    - >
+      git commit -m "chore: adjust version version"
+
+
+    - git push -f -u origin bot/chore/bump-version
+    - >
+      curl \
+        --header "PRIVATE-TOKEN: $PAT" \
+        --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+        -d "source_branch=bot/chore/bump-version" \
+        -d "target_branch=$PUBLISH_VERSION_BUMP_BRANCH" \
+        -d "title=chore: Fix version of \`$PUBLISH_VERSION_BUMP_BRANCH\`" \
+        -d "description=[🤖]: Hi @okoenig 👋,<br><br>we've adjusted the version number of \`$PUBLISH_VERSION_BUMP_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
+
+
+    - >
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
         echo "$CMD"
       else
