@@ -691,6 +691,7 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
     # clones it if it's not contiguous:
     # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
     grad_output = grad_output.contiguous()
+    all_gathered_input = all_gathered_input.contiguous()
     # Convert the tensor shapes to 2D for execution compatibility
     if grad_output.dim() == 3:
         grad_output = grad_output.view(

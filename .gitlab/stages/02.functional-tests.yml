@@ -23,6 +23,7 @@ functional:configure:
       optional: true
     - job: test:unit_tests_pyt(LTS)_mcore(latest)
       optional: true
+    - job: test:build_nemo_image
   extends: [.functional_tests_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags: 

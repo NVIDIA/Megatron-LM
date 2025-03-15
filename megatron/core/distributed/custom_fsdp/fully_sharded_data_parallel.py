@@ -12,7 +12,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from megatron.core import parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
     AllGatherPipeline,
     BucketingPolicy,
@@ -30,6 +30,7 @@ from megatron.core.utils import is_submodule, log_single_rank
 
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 class TrainingState(Enum):
     """States of a FSDP parameter group, which are coupled with
@@ -102,6 +103,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
     ):
+        assert xm is None, " Custom FullyShardedDataParallel is not supported for XLA"
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

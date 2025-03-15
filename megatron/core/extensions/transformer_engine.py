@@ -1200,12 +1200,13 @@ class TECudaRNGStatesTracker(te.pytorch.distributed.CudaRNGStatesTracker):
     """Wraps TransformerEngine's CudaRNGStatesTracker so that it is
     interchangeable with Megatron's RNG tracker"""
 
-    def __init__(self):
+    def __init__(self, is_inference_rng_tracker=False):
         super().__init__()
         self.reset()
+        self.is_inference_rng_tracker = is_inference_rng_tracker
 
     def is_initialized(self):
-        """Checks if the internal RNG state has been set wirth set_states()."""
+        """Checks if the internal RNG state has been set with set_states()."""
         return self._is_initialized
 
     def reset(self):

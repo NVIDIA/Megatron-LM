@@ -12,6 +12,7 @@ class InferenceParams:
         self.decode_mode = False
         self.key_value_memory_dict = {}
         self.decode_mode = False
+        self.materialize_only_last_token_logits = False
 
     def swap_key_value_dict(self, batch_idx):
         "swap between batches"
@@ -62,6 +63,7 @@ class InferenceParams:
             f"batch_size_offset = {self.batch_size_offset}, "
             f"key_value_memory_dict = {self.key_value_memory_dict.keys()})"
             f"decode_mode = {self.decode_mode}"
+            f"materialize_only_last_token_logits = {self.materialize_only_last_token_logits}"
         )
 
     def __eq__(self, other):
@@ -76,6 +78,8 @@ class InferenceParams:
             'current_batch_size',
             'sequence_len_offset',
             'batch_size_offset',
+            'decode_mode',
+            'materialize_only_last_token_logits',
         ]
 
         if not all(hasattr(other, attr) for attr in basic_attrs):

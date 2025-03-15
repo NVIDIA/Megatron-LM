@@ -370,7 +370,6 @@ class TextGenerationController:
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
         with torch.no_grad():
-
             self.inference_wrapped_model.prep_model_for_inference(
                 prompts_tokens=batch_prompt_tokens
             )
@@ -401,6 +400,15 @@ class TextGenerationController:
                 ):
                     inference_input_for_context_window["attention_mask"] = None
 
+                # Only materialize prompt log probs if the user requests log probs
+                materialize_only_last_token_logits = (
+                    self.inference_wrapped_model.inference_params.decode_mode
+                    or not sampling_params.return_log_probs
+                )
+                self.inference_wrapped_model.inference_params.materialize_only_last_token_logits = (
+                    materialize_only_last_token_logits
+                )
+
                 # Returns the final logits of shape [batch_size, context_length, vocab_size]
                 # Note: This is returned in all TP ranks or last PP stage in PP models
                 logits = self.inference_wrapped_model.run_one_forward_step(
@@ -415,8 +423,12 @@ class TextGenerationController:
                         xm.mark_step()
 
                     context_length = context_end_position - context_start_position
+                    logits_seq_len = 1 if materialize_only_last_token_logits else context_length
+                    logits_shape = [batch_size, logits_seq_len, vocab_size]
+                    if parallel_state.is_pipeline_last_stage():
+                        assert logits is not None and torch.Size(logits_shape) == logits.shape
                     logits = broadcast_from_last_pipeline_stage(
-                        [batch_size, context_length, vocab_size],
+                        [batch_size, logits_seq_len, vocab_size],
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
                     )

@@ -5,7 +5,8 @@
 
 import contextlib
 import logging
-from importlib.metadata import PackageNotFoundError, version
+from functools import partial
+from typing import Union
 
 from megatron.core.device_utils import get_current_rng_state, get_xla_model, set_current_rng_state, set_device_manual_seed
 import torch
@@ -55,9 +56,10 @@ class DeviceRNGStatesTracker:
     device state.
     """
 
-    def __init__(self, use_cudagraphable_rng=False):
+    def __init__(self, use_cudagraphable_rng=False, is_inference_rng_tracker=False):
         self.reset()
         self.use_cudagraphable_rng = use_cudagraphable_rng
+        self.is_inference_rng_tracker = is_inference_rng_tracker
 
         if self.use_cudagraphable_rng:
             assert (
@@ -176,8 +178,9 @@ def initialize_rng_tracker(
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
         base_tracker = TECudaRNGStatesTracker
+        tracker_kwargs = {"is_inference_rng_tracker": inference_rng_tracker}
     else:
-        base_tracker = DeviceRNGStatesTracker
+        base_tracker = partial(DeviceRNGStatesTracker, use_cudagraphable_rng=use_cudagraphable_rng)
 
     if inference_rng_tracker:
 

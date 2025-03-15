@@ -15,7 +15,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.tensor_parallel import get_device_rng_tracker
 from megatron.core.utils import (
@@ -37,6 +37,7 @@ except:
     pass
 
 
+xm = get_xla_model()
 logger = logging.getLogger(__name__)
 
 
@@ -1531,6 +1532,8 @@ class GradReducePipeline:
         cuda_stream: Optional[torch.cuda.Stream] = None,
         check_nans: bool = False,
     ) -> None:
+        assert xm is None, "GradReducePipeline is not supported for XLA"
+        
         self.buffer = param_and_grad_buffer
         self.grad_reduce_queue = []
         self.bucket_status = {

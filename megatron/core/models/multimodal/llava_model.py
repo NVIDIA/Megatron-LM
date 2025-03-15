@@ -25,6 +25,9 @@ try:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
     from megatron.core.utils import is_te_min_version
 
+    from megatron.core.extensions.transformer_engine import TENorm
+
+    NORM_IMPL = TENorm
     HAVE_TE = True
     try:
         import transformer_engine_torch as tex
@@ -33,6 +36,8 @@ try:
     except:
         HAVE_TEX = False
 except:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    NORM_IMPL = WrappedTorchNorm
     HAVE_TE = False
     if get_context_parallel_world_size() > 1:
         raise RuntimeError("ContextParallelism requires TransformerEngine support, but not found.")
@@ -264,16 +269,34 @@ class LLaVAModel(MegatronModule):
                     model_subtype=vision_transformer_config.vision_model_type,
                     add_class_token=add_class_token,
                 )
-            elif vision_transformer_config.vision_model_type in ("radio"):
+            elif vision_transformer_config.vision_model_type in ("radio", "radio-g"):
                 # TODO: should refactor into model code itself?
-                class_token_len = 8
-                max_img_h = 2048
-                max_img_w = 2048
+                class_token_len = 0
+                max_img_h = 0
+                max_img_w = 0
                 embedder_bias = False
+                ln_post_impl = None
                 use_mask_token = False
+
+                if vision_transformer_config.vision_model_type == "radio":
+                    class_token_len = 8
+                    max_img_h = 2048
+                    max_img_w = 2048
+                    embedder_bias = False
+                    ln_post_impl = None
+                    use_mask_token = False
+                elif vision_transformer_config.vision_model_type == "radio-g":
+                    class_token_len = 5
+                    max_img_h = 1792
+                    max_img_w = 1792
+                    embedder_bias = True
+
+                    ln_post_impl = NORM_IMPL
+                    use_mask_token = True
                 self.vision_model = RADIOViTModel(
                     vision_transformer_config,
                     vision_transformer_layer_spec,
+                    ln_post_impl=ln_post_impl,
                     img_h=img_h,
                     img_w=img_w,
                     max_img_h=max_img_h,
