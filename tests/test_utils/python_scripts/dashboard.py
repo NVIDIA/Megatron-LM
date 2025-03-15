@@ -1,6 +1,5 @@
 import logging
 import os
-import re
 
 import click
 import gitlab
@@ -10,7 +9,9 @@ import requests
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
 
+logging.basicConfig()
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def get_gitlab_handle():
@@ -82,37 +83,64 @@ def get_functional_test_analytics(pipeline_id: int) -> pd.DataFrame:
     )
 
 
+def get_failed_stage(pipeline_id: int) -> pd.DataFrame:
+    pipeline_jobs = (
+        get_gitlab_handle()
+        .projects.get(PROJECT_ID)
+        .pipelines.get(pipeline_id)
+        .jobs.list(get_all=True)
+    )
+
+    failed_stages = list(set([job.stage for job in pipeline_jobs if job.status == "failed"]))
+
+    if "build" in failed_stages:
+        return "build"
+
+    elif "test" in failed_stages:
+        return "test"
+
+    elif "functional_tests" in failed_stages:
+        return "functional_tests"
+
+    return
+
+
 def get_analytics_per_pipeline(pipeline_id: int) -> pd.DataFrame:
     build_analytics = get_build_analytics(pipeline_id)
     unit_tests_analytics = get_unit_test_analytics(pipeline_id)
     functional_tests_analytics = get_functional_test_analytics(pipeline_id)
 
-    analytics = {
-        "mcore_analytics": "v0.2",
-        "pipeline_id": pipeline_id,
-        "ci_started_at": build_analytics['started_at'].min(),
-        "build_started_at": build_analytics['started_at'].min(),
-        "build_finished_at": build_analytics['finished_at'].max(),
-        "build_duration_total": (
+    analytics = {"mcore_analytics": "v0.2", "pipeline_id": pipeline_id}
+
+    if not build_analytics.empty:
+        analytics["ci_started_at"] = build_analytics['started_at'].min()
+        analytics["build_started_at"] = build_analytics['started_at'].min()
+        analytics["build_finished_at"] = build_analytics['finished_at'].max()
+        analytics["build_duration_total"] = (
             pd.Timestamp(build_analytics['finished_at'].max())
             - pd.Timestamp(build_analytics['started_at'].min())
-        ).total_seconds(),
-        "unit_tests_started_at": unit_tests_analytics['started_at'].min(),
-        "unit_tests_finished_at": unit_tests_analytics['finished_at'].max(),
-        "unit_tests_duration_total": (
-            pd.Timestamp(unit_tests_analytics['finished_at'].max())
-            - pd.Timestamp(unit_tests_analytics['started_at'].min())
-        ).total_seconds(),
-    }
+        ).total_seconds()
+        analytics["build_stage_failed"] = int(get_failed_stage(pipeline_id) == "build")
+
+    if not unit_tests_analytics.empty:
+        analytics["unit_tests_started_at"] = unit_tests_analytics['started_at'].min()
+        analytics["unit_tests_finished_at"] = unit_tests_analytics['finished_at'].max()
+        analytics["unit_tests_duration_total"] = (
+            (
+                pd.Timestamp(unit_tests_analytics['finished_at'].max())
+                - pd.Timestamp(unit_tests_analytics['started_at'].min())
+            ).total_seconds(),
+        )
+        analytics["unit_tests_stage_failed"] = int(get_failed_stage(pipeline_id) == "test")
 
     if not functional_tests_analytics.empty:
-
         analytics["functional_tests_started_at"] = functional_tests_analytics['started_at'].min()
         analytics["functional_tests_finished_at"] = functional_tests_analytics['finished_at'].max()
         analytics["functional_tests_duration_total"] = (
             pd.Timestamp(functional_tests_analytics['finished_at'].max())
             - pd.Timestamp(functional_tests_analytics['started_at'].min())
         ).total_seconds()
+        analytics["functional_tests_stage_failed"] = int(get_failed_stage(pipeline_id) == "test")
 
     return pd.DataFrame([analytics])
 
@@ -120,9 +148,13 @@ def get_analytics_per_pipeline(pipeline_id: int) -> pd.DataFrame:
 @click.command()
 @click.option("--pipeline-id", required=True, type=int, help="PipelineID")
 def upload_statistics(pipeline_id: int):
+    payload = get_analytics_per_pipeline(pipeline_id).to_json()
+
+    logger.info(payload)
+
     res = requests.post(
         DASHBOARD_ENDPOINT,
-        data=get_analytics_per_pipeline(pipeline_id).to_json(orient="records"),
+        data=payload,
         headers={'Content-Type': 'application/json', 'Accept-Charset': 'UTF-8'},
     )
 
