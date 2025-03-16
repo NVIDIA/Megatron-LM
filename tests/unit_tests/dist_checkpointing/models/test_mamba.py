@@ -33,7 +33,7 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     num_moe_experts = 8
     default_config_kwargs = dict(
         num_layers=pp_size,
-        hidden_size=128,
+        hidden_size=256,  # for Mamba: expand=2, headdim=64 -> nheads=8 (divisible by ngroups=8)
         num_attention_heads=4,
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
