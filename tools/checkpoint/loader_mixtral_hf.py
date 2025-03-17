@@ -186,6 +186,7 @@ def _load_checkpoint(queue, args):
                 '--no-save-optim',
                 '--no-save-rng',
                 '--no-initialization',
+                '--no-gradient-accumulation-fusion', # Gradient accumulation fusion requires NVIDIA/apex. TODO: remove this line when we have apex working on ROCm platform.
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--transformer-impl', 'transformer_engine',
                 '--load', args.load_dir,
@@ -255,6 +256,7 @@ def _load_checkpoint(queue, args):
     md.output_layer = margs.untie_embeddings_and_output_weights
     md.position_embedding_type = margs.position_embedding_type
     md.linear_bias = margs.add_bias_linear
+    md.qkv_bias = margs.add_qkv_bias
     md.norm_has_bias = False
     md.swiglu = margs.swiglu
     md.previous_tensor_parallel_size = margs.tensor_model_parallel_size
