@@ -162,6 +162,7 @@ def test_forward_backward_func_with_pipeline_parallel(mocker):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_forward_backward_func_with_interleaving(mocker):
     from megatron.core.enums import ModelType
     from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -271,6 +272,7 @@ def test_forward_backward_func_with_interleaving(mocker):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_forward_backward_func_with_uneven_interleaving(mocker):
     from megatron.core.enums import ModelType
     from megatron.core.pipeline_parallel import get_forward_backward_func
