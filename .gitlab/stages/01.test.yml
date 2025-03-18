@@ -135,6 +135,7 @@ test:unit_tests_configure:
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job test:unit_tests_configure"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
+        "--no-enable-warmup"
       )
     - |
       export PYTHONPATH=$(pwd)
