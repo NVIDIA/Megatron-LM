@@ -311,8 +311,22 @@ def main(
         if test_type != "release":
             print(f"Logs:\n{concat_logs}")
 
-        success = pipeline.get_status() == PipelineStatus.SUCCESS
-        logger.info("Pipeline terminated with status %s", pipeline.get_status().name)
+        n_status_attempts = 0
+        status = None
+        while n_status_attempts < 3:
+            try:
+                status = pipeline.get_status()
+                break
+            except jetclient.clients.gitlab.GitlabAPIError:
+                logging.info("Could not fetch status, try again")
+                time.sleep(2 * n_status_attempts * 15)
+                n_status_attempts += 1
+
+        if status is None:
+            continue
+
+        success = status == PipelineStatus.SUCCESS
+        logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
             sys.exit(int(not success))  # invert for exit 0
