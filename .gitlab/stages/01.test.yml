@@ -11,6 +11,7 @@ include:
 
 .build_image:
   extends: [.test_rules, .dind_rules]
+  stage: build
   tags:
     - arch/amd64
     - origin/jet-fleet
@@ -103,8 +104,7 @@ test:build_nemo_image:
 
 test:unit_tests_configure:
   extends: [.test_rules]
-  needs:
-    - test:build_image
+  needs: [test:build_image]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - arch/amd64
@@ -181,9 +181,9 @@ test:unit_tests_configure:
 
 .unit_tests_run:
   needs:
-    - test:formatting
-    - test:copyright
-    - job: test:secret_detection
+    - test:linting_formatting
+    - test:linting_copyright
+    - job: test:linting_secret_detection
       optional: true
     - test:unit_tests_configure
   extends: [.test_rules]
@@ -231,7 +231,7 @@ test:unit_tests_pyt(LTS)_mcore(latest):
     ENVIRONMENT: lts
     TAG: latest
 
-test:notify_unit_tests:
+test:unit_tests_notify:
   extends: [.test_rules]
   image: badouralix/curl-jq
   needs:
@@ -263,7 +263,7 @@ test:notify_unit_tests:
       when: always
     - when: never
 
-test:docs_build:
+test:linting_docs_build:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags:
@@ -281,7 +281,7 @@ test:docs_build:
     - cd documentation/
     - ./repo docs
 
-test:formatting:
+test:linting_formatting:
   extends: [.test_rules]
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags:
@@ -317,7 +317,7 @@ test:formatting:
     - env
     - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
 
-test:copyright:
+test:linting_copyright:
   extends: [.test_rules]
   tags:
     - arch/amd64
@@ -338,7 +338,7 @@ secret_detection:
     - when: never
 
 # Inherit and modify template
-test:secret_detection:
+test:linting_secret_detection:
   tags:
     - arch/amd64
     - env/prod
@@ -347,6 +347,7 @@ test:secret_detection:
     - purpose/utility
     - team/megatron
   extends: [".secret-analyzer"]
+  needs: [test:build_image]
   variables:
     GIT_DEPTH: 0
     SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
@@ -364,341 +365,7 @@ test:secret_detection:
         exit 1
       fi
 
-test:pypi_build_wheel:
-  extends: [.test_rules]
-  image:
-    name: ${IMAGE}
-    entrypoint: [""]
-  services:
-    - name: docker:24.0.5-dind
-      variables:
-        HEALTHCHECK_TCP_PORT: "2376"
-  parallel:
-    matrix:
-      - PLATFORM: arm64
-        IMAGE: quay.io/pypa/manylinux_2_28_aarch64
-      - PLATFORM: amd64
-        IMAGE: quay.io/pypa/manylinux_2_28_x86_64
-  tags:
-    - arch/${PLATFORM}
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/builder-small
-    - team/megatron
-  variables:
-    PY_ENV: pytorch_24.10
-    KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
-    KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
-    PUBLISH_DRYRUN: "yes"
-    KUBERNETES_SERVICE_CPU_REQUEST: 4
-    KUBERNETES_SERVICE_CPU_LIMIT: 8
-  before_script:
-    - env
-    - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
-    - env
-    - git fetch origin $PUBLISH_COMMIT
-    - git checkout $PUBLISH_COMMIT
-  script:
-    - echo $PUBLISH_DRYRUN
-    - |
-      if [ "$PUBLISH_DRYRUN" = "yes" ]; then
-        PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
-        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
-      fi
-
-    - /opt/python/cp310-cp310/bin/python -m build
-    - /opt/python/cp311-cp311/bin/python -m build
-    - auditwheel repair dist/*.whl
-    - rm -rf dist/*.whl
-
-    - pushd megatron/core
-    - EXPECTED_RELEASE_NUMBER=$(/opt/python/cp311-cp311/bin/python -c "import package_info; print(package_info.__version__)")
-    - popd
-    - echo "EXPECTED_RELEASE_NUMBER_$PLATFORM=$EXPECTED_RELEASE_NUMBER" | tee -a build.env
-  artifacts:
-    paths:
-      - megatron/core/package_info.py
-      - wheelhouse/
-      - dist/
-    reports:
-      dotenv: build.env
-  retry:
-    max: 2
-
-test:pypi_test_wheel:
-  extends: [.test_rules]
-  image:
-    name: python:3.11
-    entrypoint: [""]
-  needs: [test:pypi_build_wheel]
-  parallel:
-    matrix:
-      - PLATFORM: arm64
-      - PLATFORM: amd64
-  services:
-    - name: docker:24.0.5-dind
-      variables:
-        HEALTHCHECK_TCP_PORT: "2376"
-  tags:
-    - arch/${PLATFORM}
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/builder-small
-    - team/megatron
-  variables:
-    KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
-    KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
-    KUBERNETES_SERVICE_CPU_REQUEST: 4
-    KUBERNETES_SERVICE_CPU_LIMIT: 8
-    GIT_STRATEGY: none
-    PUBLISH_DRYRUN: "yes"
-  script:
-    - rm -rf megatron
-    - pip install -U --no-cache-dir pip
-    - |
-      if [[ "$PLATFORM" == "arm64" ]]; then
-        pip install --no-cache-dir wheelhouse/*cp311*aarch64.whl
-      else
-        pip install --no-cache-dir wheelhouse/*cp311*x86_64.whl
-      fi
-
-    - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
-
-    - |
-      if [[ "$PLATFORM" == "arm64" ]]; then
-        test "$EXPECTED_RELEASE_NUMBER_arm64" == "$RELEASE_NUMBER"
-      else
-        test "$EXPECTED_RELEASE_NUMBER_amd64" == "$RELEASE_NUMBER"
-      fi
-
-    - echo "RELEASE_NUMBER=$RELEASE_NUMBER" | tee -a build.env
-  artifacts:
-    reports:
-      dotenv: build.env
-    paths:
-      - wheelhouse/
-      - dist/
-  retry:
-    max: 2
-
-test:pypi_push_wheel:
-  extends: [.test_rules]
-  image: python:3.11
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  needs: [test:pypi_test_wheel]
-  variables:
-    GIT_STRATEGY: none
-    PUBLISH_DRYRUN: "yes"
-  timeout: 3m
-  script:
-    - echo $PUBLISH_DRYRUN
-    - |
-      if [ "$PUBLISH_DRYRUN" = "yes" ]; then
-        REPOSITORY=testpypi
-        export TWINE_USERNAME=$TWINE_TEST_USERNAME
-        export TWINE_PASSWORT=$TWINE_TEST_PASSWORD
-      else
-        REPOSITORY=pypi
-        export TWINE_USERNAME=$TWINE_PROD_USERNAME
-        export TWINE_PASSWORT=$TWINE_PROD_PASSWORD
-      fi
-
-    - ls -al dist/
-    - ls -al wheelhouse/
-    - pip install twine
-    - twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository $REPOSITORY wheelhouse/* dist/*
-
-  rules:
-    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - when: on_success
-      allow_failure: true
-
-test:gh_release:
-  extends: [.test_rules]
-  needs: [test:pypi_test_wheel]
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  image: nentangso/alpine-git-curl-jq
-  before_script:
-    - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
-    - git fetch origin $PUBLISH_COMMIT
-    - git checkout $PUBLISH_COMMIT
-  variables:
-    PUBLISH_DRYRUN: "yes"
-  script:
-    - echo $PUBLISH_DRYRUN
-    - NAME="NVIDIA Megatron Core $RELEASE_NUMBER"
-    - IS_PRERELEASE=$([[ "$RELEASE_NUMBER" == *rc* ]] && echo "true" || echo "false")
-    - |
-      if [[ "$IS_PRERELEASE" == "true" ]]; then
-        DATE=$(date +"%Y-%m-%d")
-        CHANGELOG="Prerelease: $NAME ($DATE)"
-      else
-        CHANGELOG=$(awk '/^## '"$NAME"'/{flag=1; next} /^## /{flag=0} flag' CHANGELOG.md)
-        CHANGELOG=$(echo "$CHANGELOG" | sed '/./!d')
-      fi
-
-    - |
-      PAYLOAD=$(jq -nc \
-                  --arg TAG_NAME "v${RELEASE_NUMBER}" \
-                  --arg CI_COMMIT_SHA "$PUBLISH_COMMIT" \
-                  --arg NAME "$NAME" \
-                  --arg BODY "$CHANGELOG" \
-                  --argjson PRERELEASE "$IS_PRERELEASE" \
-                  '{
-                      "tag_name": $TAG_NAME,
-                      "target_commitish": $CI_COMMIT_SHA,
-                      "name": $NAME,
-                      "body": $BODY,
-                      "draft": false,
-                      "prerelease": $PRERELEASE,
-                      "generate_release_notes": false
-                  }'
-              )
-      echo -E "$PAYLOAD" | tee -a payload.txt
-
-    - cat payload.txt
-    - |
-      CMD=$(echo -E 'curl -L \
-        -X POST \
-        -H "Accept: application/vnd.github+json" \
-        -H "Authorization: Bearer '"$GH_TOKEN"'" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        https://api.github.com/repos/NVIDIA/Megatron-LM/releases \
-        -d @payload.txt
-      ')
-
-    - |
-      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
-        echo -E "$CMD"
-      else
-        eval "$CMD"
-      fi
-
-test:notify_release:
-  needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
-  extends: [.test_rules]
-  image: badouralix/curl-jq
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  variables:
-    PUBLISH_DRYRUN: "yes"
-  script:
-    - echo $PUBLISH_DRYRUN
-    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
-    - |
-      MESSAGE='{
-          "blocks": [
-            {
-              "type": "section",
-              "text": {
-                "type": "mrkdwn",
-                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
-              }
-            }
-          ]
-        }'
-
-    - echo "$MESSAGE"
-    - |
-      CMD=$(echo curl \
-        -X POST \
-        -H "Content-type: application/json" \
-        --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
-      )
-
-      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
-        echo "$CMD"
-      else
-        eval "$CMD"
-      fi
-
-test:version_bump:
-  needs: [test:pypi_test_wheel, test:pypi_push_wheel, test:gh_release]
-  extends: [.test_rules]
-  image: nentangso/alpine-git-curl-jq
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  before_script:
-    - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
-    - eval PUBLISH_VERSION_BUMP_BRANCH=$PUBLISH_VERSION_BUMP_BRANCH
-    - git fetch origin $PUBLISH_COMMIT
-    - git checkout $PUBLISH_COMMIT
-  variables:
-    PUBLISH_DRYRUN: "yes"
-  script:
-    - env
-    - echo $PUBLISH_DRYRUN
-    - MAJOR=$(cat megatron/core/package_info.py | awk '/^MAJOR = /' | awk -F"= " '{print $2}')
-    - MINOR=$(cat megatron/core/package_info.py | awk '/^MINOR = /' | awk -F"= " '{print $2}')
-    - PATCH=$(cat megatron/core/package_info.py | awk '/^PATCH = /' | awk -F"= " '{print $2}')
-    - PRERELEASE=$(cat megatron/core/package_info.py | awk '/^PRE_RELEASE = /' | awk -F"= " '{print $2}' | tr -d '"' | tr -d "'")
-
-    - |
-      if [[ "$PRERELEASE" != "" ]]; then
-        NEXT_PATCH=$PATCH
-        NEXT_PRERELEASE=rc$((${PRERELEASE#rc} + 1))
-      else
-        NEXT_PATCH=$((${PATCH} + 1))
-        NEXT_PRERELEASE=$NEXT_PRERELEASE
-      fi
-
-    - sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" megatron/core/package_info.py
-    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = $NEXT_PRERELEASE" megatron/core/package_info.py
-
-    - git config --global user.email "mcore-bot@nvidia.com"
-    - git config --global user.name "Mcore Bot"
-    - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
-    - |
-      CMD=$(
-        cat <<EOF
-          git switch --force-create bot/chore/bump-version && \
-          git add megatron/core/package_info.py && \
-          git commit -m "chore: adjust version version" && \
-          git push -f -u origin bot/chore/bump-version && \
-          curl \
-            --header "PRIVATE-TOKEN: $PAT" \
-            --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests" \
-            -d "source_branch=bot/chore/bump-version" \
-            -d "target_branch=$PUBLISH_VERSION_BUMP_BRANCH" \
-            -d "title=chore: Fix version of \`$PUBLISH_VERSION_BUMP_BRANCH\`" \
-            -d "description=[🤖]: Hi @okoenig 👋,<br><br>we've adjusted the version number of \`$PUBLISH_VERSION_BUMP_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
-      EOF
-      )
-
-    - |
-      if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
-        echo "$CMD"
-      else
-        eval "$CMD"
-      fi
-
-test:generate_coverage_report:
+test:unit_tests_x_coverage_report:
   extends: [.test_rules]
   needs:
     - test:unit_tests_pyt(DEV)_mcore(latest)
