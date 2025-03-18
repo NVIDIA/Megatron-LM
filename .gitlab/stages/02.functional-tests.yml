@@ -163,8 +163,15 @@ functional:notify:
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
     - export CONTEXT=$FUNCTIONAL_TEST_SCOPE
-    - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "functional:run_"
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TEAM_SLUG=$SLACK_ADMIN
+    - |
+      python tests/test_utils/python_scripts/notify.py \
+        --pipeline-id "${CI_PIPELINE_ID}" \
+        --check-for functional-tests \
+        --pipeline-context $CONTEXT \
+        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
+
   artifacts:
     when: always
     paths:

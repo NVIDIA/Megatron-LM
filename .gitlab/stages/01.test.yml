@@ -251,9 +251,14 @@ test:unit_tests_notify:
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
-    - export CONTEXT="unit-tests-extended"
-    - export DATE=$(date +"%Y-%m-%d")
-    - bash tests/test_utils/shell_scripts/notify.sh ${CI_PIPELINE_ID} "test:unit_tests_pyt"
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TEAM_SLUG=$SLACK_ADMIN
+    - |
+      python tests/test_utils/python_scripts/notify.py \
+        --pipeline-id "${CI_PIPELINE_ID}" \
+        --check-for unit-tests \
+        --pipeline-context "unit-tests-extended" \
+        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
   artifacts:
     when: always
     paths:
