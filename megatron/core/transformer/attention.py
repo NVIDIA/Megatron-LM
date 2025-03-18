@@ -587,9 +587,6 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
 
-            # todo: @vkorthikanti, okay to remove assert?
-            assert cu_seqlens_q == None and cu_seqlens_kv == None
-
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify
                 if inference_context is None or inference_context.is_static_batching():
