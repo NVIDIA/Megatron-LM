@@ -62,6 +62,7 @@ workflow:
     # on_job_failure: all
 
 stages:
+  - build
   - test
   - functional_tests
   - publish
