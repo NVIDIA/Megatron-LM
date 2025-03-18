@@ -260,6 +260,9 @@ class TransformerConfig(ModelParallelConfig):
     tp_only_amax_red: bool = False
     """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
 
+    first_last_layers_bf16: bool = False
+    """ Denotes whether first and last layers are retained in BF16 as opposed to FP8. """
+
     ####################
     # MoE related
     ####################
@@ -463,6 +466,18 @@ class TransformerConfig(ModelParallelConfig):
 
     use_custom_fsdp: bool = False
     """ Whether to use custom fsdp for training. """
+
+    is_hybrid_model: bool = False
+    """ Indicates whether this is a hybrid model. """
+
+    mamba_state_dim: int = 128
+    """The dimensionality of the state representation in Mamba layers."""
+
+    mamba_head_dim: int = 64
+    """The dimensionality of the heads in the Mamba layers."""
+
+    mamba_num_groups: int = 8
+    """The number of groups used in Mamba layers."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -771,7 +786,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std, self.num_layers
+                self.init_method_std,
+                self.num_layers,
+                multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
 
         if (
@@ -839,9 +856,6 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
 
-        if self.flash_decode and self.fp8:
-            raise ValueError("FP8 inference is currently not support with flash decoding.")
-
         if self.enable_cuda_graph:
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
@@ -869,7 +883,7 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
 
-        if self.cp_comm_type is not None:
+        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "

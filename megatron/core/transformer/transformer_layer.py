@@ -269,7 +269,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         )
 
         attention_optional_kwargs = {}
-        if config.cp_comm_type is not None:
+        if config.context_parallel_size > 1 and config.cp_comm_type is not None:
             if isinstance(config.cp_comm_type, list):
                 attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[self.layer_number]
             else:

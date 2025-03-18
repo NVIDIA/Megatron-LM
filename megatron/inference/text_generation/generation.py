@@ -227,7 +227,7 @@ def generate_tokens_probs_and_return_on_first_stage(
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
 
-            if args.enable_cuda_graph:
+            if args.enable_cuda_graph and not prefill:
                 create_cudagraphs()
 
             if mpu.is_pipeline_last_stage():
