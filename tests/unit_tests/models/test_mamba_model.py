@@ -7,7 +7,7 @@ from megatron.core.inference.contexts import BaseInferenceContext, StaticInferen
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -16,14 +16,14 @@ class TestMambaModel:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(
+        model_config = TransformerConfig(
             num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
             hidden_size=256,  # The Mamba layer places several constraints on this
             num_attention_heads=4,
             use_cpu_initialization=True,
         )
         self.model = MambaModel(
-            config=transformer_config,
+            config=model_config,
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=100,
             max_sequence_length=4,

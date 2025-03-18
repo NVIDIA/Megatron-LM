@@ -1039,6 +1039,11 @@ def load_args_from_checkpoint(
     _set_arg('moe_grouped_gemm', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
 
+    # Mamba args.
+    _set_arg('mamba_state_dim', force=True)
+    _set_arg('mamba_head_dim', force=True)
+    _set_arg('mamba_num_groups', force=True)
+
     # Tokenizer args.
     _set_arg('tokenizer_type', force=True)
     # Using checkpoint version might not always be safe (e.g., if running on different cluster).

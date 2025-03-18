@@ -931,6 +931,8 @@ def core_transformer_config_from_args(args, config_class=None):
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
+    if args.is_hybrid_model:
+        kw_args['is_hybrid_model'] = args.is_hybrid_model
 
     # Return config.
     return config_class(**kw_args)
@@ -965,6 +967,8 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+    group.add_argument('--first-last-layers-bf16', action='store_true',
+                       help='Construct the first and last layers in bf16.')
     group.add_argument('--te-rng-tracker', action='store_true', default=False,
                        help='Use the Transformer Engine version of the random number generator. '
                             'Required for CUDA graphs support.')
@@ -2433,12 +2437,20 @@ def _add_experimental_args(parser):
                        'range [0.0, 1.0].')
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
                        help='Force a specific hybrid layer pattern. The value'
-                       'should be a string of characters chosen from'
-                       'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
-                       'If a value greater than 0.0 is supplied to any of the '
-                       'hybrid ratio arguments, then the number of each type'
-                       'of layer in the override pattern must match number in'
-                       'the overidden pattern')
+                            'should be a string of characters chosen from'
+                            'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
+                            'If a value greater than 0.0 is supplied to any of the '
+                            'hybrid ratio arguments, then the number of each type'
+                            'of layer in the override pattern must match number in'
+                            'the overidden pattern')
+    group.add_argument('--mamba-state-dim', type=int, default=128,
+                       help='State dimension for Mamba layers.')
+    group.add_argument('--mamba-head-dim', type=int, default=64,
+                       help='Head dimension for Mamba layers.')
+    group.add_argument('--mamba-num-groups', type=int, default=8,
+                       help='Number of groups for Mamba layers.')
+    group.add_argument('--is-hybrid-model', default=False, action="store_true",
+                       help='Indicates whether the model is a hybrid model.')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 

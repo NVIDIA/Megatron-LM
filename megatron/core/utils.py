@@ -409,9 +409,9 @@ def init_method_normal(sigma):
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
 
 
-def scaled_init_method_normal(sigma, num_layers):
+def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     """Init method based on N(0, sigma/sqrt(2*num_layers)."""
-    std = sigma / math.sqrt(2.0 * num_layers)
+    std = sigma / math.sqrt(multiplier * num_layers)
 
     return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
