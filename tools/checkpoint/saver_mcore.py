@@ -401,10 +401,12 @@ def save_checkpoint(queue, args):
                         "mlp_norm_weight" : post_norm_weight
                     }
                     if margs.num_experts:
-                        params_dict.update({
-                            "mlp_fc1_weight" : mlp_l0_weight[ep_rank][tp_rank],
-                            "mlp_fc2_weight" : mlp_l1_weight[ep_rank][tp_rank]
-                        })
+                        num_local_experts = args.target_expert_parallel_size // margs.num_experts
+                        for expert_idx in range(num_local_experts):
+                            params_dict.update({
+                                f"mlp_fc1_weight.{expert_idx}" : mlp_l0_weight[ep_rank][tp_rank][expert_idx],
+                                f"mlp_fc2_weight.{expert_idx}" : mlp_l1_weight[ep_rank][tp_rank][expert_idx]
+                            })
                     else:
                         params_dict.update({
                             "mlp_fc1_weight" : mlp_l0_weight[tp_rank],
