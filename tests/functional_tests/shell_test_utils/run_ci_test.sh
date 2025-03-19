@@ -37,6 +37,12 @@ RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "release")
 
+if [[ "$TEST_TYPE" == "release" ]]; then
+    export ONE_LOGGER_JOB_CATEGORY=production
+else
+    export ONE_LOGGER_JOB_CATEGORY=test
+fi
+
 mkdir -p $CHECKPOINT_SAVE_PATH
 mkdir -p $CHECKPOINT_LOAD_PATH
 _CHECKPOINT_LOAD_PATH=$CHECKPOINT_LOAD_PATH

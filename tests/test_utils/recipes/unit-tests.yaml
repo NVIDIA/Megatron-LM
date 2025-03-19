@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}_{tag}'
+  name: "{test_case}_{environment}_{tag}"
   model: unit-tests
   nodes: 1
   build: mcore-pyt-{environment}
@@ -87,6 +87,7 @@ spec:
     # Reduce memory usage by NCCL
     export NCCL_MAX_NCHANNELS=1
     export NCCL_NVLS_ENABLE=0
+    export ONE_LOGGER_JOB_CATEGORY=test
 
     for i in $(seq $UNIT_TEST_REPEAT); do
       echo "Running prod test suite."
