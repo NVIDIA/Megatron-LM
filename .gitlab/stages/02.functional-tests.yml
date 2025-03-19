@@ -140,7 +140,7 @@ functional:run_nemo:
 
 functional:notify:
   extends: [.functional_tests_rules]
-  image: badouralix/curl-jq
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   needs:
     - functional:run_lts
     - functional:run_dev
