@@ -51,6 +51,21 @@ _CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
 
+IS_NEMO_TEST=$([[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]] && echo "true" || echo "false")
+export IS_NEMO_TEST
+
+# Adjust model_config for lightweight mode
+if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "true" ]]; then
+    yq -i '.MODEL_ARGS."trainer.max_steps" = 2' $TRAINING_PARAMS_PATH
+    N_REPEAT=1
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+
+    yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
+    yq -i '.MODEL_ARGS."--train-iters" = 2' $TRAINING_PARAMS_PATH
+    yq -i '.MODEL_ARGS."--save-interval" = 1' $TRAINING_PARAMS_PATH
+    N_REPEAT=1
+fi
+
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     yq '.TEST_TYPE')

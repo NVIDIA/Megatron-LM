@@ -47,6 +47,15 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     help="Wandb experiment (only relevant for release tests)",
 )
 @click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Run 2-step smoke tests instead of full training",
+)
+@click.option(
     "--enable-warmup/--no-enable-warmup",
     required=False,
     is_flag=True,
@@ -73,6 +82,7 @@ def main(
     tag: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
+    enable_lightweight_mode: bool = False,
     enable_warmup: Optional[bool] = None,
 ):
     list_of_test_cases = [
@@ -109,7 +119,7 @@ def main(
                     {"if": '$CI_MERGE_REQUEST_ID'},
                 ],
                 "timeout": "7 days",
-                "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": "functional:configure"}],
+                "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
             },
@@ -161,6 +171,9 @@ def main(
 
             if tag is not None:
                 script.append(f"--tag {tag}")
+
+            if enable_lightweight_mode is True:
+                script.append("--enable-lightweight-mode")
 
             if run_name is not None and wandb_experiment is not None:
                 script.append(f"--run-name {run_name}")

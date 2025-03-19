@@ -50,6 +50,7 @@ def launch_and_wait_for_completion(
     tag: Optional[str],
     run_name: Optional[str],
     wandb_experiment: Optional[str],
+    enable_lightweight_mode: bool,
 ) -> jetclient.JETPipeline:
     cluster_config = {"account": account}
     if partition is not None:
@@ -64,7 +65,7 @@ def launch_and_wait_for_completion(
                 workloads=common.load_workloads(
                     test_case=test_case,
                     n_repeat=n_repeat,
-                    time_limit=time_limit,
+                    time_limit=(1200 if enable_lightweight_mode else time_limit),
                     tag=tag,
                     scope=scope,
                     container_image=container_image,
@@ -81,6 +82,9 @@ def launch_and_wait_for_completion(
                                 cluster: {
                                     "variables": {
                                         "RUN_NAME": run_name or "",
+                                        "ENABLE_LIGHTWEIGHT_MODE": str(
+                                            enable_lightweight_mode
+                                        ).lower(),
                                         "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
                                         "WANDB_EXPERIMENT": wandb_experiment or "",
                                         "RECORD_CHECKPOINTS": str(
@@ -111,6 +115,9 @@ def launch_and_wait_for_completion(
             logger.info("Submission failed, attempt again (%s/3)", str(n_submission_attempts))
             continue
         break
+
+    if n_submission_attempts == 3:
+        sys.exit(1)
 
     register_pipeline_terminator(pipeline=pipeline)
 
@@ -205,6 +212,15 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
     type=str,
     help="Wandb experiment (only relevant for release tests)",
 )
+@click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Wandb experiment (only relevant for release tests)",
+)
 def main(
     model: str,
     test_case: str,
@@ -221,6 +237,7 @@ def main(
     container_image: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
+    enable_lightweight_mode: bool = False,
 ):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
@@ -272,6 +289,7 @@ def main(
             run_name=run_name,
             wandb_experiment=wandb_experiment,
             record_checkpoints=record_checkpoints,
+            enable_lightweight_mode=enable_lightweight_mode,
         )
 
         n_download_attempt = 0
