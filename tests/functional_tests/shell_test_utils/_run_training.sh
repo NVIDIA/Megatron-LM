@@ -62,7 +62,7 @@ if [[ "$BEFORE_SCRIPT" != null ]]; then
 fi
 
 # Exit earlier to leave time for properly saving checkpoint
-if [[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]]; then
+if [[ "$IS_NEMO_TEST" == "true" ]]; then
     PARAMS=""
     TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + "=" + .value] | join("")' "$TRAINING_PARAMS_PATH" | tr '\n' ' ')
 
@@ -117,3 +117,5 @@ AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
 fi
+
+exit ${EXIT_CODE:-0}
