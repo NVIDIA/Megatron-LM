@@ -125,6 +125,12 @@ def initialize_megatron(
             use_cudagraphable_rng=args.enable_cuda_graph,
         )
 
+        # Setup MoE aux loss scale value.
+        if args.num_experts is not None:
+            from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+
+            MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
+
     if skip_mpu_initialization:
         return None
 
@@ -307,6 +313,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
             device_id = torch.device(f'cuda:{args.local_rank}')
         else:
             device_id = None
+
+        # Set to non-default stream for cudagraph capturing.
+        if args.external_cuda_graph:
+            torch.cuda.set_stream(torch.cuda.Stream())
 
         # Call the init process
         init_process_group_kwargs = {

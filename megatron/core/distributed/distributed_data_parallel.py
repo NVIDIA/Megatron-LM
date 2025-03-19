@@ -489,8 +489,12 @@ class DistributedDataParallel(_BaseDataParallel):
         Zeros out all grad buffers. Needs to be called at the beginning of each
         training iteration.
         """
-        for param in self.params_with_grad:
-            param.grad_added_to_main_grad = False
+        if not self.config.external_cuda_graph:
+            # Don't reset grad_added_to_main_grad when CUDA Graph is used.
+            # Because in CUDA Graph it no longer has the opportunity to set it back
+            # to True, and there will be a double-GA.
+            for param in self.params_with_grad:
+                param.grad_added_to_main_grad = False
         for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.reset()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:

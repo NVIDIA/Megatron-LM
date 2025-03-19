@@ -175,7 +175,7 @@ def get_capacity(num_tokens: int, num_experts: int, capacity_factor: float, min_
 class MoEAuxLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for auxiliary loss."""
 
-    main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
+    main_loss_backward_scale: torch.Tensor = None
 
     @staticmethod
     def forward(ctx, output: torch.Tensor, aux_loss: torch.Tensor):
@@ -203,6 +203,10 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
                                                gradient.
         """
         (aux_loss,) = ctx.saved_tensors
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                1.0, device=aux_loss.device
+            )
         aux_loss_backward_scale = MoEAuxLossAutoScaler.main_loss_backward_scale
         scaled_aux_loss_grad = torch.ones_like(aux_loss) * aux_loss_backward_scale
         return grad_output, scaled_aux_loss_grad
@@ -215,7 +219,10 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+            MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        else:
+            MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
 
 
 def permute(
@@ -659,3 +666,21 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
         return updated_expert_bias
+
+
+def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
+    """Move a tensor to CPU if it is on GPU.
+    Args:
+        tensor (torch.Tensor or None): The tensor to move to CPU.
+        as_numpy (bool): Whether to convert the tensor to a numpy array.
+        record_stream (bool): Whether to record the stream of the tensor, to prevent memory leak
+                              when the DtoH data transfer is on a side stream.
+    """
+    if torch.is_tensor(tensor) and tensor.is_cuda:
+        cpu_tensor = tensor.to(torch.device("cpu"), non_blocking=True)
+        if as_numpy:
+            cpu_tensor = cpu_tensor.numpy()
+        if record_stream:
+            tensor.record_stream(torch.cuda.current_stream())
+        tensor = cpu_tensor
+    return tensor

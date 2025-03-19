@@ -27,6 +27,7 @@ from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
     get_model_config,
     StragglerDetector,
+    is_te_min_version,
 )
 from megatron.core.fp8_utils import is_float8tensor
 from megatron.training.checkpointing import load_checkpoint
@@ -66,8 +67,15 @@ from megatron.core.transformer.moe.moe_utils import track_moe_metrics
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
+    get_amax_reduction_group,
+    model_parallel_is_initialized,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.schedules import (
+    convert_schedule_table_to_order,
+    get_pp_rank_microbatches,
+    get_schedule_table,
+)
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -355,6 +363,185 @@ def preprocess_common_state_dict(common_state_dict):
     preprocessed_common_state_dict['args'].pop('local_rank', None)
     preprocessed_common_state_dict['args'].pop('rank', None)
     return preprocessed_common_state_dict
+
+
+def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_chunks):
+    """
+    Create the CUDA Graph capturing input data. The data is organized per-chunk per-microbatch per-layer.
+    """
+
+    def get_rotary_pos_emb(transformer, transformer_input):
+        if args.position_embedding_type == 'rope' and not config.multi_latent_attention:
+            rotary_seq_len = model_chunk.module.module.rotary_pos_emb.get_rotary_seq_len(
+                None, transformer, transformer_input, config, None
+            )
+            return model_chunk.module.module.rotary_pos_emb(rotary_seq_len)
+        else:
+            return None
+
+    # Generate sample arguments and keyword arguments for capturing.
+    sample_args = []
+    sample_kwargs = []
+    for chunk_number in range(num_model_chunks):
+        model_chunk = model[chunk_number]
+        num_layers = len(model_chunk.module.module.decoder.layers)
+        for _ in range(num_microbatches):
+            for layer_number in range(num_layers):
+                static_inputs = model_chunk.module.module.decoder.layers[
+                    layer_number
+                ].get_layer_static_inputs(args.seq_length, args.micro_batch_size)
+                if is_te_min_version("1.10.0", check_equality=False):
+                    # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
+                    hidden_states = static_inputs.pop("hidden_states")
+                    sample_args.append((hidden_states,))
+                    rotary_pos_emb = get_rotary_pos_emb(
+                        model_chunk.module.module.decoder, hidden_states
+                    )
+                    if rotary_pos_emb is not None:
+                        static_inputs["rotary_pos_emb"] = rotary_pos_emb
+                    sample_kwargs.append(static_inputs)
+                else:
+                    sample_args.append(
+                        (static_inputs.pop("hidden_states"), static_inputs.pop("attention_mask"))
+                    )
+
+    # Get the PP and VPP scheduling order.
+    _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
+        num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage, False
+    )
+    schedule_table = get_schedule_table(
+        num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage
+    )
+    order = convert_schedule_table_to_order(
+        num_warmup_microbatches, num_model_chunks, schedule_table
+    )
+    print_rank_0(f'ORDER {order}')
+
+    def get_make_graphed_callables_kwargs():
+        kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
+        if sample_kwargs:
+            kwargs['sample_kwargs'] = sample_kwargs
+
+        import transformer_engine
+
+        def get_fp8_recipe(config):
+            """
+            Set up the FP8 recipe for the model.
+            """
+            if config.fp8:
+                if config.fp8 == "e4m3":
+                    fp8_format = transformer_engine.common.recipe.Format.E4M3
+                elif config.fp8 == "hybrid":
+                    fp8_format = transformer_engine.common.recipe.Format.HYBRID
+                else:
+                    raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+
+                from megatron.core.transformer.custom_layers.transformer_engine import (
+                    TEDelayedScaling,
+                )
+
+                fp8_recipe = TEDelayedScaling(
+                    config=config,
+                    fp8_format=fp8_format,
+                    override_linear_precision=(False, False, not config.fp8_wgrad),
+                )
+                return fp8_recipe
+            else:
+                return None
+
+        if config.fp8:
+            kwargs['fp8_enabled'] = True
+            kwargs['fp8_recipe'] = get_fp8_recipe(config)
+            kwargs['fp8_weight_caching'] = True
+            if (
+                is_te_min_version("1.14.0", check_equality=False)
+                and model_parallel_is_initialized()
+            ):
+                kwargs['fp8_group'] = get_amax_reduction_group(with_context_parallel=True)
+        else:
+            kwargs['fp8_enabled'] = False
+        return kwargs
+
+    kwargs = get_make_graphed_callables_kwargs()
+    return sample_args, kwargs
+
+
+def cuda_graph_capture(model, config, args):
+    """
+    Capture CUDA Graphs per TransformerLayer per microbatch.
+    """
+    assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
+    assert config.cuda_graph_scope in [
+        'full',
+        'attn',
+    ], f"--cuda-graph-scope should be full or attn, got {config.cuda_graph_scope}."
+
+    # Set back to the default stream. Graph will still be captured on a side stream in
+    # make_graphed_callables().
+    torch.cuda.set_stream(torch.cuda.default_stream())
+    torch.distributed.barrier()
+    start = time.time()
+    print_rank_0(f'Start cuda_graph_capture on rank{torch.distributed.get_rank()}')
+
+    # Get the number of models chunks and microbatches.
+    num_model_chunks = len(model)
+    num_microbatches = get_num_microbatches()
+    print_rank_0(f'num_model_chunks {num_model_chunks}, num_microbatches {num_microbatches}')
+
+    # Get callables.
+    callables = []
+    for chunk_number in range(num_model_chunks):
+        model_chunk = model[chunk_number]
+        num_layers = len(model_chunk.module.module.decoder.layers)
+        print_rank_0(f'num_layers {num_layers} in model chunk {chunk_number}')
+        for layer_number in range(num_layers):
+            layer = model_chunk.module.module.decoder.layers[layer_number]
+            callables.append(layer)
+    print_rank_0(f'Total #layers {len(callables)}')
+
+    # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
+    sample_args, kwargs = get_cuda_graph_input_data(
+        model, config, args, num_microbatches, num_model_chunks
+    )
+
+    import transformer_engine  # To keep out TE dependency when not using CUDA Graph
+
+    graphs = transformer_engine.pytorch.make_graphed_callables(
+        tuple(callables), sample_args, **kwargs
+    )
+
+    # Push the captured graphs to the corresponding TransformerBlock.
+    for chunk_number in range(num_model_chunks):
+        model_chunk = model[chunk_number]
+        num_layers = len(model_chunk.module.module.decoder.layers)
+        for layer_number in range(num_layers):
+            model_chunk.module.module.decoder.layers[layer_number].cuda_graphs = []
+            for batch_number in range(num_microbatches):
+                model_chunk.module.module.decoder.layers[layer_number].cuda_graphs.append(
+                    graphs[
+                        chunk_number * num_microbatches * num_layers
+                        + batch_number * num_layers
+                        + layer_number
+                    ]
+                )
+
+    # Finish CUDA Graph capturing.
+    torch.distributed.barrier()
+    print_rank_0(
+        f'Time spent in cuda_graph_capture on rank{torch.distributed.get_rank()}: {time.time() - start}s'
+    )
+
+
+def cuda_graph_set_manual_hooks(model):
+    """
+    Set CUDA Graph manual hooks for the modules that contain direct parameters and are covered by cudagraphs.
+    """
+    for chunk_number, model_chunk in enumerate(model):
+        num_layers = len(model_chunk.module.module.decoder.layers)
+        print_rank_0(f'num_layers {num_layers} in model chunk {chunk_number}')
+        for layer_number in range(num_layers):
+            layer = model_chunk.module.module.decoder.layers[layer_number]
+            layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
 
 
 def pretrain(
@@ -959,6 +1146,19 @@ def train_step(forward_step_func, data_iterator,
     args = get_args()
     timers = get_timers()
 
+    # CUDA Graph capturing only executes once, when it's the first training iteration.
+    if args.curr_iteration == args.iteration and args.external_cuda_graph:
+        cuda_graph_capture(model, config, args)
+
+        # Set grad to zero.
+        for model_chunk in model:
+            model_chunk.zero_grad_buffer()
+        optimizer.zero_grad()
+
+        # Collect garbage and empty unused memory.
+        gc.collect()
+        torch.cuda.empty_cache()
+
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
@@ -1023,6 +1223,11 @@ def train_step(forward_step_func, data_iterator,
     # Empty unused memory.
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
+
+    # Set the manual hooks when CUDA Graphs are enabled.
+    if args.curr_iteration == args.iteration and args.external_cuda_graph:
+        if args.use_distributed_optimizer and args.overlap_param_gather:
+            cuda_graph_set_manual_hooks(model)
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
