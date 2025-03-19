@@ -161,6 +161,18 @@ Note: The MoE model structure is defined through script arguments. All MoE-relat
 - DeepEP is particularly recommended for training large-scale, fine-grained MoE architectures such as DeepSeek-V3 and other advanced MoE models.
 - To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
 
+### CUDA Graph Support
+CUDA Graph functionality can be enabled through two options:
+
+1. `--enable-cuda-graph`: Automatically captures graphs during runtime (just-in-time)
+2. `--external-cuda-graph`: Requires manual graph capture before runtime (ahead-of-time)
+
+Note: These two options cannot be enabled simultaneously.
+
+For manual capture with `--external-cuda-graph`, refer to the `cuda_graph_capture()` and `cuda_graph_set_manual_hooks()` functions in `megatron/training/training.py`.
+
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for attention layers by setting `--cuda-graph-scope=attn`, while leaving MoE layers unmodified. Note that the `--cuda-graph-scope` parameter is only applicable when using `--external-cuda-graph` mode.
+
 ### MoE Related Arguments
 | Item | Description |
 | --- | --- |

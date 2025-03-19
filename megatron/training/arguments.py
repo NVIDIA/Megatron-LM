@@ -1012,6 +1012,15 @@ def _add_inference_args(parser):
                        help='Use CUDA graph capture and replay.')
     group.add_argument("--cuda-graph-warmup-steps", type=int, default=3,
                        help="Number of CUDA graph warmup steps")
+    group.add_argument('--external-cuda-graph', action='store_true',
+                       help='Use CUDA graph capture and replay. The CUDA graphs are'
+                       'manually captured in the training script.')
+    group.add_argument('--cuda-graph-scope', type=str, default='full',
+                       choices=['full', 'attn'],
+                       help='Determines the CUDA graphs capturing scope. Valid values are '
+                       '\"full\" and \"attn\". \"Full\" scope captures a whole '
+                       'Transformer layer. \"Attn\" scope only captures operations in '
+                       'TransformerLayer._forward_attention().')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')

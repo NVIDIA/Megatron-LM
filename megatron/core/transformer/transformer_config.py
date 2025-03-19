@@ -442,6 +442,11 @@ class TransformerConfig(ModelParallelConfig):
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
+    cuda_graph_scope: str = "full"
+    """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
+    capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
+    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
+
     ####################
     # miscellaneous
     ####################
