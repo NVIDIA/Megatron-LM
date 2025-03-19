@@ -138,7 +138,7 @@ functional:run_nemo:
       allow_failure: true
     - when: never
 
-functional:notify:
+functional:x_notify:
   extends: [.functional_tests_rules]
   image: badouralix/curl-jq
   needs:
@@ -202,36 +202,5 @@ functional:download_golden_values:
   rules:
     - if: $FUNCTIONAL_TEST == "yes"
       when: manual
-      allow_failure: true
-    - when: never
-
-functional:upload_statistics:
-  stage: functional_tests
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
-  needs:
-    - job: test:unit_tests_pyt(DEV)_mcore(legacy)
-    - job: test:unit_tests_pyt(LTS)_mcore(legacy)
-    - job: test:unit_tests_pyt(DEV)_mcore(latest)
-    - job: test:unit_tests_pyt(LTS)_mcore(latest)
-    - job: functional:run_lts
-      optional: true
-    - job: functional:run_dev
-      optional: true
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  script:
-    - env
-    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
-    - export GITLAB_ENDPOINT
-    - export DASHBOARD_ENDPOINT
-    - python tests/test_utils/python_scripts/dashboard.py --pipeline-id ${CI_PIPELINE_ID}
-  rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && ($UNIT_TEST == "yes" || $FUNCTIONAL_TEST == "yes")
-      when: always
       allow_failure: true
     - when: never
