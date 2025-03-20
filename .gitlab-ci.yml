@@ -1,16 +1,39 @@
+.merge_train_rule: &merge_train_rule
+  UNIT_TEST: "yes"
+  UNIT_TEST_REPEAT: 1
+  UNIT_TEST_TIMEOUT: 15
+  INTEGRATION_TEST: "yes"
+  INTEGRATION_TEST_SCOPE: mr
+  FUNCTIONAL_TEST: "yes"
+  FUNCTIONAL_TEST_SCOPE: mr-slim
+  FUNCTIONAL_TEST_REPEAT: 5
+  FUNCTIONAL_TEST_TIME_LIMIT: 2700
+  CLUSTER_A100: ""
+  CLUSTER_H100: ""
+  PUBLISH: "no"
+
 workflow:
   rules:
+    # Do not trigger for forks
     - if: $CI_PROJECT_NAMESPACE != "ADLR"
       when: never
+
+    # ci-branches only for schedule
     - if: $CI_COMMIT_BRANCH =~ /ci-/ && $CI_PIPELINE_SOURCE != "schedule"
       when: never
+
+    # For schedules pipelines
     - if: $CI_PIPELINE_SOURCE == "schedule"
       auto_cancel:
         on_new_commit: none
+
+    # For manual pipelines
     - if: $CI_PIPELINE_SOURCE == "web"
-    - if: $CI_COMMIT_BRANCH == "main"
+
+    # For push to main
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'push' && $CI_COMMIT_BRANCH == "main"
       variables:
-        UNIT_TESTS: "no"
+        UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
@@ -19,43 +42,34 @@ workflow:
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
-        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
-        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
       auto_cancel:
         on_new_commit: none
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
+
+    # For merge-trains that need to be fast-tracked
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       variables:
-        UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
-        INTEGRATION_TEST: "yes"
-        INTEGRATION_TEST_SCOPE: mr
-        FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_SCOPE: mr-slim
-        FUNCTIONAL_TEST_REPEAT: 5
-        FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
-        CLUSTER_H100: ""
-        PUBLISH: "no"
-        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
-        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
-      variables:
+        UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
         UNIT_TEST_TIMEOUT: 15
         INTEGRATION_TEST: "no"
-        FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_SCOPE: mr
-        FUNCTIONAL_TEST_REPEAT: 5
-        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        FUNCTIONAL_TEST: "no"
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
-        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
-        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run nightly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
+
+    # For normal merge-trains
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
+      variables: *merge_train_rule
+
+    # For MRs with integration suite
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
+      variables: *merge_train_rule
+
+    # For MRs with nightly
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
-        UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST: "no"
+        INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
         FUNCTIONAL_TEST_REPEAT: 5
@@ -63,12 +77,12 @@ workflow:
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
-        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
-        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run weekly/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
+
+    # For MRs with weekly
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
       variables:
-        UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TEST: "no"
+        INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
         FUNCTIONAL_TEST_REPEAT: 1
@@ -76,19 +90,36 @@ workflow:
         CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
-        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
-        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
+
+    # For MRs with heavy suite
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
       variables:
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 15
+        INTEGRATION_TEST: "no"
+        FUNCTIONAL_TEST: "yes"
+        FUNCTIONAL_TEST_SCOPE: mr
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
+        PUBLISH: "no"
+
+    # Default MRs
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      variables:
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 15
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         PUBLISH: "no"
-        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
-        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+
     - when: never
+
   auto_cancel:
     on_new_commit: interruptible
-    # on_job_failure: all
 
 stages:
   - build
@@ -122,6 +153,15 @@ variables:
       - "yes"
       - "no"
     description: To run the integration test suite
+  INTEGRATION_TEST_SCOPE:
+    value: "mr"
+    options:
+      - "mr"
+      - "nightly"
+      - "weekly"
+      - "pre-release"
+      - "release"
+    description: "Testsuite to run (only for INTEGRATION_TEST=yes)"
   INTEGRATION_TEST_TIME_LIMIT:
     value: "900"
     description: "Timeout in seconds per test"

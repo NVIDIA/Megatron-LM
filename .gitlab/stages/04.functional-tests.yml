@@ -1,11 +1,9 @@
 .functional_tests_rules:
   stage: functional_tests
   rules:
-    - if: $FUNCTIONAL_TEST == "yes" && ($CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true")
-      allow_failure: true
-    - if: $FUNCTIONAL_TEST == "yes" || ($CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS !~ /docs-only/)
+    - if: $FUNCTIONAL_TEST == "yes"
+      when: on_success
     - when: never
-
 default:
   id_tokens:
     VAULT_JWT_TOKEN:
@@ -159,8 +157,6 @@ functional:x_notify:
     RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
     CONTEXT: $FUNCTIONAL_TEST_SCOPE
   script:
-    - apk add bash
-    - apk add --update coreutils
     - env
     - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}

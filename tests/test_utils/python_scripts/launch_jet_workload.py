@@ -347,6 +347,14 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
+            if (
+                "The server socket has failed to listen on any local network address."
+                in concat_logs
+            ):
+                logger.error("TCP error, attempt restart.")
+                n_attempts += 1
+                continue
+
             sys.exit(int(not success))  # invert for exit 0
 
         if test_type != "release":
