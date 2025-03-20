@@ -1,9 +1,8 @@
 .integration_tests_rules:
   stage: integration_tests
   rules:
-    - if: $INTEGRATION_TEST == "yes" && ($CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true")
-      allow_failure: true
-    - if: $INTEGRATION_TEST == "yes" || ($CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS !~ /docs-only/)
+    - if: $INTEGRATION_TEST == "yes"
+      when: on_success
     - when: never
 
 default:

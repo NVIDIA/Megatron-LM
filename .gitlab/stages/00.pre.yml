@@ -3,13 +3,14 @@ include:
 
 .pre_rules:
   rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: always
     - if: $CI_PIPELINE_SOURCE == 'main'
       allow_failure: true
       when: always
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: always
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: always
     - when: never
   stage: .pre
 
