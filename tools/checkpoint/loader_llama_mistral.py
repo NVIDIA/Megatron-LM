@@ -552,7 +552,10 @@ def _load_checkpoint(queue, args):
 
     # Get true (non-padded) vocab size
     tokenizer = transformers.AutoTokenizer.from_pretrained(margs.tokenizer_model)
-    md.true_vocab_size = tokenizer._tokenizer.get_vocab_size(with_added_tokens=True)
+    md.true_vocab_size = (
+        args.true_vocab_size if args.true_vocab_size is not None else
+        tokenizer._tokenizer.get_vocab_size(with_added_tokens=True)
+    )
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
