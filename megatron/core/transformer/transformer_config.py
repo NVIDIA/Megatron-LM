@@ -132,9 +132,14 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
-    post_layer_norm: bool = False
-
     layernorm_init: Optional[float] = None
+
+    layer_scale: Optional[float] = None
+
+    qknorm_init: Optional[float] = None
+
+    dyt_bias: bool = False
+    dyt_alpha_init: float = 1.0
 
     ####################
     # initialization

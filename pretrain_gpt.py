@@ -97,7 +97,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                         mlp_layernorm=args.mlp_layernorm,
                         qknorm_impl=args.qknorm_impl,
                         post_layer_norm=args.post_layer_norm,
-                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm)
+                        pre_layer_norm=args.pre_layer_norm,
+                        moe_use_legacy_grouped_gemm=args.moe_use_legacy_grouped_gemm,
+                        layer_scale=args.layer_scale,
+                        qk_dyt=args.qk_dyt)
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
                         args.num_experts, args.moe_grouped_gemm,
@@ -133,7 +136,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 rotary_percent=args.rotary_percent,
                 rotary_base=args.rotary_base,
                 rope_scaling=args.use_rope_scaling,
-                final_layernorm=args.final_layernorm,
+                final_layernorm=args.final_layernorm and args.pre_layer_norm,
+                input_embeddings_multiplier=args.input_embeddings_multiplier,
             )
 
     print_rank_0("Built model:")

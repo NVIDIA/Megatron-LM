@@ -810,6 +810,9 @@ def validate_args(args, defaults={}):
             or args.post_layer_norm or args.layernorm_init is not None or args.qknorm_impl != "te":
         assert args.transformer_impl == "transformer_engine", "OP arguments are only checked with the TE transformer implementation"
         assert not args.multi_latent_attention, "OP arguments are not implemented with --multi-latent-attention"
+    if args.qk_layernorm and args.qk_dyt:
+        assert not args.sequence_parallel, "QK DyT does not support sequence parallel yet"
+    assert not args.sequence_parallel, "I gotta check if QK norm supports sequence parallel correctly..."
 
     # MoE loss and include embedding and loss layer check
     if args.num_experts is not None:
@@ -1166,13 +1169,20 @@ def _add_network_size_args(parser):
                        help='Disable pre-mlp layernorm')
     group.add_argument('--no-final-layernorm', action='store_false', dest='final_layernorm',
                        help='Disable final pre-lmhead layernorm')
+    group.add_argument("--no-pre-layer-norm", action="store_false", dest="pre_layer_norm",
+                       help="Disables pre-layernorm")
     group.add_argument("--post-layer-norm", action="store_true",
-                       help=("When set, apply layer normalization after the attention and mlp "
-                             "instead of before. It is advise to also set --no-final-layernorm"))
+                       help="Apply layer normalization after the attention and mlp. (Will not disable pre-layernorm).")
     group.add_argument("--input-embeddings-multiplier", type=float, default=1.0,
                        help="Multiply input_embeddings by this value")
     group.add_argument("--layernorm-init", default=None, type=float,
                        help="Initialization value for layernorms")
+    group.add_argument("--layer-scale", default=None, type=float,
+                       help="Initialization value for LayerScale (layerscale not used if this argument is not specified")
+    group.add_argument("--softmax-scale", default=None, type=float,
+                       help="Softmax scale for attention scaling.")
+    group.add_argument("--qknorm-init", default=None, type=float,
+                       help="Q and K layernorm gain initialization value")
     return parser
 
 
@@ -1329,6 +1339,8 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
+    group.add_argument('--weight-decay-qk-gains', action='store_true', help='When set, QK layernorm gains are regularized')
+    group.add_argument('--no-train-qk-gains', action='store_true', help='When set, QK layernorm gains are not trained')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
@@ -2256,7 +2268,13 @@ def _add_vision_args(parser):
     group.add_argument('--qk-layernorm', action='store_true',
                        help='Whether to layer normalize the q and k attention embeddings.')
     group.add_argument('--qknorm-impl', default='te', choices={'te', 'torch', 'apex'},
-                        help='QK layernorm implementation')
+                       help='QK layernorm implementation')
+    group.add_argument('--qk-dyt', action='store_true',
+                       help='When set, QK regularization will use DynamicTanh (must be used in conjunction with --qk-layernorm)')
+    group.add_argument('--dyt-alpha-init', default=1.0, type=float,
+                       help='QK DynamicTanh alpha initialization value')
+    group.add_argument('---dyt-bias', action='store_true',
+                       help='QK DynamicTanh use bias?')
 
     return parser
 

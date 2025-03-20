@@ -357,11 +357,25 @@ def pretrain(
         else:
             checkpointing_context = {}
 
+        def no_wd_decay_cond(name: str, param: torch.nn.Parameter) -> bool:
+            if name.endswith(".bias"):
+                return True
+            if "k_layernorm.weight" in name or "q_layernorm.weight" in name:
+                return not args.weight_decay_qk_gains
+            return len(param.shape) == 1 
+
+        def scale_lr_cond(name: str, param: torch.nn.Parameter) -> bool:
+            return ("k_layernorm" in name or "q_layernorm" in name) and args.no_train_qk_gains
+
         # Model, optimizer, and learning rate.
         timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
         app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
         model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, model_type, checkpointing_context=checkpointing_context)
+            model_provider, model_type, checkpointing_context=checkpointing_context,
+            no_wd_decay_cond=no_wd_decay_cond,
+            scale_lr_cond=scale_lr_cond,
+            lr_mult=0.0,
+            )
 
         timers('model-and-optimizer-setup').stop()
         print_datetime('after model, optimizer, and learning rate '
@@ -1733,9 +1747,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         sys.exit(exit_code)
 
     torch.distributed.barrier()
-    if iteration >= args.train_iters and is_rank0():
-        print(f"Training finished after {iteration} iterations; Canceling pending scheduled jobs.")
-        Path(args.exit_trigger).touch()
+    #if iteration >= args.train_iters and is_rank0():
+    #    print(f"Training finished after {iteration} iterations; Canceling pending scheduled jobs.")
+    #    Path(args.exit_trigger).touch()
 
     return iteration, num_floating_point_operations_so_far
 

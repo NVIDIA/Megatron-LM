@@ -9,9 +9,11 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.dot_product_attention import DotProductAttention
+from megatron.core.transformer.layer_scale import LayerScale
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.dynamic_tanh import DynamicTanh
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
@@ -69,6 +71,8 @@ def get_gpt_layer_with_transformer_engine_spec(
     post_layer_norm: bool = False,
     pre_layer_norm: bool = False,
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    layer_scale: Optional[float] = None,
+    qk_dyt: bool = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -139,7 +143,9 @@ def get_gpt_layer_with_transformer_engine_spec(
         # TENorm significantly harms convergence when used
         # for QKLayerNorm if TE Version < 1.9;
         # we instead use the Apex implementation.
-        if qknorm_impl == "te":
+        if qk_dyt:
+            qk_norm = DynamicTanh
+        elif qknorm_impl == "te":
             qk_norm = TENorm if is_te_min_version("1.9.0") else FusedApexNorm
         elif qknorm_impl == "apex":
             qk_norm = FusedApexNorm
@@ -167,7 +173,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                 self_attn_bda=get_bias_dropout_add,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                attention_layerscale=IdentityOp if layer_scale is None else LayerScale,
                 post_attention_layernorm=TENorm if attn_layernorm and post_layer_norm else IdentityOp,
+                mlp_layerscale=IdentityOp if layer_scale is None else LayerScale,
                 post_mlp_layernorm=TENorm if mlp_layernorm and post_layer_norm else IdentityOp,
             ),
         )

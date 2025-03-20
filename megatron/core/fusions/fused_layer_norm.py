@@ -3,6 +3,7 @@
 import importlib
 import inspect
 import numbers
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -202,12 +203,14 @@ class FusedRMSNorm(torch.nn.Module):
         eps: float = 1e-5,
         zero_centered_gamma: bool = False,
         normalization: str = "RMSNorm",  # included to match TE interface
+        init_value: Optional[float] = None,
     ):
         super().__init__()
 
         self.config = config
 
         self.zero_centered_gamma = self.config.layernorm_zero_centered_gamma
+        self.init_value = init_value
 
         # If someone is trying to instantiate directly FusedRMSNorm but has
         # specified another normalization in the config, raise an error
@@ -233,7 +236,9 @@ class FusedRMSNorm(torch.nn.Module):
 
     def reset_parameters(self):
 
-        if self.zero_centered_gamma:
+        if self.init_value is not None:
+            init.constant_(self.weight, self.init_value)
+        elif self.zero_centered_gamma:
             init.zeros_(self.weight)
         else:
             init.ones_(self.weight)
@@ -269,6 +274,7 @@ class FusedApexNorm:
         config: TransformerConfig,
         hidden_size: int,
         eps: float = 1e-5,
+        init_value: Optional[float] = None,
     ):
         if config.normalization == "LayerNorm":
             instance = FusedLayerNorm(
@@ -276,14 +282,16 @@ class FusedApexNorm:
                 hidden_size=hidden_size,
                 eps=eps,
                 persist_layer_norm=config.persist_layer_norm,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma
+                zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                init_value=init_value,
             )
         elif config.normalization == "RMSNorm":
             instance = FusedRMSNorm(
                 config=config,
                 hidden_size=hidden_size,
                 eps=eps,
-                zero_centered_gamma=config.layernorm_zero_centered_gamma
+                zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                init_value=init_value,
             )
         else:
             raise Exception('Only LayerNorm and RMSNorm are curently supported')

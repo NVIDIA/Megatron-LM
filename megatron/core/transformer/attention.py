@@ -525,6 +525,7 @@ class SelfAttention(Attention):
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
+                init_value=self.config.qknorm_init,
             )
         else:
             self.q_layernorm = None
@@ -535,6 +536,7 @@ class SelfAttention(Attention):
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
+                init_value=self.config.qknorm_init,
             )
         else:
             self.k_layernorm = None
