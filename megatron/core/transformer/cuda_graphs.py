@@ -672,7 +672,7 @@ class _CudaGraphRunner(torch.nn.Module):
         if len(args) != len(self.fwd_graph_input_args):
             return False
         for arg, graph_arg in zip(args, self.fwd_graph_input_args):
-            if not check(args, graph_arg):
+            if not check(arg, graph_arg):
                 return False
 
         if kwargs.keys() != self.fwd_graph_input_kwargs.keys():
