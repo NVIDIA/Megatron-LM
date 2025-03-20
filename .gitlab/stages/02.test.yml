@@ -27,8 +27,8 @@ test:unit_tests_configure:
   script:
     - set -x
     - |
-      A100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_A100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
-      H100_CLUSTER=$([[ "$FUNCTIONAL_TEST_CLUSTER_H100" != "" ]] && echo $FUNCTIONAL_TEST_CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+      A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
+      H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
     - |
       ARGS=(
         "--scope unit-tests"

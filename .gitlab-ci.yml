@@ -8,19 +8,47 @@ workflow:
       auto_cancel:
         on_new_commit: none
     - if: $CI_PIPELINE_SOURCE == "web"
-    - if: $CI_COMMIT_REF_PROTECTED == "true"
+    - if: $CI_COMMIT_BRANCH == "main"
       variables:
-        FUNCTIONAL_TEST: "no"
-    - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
-      variables:
-        UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 15
+        UNIT_TESTS: "no"
+        INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        FUNCTIONAL_TEST_CLUSTER_A100: ""
-        FUNCTIONAL_TEST_CLUSTER_H100: ""
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
+        PUBLISH: "no"
+        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
+        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+      auto_cancel:
+        on_new_commit: none
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
+      variables:
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 15
+        INTEGRATION_TEST: "yes"
+        INTEGRATION_TEST_SCOPE: mr
+        FUNCTIONAL_TEST: "yes"
+        FUNCTIONAL_TEST_SCOPE: mr-slim
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
+        PUBLISH: "no"
+        PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
+        PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
+    - if: $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/ && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
+      variables:
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 15
+        INTEGRATION_TEST: "no"
+        FUNCTIONAL_TEST: "yes"
+        FUNCTIONAL_TEST_SCOPE: mr
+        FUNCTIONAL_TEST_REPEAT: 5
+        FUNCTIONAL_TEST_TIME_LIMIT: 2700
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
         PUBLISH: "no"
         PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
         PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
@@ -32,8 +60,8 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: nightly
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        FUNCTIONAL_TEST_CLUSTER_A100: ""
-        FUNCTIONAL_TEST_CLUSTER_H100: ""
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
         PUBLISH: "no"
         PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
         PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
@@ -45,13 +73,14 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: weekly
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 9000
-        FUNCTIONAL_TEST_CLUSTER_A100: ""
-        FUNCTIONAL_TEST_CLUSTER_H100: ""
+        CLUSTER_A100: ""
+        CLUSTER_H100: ""
         PUBLISH: "no"
         PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
         PUBLISH_VERSION_BUMP_BRANCH: "$$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA != ""
       variables:
+        INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         PUBLISH: "no"
         PUBLISH_COMMIT: "$$CI_COMMIT_SHA"
@@ -64,6 +93,7 @@ workflow:
 stages:
   - build
   - test
+  - integration_tests
   - functional_tests
   - publish
 
@@ -86,6 +116,18 @@ variables:
   UNIT_TEST_TIMEOUT:
     value: "30"
     description: Timeout (minutes) for Unit tests (all repeats)
+  INTEGRATION_TEST:
+    value: "yes"
+    options:
+      - "yes"
+      - "no"
+    description: To run the integration test suite
+  INTEGRATION_TEST_TIME_LIMIT:
+    value: "900"
+    description: "Timeout in seconds per test"
+  INTEGRATION_TEST_CASES:
+    value: "all"
+    description: "Comma-separated list of test_cases to run. Use 'all' to run the full suite."
   FUNCTIONAL_TEST:
     value: "yes"
     options:
@@ -110,13 +152,13 @@ variables:
   FUNCTIONAL_TEST_CASES:
     value: "all"
     description: "Comma-separated list of test_cases to run. Use 'all' to run the full suite."
-  FUNCTIONAL_TEST_CLUSTER_A100:
+  CLUSTER_A100:
     value: "dgxa100_dracooci"
     options:
       - "dgxa100_dracooci"
       - "dgxa100_dracooci-ord"
     description: "Cluster for A100 workloads"
-  FUNCTIONAL_TEST_CLUSTER_H100:
+  CLUSTER_H100:
     value: "dgxh100_eos"
     options:
       - "dgxh100_coreweave"
@@ -160,5 +202,6 @@ include:
   - .gitlab/stages/00.pre.yml
   - .gitlab/stages/01.build.yml
   - .gitlab/stages/02.test.yml
-  - .gitlab/stages/03.functional-tests.yml
-  - .gitlab/stages/04.publish.yml
+  - .gitlab/stages/03.integration-tests.yml
+  - .gitlab/stages/04.functional-tests.yml
+  - .gitlab/stages/05.publish.yml
