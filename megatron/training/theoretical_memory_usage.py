@@ -165,7 +165,8 @@ def compute_activation_memory(args, num_microbatches, verbose=False):
 
 def report_theoretical_memory(args, num_microbatches=None, verbose=False):
     if args.is_hybrid_model:
-        raise ValueError("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
+        print("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
+        return
 
     weight_and_optimizer_memory = (
         compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_MEGABYTE
