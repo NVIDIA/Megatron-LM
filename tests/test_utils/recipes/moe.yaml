@@ -138,8 +138,8 @@ products:
   - test_case: [gpt3_moe_mr_mcore_te_ep8_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-slim]
   - test_case: [gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [mr, mr-slim]
