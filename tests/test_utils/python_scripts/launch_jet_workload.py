@@ -362,7 +362,9 @@ def main(
                 sys.exit(int(not success))  # invert for exit 0
 
             if (
-                "Some NCCL operations have failed or timed out." in concat_logs
+                "The server socket has failed to listen on any local network address."
+                in concat_logs
+                or "Some NCCL operations have failed or timed out." in concat_logs
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
                 or "illegal instruction" in concat_logs
