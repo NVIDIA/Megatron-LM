@@ -67,7 +67,7 @@ def get_jobs_per_bridge(pipeline_id: int, type_of_job: str):
     required=True,
     type=click.Choice(["unit-tests", "integration-tests", "functional-tests"]),
 )
-@click.option("--pipeline-context", required=True, type=click.Choice(["main", "nightly", "weekly"]))
+@click.option("--pipeline-context", required=True, type=str)
 @click.option("--pipeline-created-at", required=True, type=str)
 def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_created_at: str):
     if check_for == "unit-tests":
