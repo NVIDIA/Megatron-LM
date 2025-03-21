@@ -104,6 +104,7 @@ LOGGING_ARGS=(
 	--log-timers-to-tensorboard
 	--no-log-loss-scale-to-tensorboard
 	--log-memory-to-tensorboard
+	--log-indiv-grad-norm
 )
 
 REGULARIZATION_ARGS=(

@@ -845,7 +845,7 @@ def train_step(forward_step_func, data_iterator,
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    update_successful, grad_norm, num_zeros_in_grad, individ_grad_norm = optimizer.step()
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -895,13 +895,13 @@ def train_step(forward_step_func, data_iterator,
                     numerator += val
                     denominator += 1
             loss_reduced[key] = numerator / denominator
-        return loss_reduced, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
+        return loss_reduced, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, individ_grad_norm, num_zeros_in_grad
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, individ_grad_norm, num_zeros_in_grad
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad):
+                 grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad, indiv_grad_norms):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -1044,7 +1044,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                               args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
-        if num_zeros_in_grad is not None and num_zeros_in_grad != 0:
+        if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar('num-zeros vs samples', num_zeros_in_grad,
                               args.consumed_train_samples)
@@ -1085,6 +1085,14 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+        if args.log_indiv_grad_norm:
+            for param_shape, norm in indiv_grad_norms.items():
+                writer.add_scalar(f'grad-norm/{param_shape}', norm, iteration)
+                writer.add_scalar(f'grad-norm/{param_shape} vs samples', norm,
+                               args.consumed_train_samples)
+                if wandb_writer:
+                    wandb_writer.log({f'grad-norm/{param_shape}': norm}, iteration)
+                    
         for key, value in tracker.get_final_metrics():
             writer.add_scalar(key, value, iteration)
             if wandb_writer:
@@ -1097,7 +1105,6 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 wandb_writer.log({"tracker-agg-time": elapsed}, iteration)
 
     tracker.reset()
-
 
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
@@ -1180,7 +1187,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
-        if num_zeros_in_grad is not None and num_zeros_in_grad != 0:
+        if num_zeros_in_grad is not None:
             log_string += f' num zeros: {num_zeros_in_grad} |'
         if params_norm is not None:
             log_string += f' params norm: {params_norm:.3f} |'
@@ -1603,7 +1610,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         # Run training step.
         args.curr_iteration = iteration
         ft_integration.on_training_step_start()
-        loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = \
+        loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, individ_grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
@@ -1678,7 +1685,8 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad)
+                                          grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad,
+                                          individ_grad_norm)
         tracker.disable()  # We won't track any activation metrics during evaluation iterations.
 
         # Evaluation.
