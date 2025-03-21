@@ -46,6 +46,7 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..transformer.module import param_is_not_shared
+from ..utils import get_layer_name
 from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
@@ -117,30 +118,46 @@ class MegatronOptimizer(ABC):
             )
         self.config = config
         self.init_state_fn = init_state_fn
+        self.indiv_grad_norms = {}  # Store norms here
 
-    def get_parameters(self) -> List[torch.nn.Parameter]:
+    def get_parameters(self, return_names: bool = False) -> List[torch.nn.Parameter]:
         """
         Get list of parameters wrapped in optimizer.
         """
         params = []
+        names = []
         if hasattr(self.optimizer, 'param_groups'):
             for param_group in self.optimizer.param_groups:
+                name = param_group['name']
                 for param in param_group['params']:
                     params.append(param)
+                    if return_names:
+                        names.append(name)
+        if return_names:
+            return params, names
         return params
 
-    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """
-        Get main_grads that should be taken into account to compute the grad norm.
+    def get_main_grads_for_grad_norm(
+        self, return_names: bool = False
+    ) -> Union[List[torch.Tensor], Tuple[List[torch.Tensor], List[str]]]:
+        """Get main_grads that should be taken into account to compute the grad norm.
         Filter parameters based on:
           - grad should not be None.
           - parameter should not be shared (i.e., grads shouldn't be double counted while
             computing norms).
           - should not be a replica due to tensor model parallelism.
+
+        Args:
+            return_names: If True, also return parameter names for each gradient
+
+        Returns:
+            If return_names is False: List of gradient tensors
+            If return_names is True: Tuple of (gradients, names)
         """
-        params = self.get_parameters()
+        params, names = self.get_parameters(return_names=True)
         grads_for_norm = []
-        for param in params:
+        grad_names = []
+        for param, name in zip(params, names):
             if self.config.use_precision_aware_optimizer:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
@@ -150,7 +167,9 @@ class MegatronOptimizer(ABC):
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(param)
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
-
+                grad_names.append(name)
+        if return_names:
+            return grads_for_norm, grad_names
         return grads_for_norm
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
@@ -187,27 +206,33 @@ class MegatronOptimizer(ABC):
     def get_grad_norm(self):
         """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
-        total_norm = get_grad_norm_fp32(
+        individ_norm, total_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
         return total_norm
 
-    def clip_grad_norm(self, clip_grad: float) -> float:
+    def clip_grad_norm(self, clip_grad: float) -> float: # collect_individ_grad_norms
         """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
         if params:
-            grads_for_norm = self.get_main_grads_for_grad_norm()
+            grads_for_norm, names = self.get_main_grads_for_grad_norm(return_names=True)
         else:
-            grads_for_norm = []
-        grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm, names = [], []
+
+        individ_norms, grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group() #, collect_individ_grad_norms
         )
+        individ_norms_dict = {
+            get_layer_name(name): norm 
+            for name, norm in zip(names, individ_norms)
+        }
 
         if params:
             clip_grad_by_total_norm_fp32(
                 params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
             )
-        return grad_norm
+
+        return individ_norms_dict, grad_norm
 
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
@@ -467,7 +492,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         return True
 
     @torch.no_grad()
-    def step(self):
+    def step(self): # collect_individ_grad_norms: bool = False
         timers = self.config.timers
 
         found_inf_flag = self.prepare_grads()
@@ -480,8 +505,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = 0.0
+        individ_grad_norms = {}
         if self.config.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.config.clip_grad)
+            individ_grad_norms, grad_norm = self.clip_grad_norm(self.config.clip_grad) # collect_individ_grad_norms
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -497,7 +523,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         success = self.step_with_ready_grads()
 
         # Successful update.
-        return success, grad_norm, num_zeros_in_grad
+        return success, grad_norm, num_zeros_in_grad, individ_grad_norms
 
 
 class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
@@ -838,8 +864,9 @@ class FP32Optimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         grad_norm = None
+        individ_grad_norms = {}
         if self.config.clip_grad > 0.0:
-            grad_norm = self.clip_grad_norm(self.config.clip_grad)
+            individ_grad_norms, grad_norm = self.clip_grad_norm(self.config.clip_grad)
         if timers is not None:
             timers('optimizer-clip-main-grad').stop()
 
@@ -855,7 +882,7 @@ class FP32Optimizer(MegatronOptimizer):
         success = self.step_with_ready_grads()
 
         # No overflow for FP32 optimizer.
-        return success, grad_norm, num_zeros_in_grad
+        return success, grad_norm, num_zeros_in_grad, individ_grad_norms
 
     def reload_model_params(self):
         pass
