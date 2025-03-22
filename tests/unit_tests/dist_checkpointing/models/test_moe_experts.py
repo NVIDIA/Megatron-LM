@@ -359,6 +359,7 @@ class TestExpertLayerReconfiguration:
             # Should be bitwise equal
             if src_module == "te_grouped":
                 model_A, model_B = model_B, model_A
+            # Compare amax_history
             torch.testing.assert_close(
                 torch.cat(
                     [
@@ -368,8 +369,23 @@ class TestExpertLayerReconfiguration:
                         for i in range(8 // dest_exp)
                     ],
                     dim=1,
-                ).view(1024, -1),
+                ).view(model_A.local_experts[0].linear_fc1.fp8_meta["recipe"].amax_history_len, -1),
                 model_B.linear_fc1.fp8_meta["scaling_fwd"].amax_history,
+                rtol=0,
+                atol=0,
+            )
+            # Compare scale
+            torch.testing.assert_close(
+                torch.cat(
+                    [
+                        model_A.local_experts[i]
+                        .linear_fc1.fp8_meta["scaling_fwd"]
+                        .scale.view(-1, 1)
+                        for i in range(8 // dest_exp)
+                    ],
+                    dim=1,
+                ).view(-1),
+                model_B.linear_fc1.fp8_meta["scaling_fwd"].scale,
                 rtol=0,
                 atol=0,
             )
