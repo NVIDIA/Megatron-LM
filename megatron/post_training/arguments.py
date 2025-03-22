@@ -46,7 +46,19 @@ def add_modelopt_args(parser):
         "--export-quant-cfg",
         type=str,
         default=None,
-        choices=["int8", "int8_sq", "fp8", "fp8_real_quant", "fp8_blockwise", "fp8_blockwise_real_quant", "int4_awq", "w4a8_awq", "int4", "fp4", "None"],
+        choices=[
+            "int8",
+            "int8_sq",
+            "fp8",
+            "fp8_real_quant",
+            "fp8_blockwise",
+            "fp8_blockwise_real_quant",
+            "int4_awq",
+            "w4a8_awq",
+            "int4",
+            "fp4",
+            "None",
+        ],
         help="Specify a quantization config from the supported choices.",
     )
 
@@ -84,11 +96,7 @@ def add_modelopt_args(parser):
 
     # Finetuning
     group.add_argument(
-        "--finetune-hf-dataset",
-        type=str,
-        default=None,
-        help="HF dataset used for finetuning."
+        "--finetune-hf-dataset", type=str, default=None, help="HF dataset used for finetuning."
     )
-
 
     return parser

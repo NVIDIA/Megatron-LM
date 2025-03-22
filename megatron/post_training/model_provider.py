@@ -10,19 +10,15 @@ import modelopt.torch.distill as mtd
 import modelopt.torch.opt as mto
 import yaml
 
-from megatron.core.post_training.modelopt.gpt.model_specs import (
-    get_gpt_modelopt_spec,
-)
-from megatron.core.post_training.modelopt.mamba.model_specs import (
-    get_mamba_stack_modelopt_spec,
-)
+from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.mamba import MambaModel as MCoreMambaModel
+from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_legacy_state_dict_pre_hook,
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.core.models.gpt import GPTModel as MCoreGPTModel
-from megatron.core.models.mamba import MambaModel as MCoreMambaModel
-from megatron.core.parallel_state import get_tensor_model_parallel_rank
+from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.core.transformer.spec_utils import import_module
 from megatron.post_training.algos import distillation
 from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
@@ -153,8 +149,8 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         )
 
     if args.spec is not None:
-        raise ValueError( "ModelOpt integration does not support custom args.spec.")
-        
+        raise ValueError("ModelOpt integration does not support custom args.spec.")
+
     if args.export_model_type == "GPTModel":
         transformer_layer_spec = get_gpt_modelopt_spec(
             config=config,
@@ -179,7 +175,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         model = MCoreGPTModel(config=config, **model_kwargs)
     elif args.export_model_type == "MambaModel":
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
-            remap_te_layernorm=args.export_te_mcore_model,
+            remap_te_layernorm=args.export_te_mcore_model
         )
         model = MCoreMambaModel(
             config=config,
@@ -196,7 +192,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base
+            rotary_base=args.rotary_base,
         )
     else:
         raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))

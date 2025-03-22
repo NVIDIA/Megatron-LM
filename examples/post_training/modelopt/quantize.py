@@ -33,7 +33,7 @@ QUANT_CFG_CHOICES = {
     "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
     "fp8": mtq.FP8_DEFAULT_CFG,
     "fp8_real_quant": mtq.FP8_PER_TENSOR_REAL_QUANT_CFG,
-    "fp8_blockwise_real_quant": mtq.FP8_BLOCKWISE_REAL_QUANT_CFG,
+    "fp8_blockwise_real_quant": mtq.FP8_2D_BLOCKWISE_REAL_QUANT_CFG,
     "int4_awq": mtq.INT4_AWQ_CFG,
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
     "int4": mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
