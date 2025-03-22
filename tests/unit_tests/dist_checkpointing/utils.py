@@ -152,6 +152,7 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.num_layers = NUM_LAYERS
     args.hidden_size = HIDDEN_SIZE
     args.num_attention_heads = NUM_ATTENTION_HEADS
+    args.ckpt_step = None
 
 
 def setup_model_and_optimizer(

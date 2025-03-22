@@ -900,6 +900,11 @@ def _load_base_checkpoint(
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
         if os.path.isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
+
+    # Allow user to specify the loaded iteration.
+    if getattr(args, "ckpt_step", None):
+        iteration = args.ckpt_step
+
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
         if non_persistent_iteration >= iteration:
             return _load_non_persistent_base_checkpoint(

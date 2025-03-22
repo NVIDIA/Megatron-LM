@@ -170,7 +170,6 @@ class TestLocalCheckpointing:
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, None)
-            mock_args.ckpt_step = None
             mock_args.non_persistent_ckpt_type = 'local'
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
@@ -276,7 +275,6 @@ class TestLocalCheckpointing:
                 )  # Test handling of non-existent directories
                 init_basic_mock_args(mock_args, tp, pp)
                 init_checkpointing_mock_args(mock_args, None)
-                mock_args.ckpt_step = None
                 mock_args.non_persistent_ckpt_type = 'local'
                 mock_args.non_persistent_local_ckpt_algo = algo
                 mock_args.async_save = async_save
