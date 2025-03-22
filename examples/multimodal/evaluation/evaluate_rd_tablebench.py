@@ -7,7 +7,7 @@ import subprocess
 import sys
 import numpy as np
 
-from evaluate_mmmu import get_input_output_paths
+from .evaluate_mmmu import get_input_output_paths
 
 # The rd-tablebench repo has functions for grading table predictions.
 # Get the absolute path of the rd-tablebench repo
