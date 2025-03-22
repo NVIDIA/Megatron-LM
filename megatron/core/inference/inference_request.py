@@ -3,7 +3,7 @@
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -42,6 +42,7 @@ class InferenceRequest:
     generated_sequence_lengths: Optional[List[int]] = None
     generated_tokens: Optional[torch.Tensor] = None
     generated_log_probs: Optional[torch.Tensor] = None
+    generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
 
     def __post_init__(self):

@@ -200,10 +200,13 @@ class TextGenerationController:
         last_token_logits: torch.Tensor,
         sampling_params: SamplingParams,
         vocab_size: int,
+        generation_started : Optional[torch.Tensor] = None,
+        top_n_logprobs_dict: Dict[int, List[Dict[str, float]]] = None,
     ) -> torch.Tensor:
         """Samples the logits to generate outputs
 
-        Given the logits of the last token, this function samples according to the parameters defined in sampling_params and returns the sampled tokens.
+        Given the logits of the last token, this function samples according to the parameters defined in sampling_params and returns the sampled tokens. If sampling_params.top_n_logprobs > 0 
+        at each step it also updates the top_n_logprobs_dict.
         """
 
     def update_generation_status(

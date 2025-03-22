@@ -44,6 +44,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=30,
         help='Number of tokens to generate for each prompt',
     )
+    group.add_argument(
+        "--top-n-logprobs",
+        type=int,
+        default=0,
+        help='Return the top n logprobs for the generated tokens and their corresponding token as a dictionary',
+    )
     group.add_argument("--incoming-requests-per-sec", type=float, default=100.,
                        help="Simulated number of requests per second.")
     group.add_argument("--incoming-requests-duration", type=float, default=10.,

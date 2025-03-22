@@ -36,7 +36,7 @@ from megatron.training import get_model
 import asyncio
 from typing import AsyncIterator, List
 
-from .utils import add_common_inference_args, build_requests
+from examples.inference.gpt.utils import add_common_inference_args, build_requests
 
 
 def add_static_inference_args(parser):
@@ -154,6 +154,7 @@ def main():
         top_p=args.top_p,
         return_log_probs=args.return_log_probs,
         num_tokens_to_generate=args.num_tokens_to_generate,
+        top_n_logprobs=args.top_n_logprobs,
     )
 
     requests = build_requests(args, get_tokenizer())
@@ -177,14 +178,17 @@ def main():
     if torch.distributed.get_rank() == 0:
         for idx, result in enumerate(results):
             print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
-            result = {
+            result_dict = {
                 'id': result.request_id,
                 'input_prompt': result.prompt,
                 'generated_text': result.generated_text,
                 'generated_tokens': result.generated_tokens,
                 'latency': latency,
             }
-            print(result)
+            if sampling_params.top_n_logprobs > 0 :
+                result_dict['generated_top_n_logprobs'] = result.generated_top_n_logprobs
+
+            print(result_dict)
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
