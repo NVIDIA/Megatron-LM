@@ -3,6 +3,7 @@
 import concurrent
 import copy
 import functools
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
@@ -119,22 +120,30 @@ class TextGenerationController:
         last_token_logits: torch.Tensor,
         sampling_params: Optional[SamplingParams] = None,
         vocab_size: Optional[int] = None,
+        generation_started: Optional[torch.Tensor] = None,
+        top_n_logprobs_dict: Dict[int, List[Dict[str, float]]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Samples the logits to generate outputs
 
         Given the logits of the last token, this function samples it
         according to the parameters defined in sampling_params
-        and returns the samples
+        and returns the samples. If sampling parameters top_n_logprobs > 0
+        at each step it also updates the top_n_logprobs dict.
 
         Args:
             last_token_logits (torch.Tensor): The last token logits. A tensor of
                 size [batch_size, vocab_size]
             sampling_params (SamplingParams): The parameters to use for inference.
             vocab_size (int): Obtained from the tokenizer. Defaults to None
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True
+                            indicates the prompt at that index has started generating tokens.
+            top_n_logprobs_dict (top_n_logprobs_dict): The dict to be updated
 
         Returns:
-            torch.Tensor: 1D tensor of the sampled logits with [batch_size] elements
+            sampled_logits (torch.Tensor): 1D tensor with [batch_size] elements
+            top_n_logprobs_this_step (torch.return_types.topk): a topk tensor with values as logits
+                and indices as the top k elements. None if sampling params top_n_logprobs is 0.
         """
 
         if kwargs.get('common_inference_params'):
@@ -172,6 +181,20 @@ class TextGenerationController:
             filter_ = filter_.scatter(1, sorted_indices, filter_)
             logits.masked_fill_(filter_, float('-Inf'))
 
+        if sampling_params.top_n_logprobs > 0:
+            # NOTE : This thing can also be clubbed with where we compute log probs
+            # when --return-log-probs is enabled. This is just more efficient
+            log_exp_sum = torch.log(torch.exp(last_token_logits).sum(dim=1))
+            top_n_logits_this_step = torch.topk(last_token_logits, sampling_params.top_n_logprobs)
+            top_n_logprobs_this_step = top_n_logits_this_step.values - log_exp_sum.unsqueeze(dim=1)
+            top_n_logprobs_indices = top_n_logits_this_step.indices
+            self._update_top_n_logprobs_dict(
+                top_n_logprobs_this_step,
+                top_n_logprobs_indices,
+                generation_started,
+                top_n_logprobs_dict,
+            )
+
         # Greedy sampling
         if top_k == 1:
             sampled_logits = torch.argmax(last_token_logits, dim=-1)
@@ -179,7 +202,6 @@ class TextGenerationController:
             last_token_logits = last_token_logits.clone()
             if temperature != 1.0:
                 last_token_logits.div_(temperature)
-
             if top_k > 1:
                 assert top_k <= last_token_logits.size(1), 'top-k is larger than logit size.'
                 if vocab_size:
@@ -191,6 +213,7 @@ class TextGenerationController:
 
             # After filtering, we need to recalculate the distribution.
             probabilities = last_token_logits.softmax(dim=-1)
+
             sampled_logits = torch.multinomial(probabilities, num_samples=1).view(-1)
 
             # If vocab size is provided, make sure the samples are in in the range [0, vocab-size).
@@ -326,6 +349,38 @@ class TextGenerationController:
 
         return current_request_ids, finished_request_ids, new_sample
 
+    def _update_top_n_logprobs_dict(
+        self,
+        top_n_logprobs_this_step: torch.Tensor,
+        top_n_logprobs_indices: torch.Tensor,
+        generation_started: torch.Tensor,
+        top_n_logprobs_dict: Dict[int, List[Dict[str, float]]],
+    ):
+        """Function to update the top_n_logprobs at each step
+
+        This function goes through the topn logprobs generated for each, and for whichever
+        batch has started generating tokens, it updates the top_n_logprobs_dict with the
+        decoded token (string) as the key and the logit as the value.
+        top_n_logprobs_dict has as keys the batch idx, the values is a list, where each element
+        represents a dictionary of decoded token as key and logit as value generated at each step
+
+        Args:
+            top_n_logprobs_this_step (torch.Tensor): The top n logprob values
+            top_n_logprobs_indices (torch.Tensor): The indices corresponding to the top n logprobs
+            generation_started (torch.Tensor): A boolean tensor of shape [batch_size]. True
+                            indicates the prompt at that index has started generating tokens.
+            top_n_logprobs_dict (top_n_logprobs_dict): The dict to be updated
+        """
+        for batch_idx, (logprob_values, logprob_indices) in enumerate(
+            zip(top_n_logprobs_this_step, top_n_logprobs_indices)
+        ):
+            logit_dict = {}
+            if generation_started[batch_idx]:
+                for logprob, logprob_index in zip(logprob_values, logprob_indices):
+                    key = self.tokenizer.detokenize([logprob_index])
+                    logit_dict[key] = logprob.item()
+            top_n_logprobs_dict[batch_idx].append(logit_dict)
+
     def generate_all_output_tokens_static_batch(
         self,
         active_requests: OrderedDict[str, InferenceRequest],
@@ -370,6 +425,7 @@ class TextGenerationController:
         )
         batch_size, max_sequence_length = batch_prompt_tokens.shape
 
+        top_n_logprobs_dict = defaultdict(list)
         # Verify that output sequence length is within configured limit
         # TODO(ksanthanam): Raise TokenOverflowError once !2518 is merged
         inference_max_sequence_length = (
@@ -484,14 +540,17 @@ class TextGenerationController:
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
                     )
-
                 # Indicates which of the input prompts have started generating tokens.
                 # A 1D boolean tensor with [batch_size] elements (i.e) The shortest
                 # prompts will start generating first and so on
                 generation_started = prompt_lengths_in_batch <= context_end_position
                 last_token_logits = logits[:, -1, :]
                 sampled_logits = self.sample_from_logits(
-                    last_token_logits, sampling_params, vocab_size
+                    last_token_logits,
+                    sampling_params,
+                    vocab_size,
+                    generation_started,
+                    top_n_logprobs_dict,
                 )
 
                 # Substitute the sampled logits only for the prompts that
@@ -499,7 +558,6 @@ class TextGenerationController:
                 batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
                     generation_started
                 ]
-
                 if sampling_params.return_log_probs:
                     log_probs = F.log_softmax(logits, dim=2)
                     indices = torch.unsqueeze(
@@ -592,6 +650,10 @@ class TextGenerationController:
                 if output_log_probs is None
                 else output_log_probs[idx, :input_prompt_length].cpu().numpy().tolist()
             )
+            if sampling_params.top_n_logprobs > 0:
+                request.generated_top_n_logprobs = top_n_logprobs_dict[idx][
+                    :required_sequence_length
+                ]
 
             request.generated_log_probs = (
                 None
