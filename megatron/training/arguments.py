@@ -953,6 +953,12 @@ def _add_transformer_engine_args(parser):
                        choices=['e4m3', 'hybrid'],
                        help='Which fp8 format scheme to use for FP8 tensors in the forward and backward pass',
                        dest='fp8')
+    # per tensor current scaling recipe selection
+    group.add_argument('--fp8-recipe', default='delayed',
+                       choices=['tensorwise', 'delayed', 'mxfp8'],
+                       help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
+                       dest='fp8_recipe')
+    # delayed scaling only configs
     group.add_argument('--fp8-margin', type=int, default=0,
                        help='Scaling margin for fp8',
                        dest='fp8_margin')
@@ -976,7 +982,11 @@ def _add_transformer_engine_args(parser):
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
     group.add_argument('--first-last-layers-bf16', action='store_true',
-                       help='Construct the first and last layers in bf16.')
+                       help='Construct first and last layers in bf16 when doing FP8 training.')
+    group.add_argument('--num-layers-at-start-in-bf16', type=int, default=1,
+                       help='Number of layers at start to construct in bf16 when --first-last-layers-bf16 is enabled.')
+    group.add_argument('--num-layers-at-end-in-bf16', type=int, default=1,
+                       help='Number of layers at end to construct in bf16 when --first-last-layers-bf16 is enabled.')
     group.add_argument('--te-rng-tracker', action='store_true', default=False,
                        help='Use the Transformer Engine version of the random number generator. '
                             'Required for CUDA graphs support.')
