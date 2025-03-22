@@ -700,18 +700,18 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
             if self.virtual_pipeline_model_parallel_size is None:
-                pipeline_parallel_size = self.pipeline_model_parallel_size
+                num_layers = self.num_layers
 
                 if self.account_for_embedding_in_pipeline_split:
-                    pipeline_parallel_size -= 1
+                    num_layers += 1
 
                 if self.account_for_loss_in_pipeline_split:
-                    pipeline_parallel_size -= 1
+                    num_layers += 1
 
-                if not self.num_layers % pipeline_parallel_size == 0:
+                if not num_layers % self.pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'number of middle layers: {self.num_layers} must be divisible by '
-                        f'middle pipeline_model_parallel_size {pipeline_parallel_size}'
+                        f'number of middle layers: {num_layers} must be divisible by '
+                        f'middle pipeline_model_parallel_size {self.pipeline_model_parallel_size}'
                     )
             else:
                 num_layers = self.num_layers
