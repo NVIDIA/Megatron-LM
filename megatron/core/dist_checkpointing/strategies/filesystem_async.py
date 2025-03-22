@@ -34,8 +34,9 @@ _results_queue = None
 def _get_write_results_queue():
     global _results_queue
     if _results_queue is None:
-        ctx = mp.get_context('spawn')
-        _results_queue = ctx.Manager().Queue()
+        ctx = mp.get_context('fork')
+        with _disable_gc():
+            _results_queue = ctx.Manager().Queue()
     return _results_queue
 
 
