@@ -7,6 +7,7 @@ from typing import Union
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
@@ -14,6 +15,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
@@ -336,10 +338,22 @@ class MLASelfAttention(MultiLatentAttention):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if self.config.q_lora_rank is not None:
+            # if linear_q_down_proj is ColumnParallelLinear:
+            #     q_compressed: [s, b, q_lora_rank / TP]
+            # elif linear_q_down_proj is Linear:
+            #     q_compressed: [s / TP, b, q_lora_rank]
             q_compressed, _ = self.linear_q_down_proj(hidden_states)
-            q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
-            if self.config.sequence_parallel:
-                q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+
+            # When output is sharded (ColumnParallelLinear), two things are needed to be
+            # identical to a normal Linear.
+            #   1. Manually gather output to restore output dim q_lora_rank;
+            #   2. Scatter sequence back to s / TP if sequence-parallel since it was
+            #      gathered by ColumnParallelLinear.
+            if q_compressed.size(-1) != self.config.q_lora_rank:
+                q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
+                if self.config.sequence_parallel:
+                    q_compressed = scatter_to_sequence_parallel_region(q_compressed)
+
             q, _ = self.linear_q_up_proj(self.q_layernorm(q_compressed))
         else:
             # hidden_states:[s, b, 2048], q: [s, b, n * 192]
@@ -355,17 +369,31 @@ class MLASelfAttention(MultiLatentAttention):
             q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
         )
 
-        # kv_combined: [s, b, 576]
+        # if linear_kv_down_proj is ColumnParallelLinear:
+        #     kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim) / TP]
+        # elif linear_kv_down_proj is Linear:
+        #     kv_combined: [s / TP, b, (kv_lora_rank + qk_pos_emb_head_dim)]
         kv_combined, _ = self.linear_kv_down_proj(hidden_states)
-        kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
 
-        # kv_compressed:[s, b, 512], k_pos_emb: [s, b, 64]
-        kv_compressed, k_pos_emb = torch.split(
-            kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
-        )
+        if kv_combined.size(-1) != self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim:
+            # kv_combined: [s, b, (kv_lora_rank + qk_pos_emb_head_dim)]
+            kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
+            # kv_compressed:[s, b, kv_lora_rank], k_pos_emb: [s, b, qk_pos_emb_head_dim]
+            kv_compressed, k_pos_emb = torch.split(
+                kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+            if self.config.sequence_parallel:
+                # kv_compressed:[s / TP, b, kv_lora_rank]
+                kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
+        else:
+            # kv_compressed:[s / TP, b, kv_lora_rank], k_pos_emb: [s / TP, b, qk_pos_emb_head_dim]
+            kv_compressed, k_pos_emb = torch.split(
+                kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+            if parallel_state.get_tensor_model_parallel_world_size() > 1:
+                # k_pos_emb: [s, b, qk_pos_emb_head_dim]
+                k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
 
-        if self.config.sequence_parallel:
-            kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
         # kv: [s, b, 2048]
         kv, _ = self.linear_kv_up_proj(self.kv_layernorm(kv_compressed))
 

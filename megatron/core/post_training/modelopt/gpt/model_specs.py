@@ -9,6 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.post_training.modelopt.layers import (
     BlockwiseFP8WeightTransformerLayer,
     FP8WeightTransformerLayer,
+    Linear,
     Norm,
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -135,10 +136,10 @@ def get_gpt_modelopt_spec(
         attn_module = MLASelfAttention
         attn_submodules = MLASelfAttentionSubmodules(
             linear_q_proj=ColumnParallelLinear,
-            linear_q_down_proj=ColumnParallelLinear,
+            linear_q_down_proj=Linear,
             q_layernorm=Norm,
             linear_q_up_proj=ColumnParallelLinear,
-            linear_kv_down_proj=ColumnParallelLinear,
+            linear_kv_down_proj=Linear,
             kv_layernorm=Norm,
             linear_kv_up_proj=ColumnParallelLinear,
             core_attention=core_attention,
