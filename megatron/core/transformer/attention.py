@@ -510,7 +510,7 @@ class Attention(MegatronModule, ABC):
             ), "Internal use only: install package `nvidia_chunked_flash_attn`."
 
         # hidden_states: [sq, b, h]
-        if self.config.flash_decode and not self.training:
+        if self.config.flash_decode and not self.training and inference_params is not None:
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
