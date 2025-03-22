@@ -96,7 +96,10 @@ class TRTLLMLayers(Enum):
             dict: The model state dict with the key (i.e original model layer name) replaced by trtllm layer names
         """
         for original_model_layer_name in list(model_state_dict.keys()):
-            if "_extra_state" in original_model_layer_name:
+            if (
+                "_extra_state" in original_model_layer_name
+                or "adapter_layer" in original_model_layer_name
+            ):
                 del model_state_dict[original_model_layer_name]
                 continue
 
