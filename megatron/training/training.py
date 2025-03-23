@@ -64,6 +64,7 @@ from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
@@ -1417,6 +1418,11 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
+    if args.mtp_num_layers is not None:
+        mtp_loss_scale = 1 / get_num_microbatches()
+        MTPLossLoggingHelper.track_mtp_metrics(
+            mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+            )
 
     if iteration % args.log_interval == 0:
         if args.record_memory_history and is_last_rank():

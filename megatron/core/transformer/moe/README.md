@@ -7,6 +7,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
   - Enable TP for MLA and DeepSeek-V3
   - Support aux-loss-free load balancing strategy
   - Support node-limited routing
+  - Support Multi-Token Prediction (MTP)
 - **Support DeepSeek's DeepEP for efficient token dispatching and combining**
 - Add fusion for token permutation and unpermutation
 - Support Uneven virtual pipeline parallel split

@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from typing import Optional
+from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -14,6 +14,12 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlockSubmodules,
+    get_mtp_layer_offset,
+    get_mtp_layer_spec,
+    get_mtp_num_layers_to_build,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -394,3 +400,41 @@ def get_gpt_decoder_block_spec(
     block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)
 
     return block_spec
+
+
+def get_gpt_mtp_block_spec(
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    use_transformer_engine: bool,
+) -> MultiTokenPredictionBlockSubmodules:
+    """GPT Multi-Token Prediction (MTP) block spec."""
+    num_layers_to_build = get_mtp_num_layers_to_build(config)
+    if num_layers_to_build == 0:
+        return None
+
+    if isinstance(spec, TransformerBlockSubmodules):
+        # get the spec for the last layer of decoder block
+        transformer_layer_spec = spec.layer_specs[-1]
+    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+        transformer_layer_spec = spec
+    else:
+        raise ValueError(f"Invalid spec: {spec}")
+
+    mtp_layer_spec = get_mtp_layer_spec(
+        transformer_layer_spec=transformer_layer_spec, use_transformer_engine=use_transformer_engine
+    )
+    mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
+    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
+
+    offset = get_mtp_layer_offset(config)
+    # split the mtp layer specs to only include the layers that are built in this pipeline stage.
+    mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+    if len(mtp_layer_specs) > 0:
+        assert (
+            len(mtp_layer_specs) == config.mtp_num_layers
+        ), +f"currently all of the mtp layers must stage in the same pipeline stage."
+        mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
+    else:
+        mtp_block_spec = None
+
+    return mtp_block_spec
