@@ -306,10 +306,11 @@ class TransformerConfig(ModelParallelConfig):
     """MoE Feed-Forward Network hidden size"""
 
     moe_router_load_balancing_type: str = "aux_loss"
-    """The load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss 
-    used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the loss used in DeepSeekV2, 
-    which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing 
-    algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss"."""
+    """The load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss
+    used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used
+    in DeepSeekV2 and DeepSeekV3, which computes the loss for each individual sample; "sinkhorn"
+    corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing.
+    The default is "aux_loss"."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
@@ -323,8 +324,8 @@ class TransformerConfig(ModelParallelConfig):
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
-    2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
-    (specifically, the sum of top-2 expert scores within each group)
+    2. For each token, 'moe_router_group_topk' groups are selected based on sum of
+    top-('moe_router_num_groups'/'moe_router_group_topk') routing scores within each group
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)

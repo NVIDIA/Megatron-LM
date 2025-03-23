@@ -415,7 +415,12 @@ def group_limited_topk(
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
     # Organize the experts into groups
-    group_scores = scores.view(num_tokens, num_groups, -1).topk(2, dim=-1)[0].sum(dim=-1)
+    # Select groups based on sum of top-(num_groups/group_topk) routing scores within each group
+    group_scores = (
+        scores.view(num_tokens, num_groups, -1)
+        .topk(num_groups // group_topk, dim=-1)[0]
+        .sum(dim=-1)
+    )
     group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
     group_mask.scatter_(1, group_idx, 1)
