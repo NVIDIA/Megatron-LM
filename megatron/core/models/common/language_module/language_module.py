@@ -110,7 +110,14 @@ class LanguageModule(MegatronModule):
         if self.post_process and self.output_layer.weight is not None:
             self.output_layer.weight.is_embedding_or_output_parameter = True
 
-        if not self.share_embeddings_and_output_weights:
+        # If share_embeddings_and_output_weights is True, we need to maintain duplicated
+        # embedding weights in post processing stage. If use Multi-Token Prediction (MTP),
+        # we also need to maintain duplicated embedding weights in mtp process stage.
+        # So we need to copy embedding weights from pre processing stage as initial parameters
+        # in these cases.
+        if not self.share_embeddings_and_output_weights and not getattr(
+            self.config, 'mtp_num_layers', 0
+        ):
             return
 
         if parallel_state.get_pipeline_model_parallel_world_size() == 1:
@@ -123,13 +130,14 @@ class LanguageModule(MegatronModule):
         if parallel_state.is_pipeline_first_stage() and self.pre_process and not self.post_process:
             self.shared_embedding_or_output_weight().shared_embedding = True
 
-        if self.post_process and not self.pre_process:
+        if (self.post_process or getattr(self, 'mtp_process', False)) and not self.pre_process:
             assert not parallel_state.is_pipeline_first_stage()
-            # set word_embeddings weights to 0 here, then copy first
-            # stage's weights using all_reduce below.
-            self.output_layer.weight.data.fill_(0)
-            self.output_layer.weight.shared = True
-            self.output_layer.weight.shared_embedding = True
+            # set weights of the duplicated embedding to 0 here,
+            # then copy weights from pre processing stage using all_reduce below.
+            weight = self.shared_embedding_or_output_weight()
+            weight.data.fill_(0)
+            weight.shared = True
+            weight.shared_embedding = True
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
@@ -237,6 +245,15 @@ class LanguageModule(MegatronModule):
 
         if self.pre_process:
             # Output layer is equivalent to the embedding already
+            return
+
+        # If use Multi-Token Prediction (MTP), we need maintain both embedding layer and output
+        # layer in mtp process stage. In this case, if share_embeddings_and_output_weights is True,
+        # the shared weights will be stored in embedding layer, and output layer will not have
+        # any weight.
+        if getattr(self, 'mtp_process', False):
+            # No output layer
+            assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
             return
 
         # Replace the default output layer with a one sharing the weights with the embedding

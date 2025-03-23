@@ -26,6 +26,12 @@ class TransformerConfig(ModelParallelConfig):
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
+    mtp_num_layers: Optional[int] = None
+    """Number of Multi-Token Prediction (MTP) Layers."""
+
+    mtp_loss_scaling_factor: Optional[float] = None
+    """Weighting factor of Multi-Token Prediction (MTP) loss."""
+
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage. 
     None implies equal layer division across PP ranks."""

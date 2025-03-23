@@ -1,7 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
 
-import os
 import torch
 from functools import partial
 from contextlib import nullcontext
@@ -34,7 +33,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
 
 stimer = StragglerDetector()
@@ -105,6 +106,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                         args.num_experts, args.moe_grouped_gemm,
                         args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm,
                         normalization=args.normalization)
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
 
         build_model_context = nullcontext
         build_model_context_args = {}
@@ -135,7 +139,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 position_embedding_type=args.position_embedding_type,
                 rotary_percent=args.rotary_percent,
                 rotary_base=args.rotary_base,
-                rope_scaling=args.use_rope_scaling
+                rope_scaling=args.use_rope_scaling,
+                mtp_block_spec=mtp_block_spec,
             )
 
     return model
@@ -248,8 +253,12 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+        if args.use_legacy_models:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels)
+        else:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels, loss_mask=loss_mask)
 
     return output_tensor, partial(loss_func, loss_mask)
 
