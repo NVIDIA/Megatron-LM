@@ -26,6 +26,7 @@ include:
 pre:mirror_to_github:
   rules:
     - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
     - when: never
   tags:
     - arch/amd64
@@ -48,6 +49,7 @@ pre:mirror_to_github:
 pre:create_ci_branches:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
     - when: never
   parallel:
     matrix:
@@ -72,6 +74,8 @@ pre:create_ci_branches:
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
     - git switch --force-create $branch
     - git push --force -u origin $branch
+  retry:
+    max: 2
 
 pre:label_merge_request:
   extends: [.pre_rules]
