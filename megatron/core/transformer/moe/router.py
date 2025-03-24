@@ -168,7 +168,7 @@ class TopKRouter(Router):
             torch.Tensor: The normalized routing scores.
         """
         if self.score_function == "softmax":
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32).type_as(logits)
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif self.score_function == "sigmoid":
             scores = torch.sigmoid(logits)
             scores = (
