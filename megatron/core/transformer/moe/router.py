@@ -125,6 +125,17 @@ class TopKRouter(Router):
             self.local_tokens_per_expert = None
             self.expert_bias = None
 
+    def _maintain_float32_expert_bias(self):
+        """
+        Maintain the expert bias in float32.
+
+        When using bf16/fp16, the expert bias gets converted to lower precision in Float16Module.
+        We keep it in float32 to avoid routing errors when updating the expert_bias.
+        """
+        if hasattr(self, 'expert_bias') and self.expert_bias is not None:
+            if self.expert_bias.dtype != torch.float32:
+                self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
 
@@ -393,6 +404,7 @@ class TopKRouter(Router):
         Args:
             input (torch.Tensor): Input tensor.
         """
+        self._maintain_float32_expert_bias()
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
