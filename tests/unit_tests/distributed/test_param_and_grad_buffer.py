@@ -174,15 +174,15 @@ def test_grad_sync(
     average_in_collective: bool,
     num_distributed_optimizer_instances: int,
 ):
+    use_distributed_optimizer = use_distributed_optimizer and xm is None
+    average_in_collective = average_in_collective and xm is None
+
     Utils.initialize_model_parallel(
         num_distributed_optimizer_instances=num_distributed_optimizer_instances
     )
     # Skip test if num_distributed_optimizer_instances > 1 and not using distributed optimizer
     if num_distributed_optimizer_instances > 1 and not use_distributed_optimizer:
         pytest.skip("Multiple optimizer instances require distributed optimizer to be enabled")
-
-    use_distributed_optimizer = use_distributed_optimizer and xm is None
-    average_in_collective = average_in_collective and xm is None
     
     input_dim = 100
     output_dim = 100

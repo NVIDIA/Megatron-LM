@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-"""Sample Generate GPT"""
+"""Sample Generate"""
 import os
 import sys
 
@@ -13,18 +13,21 @@ from argparse import Namespace
 from contextlib import nullcontext
 from typing import Union
 
+from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
+from megatron.core.inference.text_generation_controllers.text_generation_controller import TextGenerationController
 import torch
 
 import megatron
-from megatron.core.inference.engines.abstract_engine import AbstractEngine
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import SimpleTextGenerationController
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import import_module
-from megatron.inference.text_generation.mcore_engine_server import GPTInferenceWrapperServer, run_mcore_engine
+from megatron.inference.text_generation.mcore_engine_server import ModelInferenceWrapperServer, run_mcore_engine
 from megatron.inference.text_generation_server import MegatronServer
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
@@ -103,7 +106,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
 def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
     """Get the relevant backend for running inference
 
-    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
+    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore
+    backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
 
     Args:
         args (Namespace): The user arguments parsed from command line
@@ -124,9 +128,9 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         inference_max_requests=args.inference_max_batch_size,
     )
 
-    inference_wrapped_model = GPTInferenceWrapperServer(model, inference_wrapper_config)
-    text_generation_controller = SimpleTextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-    return MCoreEngine(
+    inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)
+    text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
+    return StaticInferenceEngine(
         text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
     )
 

@@ -50,6 +50,9 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                 LanguageModelEmbedding (initial embedding layer)
                 RotaryEmbedding  (initial RoPE layer)
                 tensor_parallel.ColumnParallelLinear (final output layer)
+
+            User can set _fsdp_modules attribute on submodules to set additional
+            submodules to shard with FSDP.
     """
 
     def __init__(
@@ -91,8 +94,8 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                 "mark_step_on_finalization": True,
             }
         else:
-            mesh = DeviceMesh.from_group(self.data_parallel_group, get_current_device_type())
-            kwargs = {"mesh": mesh}
+            self.mesh = DeviceMesh.from_group(self.data_parallel_group, get_current_device_type())
+            kwargs = {"mesh": self.mesh}
 
         def save_custom_attrs(module):
             custom_attrs = {}
@@ -116,6 +119,12 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         # Save the custom attributes on Parameters before FSDP overwrites them.
         # See https://github.com/pytorch/pytorch/issues/136929.
         attrs = save_custom_attrs(self.module)
+
+        sub_modules_to_wrap = set(sub_modules_to_wrap)
+        for sub_module in self.module.modules():
+            fsdp_modules = getattr(sub_module, "_fsdp_modules", [])
+            for f in fsdp_modules:
+                sub_modules_to_wrap.add(f)
 
         prev_module = None
         for sub_module in self.module.modules():

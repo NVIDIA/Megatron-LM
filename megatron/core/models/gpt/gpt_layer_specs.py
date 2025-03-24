@@ -45,6 +45,8 @@ except ImportError:
         warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
 try:
     import apex  # pylint: disable=unused-import
 
@@ -53,6 +55,8 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
+    import warnings
+
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     warnings.warn('Apex is not installed. Falling back to Torch Norm')
@@ -164,6 +168,7 @@ def get_gpt_layer_local_spec(
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    normalization: Optional[str] = None,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -179,6 +184,12 @@ def get_gpt_layer_local_spec(
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
     """
+
+    # Adjust for RMS norm.
+    if normalization == "RMSNorm":
+        global LNImpl
+        LNImpl = WrappedTorchNorm
+
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
@@ -302,7 +313,7 @@ def get_mlp_module_spec(
 
 
 def get_gpt_decoder_block_spec(
-    config: TransformerConfig, use_transformer_engine: bool
+    config: TransformerConfig, use_transformer_engine: bool, normalization: Optional[str] = None
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -326,6 +337,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            normalization=normalization,
         )
     )
     moe_layer_spec = (
@@ -343,6 +355,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            normalization=normalization,
         )
     )
 

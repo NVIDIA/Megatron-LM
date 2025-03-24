@@ -3,14 +3,14 @@
 """Retro's cross attention modules for the decoder block."""
 
 from functools import partial
-from typing import Callable
+from typing import Callable, Optional
 
 import numpy as np
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.retro.base_attention import BaseRetroCrossAttention
 from megatron.core.models.retro.config import RetroConfig
 from megatron.core.models.retro.utils import get_all_true_mask
@@ -19,6 +19,7 @@ from megatron.core.transformer.attention import CrossAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.utils import deprecate_inference_params
 
 
 class RetroDecoderCrossAttention(BaseRetroCrossAttention):
@@ -48,7 +49,8 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         submodules (CrossAttentionSubmodules): Cross attention submodules.
         layer_number (int): Layer number within transformer block.
         attn_mask_type (AttnMaskType): Mask type ('causal' or 'padding').
-        encoder_block_spec (ModuleSpec): The first Retro decoder layer is provided with a transformer block spec to construct the neighbor encoder.
+        encoder_block_spec (ModuleSpec): The first Retro decoder layer is
+            provided with a transformer block spec to construct the neighbor encoder.
     """
 
     def __init__(
@@ -79,8 +81,10 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         hidden_states: Tensor,
         attention_mask: Tensor,
         key_value_states: Tensor = None,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         # rotary_pos_emb: Tensor = None, # ... unsupported for retro.
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> dict:
         """Cross attention for Retro decoder.
 
@@ -96,15 +100,19 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
         Args:
             hidden_states (Tensor): Transformer layer hidden states.
             attention_mask (Tensor): Attention mask.
-            key_value_states (Tensor): Neighbor embeddings if first decoder layer, else encoder output.
-            inference_params (InferenceParams): Inference params.
+            key_value_states (Tensor): Neighbor embeddings if first decoder layer,
+                else encoder output.
+            inference_context (BaseInferenceContext): Inference context.
 
         Returns:
-            A dict consisting of the attention output and context, along with other scalars necessary for performing the downstream bias-dropout-add.
+            A dict consisting of the attention output and context, along with
+                other scalars necessary for performing the downstream bias-dropout-add.
         """
 
         # hidden_states: [ ns, bs, d ]
         # key_value_states: [ r, k*bs*l, d ]
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ns, bs, d = hidden_states.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
@@ -156,7 +164,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
                 attention_mask=attention_mask,
                 context=chunked_output,
                 context_mask=chunked_output_mask,
-                inference_params=inference_params,
+                inference_context=inference_context,
             )  # [ r, k*bs*l, d ]
             key_value_states = key_value_states.reshape(
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d
@@ -234,7 +242,8 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
         """Per-chunk bias-dropout-add.
 
         Args:
-            x_with_bias (dict): Attention output and bias, along with other Retro relevant parameters.
+            x_with_bias (dict): Attention output and bias, along with other Retro
+                relevant parameters.
             residual (Tensor): Transformer layer residual.
             prob (float): Dropout probability.
             retro_chunk_length (int): Retro chunk length (e.g., 64).

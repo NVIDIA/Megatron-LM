@@ -4,10 +4,10 @@ from typing import Any, Dict
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference_params import InferenceParams
 
 
 # pylint: disable=line-too-long
@@ -76,7 +76,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
 
         batch_size, max_sequence_length = prompts_tokens.shape
-        self.inference_params = InferenceParams(
+        self.inference_context = StaticInferenceContext(
             batch_size, max_sequence_length + num_img_embeddings
         )
 
@@ -143,7 +143,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             tokens,
             position_ids=position_ids,
             attention_mask=None,
-            inference_params=self.inference_params,
+            inference_context=self.inference_context,
             num_image_tiles=num_image_tiles,
             runtime_gather_output=True,
         )
@@ -192,16 +192,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # On every PP stage(although inference params should only matter for decoder),
         # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
-            if "image_tokens_count" not in self.inference_params.key_value_memory_dict:
-                self.inference_params.key_value_memory_dict["image_tokens_count"] = (
+            if "image_tokens_count" not in self.inference_context.key_value_memory_dict:
+                self.inference_context.key_value_memory_dict["image_tokens_count"] = (
                     num_img_embeddings
                 )
 
             if num_img_embeddings + num_tokens - num_image_tokens > decoder_seq_length:
-                self.inference_params.sequence_len_offset += decoder_seq_length - num_tokens
+                self.inference_context.sequence_len_offset += decoder_seq_length - num_tokens
             else:
-                self.inference_params.sequence_len_offset += (
-                    self.inference_params.key_value_memory_dict["image_tokens_count"]
+                self.inference_context.sequence_len_offset += (
+                    self.inference_context.key_value_memory_dict["image_tokens_count"]
                     - num_image_tokens
                 )
 

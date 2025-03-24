@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron initialization."""
 import logging
@@ -127,6 +127,7 @@ def initialize_megatron(
             args.data_parallel_random_init,
             args.te_rng_tracker,
             args.inference_rng_tracker,
+            use_cudagraphable_rng=args.enable_cuda_graph,
         )
 
     if skip_mpu_initialization:
@@ -364,7 +365,11 @@ def _init_autoresume():
 
 
 def _set_random_seed(
-    seed_, data_parallel_random_init=False, te_rng_tracker=False, inference_rng_tracker=False
+    seed_: int,
+    data_parallel_random_init: bool = False,
+    te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
 ):
     """Set random seed for reproducability."""
     if seed_ is not None and seed_ > 0:
@@ -377,7 +382,9 @@ def _set_random_seed(
         np.random.seed(seed)
         set_manual_seed(seed)
         if get_local_device_count() > 0:
-            tensor_parallel.model_parallel_device_manual_seed(seed, te_rng_tracker, inference_rng_tracker)
+            tensor_parallel.model_parallel_device_manual_seed(
+                seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
+            )
     else:
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 

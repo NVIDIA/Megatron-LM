@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.pooler import Pooler
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
@@ -22,6 +23,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import get_linear_layer
+from megatron.core.utils import deprecate_inference_params
 from megatron.core.utils import get_te_version as _get_te_version
 from megatron.core.utils import is_te_min_version
 
@@ -290,7 +292,9 @@ class BertModel(LanguageModule):
         attention_mask: Tensor,
         tokentype_ids: Tensor = None,
         lm_labels: Tensor = None,
-        inference_params=None,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """Forward function of BERT model
 
@@ -300,6 +304,9 @@ class BertModel(LanguageModule):
 
         It either returns the Loss values if labels are given  or the final hidden units
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         extended_attention_mask = self.bert_extended_attention_mask(attention_mask)
 
         if parallel_state.is_pipeline_first_stage():
@@ -323,7 +330,7 @@ class BertModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.encoder, encoder_input, self.config
+                inference_context, self.encoder, encoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -331,7 +338,7 @@ class BertModel(LanguageModule):
         hidden_states = self.encoder(
             hidden_states=encoder_input,
             attention_mask=extended_attention_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
         )
         if not self.post_process:
@@ -339,6 +346,8 @@ class BertModel(LanguageModule):
 
         if self.add_binary_head:
             pooled_output = self.pooler(hidden_states, 0)
+        else:
+            pooled_output = None  # for pylint.
 
         if self.return_embeddings:
             embeddings = torch.transpose(hidden_states, 0, 1)

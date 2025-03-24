@@ -825,7 +825,7 @@ def setup_model_and_optimizer(model_provider_func,
 
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
                 model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2 and args.use_torch_fsdp2)
+                skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False) and args.ckpt_format == "torch_dist")
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics({
@@ -1428,6 +1428,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     args = get_args()
     timers = get_timers()
     one_logger = get_one_logger()
+
+    if args.run_workload_inspector_server:
+        try:
+            from workload_inspector.utils.webserver import run_server
+            import threading
+            threading.Thread(target=run_server, daemon=True, args=(torch.distributed.get_rank(), )).start()
+        except ModuleNotFoundError:
+            print_rank_0("workload inspector module not found.")
 
     # Write args to tensorboard
     write_args_to_tensorboard()

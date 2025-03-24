@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
@@ -86,7 +87,11 @@ class TestT5InferenceWrapper:
             padded_vocab_size=self.vocab_size,
         )
 
-        self.inference_wrapped_model = T5InferenceWrapper(t5_model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        self.inference_wrapped_model = T5InferenceWrapper(
+            t5_model, inference_wrapper_config, inference_context
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()

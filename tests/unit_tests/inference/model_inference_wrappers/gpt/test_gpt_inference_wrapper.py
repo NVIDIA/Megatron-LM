@@ -5,10 +5,19 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
-import torch
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from tests.unit_tests.test_utilities import Utils
@@ -49,7 +58,11 @@ class TestGPTInferenceWrapper:
             padded_vocab_size=self.vocab_size,
         )
 
-        self.inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        self.inference_wrapped_model = GPTInferenceWrapper(
+            gpt_model, inference_wrapper_config, inference_context
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -61,7 +74,7 @@ class TestGPTInferenceWrapper:
         
         batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
-        self.inference_wrapped_model.inference_params.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 
@@ -93,7 +106,7 @@ class TestGPTInferenceWrapper:
         
         batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
-        self.inference_wrapped_model.inference_params.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 
@@ -124,7 +137,7 @@ class TestGPTInferenceWrapper:
     
         batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
         self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
-        self.inference_wrapped_model.inference_params.materialize_only_last_token_logits = (
+        self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
 

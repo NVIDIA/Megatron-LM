@@ -6,10 +6,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core import InferenceParams
 from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core import parallel_state as ps
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
+from megatron.core import parallel_state as ps
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
@@ -145,7 +146,7 @@ class TestLLaVAModel:
         num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).to(device=get_current_device())
 
         use_inference_kv_cache = False
-        inference_params = None
+        inference_context = None
 
         embeddings, labels, loss_mask = self.model._preprocess_data(
             image_embeddings,
@@ -154,7 +155,7 @@ class TestLLaVAModel:
             loss_mask,
             labels,
             use_inference_kv_cache,
-            inference_params,
+            inference_context,
             image_token_index,
             num_image_tiles,
         )
@@ -384,7 +385,7 @@ class TestLLaVAModel:
         assert logits.shape == torch.Size((5, max_seq_len, 8192))
 
         # Try without labels and with inference params.
-        inference_params = InferenceParams(5, max_seq_len)
+        inference_context = StaticInferenceContext(5, max_seq_len)
         logits, _ = self.model.forward(
             img,
             input_ids,
@@ -393,12 +394,12 @@ class TestLLaVAModel:
             labels=None,
             loss_mask=None,
             num_image_tiles=num_image_tiles,
-            inference_params=inference_params,
+            inference_context=inference_context,
         )
         assert logits.shape == torch.Size((5, max_seq_len, 8192))
 
         # Check KV cache got populated correctly.
-        kv_dict = inference_params.key_value_memory_dict
+        kv_dict = inference_context.key_value_memory_dict
 
         assert kv_dict["image_tokens_count"] == 577 * 7
         for layer_no in range(1, 4):  # 3 layers in the model.
@@ -521,7 +522,7 @@ def setup_and_teardown_llava_model(request):
 
 
 class TestLLaVAModelVisionEncoders:
-    num_weights_by_encoder = {"siglip": 1832456 if xm is None else 1832328, "radio-g": 2844552 if xm is None else 2844424}
+    num_weights_by_encoder = {"siglip": 1832456 if HAVE_TE else 1832328, "radio-g": 2844552 if HAVE_TE else 2844424}
 
     @pytest.mark.internal
     def test_constructor(self, setup_and_teardown_llava_model):

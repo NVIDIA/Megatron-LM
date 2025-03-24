@@ -215,7 +215,7 @@ def generate_tokens_probs_and_return_on_first_stage(
 
             prefill = context_length == min_prompt_length
             if not prefill:
-                forward_step.inference_params.enable_decode_mode()
+                forward_step.inference_context.enable_decode_mode()
 
             # Pick the slice that we need to pass through the network.
             tokens2use = tokens[:, prev_context_length:context_length]
@@ -432,7 +432,7 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
 
             # set inference key values to make it consistent with best beam index
             best_batches = broadcast_from_last_pipeline_stage(beam_size, torch.int64, best_batches)
-            forward_step.inference_params.swap_key_value_dict(best_batches)
+            forward_step.inference_context.swap_key_value_dict(best_batches)
 
             # Update the context length for the next token generation.
             prev_context_length = context_length

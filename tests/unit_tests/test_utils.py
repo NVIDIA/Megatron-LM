@@ -2,6 +2,7 @@ import os
 import time
 import urllib.request as req
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import unittest.mock as mock
 import numpy as np
@@ -12,6 +13,7 @@ import megatron.core.utils as util
 from tests.unit_tests.test_utilities import Utils, TestModel
 from megatron.core.device_utils import get_current_device, get_xla_model
 import megatron.training.utils as training_util
+from megatron.core import config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
@@ -34,6 +36,22 @@ class TestUtils:
         with pytest.raises(AssertionError):
             util.divide(4, 5)
 
+success_string = "hello,world"
+
+
+@util.experimental_cls(introduced_with_version="0.1.0")
+class A:
+
+    def __init__(self):
+        pass
+
+    def some_method(self):
+        return success_string
+
+    @classmethod
+    def some_static_method(cls):
+        return success_string
+
 
     def test_global_memory_buffer(self):
         global_memory_buffer = util.GlobalMemoryBuffer()
@@ -48,11 +66,46 @@ class TestUtils:
         assert torch.equal(inp, util.make_viewless_tensor(inp, True, False))
 
 
-    def test_safely_set_viewless_tensor_data(self):
-        tensor = torch.zeros((3, 4), device=self.device)
-        new_data_tensor = torch.tensor(np.random.rand(3, 4), device=self.device)
-        util.safely_set_viewless_tensor_data(tensor, new_data_tensor)
-        assert torch.equal(tensor, new_data_tensor)
+    def test_experimental_cls_init(self):
+        with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+            # Check that initialization works
+            a = A()
+            assert a.__class__.__qualname__ == "A"
+            assert a.some_method() == success_string
+            assert a.is_experimental is True
+
+
+    def test_experimental_cls_static(self):
+        with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+            # Check that static methods work
+            assert A.__class__.__qualname__ == "A"
+            assert A.some_static_method() == success_string
+            assert A.is_experimental is True
+
+
+    def test_experimental_cls_exception_init(self):
+        with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+            util.ExperimentalNotEnabledError
+        ):
+            a = A()
+            assert a.some_method() == success_string
+            assert a.is_experimental is False
+
+
+    def test_experimental_cls_exception_static(self):
+        with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+            util.ExperimentalNotEnabledError
+        ):
+            assert A.some_static_method() == success_string
+
+        assert A.is_experimental is False
+
+
+    def test_global_memory_buffer():
+        global_memory_buffer = util.GlobalMemoryBuffer()
+        obtained_tensor = global_memory_buffer.get_tensor((3, 2), torch.float32, "test_tensor")
+        expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=torch.cuda.current_device())
+        assert obtained_tensor.shape == expected_tensor.shape
 
 
     def test_assert_viewless_tensor(self):

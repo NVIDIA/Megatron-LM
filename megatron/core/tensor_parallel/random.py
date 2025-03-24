@@ -233,8 +233,14 @@ def get_all_rng_states():
     # no valid tracker, return an empty dict
     else:
         return {}
-    
-def model_parallel_device_manual_seed(seed, te_rng_tracker=False, inference_rng_tracker=False):
+
+
+def model_parallel_device_manual_seed(
+    seed: int,
+    te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Initialize model parallel device seed.
 
     This function should be called after the model parallel is
@@ -258,9 +264,8 @@ def model_parallel_device_manual_seed(seed, te_rng_tracker=False, inference_rng_
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker)
+    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
     _DEVICE_RNG_STATE_TRACKER.reset()
-    
     # Set the default state.
     set_device_manual_seed(data_parallel_seed)
     _DEVICE_RNG_STATE_TRACKER.add(_DATA_PARALLEL_RNG_TRACKER_NAME, data_parallel_seed)

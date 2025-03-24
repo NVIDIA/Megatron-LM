@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from megatron.core.device_utils import get_current_device
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
-    from megatron.core.inference_params import InferenceParams
+    from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
 
 import logging
@@ -27,6 +27,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     apply_rotary_pos_emb,
     get_pos_emb_on_this_cp_rank,
 )
+from megatron.core.utils import deprecate_inference_params
 
 logger = logging.getLogger(__name__)
 
@@ -182,16 +183,18 @@ class RotaryEmbedding(nn.Module):
 
     def get_rotary_seq_len(
         self,
-        inference_params: InferenceParams,
+        inference_context: BaseInferenceContext,
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
         packed_seq_params: PackedSeqParams,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> float:
         """Function to get the rotary sequence length.
 
         Args:
-            inference_params : Used during Inference time
+            inference_context : Used during Inference time
             transformer (TransformerBlock): The transformer block (decoder/encoder) used
                 by the model
             transformer_input (Tensor): Input tensor to the transformer
@@ -201,12 +204,15 @@ class RotaryEmbedding(nn.Module):
         Returns:
             float: The rotary sequence length
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         if packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
-        elif inference_params is not None:
-            rotary_seq_len = inference_params.max_sequence_length
+        elif inference_context is not None:
+            rotary_seq_len = inference_context.max_sequence_length
         else:
             if transformer is not None and transformer.input_tensor is not None:
                 rotary_seq_len = transformer.input_tensor.size(0)

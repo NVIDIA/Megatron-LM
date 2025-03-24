@@ -12,7 +12,7 @@ from megatron.inference.text_generation.communication import broadcast_float_lis
 from megatron.inference.text_generation.tokenization import tokenize_prompts
 
 
-class GPTInferenceWrapperServer(GPTInferenceWrapper):
+class ModelInferenceWrapperServer(GPTInferenceWrapper):
     def __init__(self, model, inference_wrapper_config):
         super().__init__(model, inference_wrapper_config)
 
@@ -85,7 +85,7 @@ def run_mcore_engine(
         req = InferenceRequest(
             prompt=detokenized_prompts[i],
             prompt_tokens=tokenized_prompts[i],
-            inference_parameters=sampling_params,
+            sampling_params=sampling_params,
             request_id=engine.get_new_request_id(),
         )
         requests.append(req)

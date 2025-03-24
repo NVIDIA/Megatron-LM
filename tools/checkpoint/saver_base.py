@@ -103,6 +103,8 @@ class MegatronCheckpointSaverBase:
         margs = parse_args()
         margs = self._load_checkpoint_args(margs)
 
+        margs.inference_batch_times_seqlen_threshold = -1
+
         # Explicitly copy sequence_parallel, apply_query_key_layer_scaling.
         margs.sequence_parallel = self.md.checkpoint_args.sequence_parallel
         margs.apply_query_key_layer_scaling = self.md.checkpoint_args.apply_query_key_layer_scaling
@@ -126,6 +128,8 @@ class MegatronCheckpointSaverBase:
         if not self.build_tokenizer:
             margs.tokenizer_model = None
         margs.transformer_impl = self.args.saver_transformer_impl
+        if self.args.saver_transformer_impl == "local" and margs.normalization == "RMSNorm":
+            margs.no_persist_layer_norm = True
 
         self.margs = margs
 

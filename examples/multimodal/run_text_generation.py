@@ -27,7 +27,7 @@ from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.inference.text_generation.communication import broadcast_int_list
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
@@ -185,7 +185,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         controller = VLMTextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
-        inference_engine = MCoreEngine(
+        inference_engine = StaticInferenceEngine(
             controller, max_batch_size=1, random_seed=args.seed
         )
         sampling_params = SamplingParams(
@@ -212,7 +212,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                    request_id=inference_engine.get_new_request_id(),
                    prompt=conv,
                    prompt_tokens=controller.tokenize_prompt(conv),
-                   inference_parameters=sampling_params,
+                   sampling_params=sampling_params,
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
                    num_tiles=num_tiles,
@@ -316,7 +316,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                    request_id=inference_engine.get_new_request_id(),
                    prompt=conv,
                    prompt_tokens=controller.tokenize_prompt(conv),
-                   inference_parameters=sampling_params,
+                   sampling_params=sampling_params,
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
                    num_tiles=num_tiles,
@@ -436,7 +436,7 @@ class VLMForwardStep(ForwardStep):
             tokens,
             position_ids,
             attention_mask=None,
-            inference_params=self.inference_params,
+            inference_context=self.inference_context,
             num_image_tiles=self._num_tiles,
             runtime_gather_output=True,
         )
@@ -471,14 +471,14 @@ class VLMForwardStep(ForwardStep):
         # On every PP stage(although inference params should only matter for decoder),
         # update the sequence length offset by the number of image tokens.
         if num_tokens > 1 and num_image_tokens > 0:
-            if "image_tokens_count" not in self.inference_params.key_value_memory_dict:
-                self.inference_params.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
+            if "image_tokens_count" not in self.inference_context.key_value_memory_dict:
+                self.inference_context.key_value_memory_dict["image_tokens_count"] = self._num_img_embeddings
 
             if self._num_img_embeddings + num_tokens - num_image_tokens > self.decoder_seq_length:
-                self.inference_params.sequence_len_offset += self.decoder_seq_length - num_tokens
+                self.inference_context.sequence_len_offset += self.decoder_seq_length - num_tokens
             else:
-                self.inference_params.sequence_len_offset += (
-                    self.inference_params.key_value_memory_dict["image_tokens_count"] - num_image_tokens
+                self.inference_context.sequence_len_offset += (
+                    self.inference_context.key_value_memory_dict["image_tokens_count"] - num_image_tokens
                 )
 
         return logits

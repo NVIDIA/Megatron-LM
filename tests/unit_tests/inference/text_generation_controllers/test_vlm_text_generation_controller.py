@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from megatron.core.device_utils import get_current_device
-from megatron.core.inference.common_inference_params import CommonInferenceParams
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -20,6 +20,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
 )
@@ -94,7 +95,11 @@ class TestVLMTextGenerationController:
             padded_vocab_size=self.language_vocab_size,
         )
 
-        inference_wrapped_model = VLMInferenceWrapper(self.model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        inference_wrapped_model = VLMInferenceWrapper(
+            self.model, inference_wrapper_config, inference_context
+        )
 
         self.mock_tokenizer = mock.Mock()
 
@@ -134,7 +139,7 @@ class TestVLMTextGenerationController:
             inference_request = VLMInferenceRequest(
                 request_id=request_id,
                 prompt=prompt,
-                inference_parameters=CommonInferenceParams(num_tokens_to_generate=10),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
                 arrival_time=time.time(),
                 prompt_tokens=prompt_tokens,
                 num_img_embeddings_per_tile=num_img_embeddings_per_tile,

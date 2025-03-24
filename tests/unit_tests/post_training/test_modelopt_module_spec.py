@@ -6,8 +6,9 @@ import pytest
 import torch
 from packaging.version import Version
 
-from megatron.core import InferenceParams, dist_checkpointing
 from megatron.core.device_utils import get_current_device
+from megatron.core import dist_checkpointing
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -28,7 +29,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch_size: int = 2):
-    inference_params: InferenceParams = InferenceParams(
+    inference_context: StaticInferenceContext = StaticInferenceContext(
         max_batch_size=micro_batch_size, max_sequence_length=model.max_sequence_length
     )
     prompt_length = model.max_sequence_length - 1
@@ -39,7 +40,7 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
             sequence_length = prompt_length
         else:
             sequence_length = 1
-        inference_params.sequence_len_offset = offset
+        inference_context.sequence_len_offset = offset
 
         data = list(range(sequence_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
@@ -52,7 +53,7 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
         )
 
         assert logits.shape[0] == micro_batch_size

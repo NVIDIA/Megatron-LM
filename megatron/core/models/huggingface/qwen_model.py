@@ -2,6 +2,7 @@
 
 import torch
 from transformers.models.qwen2 import Qwen2ForCausalLM
+from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 
 from megatron.core.models.huggingface import HuggingFaceModule
 
@@ -10,6 +11,9 @@ class QwenHuggingFaceModel(HuggingFaceModule):
     """
     Wrapper for Qwen LM HuggingFace models.
     """
+
+    # Currently applies to FSDP2 only, not the custom FSDP implementation.
+    _fsdp_modules = [Qwen2DecoderLayer]
 
     def __init__(self, config):
         super().__init__(config)

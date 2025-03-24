@@ -2,6 +2,7 @@
 
 """ Utilities for transforming state_dict, including a tensor-aware implementation."""
 
+import copy
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -18,7 +19,7 @@ from .exchange_utils import (
     determine_main_replica_uniform_distribution,
     exchange_by_distribution,
 )
-from .mapping import ShardedObject, ShardedStateDict, ShardedTensor, StateDict, apply_factory_merges
+from .mapping import CommonStateDict, ShardedObject, ShardedStateDict, ShardedTensor, StateDict, apply_factory_merges
 from .state_dict_utils import load_preprocess, save_preprocess
 from .utils import (
     _sharded_object_id,
@@ -86,6 +87,12 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                     ):
                         sh_base.data = None
 
+    @staticmethod
+    def preprocess_common_state_dict(state_dict: CommonStateDict) -> CommonStateDict:
+        state_dict = copy.deepcopy(state_dict)
+        state_dict.pop('optimizer', None)
+        return state_dict
+
     @classmethod
     @debug_time("from_state_dict", logger)
     def from_state_dict(
@@ -119,7 +126,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
             cls._validate_params(algo)
             fully_parallel = algo == 'fully_parallel'
             sharded_part, common_state_dict = save_preprocess(
-                sharded_state_dict, cached_metadata is None, process_group=process_group
+                sharded_state_dict, cached_metadata is None, process_group=process_group,
+                preprocess_common_before_consistancy_check=cls.preprocess_common_state_dict
             )
             cacheable_distribution = cls._get_distribution(
                 fully_parallel, sharded_part, parallelization_group, cached_metadata

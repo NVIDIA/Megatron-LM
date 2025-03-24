@@ -7,7 +7,8 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.inference.engines.mcore_engine import MCoreEngine
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -29,7 +30,7 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 
 xm=get_xla_model()
 
-class TestMCoreEngine:
+class TestStaticInferenceEngine:
     def setup_engine(self, engine_max_batch_size=None):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
@@ -65,7 +66,11 @@ class TestMCoreEngine:
             padded_vocab_size=self.vocab_size,
         )
 
-        inference_wrapped_model = GPTInferenceWrapper(gpt_model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        inference_wrapped_model = GPTInferenceWrapper(
+            gpt_model, inference_wrapper_config, inference_context
+        )
         self.mock_tokenizer = mock.Mock()
         text_generation_controller = TextGenerationController(
             inference_wrapped_model=inference_wrapped_model, tokenizer=self.mock_tokenizer
@@ -73,12 +78,12 @@ class TestMCoreEngine:
 
         if engine_max_batch_size is not None and engine_max_batch_size > self.batch_size:
             with pytest.warns(UserWarning):
-                self.mcore_engine = MCoreEngine(
+                self.static_engine = StaticInferenceEngine(
                     text_generation_controller=text_generation_controller,
                     max_batch_size=engine_max_batch_size,
                 )
         else:
-            self.mcore_engine = MCoreEngine(
+            self.static_engine = StaticInferenceEngine(
                 text_generation_controller=text_generation_controller,
                 max_batch_size=engine_max_batch_size,
             )
@@ -110,7 +115,7 @@ class TestMCoreEngine:
                 prompts = ["" for i in range(batch_size)]
             else:
                 prompts = ["sample" * (i + 1) for i in range(batch_size)]
-            results: List[InferenceRequest] = self.mcore_engine.generate(
+            results: List[InferenceRequest] = self.static_engine.generate(
                 prompts, sampling_params=SamplingParams(num_tokens_to_generate=10)
             )
 
@@ -188,13 +193,13 @@ class TestMCoreEngine:
             num_tokens_to_generate=num_tokens_to_generate, return_log_probs=True
         )
         request_ids: List[str] = [
-            self.mcore_engine.add_request(
-                prompt, add_BOS=True, inference_parameters=sampling_params, streaming=True
+            self.static_engine.add_request(
+                prompt, add_BOS=True, sampling_params=sampling_params, streaming=True
             )
             for prompt in prompts
         ]
         stream_generators: List[AsyncGenerator[InferenceRequest, None]] = [
-            self.mcore_engine.get_stream_generator(request_id) for request_id in request_ids
+            self.static_engine.get_stream_generator(request_id) for request_id in request_ids
         ]
         assert all(stream_generator is not None for stream_generator in stream_generators)
 
@@ -203,10 +208,10 @@ class TestMCoreEngine:
             for stream_generator in stream_generators
         ]
 
-        await self.mcore_engine.run_engine_async()
+        await self.static_engine.run_engine_async()
         final_streamed_tokens: List[InferenceRequest] = await asyncio.gather(*tasks)
         results: List[InferenceRequest] = [
-            self.mcore_engine.scheduler.completed_request_pool[request_id]
+            self.static_engine.scheduler.completed_request_pool[request_id]
             for request_id in request_ids
         ]
         assert len(final_streamed_tokens) == len(results)

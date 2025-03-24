@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 """Megatron arguments."""
 
@@ -68,6 +68,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_mla_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
+    parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
@@ -246,7 +247,7 @@ def validate_args(args, defaults={}):
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
-    # Pipeline model parallel size.        
+    # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
     args.data_parallel_size = args.world_size // total_model_size
@@ -351,11 +352,11 @@ def validate_args(args, defaults={}):
             print('setting global batch size to {}'.format(
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
-    
+
     # Uneven virtual pipeline parallelism
     assert args.num_layers_per_virtual_pipeline_stage is None or args.num_virtual_stages_per_pipeline_rank is None, \
         '--num-layers-per-virtual-pipeline-stage and --num-virtual-stages-per-pipeline-rank cannot be set at the same time'
-                  
+
     if args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None:
         if args.overlap_p2p_comm:
             assert args.pipeline_model_parallel_size > 1, \
@@ -366,22 +367,22 @@ def validate_args(args, defaults={}):
                 'When interleaved schedule is used and p2p communication overlap is disabled, '\
                 'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
                 'p2p sends and recvs between same 2 ranks per communication batch'
-        
+
         if args.num_virtual_stages_per_pipeline_rank is None:
             assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
                 'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
             num_layers = args.num_layers
-            
+
             if args.account_for_embedding_in_pipeline_split:
                 num_layers += 1
-            
+
             if args.account_for_loss_in_pipeline_split:
                 num_layers += 1
-            
+
             assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                 'number of layers of the model must be divisible pipeline model parallel size'
             num_layers_per_pipeline_stage = num_layers // args.transformer_pipeline_model_parallel_size
-            
+
             assert num_layers_per_pipeline_stage % args.num_layers_per_virtual_pipeline_stage == 0, \
                 'number of layers per pipeline stage must be divisible number of layers per virtual pipeline stage'
             args.virtual_pipeline_model_parallel_size = num_layers_per_pipeline_stage // \
@@ -398,19 +399,19 @@ def validate_args(args, defaults={}):
             print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
                   'since non-interleaved schedule does not support overlapping p2p communication '
                   'and aligned param AG')
-            
+
         if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
             # Divisibility check not applicable for T5 models which specify encoder_num_layers
             # and decoder_num_layers.
             if args.num_layers is not None:
                 num_layers = args.num_layers
-                
+
                 if args.account_for_embedding_in_pipeline_split:
                     num_layers += 1
-                
+
                 if args.account_for_loss_in_pipeline_split:
                     num_layers += 1
-                    
+
                 assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                     'Number of layers should be divisible by the pipeline-model-parallel size'
     if args.rank == 0:
@@ -445,8 +446,8 @@ def validate_args(args, defaults={}):
             "--use-torch-fsdp2 is not supported with MCore's distributed optimizer"
         assert not args.gradient_accumulation_fusion, \
             '--use-torch-fsdp2 is not supported with gradient accumulation fusion'
-        assert args.ckpt_format == 'torch_dist', \
-            '--use-torch-fsdp2 requires --ckpt-format torch_dist'
+        assert args.ckpt_format in ('torch_dist', 'torch_dcp'), \
+            '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         assert args.untie_embeddings_and_output_weights, \
             '--use-torch-fsdp2 requires --untie-embeddings-and-output-weights'
         assert not args.fp16, \
@@ -514,7 +515,7 @@ def validate_args(args, defaults={}):
         if args.accumulate_allreduce_grads_in_fp32:
             assert args.main_grads_dtype == torch.float32, \
                 "--main-grads-dtype can only be fp32 when --accumulate-allreduce-grads-in-fp32 is set"
-    
+
         if args.grad_reduce_in_bf16:
             args.accumulate_allreduce_grads_in_fp32 = False
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
@@ -763,7 +764,7 @@ def validate_args(args, defaults={}):
 
     if args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
-    
+
     # Context parallel
     if args.context_parallel_size > 1:
         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
@@ -779,6 +780,14 @@ def validate_args(args, defaults={}):
     # Distributed checkpointing checks
     if args.use_dist_ckpt and args.use_legacy_models:
         raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
+
+    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
+    if args.ckpt_format == "torch_dcp":
+        assert args.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
+        assert args.tensor_model_parallel_size <= 1 and args.encoder_tensor_model_parallel_size <= 1, \
+            "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."
+        assert args.pipeline_model_parallel_size <= 1 and args.encoder_pipeline_model_parallel_size <= 1, \
+            "--ckpt-format torch_dcp is not tested with megatron pipeline parallelism."
 
     # Data blend checks
     assert args.mock_data + \
@@ -842,6 +851,10 @@ def validate_args(args, defaults={}):
         assert args.pipeline_model_parallel_size > 1, \
             "--inference-batch-times-seqlen-threshold requires setting --pipeline-model-parallel-size > 1."
 
+    if args.inference_dynamic_batching:
+        assert args.inference_dynamic_batching_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
+
     # MoE upcycling check
     if args.moe_use_upcycling:
         assert args.save is not None, "When using upcycling, the --save option must be specified."
@@ -889,7 +902,7 @@ def validate_args(args, defaults={}):
                 "Cannot support load balancing loss and z loss with --account-for-embedding-in-pipeline-split"
             assert not args.account_for_loss_in_pipeline_split, \
                 "Cannot support load balancing loss and z loss with --account-for-loss-in-pipeline-split"
-                
+
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -1043,6 +1056,36 @@ def _add_inference_args(parser):
     group.add_argument('--inference-max-seq-length', type=int, default=2560,
                        help='Maximum sequence length expected for inference (prefill + decode).',
                        dest='inference_max_seq_length')
+    group.add_argument('--inference-dynamic-batching',
+                       action='store_true', default=False,
+                       help='Enable dynamic batching mode.')
+    group.add_argument('--inference-dynamic-batching-buffer-size-gb',
+                       type=float, default=40.,
+                       help='Total buffer size (GB) allocated for the chunked KV '
+                       'memory.')
+    group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
+                       type=float, default=0.2,
+                       help='Space is reserved within the inference context '
+                       'memory buffer to guarantee that a minimum number of '
+                       'active requests will always be able to run to '
+                       'completion. This is to avoid the context being blocked '
+                       'by paused requests.')
+    group.add_argument('--inference-dynamic-batching-buffer-overflow-factor',
+                       type=float, default=None,
+                       help='Scaling factor over the memory buffer size for auto '
+                       'computing `max_requests` and `max_tokens`. This scaling '
+                       'factor is used for fitting more requests and tokens in '
+                       'the memory buffer than it can safely hold, which in turn '
+                       'increases throughput.')
+    group.add_argument('--inference-dynamic-batching-max-requests-override',
+                       type=int, default=None,
+                       help='If set, this overrides the max requests as computed '
+                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+    group.add_argument('--inference-dynamic-batching-max-tokens-override',
+                       type=int, default=None,
+                       help='If set, this overrides the max tokens as computed '
+                       'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+
     return parser
 
 
@@ -1197,6 +1240,11 @@ def _add_straggler_detector_args(parser):
                        help='Number of ranks to report with high/low estimated throughput')
     return parser
 
+def _add_workload_inspector_server_args(parser):
+    group = parser.add_argument_group(title='workload inspector')
+    group.add_argument('--run-workload-inspector-server', action='store_true',
+                       help='If set, enables workload inspector server for on-demand profiling.')
+    return parser
 
 def _add_one_logger_args(parser):
     group = parser.add_argument_group(title='one logger')
@@ -1791,8 +1839,10 @@ def _add_checkpointing_args(parser):
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
     group.add_argument('--ckpt-format', default='torch_dist',
-                       choices=['torch', 'torch_dist', 'zarr'],
-                       help='Checkpoint format to use.')
+                       choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
+                       help='Checkpoint format to use. torch is the format used by torch.save/load.'
+                       ' torch_dist is a megatron built-in distributed checkpointing format.'
+                       ' torch_dcp is the torch.distributed.checkpoint format.')
     group.add_argument('--ckpt-convert-format', default=None,
                        choices=['torch', 'torch_dist', 'zarr'],
                        help='Checkpoint format for conversion.')

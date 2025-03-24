@@ -6,8 +6,11 @@ from collections.abc import Iterable
 
 from megatron.core.device_utils import get_current_device
 import torch
+import warnings
 
-from megatron.core import InferenceParams, mpu
+from megatron.core import mpu
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args
 
 from .communication import recv_from_prev_pipeline_rank_, send_to_next_pipeline_rank
@@ -18,16 +21,18 @@ class ForwardStep:
     We use a class here to hide the inference parameters
     from the outside caller."""
 
-    def __init__(self, model, max_batch_size, max_sequence_length):
+    def __init__(
+        self,
+        model: MegatronModule,
+        inference_context: BaseInferenceContext,
+    ):
         """Set values so we don't need to do it multiple times."""
         # Make sure model is in eval mode.
         assert not isinstance(model, Iterable), \
             'interleaving schedule is not supported for inference'
         model.eval()
         self.model = model
-        # Initialize inference parameters.
-        self.inference_params = InferenceParams(max_batch_size,
-                                                max_sequence_length)
+        self.inference_context = inference_context
         # Pipelining arguments.
         args = get_args()
         self.pipeline_size_larger_than_one = (
@@ -36,11 +41,21 @@ class ForwardStep:
         self.pipelining_batch_x_seqlen = \
             args.inference_batch_times_seqlen_threshold
 
+    @property
+    def inference_params(self):
+        warnings.warn("`inference_params` renamed to `inference_context`, and will be removed in `megatron-core` 0.13.")
+        return self.inference_context
+
+    @inference_params.setter
+    def inference_params(self, value):
+        warnings.warn("`inference_params` renamed to `inference_context`, and will be removed in `megatron-core` 0.13.")
+        self.inference_context = value
+
     def _forward(self, tokens, position_ids, attention_mask):
-        return self.model(tokens, position_ids, attention_mask, inference_params=self.inference_params)
+        return self.model(tokens, position_ids, attention_mask, inference_context=self.inference_context)
 
     def __call__(self, tokens, position_ids, attention_mask, recv_buffer_seq_length=None):
-        """Invocation of the forward methods. Note that self.inference_params
+        """Invocation of the forward methods. Note that self.inference_context
         is being modified by the forward step."""
         # Pipelining case.
         # This runs only if current_batch_x_seqlen > args.inference_batch_times_seqlen_threshold
@@ -102,7 +117,7 @@ class ForwardStep:
         output_tensor = self._forward_step_helper(tokens, position_ids,
                                                   attention_mask, recv_buffer=recv_buffer)
         # Update the sequence length offset.
-        self.inference_params.sequence_len_offset += tokens.size(1)
+        self.inference_context.sequence_len_offset += tokens.size(1)
 
         logits = None
         if mpu.is_pipeline_last_stage():
@@ -147,7 +162,7 @@ class ForwardStep:
             output = self._forward_step_helper(tokens2use, position_ids2use, attention_mask, recv_buffer=recv_buffer)
 
             # Adjust the batch size offset to account for the micro-batch.
-            self.inference_params.batch_size_offset += this_micro_batch_size
+            self.inference_context.batch_size_offset += this_micro_batch_size
 
             # Copy logits.
             if mpu.is_pipeline_last_stage():
@@ -155,9 +170,9 @@ class ForwardStep:
 
         # Once we are done with all the micro-batches, we can
         # adjust the sequence length offset.
-        self.inference_params.sequence_len_offset += tokens.size(1)
+        self.inference_context.sequence_len_offset += tokens.size(1)
         # and reset the batch size offset
-        self.inference_params.batch_size_offset = 0
+        self.inference_context.batch_size_offset = 0
 
         return logits
 

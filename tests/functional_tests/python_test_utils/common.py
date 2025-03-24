@@ -166,11 +166,6 @@ def read_tb_logs_as_list(
             values=values,
         )
 
-    # for metric_name, golden_value in golden_values.items():
-    #     logger.info(
-    #         f"Extracted {golden_value.end_step} values of {metric_name} from Tensorboard logs. Here are the sampled values: {golden_value.values}"
-    #     )
-
     return golden_values
 
 

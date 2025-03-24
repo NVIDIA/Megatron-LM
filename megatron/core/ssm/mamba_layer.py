@@ -13,10 +13,12 @@ from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecate_inference_params
 
 
 @dataclass
@@ -81,8 +83,10 @@ class MambaLayer(MegatronModule):
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,  # Not used in MambaLayer
-        inference_params=None,
-        rotary_pos_emb: Tensor = None,  # Not used in MambaLayer
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -94,12 +98,15 @@ class MambaLayer(MegatronModule):
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
             attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
-            inference_params (object, optional): Parameters for inference-time optimizations.
+            inference_context (BaseInferenceContext, optional): Parameters for inference-time
+                optimizations.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
         if self.residual_in_fp32:
@@ -108,7 +115,7 @@ class MambaLayer(MegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = self.norm(hidden_states)
 
-        mixer_out_with_bias = self.mixer(hidden_states, inference_params=inference_params)
+        mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
 
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mamba_bda(self.training, self.config.bias_dropout_fusion)(

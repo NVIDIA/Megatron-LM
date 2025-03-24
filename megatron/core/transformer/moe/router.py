@@ -183,8 +183,9 @@ class TopKRouter(Router):
             expert_bias=self.expert_bias,
         )
 
-        if self.training:
+        if self.training and torch.is_grad_enabled():
             # Apply load balancing loss
+            # Skip auxiliary loss calculations when using torch.no_grad() or checkpointing.
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             aux_loss_func = partial(
                 switch_load_balancing_loss_func,
@@ -215,7 +216,7 @@ class TopKRouter(Router):
             expert_bias=self.expert_bias,
         )
 
-        if self.training:
+        if self.training and torch.is_grad_enabled():
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             aux_loss_func = partial(
                 sequence_load_balancing_loss_func,
@@ -276,7 +277,8 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """
-        if self.config.moe_z_loss_coeff is not None and self.training:
+        if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
+            # Skip Z loss calculations when using torch.no_grad() or checkpointing.
             moe_z_loss_coeff = (
                 self.config.moe_z_loss_coeff
                 / parallel_state.get_tensor_and_context_parallel_world_size()
