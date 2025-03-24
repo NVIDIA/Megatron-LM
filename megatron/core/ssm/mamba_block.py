@@ -295,6 +295,10 @@ class MambaStack(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        # Update the inference parameters with the current batch size in case it is variable
+        if inference_context and not self.training:
+            inference_context.current_batch_size = hidden_states.size(1)
+
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
