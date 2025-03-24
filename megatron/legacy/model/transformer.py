@@ -1764,8 +1764,11 @@ class ParallelTransformer(MegatronModule):
                     forward_kwargs = {
                         'encoder_output': encoder_output,
                         'enc_dec_attn_mask': enc_dec_attn_mask,
-                        'inference_context': inference_context,
                     }
+                    if self.transformer_impl == 'local':
+                        forward_kwargs['inference_context'] = inference_context
+                    else:
+                        forward_kwargs['inference_params'] = inference_context
 
                     if self.transformer_impl == 'transformer_engine':
                         forward_kwargs['is_first_microbatch'] = is_first_microbatch
