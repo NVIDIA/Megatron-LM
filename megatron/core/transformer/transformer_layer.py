@@ -257,6 +257,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 config.enable_cuda_graph and config.external_cuda_graph
             ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
             if config.enable_cuda_graph:
+                if not self.training:
+                    # Cudagraphs for inference are only enabled with the flash decoding kernel
+                    assert (
+                        self.config.flash_decode
+                    ), "--flash-decode is required to use CUDA graphs during inference"
                 self.cudagraph_manager = CudaGraphManager(config)
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
