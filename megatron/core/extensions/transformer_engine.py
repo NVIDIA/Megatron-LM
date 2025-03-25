@@ -1401,11 +1401,11 @@ try:
 
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
 
-    def te_parallel_cross_entropy(logits: torch.Tensor, labels: torch.Tensor):
+    def te_parallel_cross_entropy(
+        logits: torch.Tensor, labels: torch.Tensor, tp_group: torch.distributed.ProcessGroup
+    ):
         """Wrapper function for TE's Cross Entropy Loss kernel"""
-        return parallel_cross_entropy(
-            logits, labels, 0.0, False, get_tensor_model_parallel_group(check_initialized=False)
-        )
+        return parallel_cross_entropy(logits, labels, 0.0, False, tp_group)
 
 except ImportError:
 

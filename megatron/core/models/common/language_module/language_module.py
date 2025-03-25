@@ -84,11 +84,15 @@ class LanguageModule(MegatronModule):
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-                    loss = te_parallel_cross_entropy(logits, labels)
+                    loss = te_parallel_cross_entropy(
+                        logits, labels, parallel_state.get_tensor_model_parallel_group()
+                    )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels)
+                loss = fused_vocab_parallel_cross_entropy(
+                    logits, labels, parallel_state.get_tensor_model_parallel_group()
+                )
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 
