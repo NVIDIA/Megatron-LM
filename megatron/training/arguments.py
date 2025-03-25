@@ -29,10 +29,8 @@ from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
 
 
-def parse_args(extra_args_provider=None, ignore_unknown_args=False):
-    """Parse all arguments."""
-    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
-                                     allow_abbrev=False)
+def add_megatron_arguments(parser: argparse.ArgumentParser):
+    """"Add Megatron-LM arguments to the given parser."""
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
@@ -62,6 +60,15 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
+
+    return parser
+
+def parse_args(extra_args_provider=None, ignore_unknown_args=False):
+    """Parse all arguments."""
+    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
+                                     allow_abbrev=False)
+
+    parser = add_megatron_arguments(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
