@@ -121,6 +121,12 @@ class TransformerConfig(ModelParallelConfig):
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
 
+    short_factor: list[float] = None
+    """LongRoPE factors to use when seq_len <= original_seq_len"""
+
+    long_factor: list[float] = None
+    """LongRoPE factors to use when seq_len > original_seq_len"""
+
     window_size: Optional[Tuple[int, int]] = None
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
