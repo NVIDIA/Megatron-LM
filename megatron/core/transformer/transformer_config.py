@@ -491,6 +491,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    mrope_section: Optional[List[int]] = None
+    """ Multimodal rope section is for channel dimension of temporal, height and width 
+    in rope calculation. """
+
     use_custom_fsdp: bool = False
     """ Whether to use custom fsdp for training. """
 
