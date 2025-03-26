@@ -1,14 +1,10 @@
 import argparse
-import glob
 import json
-import os
-import re
 import subprocess
-import sys
 import nltk
 nltk.download("wordnet")
 
-from evaluate_mmmu import get_input_output_paths
+from .evaluate_mmmu import get_input_output_paths
 
 
 def convert_to_ocrbench_v2_format(input_path, groundtruth_path):

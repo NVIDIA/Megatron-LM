@@ -21,15 +21,17 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import import_module
 from megatron.inference.text_generation.mcore_engine_server import ModelInferenceWrapperServer, run_mcore_engine
-from megatron.inference.text_generation_server import MegatronServer
-from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training import get_model
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.inference.text_generation_server import MegatronServer
+from megatron.core.transformer import TransformerConfig
 
 
 def count_parameters_in_layer(model, layer_name):
@@ -56,7 +58,7 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
     args = get_args()
 
     print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(get_args())
+    config = core_transformer_config_from_args(args, TransformerConfig)
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 
@@ -86,7 +88,6 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
     for l in range(model.decoder.num_layers_per_pipeline_rank):
         layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
         print_rank_0(f" == params layer {l}: {layer_params}")
-
     return model
 
 

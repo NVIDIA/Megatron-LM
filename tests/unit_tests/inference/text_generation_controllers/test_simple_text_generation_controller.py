@@ -4,8 +4,7 @@ import random
 import string
 import time
 from argparse import Namespace
-from collections import OrderedDict
-import traceback
+from collections import OrderedDict, defaultdict
 from typing import Dict, List
 from unittest import mock
 
@@ -130,6 +129,30 @@ class TestTextGenerationController:
         assert torch.all(
             sampled_logits.cpu() == torch.ones(self.batch_size) * self.vocab_size - 1
         ), f"The sampled logits should all be {self.vocab_size} but its {sampled_logits}"
+
+        top_n_logprobs_dict = defaultdict(list)
+
+        class MockTokenizer:
+            def detokenize(self, inp):
+                return inp[0]
+
+        self.text_generation_controller.tokenizer = MockTokenizer()
+        last_token_logits_top_n_input = (
+            torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().to(device=get_current_device()) / 10
+        )
+        sampled_logits = self.text_generation_controller.sample_from_logits(
+            last_token_logits_top_n_input,
+            SamplingParams(top_k=1, top_n_logprobs=3),
+            self.vocab_size,
+            generation_started=torch.tensor([True] * self.batch_size),
+            top_n_logprobs_dict=top_n_logprobs_dict,
+        )
+
+        assert list(top_n_logprobs_dict[0][0].values()) == [
+            -2.3521223068237305,
+            -2.452122688293457,
+            -2.5521230697631836,
+        ]
 
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits, SamplingParams(top_k=2), self.vocab_size

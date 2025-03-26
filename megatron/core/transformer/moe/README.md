@@ -7,6 +7,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
   - Enable TP for MLA and DeepSeek-V3
   - Support aux-loss-free load balancing strategy
   - Support node-limited routing
+  - Support Multi-Token Prediction (MTP)
 - **Support DeepSeek's DeepEP for efficient token dispatching and combining**
 - Add fusion for token permutation and unpermutation
 - Support Uneven virtual pipeline parallel split
@@ -161,6 +162,18 @@ Note: The MoE model structure is defined through script arguments. All MoE-relat
 - DeepEP is particularly recommended for training large-scale, fine-grained MoE architectures such as DeepSeek-V3 and other advanced MoE models.
 - To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
 
+### CUDA Graph Support
+CUDA Graph functionality can be enabled through two options:
+
+1. `--enable-cuda-graph`: Automatically captures graphs during runtime (just-in-time)
+2. `--external-cuda-graph`: Requires manual graph capture before runtime (ahead-of-time)
+
+Note: These two options cannot be enabled simultaneously.
+
+For manual capture with `--external-cuda-graph`, refer to the `cuda_graph_capture()` and `cuda_graph_set_manual_hooks()` functions in `megatron/training/training.py`.
+
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for attention layers by setting `--cuda-graph-scope=attn`, while leaving MoE layers unmodified. Note that the `--cuda-graph-scope` parameter is only applicable when using `--external-cuda-graph` mode.
+
 ### MoE Related Arguments
 | Item | Description |
 | --- | --- |
@@ -179,7 +192,7 @@ Note: The MoE model structure is defined through script arguments. All MoE-relat
 | --expert-tensor-parallel-size | Degree of tensor model parallelism of expert layer. Default is same to --tensor-model-parallel-size. |
 | --moe-layer-freq | Frequency between MoE layers and Dense layers. Accepts either: 1) An integer N for 1:N ratio (one expert layer for every N-1 dense layers), 2) A string "N" for the same ratio, or 3) A string with Python list expression for custom patterns like `([1]*3+[0]*1)*3` which gives [1,1,1,0,1,1,1,0,1,1,1,0] where 1=expert layer and 0=dense layer. Examples: `([0]+[1]*23)` for 1 dense layer followed by 23 experts layers, `([1]*3+[0]*2)*2` for three expert layers followed by two dense layers, repeated twice. Default is 1. |
 | --moe-grouped-gemm | When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine. |
-| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
+| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2 and DeepSeekV3, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | --moe-router-dtype | Data type for routing computation and expert output weighted averaging. Options are 'fp32' and 'fp64'. This can improve numerical stability, particularly when using a large number of experts. The throughput/memory impact should be negligible when used with --moe-permute-fusion. Default is None (no dtype promotion). |
 | --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
 | --moe-router-score-function | Score function for MoE routing. Can be "softmax" or "sigmoid". Default is "softmax". |

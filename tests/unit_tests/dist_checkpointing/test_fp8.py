@@ -18,10 +18,21 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+    import transformer_engine  # pylint: disable=W0611
+
     HAVE_TE = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
+    # Transformer Engine not found
     HAVE_TE = False
+
+HAVE_TE_FLOAT8TENSOR = False
+try:
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
+
+    HAVE_TE_FLOAT8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # Float8Tensor not found
+    Float8Tensor = None
 
 @pytest.mark.skipif(not HAVE_TE, reason="Transormer Engine is required for fp8")
 class TestFP8:
@@ -33,7 +44,7 @@ class TestFP8:
         def get_ten(dtype: str = 'fp8'):
             if dtype == 'fp8':
                 return Float8Tensor.to_float8(
-                    torch.full((3,), Utils.rank, dtype=torch.bfloat16, device=get_current_device())
+                    torch.full((3,), Utils.rank, dtype=torch.bfloat16, device='cuda')
                 )
             elif dtype == 'bf16':
                 return torch.full((3,), Utils.rank, dtype=torch.bfloat16, device=get_current_device())
@@ -46,7 +57,7 @@ class TestFP8:
 
         # because of a bug in TE, with the cast broadcast fails
         if isinstance(ten, Float8Tensor):
-            ten = ten.from_float8()
+            ten = ten.dequantize()
         torch.distributed.broadcast(ten, src=src_rank)
         assert torch.all(ten == src_rank)
 
@@ -65,7 +76,7 @@ class TestFP8:
 
         def get_fp8_tensor(fill_val=1):
             return Float8Tensor.to_float8(
-                torch.full((3,), fill_val, dtype=torch.bfloat16, device=get_current_device())
+                torch.full((3,), fill_val, dtype=torch.bfloat16, device='cuda')
             )
 
         def get_state_dict(fill_val=1):

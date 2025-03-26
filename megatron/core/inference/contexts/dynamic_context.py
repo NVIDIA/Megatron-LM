@@ -19,12 +19,10 @@ except ModuleNotFoundError:
 
 
 from megatron.core import parallel_state
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
 from .base_context import BaseInferenceContext
-
 
 class ContextOverflowError(Exception):
     '''Base exception for when a new request would not fit.'''
@@ -421,6 +419,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Query tensor after applying rotary embeddings.
         """
+        # Import here to avoid circular dependency
+        from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
         n = self.padded_active_token_count
         query_seq_idx = self.token_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
@@ -440,6 +440,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Key tensor after applying rotary embeddings.
         """
+        # Import here to avoid circular dependency
+        from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
         n = self.padded_active_token_count
         key_seq_idx = self.token_to_kv_seq_idx[:n]
         key_emb = key_emb[key_seq_idx]

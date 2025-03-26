@@ -10,8 +10,10 @@ from megatron.training import get_args, get_tokenizer
 from megatron.core import mpu
 from megatron.training.utils import get_ltor_masks_and_position_ids
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.inference.contexts import StaticInferenceContext
 from .communication import (
     copy_from_last_to_first_pipeline_stage,
+    broadcast_tensor,
     broadcast_from_last_pipeline_stage,
     broadcast_from_last_to_first_pipeline_stage)
 from .forward_step import ForwardStep
@@ -52,7 +54,8 @@ def score_and_return_on_first_stage(model, tokens: torch.Tensor, lengths: torch.
         )
 
     # forward step.
-    forward_step = ForwardStep(model, batch_size, args.inference_max_seq_length)
+    inference_context = StaticInferenceContext(batch_size, args.inference_max_seq_length)
+    forward_step = ForwardStep(model, inference_context)
 
     # ===================
     # Pre-allocate memory
@@ -122,7 +125,8 @@ def generate_tokens_probs_and_return_on_first_stage(
         use_eod_token_for_early_termination=True,
         stop_on_double_eol=False,
         stop_on_eol=False,
-        prevent_newline_after_colon=True
+        prevent_newline_after_colon=True,
+        data_parallel=False
         ):
     """Main token generation function.
 
@@ -168,11 +172,12 @@ def generate_tokens_probs_and_return_on_first_stage(
         raise ValueError("Too many tokens.  " + str(max_sequence_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
 
     # forward step.
-    forward_step = forward_step(model, batch_size, args.inference_max_seq_length)
+    inference_context = StaticInferenceContext(batch_size, args.inference_max_seq_length)
+    forward_step = forward_step(model, inference_context)
 
     # Added termination_id to support the case that we want to terminate the
     # generation once that id is generated.
-    if hasattr(args, 'eos_id'):
+    if hasattr(args, 'eos_id') and args.eos_id:
         termination_id = args.eos_id
     elif hasattr(tokenizer, 'eod'):
         termination_id = tokenizer.eod
@@ -228,7 +233,7 @@ def generate_tokens_probs_and_return_on_first_stage(
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
 
-            if args.enable_cuda_graph:
+            if args.enable_cuda_graph and not prefill:
                 create_cudagraphs()
 
             if mpu.is_pipeline_last_stage():
@@ -302,8 +307,7 @@ def generate_tokens_probs_and_return_on_first_stage(
                     context_length + 1
                 is_generation_done = is_generation_done | done_token
                 done = torch.all(is_generation_done)
-            done = broadcast_from_last_pipeline_stage(1, torch.uint8,
-                                                      tensor=done)
+            done = broadcast_tensor(size=1, dtype=torch.uint8, tensor=done, data_parallel=data_parallel)
             if use_eod_token_for_early_termination and done:
                 break
 
@@ -344,7 +348,8 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
         raise ValueError("context length + tokens_to_generate too large")
 
     # forward step.
-    forward_step = forward_step(model, beam_size, final_sequence_length)
+    inference_context = StaticInferenceContext(beam_size, final_sequence_length)
+    forward_step = forward_step(model, inference_context)
 
     beam_hyp = BeamHypotheses(beam_size, length_penalty)
     best_batches = None

@@ -15,24 +15,33 @@ if [ -z ${QUANT_CFG} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}QUANT_CFG${WHITE} is not set (default: ${QUANT_CFG})!\n"
 fi
 
-if [ -z ${MLM_MODEL_CKPT} ]; then
-    printf "${MLM_ERROR} Variable ${PURPLE}MLM_MODEL_CKPT${WHITE} must be set!\n"
-    exit 1
-fi
-
 if [ -z ${MLM_QUANT_CKPT} ]; then
     MLM_QUANT_CKPT=${MLM_WORK_DIR}/${MLM_MODEL_CFG}_quant
     printf "${MLM_WARNING} Variable ${PURPLE}MLM_QUANT_CKPT${WHITE} is not set (default: ${MLM_QUANT_CKPT})!\n"
 fi
 
-${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
-    ${MODEL_ARGS} \
-    --tensor-model-parallel-size ${TP} \
-    --expert-model-parallel-size ${EP} \
-    --pipeline-model-parallel-size ${PP} \
-    --tokenizer-model ${TOKENIZER_MODEL} \
-    --load ${MLM_MODEL_CKPT} \
-    --save ${MLM_QUANT_CKPT} \
-    --export-quant-cfg ${QUANT_CFG} \
-    --references "${MLM_REF_LABEL}" \
-    ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
+if [ -z ${MLM_MODEL_CKPT} ]; then
+    ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
+        ${MODEL_ARGS} \
+        --tensor-model-parallel-size ${TP} \
+        --expert-model-parallel-size ${EP} \
+        --pipeline-model-parallel-size ${PP} \
+        --tokenizer-model ${TOKENIZER_MODEL} \
+	--pretrained-model-path ${HF_MODEL_CKPT} \
+        --save ${MLM_QUANT_CKPT} \
+        --export-quant-cfg ${QUANT_CFG} \
+        --references "${MLM_REF_LABEL}" \
+        ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
+else
+    ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
+        ${MODEL_ARGS} \
+        --tensor-model-parallel-size ${TP} \
+        --expert-model-parallel-size ${EP} \
+        --pipeline-model-parallel-size ${PP} \
+        --tokenizer-model ${TOKENIZER_MODEL} \
+        --load ${MLM_MODEL_CKPT} \
+        --save ${MLM_QUANT_CKPT} \
+        --export-quant-cfg ${QUANT_CFG} \
+        --references "${MLM_REF_LABEL}" \
+        ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
+fi

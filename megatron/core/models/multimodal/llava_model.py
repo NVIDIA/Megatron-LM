@@ -51,52 +51,6 @@ IMAGE_TOKEN = "<image>"
 VIDEO_TOKEN = "<video>"
 
 
-class _get_data_on_this_cp_rank(torch.autograd.Function):
-    """Performs sharding for Context Parallelism in THD format
-
-    In the forward pass, indices are selected for each CP rank and remaining tokens are dropped.
-    In the backward pass, this class takes care of managing gradients for dropped tokens on each
-    CP rank.
-    """
-
-    @staticmethod
-    def forward(ctx, batch, packed_seq_params):
-        """Context Parallelism forward support for THD format"""
-        cp_size = get_context_parallel_world_size()
-        cp_rank = get_context_parallel_rank()
-        for key, data in batch.items():
-            index = tex.thd_get_partitioned_indices(
-                packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
-            )
-            if key == "combined_embeddings":
-                ctx.decoder_emb_index = index
-                ctx.decoder_emb_seqlen = data.size(1)
-            batch[key] = data.index_select(1, index)
-            batch[key].requires_grad = data.requires_grad
-
-        return batch
-
-    @staticmethod
-    def backward(ctx, grad_out, grad_label, grad_loss):
-        """Context Parallelism backward support for THD format"""
-        seqlen = ctx.decoder_emb_seqlen
-        index = ctx.decoder_emb_index
-        assert grad_out.size(1) == index.size(
-            0
-        ), f"Shape mismatch in incoming gradient {grad_out.shape} and \
-                index from THD CP sharding {index.shape}"
-        grad_in = torch.zeros(
-            grad_out.size(0),
-            seqlen,
-            *grad_out.size()[2:],
-            dtype=grad_out.dtype,
-            device=grad_out.device,
-        )
-        grad_in[:, ctx.decoder_emb_index, :] = grad_out
-
-        return (grad_in, None, None, None)
-
-
 # Note: This is under development and may be missing features.
 class LLaVAModel(MegatronModule):
     """LLaVA multi-modal model.
@@ -719,7 +673,13 @@ class LLaVAModel(MegatronModule):
                     "1.10.0"
                 ), "Please update Transformer Engine to >= 1.10 to use \
                     Context Parallel with THD format data"
-                batch = _get_data_on_this_cp_rank.apply(batch, packed_seq_params)
+                cp_size = get_context_parallel_world_size()
+                cp_rank = get_context_parallel_rank()
+                for key, data in batch.items():
+                    index = tex.thd_get_partitioned_indices(
+                        packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
+                    )
+                    batch[key] = data.index_select(1, index)
 
             if self.pre_process:
                 combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]

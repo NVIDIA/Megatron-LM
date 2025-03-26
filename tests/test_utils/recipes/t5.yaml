@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}'
+  name: "{test_case}_{environment}"
   model: t5
   build: mcore-pyt-{environment}
   nodes: 1
@@ -102,7 +102,7 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [t5_220m_mr_mcore_te_tp2_pp2_frozen_resume_torch_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
+  # - test_case: [t5_220m_mr_mcore_te_tp2_pp2_frozen_resume_torch_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]

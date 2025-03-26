@@ -24,27 +24,6 @@ pixel_statistics = {
 }
 
 
-class ImageTransform:
-    """Image transformation."""
-
-    def __init__(self, input_size, vision_model_type):
-        self._transform = _build_transform(input_size, vision_model_type)
-        self._vision_model_type = vision_model_type
-
-    def __call__(self, img, img_h, img_w, use_tiling=False, max_num_tiles=1, use_thumbnail=False, augment=False, find_closest_aspect_ratio_fn=find_closest_aspect_ratio):
-        assert not augment, "Image augmentation not implemented."
-        if use_tiling:
-            assert img_h == img_w, "dynamic tiling expects equal tile height and width"
-            imgs = dynamic_preprocess(
-                img, min_num=1, max_num=max_num_tiles, image_size=img_h, use_thumbnail=use_thumbnail,
-                find_closest_aspect_ratio_fn=find_closest_aspect_ratio_fn)
-            imgs = [self._transform(img) for img in imgs]
-        else:
-            imgs = [self._transform(img)]
-
-        return imgs
-
-
 # From https://github.com/OpenGVLab/InternVL/blob/c62fa4f7c850165d7386bdc48ac6bc5a6fab0864/internvl_chat/internvl/train/dataset.py#L685
 # Copyright (c) 2023 OpenGVLab.
 def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
@@ -79,6 +58,27 @@ def find_closest_area_weighted_aspect_ratio(aspect_ratio, target_ratios, width, 
             best_factor = factor_based_on_area_n_ratio
             best_ratio = ratio
     return best_ratio
+
+
+class ImageTransform:
+    """Image transformation."""
+
+    def __init__(self, input_size, vision_model_type):
+        self._transform = _build_transform(input_size, vision_model_type)
+        self._vision_model_type = vision_model_type
+
+    def __call__(self, img, img_h, img_w, use_tiling=False, max_num_tiles=1, use_thumbnail=False, augment=False, find_closest_aspect_ratio_fn=find_closest_aspect_ratio):
+        assert not augment, "Image augmentation not implemented."
+        if use_tiling:
+            assert img_h == img_w, "dynamic tiling expects equal tile height and width"
+            imgs = dynamic_preprocess(
+                img, min_num=1, max_num=max_num_tiles, image_size=img_h, use_thumbnail=use_thumbnail,
+                find_closest_aspect_ratio_fn=find_closest_aspect_ratio_fn)
+            imgs = [self._transform(img) for img in imgs]
+        else:
+            imgs = [self._transform(img)]
+
+        return imgs
 
 
 # From https://github.com/OpenGVLab/InternVL/blob/c62fa4f7c850165d7386bdc48ac6bc5a6fab0864/internvl_chat/internvl/train/dataset.py#L702

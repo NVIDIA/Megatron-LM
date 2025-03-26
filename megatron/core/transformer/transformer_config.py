@@ -7,6 +7,7 @@ from typing import Callable, List, Optional, Tuple, Union
 from megatron.core.device_utils import get_xla_model
 import torch.nn.functional as F
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.enums import AttnBackend
 
 from ..model_parallel_config import ModelParallelConfig
@@ -24,8 +25,15 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # model architecture
     ####################
+
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
+
+    mtp_num_layers: Optional[int] = None
+    """Number of Multi-Token Prediction (MTP) Layers."""
+
+    mtp_loss_scaling_factor: Optional[float] = None
+    """Weighting factor of Multi-Token Prediction (MTP) loss."""
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
     """Number of transformer layers on first pipeline stage. 
@@ -230,6 +238,11 @@ class TransformerConfig(ModelParallelConfig):
     choices (1) 'e4m3' uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
 
+    fp8_recipe: Optional[str] = "delayed"
+    """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
+    choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
+    uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only"""
+
     fp8_margin: int = 0
     """Margin for the scaling factor computation."""
 
@@ -261,6 +274,17 @@ class TransformerConfig(ModelParallelConfig):
     tp_only_amax_red: bool = False
     """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
 
+    first_last_layers_bf16: bool = False
+    """If True, retains first and last N TransformerBlocks in BF16 as opposed to FP8."""
+
+    num_layers_at_start_in_bf16: int = 1
+    """Number of layers at the start of the model to keep in BF16 precision when
+    first_last_layers_bf16 is True."""
+
+    num_layers_at_end_in_bf16: int = 1
+    """Number of layers at the end of the model to keep in BF16 precision when
+    first_last_layers_bf16 is True."""
+
     ####################
     # MoE related
     ####################
@@ -283,10 +307,11 @@ class TransformerConfig(ModelParallelConfig):
     """MoE Feed-Forward Network hidden size"""
 
     moe_router_load_balancing_type: str = "aux_loss"
-    """The load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss 
-    used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the loss used in DeepSeekV2, 
-    which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing 
-    algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss"."""
+    """The load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss
+    used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used
+    in DeepSeekV2 and DeepSeekV3, which computes the loss for each individual sample; "sinkhorn"
+    corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing.
+    The default is "aux_loss"."""
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
@@ -300,8 +325,8 @@ class TransformerConfig(ModelParallelConfig):
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
-    2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
-    (specifically, the sum of top-2 expert scores within each group)
+    2. For each token, 'moe_router_group_topk' groups are selected based on sum of
+    top-('moe_router_num_groups'/'moe_router_group_topk') routing scores within each group
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
@@ -316,7 +341,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
+    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection.
     By default, softmax is done after top-k."""
 
     moe_router_topk_scaling_factor: Optional[float] = None
@@ -440,6 +465,11 @@ class TransformerConfig(ModelParallelConfig):
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
+    cuda_graph_scope: str = "full"
+    """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
+    capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
+    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
+
     ####################
     # miscellaneous
     ####################
@@ -464,6 +494,18 @@ class TransformerConfig(ModelParallelConfig):
 
     use_custom_fsdp: bool = False
     """ Whether to use custom fsdp for training. """
+
+    is_hybrid_model: bool = False
+    """ Indicates whether this is a hybrid model. """
+
+    mamba_state_dim: int = 128
+    """The dimensionality of the state representation in Mamba layers."""
+
+    mamba_head_dim: int = 64
+    """The dimensionality of the heads in the Mamba layers."""
+
+    mamba_num_groups: int = 8
+    """The number of groups used in Mamba layers."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -516,6 +558,37 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_query_groups ({self.num_query_groups}) must be a multiple of "
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
+
+        if self.fp8:
+            # cannot support first last layer bf16 with delayed scaling
+            if self.first_last_layers_bf16 and self.fp8_recipe == Fp8Recipe.delayed:
+                raise ValueError("Delayed scaling does not support first / last layer in BF16.")
+
+            # max bf16 layers per pipeline stage
+            max_bf16_layers_per_pipeline_stage = (
+                self.num_layers // self.pipeline_model_parallel_size
+            )
+
+            # check start/end bf16 layer counts are valid
+            if self.first_last_layers_bf16:
+                if (
+                    self.num_layers_at_start_in_bf16 < 0
+                    or self.num_layers_at_start_in_bf16 > max_bf16_layers_per_pipeline_stage
+                ):
+                    raise ValueError(
+                        f"num_layers_at_start_in_bf16 ({self.num_layers_at_start_in_bf16}) must be "
+                        f"between 0 and number of layers per pipeline stage "
+                        f"({max_bf16_layers_per_pipeline_stage})."
+                    )
+                if (
+                    self.num_layers_at_end_in_bf16 < 0
+                    or self.num_layers_at_end_in_bf16 > max_bf16_layers_per_pipeline_stage
+                ):
+                    raise ValueError(
+                        f"num_layers_at_end_in_bf16 ({self.num_layers_at_end_in_bf16}) must be "
+                        f"between 0 and number of layers per pipeline stage "
+                        f"({max_bf16_layers_per_pipeline_stage})."
+                    )
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
@@ -701,18 +774,18 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
             if self.virtual_pipeline_model_parallel_size is None:
-                pipeline_parallel_size = self.pipeline_model_parallel_size
+                num_layers = self.num_layers
 
                 if self.account_for_embedding_in_pipeline_split:
-                    pipeline_parallel_size -= 1
+                    num_layers += 1
 
                 if self.account_for_loss_in_pipeline_split:
-                    pipeline_parallel_size -= 1
+                    num_layers += 1
 
-                if not self.num_layers % pipeline_parallel_size == 0:
+                if not num_layers % self.pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'number of middle layers: {self.num_layers} must be divisible by '
-                        f'middle pipeline_model_parallel_size {pipeline_parallel_size}'
+                        f'number of middle layers: {num_layers} must be divisible by '
+                        f'middle pipeline_model_parallel_size {self.pipeline_model_parallel_size}'
                     )
             else:
                 num_layers = self.num_layers
@@ -792,7 +865,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std, self.num_layers
+                self.init_method_std,
+                self.num_layers,
+                multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
 
         if (
@@ -860,9 +935,6 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
 
-        if self.flash_decode and self.fp8:
-            raise ValueError("FP8 inference is currently not support with flash decoding.")
-
         if self.enable_cuda_graph:
             if self.cpu_offloading:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
@@ -890,7 +962,7 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
 
-        if self.cp_comm_type is not None:
+        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "

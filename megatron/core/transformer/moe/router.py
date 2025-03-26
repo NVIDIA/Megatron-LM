@@ -125,6 +125,17 @@ class TopKRouter(Router):
             self.local_tokens_per_expert = None
             self.expert_bias = None
 
+    def _maintain_float32_expert_bias(self):
+        """
+        Maintain the expert bias in float32.
+
+        When using bf16/fp16, the expert bias gets converted to lower precision in Float16Module.
+        We keep it in float32 to avoid routing errors when updating the expert_bias.
+        """
+        if hasattr(self, 'expert_bias') and self.expert_bias is not None:
+            if self.expert_bias.dtype != torch.float32:
+                self.expert_bias.data = self.expert_bias.data.to(torch.float32)
+
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
 
@@ -158,11 +169,31 @@ class TopKRouter(Router):
         scores = logits * map
         return scores, map
 
-    def aux_loss_load_balancing(self, logits: torch.Tensor):
-        """Apply loss-based load balancing to the logits tensor.
+    def compute_routing_scores_for_aux_loss(self, logits: torch.Tensor) -> torch.Tensor:
+        """Compute routing scores based on the score function.
 
         Args:
-            logits (torch.Tensor): the logits tensor after gating, shape: [num_tokens, num_experts].
+            logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
+
+        Returns:
+            torch.Tensor: The normalized routing scores.
+        """
+        if self.score_function == "softmax":
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        elif self.score_function == "sigmoid":
+            scores = torch.sigmoid(logits)
+            scores = (
+                scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.topk > 1 else scores
+            )
+        else:
+            raise ValueError(f"Invalid score_function: {self.score_function}")
+        return scores
+
+    def aux_loss_load_balancing(self, logits: torch.Tensor):
+        """Apply auxiliary loss-based load balancing to the logits tensor.
+
+        Args:
+            logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -184,9 +215,9 @@ class TopKRouter(Router):
         )
 
         if self.training and torch.is_grad_enabled():
-            # Apply load balancing loss
+            # Apply auxiliary load balancing loss
             # Skip auxiliary loss calculations when using torch.no_grad() or checkpointing.
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            scores = self.compute_routing_scores_for_aux_loss(logits)
             aux_loss_func = partial(
                 switch_load_balancing_loss_func,
                 probs=scores,
@@ -199,7 +230,17 @@ class TopKRouter(Router):
         return probs, routing_map
 
     def seq_aux_loss_load_balancing(self, logits: torch.Tensor, bsz: int, seq_length: int):
-        """Apply loss-based load balancing to the logits tensor."""
+        """Apply sequence-auxiliary loss-based load balancing to the logits tensor.
+
+        Args:
+            logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
+            bsz (int): The batch size.
+            seq_length (int): The sequence length.
+
+        Returns:
+            probs (torch.Tensor): The probabilities of token to experts assignment.
+            routing_map (torch.Tensor): The mask of token to experts assignment.
+        """
 
         probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
             logits,
@@ -217,7 +258,8 @@ class TopKRouter(Router):
         )
 
         if self.training and torch.is_grad_enabled():
-            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            # Apply sequence-auxiliary load balancing loss
+            scores = self.compute_routing_scores_for_aux_loss(logits)
             aux_loss_func = partial(
                 sequence_load_balancing_loss_func,
                 probs=scores,
@@ -370,6 +412,7 @@ class TopKRouter(Router):
         Args:
             input (torch.Tensor): Input tensor.
         """
+        self._maintain_float32_expert_bias()
 
         # Apply input jitter
         input = self.apply_input_jitter(input)

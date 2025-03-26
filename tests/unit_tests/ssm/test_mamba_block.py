@@ -9,9 +9,9 @@ from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
@@ -66,11 +66,11 @@ class TestMambaBlock:
         block = self.get_mamba_block(hybrid_override_pattern)
         layers = block.layers
         # Note that this matches the order specified by hybrid_override_pattern in setup_method
-        assert type(layers[0]) == MambaLayer
-        assert type(layers[1]) == TransformerLayer
-        assert type(layers[1].self_attention) == SelfAttention
-        assert type(layers[2]) == TransformerLayer
-        assert type(layers[2].mlp) == MLP
+        assert isinstance(layers[0], MambaLayer)
+        assert isinstance(layers[1], TransformerLayer)
+        assert isinstance(layers[1].self_attention, SelfAttention)
+        assert isinstance(layers[2], TransformerLayer)
+        assert isinstance(layers[2].mlp, MLP)
 
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = '+'

@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -168,7 +169,8 @@ def set_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and decoder is not None:
-        decoder.current_microbatch = microbatch_id
+        for layer in decoder.layers:
+            layer.current_microbatch = microbatch_id
 
 
 def forward_step(
@@ -311,10 +313,24 @@ def forward_step(
         loss_scale = (
             config.grad_scale_func(torch.ones(1, device=output_tensor.device))
             if config.grad_scale_func is not None
-            else torch.tensor(1.0)
+            else torch.ones(1, device=output_tensor.device)
         )
         # Set the loss scale
         MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for Multi-Token Prediction (MTP) loss.
+    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MTPLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # If T5 model and in decoder stack, then send encoder_hidden_state
     # downstream as well.
@@ -365,10 +381,16 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
 
-    if config.deallocate_pipeline_outputs:
-        custom_backward(output_tensor[0], output_tensor_grad[0])
-    else:
-        torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+    # In multi-modal models like VLM, some batches may not have images.
+    # When no image is present, the vision encoder (as a separate pipeline stage)
+    # will not participate in the computation.
+    # This results in a tensor that does not require gradients.
+    # In such cases, we intentionally skip the backward pass while preserving zero gradients.
+    if output_tensor[0].requires_grad:
+        if config.deallocate_pipeline_outputs:
+            custom_backward(output_tensor[0], output_tensor_grad[0])
+        else:
+            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -547,6 +569,104 @@ def finish_embedding_wgrad_compute(config, embedding_module):
         )
 
 
+def get_pp_rank_microbatches(
+    num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage, forward_only=False
+):
+    """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
+    pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+    pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
+    virtual_pipeline_parallel_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+
+    total_num_microbatches = num_microbatches * num_model_chunks
+    are_all_microbatches_in_warmup = False
+
+    if forward_only:
+        num_warmup_microbatches = total_num_microbatches
+    elif pipeline_parallel_size > 1:
+        if virtual_pipeline_parallel_size is None:
+            # forward_backward_pipelining_without_interleaving
+            num_warmup_microbatches = pipeline_parallel_size - pipeline_parallel_rank - 1
+        else:
+            # forward_backward_pipelining_with_interleaving
+            # Run (num_model_chunks-1)*microbatch_group_size_per_vp_stage on
+            # all workers, followed by more microbatches after depending on
+            # stage ID (more forward passes for earlier stages, later stages can
+            # immediately start with 1F1B).
+            num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
+            num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+    else:
+        # forward_backward_no_pipelining
+        num_warmup_microbatches = 1
+
+    if num_warmup_microbatches >= total_num_microbatches:
+        num_warmup_microbatches = total_num_microbatches
+        are_all_microbatches_in_warmup = True
+    num_microbatches_remaining = total_num_microbatches - num_warmup_microbatches
+
+    return (
+        total_num_microbatches,
+        are_all_microbatches_in_warmup,
+        num_warmup_microbatches,
+        num_microbatches_remaining,
+    )
+
+
+def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
+    """Get the schedule table for PP scheduling."""
+    schedule_table = []
+    for min_microbatch_id_in_group in range(
+        0, num_microbatches, microbatch_group_size_per_vp_stage
+    ):
+        if min_microbatch_id_in_group + microbatch_group_size_per_vp_stage >= num_microbatches:
+            # Construct schedule for the last microbatch group
+            schedule_table.extend(
+                [
+                    (microbatch_id, model_chunk_id)
+                    for model_chunk_id in range(num_model_chunks)
+                    for microbatch_id in range(min_microbatch_id_in_group, num_microbatches)
+                ]
+            )
+        else:
+            # Construct schedule for other microbatch groups
+            schedule_table.extend(
+                [
+                    (microbatch_id, model_chunk_id)
+                    for model_chunk_id in range(num_model_chunks)
+                    for microbatch_id in range(
+                        min_microbatch_id_in_group,
+                        min_microbatch_id_in_group + microbatch_group_size_per_vp_stage,
+                    )
+                ]
+            )
+    return schedule_table
+
+
+def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
+    """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
+    order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
+    virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
+    microbatch_id         | 0 1 2 0 1 2 3 4 3 4
+    model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
+
+    Then the forward backward separated order is:
+    forward               | 1 1 1 2 2 2 1 1 2 2
+    backward              | -2 -2 -2 -1 -1 -1 -2 -2 -1 -1
+
+    If num_warmup_microbatches is 5, the output order is:
+    1 1 1 2 2 2 -2 1 -2 1 -2 2 -1 2 -1 -1 -2 -2 -1 -1
+    """
+    _, model_chunk_id_table = zip(*schedule_table)
+    forward_order = [chunk_id + 1 for chunk_id in model_chunk_id_table]
+    backward_order = [chunk_id - num_model_chunks for chunk_id in model_chunk_id_table]
+    order = forward_order[:num_warmup_microbatches]
+    for i in range(num_warmup_microbatches, len(forward_order)):
+        order.append(forward_order[i])
+        order.append(backward_order[i - num_warmup_microbatches])
+    if num_warmup_microbatches > 0:
+        order.extend(backward_order[-num_warmup_microbatches:])
+    return order
+
+
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -643,6 +763,7 @@ def forward_backward_pipelining_with_interleaving(
     total_num_tokens = torch.tensor(0, dtype=torch.int).to(device=get_current_device())
 
     forward_data_store = []
+    output_tensor_grads = None
     if not forward_only:
         output_tensor_grads = [[] for _ in range(len(model))]
     else:
@@ -689,23 +810,14 @@ def forward_backward_pipelining_with_interleaving(
 
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
-    total_num_microbatches = num_microbatches * num_model_chunks
-    all_warmup_microbatches = False
-    if forward_only:
-        num_warmup_microbatches = total_num_microbatches
-    else:
-        # Run (num_model_chunks-1)*config.microbatch_group_size_per_vp_stage on
-        # all workers, followed by more microbatches after depending on
-        # stage ID (more forward passes for earlier stages, later stages can
-        # immediately start with 1F1B).
-        num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
-        num_warmup_microbatches += (
-            num_model_chunks - 1
-        ) * config.microbatch_group_size_per_vp_stage
-        if num_warmup_microbatches >= total_num_microbatches:
-            num_warmup_microbatches = total_num_microbatches
-            all_warmup_microbatches = True
-    num_microbatches_remaining = total_num_microbatches - num_warmup_microbatches
+    (
+        total_num_microbatches,
+        are_all_microbatches_in_warmup,
+        num_warmup_microbatches,
+        num_microbatches_remaining,
+    ) = get_pp_rank_microbatches(
+        num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage, forward_only
+    )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
@@ -731,34 +843,9 @@ def forward_backward_pipelining_with_interleaving(
     # virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
     # microbatch_id         | 0 1 2 0 1 2 3 4 3 4
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
-    schedule_table = []
-    for min_microbatch_id_in_group in range(
-        0, num_microbatches, config.microbatch_group_size_per_vp_stage
-    ):
-        if (
-            min_microbatch_id_in_group + config.microbatch_group_size_per_vp_stage
-            >= num_microbatches
-        ):
-            # Construct schedule for the last microbatch group
-            schedule_table.extend(
-                [
-                    (microbatch_id, model_chunk_id)
-                    for model_chunk_id in range(len(model))
-                    for microbatch_id in range(min_microbatch_id_in_group, num_microbatches)
-                ]
-            )
-        else:
-            # Construct schedule for other microbatch groups
-            schedule_table.extend(
-                [
-                    (microbatch_id, model_chunk_id)
-                    for model_chunk_id in range(len(model))
-                    for microbatch_id in range(
-                        min_microbatch_id_in_group,
-                        min_microbatch_id_in_group + config.microbatch_group_size_per_vp_stage,
-                    )
-                ]
-            )
+    schedule_table = get_schedule_table(
+        num_microbatches, len(model), config.microbatch_group_size_per_vp_stage
+    )
 
     # Decouple individual lookup table for microbatch_id and model_chunk_id.
     # For example, the micro-batch table for PP2 N3M5 with VP2 is
@@ -946,6 +1033,7 @@ def forward_backward_pipelining_with_interleaving(
             enable_grad_sync()
             synchronized_model_chunks.add(model_chunk_id)
 
+        # pylint: disable=E0606
         if parallel_state.is_pipeline_last_stage():
             if len(output_tensor_grads[model_chunk_id]) == 0:
                 output_tensor_grads[model_chunk_id].append(None)
@@ -1064,7 +1152,7 @@ def forward_backward_pipelining_with_interleaving(
                 k == (num_warmup_microbatches - 1)
                 and not config.overlap_p2p_comm
                 and not forward_only
-                and not all_warmup_microbatches
+                and not are_all_microbatches_in_warmup
             ):
                 input_tensor_grad = None
                 recv_next = True
@@ -1128,7 +1216,7 @@ def forward_backward_pipelining_with_interleaving(
             if (
                 k == (num_warmup_microbatches - 1)
                 and not forward_only
-                and not all_warmup_microbatches
+                and not are_all_microbatches_in_warmup
             ):
                 input_tensor_grad = None
                 recv_next = True
@@ -1356,7 +1444,7 @@ def forward_backward_pipelining_with_interleaving(
             for bwd_wait_handle in bwd_wait_handles.values():
                 bwd_wait_handle.wait()
 
-        if all_warmup_microbatches:
+        if are_all_microbatches_in_warmup:
             output_tensor_grads[num_model_chunks - 1].append(
                 p2p_communication.recv_backward(tensor_shape, config=config)
             )

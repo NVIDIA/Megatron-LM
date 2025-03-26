@@ -20,6 +20,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.models.mamba import MambaModel
 from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -55,7 +56,7 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
     args = get_args()
 
     print_rank_0('building Mamba model ...')
-    config = core_transformer_config_from_args(get_args())
+    config = core_transformer_config_from_args(args, TransformerConfig)
 
     assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
 

@@ -150,7 +150,7 @@ class TestPipelineParallelTransformerBlock:
     @pytest.mark.skip("Test is broken")
     @pytest.mark.parametrize(
         "num_layers, pipeline_model_parallel_size, virtual_pipeline_model_parallel_size, "
-        "include_embedding_in_pipeline_split, include_loss_in_pipeline_split, "
+        "account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split, "
         "first_pipeline_num_layers, last_pipeline_num_layers, should_assert_error",
         [
             # Last pipeline stage has specified layers
@@ -190,15 +190,13 @@ class TestPipelineParallelTransformerBlock:
             (4, 4, 4, False, False, None, None, True),
         ],
     )
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_layer_builder(
         self,
         num_layers,
         pipeline_model_parallel_size,
         virtual_pipeline_model_parallel_size,
-        include_embedding_in_pipeline_split,
-        include_loss_in_pipeline_split,
+        account_for_embedding_in_pipeline_split,
+        account_for_loss_in_pipeline_split,
         first_pipeline_num_layers,
         last_pipeline_num_layers,
         should_assert_error,
@@ -216,10 +214,10 @@ class TestPipelineParallelTransformerBlock:
                 num_layers=num_layers,
                 pipeline_model_parallel_size=pipeline_model_parallel_size,
                 virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
-                include_embedding_in_pipeline_split=include_embedding_in_pipeline_split,
-                include_loss_in_pipeline_split=include_loss_in_pipeline_split,
-                first_pipeline_num_layers=first_pipeline_num_layers,
-                last_pipeline_num_layers=last_pipeline_num_layers,
+                account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
+                account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
+                num_layers_in_first_pipeline_stage=first_pipeline_num_layers,
+                num_layers_in_last_pipeline_stage=last_pipeline_num_layers,
                 pipeline_dtype=torch.bfloat16,
                 hidden_size=128,
                 num_attention_heads=16,

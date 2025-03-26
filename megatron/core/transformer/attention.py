@@ -287,25 +287,30 @@ class Attention(MegatronModule, ABC):
             )
 
         if self.config.flash_decode:
+            rotary_pos_cos_q = None
+            rotary_pos_sin_q = None
+            rotary_pos_cos_k = None
+            rotary_pos_sin_k = None
+
             assert inference_context.is_static_batching()
-            assert (
-                rotary_pos_cos is not None and rotary_pos_sin is not None
-            ), "Flash decoding requires precomputed cos and sin tensors"
-            if inference_context.sequence_len_offset > 0:  # Decode phase, not prefill
+            if (
+                inference_context.sequence_len_offset > 0 and rotary_pos_cos
+            ):  # Decode phase, not prefill
                 rotary_pos_cos_q = rotary_pos_cos[sequence_end - 1 : sequence_end]
                 rotary_pos_sin_q = rotary_pos_sin[sequence_end - 1 : sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[sequence_end - 1 : sequence_end]
                 rotary_pos_sin_k = rotary_pos_sin[sequence_end - 1 : sequence_end]
-            else:  # Prefill
+            elif rotary_pos_cos is not None:  # Prefill
                 rotary_pos_cos_q = rotary_pos_cos[:sequence_end]
                 rotary_pos_sin_q = rotary_pos_sin[:sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[:sequence_end]
                 rotary_pos_sin_k = rotary_pos_sin[:sequence_end]
 
             # Flash Decoding assumes that the keys stored in the KV Cache already have RoPE applied.
-            # Apply RoPE before we store the keys to make it compatible with flash decoding kernel.
-            key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos_k, rotary_pos_sin_k)
-            query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos_q, rotary_pos_sin_q)
+            # Apply RoPE before we store the keys to make it compatible with flash decoding kernel
+            if rotary_pos_sin_q is not None and rotary_pos_sin_k is not None:
+                key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos_k, rotary_pos_sin_k)
+                query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos_q, rotary_pos_sin_q)
         else:
             rotary_pos_cos_q = None
             rotary_pos_sin_q = None
@@ -511,7 +516,7 @@ class Attention(MegatronModule, ABC):
             ), "Internal use only: install package `nvidia_chunked_flash_attn`."
 
         # hidden_states: [sq, b, h]
-        if self.config.flash_decode and not self.training:
+        if self.config.flash_decode and not self.training and inference_params is not None:
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -592,9 +597,6 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
-
-            # todo: @vkorthikanti, okay to remove assert?
-            assert cu_seqlens_q == None and cu_seqlens_kv == None
 
             if q_pos_emb is not None:
                 # TODO VIJAY: simplify

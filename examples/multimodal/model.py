@@ -75,8 +75,8 @@ def model_provider(
     vision_model_type = args.vision_model_type
 
     base_config = core_transformer_config_from_args(get_args())
-    base_config.language_model_type = language_model_type
-    base_config.vision_model_type = vision_model_type
+    base_config.language_model_type = args.language_model_type
+    base_config.vision_model_type = args.vision_model_type
     base_config.calculate_per_token_loss = True
 
     language_config = deepcopy(base_config)

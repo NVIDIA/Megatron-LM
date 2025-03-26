@@ -125,7 +125,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
 
         num_image_tokens = torch.sum(tokens == image_token_index).item()
-        num_image_embeddings = num_image_tokens * img_seq_len - num_image_tokens
+        num_image_embeddings = img_seq_len * imgs.shape[0] - num_image_tokens
         seq_len = text_length + num_image_embeddings
 
         # CP expects sequence length is divisible by CP size so apply padding.
@@ -201,6 +201,7 @@ def scaled_loss_func(loss_mask, output_tensor):
 
     Where we use the loss mask to infer the start / end of the conversation turns.
     """
+    args = get_args()
     losses = output_tensor.float()
 
     loss_list = []
@@ -222,18 +223,31 @@ def scaled_loss_func(loss_mask, output_tensor):
         # normalize loss for each turn
         loss_list[idx] = loss_list[idx] * math.sqrt(num_valid_labels_list[idx]) / base_num
 
-    total_loss = torch.stack(loss_list).sum()
-    total_tokens = torch.ones_like(total_loss)
+    # Some ranks may not get loss tokens due to Context Parallel Sharding
+    if len(loss_list) > 0
+        total_loss = torch.stack(loss_list).sum()
+        total_tokens = torch.ones_like(total_loss)
+    elif len(loss_list) == 0 and args.context_parallel_size > 1:
+        total_tokens = loss_mask.sum()
+        total_loss = torch.sum(losses.view(-1) * loss_mask)
+    else:
+        raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
     return (
-        total_loss,
+        loss[0].clone(),
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )

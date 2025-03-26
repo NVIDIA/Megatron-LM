@@ -6,10 +6,12 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional, Union
 
+import torch
 from torch import Tensor, nn
 import torch
 
@@ -32,11 +34,13 @@ except ImportError:
     if torch.cuda.is_available():
         warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
    
-
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
 
@@ -60,8 +64,10 @@ def _init_weights(
             nn.init.normal_(module.weight, std=initializer_range)
 
         for name, p in module.named_parameters():
-            if name in ["in_proj.weight", "x_proj.weight", "conv1d.weight", "out_proj.weight"]:
+            if name in ["conv1d.weight", "out_proj.weight"]:
                 nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+            if name in ["in_proj.weight"]:
+                nn.init.normal_(p, mean=0.0, std=initializer_range)
 
         if rescale_prenorm_residual:
             # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
@@ -99,10 +105,8 @@ class MambaStack(MegatronModule):
     Constructor for the MambaStack class.
 
     Args:
-        config (TransformerConfig): the transformer configuration
+        config (TransformerConfig): the model configuration
         submodules (MambaStackSubmodules): the submodules for the stack
-        mamba_ssm_ngroups (int, optional): the number of groups for the
-            MAMBA SSM. Defaults to 8.
         residual_in_fp32 (bool, optional): whether to do residual connections
             in fp32. Defaults to False.
         pre_process (bool, optional): whether to include an embedding layer.
@@ -125,7 +129,6 @@ class MambaStack(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaStackSubmodules,
-        mamba_ssm_ngroups: int = 8,
         residual_in_fp32=False,
         pre_process: bool = True,
         hybrid_attention_ratio: float = 0.0,
@@ -168,7 +171,6 @@ class MambaStack(MegatronModule):
                 layer = build_module(
                     submodules.mamba_layer,
                     config=self.config,
-                    mamba_ssm_ngroups=mamba_ssm_ngroups,
                     residual_in_fp32=residual_in_fp32,
                     layer_number=i + 1 + pp_layer_offset,
                 )
@@ -195,7 +197,13 @@ class MambaStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        self.apply(partial(_init_weights, n_layer=self.config.num_layers))
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=self.config.num_layers,
+                initializer_range=self.config.init_method_std,
+            )
+        )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -280,19 +288,57 @@ class MambaStack(MegatronModule):
             inference_context.max_seqlen = inference_context.max_sequence_length
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                attention_mask,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
+        if (
+            (self.config.enable_cuda_graph or self.config.flash_decode)
+            and inference_context
+            and inference_context.is_static_batching()
+            and not self.training
+        ):
+            sequence_len_offset = torch.tensor(
+                [inference_context.sequence_len_offset] * inference_context.current_batch_size,
+                dtype=torch.int32,
+                device='cuda',
             )
+        else:
+            sequence_len_offset = None
 
-            # The attention layer (currently a simplified transformer layer)
-            # outputs a tuple of (hidden_states, context). Context is intended
-            # for cross-attention, and is not needed in our model.
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[0]
+        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
+        # otherwise do nothing extra at the outer level
+        # if we are using other fp8 recipes, then the context manager enter&exit are free
+        # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
+        # control which layer will be fp8 or bf16
+        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+
+        with outer_fp8_context:
+            for layer in self.layers:
+                inner_fp8_context = (
+                    get_fp8_context(self.config, layer.layer_number - 1)
+                    if use_inner_fp8_context
+                    else nullcontext()
+                )
+                with inner_fp8_context:
+                    if isinstance(layer, TransformerLayer):
+                        hidden_states, _ = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                        )
+                    else:  # MambaLayer
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                        )
+
+                # The attention layer (currently a simplified transformer layer)
+                # outputs a tuple of (hidden_states, context). Context is intended
+                # for cross-attention, and is not needed in our model.
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

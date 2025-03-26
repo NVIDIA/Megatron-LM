@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+import contextlib
 from typing import List, Optional, Tuple
 
 from megatron.core.device_utils import get_current_device, get_xla_model
@@ -23,6 +24,7 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.moe.fused_a2a import fused_combine, fused_dispatch
 from megatron.core.transformer.moe.moe_utils import (
     get_capacity,
+    maybe_move_tensor_to_cpu,
     permute,
     sort_chunks_by_idxs,
     unpermute,
@@ -343,11 +345,20 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.capacity = None
 
         # A cuda stream synchronization is needed in self.token_permutation() in some cases,
-        # because there are several non-blocking DtoH data transfers called in self.preprocess().
-        # The synchronization happens at different points based on MoE settings as late as possible.
-        # Valid sync points are "before_permutation_1", "before_ep_alltoall", "before_finish",
-        # and "no_sync".
+        # because there are several non-blocking DtoH data transfers called at
+        # `self.cuda_dtoh_point`. The synchronization happens at `self.cuda_sync_point`, which is
+        # decided based on the MoE and parallel settings. Valid points are "before_permutation_1",
+        # "before_ep_alltoall", "before_permutation_2", "before_finish", and "no_sync".
         self.cuda_sync_point = "no_sync"
+        self.cuda_sync_point_priority = {
+            "before_permutation_1": 0,
+            "before_ep_alltoall": 1,
+            "before_permutation_2": 2,
+            "before_finish": 3,
+            "no_sync": 4,
+        }
+        self.cuda_dtoh_point = "before_permutation_1"
+        self.cuda_dtoh_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         self.shared_experts = None
 
@@ -357,7 +368,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         This method computes the number of tokens assigned to each expert based on the routing_map.
         It also initializes the necessary data structures for AlltoAll communication, such as input
-        and output splits, and the mapping between global tokens and local experts.
+        and output splits, and the mapping between global tokens and local experts. This method
+        should not call any DtoH data copying due to performance consideration. The necessary DtoH
+        copies are made on the `self.cuda_dtoh_stream` at `self.cuda_dtoh_point`.
 
         Args:
             routing_map (torch.Tensor): The mapping of tokens to experts, with shape
@@ -366,9 +379,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             torch.Tensor: Tensor containing the number of tokens assigned to local expert.
         """
-        # [num_experts], number of tokens assigned to each expert from the current rank's input.
-        num_local_tokens_per_expert = routing_map.sum(dim=0).long()
-
         if self.drop_and_pad:
             # Drop and pad the input to capacity.
             num_tokens = routing_map.size(0) * self.config.moe_router_topk
@@ -393,25 +403,20 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 device=self.permute_idx_device,
             )
             return num_tokens_per_local_expert
-        elif self.config.moe_expert_capacity_factor is not None:
+
+        # [num_experts], number of tokens assigned to each expert from the current rank's input.
+        num_local_tokens_per_expert = routing_map.sum(dim=0).long()
+
+        if self.config.moe_expert_capacity_factor is not None:
             # Drop tokens to capacity, no padding.
-            # A synchronization is needed before the first
-            # permutation to get the `num_out_tokens` CPU value.
-            self.num_out_tokens = num_local_tokens_per_expert.sum().to(
-                torch.device("cpu"), non_blocking=True
-            )
-            self.cuda_sync_point = "before_permutation_1"
+            self.num_out_tokens = num_local_tokens_per_expert.sum()
+
+            # A synchronization is needed before the first permutation
+            # to get the `num_out_tokens` CPU value.
+            self._maybe_update_cuda_sync_point("before_permutation_1")
         else:
             # Dropless
             self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
-            if self.ep_size > 1 or self.num_local_experts > 1:
-                # Token dropless and enable ep. A synchronization is needed before expert parallel
-                # AlltoAll communication to get the `input_splits` and `output_splits` CPU values.
-                self.cuda_sync_point = "before_ep_alltoall"
-            else:
-                # Token dropless and no ep. A synchronization is needed before the returns
-                # to get the `tokens_per_expert` CPU value for
-                self.cuda_sync_point = "before_finish"
 
         if self.ep_size > 1 or self.tp_size > 1:
             # ===================================================
@@ -419,12 +424,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # ===================================================
             # [ep_size]. Represents the number of tokens sent by the current rank to other
             # EP ranks.
-            self.input_splits = (
-                num_local_tokens_per_expert.reshape(self.ep_size, self.num_local_experts)
-                .sum(axis=1)
-                .to(torch.device("cpu"), non_blocking=True)
-                .numpy()
-            )
+            self.input_splits = num_local_tokens_per_expert.reshape(
+                self.ep_size, self.num_local_experts
+            ).sum(axis=1)
             # Gather the global distribution of tokens across ranks.
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
@@ -445,30 +447,26 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # [tp_size, ep_size] -> [ep_size]
             # self.output_splits represents the number of tokens received by the current rank
             # from other EP rank.
-            self.output_splits = (
-                num_global_tokens_per_rank[self.tp_rank]
-                .to(torch.device("cpu"), non_blocking=True)
-                .numpy()
-            )
+            self.output_splits = num_global_tokens_per_rank[self.tp_rank]
             # [tp_size, ep_size] -> [tp_size]
             # self.output_splits_tp represents the number of tokens received by the current
             # rank from other TP rank.
-            self.output_splits_tp = (
-                num_global_tokens_per_rank.sum(axis=1)
-                .to(torch.device("cpu"), non_blocking=True)
-                .numpy()
-            )
+            self.output_splits_tp = num_global_tokens_per_rank.sum(axis=1)
             # [tp_size, ep_size, num_local_experts] -> [num_local_experts]
-            num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1)).to(
-                torch.device("cpu"), non_blocking=True
-            )
+            num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(dim=(0, 1))
+
+            # A synchronization is needed before expert parallel AlltoAll communication
+            # to get the `input_splits` and `output_splits` CPU values.
+            self._maybe_update_cuda_sync_point("before_ep_alltoall")
         else:
             num_global_tokens_per_local_expert = num_local_tokens_per_expert.reshape(
                 self.num_experts
             )
-            num_tokens_per_local_expert = num_local_tokens_per_expert.to(
-                torch.device("cpu"), non_blocking=True
-            )
+            num_tokens_per_local_expert = num_local_tokens_per_expert
+
+            # A synchronization is needed before the returns
+            # to get the `num_tokens_per_local_expert` CPU value.
+            self._maybe_update_cuda_sync_point("before_finish")
 
         if self.num_local_experts > 1:
             # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
@@ -477,12 +475,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 -1, self.num_local_experts
             )
             if not self.config.moe_permute_fusion:
-                self.num_global_tokens_per_local_expert = (
-                    self.num_global_tokens_per_local_expert.to(
-                        torch.device("cpu"), non_blocking=True
-                    )
-                )
+                # A synchronization is needed before permutation 2
+                # to get the `num_global_tokens_per_local_expert` CPU value.
+                self._maybe_update_cuda_sync_point("before_permutation_2")
 
+        assert (
+            self.cuda_sync_point_priority[self.cuda_dtoh_point]
+            <= self.cuda_sync_point_priority[self.cuda_sync_point]
+        ), "cuda_sync_point must be after cuda_dtoh_point."
         return num_tokens_per_local_expert
 
     def token_permutation(
@@ -521,9 +521,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
 
         # Permutation 1: input to AlltoAll input
+        tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_permutation_1", tokens_per_expert
+        )
         self.hidden_shape_before_permute = hidden_states.shape
-        if self.cuda_sync_point == "before_permutation_1" and torch.cuda.is_available():
-            torch.cuda.current_stream().synchronize()
         permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
             hidden_states,
             routing_map,
@@ -533,8 +534,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         )
 
         # Perform expert parallel AlltoAll communication
-        if self.cuda_sync_point == "before_ep_alltoall" and torch.cuda.is_available():
-            torch.cuda.current_stream().synchronize()
+        tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_ep_alltoall", tokens_per_expert
+        )
         global_input_tokens = all_to_all(
             self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
         )
@@ -551,6 +553,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             )
 
         # Permutation 2: Sort tokens by local expert.
+        tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_permutation_2", tokens_per_expert
+        )
         if self.num_local_experts > 1:
             if self.drop_and_pad:
                 global_input_tokens = (
@@ -572,8 +577,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     fused=self.config.moe_permute_fusion,
                 )
 
-        if self.cuda_sync_point == "before_finish" and torch.cuda.is_available():
-            torch.cuda.current_stream().synchronize()
+        tokens_per_expert = self._maybe_dtoh_and_synchronize("before_finish", tokens_per_expert)
 
         return global_input_tokens, tokens_per_expert
 
@@ -658,6 +662,60 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
         return output, None
+
+    def _maybe_update_cuda_sync_point(self, point: str):
+        """
+        Update the CUDA sync point if the priority of the new point is higher than the current
+        sync point, which means the new point is reached earlier than the current sync point.
+        """
+        if (
+            self.cuda_sync_point_priority[point]
+            < self.cuda_sync_point_priority[self.cuda_sync_point]
+        ):
+            self.cuda_sync_point = point
+
+    def _maybe_dtoh_and_synchronize(
+        self, point: str, tokens_per_expert: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Move all possible GPU tensors to CPU and make a synchronization at the expected point.
+        """
+        if not self.drop_and_pad:
+            if point == self.cuda_dtoh_point:
+                # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
+                on_side_stream = torch.cuda.is_available() and \
+                    (torch.cuda.current_stream() != self.cuda_dtoh_stream)
+                if on_side_stream:
+                    self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
+                stream_context = torch.cuda.stream(self.cuda_dtoh_stream) if torch.cuda.is_available() \
+                    else contextlib.nullcontext()
+                with stream_context:
+                    # TODO: use MemcpyBatchAsync instead.
+                    tokens_per_expert = maybe_move_tensor_to_cpu(
+                        tokens_per_expert, record_stream=on_side_stream
+                    )
+                    self.input_splits = maybe_move_tensor_to_cpu(
+                        self.input_splits, as_numpy=True, record_stream=on_side_stream
+                    )
+                    self.output_splits = maybe_move_tensor_to_cpu(
+                        self.output_splits, as_numpy=True, record_stream=on_side_stream
+                    )
+                    self.output_splits_tp = maybe_move_tensor_to_cpu(
+                        self.output_splits_tp, as_numpy=True, record_stream=on_side_stream
+                    )
+                    self.num_out_tokens = maybe_move_tensor_to_cpu(
+                        self.num_out_tokens, record_stream=on_side_stream
+                    )
+                    if self.num_local_experts > 1 and not self.config.moe_permute_fusion:
+                        self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
+                            self.num_global_tokens_per_local_expert, record_stream=on_side_stream
+                        )
+
+            if torch.cuda.is_available() and point == self.cuda_sync_point:
+                # Synchronize with the dtoh stream at self.cuda_sync_point.
+                self.cuda_dtoh_stream.synchronize()
+
+        return tokens_per_expert
 
 
 class _DispatchManager(ABC):

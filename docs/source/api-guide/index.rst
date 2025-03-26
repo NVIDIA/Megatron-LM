@@ -20,4 +20,5 @@ API Guide
    num_microbatches_calculator
    optimizer_param_scheduler
    optimizer_cpu_offload
+   multi_token_prediction
    encoder_decoder_parallelism

@@ -6,8 +6,7 @@ import os
 import warnings
 from datetime import timedelta
 from functools import partial
-from itertools import cycle
-from typing import Callable, List, Optional, Union
+from typing import Callable, List, Optional
 
 import torch.distributed
 
@@ -765,7 +764,16 @@ def initialize_model_parallel(
         tensor, pipeline, data, expert, and context parallelism. If we have an encoder,
         in addition to the default decoder, we essentially instantiate two `RankGenerator`
         classes to construct the parallelism for each module separately, and we then have
-        to stitch them together for the right groups. For now, this means pp and tp-pp."""
+        to stitch them together for the right groups. For now, this means pp and tp-pp.
+
+        Let's say we have a total of 6 GPUs denoted by g0 ... g5.
+        For encoder_tp=1, encoder_pp=1, decoder_tp=2, decoder_pp=1, dp=2,
+        g0, g1 belong to encoder and g2, ..., g5 belong to decoder.
+        The present function will create with "tp-dp-pp":
+        3 data-parallel groups: [g0, g1], [g2, g4], [g3, g5]
+        4 tensor model-parallel groups: [g0], [g1], [g2, g3], [g4, g5]
+        4 pipeline model-parallel groups: [g0, g2], [g0, g3], [g1, g4], [g1, g5]
+        """
         if is_expert:
             d_ranks = expert_decoder_rank_generator.get_ranks(group_type, **kwargs)
         else:
@@ -777,9 +785,21 @@ def initialize_model_parallel(
             return
         e_ranks = encoder_rank_generator.get_ranks(group_type, **kwargs)
         if group_type == 'pp':
-            # Map 1 encoder tp rank to several decoder tp ranks, because
-            # these won't be the same size.
-            for x, y in zip(cycle(e_ranks), d_ranks):
+            # Map one encoder tp rank to several decoder tp ranks, because
+            # encoder tp and decoder tp won't be the same size.
+            # Assign this way to avoid getting the DP ranks mixed up with the PP ranks.
+            # For example, if e_ranks = [0,1,2] and d_ranks = [3,4,5,6]
+            # Should yield [0,3], [0,4], [1,5], [2,6]
+            rep = len(d_ranks) // len(e_ranks)
+            remain = len(d_ranks) % len(e_ranks)
+            e_ind = 0
+            e_rep = rep + int(e_ind < remain)
+            for i, y in enumerate(d_ranks):
+                x = e_ranks[e_ind]
+                e_rep -= 1
+                if e_rep == 0:
+                    e_ind += 1
+                    e_rep = rep + int(e_ind < remain)
                 yield x + y
         elif group_type == 'tp-pp':
             # For this group, we can just return the concatenated
@@ -1088,7 +1108,7 @@ def initialize_model_parallel(
                 _PIPELINE_MODEL_PARALLEL_GROUP = group
                 _PIPELINE_GLOBAL_RANKS = ranks
             elif isinstance(_PIPELINE_GLOBAL_RANKS[0], list):
-                _PIPELINE_MODEL_PARALLEL_GROUP.append(ranks)
+                _PIPELINE_MODEL_PARALLEL_GROUP.append(group)
                 _PIPELINE_GLOBAL_RANKS.append(ranks)
             else:
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]

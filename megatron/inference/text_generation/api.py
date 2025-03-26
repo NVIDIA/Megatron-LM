@@ -168,7 +168,8 @@ def generate(model,
         use_eod_token_for_early_termination=use_eod_token_for_early_termination,
         stop_on_double_eol=stop_on_double_eol,
         stop_on_eol=stop_on_eol,
-        prevent_newline_after_colon=prevent_newline_after_colon)
+        prevent_newline_after_colon=prevent_newline_after_colon,
+        data_parallel=data_parallel)
 
 def beam_search_and_post_process(model,
                                  forward_step=ForwardStep,

@@ -10,6 +10,8 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -18,11 +20,10 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import deprecate_inference_params, is_te_min_version, make_viewless_tensor
+from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
 
 try:
     from megatron.core.extensions.transformer_engine import (
-        TEDelayedScaling,
         TENorm,
         get_cpu_offload_context,
         te_checkpoint,
@@ -226,14 +227,6 @@ class TransformerBlock(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
-        # Dictionary to store CUDA graphs. Number of items in the dictionary = len(self.layers).
-        # Item `i` in the dictionary is a list of `N` CUDA graphs for layer 'i' where N is the
-        # number of microbatches. Multiple CUDA graphs per layer is required to support
-        # pipelining which requires running FWD graph of multiple microbatches before BWD graph.
-        # To enable CUDA graph, this dictionary should be populated in the model training script
-        # with the graphs returned by make_graphed_callables API before the first trainng step.
-        self.cuda_graphs = {}
-        self.current_microbatch = -1
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -263,7 +256,6 @@ class TransformerBlock(MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
-        self.tp_only_amax_red = config.tp_only_amax_red
 
     def _build_layers(self):
         # Transformer layers.
@@ -403,40 +395,6 @@ class TransformerBlock(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def get_cuda_graph_optional_args(
-        self,
-        attention_mask: Tensor,
-        context: Tensor,
-        context_mask: Tensor,
-        rotary_pos_emb: Tensor,
-        attention_bias: Tensor,
-        inference_context: BaseInferenceContext,
-        packed_seq_params: PackedSeqParams,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-    ):
-        """Get optional tensor arguments for CUDA graph."""
-
-        inference_context = deprecate_inference_params(inference_context, inference_params)
-
-        optional_inputs = {}
-        optional_inputs['is_first_microbatch'] = self.current_microbatch == 0
-        try:
-            import transformer_engine.pytorch as te  # pylint: disable=unused-import
-
-            if is_te_min_version("1.10.0", check_equality=False):
-                assert not any(
-                    [attention_mask, context, context_mask, rotary_pos_emb]
-                ), "Keyword Arguments not supported with CUDA graph."
-            else:
-                optional_inputs['attention_mask'] = attention_mask
-                optional_inputs['context'] = context
-                optional_inputs['context_mask'] = context_mask
-                optional_inputs['rotary_pos_emb'] = rotary_pos_emb
-        except ImportError:
-            raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
-        return optional_inputs
-
     def forward(
         self,
         hidden_states: Tensor,
@@ -512,33 +470,16 @@ class TransformerBlock(MegatronModule):
         else:
             rng_context = nullcontext()
 
-        if self.config.fp8:
-            import transformer_engine  # To keep out TE dependency when not training in fp8
+        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
+        # otherwise do nothing extra at the outer level
+        # if we are using other fp8 recipes, then the context manager enter&exit are free
+        # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
+        # control which layer will be fp8 or bf16
+        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
-            if self.config.fp8 == "e4m3":
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif self.config.fp8 == "hybrid":
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
-            else:
-                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-            fp8_recipe = TEDelayedScaling(
-                config=self.config,
-                fp8_format=fp8_format,
-                override_linear_precision=(False, False, not self.config.fp8_wgrad),
-            )
-            fp8_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(
-                    with_context_parallel=True, tp_only_amax_red=self.tp_only_amax_red
-                )
-            fp8_context = transformer_engine.pytorch.fp8_autocast(
-                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
-            )
-        else:
-            fp8_context = nullcontext()
-
-        with rng_context, fp8_context:
+        with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = self._checkpointed_forward(
@@ -552,45 +493,25 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
-                    with self.offload_context:
-                        layer.use_cudagraph = True
-                        if (len(self.cuda_graphs) == 0) or (not self.training):
-                            hidden_states, context = layer(
-                                hidden_states=hidden_states,
-                                attention_mask=attention_mask,
-                                context=context,
-                                context_mask=context_mask,
-                                rotary_pos_emb=rotary_pos_emb,
-                                rotary_pos_cos=rotary_pos_cos,
-                                rotary_pos_sin=rotary_pos_sin,
-                                attention_bias=attention_bias,
-                                inference_context=inference_context,
-                                packed_seq_params=packed_seq_params,
-                                sequence_len_offset=sequence_len_offset,
-                            )
-                        else:
-                            # CUDA graph replay for layer `l_no` and microbatch
-                            # `self.current_microbatch`. TransformerEngine versions>=1.10
-                            # allow keyword arguments with CUDA graph. However, CUDA graph
-                            # acccepts only Tensor inputs and Tensor outputs. Hence,
-                            # `inference_context` and `packed_seq_params` are excluded from
-                            # input list while output is limited to `hidden_states`.
-                            cg_index = self.current_microbatch % len(self.cuda_graphs[l_no])
-                            assert not any(
-                                [inference_context, packed_seq_params]
-                            ), "CUDA graph accepts only Tensor inputs."
-                            optional_inputs = self.get_cuda_graph_optional_args(
-                                attention_mask,
-                                context,
-                                context_mask,
-                                rotary_pos_emb,
-                                attention_bias,
-                                inference_context,
-                                packed_seq_params,
-                            )
-                            hidden_states = self.cuda_graphs[l_no][cg_index](
-                                hidden_states, **optional_inputs
-                            )
+                    inner_fp8_context = (
+                        get_fp8_context(self.config, layer.layer_number - 1)
+                        if use_inner_fp8_context
+                        else nullcontext()
+                    )
+                    with self.offload_context, inner_fp8_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
+                            attention_bias=attention_bias,
+                            inference_context=inference_context,
+                            packed_seq_params=packed_seq_params,
+                            sequence_len_offset=sequence_len_offset,
+                        )
 
                     if (
                         torch.is_grad_enabled()

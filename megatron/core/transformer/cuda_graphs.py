@@ -30,8 +30,6 @@ try:
     from transformer_engine.pytorch.graph import set_capture_start as te_set_capture_start
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
 
-    from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
-
     HAVE_TE_GRAPHS = True
 except:
     HAVE_TE_GRAPHS = False
@@ -143,7 +141,7 @@ class _CudagraphGlobalRecord:
         #    cudagraphs can alternate reusing the same hidden_state input, output buffer.
         #    Similarly, bwd graphs can alternate the same output, input grad buffers.
         optimize_transformer_layer_graph_buffers = all(
-            [g[0].is_transformer_decoder_layer for g in cls.cudagraph_record]
+            [g[0].reuse_input_output_buffer for g in cls.cudagraph_record]
         )
         if optimize_transformer_layer_graph_buffers:
             prev_fwd_hidden_state_output = None
@@ -168,7 +166,12 @@ class _CudagraphGlobalRecord:
                     runner.create_fwd_graph(args, kwargs, clone_inputs=False)
 
                     # The output of TransformerLayer is: (hidden_states, None)
-                    prev_fwd_hidden_state_output, _ = runner.fwd_graph_outputs
+                    if isinstance(runner.fwd_graph_outputs, tuple):
+                        prev_fwd_hidden_state_output, _ = runner.fwd_graph_outputs
+                    # MambaLayer returns only hidden_states
+                    elif isinstance(runner.fwd_graph_outputs, torch.Tensor):
+                        prev_fwd_hidden_state_output = runner.fwd_graph_outputs
+
                 else:
                     runner.create_bwd_graph(prev_bwd_hidden_state_inputgrad)
 
@@ -385,15 +388,17 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
+        from megatron.core.ssm.mamba_layer import MambaLayer
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
         self.is_first_layer = None
         self.is_last_layer = None
-        self.is_transformer_decoder_layer = False
-        if isinstance(base_module, TransformerLayer) and isinstance(
-            base_module.cross_attention, IdentityOp
-        ):
-            self.is_transformer_decoder_layer = True
+        self.reuse_input_output_buffer = False
+        if (
+            isinstance(base_module, TransformerLayer)
+            and isinstance(base_module.cross_attention, IdentityOp)
+        ) or isinstance(base_module, MambaLayer):
+            self.reuse_input_output_buffer = True
 
             total_num_layers = base_module.config.num_layers
             pp_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -610,6 +615,9 @@ class _CudaGraphRunner(torch.nn.Module):
         # Run the forward pass as normal in eager mode.
         out = super(MegatronModule, self.base_module).__call__(*args, **kwargs)
 
+        if type(out) != tuple:
+            out = (out,)
+
         # Register a noop autograd node that toggles `self.graph_status` in the bwd pass, which
         # tracks when the runner completes its bwd pass.
         # If it's the first bwd encountered by this runner, record it to _CudagraphGlobalRecord
@@ -665,7 +673,7 @@ class _CudaGraphRunner(torch.nn.Module):
         if len(args) != len(self.fwd_graph_input_args):
             return False
         for arg, graph_arg in zip(args, self.fwd_graph_input_args):
-            if not check(args, graph_arg):
+            if not check(arg, graph_arg):
                 return False
 
         if kwargs.keys() != self.fwd_graph_input_kwargs.keys():
@@ -751,7 +759,18 @@ class CudaGraphManager(torch.nn.Module):
         super().__init__()
 
         rng_tracker = get_device_rng_tracker()
-        assert (HAVE_TE_GRAPHS and isinstance(rng_tracker, TECudaRNGStatesTracker)) or (isinstance(rng_tracker, DeviceRNGStatesTracker) and rng_tracker.use_cudagraphable_rng), "RNG tracker does not support cudagraphs!"
+
+        try:
+            from megatron.core.tensor_parallel.random  import TECudaRNGStatesTracker
+        except ImportError:
+            HAVE_TE_GRAPHS = False
+            TECudaRNGStatesTracker = None
+
+        assert (
+            rng_tracker.is_inference_rng_tracker
+            or (HAVE_TE_GRAPHS and isinstance(rng_tracker, TECudaRNGStatesTracker))
+            or (isinstance(rng_tracker, DeviceRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
+        ), "RNG tracker does not support cudagraphs!"
 
         self.cudagraph_runners = []
         self.is_first_microbatch = False
@@ -888,9 +907,6 @@ class CudaGraphManager(torch.nn.Module):
                 # No cudagraphs were found in training mode with grad disabled, so fallback to
                 # eager since autograd is needed to correctly trace the backward graph.
                 return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
-
-            runner = self.get_cudagraph_runner(megatron_module)
-            out = runner.record_graph_capture(args, kwargs)
 
         # If forward only, next replay should be a forward pass as well
         if self.training and torch.is_grad_enabled():

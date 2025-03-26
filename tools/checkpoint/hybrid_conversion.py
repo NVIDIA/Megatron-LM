@@ -232,7 +232,7 @@ def main(args):
         try:
             iteration = int(metastring)
         except ValueError:
-            raise Exception("")
+            raise Exception("Invalid iteration found in latest_checkpointed_iteration.txt!")
     out_iteration = iteration if not args.reset_iterations else 0
 
     # get model directory and model parallel ranks
@@ -294,7 +294,7 @@ def main(args):
             try:
                 layer_num = int(re.findall(r'\d+', key)[0])
                 new_key = key.replace(str(layer_num), str(layer_num + pp*num_layers_per_pipeline_rank), 1)
-            except Exception:
+            except:
                 new_key = key
             full_model[new_key] = original_tensor
     # print("Combined model: {}".format(full_model.keys()))

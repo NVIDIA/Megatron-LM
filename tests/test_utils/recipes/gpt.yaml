@@ -491,6 +491,10 @@ products:
   #       scope: [mr]
   #     - environment: [lts]
   #       scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_mla_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -557,12 +561,12 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  # - test_case: [gpt3_mr_te_tp2_pp2_resume_torch_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_mr_te_tp2_pp2_resume_torch_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
   - test_case: [gpt3_mr_tp1_pp4_vp1_resume_torch_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -604,6 +608,8 @@ products:
     products:
       - environment: [dev, lts]
         scope: [mr]
+      - environment: [dev]
+        scope: [mr-slim]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_dgx_a100_1N8G]
     products:
       - environment: [dev, lts]
@@ -616,10 +622,12 @@ products:
     products:
       - environment: [dev, lts]
         scope: [mr]
-  # - test_case: [gpt3_mr_te_tp2_pp2_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev, lts]
-  #       scope: [mr]
+      - environment: [dev]
+        scope: [mr-slim]
+  - test_case: [gpt3_mr_te_tp2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev, lts]
+        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G]
     products:
       - environment: [dev, lts]

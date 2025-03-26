@@ -6,11 +6,9 @@
 import contextlib
 import logging
 from functools import partial
-from typing import Union
 
 from megatron.core.device_utils import get_current_rng_state, get_xla_model, set_current_rng_state, set_device_manual_seed
 import torch
-from pkg_resources import packaging
 from torch.utils.checkpoint import detach_variable
 
 from megatron.core.parallel_state import (

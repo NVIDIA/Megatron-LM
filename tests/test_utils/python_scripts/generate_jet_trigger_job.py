@@ -46,6 +46,23 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     type=str,
     help="Wandb experiment (only relevant for release tests)",
 )
+@click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Run 2-step smoke tests instead of full training",
+)
+@click.option(
+    "--enable-warmup/--no-enable-warmup",
+    required=False,
+    is_flag=True,
+    default=True,
+    type=bool,
+    help="Run one job as dependency to others as to warm up cache",
+)
 def main(
     scope: str,
     environment: str,
@@ -65,6 +82,8 @@ def main(
     tag: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
+    enable_lightweight_mode: bool = False,
+    enable_warmup: Optional[bool] = None,
 ):
     list_of_test_cases = [
         test_case
@@ -100,22 +119,26 @@ def main(
                     {"if": '$CI_MERGE_REQUEST_ID'},
                 ],
                 "timeout": "7 days",
-                "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": "functional:configure"}],
+                "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
                 "artifacts": {"paths": ["results/"], "when": "always"},
             },
         }
 
     else:
+        list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x.spec.model)
+
         gitlab_pipeline = {
-            "stages": list(set([test_case.spec.model for test_case in list_of_test_cases])),
+            "stages": sorted(list(set([test_case.spec.model for test_case in list_of_test_cases]))),
             "default": {
                 "interruptible": True,
                 "retry": {"max": 2, "when": "runner_system_failure"},
             },
         }
 
-        for test_case in list_of_test_cases:
+        warmup_job = ""
+
+        for test_idx, test_case in enumerate(list_of_test_cases):
             if test_case.spec.platforms == "dgx_a100":
                 cluster = a100_cluster
                 partition = a100_partition
@@ -149,12 +172,23 @@ def main(
             if tag is not None:
                 script.append(f"--tag {tag}")
 
+            if enable_lightweight_mode is True:
+                script.append("--enable-lightweight-mode")
+
             if run_name is not None and wandb_experiment is not None:
                 script.append(f"--run-name {run_name}")
                 test_case.spec.model
                 script.append(
                     f"--wandb-experiment {wandb_experiment}-{test_case.spec.model}-{test_case.spec.test_case}"
                 )
+
+            needs = [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}]
+
+            if enable_warmup:
+                if test_idx == 0:
+                    warmup_job = test_case.spec.test_case
+                elif warmup_job != "":
+                    needs.append({"job": warmup_job})
 
             gitlab_pipeline[test_case.spec.test_case] = {
                 "stage": f"{test_case.spec.model}",
@@ -165,7 +199,7 @@ def main(
                     {"if": '$CI_MERGE_REQUEST_ID'},
                 ],
                 "timeout": "7 days",
-                "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
+                "needs": needs,
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},
             }
