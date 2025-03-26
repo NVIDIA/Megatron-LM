@@ -189,8 +189,18 @@ def apply_rotary_pos_emb(
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
-            assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
-            return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
+            # NOTE: TE backends do not support mRoPE in bshd format when bs > 1
+            if config.mrope_section is not None and freqs.shape[1] > 1:
+                return _apply_rotary_pos_emb_bshd(
+                    t,
+                    freqs,
+                    rotary_interleaved=config.rotary_interleaved,
+                    multi_latent_attention=config.multi_latent_attention,
+                    mscale=mscale,
+                )
+            else:
+                assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
+                return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
             cp_size = parallel_state.get_context_parallel_world_size()
