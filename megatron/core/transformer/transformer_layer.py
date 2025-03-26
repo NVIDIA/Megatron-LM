@@ -3,7 +3,7 @@
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.distributed
@@ -12,7 +12,6 @@ from torch import Tensor
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
-from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -352,11 +351,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
         attention_bias: Optional[Tensor] = None,
-        inference_context: Optional[BaseInferenceContext] = None,
+        inference_context: Optional[Any] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         *,
-        inference_params: Optional[BaseInferenceContext] = None,
+        inference_params: Optional[Any] = None,
     ):
         """
         Perform a forward pass through the transformer layer.
