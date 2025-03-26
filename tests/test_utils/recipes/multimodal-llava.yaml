@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}'
+  name: "{test_case}_{environment}"
   model: multimodal-llava
   build: mcore-pyt-{environment}
   nodes: 1
@@ -73,5 +73,5 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly]
