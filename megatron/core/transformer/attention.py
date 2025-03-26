@@ -537,6 +537,7 @@ class Attention(MegatronModule, ABC):
             and inference_context is not None
             and inference_context.decode_mode
             and not self.training
+            and rotary_pos_cos is not None
         ):
             assert self.layer_number in inference_context.key_value_memory_dict
             assert inference_context.sequence_len_offset is not None
