@@ -34,6 +34,9 @@ megatron/core/optimizer/distrib_optimizer/
 [Inference] @mcore-reviewers/inference
 megatron/core/inference/
 
+[ParallelState] @mcore-reviewers/parallelstate
+megatron/core/parallel_state.py
+
 ^[Quantization and Inference (QAT)] @mcore-reviewers/quantization-and-inference
 megatron/core/inference/
 
