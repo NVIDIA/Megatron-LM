@@ -93,10 +93,8 @@ pre:label_merge_request:
     - |
       LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}")
     - LABELS=$(echo "$LABELS" | gojq '.labels -= ["ParallelState"]')
-    - git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME
-    - git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
     - |
-      if git --no-pager diff origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME origin/$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME -- 'megatron/core/' | grep -q 'parallel_state'; then
+      if git --no-pager diff --merge-base origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} -- 'megatron/core/' | grep -q 'parallel_state'; then
         LABELS=$(echo "$LABELS" | gojq '.labels += ["ParallelState"]')
         echo "$LABELS"
       fi
