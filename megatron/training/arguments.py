@@ -804,7 +804,7 @@ def validate_args(args, defaults={}):
         assert args.layernorm_init == 0.0 or not args.apply_layernorm_1p, "can't have --layernorm-init and --apply-layernorm-1p at the same time"
         assert args.normalization == "RMSNorm", "--layernorm-init only implemented with RMSNorm"
         assert args.transformer_impl == "transformer_engine", "--layernorm-init only implemented with TE"
-        if args.qk_layernorm:
+        if args.qk_layernorm and not args.qk_dyt:
             assert args.qknorm_impl != "te", "Use --qknorm-impl=apex or --qknorm-impl=torch when --layernorm-init is specified"
     if not args.attn_layernorm or not args.mlp_layernorm or not args.final_layernorm \
             or args.post_layer_norm or args.layernorm_init is not None or args.qknorm_impl != "te":
@@ -813,6 +813,10 @@ def validate_args(args, defaults={}):
     if args.qk_layernorm and args.qk_dyt:
         assert not args.sequence_parallel, "QK DyT does not support sequence parallel yet"
     assert not args.sequence_parallel, "I gotta check if QK norm supports sequence parallel correctly..."
+
+    if args.log_indiv_grad_norm:
+        assert not args.use_distributed_optimizer, "Can't use distributed optimizer with log_indiv_grad_norm"
+        assert args.pipeline_model_parallel_size == 1, "Can't use pp>1 with log_indiv_grad_norm"
 
     # MoE loss and include embedding and loss layer check
     if args.num_experts is not None:
@@ -1183,6 +1187,7 @@ def _add_network_size_args(parser):
                        help="Softmax scale for attention scaling.")
     group.add_argument("--qknorm-init", default=None, type=float,
                        help="Q and K layernorm gain initialization value")
+    group.add_argument("--mlp-alpha", default=None, type=float)
     return parser
 
 
@@ -2275,7 +2280,7 @@ def _add_vision_args(parser):
                        help='When set, QK regularization will use DynamicTanh (must be used in conjunction with --qk-layernorm)')
     group.add_argument('--dyt-alpha-init', default=1.0, type=float,
                        help='QK DynamicTanh alpha initialization value')
-    group.add_argument('---dyt-bias', action='store_true',
+    group.add_argument('--dyt-bias', action='store_true',
                        help='QK DynamicTanh use bias?')
 
     return parser

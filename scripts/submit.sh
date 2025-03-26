@@ -16,6 +16,8 @@ NODES=1
 TIME=1-00:00:00
 MARGIN=0
 PARTITION=normal
+PRECISION=hybrid
+FP8LEN=1024
 
 # Usage function.
 usage () {
@@ -31,10 +33,14 @@ usage () {
 	echo " --fp8: Enables fp8"
 	echo " --fp8-dpa: Enables fp8 DPA"
 	echo " --fp8-margin: fp8 margin"
+	echo " --fp8-dpa-nobwd: Disables fp8 DPA for backward"
+	echo " --fp8-e4m3: Use e4m3 fp8 precision instead of hybrid"
+	echo " --fp8-len <int>: fp8 history length"
 	# Training settings..
 	echo " --tokens <int> (default=$DEF_TOKENS): Amount of tokens to train with (in B)."
 	echo " --lr <float>: Learning rate."
 	# Architecture settings.
+	echo " --init <float>: Change init std."
 	echo " --no-prenorm: Disables pre-layernorm."
 	echo " --postnorm: Enables post-layernorm."
 	echo " --qknorm: Enables qk norm."
@@ -44,11 +50,15 @@ usage () {
 	echo " --dyt-alpha <float>: QK DyT alpha initialization"
 	echo " --softmax-scale: Sets attention softmax scale."
 	echo " --layerscale: Enables layerscale."
+	echo " --layerscale-value <float>: Layerscale init value."
 	echo " --input-upscale: Upscales input by 1/std."
+	echo " --alpha: MLP alpha."
 	echo " --activation (default=$ACTIVATION): MLP activation. Choices=[swiglu, gelu, xielu]."
 	# Opt settings.
 	echo " --decay-qkgains: Decay qk layernorm gains"
 	echo " --no-train-qk-gains: Don't train QK layernorm gains"
+	# Logs.
+	echo " --log-grad: Log individual grad norms."
 }
 
 if [[ $# -eq 0 ]]; then
@@ -92,7 +102,7 @@ elif [[ $1 -eq 1 ]]; then
 	GBS=256
 	ITERS=1000  # 1BT.
 	LR=0.0005
-	INIT_STD=0.001
+	INIT_STD=0.01
 	SIZE=1.3B
 	SAVE_FREQ=5000
 else
@@ -103,6 +113,7 @@ fi
 shift
 
 # Now get the general options.
+ENVS=""
 SUFFIX=""
 while [[ $# -gt 0 ]]; do
 	case $1 in
@@ -121,10 +132,18 @@ while [[ $# -gt 0 ]]; do
 			FP8DPA=true; shift;;
 		--fp8-margin)
 			MARGIN=$2; shift 2;;
+		--fp8-dpa-nobwd)
+			FP8DPA_NOBWD=true; shift;;
+		--fp8-e4m3)
+			PRECISION=e4m3; shift;;
+		--fp8-len)
+			FP8LEN=$2; shift 2;;
 		--extra-name)
 			EXTRA_NAME="-$2"; shift 2;;
 		--tokens)
 			TOKENS=$2; shift 2;;
+		--init)
+			NEW_INIT_STD=$2; shift 2;;
 		--lr)
 			LR=$2; 
 			CHANGED_LR=true
@@ -147,14 +166,20 @@ while [[ $# -gt 0 ]]; do
 			SOFTMAX_SCALE=$2; shift 2;;
 		--layerscale)
 			LAYERSCALE=true; shift;;
+		--layerscale-value)
+			LAYERSCALE_VALUE=$2; shift 2;;
 		--input-upscale)
 			INPUT_UPSCALE=true; shift;;
 		--activation)
 			ACTIVATION=$2; shift 2;;
+		--alpha)
+			ALPHA=$2; shift 2;;
 		--decay-qkgains)
 			DECAY_GAINS=true; shift;;
 		--no-train-qk-gains)
 			NOTRAIN_GAINS=true; shift;;
+		--log-grad)
+			LOG_GRADS=true; shift;;
 		*)
 			echo "Unexpected argument $1"
 			usage
@@ -166,17 +191,31 @@ done
 FP8_ARGS=()
 if [[ $FP8 = true ]]; then
 	SUFFIX=$SUFFIX-fp8
-	FP8_ARGS+=(--fp8-margin $MARGIN --fp8-format hybrid --fp8-amax-history-len 1024 --fp8-amax-compute-algo max)
+	FP8_ARGS+=(--fp8-margin $MARGIN --fp8-format $PRECISION --fp8-amax-history-len $FP8LEN --fp8-amax-compute-algo max)
 	if [[ $FP8DPA = true ]]; then
 		SUFFIX=$SUFFIX-fp8dpa
 		FP8_ARGS+=(--fp8-dot-product-attention)
+		if [[ $FP8DPA_NOBWD = true ]]; then
+			SUFFIX=$SUFFIX-dpaNObwd
+			ENVS="$ENVS NVTE_FP8_DPA_BWD=0"
+		fi
 	fi
 	if [[ $MARGIN -ne 0 ]]; then
 		SUFFIX=$SUFFIX-fp8margin$MARGIN
 	fi
+	if [[ $PRECISION != hybrid ]]; then
+		SUFFIX=$SUFFIX-fp8$PRECISION
+	fi
+	if [[ $FP8LEN -ne 1024 ]]; then
+		SUFFIX=$SUFFIX-fp8len$FP8LEN
+	fi
 fi
 
 ARCH_ARGS=()
+if [[ ! -z ${NEW_INIT_STD+x} ]]; then
+	SUFFIX=$SUFFIX-std$NEW_INIT_STD
+	INIT_STD=$NEW_INIT_STD
+fi
 if [[ $PRENORM = false ]]; then
 	SUFFIX=$SUFFIX-nopre
 	ARCH_ARGS+=(--no-pre-layer-norm)
@@ -215,7 +254,12 @@ if [[ ! -z ${SOFTMAX_SCALE+x} ]]; then
 fi
 if [[ $LAYERSCALE = true ]]; then
 	SUFFIX=$SUFFIX-layerscale
-	BETA=$(echo "print(1/$LAYERS**0.5)" | python3)
+	if [[ ! -z ${LAYERSCALE_VALUE+x} ]]; then
+		BETA=$LAYERSCALE_VALUE
+		SUFFIX=$SUFFIX-ls$BETA
+	else
+		BETA=$(echo "print(1/$LAYERS**0.5)" | python3)
+	fi
 	if [[ $POSTNORM = true ]] && [[ $PRENORM = false ]]; then
 		ARCH_ARGS+=(--layernorm-init $BETA)
 	else
@@ -239,6 +283,10 @@ fi
 if [[ $ACTIVATION != gelu ]]; then
 	ARCH_ARGS+=(--$ACTIVATION)
 fi
+if [[ ! -z ${ALPHA+x} ]]; then
+	SUFFIX=$SUFFIX-mlp$ALPHA
+	ARCH_ARGS+=(--mlp-alpha $ALPHA)
+fi
 
 OPT_ARGS=()
 if [[ $DECAY_GAINS = true ]]; then
@@ -254,7 +302,7 @@ if [[ $CHANGED_LR = true ]]; then
 	SUFFIX=$SUFFIX-lr$LR
 fi
 
-WARMUP=$((5*ITERS/2))  # 5BT.
+WARMUP=$((5*ITERS/2))  # 2.5BT.
 EVAL_INTERVAL=$((ITERS/2))  # 500MT.
 EVAL_ITERS=$((ITERS/100))  # 10MT.
 if [[ $TOKENS != $DEF_TOKENS ]]; then
@@ -266,9 +314,18 @@ if [[ $NODES -ne 1 ]]; then
 	SUFFIX=$SUFFIX-nodes$NODES
 fi
 
+EXTRA_LOGS=()
+EXTRA_OPT=()
+if [[ $LOG_GRADS = true ]]; then
+	EXTRA_LOGS+=(--log-indiv-grad-norm)
+else
+	EXTRA_OPT+=(--use-distributed-optimizer --overlap-param-gather)
+fi
+
 # Final preparations.
 SUFFIX=$SUFFIX$EXTRA_NAME
 NAME=llama${SIZE}$SUFFIX
+JOB_NAME=$NAME
 ROOT_PATH=$SCRATCH/op$SCRIPT_VERSION/$NAME
 SAVE_PATH=$ROOT_PATH/checkpoints
 DIFFS_PATH=$ROOT_PATH/diffs
@@ -278,9 +335,12 @@ mkdir -p $DIFFS_PATH
 if [[ $NODES -eq 1 ]] && [[ $DEBUG = true ]]; then
 	PARTITION=debug
 fi
+if [[ $DEBUG = true ]]; then
+	JOB_NAME=$NAME-debug
+fi
 
 #= WRAPPING UP: Set up the _ARGS variables that are going to be used in the end =#
-ENVS="CUDA_DEVICE_MAX_CONNECTIONS=1 OMP_NUM_THREADS=\\\$SLURM_CPUS_PER_TASK WANDB_RESUME=allow WANDB_RUN_ID=$NAME"
+ENVS="$ENVS CUDA_DEVICE_MAX_CONNECTIONS=1 OMP_NUM_THREADS=\\\$SLURM_CPUS_PER_TASK WANDB_RESUME=allow WANDB_RUN_ID=$NAME"
 WANDB_PROJECT=op_$SCRIPT_VERSION
 
 LLAMA_ARGS=(
@@ -361,6 +421,7 @@ LOGGING=(
 	--log-params-norm
 	--log-memory-to-tensorboard
 )
+LOGGING=(${LOGGING[@]} ${EXTRA_LOGS[@]})
 
 SCHEDULER_ARGS=(
 	--lr-decay-style WSD
@@ -370,12 +431,11 @@ SCHEDULER_ARGS=(
 )
 
 EXTRA_ARGS+=(
-	--use-distributed-optimizer
 	--overlap-grad-reduce
-	--overlap-param-gather
 	--async-save
 	--sequence-parallel
 )
+EXTRA_ARGS=(${EXTRA_ARGS[@]} ${EXTRA_OPT[@]})
 
 ARGS="${LLAMA_ARGS[@]} ${TRAINING_ARGS[@]} ${SCHEDULER_ARGS[@]} ${DATA_ARGS[@]} ${LOGGING[@]} ${EXTRA_ARGS[@]} ${FP8_ARGS[@]} ${ARCH_ARGS[@]} ${OPT_ARGS[@]}"
 
@@ -387,7 +447,7 @@ cat > $ROOT_PATH/submission.sbatch <<- EOM
 #!/bin/bash
 #SBATCH --account=a-a06
 #SBATCH --time=$TIME
-#SBATCH --job-name=$NAME
+#SBATCH --job-name=$JOB_NAME
 #SBATCH --output=$ROOT_PATH/slurmlogs/%j.out
 #SBATCH --error=$ROOT_PATH/slurmlogs/%j.err
 #SBATCH --nodes=$NODES
@@ -406,8 +466,10 @@ srun -l bash -c 'echo \$(hostname) \$(nvidia-smi | grep -o "|\\s*[0-9]*MiB")'
 # Log git status.
 cd $CODE_PATH
 echo ---------
-echo OUTPUT OF GIT LOG:
-git log --name-status HEAD^..HEAD
+echo git status:
+git status
+echo git log:
+git log -n 1
 echo ---------
 git diff > $DIFFS_PATH/\$SLURM_JOBID.diff
 

@@ -52,6 +52,7 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ensure_individual_correct: bool = False,
 ) -> tuple[list[torch.Tensor], float]:
     """Calculate the norm of gradients in fp32.
 
@@ -141,15 +142,22 @@ def get_grad_norm_fp32(
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
         # reduce individ_norms
-        for i in range(len(individ_norms)):
-            if data_parallel_groups[i]:
-                torch.distributed.all_reduce(
-                    individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
-                )
-            torch.distributed.all_reduce(
-                individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-            )
-            individ_norms[i] = individ_norms[i].item() ** (1 / norm_type)
+        if ensure_individual_correct:
+            assert all(group is None for group in data_parallel_group)  # We shouldn't be using distributed optimizer.
+            individ_norms_tensor = torch.cat(individ_norms)
+            torch.distributed.all_reduce(individ_norms_tensor, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group)
+            indiv_norms = indiv_norms**(1/norm_type)
+            indiv_norms = list(indiv_norms_tensor)
+
+            #for i in range(len(individ_norms)):
+            #    if data_parallel_groups[i]:
+            #        torch.distributed.all_reduce(
+            #            individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
+            #        )
+            #    torch.distributed.all_reduce(
+            #        individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+            #    )
+            #    individ_norms[i] = individ_norms[i].item() ** (1 / norm_type)
             
     return individ_norms, total_norm
 

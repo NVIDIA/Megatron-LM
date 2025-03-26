@@ -104,6 +104,10 @@ class MLP(MegatronModule):
     def forward(self, hidden_states):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
+
+        if self.config.mlp_alpha is not None:
+            hidden_states = self.config.mlp_alpha*hidden_states
+
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
         tracker = get_tracker()

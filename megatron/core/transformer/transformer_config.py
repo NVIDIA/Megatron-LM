@@ -141,6 +141,8 @@ class TransformerConfig(ModelParallelConfig):
     dyt_bias: bool = False
     dyt_alpha_init: float = 1.0
 
+    mlp_alpha: Optional[float] = None
+
     ####################
     # initialization
     ####################

@@ -137,6 +137,8 @@ class OptimizerConfig:
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
 
+    log_indiv_grad_norm: bool = False
+
     barrier_with_L1_time: bool = False
     """If true, use barrier with level 1 time measurements."""
 

@@ -365,7 +365,7 @@ def pretrain(
             return len(param.shape) == 1 
 
         def scale_lr_cond(name: str, param: torch.nn.Parameter) -> bool:
-            return ("k_layernorm" in name or "q_layernorm" in name) and args.no_train_qk_gains
+            return ("k_layernorm.weight" in name or "q_layernorm.weight" in name) and args.no_train_qk_gains
 
         # Model, optimizer, and learning rate.
         timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
