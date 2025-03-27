@@ -265,6 +265,7 @@ def _load_checkpoint(queue, args):
     md.consumed_train_samples = 0
     md.consumed_valid_samples = 0
     md.num_experts = margs.num_experts
+    md.qkv_bias = margs.add_qkv_bias
 
     # Get first pipe stage.
     mpu.set_tensor_model_parallel_rank(0)
