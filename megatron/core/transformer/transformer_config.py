@@ -325,7 +325,7 @@ class TransformerConfig(ModelParallelConfig):
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
     2. For each token, 'moe_router_group_topk' groups are selected based on sum of
-    top-('moe_router_num_groups'/'moe_router_group_topk') routing scores within each group
+    top-('moe_router_topk'/'moe_router_group_topk') routing scores within each group
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
