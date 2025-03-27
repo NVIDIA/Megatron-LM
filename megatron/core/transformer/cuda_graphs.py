@@ -763,7 +763,6 @@ class CudaGraphManager(torch.nn.Module):
         try:
             from megatron.core.tensor_parallel.random  import TECudaRNGStatesTracker
         except ImportError:
-            HAVE_TE_GRAPHS = False
             TECudaRNGStatesTracker = None
 
         assert (

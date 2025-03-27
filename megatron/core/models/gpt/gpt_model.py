@@ -12,7 +12,10 @@ from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+    MultimodalRotaryEmbedding,
+    RotaryEmbedding,
+)
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
@@ -82,7 +85,9 @@ class GPTModel(LanguageModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'learned_absolute',
+        position_embedding_type: Literal[
+            'learned_absolute', 'rope', 'mrope', 'none'
+        ] = 'learned_absolute',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         rope_scaling: bool = False,
@@ -104,7 +109,11 @@ class GPTModel(LanguageModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-        self.position_embedding_type = position_embedding_type
+
+        if hasattr(self.config, 'position_embedding_type'):
+            self.position_embedding_type = self.config.position_embedding_type
+        else:
+            self.position_embedding_type = position_embedding_type
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
@@ -113,7 +122,11 @@ class GPTModel(LanguageModule):
         # These 4 attributes are needed for TensorRT-LLM export.
         self.max_position_embeddings = max_sequence_length
         self.rotary_percent = rotary_percent
-        self.rotary_base = rotary_base
+
+        if hasattr(self.config, 'rotary_base'):
+            self.rotary_base = self.config.rotary_base
+        else:
+            self.rotary_base = rotary_base
         self.rotary_scaling = rope_scaling
         self.mtp_block_spec = mtp_block_spec
         self.mtp_process = mtp_block_spec is not None
@@ -138,6 +151,19 @@ class GPTModel(LanguageModule):
                 rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
+
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = MultimodalRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+            )
+            self.mrope_section = self.config.mrope_section
+            assert (
+                self.mrope_section is not None
+            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
 
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
@@ -272,6 +298,16 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                 )
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            if self.training or not self.config.flash_decode:
+                rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
+            else:
+                # Flash decoding uses precomputed cos and sin for RoPE
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implmented in "
+                    "MultimodalRotaryEmbedding yet."
+                )
+
         if (
             (self.config.enable_cuda_graph or self.config.flash_decode)
             and rotary_pos_cos is not None

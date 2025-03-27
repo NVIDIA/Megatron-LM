@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}'
+  name: "{test_case}_{environment}"
   model: bert
   nodes: 1
   build: mcore-pyt-{environment}
@@ -94,14 +94,14 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [bert_nightly_dgx_a100_1N8G_tp1_pp2]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
-  - test_case: [bert_nightly_dgx_a100_1N8G_tp4_pp1]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
+  # - test_case: [bert_nightly_dgx_a100_1N8G_tp1_pp2]
+  #   products:
+  #     - environment: [dev, lts]
+  #       scope: [nightly]
+  # - test_case: [bert_nightly_dgx_a100_1N8G_tp4_pp1]
+  #   products:
+  #     - environment: [dev, lts]
+  #       scope: [nightly]
   # - test_case: [bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev] Update checkpoint

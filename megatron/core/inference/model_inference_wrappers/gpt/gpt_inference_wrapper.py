@@ -11,6 +11,8 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 from megatron.core.models.gpt import GPTModel
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.utils import get_model_config
 
 
 # pylint: disable=line-too-long
@@ -44,6 +46,10 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         Returns:
             A dict with all the inference input needed for the batch.
         """
+        assert (
+            not self.inference_params.is_decode_only()
+        ), "`prep_inference_input` should only be called in prefill mode"
+
         attention_mask, position_ids = self._build_attention_mask_and_position_ids(prompts_tokens)
         return {
             "tokens": prompts_tokens,
@@ -63,11 +69,27 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
             Tuple[torch.Tensor, torch.Tensor]: The attention mask of shape [1, 1, max_seq_len, max_seq_len] and position ids of shape [batch_size, max_seq_len]
         """
         seq_length = prompts_tokens.size(1)
-        attention_mask = torch.tril(
-            torch.ones((1, seq_length, seq_length), device=prompts_tokens.device)
-        ).view(1, 1, seq_length, seq_length)
-        # Convert to boolean
-        attention_mask = attention_mask < 0.5
+        config = get_model_config(self.model)
+
+        attention_backend = config.attention_backend
+
+        if attention_backend == AttnBackend.local:
+            attention_mask = torch.tril(
+                torch.ones((1, seq_length, seq_length), device=prompts_tokens.device)
+            ).view(1, 1, seq_length, seq_length)
+
+            # Convert to boolean
+            attention_mask = attention_mask < 0.5
+        elif (
+            attention_backend == AttnBackend.flash
+            or attention_backend == AttnBackend.fused
+            or attention_backend == AttnBackend.unfused
+            or attention_backend == AttnBackend.auto
+        ):
+            # TE creates the attention mask internally
+            attention_mask = None
+        else:
+            raise ValueError(f"Unknown attention backend {attention_backend}")
 
         position_ids = (
             torch.arange(seq_length, dtype=torch.long, device=prompts_tokens.device)
@@ -100,9 +122,12 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         attention_mask = inference_input["attention_mask"]
         tokens2use = tokens[:, context_start_position:context_end_position]
         positions2use = position_ids[:, context_start_position:context_end_position]
-        attention_mask2use = attention_mask[
-            ..., context_start_position:context_end_position, :context_end_position
-        ]
+        if attention_mask is not None:
+            attention_mask2use = attention_mask[
+                ..., context_start_position:context_end_position, :context_end_position
+            ]
+        else:
+            attention_mask2use = None
         return {
             "tokens": tokens2use,
             "position_ids": positions2use,

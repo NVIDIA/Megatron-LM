@@ -378,45 +378,60 @@ def run_online_eval(model):
     from run_text_generation import generate_and_write_samples
 
     with open(args.online_evaluation_config, "r") as f:
-        config_dict = yaml.safe_load(f)
+        config_dict = yaml.safe_load(f)['datasets']
 
-    config = EvaluationConfig(**config_dict)
+    scores = {}
 
-    # The inference code assumes the first rank is the leader.
-    # Tensorboard writer is on the last rank.
-    # We must write to a storage space that all ranks see.
-    output_dir = os.path.join(args.save, "online_eval")
-    os.makedirs(output_dir, exist_ok=True)
-    config.output_path = os.path.join(output_dir, args.language_model_type)
+    for key, value in config_dict.items():
+        config = EvaluationConfig(**value)
 
-    # The actual generation.
-    generate_and_write_samples(model[0].module, config, print_output=False)
+        # The inference code assumes the first rank is the leader.
+        # Tensorboard writer is on the last rank.
+        # We must write to a storage space that all ranks see.
+        output_dir = os.path.join(args.save, "online_eval")
+        os.makedirs(output_dir, exist_ok=True)
+        config.output_path = os.path.join(output_dir, args.language_model_type + '-' + key)
 
-    # Make sure the first rank is done writing so that the last rank can run eval.
-    torch.distributed.barrier()
+        # The actual generation.
+        generate_and_write_samples(model[0].module, config, print_output=False)
 
-    if not is_last_rank():
-        return []
+        # Make sure the first rank is done writing so that the last rank can run eval.
+        torch.distributed.barrier()
 
-    # Run evaluation.
-    if config.task == "TextVQA":
-        from evaluate_textvqa import textvqa_eval
+        if is_last_rank():
+            from run_text_generation import run_eval
+            scores.update(run_eval(config))
 
-        avg_acc = textvqa_eval(config.output_path)
+        torch.distributed.barrier()
 
-        return [{"TextVQA accuracy": avg_acc}]
-    else:
-        raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
+    return [scores]
 
 
-def write_online_eval_to_tensorboard(data, iteration, writer):
-    """Write online evaluation data to Tensorboard."""
+def write_eval_to_tensorboard(data, iteration, writer, walltime=None):
+    """Write evaluation data to Tensorboard."""
     if not writer:
         return
 
     for item in data:
         for k, v in item.items():
-            writer.add_scalar(k, v, iteration)
+            writer.add_scalar(k, v, iteration, walltime=walltime)
+
+
+def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
+    """Write online evaluation data to Tensorboard."""
+    import shutil
+    args = get_args()
+
+    # Define source and destination directories
+    source_dir = os.path.join(args.save, "online_eval")
+    destination_dir = os.path.join(args.save, f"online_eval_{iteration}")
+    if os.path.exists(source_dir):
+        print("Moving online eval data from", source_dir, "to", destination_dir)
+
+        # Move the directory (back up the generation)
+        shutil.move(source_dir, destination_dir)
+
+    write_eval_to_tensorboard(data, iteration, writer, walltime)
 
 
 if __name__ == "__main__":

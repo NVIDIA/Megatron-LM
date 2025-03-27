@@ -207,3 +207,26 @@ pre:check_milestone:
         echo Please assign a Milestone to this MR!
         exit 1
       fi
+
+pre:check_status_of_main:
+  extends: [.pre_rules]
+  image: python:3.10
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - pip install python-gitlab
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - python tests/test_utils/python_scripts/check_status_of_main.py
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
+      when: never
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
+      when: always
+    - when: never

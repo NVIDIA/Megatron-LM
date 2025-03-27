@@ -29,7 +29,6 @@ from megatron.core.utils import (
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
 
-
 try:
     import transformer_engine # pylint: disable=unused-import
     HAVE_TE = True
@@ -44,10 +43,8 @@ except ImportError:
 
 xm = get_xla_model()
 
-def parse_args(extra_args_provider=None, ignore_unknown_args=False):
-    """Parse all arguments."""
-    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
-                                     allow_abbrev=False)
+def add_megatron_arguments(parser: argparse.ArgumentParser):
+    """"Add Megatron-LM arguments to the given parser."""
 
     # Standard arguments.
     parser = _add_network_size_args(parser)
@@ -77,6 +74,15 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
+
+    return parser
+
+def parse_args(extra_args_provider=None, ignore_unknown_args=False):
+    """Parse all arguments."""
+    parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
+                                     allow_abbrev=False)
+
+    parser = add_megatron_arguments(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -756,6 +762,11 @@ def validate_args(args, defaults={}):
             args.transformer_impl == "transformer_engine"
         ), 'Local transformer implementation currently does not support attention bias-based position embeddings.'
 
+    # MultiModal rotary embeddings arguments
+    if args.position_embedding_type == "mrope":
+        assert args.mrope_section is not None, \
+            '--mrope-section should be set when using --position-embedding-type mrope.'
+
     # MoE Spec check
     if args.num_experts == 0:
         args.num_experts = None
@@ -1198,7 +1209,7 @@ def _add_network_size_args(parser):
                        help='Maximum number of position embeddings to use. '
                        'This is the size of position embedding.')
     group.add_argument('--position-embedding-type', type=str, default='learned_absolute',
-                        choices=['learned_absolute', 'rope', 'relative', 'none'],
+                        choices=['learned_absolute', 'rope', 'mrope', 'relative', 'none'],
                         help='Position embedding type.')
     group.add_argument('--relative-attention-num-buckets', type=int, default=32,
                         help='Number of buckets for relative position embeddings.')
@@ -1223,6 +1234,8 @@ def _add_network_size_args(parser):
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
                        dest='add_position_embedding')
+    group.add_argument('--mrope-section', nargs='+', type=int, default=None,
+                       help='Multimodal rope section is for channel dimension, empty by default.')
     group.add_argument('--make-vocab-size-divisible-by', type=int, default=128,
                        help='Pad the vocab size to be divisible by this value.'
                        'This is added for computational efficieny reasons.')

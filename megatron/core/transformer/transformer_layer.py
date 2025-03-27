@@ -10,6 +10,7 @@ import torch.distributed
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -257,6 +258,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 config.enable_cuda_graph and config.external_cuda_graph
             ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
             if config.enable_cuda_graph:
+                if not self.training:
+                    # Cudagraphs for inference are only enabled with the flash decoding kernel
+                    assert (
+                        self.config.flash_decode
+                    ), "--flash-decode is required to use CUDA graphs during inference"
                 self.cudagraph_manager = CudaGraphManager(config)
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
@@ -550,11 +556,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             (slen_per_cptp, micro_batch_size, self.config.hidden_size),
             dtype=torch.bfloat16,
             requires_grad=True,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
         static_inputs["attention_mask"] = (
             ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-            .to(torch.cuda.current_device())
+            .to(get_current_device())
             .reshape(1, 1, slen_per_cp, seq_length)
             .tile(micro_batch_size, 1, 1, 1)
         )
@@ -651,7 +657,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     return torch.zeros(
                         (micro_batch_size, 1, slen_per_cp, slen),
                         dtype=torch.bool,
-                        device=torch.cuda.current_device(),
+                        device=get_current_device(),
                     )
 
                 if not is_te_min_version("1.10.0", check_equality=False):

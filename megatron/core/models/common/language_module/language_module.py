@@ -20,6 +20,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
+xm = get_xla_model()
 
 class LanguageModule(MegatronModule):
     """Base language module that has common helper functions used across GPT, BERT etc.
@@ -85,11 +86,17 @@ class LanguageModule(MegatronModule):
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-                    loss = te_parallel_cross_entropy(logits, labels)
+                    loss = te_parallel_cross_entropy(
+                        logits, labels, parallel_state.get_tensor_model_parallel_group()
+                    )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
-                loss = fused_vocab_parallel_cross_entropy(logits, labels)
+                loss = fused_vocab_parallel_cross_entropy(
+                    logits, labels, 
+                    parallel_state.get_tensor_model_parallel_group() if xm is None else \
+                        parallel_state.get_tensor_model_parallel_groups()
+                )
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
 

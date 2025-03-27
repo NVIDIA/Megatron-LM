@@ -174,7 +174,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-request state.
         self.request_ids = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), 0, dtype=torch.int32, device=get_current_device()
         )
         self.request_query_lengths = torch.empty_like(self.request_ids)
         self.request_kv_length_offsets = torch.empty_like(self.request_ids)
@@ -184,7 +184,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-token state.
         self.token_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+            (self.max_tokens,), 0, dtype=torch.long, device=get_current_device()
         )
         self.token_pos_ids = torch.full_like(self.token_input_ids, 0)
         self.token_to_request_idx = torch.empty_like(self.token_input_ids)
@@ -207,7 +207,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunk_count_avail = self.chunk_count_total - 1
         self.dummy_chunk_idx = self.chunk_count_total - 1
         self.chunk_bag = torch.arange(
-            self.chunk_count_total, dtype=torch.int32, device=torch.cuda.current_device()
+            self.chunk_count_total, dtype=torch.int32, device=get_current_device()
         )
 
         # Memory buffer.
@@ -222,12 +222,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             0,
             dtype=self.params_dtype,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         # Precompute base pointers for all chunks and layers.
-        chunk_idxs = torch.arange(self.chunk_count_total, device=torch.cuda.current_device())
-        layer_idxs = torch.arange(self.num_layers, device=torch.cuda.current_device())
+        chunk_idxs = torch.arange(self.chunk_count_total, device=get_current_device())
+        layer_idxs = torch.arange(self.num_layers, device=get_current_device())
         row_idx = chunk_idxs.repeat_interleave(self.num_layers)
         col_idx = layer_idxs.repeat(self.chunk_count_total)
 
@@ -238,13 +238,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.chunk_count_total,
             self.num_layers,
             dtype=torch.long,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
         self.value_memory_buffer_pointers = torch.empty(
             self.chunk_count_total,
             self.num_layers,
             dtype=torch.long,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         self.key_memory_buffer_pointers[row_idx, col_idx] = dtype_size_bytes * (
@@ -265,7 +265,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (self.max_requests, self.max_kv_chunk_count),
             0,
             dtype=torch.int,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         # `*_decode_only` tensors are for use with cuda graphs to maintain
@@ -281,27 +281,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             (self.num_layers, self.max_requests * self.max_kv_chunk_count),
             0,
             dtype=torch.long,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         self.curr_chunk_value_ptrs_decode_only = torch.full(
             (self.num_layers, self.max_requests * self.max_kv_chunk_count),
             0,
             dtype=torch.long,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         self.query_seq_lengths_decode_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), 0, dtype=torch.int32, device=get_current_device()
         )
         self.cu_query_seq_lengths_decode_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests + 1,), 0, dtype=torch.int32, device=get_current_device()
         )
         self.kv_seq_lengths_decode_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), 0, dtype=torch.int32, device=get_current_device()
         )
         self.cu_kv_seq_lengths_decode_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests + 1,), 0, dtype=torch.int32, device=get_current_device()
         )
 
         # Guaranteed active requests.
@@ -562,7 +562,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (self.total_request_count - self.paused_request_count + 1,),
                 0,
                 dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             self.cu_query_seq_lengths[1:] = cu_query_lengths
             self.max_seqlen_q = query_lengths.max().item()
@@ -582,7 +582,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (self.total_request_count - self.paused_request_count + 1,),
                 0,
                 dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             self.cu_kv_seq_lengths[1:] = torch.cumsum(kv_lengths, dim=0)
             self.max_seqlen_k = kv_lengths.max().item()
@@ -747,7 +747,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) % self.chunk_size_tokens
 
         # Update token state.
-        arange_context_length = torch.arange(context_length, device=torch.cuda.current_device())
+        arange_context_length = torch.arange(context_length, device=get_current_device())
 
         self.token_pos_ids[self.active_token_count : (self.active_token_count + context_length)] = (
             arange_context_length
@@ -838,7 +838,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             begin_idxs = lengths.cumsum(dim=0).roll(1)
             begin_idxs[0] = 0
             col_idx = torch.arange(
-                lengths.sum(), device=torch.cuda.current_device()
+                lengths.sum(), device=get_current_device()
             ) - begin_idxs.repeat_interleave(lengths)
             self.release_memory_chunks(self.request_kv_memory[row_idx, col_idx])
 
@@ -979,7 +979,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             row_idx = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + resume_request_count,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             col_idx = self.request_kv_chunk_counts[
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
@@ -994,7 +994,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Update token indexes.
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
-            self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
+            self.paused_request_count, self.total_request_count, device=get_current_device()
         )
         self.token_to_kv_seq_idx[: self.active_token_count] = self.request_kv_length_offsets[
             self.paused_request_count : self.total_request_count
