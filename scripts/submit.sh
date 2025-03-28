@@ -18,6 +18,8 @@ MARGIN=0
 PARTITION=normal
 PRECISION=hybrid
 FP8LEN=1024
+WEIGHT_DECAY=0.1
+MIN_LR=1e-8
 
 # Usage function.
 usage () {
@@ -39,6 +41,7 @@ usage () {
 	# Training settings..
 	echo " --tokens <int> (default=$DEF_TOKENS): Amount of tokens to train with (in B)."
 	echo " --lr <float>: Learning rate."
+	echo " --cooldown-wd: When set weight decay will be cooldown."
 	# Architecture settings.
 	echo " --init <float>: Change init std."
 	echo " --no-prenorm: Disables pre-layernorm."
@@ -148,6 +151,8 @@ while [[ $# -gt 0 ]]; do
 			LR=$2; 
 			CHANGED_LR=true
 			shift 2;;
+		--cooldown-wd)
+			COOLDOWN_WD=true; shift;;
 		--no-prenorm)
 			PRENORM=false; shift;;
 		--postnorm)
@@ -253,10 +258,10 @@ if [[ ! -z ${SOFTMAX_SCALE+x} ]]; then
 	ARCH_ARGS+=(--softmax-scale $SOFTMAX_SCALE)
 fi
 if [[ $LAYERSCALE = true ]]; then
-	SUFFIX=$SUFFIX-layerscale
+	SUFFIX=$SUFFIX-ls
 	if [[ ! -z ${LAYERSCALE_VALUE+x} ]]; then
 		BETA=$LAYERSCALE_VALUE
-		SUFFIX=$SUFFIX-ls$BETA
+		SUFFIX=$SUFFIX$BETA
 	else
 		BETA=$(echo "print(1/$LAYERS**0.5)" | python3)
 	fi
@@ -267,7 +272,7 @@ if [[ $LAYERSCALE = true ]]; then
 	fi
 fi
 if [[ $INPUT_UPSCALE = true ]]; then
-	SUFFIX=$SUFFIX-inputscale
+	SUFFIX=$SUFFIX-is
 	MULT=$(echo "print(1/$INIT_STD)" | python3)
 	ARCH_ARGS+=(--input-embeddings-multiplier $MULT)
 fi
@@ -294,7 +299,7 @@ if [[ $DECAY_GAINS = true ]]; then
 	OPT_ARGS+=(--weight-decay-qk-gains)
 fi
 if [[ $NOTRAIN_GAINS = true ]]; then
-	SUFFIX=$SUFFIX-notrainQKgains
+	SUFFIX=$SUFFIX-ntQKgain
 	OPT_ARGS+=(--no-train-qk-gains)
 fi
 
@@ -309,9 +314,12 @@ if [[ $TOKENS != $DEF_TOKENS ]]; then
 	SUFFIX=$SUFFIX-${TOKENS}BT
 fi
 ITERS=$((ITERS*TOKENS))
+DECAY_ITERS=$(($ITERS/5))
 
-if [[ $NODES -ne 1 ]]; then
-	SUFFIX=$SUFFIX-nodes$NODES
+if [[ $COOLDOWN_WD = true ]]; then
+	SUFFIX=$SUFFIX-coolWD
+	MIN_COOLDOWN=$(echo "print($LR*$WEIGHT_DECAY/$MIN_LR)" | python3)
+	OPT_ARGS+=(--end-weight-decay-cooldown $MIN_COOLDOWN --weight-decay-cooldown-iters $DECAY_ITERS --weight-decay-cooldown-style 1-sqrt)
 fi
 
 EXTRA_LOGS=()
@@ -375,13 +383,13 @@ TRAINING_ARGS=(
 	--micro-batch-size $MBS
 	--global-batch-size $GBS
 	--train-iters $ITERS
-	--weight-decay 0.1
+	--weight-decay $WEIGHT_DECAY
 	--adam-beta1 0.9 
 	--adam-beta2 0.95
 	--init-method-std $INIT_STD
 	--clip-grad 1.0 
 	--lr $LR
-	--min-lr 1e-8
+	--min-lr $MIN_LR
 )
 
 DISTRIBUTED_ARGS=(
@@ -427,7 +435,7 @@ LOGGING=(${LOGGING[@]} ${EXTRA_LOGS[@]})
 SCHEDULER_ARGS=(
 	--lr-decay-style WSD
 	--lr-wsd-decay-style 1-sqrt
-	--lr-wsd-decay-iters $(($ITERS/5))
+	--lr-wsd-decay-iters $DECAY_ITERS
 	--lr-warmup-iters $WARMUP
 )
 
