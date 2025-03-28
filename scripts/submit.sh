@@ -90,7 +90,7 @@ if [[ $1 -eq 300 ]]; then
 	SAVE_FREQ=10000
 elif [[ $1 -eq 1 ]]; then 
 	# batch_size: ~1.05M.
-	# tok/sec/gpu: 36.5k (8nodes, bf16).
+	# tok/sec/gpu: ~36.5k (8nodes, bf16).
 	# 50B ETA: ~12h (8nodes, bf16).
 	# ckpt freq: ~1h15m (8nodes, bf16).
 	LAYERS=16
@@ -420,6 +420,7 @@ LOGGING=(
 	--log-intermediate-metrics mean rms kurtosis
 	--log-params-norm
 	--log-memory-to-tensorboard
+	--log-weight-decay
 )
 LOGGING=(${LOGGING[@]} ${EXTRA_LOGS[@]})
 

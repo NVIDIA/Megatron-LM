@@ -661,6 +661,7 @@ def get_optimizer_param_scheduler(optimizer):
             args.lr_decay_iters = args.train_iters
         lr_decay_steps = args.lr_decay_iters * args.global_batch_size
         wd_incr_steps = args.train_iters * args.global_batch_size
+        wd_cooldown_steps = args.weight_decay_cooldown_iters * args.global_batch_size
         wsd_decay_steps = None
         if args.lr_wsd_decay_iters is not None:
             wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
@@ -678,6 +679,7 @@ def get_optimizer_param_scheduler(optimizer):
             args.lr_decay_samples = args.train_samples
         lr_decay_steps = args.lr_decay_samples
         wd_incr_steps = args.train_samples
+        wd_cooldown_steps = args.weight_decay_cooldown_iters
         wsd_decay_steps = args.lr_wsd_decay_samples
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
@@ -699,6 +701,9 @@ def get_optimizer_param_scheduler(optimizer):
         end_wd=args.end_weight_decay,
         wd_incr_steps=wd_incr_steps,
         wd_incr_style=args.weight_decay_incr_style,
+        wd_cooldown_steps=wd_cooldown_steps,
+        wd_cooldown_style=args.weight_decay_cooldown_style,
+        end_cooldown_wd=args.end_weight_decay_cooldown,
         use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
@@ -899,7 +904,7 @@ def train_step(forward_step_func, data_iterator,
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, individ_grad_norm, num_zeros_in_grad
 
 
-def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
+def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, wd, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
                  grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad, indiv_grad_norms):
     """Log training information such as losses, timing, ...."""
@@ -977,6 +982,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate = reduce_max_stat_across_model_parallel_group(learning_rate)
+    wd = reduce_max_stat_across_model_parallel_group(wd)
     # Tensorboard values.
     # Timer requires all the ranks to call.
     if args.log_timers_to_tensorboard and \
@@ -1010,6 +1016,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             wandb_writer.log({'learning-rate': learning_rate}, iteration)
         if args.decoupled_lr is not None:
             writer.add_scalar('decoupled-learning-rate', decoupled_learning_rate, iteration)
+        if args.log_weight_decay:
+            writer.add_scalar('weight-decay', wd, iteration)
+            if wandb_writer:
+                wandb_writer.log({'weight-decay': wd}, iteration)
         if args.skipped_train_samples > 0:
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
@@ -1680,9 +1690,14 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
+
+        wd = 0.0
+        for param_group in optimizer.param_groups:
+            wd = max(wd, param_group['weight_decay'])
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           learning_rate,
                                           decoupled_learning_rate,
+                                          wd,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
                                           grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad,

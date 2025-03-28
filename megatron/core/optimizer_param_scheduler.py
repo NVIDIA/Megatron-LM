@@ -26,6 +26,8 @@ class OptimizerParamScheduler:
         end_wd (float): final weight decay
         wd_incr_steps (int): number of weight decay increment steps
         wd_incr_style (str): weight decay increment style
+        wd_cooldown_steps (int): number of weight decay cooldown steps
+        wd_cooldown_style (str): weight decay cooldown style
         use_checkpoint_opt_param_scheduler (bool, optional): whether to use the checkpoint values
             for the optimizer param scheduler
         override_opt_param_scheduler (bool, optional): whether to override the optimizer param
@@ -49,6 +51,9 @@ class OptimizerParamScheduler:
         end_wd: float,
         wd_incr_steps: int,
         wd_incr_style: str,
+        wd_cooldown_steps: int,
+        wd_cooldown_style: str,
+        end_cooldown_wd: int,
         use_checkpoint_opt_param_scheduler: Optional[bool] = True,
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
@@ -84,6 +89,12 @@ class OptimizerParamScheduler:
         self.wd_incr_steps = wd_incr_steps
         self.wd_incr_style = wd_incr_style
 
+        self.wd_cooldown_steps = wd_cooldown_steps
+        self.wd_cooldown_style = wd_cooldown_style
+        self.end_cooldown_wd = end_cooldown_wd
+        if self.wd_cooldown_style == "constant":
+            assert self.wd_cooldown_steps is not None
+
         self.override_opt_param_scheduler = override_opt_param_scheduler
         self.use_checkpoint_opt_param_scheduler = use_checkpoint_opt_param_scheduler
         if self.override_opt_param_scheduler:
@@ -97,13 +108,32 @@ class OptimizerParamScheduler:
 
     def get_wd(self) -> float:
         """Weight decay incr functions"""
+        # Cooldown stage (no increment).
+        wd_cooldown_start = self.wd_incr_steps - self.wd_cooldown_steps
+        if self.wd_cooldown_style != 'constant' and self.num_steps > wd_cooldown_start:
+            cooldown_steps = self.num_steps - wd_cooldown_start
+            cooldown_ratio = cooldown_steps/self.wd_cooldown_steps
+            if self.wd_cooldown_style == 'linear':
+                coeff = 1.0 - cooldown_ratio
+            elif self.wd_cooldown_style == 'cosine':
+                coeff = 0.5 * (math.cos(math.pi * cooldown_ratio) + 1.0)
+            elif self.wd_cooldown_style == '1-sqrt':
+                coeff = 1.0 - math.sqrt(cooldown_ratio)
+            else:
+                raise Exception(f'{self.wd_cooldown_style} weight decay cooldown style is not supported.')
+            delta_wd = self.end_wd - self.end_cooldown_wd
+            return self.end_cooldown_wd + coeff*delta_wd
+
+        # Cooldown disabled, steady stage.
         if self.num_steps > self.wd_incr_steps:
             return self.end_wd
 
+        # Increment disabled, steady stage.
         if self.wd_incr_style == 'constant':
             assert self.start_wd == self.end_wd
             return self.end_wd
 
+        # Increment enabled, incrementing stage.
         incr_ratio = float(self.num_steps) / float(self.wd_incr_steps)
         assert incr_ratio >= 0.0
         assert incr_ratio <= 1.0
