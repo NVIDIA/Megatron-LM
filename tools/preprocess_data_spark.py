@@ -6,6 +6,7 @@ import math
 import json
 import os
 import sys
+import pyspark
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
 import time
@@ -166,53 +167,82 @@ class Partition(object):
         fout.close()
 
     def process_json_file(self, file_name):
+        # Unpack input file name and output prefix
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
         
+        # Start timer for file opening
         file_open_start = time.time()
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        
+        # Create a SparkSession (or get the existing one)
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder \
+            .config("spark.executorEnv.PYTHONPATH", "/shared/all/nemo_workspace/Megatron_yuli/:$PYTHONPATH") \
+            .config("spark.driverEnv.PYTHONPATH", "/shared/all/nemo_workspace/Megatron_yuli/:$PYTHONPATH") \
+            .getOrCreate()
+        sc = spark.sparkContext
+        
+        # Read the input file into an RDD. This does not load the entire file into memory.
+        rdd = sc.textFile(input_file_name)
+        
         file_open_end = time.time()
         print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Opening file took {file_open_end - file_open_start:.2f} seconds")
-
+        
+        # Start-up phase: create a dummy encoder for builder setup.
         startup_start = time.time()
-        encoder = Encoder(self.args)
+        encoder_dummy = Encoder(self.args)  # only for initialization on the driver
         tokenizer = build_tokenizer(self.args)
-        pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
-        encoded_docs = pool.imap(encoder.encode, fin, 32)
-
+        
+        # Define a function to process one partition.
+        # Each partition will create its own local Encoder instance,
+        # initialize it, and then process each line in the partition.
+        def process_partition(iterator):
+            local_encoder = Encoder(self.args)
+            local_encoder.initializer()
+            for line in iterator:
+                yield local_encoder.encode(line)
+        
+        # Apply the processing function to each partition of the RDD.
+        # This maps our encode() function over the RDD in parallel.
+        encoded_docs_rdd = rdd.mapPartitions(process_partition)
+        
+        # Since we don't care about preserving the original order,
+        # we can simply collect the results to the driver.
+        encoded_docs = encoded_docs_rdd.collect()
+        
+        # Determine level of processing.
         level = "document"
         if self.args.split_sentences:
             level = "sentence"
-
+        
+        # Create builders to accumulate processed documents.
         output_bin_files = {}
         output_idx_files = {}
         builders = {}
-
         for key in self.args.json_keys:
-            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix,
-                                                          key, level)
-            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
-                                                          key, level)
+            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix, key, level)
+            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix, key, level)
             builders[key] = indexed_dataset.IndexedDatasetBuilder(
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
             )
-
-        startup_end = time.time()
+        
         proc_start = time.time()
         total_bytes_processed = 0
-        print(f"{time.strftime('%H:%M:%S', time.localtime())}  IN - startup took: {startup_end - startup_start:.2f} seconds")
-        encode_start = time.time()
+        
+        # Process each encoded document and feed it to the builders.
+        # Each element of encoded_docs is a tuple: (doc, sentence_lens, bytes_processed)
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
             for key in doc.keys():
                 builders[key].add_document(doc[key], sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed)            
-
-        fin.close()
+            # Optionally, add progress logging here.
+            self.print_processing_stats(i, proc_start, total_bytes_processed)
+        
         encode_end = time.time()
-        print(f"{time.strftime('%H:%M:%S', time.localtime())}  IN - Encoding partitions took {encode_end - encode_start:.2f} seconds")
-
+        print(f"{time.strftime('%H:%M:%S', time.localtime())}  IN - Encoding partitions took {encode_end - proc_start:.2f} seconds")
+        
+        # Finalize each builder (this writes out the accumulated data to disk)
         finalize_start = time.time()
         for key in builders:
             builders[key].finalize(output_idx_files[key])
