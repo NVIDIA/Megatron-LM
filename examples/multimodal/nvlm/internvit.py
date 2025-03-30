@@ -42,6 +42,22 @@ from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_
 
 
 xm = get_xla_model()
+try:
+    import apex
+
+    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    HAVE_APEX = True
+    LNImpl = FusedLayerNorm
+except ImportError:
+    import warnings
+
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
+    LNImpl = WrappedTorchNorm
+
 
 class InternViTRMSNorm(MegatronModule):
 
@@ -240,6 +256,31 @@ def get_internvit_layer_spec(use_te) -> ModuleSpec:
             ),
             self_attn_bda=get_bias_dropout_add_layer_scaling,
             pre_mlp_layernorm=InternViTRMSNorm,
+            mlp=mlp,
+            mlp_bda=get_bias_dropout_add_layer_scaling,
+        ),
+    )
+
+def get_internvit300M_layer_spec(use_te) -> ModuleSpec:
+    mlp = get_mlp_module_spec(use_te)  # no norm
+
+    return ModuleSpec(
+        module=LayerScalingTransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=LNImpl,
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.no_mask},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear if use_te else ColumnParallelLinear,
+                    core_attention=TEDotProductAttention if use_te else DotProductAttention,
+                    linear_proj=TERowParallelLinear if use_te else RowParallelLinear,
+                    q_layernorm=None,
+                    k_layernorm=None,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add_layer_scaling,
+            pre_mlp_layernorm=LNImpl,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add_layer_scaling,
         ),

@@ -53,7 +53,7 @@ class CLIPViTModel(VisionModule):
     ) -> None:
 
         error_msg = f"CLIPViTModel model subtype {model_subtype} is not supported."
-        assert model_subtype in ["clip", "siglip", "internvit"], error_msg
+        assert model_subtype in ["clip", "siglip", "internvit", "internvit300M"], error_msg
 
         if model_subtype == "siglip":
             assert class_token_len == 0, "SigLIP does not support class tokens."
@@ -101,7 +101,7 @@ class CLIPViTModel(VisionModule):
             )
             conv_bias = True
             padding = "valid"
-        elif model_subtype == "internvit":
+        elif model_subtype.startswith("internvit"):
             conv_bias = True
             padding = 0
         else:
@@ -195,13 +195,15 @@ def get_num_image_embeddings(
     vision_model_type,
     disable_vision_class_token,
     class_token_len,
-    pixel_shuffle=False,
+    pixel_shuffle,
     use_tile_tags=False,
+    max_num_tiles=0,
+    tokenizer_type=None,
 ):
     """Get the number of image embeddings per image tile."""
     if vision_model_type == "siglip":
         keep_class_token = False
-    elif vision_model_type in ("clip", "internvit"):
+    elif vision_model_type in ("clip", "internvit", "internvit300M"):
         keep_class_token = not disable_vision_class_token
     elif vision_model_type.startswith("radio"):
         keep_class_token = not disable_vision_class_token
@@ -215,7 +217,7 @@ def get_num_image_embeddings(
         else:
             raise NotImplementedError(f"unsupported huggingface vision model: {vision_model_type}")
     else:
-        raise ValueError(f"unsupported vision model: {vision_model_type}")
+        raise NotImplementedError(f"unknown vision model type {vision_model_type}")
 
     num_patches_per_dim_h = img_h // patch_dim
     num_patches_per_dim_w = img_w // patch_dim
@@ -226,7 +228,17 @@ def get_num_image_embeddings(
         num_image_embeddings_per_tile = int(num_image_embeddings_per_tile * (0.5**2))
 
     if use_tile_tags:
-        # The length of tile tags tokenized. Currently, the same across tokenizers used.
-        num_image_embeddings_per_tile += 5
+        if tokenizer_type in ("llama3p1", "chatml", "qwen2p0", "qwen2p5"):
+            num_image_embeddings_per_tile += 5
+        elif tokenizer_type.startswith("nemotron5"):
+            num_image_embeddings_per_tile += 6
+        else:
+            raise ValueError("tokenizer type not defined")
+
+        if 10 < max_num_tiles < 100:
+            if tokenizer_type.startswith("qwen"):
+                num_image_embeddings_per_tile += 1  # add padding 0
+        elif max_num_tiles > 100:
+            raise ValueError(f"max number of tiles {max_num_tiles} not supported")
 
     return num_image_embeddings_per_tile

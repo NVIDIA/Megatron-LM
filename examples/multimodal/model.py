@@ -132,6 +132,9 @@ def model_provider(
     elif vision_model_type == "internvit":
         from nvlm.internvit import get_internvit_layer_spec
         vision_transformer_layer_spec = get_internvit_layer_spec(use_te=use_te)
+    elif vision_model_type == "internvit300M":
+        from nvlm.internvit import get_internvit300M_layer_spec
+        vision_transformer_layer_spec = get_internvit300M_layer_spec(use_te=use_te)
     elif vision_model_type.startswith("hf://"):
         vision_transformer_layer_spec = None
     else:

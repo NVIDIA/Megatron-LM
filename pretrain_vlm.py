@@ -309,7 +309,8 @@ def get_batch(data_iterator):
         vision_model_type = "clip"
         # Calculate the number of image embedding tokens will be added to text tokens
         num_image_embeddings_per_tile = get_num_image_embeddings(
-            args.img_h, args.img_w, args.patch_dim, vision_model_type, args.disable_vision_class_token, 1
+            args.img_h, args.img_w, args.patch_dim, vision_model_type,
+            args.disable_vision_class_token, 1, False
         )
         # Pad to make sure the text sequence can be sharded equally by CP chunks.
         image_token_mask = tokens == DEFAULT_IMAGE_TOKEN_INDEX

@@ -20,6 +20,7 @@ pixel_statistics = {
     "internvit": (IMAGENET_PIXEL_MEAN, IMAGENET_PIXEL_STD),
     "radio": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
     "radio-g": (RADIO_G_PIXEL_MEAN, RADIO_G_PIXEL_STD),
+    "internvit300M": (IMAGENET_PIXEL_MEAN, IMAGENET_PIXEL_STD),
     "huggingface": (SIGLIP_PIXEL_MEAN, SIGLIP_PIXEL_STD),
 }
 
@@ -127,7 +128,7 @@ def dynamic_preprocess(
 # Based on https://github.com/openai/CLIP/blob/dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1/clip/clip.py#L79
 # and https://github.com/OpenGVLab/InternVL/blob/aa521e6eb1df4cf153aa4118fcf13e673c055d46/internvl_chat/internvl/train/dataset.py#L276
 def _build_transform(input_size, vision_model_type):
-    if vision_model_type in ("siglip", "internvit", "radio", "radio-g"):
+    if vision_model_type in ("siglip", "internvit", "internvit300M", "radio", "radio-g"):
         pixel_mean, pixel_std = pixel_statistics[vision_model_type]
 
         transform = T.Compose([
