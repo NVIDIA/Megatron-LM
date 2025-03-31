@@ -6,6 +6,7 @@ import math
 import json
 import os
 import sys
+import glob
 import pyspark
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
@@ -167,88 +168,102 @@ class Partition(object):
         fout.close()
 
     def process_json_file(self, file_name):
-        # Unpack input file name and output prefix
+        # Unpack input file name and output prefix.
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
         
-        # Start timer for file opening
         file_open_start = time.time()
         
-        # Create a SparkSession (or get the existing one)
+        # Create a SparkSession (or get the existing one).
         from pyspark.sql import SparkSession
         spark = SparkSession.builder \
+            .master("local[*]") \
+            .config("spark.driver.memory", "200g") \
+            .config("spark.executor.memory", "200g") \
             .config("spark.executorEnv.PYTHONPATH", "/shared/all/nemo_workspace/Megatron_yuli/:$PYTHONPATH") \
             .config("spark.driverEnv.PYTHONPATH", "/shared/all/nemo_workspace/Megatron_yuli/:$PYTHONPATH") \
             .getOrCreate()
         sc = spark.sparkContext
         
-        # Read the input file into an RDD. This does not load the entire file into memory.
+        # Read the input file and repartition it to the desired number of partitions.
+        # This ensures the output is split into exactly args.partitions parts.
         rdd = sc.textFile(input_file_name)
         
         file_open_end = time.time()
         print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Opening file took {file_open_end - file_open_start:.2f} seconds")
         
-        # Start-up phase: create a dummy encoder for builder setup.
+        # Startup phase: initialize a dummy encoder (for driver) and obtain the tokenizer.
         startup_start = time.time()
-        encoder_dummy = Encoder(self.args)  # only for initialization on the driver
+        encoder_dummy = Encoder(self.args)  # for driver initialization only
         tokenizer = build_tokenizer(self.args)
         
-        # Define a function to process one partition.
-        # Each partition will create its own local Encoder instance,
-        # initialize it, and then process each line in the partition.
-        def process_partition(iterator):
-            local_encoder = Encoder(self.args)
-            local_encoder.initializer()
-            for line in iterator:
-                yield local_encoder.encode(line)
-        
-        # Apply the processing function to each partition of the RDD.
-        # This maps our encode() function over the RDD in parallel.
-        encoded_docs_rdd = rdd.mapPartitions(process_partition)
-        
-        # Since we don't care about preserving the original order,
-        # we can simply collect the results to the driver.
-        encoded_docs = encoded_docs_rdd.collect()
-        
-        # Determine level of processing.
+        # Determine processing level.
         level = "document"
         if self.args.split_sentences:
             level = "sentence"
         
-        # Create builders to accumulate processed documents.
-        output_bin_files = {}
-        output_idx_files = {}
-        builders = {}
+        # Define a function to process a partition and write out its results
+        # in the same bin/idx format using the IndexedDatasetBuilder.
+        def process_and_write_partition(index, iterator):
+            # Each partition gets its own Encoder instance.
+            local_encoder = Encoder(self.args)
+            local_encoder.initializer()
+            
+            # Initialize an IndexedDatasetBuilder for each json key.
+            local_builders = {}
+            for key in self.args.json_keys:
+                bin_file = "{}_{}_{}_{}.bin".format(output_prefix, key, level, index)
+                # Note: We create a new builder for each key.
+                local_builders[key] = indexed_dataset.IndexedDatasetBuilder(
+                    bin_file,
+                    dtype=indexed_dataset.DType.optimal_dtype(build_tokenizer(self.args).vocab_size)
+                )
+            
+            # Process each line in the partition.
+            for line in iterator:
+                doc, sentence_lens, bytes_processed = local_encoder.encode(line)
+                for key in doc.keys():
+                    local_builders[key].add_document(doc[key], sentence_lens[key])
+            
+            # Finalize each builder to write out the corresponding idx file.
+            for key in local_builders:
+                idx_file = "{}_{}_{}_{}.idx".format(output_prefix, key, level, index)
+                local_builders[key].finalize(idx_file)
+            
+            # Return an empty iterator
+            return iter([])
+        
+        rdd.mapPartitionsWithIndex(process_and_write_partition).count()  # Just to trigger execution
+        
+        startup_end = time.time()
+        print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Partition processing and writing took {startup_end - file_open_end:.2f} seconds")
+        
+        # ---------------------------
+        # Phase 2: Merge the per-partition output files into one final dataset.
+        # ---------------------------
+        
+        # Now, for each JSON key, merge all partition outputs.
         for key in self.args.json_keys:
-            output_bin_files[key] = "{}_{}_{}.bin".format(output_prefix, key, level)
-            output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix, key, level)
-            builders[key] = indexed_dataset.IndexedDatasetBuilder(
-                output_bin_files[key],
-                dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
+            # Final output names.
+            output_full_prefix = "{}_{}_{}".format(output_prefix, key, level)
+            output_bin_file = "{}.bin".format(output_full_prefix)
+            output_idx_file = "{}.idx".format(output_full_prefix)
+            # Initialize the final builder.
+            builder = indexed_dataset.IndexedDatasetBuilder(
+                output_bin_file,
+                dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size)
             )
+            # Find all partitions with the common output prefix and extract unique partition prefixes
+            partitions = glob.glob(f"{output_prefix}_{key}_{level}_*.idx")
+            print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Found {len(partitions)} partitions")
+            for partition in partitions:
+                # Extract the base name without extension
+                partition_name = os.path.splitext(partition)[0]
+                builder.add_index(partition_name)
+            # Finalize the final builder to merge all indices and write the idx file.
+            builder.finalize(output_idx_file)
         
-        proc_start = time.time()
-        total_bytes_processed = 0
-        
-        # Process each encoded document and feed it to the builders.
-        # Each element of encoded_docs is a tuple: (doc, sentence_lens, bytes_processed)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
-            total_bytes_processed += bytes_processed
-            for key in doc.keys():
-                builders[key].add_document(doc[key], sentence_lens[key])
-            # Optionally, add progress logging here.
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
-        
-        encode_end = time.time()
-        print(f"{time.strftime('%H:%M:%S', time.localtime())}  IN - Encoding partitions took {encode_end - proc_start:.2f} seconds")
-        
-        # Finalize each builder (this writes out the accumulated data to disk)
-        finalize_start = time.time()
-        for key in builders:
-            builders[key].finalize(output_idx_files[key])
-        finalize_end = time.time()
-        print(f"{time.strftime('%H:%M:%S', time.localtime())}  IN - Finalizing builders took {finalize_end - finalize_start:.2f} seconds")
-
+        print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Merging partitions completed.")
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -298,6 +313,7 @@ def get_args():
 
 
 def get_file_name(args, file_id):
+    """Constructs file names for input, sentence split, and output files based on file_id."""
     file_name, extension = os.path.splitext(args.input)
     input_file_name = file_name + "_" + str(file_id) + extension
     sentence_split_file = file_name + "_ss_" + str(file_id) + extension
@@ -311,6 +327,7 @@ def get_file_name(args, file_id):
 
 @timing_decorator
 def check_files_exist(in_ss_out_names, key, num_partitions):
+    """Checks if all partition files for a given output directory and key exist."""
     for i in range(num_partitions):
         if not os.path.exists(in_ss_out_names[i][key]):
             return False
@@ -332,6 +349,7 @@ def main():
     print(f"{time.strftime('%H:%M:%S', time.localtime())}  Sentence splitting is {'enabled' if args.split_sentences else 'disabled'}")
     print(f"{time.strftime('%H:%M:%S', time.localtime())}  Number of partitions: {args.partitions}")
 
+    # handling single source partition
     if args.partitions == 1:
         file_name, extension = os.path.splitext(args.input)
         sentence_split_file = file_name + "_ss" + extension
@@ -340,6 +358,7 @@ def main():
             'sentence_split': sentence_split_file,
             'output_prefix': args.output_prefix}
         in_ss_out_names.append(file_names)
+    # handling multiple source partitions
     else:
         in_file_names = glob.glob(args.input)
 
@@ -373,19 +392,23 @@ def main():
 
             index = 0
             if args.keep_sequential_samples: line_count = 0
+            # further partitional each source file into equal size partitions
             for in_file_name in in_file_names:
                 # support for gzip files
                 if in_file_name.endswith(".gz"):
                     fin = gzip.open(in_file_name, 'rt')
+                # loads a normal json/text file
                 else:
                     fin = open(in_file_name, 'r', encoding='utf-8')
 
                 for line in fin:
                     partitioned_input_files[index].write(line)
+                    # sequential partitioning
                     if args.keep_sequential_samples:
                         line_count += 1
                         if line_count % partition_size == 0:
                             index += 1
+                    # round-robin partitioning, faster but not preserving the original order
                     else:
                         index = (index + 1)%args.partitions
 
@@ -417,20 +440,13 @@ def main():
 
 
     # encode partition files in parallel
-    processes = []
     input_key = 'sentence_split' if args.split_sentences else 'partition'
     
     process_json_start = time.time()
+    # it applies to both single and multiple partitions
     for name in in_ss_out_names:
-        p = multiprocessing.Process(target=partition.process_json_file,
-                                    args=((name[input_key], name['output_prefix']),))
-        p.start()
-        processes.append(p)
+        partition.process_json_file((name[input_key], name['output_prefix']))
 
-    add_process_end = time.time()
-    print(f"{time.strftime('%H:%M:%S', time.localtime())}  Process - Adding {len(processes)} processes took {add_process_end - process_json_start:.2f} seconds")  
-    for p in processes:
-        p.join()
     process_json_end = time.time()
     print(f"{time.strftime('%H:%M:%S', time.localtime())}  Process - Process json took {process_json_end - process_json_start:.2f} seconds")
 
@@ -451,21 +467,25 @@ def main():
     print(f"{time.strftime('%H:%M:%S', time.localtime())}  Process - Building tokenizer took {tokenizer_end - tokenizer_start:.2f} seconds")
 
     merge_start = time.time()
+    # the final file is output_prefix-key specific
     for key in args.json_keys:
         output_bin_files[key] = "{}_{}_{}.bin".format(args.output_prefix,
                                                       key, level)
         output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
                                                       key, level)
+        # initialize a builder for each key
         builders[key] = indexed_dataset.IndexedDatasetBuilder(
             output_bin_files[key],
             dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
         )
 
+        # add all output rows from all partitions to the builder
         for name in in_ss_out_names:
             parition_output_prefix = name['output_prefix']
             full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,
                                                              key, level)
             builders[key].add_index(full_partition_output_prefix)
+        # close all output file handlers, write out the accumulated data to disk
         builders[key].finalize(output_idx_files[key])
     merge_end = time.time()
     print(f"{time.strftime('%H:%M:%S', time.localtime())} Process - Merging partitions took {merge_end - merge_start:.2f} seconds")
