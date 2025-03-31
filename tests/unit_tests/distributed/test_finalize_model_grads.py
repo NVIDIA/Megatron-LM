@@ -7,12 +7,20 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.distributed.finalize_model_grads import _allreduce_layernorm_grads
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 class TestAllReduceLNGrads:
@@ -29,7 +37,7 @@ class TestAllReduceLNGrads:
 
         self.model = GPTModel(
             config=self.transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True),
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True) if HAVE_TE else get_gpt_layer_local_spec(qk_layernorm=True),
             vocab_size=100,
             max_sequence_length=4,
         )
@@ -48,10 +56,10 @@ class TestAllReduceLNGrads:
 
         self.tp_size = tp_size
         Utils.initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         self.init_model()
-        self.model.cuda()
+        self.model.to(device=get_current_device())
 
         for param in self.model.parameters():
             if freeze_model:

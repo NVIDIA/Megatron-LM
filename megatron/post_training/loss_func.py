@@ -48,7 +48,7 @@ def _allreduce_loss(loss):
         global_rank = torch.distributed.get_rank()
         assert not loss.isnan(), (
             f'Rank {global_rank}: found NaN in local forward loss calculation. '
-            f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+            f'Device: {get_current_device()}, node: {os.uname()[1]}'
         )
 
     # Reduce loss for logging.

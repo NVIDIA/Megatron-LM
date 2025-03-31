@@ -3,14 +3,21 @@
 from typing import List
 
 import torch
+import torch.distributed
+
+from megatron.core.device_utils import get_current_device_type, get_xla_model
 
 try:
-    from torch.distributed import DeviceMesh
-    from torch.distributed._composable.fsdp import fully_shard
-
+    from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as fully_shard
     HAVE_FSDP = True
 except ImportError:
-    HAVE_FSDP = False
+    try:
+        from torch.distributed import DeviceMesh
+        from torch.distributed._composable.fsdp import fully_shard
+
+        HAVE_FSDP = True
+    except ImportError:
+        HAVE_FSDP = False
 
 from megatron.core.fp8_utils import is_float8tensor
 
@@ -22,6 +29,7 @@ from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
+xm = get_xla_model()
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
     """
@@ -67,10 +75,27 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         super().__init__(config=config, module=module)
         self.data_parallel_group = parallel_state.get_data_parallel_group(
             with_context_parallel=True
+        ) if xm is None else parallel_state.get_data_parallel_groups(
+            with_context_parallel=True
         )
 
-        self.device_mesh = DeviceMesh.from_group(self.data_parallel_group, "cuda")
-        kwargs = {"mesh": self.device_mesh}
+        if xm:
+            sharding_groups = self.data_parallel_group
+            sharding_rank = parallel_state.get_data_parallel_rank()
+            sharding_world_size = parallel_state.get_data_parallel_world_size()
+            kwargs = {
+                "sharding_groups": sharding_groups, 
+                "sharding_rank": sharding_rank, 
+                "sharding_world_size": sharding_world_size,
+                "reshard_after_forward": True,
+                "execute_sharding_on_init": True,
+                "optimization_barrier_in_forward": True,
+                "optimization_barrier_in_backward": True,
+                "mark_step_on_finalization": True,
+            }
+        else:
+            self.mesh = DeviceMesh.from_group(self.data_parallel_group, get_current_device_type())
+            kwargs = {"mesh": self.mesh}
 
         def save_custom_attrs(module):
             custom_attrs = {}

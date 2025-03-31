@@ -1,14 +1,19 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+import contextlib
 from typing import List, Optional, Tuple
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.parallel_state import (
     get_expert_model_parallel_group,
+    get_expert_model_parallel_groups,
     get_expert_tensor_and_model_parallel_group,
+    get_expert_tensor_and_model_parallel_groups,
     get_expert_tensor_parallel_group,
+    get_expert_tensor_parallel_groups,
     get_expert_tensor_parallel_rank,
 )
 from megatron.core.tensor_parallel import (
@@ -37,6 +42,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
      num_global_tokens: num_local_tokens*TP*EP
 """
 
+xm = get_xla_model()
 
 class MoETokenDispatcher:
     """
@@ -56,12 +62,14 @@ class MoETokenDispatcher:
     @property
     def ep_group(self):
         """Get expert model parallel group."""
-        return get_expert_model_parallel_group()
+        return get_expert_model_parallel_group() if not xm else \
+            get_expert_model_parallel_groups()
 
     @property
     def tp_group(self):
         """Get expert tensor parallel group."""
-        return get_expert_tensor_parallel_group()
+        return get_expert_tensor_parallel_group() if not xm else \
+            get_expert_tensor_parallel_groups()
 
     @property
     def tp_rank(self):
@@ -71,7 +79,8 @@ class MoETokenDispatcher:
     @property
     def tp_ep_group(self):
         """Get expert tensor and model parallel group."""
-        return get_expert_tensor_and_model_parallel_group()
+        return get_expert_tensor_and_model_parallel_group() if not xm else \
+            get_expert_tensor_and_model_parallel_groups()
 
     @abstractmethod
     def token_permutation(
@@ -314,7 +323,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # [tp_size]. Represents the number of tokens received by the current rank from
         # other TP ranks.
         self.output_splits_tp = None
-        self.permute_idx_device = torch.device("cuda") if self.config.moe_permute_fusion else None
+        self.permute_idx_device = get_current_device() if self.config.moe_permute_fusion else None
         input_chunk_idxs = torch.arange(
             self.num_experts * self.tp_size, device=self.permute_idx_device
         )
@@ -349,7 +358,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "no_sync": 4,
         }
         self.cuda_dtoh_point = "before_permutation_1"
-        self.cuda_dtoh_stream = torch.cuda.Stream()
+        self.cuda_dtoh_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
         self.shared_experts = None
 
@@ -674,10 +683,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if not self.drop_and_pad:
             if point == self.cuda_dtoh_point:
                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
-                on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
+                on_side_stream = torch.cuda.is_available() and \
+                    (torch.cuda.current_stream() != self.cuda_dtoh_stream)
                 if on_side_stream:
                     self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.cuda_dtoh_stream):
+                stream_context = torch.cuda.stream(self.cuda_dtoh_stream) if torch.cuda.is_available() \
+                    else contextlib.nullcontext()
+                with stream_context:
                     # TODO: use MemcpyBatchAsync instead.
                     tokens_per_expert = maybe_move_tensor_to_cpu(
                         tokens_per_expert, record_stream=on_side_stream
@@ -699,7 +711,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                             self.num_global_tokens_per_local_expert, record_stream=on_side_stream
                         )
 
-            if point == self.cuda_sync_point:
+            if torch.cuda.is_available() and point == self.cuda_sync_point:
                 # Synchronize with the dtoh stream at self.cuda_sync_point.
                 self.cuda_dtoh_stream.synchronize()
 

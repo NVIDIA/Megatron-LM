@@ -19,7 +19,7 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+from megatron.core.device_utils import get_current_device, get_xla_model
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -58,7 +58,7 @@ class Router(ABC, MegatronModule):
         """
         if self.weight.device.type == 'cpu':
             # move weights to GPU
-            self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+            self.weight.data = self.weight.data.to(device=get_current_device())
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
@@ -282,11 +282,19 @@ class TopKRouter(Router):
         if moe_aux_loss_coeff == 0:
             return activation
         sequence_partition_group = None
+        xm = get_xla_model()
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
-            sequence_partition_group = parallel_state.get_context_parallel_group()
+            if xm:
+                sequence_partition_group = parallel_state.get_context_parallel_groups()
+            else:
+                sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
         elif parallel_state.get_tensor_and_context_parallel_world_size() > 1:
-            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
+            if xm:
+                sequence_partition_group = parallel_state.get_tensor_and_context_parallel_groups()
+            else:
+                sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
+            
 
         aux_loss = load_balancing_loss_func(
             moe_aux_loss_coeff=moe_aux_loss_coeff, sequence_partition_group=sequence_partition_group
@@ -296,7 +304,7 @@ class TopKRouter(Router):
             aux_loss / moe_aux_loss_coeff,
             self.layer_number,
             self.config.num_layers,
-            reduce_group=sequence_partition_group,
+            reduce_group=sequence_partition_group
         )
         activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
@@ -411,5 +419,4 @@ class TopKRouter(Router):
         logits = self.gating(input)
 
         scores, routing_map = self.routing(logits)
-
         return scores, routing_map

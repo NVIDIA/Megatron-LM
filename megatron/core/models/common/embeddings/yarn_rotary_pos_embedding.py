@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
@@ -64,7 +65,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
 
-        device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()
+        device = 'cpu' if use_cpu_initialization else get_current_device()
         self.inv_freq_extra = 1.0 / (
             self.rotary_base
             ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
@@ -100,11 +101,11 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
         if self.inv_freq_extra.device.type == 'cpu':
             # move `inv_freq_extra` to GPU once at the first micro-batch forward pass
-            self.inv_freq_extra = self.inv_freq_extra.to(device=torch.cuda.current_device())
+            self.inv_freq_extra = self.inv_freq_extra.to(device=get_current_device())
 
         if self.inv_freq_inter.device.type == 'cpu':
             # move `inv_freq_inter` to GPU once at the first micro-batch forward pass
-            self.inv_freq_inter = self.inv_freq_inter.to(device=torch.cuda.current_device())
+            self.inv_freq_inter = self.inv_freq_inter.to(device=get_current_device())
 
         low, high = _yarn_find_correction_range(
             self.beta_fast,

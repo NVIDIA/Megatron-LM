@@ -2,6 +2,7 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     TorchFullyShardedDataParallel,
@@ -11,13 +12,14 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.core.tensor_parallel import ColumnParallelLinear
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class DummyModel(MegatronModule):
     """Setup a few modules to test the FSDP2 constructor."""
@@ -32,19 +34,18 @@ class DummyModel(MegatronModule):
             input_size=2, output_size=2, config=config, init_method=init_method_normal(0.02)
         )
         self.conv = torch.nn.Conv2d(2, 2, 1)
-
-
+    
 @pytest.fixture
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
     init_num_microbatches_calculator(0, None, 1, 1, 1)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
     yield  # Run the actual test.
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
 
-
+@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
 def test_fsdp2_constructor(init_model_parallel):
     """Test the FSDP2 constructor."""
     if not is_torch_min_version("2.4.0"):

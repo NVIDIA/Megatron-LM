@@ -4,11 +4,12 @@ import os
 
 import torch
 
+from megatron.core.device_utils import get_current_device
+
 import clip
 
-
 def convert(download_root, output_path, tensor_parallel_size, use_te):
-    device = "cuda"
+    device = get_current_device()
 
     model, _ = clip.load("ViT-L/14@336px", device=device, download_root=download_root)
 

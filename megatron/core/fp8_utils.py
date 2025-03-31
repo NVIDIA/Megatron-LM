@@ -10,14 +10,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
 # Check if Transformer Engine is installed
-HAVE_TE = False
 try:
     import transformer_engine  # pylint: disable=W0611
 
     HAVE_TE = True
 except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
-    pass
+    HAVE_TE = False
 
 # Check if Transformer Engine has Float8Tensor class
 HAVE_TE_FLOAT8TENSOR = False
@@ -27,7 +26,7 @@ try:
     HAVE_TE_FLOAT8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # Float8Tensor not found
-    pass
+    Float8Tensor = None
 
 # Check if Transformer Engine has MXFP8Tensor class
 HAVE_TE_MXFP8TENSOR = False
@@ -37,7 +36,7 @@ try:
     HAVE_TE_MXFP8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
-    pass
+    MXFP8Tensor = None
 
 # utils for transformer engine fp8 and mxfp8 tensor
 

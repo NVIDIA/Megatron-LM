@@ -22,10 +22,13 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+    if torch.cuda.is_available():
+        warnings.warn('Transfomer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 try:
-    import apex
+    import apex  # pylint: disable=unused-import
 
     from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
@@ -121,6 +124,8 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
 
 def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
     # Dense MLP w/ or w/o TE modules.
+
+    use_te = use_te & HAVE_TE
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
@@ -129,8 +134,9 @@ def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
         ),
     )
 
-
+    
 def get_norm_mlp_module_spec_te() -> ModuleSpec:
+    
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(

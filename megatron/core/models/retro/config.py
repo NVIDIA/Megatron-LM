@@ -4,6 +4,7 @@
 
 import os
 from dataclasses import dataclass
+import torch
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
@@ -66,20 +67,24 @@ class RetroConfig(TransformerConfig):
         self.attention_backend = AttnBackend.unfused
 
         # Validate Transformer Engine version.
-        if is_te_min_version("1.3"):
-            try:
-                assert os.getenv("NVTE_FLASH_ATTN") == "0"
-                assert os.getenv("NVTE_FUSED_ATTN") == "0"
-            except Exception as e:
-                raise Exception(
-                    "When using Transformer Engine >= 1.3, environment vars NVTE_FLASH_ATTN "
-                    "and NVTE_FUSED_ATTN most both be defined and set to '0'. "
-                    "Currently, NVTE_FLASH_ATTN == %s, NVTE_FUSED_ATTN == %s."
-                    % (
-                        os.getenv("NVTE_FLASH_ATTN", "[unset]"),
-                        os.getenv("NVTE_FUSED_ATTN", "[unset]"),
-                    )
-                )
+        try:
+            if is_te_min_version("1.3"):
+                try:
+                    assert os.getenv("NVTE_FLASH_ATTN") == "0"
+                    assert os.getenv("NVTE_FUSED_ATTN") == "0"
+                except Exception as e:
+                    raise Exception(
+                        "When using Transformer Engine >= 1.3, environment vars NVTE_FLASH_ATTN "
+                        "and NVTE_FUSED_ATTN most both be defined and set to '0'. "
+                        "Currently, NVTE_FLASH_ATTN == %s, NVTE_FUSED_ATTN == %s."
+                        % (
+                            os.getenv("NVTE_FLASH_ATTN", "[unset]"),
+                            os.getenv("NVTE_FUSED_ATTN", "[unset]"),
+                        ))
+        except ImportError:
+            import warnings
+            if torch.cuda.is_available():
+                warnings.warn("transformer-engine package is not installled")
 
         # Preprocessing split should be defined.
         assert self.retro_split_preprocessing is not None

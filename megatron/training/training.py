@@ -10,6 +10,9 @@ import logging
 import math
 import os
 import sys
+
+from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
 from typing import List
 
 import torch.distributed
@@ -68,6 +71,7 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
+    get_default_process_group,
     get_amax_reduction_group,
     model_parallel_is_initialized,
 )
@@ -111,8 +115,14 @@ from . import one_logger_utils
 
 from . import ft_integration
 
+
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel as DDP
+
+
 stimer = StragglerDetector()
 
+xm = get_xla_model()
 
 def destroy_global_state():
     destroy_global_vars()
@@ -611,7 +621,8 @@ def pretrain(
         ft_integration.maybe_setup_simulated_fault()
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    if xm is None:
+        set_jit_fusion_options()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
@@ -619,7 +630,7 @@ def pretrain(
     global _TRAIN_START_TIME
     start_time_tensor = torch.tensor([_TRAIN_START_TIME],
                                      dtype=torch.double,
-                                     device='cuda')
+                                     device=get_current_device())
     torch.distributed.all_reduce(start_time_tensor,
                                  op=torch.distributed.ReduceOp.MIN)
     _TRAIN_START_TIME = start_time_tensor.item()
@@ -659,7 +670,8 @@ def pretrain(
 
         checkpointing_context = {
             'local_checkpoint_manager': LocalCheckpointManager(args.non_persistent_local_ckpt_dir,
-                                                               repl_strategy=repl_strategy
+                                                               repl_strategy=repl_strategy,
+                                                               group=get_default_process_group()
                                                                )
         }
     else:
@@ -891,9 +903,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # GPU allocation.
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
-    if not (args.use_torch_fsdp2 and args.use_cpu_initialization) and not args.init_model_with_meta_device:
+    if torch.cuda.is_available() and not (args.use_torch_fsdp2 and args.use_cpu_initialization) and not args.init_model_with_meta_device:
         for model_module in model:
-            model_module.cuda(torch.cuda.current_device())
+            model_module.to(device=get_current_device())
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
@@ -1183,7 +1195,7 @@ def train_step(forward_step_func, data_iterator,
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
 
     # Empty unused memory.
-    if args.empty_unused_memory_level >= 1:
+    if args.empty_unused_memory_level >= 1 and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     # Vision gradients.
@@ -1222,7 +1234,7 @@ def train_step(forward_step_func, data_iterator,
         skipped_iter = 1
 
     # Empty unused memory.
-    if args.empty_unused_memory_level >= 2:
+    if args.empty_unused_memory_level >= 2 and torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     # Set the manual hooks when CUDA Graphs are enabled.
@@ -1282,7 +1294,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     for key in loss_dict:
         if not skipped_iter:
             total_loss_dict[key] = total_loss_dict.get(
-                key, torch.tensor([0.0], dtype=torch.float, device='cuda')) + loss_dict[key]
+                key, torch.tensor([0.0], dtype=torch.float, device=get_current_device())) + loss_dict[key]
         else:
             value = loss_dict[key].float().sum().item()
             is_nan = value == float('inf') or \
@@ -1479,7 +1491,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                       float(max(1, total_loss_dict[advanced_iters_key]))
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
-                total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+                total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device=get_current_device())
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -1597,7 +1609,7 @@ def post_training_step_callbacks(model, optimizer, opt_param_scheduler, iteratio
     args = get_args()
 
     # Bring CPU and GPU back in sync if on right iteration.
-    if args.train_sync_interval and iteration % args.train_sync_interval == 0:
+    if torch.cuda.is_available() and args.train_sync_interval and iteration % args.train_sync_interval == 0:
         torch.cuda.synchronize()
 
     # Straggler detector.
@@ -1685,7 +1697,7 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
         train_time = (time.time() - _TRAIN_START_TIME) / 60.0
         done_cuda = torch.tensor(
             [train_time > args.exit_duration_in_mins],
-            dtype=torch.int, device='cuda')
+            dtype=torch.int, device=get_current_device())
         torch.distributed.all_reduce(
             done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
@@ -1763,7 +1775,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if isinstance(model[0], (custom_FSDP, DDP)) and args.overlap_grad_reduce:
         assert config.no_sync_func is None, \
             ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
-             'a custom no_sync_func is not supported when overlapping grad-reduce')
+            'a custom no_sync_func is not supported when overlapping grad-reduce')
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
@@ -2109,7 +2121,7 @@ def evaluate(forward_step_func,
             config.timers = get_timers()
 
             # Empty unused memory
-            if args.empty_unused_memory_level >= 1:
+            if args.empty_unused_memory_level >= 1 and torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):
@@ -2117,7 +2129,7 @@ def evaluate(forward_step_func,
                 for loss_dict in loss_dicts:
                     for key in loss_dict:
                         if key not in total_loss_dict:
-                            total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).cuda()
+                            total_loss_dict[key] = torch.tensor([0.0, 0.0], dtype=torch.float).to(device=get_current_device())
                         val = loss_dict[key]
                         if isinstance(val, tuple) or isinstance(val, list):
                             total_loss_dict[key][0] += val[0]
@@ -2130,12 +2142,12 @@ def evaluate(forward_step_func,
 
             if args.exit_duration_in_mins:
                 train_time = (time.time() - _TRAIN_START_TIME) / 60.0
-                done_cuda = torch.tensor(
+                done_device = torch.tensor(
                     [train_time > args.exit_duration_in_mins],
-                    dtype=torch.int, device='cuda')
+                    dtype=torch.int, device=get_current_device())
                 torch.distributed.all_reduce(
-                    done_cuda, op=torch.distributed.ReduceOp.MAX)
-                done = done_cuda.item()
+                    done_device, op=torch.distributed.ReduceOp.MAX)
+                done = done_device.item()
                 if done:
                     rerun_state_machine.set_mode(rerun_mode)
                     print_rank_0('Exiting during evaluation, timelimit reached')
@@ -2305,9 +2317,9 @@ def build_train_valid_test_data_loaders(
         do_test = test_dataloader is not None and args.eval_iters > 0
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)],
-            dtype=torch.long, device='cuda')
+            dtype=torch.long, device=get_current_device())
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        flags = torch.tensor([0, 0, 0], dtype=torch.long, device=get_current_device())
 
     torch.distributed.broadcast(flags, 0)
 

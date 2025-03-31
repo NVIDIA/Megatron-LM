@@ -2,6 +2,7 @@
 
 """Specs for Retro encoder."""
 
+import torch
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -24,12 +25,17 @@ try:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
-        TENorm,
         TERowParallelLinear,
+        TENorm
     )
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
+    
     HAVE_TE = False
 
 try:
@@ -47,7 +53,6 @@ except ImportError:
     warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 
-
 def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     """Retro encoder TE spec (uses Transformer Engine components).
 
@@ -59,6 +64,10 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
     Returns:
         A module spec if Transformer Engine modules.
     """
+
+    if not HAVE_TE:
+        return get_retro_encoder_layer_local_spec()
+    
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.pre_cross_attn_layernorm = TENorm
     spec.submodules.cross_attention = ModuleSpec(
@@ -72,7 +81,7 @@ def get_retro_encoder_layer_te_spec() -> ModuleSpec:
         ),
     )
     spec.submodules.cross_attn_bda = ModuleSpec(module=RetroEncoderBiasDropoutAdd)
-    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm, submodules=TENorm)
+    spec.submodules.pre_mlp_layernorm = ModuleSpec(module=RetroEncoderLayerNorm, submodules=LNImpl)
     spec.submodules.mlp = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
@@ -131,6 +140,8 @@ def get_retro_encoder_block_spec(
         Transformer block submodules for the given spec.
     """
 
+    use_transformer_engine = use_transformer_engine & HAVE_TE
+    
     # Num layers.
     num_layers = config.retro_encoder_num_layers
     retro_layer_numbers = [1]

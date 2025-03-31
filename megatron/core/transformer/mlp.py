@@ -132,7 +132,7 @@ class MLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
-
+            
         return output, output_bias
 
     # pylint: disable=missing-function-docstring

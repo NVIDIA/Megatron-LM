@@ -1,7 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import signal
+from typing import List, Optional, Union
 
 import torch
+
+from megatron.core.device_utils import get_xla_model
+
+try:
+    import torch_xla.core.xla_model as xm
+except ImportError:
+    xm = None
 
 
 def get_world_size():
@@ -13,6 +21,10 @@ def get_world_size():
 
 
 def get_device(local_rank=None):
+
+    if xm:
+        return xm.xla_device()
+    
     backend = torch.distributed.get_backend()
     if backend == 'nccl':
         if local_rank is None:
@@ -26,7 +38,8 @@ def get_device(local_rank=None):
     return device
 
 
-def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None):
+def all_gather_item(item, dtype, group:Optional[Union[torch.distributed.ProcessGroup, List[List[int]]]]=None, async_op=False, local_rank=None):
+    
     if not torch.distributed.is_available() or \
        not torch.distributed.is_initialized():
         return [item]
@@ -39,11 +52,15 @@ def all_gather_item(item, dtype, group=None, async_op=False, local_rank=None):
         group_size = get_world_size()
 
     tensor = torch.tensor([item], device=device, dtype=dtype)
-    output_tensors = [
-        torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
-        for _ in range(group_size)
-    ]
-    torch.distributed.all_gather(output_tensors, tensor, group, async_op)
+    xm = get_xla_model()
+    if xm:
+        output_tensors = list(xm.all_gather(tensor, groups=group).split(tensor.size()[0]), pin_layout=False)
+    else:
+        output_tensors = [
+            torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
+            for _ in range(group_size)
+        ]
+        torch.distributed.all_gather(output_tensors, tensor, group, async_op)
     output = [elem.item() for elem in output_tensors]
     return output
 

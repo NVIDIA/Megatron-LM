@@ -4,6 +4,8 @@
 
 import typing
 
+import torch
+
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -43,12 +45,16 @@ try:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
-        TENorm,
         TERowParallelLinear,
+        TENorm
     )
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 
@@ -70,6 +76,10 @@ def get_retro_decoder_layer_te_spec(
     Returns:
         A module spec with Transformer Engine modules.
     """
+
+    if not HAVE_TE:
+        return get_retro_decoder_layer_local_spec(encoder_block_spec=encoder_block_spec)
+    
     spec = get_gpt_layer_with_transformer_engine_spec()
     spec.submodules.pre_cross_attn_layernorm = TENorm
     spec.submodules.cross_attention = ModuleSpec(

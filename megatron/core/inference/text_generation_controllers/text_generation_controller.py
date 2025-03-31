@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
 from megatron.core.inference.inference_request import InferenceRequest, Status
@@ -21,6 +22,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.utils import get_model_config
 
+xm = get_xla_model()
 
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
@@ -289,7 +291,7 @@ class TextGenerationController:
             padding_size = max_seq_len - len(prompt_tokens)
             prompt_tokens.extend([self.tokenizer.eod] * padding_size)
 
-        return torch.tensor(batch_prompt_tokens_list, device=torch.cuda.current_device())
+        return torch.tensor(batch_prompt_tokens_list).to(device=get_current_device())
 
     def generate_output_tokens_dynamic_batch(
         self, sampling_params: SamplingParams, termination_id: int
@@ -408,9 +410,8 @@ class TextGenerationController:
             )
         )
         prompt_lengths_in_batch = torch.tensor(
-            [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list],
-            device=torch.cuda.current_device(),
-        )
+            [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list]
+        ).to(device=get_current_device())
         max_prompt_length_in_batch = max(prompt_lengths_in_batch)
         min_prompt_length_in_batch = min(prompt_lengths_in_batch)
 
@@ -440,20 +441,14 @@ class TextGenerationController:
         output_log_probs = None
         if sampling_params.return_log_probs:
             output_log_probs = torch.empty(
-                (batch_size, max_sequence_length - 1),
-                dtype=torch.float32,
-                device=torch.cuda.current_device(),
-            )
+                (batch_size, max_sequence_length - 1), dtype=torch.float32
+            ).to(device=get_current_device())
 
         # An array to check which of the prompts have reached end of generation condition
-        is_generation_done_tensor = torch.zeros(
-            batch_size, dtype=torch.bool, device=torch.cuda.current_device()
-        )
+        is_generation_done_tensor = torch.zeros(batch_size, dtype=torch.bool).to(device=get_current_device())
 
         # An array to act as a counter to keep track of generated sequence lengths
-        generated_sequence_lengths = torch.zeros(
-            batch_size, device=torch.cuda.current_device()
-        ).cuda()
+        generated_sequence_lengths = torch.zeros(batch_size).to(device=get_current_device())
 
         # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2
@@ -530,6 +525,10 @@ class TextGenerationController:
                     create_cudagraphs()
 
                 if self.model_is_pipeline_parallel:
+                    if xm:
+                        torch.distributed.barrier(group=parallel_state.get_default_process_group())
+                        xm.mark_step()
+
                     context_length = context_end_position - context_start_position
                     logits_seq_len = 1 if materialize_only_last_token_logits else context_length
                     logits_shape = [batch_size, logits_seq_len, vocab_size]
@@ -540,6 +539,11 @@ class TextGenerationController:
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
                     )
+                
+                    if xm:
+                        torch.distributed.barrier(group=parallel_state.get_default_process_group())
+                        xm.mark_step()
+
                 # Indicates which of the input prompts have started generating tokens.
                 # A 1D boolean tensor with [batch_size] elements (i.e) The shortest
                 # prompts will start generating first and so on

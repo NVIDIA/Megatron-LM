@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.sampling_params import SamplingParams
@@ -101,18 +102,18 @@ class DynamicInferenceEngine(AbstractEngine):
             tokens = torch.tensor(
                 self.controller.tokenize_prompt(prompt),
                 dtype=torch.int64,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
 
         # Convert List[int] -> Tensor.
         elif isinstance(prompt, list):
-            tokens = torch.tensor(prompt, dtype=torch.int64, device=torch.cuda.current_device())
+            tokens = torch.tensor(prompt, dtype=torch.int64, device=get_current_device())
 
         # Prompt already tokenized.
         elif isinstance(prompt, torch.Tensor):
             assert prompt.dtype == torch.int64, prompt.dtype
             assert prompt.device == torch.device(
-                f"cuda:{torch.cuda.current_device()}"
+                f"cuda:{get_current_device()}"
             ), prompt.device
             tokens = prompt
 

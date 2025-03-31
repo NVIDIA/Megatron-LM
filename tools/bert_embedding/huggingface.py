@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -71,7 +72,7 @@ class HuggingfaceEmbedder:
         self.pipe = MyFeatureExtractionPipeline(
             model=self.model,
             tokenizer=self.tokenizer,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
             truncation=True,
             max_length=max_seq_length,
         )

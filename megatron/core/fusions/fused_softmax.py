@@ -151,7 +151,8 @@ class FusedScaleMaskSoftmax(nn.Module):
         attn_batches = b * np
 
         if (
-            self.scaled_masked_softmax_fusion  # user want to fuse
+            torch.cuda.is_available()
+            and self.scaled_masked_softmax_fusion  # user want to fuse
             and self.input_in_float16  # input must be fp16
             and 16 < sk <= 4096  # sk must be 16 ~ 2048
             and sq % 4 == 0  # sq must be divisor of 4

@@ -7,6 +7,7 @@ from functools import partial, wraps
 from math import ceil
 from typing import Optional, Tuple
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
@@ -26,7 +27,7 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
-    _initialize_affine_weight_gpu,
+    _initialize_affine_weight_device,
 )
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.mlp import MLP, MLPSubmodules, apply_swiglu_sharded_factory
@@ -40,14 +41,10 @@ from megatron.core.transformer.utils import (
 )
 
 try:
-
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
-
-    HAVE_TE = True
-
+    HAVE_TE_FP8 = True
 except ImportError:
-
-    HAVE_TE = False
+    HAVE_TE_FP8 = False
 
 
 def expert_dist_ckpt_decorator(func):
@@ -98,7 +95,7 @@ class GroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.config: TransformerConfig = config
         self.num_local_experts = num_local_experts
-        gg.assert_grouped_gemm_is_available()
+        # gg.assert_grouped_gemm_is_available()
         assert (
             config.add_bias_linear == False
         ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
@@ -177,7 +174,7 @@ class GroupedMLP(MegatronModule):
                 torch.empty(
                     self.config.hidden_size,
                     fc1_output_size_per_partition,
-                    device=torch.cuda.current_device(),
+                    device=get_current_device(),
                     dtype=config.params_dtype,
                 )
             )
@@ -185,15 +182,15 @@ class GroupedMLP(MegatronModule):
                 torch.empty(
                     fc2_input_size_per_partition,
                     self.config.hidden_size,
-                    device=torch.cuda.current_device(),
+                    device=get_current_device(),
                     dtype=config.params_dtype,
                 )
             )
             if config.perform_initialization:
-                _initialize_affine_weight_gpu(
+                _initialize_affine_weight_device(
                     self.weight1, config.init_method, partition_dim=1, is_expert=True
                 )
-                _initialize_affine_weight_gpu(
+                _initialize_affine_weight_device(
                     self.weight2, config.output_layer_init_method, partition_dim=0, is_expert=True
                 )
         setattr(self.weight1, 'allreduce', not self.expert_parallel)
@@ -237,7 +234,7 @@ class GroupedMLP(MegatronModule):
             h = torch.matmul(h, w2)
 
             fc2_output = h
-
+            
         return fc2_output, None
 
     @expert_dist_ckpt_decorator
@@ -664,7 +661,7 @@ class TEGroupedMLP(MegatronModule):
         )
 
         if self.config.fp8:
-            assert HAVE_TE, "FP8 requires TE."
+            assert HAVE_TE_FP8, f"fp8 config {self.config.fp8} requires Transformer Engine FP8"
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
 
@@ -683,6 +680,7 @@ class TEGroupedMLP(MegatronModule):
         """
         tokens_per_expert = tokens_per_expert.tolist()
         if self.config.fp8:
+            assert HAVE_TE_FP8, f"fp8 config {self.config.fp8} requires Transformer Engine FP8"
             actual_tokens_per_expert = tokens_per_expert
             permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
                 permuted_local_hidden_states, tokens_per_expert
@@ -735,6 +733,7 @@ class TEGroupedMLP(MegatronModule):
 
         # upad and concat the output
         if self.config.fp8:
+            assert HAVE_TE_FP8, f"fp8 config {self.config.fp8} requires Transformer Engine FP8"
             output = self.fp8_unpadding(output, actual_tokens_per_expert)
 
         return output, output_bias
@@ -813,6 +812,7 @@ class SequentialMLP(MegatronModule):
         """Forward step of the SequentialMLP."""
         if self.num_local_experts == 1:
             if self.config.fp8:
+                assert HAVE_TE_FP8, f"fp8 config {self.config.fp8} requires Transformer Engine FP8"
                 hidden = self._pad_tensor_for_fp8(permuted_local_hidden_states)
                 output, output_bias = self.local_experts[0](hidden)
                 output = output[: permuted_local_hidden_states.shape[0]]
@@ -829,6 +829,7 @@ class SequentialMLP(MegatronModule):
 
             for expert, tokens in zip(self.local_experts, tokens_list):
                 if self.config.fp8:
+                    assert HAVE_TE_FP8, f"fp8 config {self.config.fp8} requires Transformer Engine FP8"
                     hidden = self._pad_tensor_for_fp8(tokens)
                     output, output_bias = expert(hidden)
                     output = output[: tokens.shape[0]]

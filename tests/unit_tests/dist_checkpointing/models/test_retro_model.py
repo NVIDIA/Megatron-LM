@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import os
+import types
 
 import pytest
 import torch
@@ -8,15 +9,21 @@ from megatron.core import parallel_state as ps
 from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.retro import RetroConfig, RetroModel, get_retro_decoder_block_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def initialize_retro_model(seed, decoder_spec_fn, spec_type, num_layers=9, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     default_config_kwargs = dict(
         num_layers=num_layers,
@@ -71,6 +78,13 @@ class TestRetroModel:
     def test_sharded_state_dict_save_load(
         self, tmp_path_dist_ckpt, src_spec_type, dst_spec_type, model_type
     ):
+        os.environ["NVTE_FLASH_ATTN"] = "0"
+        os.environ["NVTE_FUSED_ATTN"] = "0"
+        
+        if not HAVE_TE:
+            src_spec_type = 'local'
+            dst_spec_type = 'local'
+            
         decoder_spec_fn = get_retro_decoder_block_spec
 
         Utils.initialize_model_parallel(1, 1)
@@ -78,14 +92,15 @@ class TestRetroModel:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
             # Save
             sharded_state_dict = gpt_model.sharded_state_dict()
-            save(sharded_state_dict, ckpt_dir)
+            save(sharded_state_dict, ckpt_dir, process_group=ps.get_default_process_group())
 
             # Load
             gpt_model = initialize_retro_model(2, decoder_spec_fn, dst_spec_type)
             sharded_state_dict = gpt_model.sharded_state_dict()
 
             state_dict, missing_keys, unexpected_keys = load(
-                sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL
+                sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL,
+                process_group=ps.get_default_process_group()
             )
             # Potential mismatch is because of extra states which is ok
             assert all('_extra_state' in k for k in missing_keys)

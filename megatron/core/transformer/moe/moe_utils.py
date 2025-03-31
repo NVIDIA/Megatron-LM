@@ -1,13 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import Optional
+from typing import List, Optional, Union
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
+xm = get_xla_model()
 try:
     from megatron.core.extensions.transformer_engine import (
         fused_permute,
@@ -52,8 +54,12 @@ def switch_load_balancing_loss_func(
     if sequence_partition_group is not None:
         # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
-        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
-        torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
+        if xm:
+            num_sub_sequence = len(sequence_partition_group[0])
+            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group, pin_layout=False)
+        else:
+            num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+            torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
 
     num_tokens = probs.shape[0] * num_sub_sequence
     num_experts = probs.shape[1]
@@ -108,7 +114,9 @@ def sequence_load_balancing_loss_func(
     # or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full
     # sequence.
     if sequence_partition_group is not None:
-        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group) if not xm else \
+            len(sequence_partition_group[0])
+        
         seq_length *= num_sub_sequence
         probs_for_aux_loss = gather_from_sequence_parallel_region(
             probs_for_aux_loss, group=sequence_partition_group
@@ -560,8 +568,8 @@ def save_to_aux_losses_tracker(
     loss: torch.Tensor,
     layer_number: int,
     num_layers: int,
-    reduce_group: torch.distributed.ProcessGroup = None,
-    avg_group: torch.distributed.ProcessGroup = None,
+    reduce_group: Union[torch.distributed.ProcessGroup, List[List[int]]] = None,
+    avg_group: Union[torch.distributed.ProcessGroup, List[List[int]]] = None,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -600,16 +608,30 @@ def reduce_aux_losses_tracker_across_ranks():
     for name in tracker:
         values = tracker[name]["values"]
         # Collect aux losses across PP.
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        xm = get_xla_model()
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [values], 
+                                        groups=parallel_state.get_pipeline_model_parallel_groups(), pin_layout=False)
+        else:
+            torch.distributed.all_reduce(
+                values, group=parallel_state.get_pipeline_model_parallel_group()
+            )
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [values], 
+                                        groups=tracker[name].get('reduce_group'), pin_layout=False)
+            else:
+                torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
         if tracker[name].get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [values], 
+                                        groups=tracker[name].get('avg_group'), pin_layout=False)
+                values = values / parallel_state.get_pipeline_model_parallel_world_size()
+            else:
+                torch.distributed.all_reduce(
+                    values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
 
 
 def track_moe_metrics(
@@ -663,10 +685,15 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
     """
     with torch.no_grad():
         # All Reduce Across TPxCPxDP group
-        torch.distributed.all_reduce(
-            tokens_per_expert,
-            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
-        )
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], 
+                          groups=parallel_state.get_tensor_and_data_parallel_groups(with_context_parallel=True), 
+                          pin_layout=False)
+        else:
+            torch.distributed.all_reduce(
+                tokens_per_expert,
+                group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
+            )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
