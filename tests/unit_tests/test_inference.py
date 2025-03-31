@@ -45,6 +45,7 @@ def client(app):
     return app.test_client()
 
 
+@pytest.mark.internal
 @unittest.mock.patch('megatron.inference.endpoints.completions.get_tokenizer')
 @unittest.mock.patch('megatron.inference.endpoints.completions.send_do_generate')
 @unittest.mock.patch('megatron.inference.text_generation.generation.get_args')
