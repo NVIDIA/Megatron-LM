@@ -210,14 +210,25 @@ class AbstractModelInferenceWrapper(abc.ABC):
         input_tensor=None
         if not parallel_state.is_pipeline_first_stage():
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
-            recv_from_prev_pipeline_rank_(recv_buffer)
+            if xm:
+                xm.mark_step()
+                recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                xm.mark_step()
+            else:
+                recv_from_prev_pipeline_rank_(recv_buffer)
             input_tensor = recv_buffer.float()
 
         self.model.set_input_tensor(input_tensor)
         output_tensor = self._forward(inference_input)
 
         if not parallel_state.is_pipeline_last_stage():
-            send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
+            if xm:
+                xm.mark_step()
+                recv_buffer = output_tensor
+                recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                xm.mark_step()
+            else:
+                send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
 
         self.inference_context.sequence_len_offset += seq_len
 
@@ -288,7 +299,12 @@ class AbstractModelInferenceWrapper(abc.ABC):
                 recv_buffer = self._allocate_recv_buffer(current_micro_batch_size, seq_len)
 
             if not parallel_state.is_pipeline_first_stage():
-                recv_from_prev_pipeline_rank_(recv_buffer)
+                if xm:
+                    xm.mark_step()
+                    recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                    xm.mark_step()
+                else:
+                    recv_from_prev_pipeline_rank_(recv_buffer)
 
             self.model.set_input_tensor(recv_buffer)
             output_tensor = self._forward(
@@ -302,7 +318,13 @@ class AbstractModelInferenceWrapper(abc.ABC):
             )
 
             if not parallel_state.is_pipeline_last_stage():
-                send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
+                if xm:
+                    xm.mark_step()
+                    recv_buffer = output_tensor
+                    recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                    xm.mark_step()
+                else:
+                    send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
 
             self.inference_context.batch_size_offset += current_micro_batch_size
 
