@@ -40,10 +40,6 @@ products:
   #######################################################################
   # Nightly tests: Run both DEV and LTS unless something is flaky       #
   #######################################################################
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev, lts]
@@ -64,10 +60,6 @@ products:
   #   products:
   #     - environment: [dev, lts]
   #       scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch]
     products:
       - environment: [dev, lts]
@@ -84,15 +76,7 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp2]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp2_resume_torch]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp1_pp4]
     products:
       - environment: [dev, lts]
         scope: [nightly]
@@ -108,15 +92,7 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_overlap_grad_reduce]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_overlap_grad_reduce]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp4_pp1]
     products:
       - environment: [dev, lts]
         scope: [nightly]
@@ -174,12 +150,6 @@ products:
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_no_mmap_bin_files_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
@@ -299,32 +269,7 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_decoupled_lr_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
@@ -390,12 +335,6 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_multi_dist_optimizer_instances_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -454,25 +393,7 @@ products:
   #       scope: [mr]
   #     - environment: [lts]
   #       scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ddp_average_in_collective_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_defer_embedding_wgrad_compute_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
 
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_no_create_attention_mask_in_dataloader_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_no_mmap_bin_files_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -519,25 +440,7 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_mmap_bin_files_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp4_pp1_qk_layernorm_test_mode_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
