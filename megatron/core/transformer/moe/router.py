@@ -46,6 +46,9 @@ class Router(ABC, MegatronModule):
             config.init_method(self.weight)
         self.weight.data = self.weight.data.to(dtype=config.params_dtype)
         setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
+        # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
+        # So we need to know if the model is configured to calculate per token loss.
+        self.calculate_per_token_loss = self.config.calculate_per_token_loss
 
     def gating(self, input: torch.Tensor):
         """Forward pass of the router gate.
@@ -298,7 +301,17 @@ class TopKRouter(Router):
             self.config.num_layers,
             reduce_group=sequence_partition_group,
         )
-        activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
+        if self.calculate_per_token_loss:
+            # Scale the aux_loss by the number of tokens.
+            # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
+            # After commit 02648000, Megatron started using the number of total tokens to scale
+            # gradients under the argument of calculate_per_token_loss,
+            # which scales both the main_loss gradient and aux_loss gradient by
+            # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads function.
+            # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
+            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss * activation.shape[0])
+        else:
+            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
 
     def apply_z_loss(self, logits):
@@ -318,7 +331,18 @@ class TopKRouter(Router):
                 / parallel_state.get_tensor_and_context_parallel_world_size()
             )
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
-            logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+            scale_up = 1.0
+            if self.calculate_per_token_loss:
+                # The expected final scaling for z_loss gradients is
+                # 1/(num_micro_batches * dp_size).
+                # After commit 02648000, Megatron started using the number of total tokens
+                # to scale gradients under the argument of calculate_per_token_loss,
+                # which scales both the main_loss gradient and z_loss gradient by
+                # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
+                # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
+                logits = MoEAuxLossAutoScaler.apply(logits, z_loss * logits.shape[0])
+            else:
+                logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
                 "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers
             )

@@ -315,7 +315,10 @@ def forward_step(
             else torch.ones(1, device=output_tensor.device)
         )
         # Set the loss scale
-        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        if config.calculate_per_token_loss:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -486,7 +489,7 @@ def forward_backward_no_pipelining(
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                 current_microbatch=i,
             )
-            total_num_tokens += num_tokens.item()
+            total_num_tokens += num_tokens
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
@@ -506,7 +509,7 @@ def forward_backward_no_pipelining(
         ),
         current_microbatch=num_microbatches - 1,
     )
-    total_num_tokens += num_tokens.item()
+    total_num_tokens += num_tokens
 
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
@@ -1008,7 +1011,7 @@ def forward_backward_pipelining_with_interleaving(
         output_tensors[model_chunk_id].append(output_tensor)
 
         nonlocal total_num_tokens
-        total_num_tokens += num_tokens.item()
+        total_num_tokens += num_tokens
 
         # If forward-only, no need to save tensors for a backward pass.
         if forward_only:
@@ -1845,7 +1848,7 @@ def forward_backward_pipelining_without_interleaving(
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
         send_forward(output_tensor, send_tensor_shapes, config)
-        total_num_tokens += num_tokens.item()
+        total_num_tokens += num_tokens
 
         if not forward_only:
             input_tensors.append(input_tensor)
@@ -1886,7 +1889,7 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i + num_warmup_microbatches,
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
-        total_num_tokens += num_tokens.item()
+        total_num_tokens += num_tokens
 
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, config)
