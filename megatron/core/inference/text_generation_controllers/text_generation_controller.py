@@ -648,7 +648,7 @@ class TextGenerationController:
             request.prompt_log_probs = (
                 None
                 if output_log_probs is None
-                else output_log_probs[idx, :input_prompt_length].cpu().numpy().tolist()
+                else output_log_probs[idx, : input_prompt_length - 1].cpu().numpy().tolist()
             )
             if sampling_params.top_n_logprobs > 0:
                 request.generated_top_n_logprobs = top_n_logprobs_dict[idx][
