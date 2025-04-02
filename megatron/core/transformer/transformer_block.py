@@ -265,7 +265,10 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            return build_module(layer_spec, config=self.config, layer_number=layer_number)
+            fp8_init_context = get_fp8_context(self.config, layer_number - 1, is_init=True)
+            with fp8_init_context:
+                module = build_module(layer_spec, config=self.config, layer_number=layer_number)
+            return module
 
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(

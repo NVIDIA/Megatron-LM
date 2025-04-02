@@ -155,23 +155,27 @@ class MambaStack(MegatronModule):
 
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(layer_type_list):
-            if layer_type == LayerSymbols.MAMBA:
-                layer = build_module(
-                    submodules.mamba_layer,
-                    config=self.config,
-                    residual_in_fp32=residual_in_fp32,
-                    layer_number=i + 1 + pp_layer_offset,
-                )
-            elif layer_type == LayerSymbols.ATTENTION:
-                # Transformer layers apply their own pp_layer_offset
-                layer = build_module(
-                    submodules.attention_layer, config=self.config, layer_number=i + 1
-                )
-            elif layer_type == LayerSymbols.MLP:
-                # Transformer layers apply their own pp_layer_offset
-                layer = build_module(submodules.mlp_layer, config=self.config, layer_number=i + 1)
-            else:
-                assert False, "unexpected layer_type"
+            fp8_init_context = get_fp8_context(self.config, i, is_init=True)
+            with fp8_init_context:
+                if layer_type == LayerSymbols.MAMBA:
+                    layer = build_module(
+                        submodules.mamba_layer,
+                        config=self.config,
+                        residual_in_fp32=residual_in_fp32,
+                        layer_number=i + 1 + pp_layer_offset,
+                    )
+                elif layer_type == LayerSymbols.ATTENTION:
+                    # Transformer layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.attention_layer, config=self.config, layer_number=i + 1
+                    )
+                elif layer_type == LayerSymbols.MLP:
+                    # Transformer layers apply their own pp_layer_offset
+                    layer = build_module(
+                        submodules.mlp_layer, config=self.config, layer_number=i + 1
+                    )
+                else:
+                    assert False, "unexpected layer_type"
             self.layers.append(layer)
 
         # Required for activation recomputation

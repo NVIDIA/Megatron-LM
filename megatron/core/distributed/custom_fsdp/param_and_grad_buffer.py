@@ -16,7 +16,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.fp8_utils import is_float8tensor, quantize_param_fragment
+from megatron.core.fp8_utils import is_float8tensor, modify_underlying_storage, quantize_param_shard
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.utils import is_submodule, is_te_min_version, log_on_each_pipeline_stage
 
@@ -1087,15 +1087,15 @@ class ParamAndGradBuffer:
                     wbuf.set_item(item_id, p.data)
 
                     # reset the parameter data to the buffer
-                    old_param_data = p.data
                     new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(p.shape)
                     if is_float8tensor(p):
-                        p._data = new_param_data
+                        modify_underlying_storage(p, new_param_data)
                     else:
+                        old_param_data = p.data
                         p.data = new_param_data
-                    assert old_param_data._base is None
-                    p.data.detach().copy_(old_param_data)
-                    del old_param_data
+                        assert old_param_data._base is None
+                        p.data.detach().copy_(old_param_data)
+                        del old_param_data
                 if mbuf:
                     if hasattr(p, 'get_high_precision_init_val'):
                         mbuf.set_item(item_id, p.get_high_precision_init_val())
@@ -1348,6 +1348,11 @@ class ParamAndGradBuffer:
             if mbuf is None:
                 continue
 
+            fp8_params = []
+            shard_fp32_from_fp8 = []
+            shard_offsets_in_fp8 = []
+            shard_model_params = []
+
             for param in pg.params:
                 item_id = mbuf.param_idx[param]
                 if wbuf:
@@ -1362,23 +1367,28 @@ class ParamAndGradBuffer:
                     model_param = param
                     main_weight = pg.main_weight_buffer.get_item(item_id)
 
-                if model_param.numel() == 0:
+                if is_float8tensor(param):
+                    fp8_params.append(param)
+                    if model_param.numel() == 0:
+                        shard_fp32_from_fp8.append(None)
+                        shard_offsets_in_fp8.append(None)
+                        shard_model_params.append(None)
+                    else:
+                        shard_fp32_from_fp8.append(main_weight)
+                        shard_offsets_in_fp8.append(wbuf.locate_item_in_global_item(item_id)[0])
+                        shard_model_params.append(model_param)
                     continue
 
-                if is_float8tensor(param):
-                    # 1. When "--fp8-param-gather" is disabled, the main param
-                    # is first casted to BF16/FP16, and then casted to FP8, so
-                    # the amax_history is calculated using BF16/FP16 param.
-                    # 2. When "--fp8-param-gather" is enabled, we can cast the
-                    # FP32 main param to FP8 directly, which results in slightly
-                    # different results with higher performance. In theory, this
-                    # does not affect convergence.
-                    # TODO: The following code maintains the logic of the point-1
-                    # above. It can be deleted if it is not necessary.
-                    main_weight = main_weight.to(param.dtype)
-                    quantize_param_fragment(input_=main_weight, out=model_param, param=param)
-                else:
+                if model_param.numel() > 0:
                     model_param.data.copy_(main_weight.view(model_param.shape))
+
+            quantize_param_shard(
+                fp8_params,
+                shard_fp32_from_fp8,
+                shard_offsets_in_fp8,
+                wbuf.data_parallel_group,
+                shard_model_params,
+            )
 
     @torch.no_grad()
     def copy_model_weights_to_main_weights(self):
