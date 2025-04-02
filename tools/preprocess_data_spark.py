@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import glob
-import pyspark
+from pyspark.sql import SparkSession
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir)))
 import time
@@ -173,11 +173,11 @@ class Partition(object):
         print("Opening", input_file_name)
         
         file_open_start = time.time()
+        n_workers = f"local[{self.args.workers}]" if hasattr(self.args, 'workers') and self.args.workers > 0 else "local[*]"
         
         # Create a SparkSession (or get the existing one).
-        from pyspark.sql import SparkSession
         spark = SparkSession.builder \
-            .master("local[*]") \
+            .master(n_workers) \
             .config("spark.driver.memory", "200g") \
             .config("spark.executor.memory", "200g") \
             .config("spark.executorEnv.PYTHONPATH", "/shared/all/nemo_workspace/Megatron_yuli/:$PYTHONPATH") \
@@ -371,95 +371,25 @@ def main():
     print(f"{time.strftime('%H:%M:%S', time.localtime())}  Sentence splitting is {'enabled' if args.split_sentences else 'disabled'}")
     print(f"{time.strftime('%H:%M:%S', time.localtime())}  Number of partitions: {args.partitions}")
 
-    # handling single source partition
-    if args.partitions == 1:
-        file_name, extension = os.path.splitext(args.input)
-        sentence_split_file = file_name + "_ss" + extension
-        file_names = {
-            'partition': args.input,
-            'sentence_split': sentence_split_file,
-            'output_prefix': args.output_prefix}
-        in_ss_out_names.append(file_names)
-    # handling multiple source partitions
-    else:
-        in_file_names = glob.glob(args.input)
+    file_name, extension = os.path.splitext(args.input)
+    sentence_split_file = file_name + "_ss" + extension
+    file_names = {
+        'partition': args.input,
+        'sentence_split': sentence_split_file,
+        'output_prefix': args.output_prefix}
+    in_ss_out_names.append(file_names)
 
-        # Count total number of lines across .jsonl files
-        if args.keep_sequential_samples:
-            total_sample_count = 0
-            for filename in in_file_names:
-                with open(filename, "r") as fin:
-                    for fc, _ in enumerate(fin):
-                        pass
-                total_sample_count += (fc + 1)
-            partition_size = math.ceil(total_sample_count / args.partitions)
-
-        # create .jsonl parition files
-        for idx in range(args.partitions):
-            in_ss_out_name = get_file_name(args, idx)
-            in_ss_out_names.append(in_ss_out_name)
-
-        # check to see if paritions were already created
-        partitions_present = check_files_exist(in_ss_out_names, 'partition', args.partitions)
-
-        # check to see if paritions with split sentences already created
-        split_sentences_present = check_files_exist(in_ss_out_names, 'sentence_split', args.partitions)
-
-        if not partitions_present and not split_sentences_present:
-            # populate .jsonl partition files from parent files
-            partitioned_input_files = []
-            for idx in range(args.partitions):
-                partitioned_input_file = open(in_ss_out_names[idx]['partition'], 'w')
-                partitioned_input_files.append(partitioned_input_file)
-
-            index = 0
-            if args.keep_sequential_samples: line_count = 0
-            # further partitional each source file into equal size partitions
-            for in_file_name in in_file_names:
-                # support for gzip files
-                if in_file_name.endswith(".gz"):
-                    fin = gzip.open(in_file_name, 'rt')
-                # loads a normal json/text file
-                else:
-                    fin = open(in_file_name, 'r', encoding='utf-8')
-
-                for line in fin:
-                    partitioned_input_files[index].write(line)
-                    # sequential partitioning
-                    if args.keep_sequential_samples:
-                        line_count += 1
-                        if line_count % partition_size == 0:
-                            index += 1
-                    # round-robin partitioning, faster but not preserving the original order
-                    else:
-                        index = (index + 1)%args.partitions
-
-                fin.close()
-
-            for idx in range(args.partitions):
-                partitioned_input_files[idx].close()
-
-    assert args.workers % args.partitions == 0
-    partition = Partition(args, args.workers//args.partitions)
+    partition = Partition(args, args.workers)
 
     # check to see if paritions with split sentences already created
     split_sentences_present = check_files_exist(in_ss_out_names, 'sentence_split', args.partitions)
 
+    # TODO: to resolve and test by fixing the error in splitter = nltk.load(url)
     # split sentences in partition files
     if args.split_sentences and not split_sentences_present:
-        processes = []
         for name in in_ss_out_names:
-            p = multiprocessing.Process(target=partition.split_sentences,
-                                        args=((name['partition'], name['sentence_split']),))
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-
-        if args.partitions == 1:
-            return
-
+            partition.split_sentences((name['partition'], name['sentence_split']))
+        return
 
     # encode partition files in parallel
     input_key = 'sentence_split' if args.split_sentences else 'partition'
