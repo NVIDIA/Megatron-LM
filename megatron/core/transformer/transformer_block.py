@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -397,7 +397,7 @@ class TransformerBlock(MegatronModule):
 
     def forward(
         self,
-        hidden_states: Tensor,
+        hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Optional[Tensor],
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
@@ -418,8 +418,10 @@ class TransformerBlock(MegatronModule):
         self-attention, optional cross-attention, and feed-forward operations.
 
         Args:
-            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is the
-                sequence length, b is the batch size, and h is the hidden size.
+            hidden_states (Union[Tensor, WrappedTensor]): Input tensor of shape [s, b, h]
+                where s is the sequence length, b is the batch size, and h is the hidden size.
+                Can be passed as a WrappedTensor during inference to avoid an obsolete
+                reference in the calling function.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
             context (Tensor, optional): Context tensor for cross-attention.
@@ -439,6 +441,10 @@ class TransformerBlock(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        # Delete the obsolete reference to the initial input tensor if necessary
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
 
         if not self.pre_process:
             # See set_input_tensor()

@@ -13,7 +13,7 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
 class MambaModel(LanguageModule):
@@ -191,6 +191,12 @@ class MambaModel(LanguageModule):
                 inference_context, self.decoder, decoder_input, self.config
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+
+        # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
+        # reference held by this caller function, enabling early garbage collection
+        # for inference.
+        if inference_context is not None and not self.training:
+            decoder_input = WrappedTensor(decoder_input)
 
         # The following assert will currently fail when running inference.
         # Commented out for now.
