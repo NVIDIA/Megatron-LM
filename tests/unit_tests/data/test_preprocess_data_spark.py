@@ -15,8 +15,6 @@ from megatron.training.tokenizer.gpt2_tokenization import (
     PRETRAINED_MERGES_ARCHIVE_MAP,
     PRETRAINED_VOCAB_ARCHIVE_MAP,
 )
-import tools
-print(f"Module file path: {tools.__file__}")
 
 from tools.merge_datasets import main as merge_main
 from tools.preprocess_data_spark import Encoder
