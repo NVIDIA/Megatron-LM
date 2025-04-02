@@ -8,12 +8,12 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
-from megatron.legacy.model import Float16Module
 from megatron.training.arguments import parse_args
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
@@ -77,7 +77,7 @@ class TestParallelGroupedMLP:
         # Bias is not supported in grouped gemm currently, thus we disable the
         # bias in the linear layer.
         self.args.add_bias_linear = False
-        self.sequential_mlp = Float16Module(self.sequential_mlp, self.args).module
+        self.sequential_mlp = Float16Module(self.sequential_mlp.config, self.sequential_mlp).module
         print("done intializing for sequential gemm")
 
         ## Grouped GEMM
@@ -87,7 +87,7 @@ class TestParallelGroupedMLP:
             self.num_experts, moe_grouped_gemm=True
         )
         self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
-        self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
+        self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
         print("done intializing for grouped gemm")
 
     def teardown_method(self, method):
@@ -263,7 +263,7 @@ class TestTEGroupedMLP:
         # Bias is not supported in grouped gemm currently, thus we disable the
         # bias in the linear layer.
         self.args.add_bias_linear = False
-        self.sequential_mlp = Float16Module(self.sequential_mlp, self.args).module
+        self.sequential_mlp = Float16Module(self.sequential_mlp.config, self.sequential_mlp).module
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
@@ -273,7 +273,7 @@ class TestTEGroupedMLP:
         tf_config.moe_grouped_gemm = True
         self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         assert isinstance(self.grouped_mlp.experts, TEGroupedMLP)
-        self.grouped_mlp = Float16Module(self.grouped_mlp, self.args).module
+        self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
