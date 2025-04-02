@@ -234,8 +234,12 @@ class TestTextGenerationController:
             assert (
                 all_prompt_tokens[request_id] == request.prompt_tokens
             ), "Prompt tokens should not have changed during generation"
-            assert len(request.segments) == len(request.prompt_log_probs) + len(
-                request.generated_log_probs
+            # Log probabilities are calculated based on the likelihood of a token given the
+            # preceding context. The first token lacks this dependency and is excluded from
+            # the logprobs output, which is why the +1 is necessary
+            assert (
+                len(request.segments)
+                == len(request.prompt_log_probs) + len(request.generated_log_probs) + 1
             ), "Segments should be returned for both prompt and generated tokens"
             assert len(request.prompt) + len(request.generated_text) == len(
                 request.text
