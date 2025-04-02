@@ -15,10 +15,13 @@ from megatron.training.tokenizer.gpt2_tokenization import (
     PRETRAINED_MERGES_ARCHIVE_MAP,
     PRETRAINED_VOCAB_ARCHIVE_MAP,
 )
+import tools
+print(f"Module file path: {tools.__file__}")
+
 from tools.merge_datasets import main as merge_main
-from tools.preprocess_data import Encoder
-from tools.preprocess_data import get_args as build_args
-from tools.preprocess_data import main as build_main
+from tools.preprocess_data_spark import Encoder
+from tools.preprocess_data_spark import get_args as build_args
+from tools.preprocess_data_spark import main as build_main
 
 __HUGGINGFACE_BERT_BASE_UNCASED_VOCAB = (
     "https://huggingface.co/bert-base-uncased/raw/main/vocab.txt"
@@ -30,29 +33,30 @@ __LOCAL_GPT2_MERGE = "/home/gitlab-runner/data/gpt3_data/gpt2-merges.txt"
 
 __LOCAL_GPT2_VOCAB = "/home/gitlab-runner/data/gpt3_data/gpt2-vocab.json"
 
+def dummy_jsonl(odir):
+    # numbers
+    list_numbers = [json.dumps({"text": str(i + 1)}) + "\n" for i in range(100)]
+    with open(os.path.join(odir, "numbers.jsonl"), "w") as writer:
+        writer.writelines(list_numbers)
+    # numbers ascending
+    list_numbers_ascending = [
+        json.dumps({"text": " ".join([str(j + 1) for j in range(i + 1)])}) + "\n"
+        for i in range(100)
+    ]
+    with open(os.path.join(odir, "numbers_ascending.jsonl"), "w") as writer:
+        writer.writelines(list_numbers_ascending)
+    # test
+    list_test = []
+    with open(__file__) as reader:
+        for line in reader:
+            list_test.append(json.dumps({"text": line}) + "\n")
+    with open(os.path.join(odir, "test.jsonl"), "w") as writer:
+        writer.writelines(list_test)
 
-# def dummy_jsonl(odir):
-#     # numbers
-#     list_numbers = [json.dumps({"text": str(i + 1)}) + "\n" for i in range(100)]
-#     with open(os.path.join(odir, "numbers.jsonl"), "w") as writer:
-#         writer.writelines(list_numbers)
-#     # numbers ascending
-#     list_numbers_ascending = [
-#         json.dumps({"text": " ".join([str(j + 1) for j in range(i + 1)])}) + "\n"
-#         for i in range(100)
-#     ]
-#     with open(os.path.join(odir, "numbers_ascending.jsonl"), "w") as writer:
-#         writer.writelines(list_numbers_ascending)
-#     # test
-#     list_test = []
-#     with open(__file__) as reader:
-#         for line in reader:
-#             list_test.append(json.dumps({"text": line}) + "\n")
-#     with open(os.path.join(odir, "test.jsonl"), "w") as writer:
-#         writer.writelines(list_test)
-
-NUM_SAMPLES = 100000
+NUM_SAMPLES = 1000
 SEQ_LEN = 8192
+print(f"NUM_SAMPLES: {NUM_SAMPLES}")
+print(f"SEQ_LEN: {SEQ_LEN}")
 
 def dummy_long_jsonl(odir):
     """
@@ -88,6 +92,10 @@ def build_datasets(idir, odir, extra_args=[]):
 
 
 def merge_datasets(idir):
+    """
+    Merges multiple pairs of .bin and .idx files in the input directory into a single pair.
+    If only one pair exists, creates a duplicate pair named 'merge'.
+    """
     sys.argv = [sys.argv[0], "--input", idir, "--output-prefix", os.path.join(idir, "merge")]
     merge_main()
 
@@ -104,7 +112,7 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
 
     # create the dummy resources
     start_time = time.time()
-    # dummy_jsonl(path_to_raws)
+    dummy_jsonl(path_to_raws)
     dummy_long_jsonl(path_to_raws)
     create_time = time.time() - start_time
     print(f"{time.strftime('%H:%M:%S', time.localtime())}  Test - Dataset creation completed in {create_time:.2f} seconds")
@@ -149,7 +157,11 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     merged_doc_index_index = 0
 
     for basename in basenames:
+        print(f"path_to_raws: {path_to_raws}")
+        print(f"basename: {basename}")
         realpath_raw = f"{os.path.join(path_to_raws, '_'.join(basename.split('_')[:-2]))}.jsonl"
+        print(f"realpath_raw: {realpath_raw}")
+
         realpath_doc = os.path.join(path_to_data, basename.split(".")[-2])
 
         dataset_index = 0
