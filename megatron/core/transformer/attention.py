@@ -288,7 +288,7 @@ class Attention(MegatronModule, ABC):
 
             assert inference_context.is_static_batching()
             if (
-                inference_context.sequence_len_offset > 0 and rotary_pos_cos is not None
+                inference_context.is_decode_only() and rotary_pos_cos is not None
             ):  # Decode phase, not prefill
                 rotary_pos_cos_q = rotary_pos_cos[sequence_end - 1 : sequence_end]
                 rotary_pos_sin_q = rotary_pos_sin[sequence_end - 1 : sequence_end]
