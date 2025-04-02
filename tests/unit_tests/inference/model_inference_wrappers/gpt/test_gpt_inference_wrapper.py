@@ -79,8 +79,7 @@ class TestGPTInferenceWrapper:
             .int()
             .cuda()
         )
-
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
+        self.inference_wrapped_model.prep_model_for_inference()
         self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
@@ -116,7 +115,7 @@ class TestGPTInferenceWrapper:
             .int()
             .cuda()
         )
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
+        self.inference_wrapped_model.prep_model_for_inference()
         self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
@@ -151,7 +150,7 @@ class TestGPTInferenceWrapper:
             .int()
             .cuda()
         )
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
+        self.inference_wrapped_model.prep_model_for_inference()
         self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )

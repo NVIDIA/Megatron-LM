@@ -535,7 +535,7 @@ class Attention(MegatronModule, ABC):
         if (
             self.config.flash_decode
             and inference_context is not None
-            and inference_context.decode_mode
+            and inference_context.is_decode_only()
             and not self.training
             and rotary_pos_cos is not None
         ):

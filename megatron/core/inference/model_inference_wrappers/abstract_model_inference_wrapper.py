@@ -79,15 +79,21 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
         self.inference_context = value
 
-    def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
+    def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
         """A utility function for preparing model for inference
 
         The function gets called once before the auto regressive inference loop.
         It puts the model in eval mode.
 
         Args:
-            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
+            prompts_tokens (torch.Tensor, optional): Deprecated, will be removed in `megatron-core` 0.13
         """
+        if prompts_tokens is not None:
+            warnings.warn(
+                "Passing `prompts_tokens` is deprecated and this argument will be ignored."
+                "This parameter will be removed in `megatron-core` 0.13."
+            )
+
         self.model.eval()
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
@@ -330,7 +336,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         Appropriate utility is called for the forward pass depending on the type of model parallelism used
 
         Args:
-            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model [tokens, position ids, attention mask]
             recv_buffer_seq_len (int): An optional sequence length for the pipeline parallel recv buffer.
 
         Returns:

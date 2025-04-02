@@ -140,7 +140,7 @@ class MambaLayer(MegatronModule):
         elif not self.training and (
             hasattr(self, 'cudagraph_manager')
             and kwargs.get('attention_mask') is None
-            and kwargs['inference_context'].decode_mode
+            and kwargs['inference_context'].is_decode_only()
         ):
             return self.cudagraph_manager(self, args, kwargs)
         return super(MegatronModule, self).__call__(*args, **kwargs)
