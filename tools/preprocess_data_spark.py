@@ -254,7 +254,10 @@ class Partition(object):
                 dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size)
             )
             # Find all partitions with the common output prefix and extract unique partition prefixes
-            partitions = glob.glob(f"{output_prefix}_{key}_{level}_*.idx")
+            partitions = sorted(
+                glob.glob(f"{output_prefix}_{key}_{level}_*.idx"),
+                key=lambda x: int(x.split('_')[-1].split('.')[0])  # Sort by numeric partition index
+            )
             print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Found {len(partitions)} partitions")
             for partition in partitions:
                 # Extract the base name without extension
