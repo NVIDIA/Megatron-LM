@@ -13,8 +13,13 @@ from typing import Union
 
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
-from megatron.core.inference.text_generation_controllers.text_generation_controller import TextGenerationController
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+    InferenceWrapperConfig,
+)
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 import torch
 
 import megatron
@@ -25,13 +30,18 @@ from megatron.training import get_model
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import import_module
-from megatron.inference.text_generation.mcore_engine_server import ModelInferenceWrapperServer, run_mcore_engine
+from megatron.inference.text_generation.mcore_engine_server import (
+    ModelInferenceWrapperServer,
+    run_mcore_engine,
+)
 from megatron.inference.text_generation_server import MegatronServer
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir)))
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
@@ -39,19 +49,21 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+def model_provider(
+    pre_process=True, post_process=True
+) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
-        If you set the use_legacy_models to True, it will return the legacy GPT model and if not the core GPT model.
+    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the core GPT model.
 
-        Args:
-            pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-            post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+    Args:
+        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
 
 
-        Returns:
-            Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
-        """
+    Returns:
+        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
+    """
 
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
@@ -77,9 +89,13 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             transformer_layer_spec = import_module(args.spec)
         else:
             if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+                )
             else:
-                transformer_layer_spec = get_gpt_layer_local_spec(args.num_experts, args.moe_grouped_gemm, args.qk_layernorm)
+                transformer_layer_spec = get_gpt_layer_local_spec(
+                    args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
+                )
 
         model = GPTModel(
             config=config,
@@ -135,43 +151,59 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
 def add_text_generate_args(parser):
     group = parser.add_argument_group(title='text generation')
-    group.add_argument("--port", type=int, default=5000,
-                       help='port for text generation server to run on')
-    group.add_argument("--temperature", type=float, default=1.0,
-                       help='Sampling temperature.')
-    group.add_argument("--top_k", type=int, default=1,
-                       help='Top k sampling.')
-    group.add_argument("--top_p", type=float, default=0.0,
-                       help='Top p sampling.')
-    group.add_argument("--return-log-probs", action='store_true', default=True,
-                       help='Return the log probabilities of the final output tokens')
-    group.add_argument("--num-tokens-to-generate", type=int, default=30,
-                       help='Number of tokens to generate for each prompt')
-    group.add_argument("--prompts", metavar='N', type=str, nargs='+',
-                       help='Input prompts with each prompt within quotes and seperated by space')
-    group.add_argument("--max-batch-size", type=int, default=8,
-                       help='Max number of prompts to process at once')
+    group.add_argument(
+        "--port", type=int, default=5000, help='port for text generation server to run on'
+    )
+    group.add_argument("--temperature", type=float, default=1.0, help='Sampling temperature.')
+    group.add_argument("--top_k", type=int, default=1, help='Top k sampling.')
+    group.add_argument("--top_p", type=float, default=0.0, help='Top p sampling.')
+    group.add_argument(
+        "--return-log-probs",
+        action='store_true',
+        default=True,
+        help='Return the log probabilities of the final output tokens',
+    )
+    group.add_argument(
+        "--num-tokens-to-generate",
+        type=int,
+        default=30,
+        help='Number of tokens to generate for each prompt',
+    )
+    group.add_argument(
+        "--prompts",
+        metavar='N',
+        type=str,
+        nargs='+',
+        help='Input prompts with each prompt within quotes and seperated by space',
+    )
+    group.add_argument(
+        "--max-batch-size", type=int, default=8, help='Max number of prompts to process at once'
+    )
     return parser
 
 
 if __name__ == "__main__":
-    initialize_megatron(extra_args_provider=add_text_generate_args,
-                        args_defaults={'no_load_rng': True,
-                                       'no_load_optim': True,
-                                       'exit_on_missing_checkpoint': True})
+    initialize_megatron(
+        extra_args_provider=add_text_generate_args,
+        args_defaults={
+            'no_load_rng': True,
+            'no_load_optim': True,
+            'exit_on_missing_checkpoint': True,
+        },
+    )
 
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
-    print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text "
-                 "generation.")
+    print_rank_0("WARNING: Forcing exit_on_missing_checkpoint to True for text " "generation.")
     args.exit_on_missing_checkpoint = True
 
     # Set up model and load checkpoint
     load_context = nullcontext()
     if args.fp8:
         from transformer_engine.pytorch.fp8 import fp8_model_init
+
         load_context = fp8_model_init()
     with load_context:
         model = get_model(model_provider, wrap_with_ddp=False)
@@ -184,6 +216,12 @@ if __name__ == "__main__":
     model.eval()
 
     inference_engine = get_inference_engine(args, model)
+
+    if args.enable_cuda_graph:
+        print(f"Running warmup for CUDA graphs...")
+        inference_engine.generate(
+            prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
+        )
 
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(inference_engine, args)

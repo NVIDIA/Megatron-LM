@@ -12,7 +12,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.contexts import StaticInferenceContext, TokenOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -322,7 +322,7 @@ class TestTextGenerationController:
             )
             active_requests[i] = inference_request
 
-        with pytest.raises(AssertionError):
+        with pytest.raises(TokenOverflowError):
             requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
                 active_requests
             )
