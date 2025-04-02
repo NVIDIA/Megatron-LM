@@ -291,6 +291,7 @@ class TestExpertLayerReconfiguration:
             assert not any(map(bool, diffs)), diffs
             Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.11.0"),
         reason="FP8 support of TEGroupedMLP is only available in TE 1.11.0 and later.",
@@ -376,6 +377,7 @@ class TestExpertLayerReconfiguration:
 
             Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.9.0"),
         reason="TEGroupedMLP is only supported in TE 1.9.0 and later.",
