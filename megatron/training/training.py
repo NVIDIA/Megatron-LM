@@ -29,7 +29,7 @@ from megatron.core.utils import (
     StragglerDetector,
     is_te_min_version,
 )
-from megatron.core.fp8_utils import is_float8tensor
+from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -899,20 +899,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
 
-    # The model_module.bfloat16()/model_module.half() above will call the inplace copy of TE's
-    # Float8Tensor, which will write an unwanted value (amax calculated from the current fp8
-    # param) to its amax_history. The following logic will correct the amax_history back.
-    for model_module in model:
-        for param in model_module.parameters():
-            if is_float8tensor(param) and param._fp8_meta is not None:
-                fp8_meta = param._fp8_meta['scaling_fwd']
-                fp8_meta_index = param._fp8_meta_index
-                if hasattr(param, 'get_high_precision_init_val'):
-                    fp8_meta.amax_history[0][fp8_meta_index].copy_(
-                        param.get_high_precision_init_val().abs().max()
-                    )
-                else:
-                    fp8_meta.amax_history[0][fp8_meta_index] = 0
+    # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
+    #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
+    #               from the current fp8 param) to its amax_history. The below function will correct
+    #               the amax_history back.
+    # After TE2.x: Below function is an empty function and does nothing.
+    correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
