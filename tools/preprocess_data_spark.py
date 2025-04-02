@@ -267,6 +267,25 @@ class Partition(object):
             builder.finalize(output_idx_file)
         
         print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Merging partitions completed.")
+        
+        # ---------------------------
+        # Phase 3: Clean up intermediate files
+        # ---------------------------
+        cleanup_start = time.time()
+        deleted_count = 0
+        
+        # Delete all partition .idx files
+        for idx_file in glob.glob(f"{output_prefix}_*_{level}_*.idx"):
+            os.remove(idx_file)
+            deleted_count += 1
+            
+        # Delete all partition .bin files 
+        for bin_file in glob.glob(f"{output_prefix}_*_{level}_*.bin"):
+            os.remove(bin_file)
+            deleted_count += 1
+        
+        cleanup_end = time.time()
+        print(f"{time.strftime('%H:%M:%S', time.localtime())} IN - Deleted {deleted_count} intermediate files in {cleanup_end - cleanup_start:.2f} seconds")
 
 def get_args():
     parser = argparse.ArgumentParser()
