@@ -130,7 +130,6 @@ def print_datetime(string):
 
 
 def num_floating_point_operations(args, batch_size):
-
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
         if args.hybrid_override_pattern:
@@ -207,6 +206,7 @@ def num_floating_point_operations(args, batch_size):
             num_dense_layers = args.num_layers
             num_moe_layers = 0
             num_experts_routed_to = 0
+            last_layer_is_moe = 0
         else:
             # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.moe_layer_freq, int):
@@ -217,10 +217,24 @@ def num_floating_point_operations(args, batch_size):
                 moe_layer_pattern = args.moe_layer_freq
             else:
                 raise RuntimeError("Illegal --moe-layer-freq argument provided!")
-            assert len(moe_layer_pattern) == args.num_layers
+            assert len(moe_layer_pattern) == args.num_layers, (
+                f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
+                f"expected {args.num_layers}, "
+                f"current moe layer pattern: {args.moe_layer_freq}"
+            )
             num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
             num_dense_layers = args.num_layers - num_moe_layers
             num_experts_routed_to = args.moe_router_topk
+            last_layer_is_moe = moe_layer_pattern[-1]
+        
+        if args.mtp_num_layers is not None:
+            mtp_num_layers = args.mtp_num_layers
+            num_moe_layers += last_layer_is_moe * mtp_num_layers
+            num_dense_layers += (1 - last_layer_is_moe) * mtp_num_layers
+            num_layers = args.num_layers + mtp_num_layers
+        else:
+            mtp_num_layers = 0
+            num_layers = args.num_layers
 
         moe_ffn_hidden_size = args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None else args.ffn_hidden_size
         shared_expert_ffn_hidden_size = (
@@ -241,44 +255,105 @@ def num_floating_point_operations(args, batch_size):
         # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
         expansion_factor = 3 * 2 * 2
 
-        return (
+        if args.multi_latent_attention:
+            assert not args.group_query_attention
+            '''
+            Basic arithmetic
+            let B is batch size, s is seq_len, h is embedding dim,
+            for one self_attnetion block (prenorm is not included)
+            qkv projection:  6Bsh^2
+            attn:            2Bs^2h
+            attn over value: 2Bs^2h
+            oproj:           2Bsh^2
+
+            references
+            https://arxiv.org/abs/2305.10403
+            https://arxiv.org/abs/2205.05198
+            '''
+            ## MLA
+            if args.q_lora_rank is None:
+                q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+            else:
+                q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1) 
+            self_attn_term = (
+                3*2 # fwd(1) + bwd(2) *FMA
+                * num_layers 
+                * (
+                    ## q lora + rope + q norm
+                    q_term
+
+                    ## kv lora + rope + kv norm
+                    + args.kv_lora_rank
+                    * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + 1)
+                    + args.hidden_size * args.qk_pos_emb_head_dim
+
+                    ## o proj
+                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+
+                    ## core attn
+                    + args.seq_length * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)) / 2
+                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                )
+            )
+
+        else:
+            ## MHA or GQA
+            self_attn_term = (
                 expansion_factor
-                * batch_size
-                * args.seq_length
-                * args.num_layers
+                * num_layers
                 * args.hidden_size
                 * args.hidden_size
                 * (
-                    # Attention.
-                        (
-                                (
-                                        1
-                                        + (args.num_query_groups / args.num_attention_heads)
-                                        # Only half of the attention matrix is non-zero and needs to be multiplied with V.
-                                        + (args.seq_length / args.hidden_size / 2)
-                                ) * query_projection_to_hidden_size_ratio
-                        )
-                        # MLP.
-                        + (
-                                (
-                                    # Dense.
-                                        (args.ffn_hidden_size * num_dense_layers) +
-                                        # MoE.
-                                        (
-                                                (
-                                                    # Routed experts.
-                                                        moe_ffn_hidden_size * num_experts_routed_to +
-                                                        # Shared experts.
-                                                        shared_expert_ffn_hidden_size
-                                                )
-                                                * num_moe_layers
-                                        )
-                                ) * gated_linear_multiplier / (args.num_layers * args.hidden_size)
-                        )
-                        # Logit.
-                        + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size))
+                    (
+                        1
+                        + (args.num_query_groups / args.num_attention_heads)
+                        # # Only half of the attention matrix is non-zero and needs to be multiplied with V.
+                        + (args.seq_length / args.hidden_size / 2)
+                    ) * query_projection_to_hidden_size_ratio
                 )
+            )
+
+        total_floating_point_operations = batch_size * args.seq_length * (
+            # MLP
+            expansion_factor
+            * num_layers
+            * args.hidden_size
+            * (
+                # dense layer (deepseek v2, v3 style)
+                (
+                    args.ffn_hidden_size
+                    * gated_linear_multiplier
+                ) * (num_dense_layers/num_layers)
+                # routed experts
+                + (
+                    moe_ffn_hidden_size
+                    * num_experts_routed_to
+                    * gated_linear_multiplier
+                ) * (num_moe_layers/num_layers)
+                # Shared Experts.
+                + (
+                    shared_expert_ffn_hidden_size 
+                    * gated_linear_multiplier
+                ) * (num_moe_layers/num_layers)
+            )
+            # Self Attention
+            + self_attn_term
+            # MTP norms and proj
+            + 3*2
+            * mtp_num_layers
+            * (
+                # MTP eh norm + final nrom
+                3 * args.hidden_size
+                # MTH eh proj
+                + 2 * args.hidden_size * args.hidden_size
+            )
+            # Logit.
+            + 3*2
+            * args.hidden_size
+            * args.padded_vocab_size 
+            * (mtp_num_layers + 1)
         )
+        return total_floating_point_operations
 
 
     # Main entrypoint for FLOPs calculation.
