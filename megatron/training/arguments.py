@@ -1929,6 +1929,9 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
+    group.add_argument('--disable-bf16-reduced-precision-matmul', action='store_true',
+                       help='If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to '
+                       'prevent matmul from using reduced precision accumulation when using BF16.')
 
     return parser
 

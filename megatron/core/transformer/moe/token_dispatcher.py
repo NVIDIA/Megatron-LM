@@ -247,15 +247,15 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
             output_total = reduce_scatter_to_sequence_parallel_region(
-                output_total, group=self.tp_ep_group
-            )
+                output_total.to(self.local_probs.dtype), group=self.tp_ep_group
+            ).to(output_total.dtype)
             if self.add_bias:
                 # Unpermute the bias across expert parallel devices.
                 # bias is duplicated across tensor parallelism ranks;
                 output_bias_total = (
                     reduce_scatter_to_sequence_parallel_region(
-                        output_bias_total, group=self.tp_ep_group
-                    )
+                        output_bias_total.to(self.local_probs.dtype), group=self.tp_ep_group
+                    ).to(output_bias_total.dtype)
                     / self.tp_size
                 )
 
@@ -621,9 +621,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 input_split_sizes = None
             else:
                 input_split_sizes = self.output_splits_tp.tolist()
+            # The precision of TP reduce_scatter should be the same as the router_dtype
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states, group=self.tp_group, input_split_sizes=input_split_sizes
-            )
+                hidden_states.to(self.probs.dtype),
+                group=self.tp_group,
+                input_split_sizes=input_split_sizes,
+            ).to(hidden_states.dtype)
 
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
