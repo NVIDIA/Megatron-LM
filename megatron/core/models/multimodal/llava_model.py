@@ -14,7 +14,7 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_ima
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_rank, get_context_parallel_world_size
+from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -35,8 +35,6 @@ try:
         HAVE_TEX = False
 except:
     HAVE_TE = False
-    if get_context_parallel_world_size() > 1:
-        raise RuntimeError("ContextParallelism requires TransformerEngine support, but not found.")
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
@@ -83,6 +81,7 @@ class LLaVAModel(MegatronModule):
         image_token_index (int): Token ID for image token such as <image>.
         pixel_shuffle (bool): Enable pixel shuffle.
         tile_tags (list): Optional tile tags.
+        cp_group (torch.distributed.ProcessGroup): Process group for context parallelism.
     """
 
     def __init__(
@@ -115,6 +114,7 @@ class LLaVAModel(MegatronModule):
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         tile_tags: Optional[list] = None,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -147,9 +147,15 @@ class LLaVAModel(MegatronModule):
                 and HAVE_TE
             ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
+                self.cp_group = get_context_parallel_group() if cp_group is None else cp_group
+                assert (
+                    torch.distributed.get_world_size(self.cp_group) == self.context_parallel_lm
+                ), "CP Group size should match the Language Model CP size"
                 assert is_te_min_version(
                     "1.10.0"
                 ), "Context Parallelism in LLaVA requires TE v1.10 or higher"
+            else:
+                self.cp_group = None
         self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
 
         # This attribute is needed to check if an all-reduce is required
@@ -665,8 +671,8 @@ class LLaVAModel(MegatronModule):
                     "1.10.0"
                 ), "Please update Transformer Engine to >= 1.10 to use \
                     Context Parallel with THD format data"
-                cp_size = get_context_parallel_world_size()
-                cp_rank = get_context_parallel_rank()
+                cp_size = self.cp_group.size()
+                cp_rank = self.cp_group.rank()
                 for key, data in batch.items():
                     index = tex.thd_get_partitioned_indices(
                         packed_seq_params.cu_seqlens_q_padded, data.size(1), cp_size, cp_rank
