@@ -23,6 +23,8 @@ RUN pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgr
 
 RUN pip3 install --upgrade pip
 RUN git clone https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git /nvidia-resiliency-ext-x
+RUN cd /nvidia-resiliency-ext-x && git fetch origin e4b22cfb45d9e078b77242b68a35d9df4947dc91
+RUN cd /nvidia-resiliency-ext-x && git reset --hard e4b22cfb45d9e078b77242b68a35d9df4947dc91
 RUN cd /nvidia-resiliency-ext-x && sed -e '/cupti_build\.py/ s/^/#/' -i pyproject.toml
 RUN cd /nvidia-resiliency-ext-x && pip3 install -e .
 

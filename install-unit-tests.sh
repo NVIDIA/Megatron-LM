@@ -29,6 +29,6 @@ pip3 install git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0
 
 pip3 install git+https://github.com/Dao-AILab/flash-attention@v2.5.8
 pip3 install git+https://github.com/NVIDIA/TransformerEngine.git@v1.10
-pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git
+pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git@e4b22cfb45d9e078b77242b68a35d9df4947dc91
 
 

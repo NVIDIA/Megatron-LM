@@ -4,7 +4,7 @@ import logging
 import shutil
 import tempfile
 from pathlib import Path
-import traceback
+import time
 from types import SimpleNamespace
 from unittest import mock
 
@@ -202,7 +202,6 @@ class TestLocalCheckpointing:
                                                                     group=get_default_process_group())
             }
             torch.distributed.barrier(group=get_default_process_group())
-            
             save_checkpoint(
                 1,
                 model,
@@ -214,7 +213,7 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
-                torch.distributed.barrier(group=get_default_process_group())
+            torch.distributed.barrier(group=get_default_process_group())
             iteration, _ = load_checkpoint(
                 model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context
             )
@@ -246,6 +245,7 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
+            torch.distributed.barrier(group=get_default_process_group())
             assert filecmp.cmp(ckpt_path, backup_path, shallow=False), [ckpt_path, backup_path]
             save_checkpoint(
                 2,
@@ -258,7 +258,8 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
-                torch.distributed.barrier(group=get_default_process_group())
+            torch.distributed.barrier(group=get_default_process_group())
+            time.sleep(1) # race condiiton between removing a file and checking it does not exist
             assert not ckpt_path.exists(), f"rank: {Utils.rank} path: {ckpt_path}"
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(2)
             ckpt_path = checkpointing_context['local_checkpoint_manager']._local_ckpt_path_from_id(
