@@ -4,6 +4,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
+import torch
 import torch.nn.functional as F
 
 from megatron.core.enums import Fp8Recipe
@@ -176,6 +177,10 @@ class TransformerConfig(ModelParallelConfig):
     """If True, run attention masking and softmax in fp32. This should be True if
     apply_query_key_layer_scaling is True."""
 
+    disable_bf16_reduced_precision_matmul: bool = False
+    """If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to 
+    prevent matmul from using reduced precision accumulation when using BF16."""
+
     ####################
     # fusion
     ####################
@@ -332,7 +337,7 @@ class TransformerConfig(ModelParallelConfig):
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
     2. For each token, 'moe_router_group_topk' groups are selected based on sum of
-    top-('moe_router_num_groups'/'moe_router_group_topk') routing scores within each group
+    top-('moe_router_topk'/'moe_router_group_topk') routing scores within each group
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
@@ -527,6 +532,10 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'
             )
+
+        # Apply BF16 matmul precision setting if needed
+        if self.bf16 and self.disable_bf16_reduced_precision_matmul:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(
