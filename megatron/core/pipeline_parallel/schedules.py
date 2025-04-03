@@ -797,18 +797,29 @@ def forward_backward_pipelining_with_interleaving(
         raise RuntimeError(msg)
 
     model_type = get_model_type(model[0])
+
     if model_type == ModelType.encoder_and_decoder:
-        raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
-
-    if decoder_seq_length is not None and decoder_seq_length != seq_length:
-        raise RuntimeError(
-            "Interleaving is not supported with a different decoder sequence length."
+        xattn_needed = get_model_xattn(model)
+        assert (
+            not xattn_needed
+        ), "Interleaving is not supported when xattn is required between encoder and decoder"
+        tensor_shape = get_tensor_shapes(
+            rank=parallel_state.get_pipeline_model_parallel_rank(),
+            model_type=model_type,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            config=config,
+            encoder_decoder_xattn=xattn_needed,
         )
-
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
-    tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
-    if config.sequence_parallel:
-        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+        tensor_shape = list(tensor_shape[0])
+    else:
+        tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+        tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
+        if config.sequence_parallel:
+            tensor_shape[0] = (
+                tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+            )
 
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)

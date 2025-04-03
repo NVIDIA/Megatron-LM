@@ -113,7 +113,10 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
         ), "num_layers should be divisible by pipeline_model_parallel_size"
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
-    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+    if (
+        parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+        and config.pipeline_model_parallel_size > 1
+    ):
         # Interleaved pipeline parallelism:
         # Number of layers in each model chunk is the number of layers in the stage,
         # divided by the number of model chunks in a stage.
@@ -129,7 +132,8 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 
         assert (
             num_layers_per_pipeline_rank % vp_size == 0
-        ), "num_layers_per_pipeline_rank should be divisible by vp_size"
+        ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
+            should be divisible by vp_size {vp_size}"
         num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
 
         num_layers_to_build = num_layers_per_virtual_rank

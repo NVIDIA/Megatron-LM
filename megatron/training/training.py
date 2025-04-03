@@ -819,8 +819,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     def build_model():
         if mpu.get_pipeline_model_parallel_world_size() > 1 and \
         args.virtual_pipeline_model_parallel_size is not None:
-            assert model_type != ModelType.encoder_and_decoder, \
-                "Interleaved schedule not supported for model with both encoder and decoder"
+            if model_type == ModelType.encoder_and_decoder:
+                assert args.encoder_pipeline_model_parallel_size == 0, \
+                    "Interleaved schedule not supported for model with encoder on separate PP rank"
             model = []
             for i in range(args.virtual_pipeline_model_parallel_size):
                 mpu.set_virtual_pipeline_model_parallel_rank(i)

@@ -363,8 +363,11 @@ def validate_args(args, defaults={}):
         if args.num_virtual_stages_per_pipeline_rank is None:
             assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
                 'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
-            num_layers = args.num_layers
-
+            if args.num_layers is not None:
+                num_layers = args.num_layers
+            else:
+                num_layers = args.decoder_num_layers
+            
             if args.account_for_embedding_in_pipeline_split:
                 num_layers += 1
 
