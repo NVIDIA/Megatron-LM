@@ -2,7 +2,7 @@
 
 """Multimodal tokenizer."""
 from dataclasses import dataclass
-from typing import Dict, List, Union
+from typing import Dict, List, Union, Optional
 
 import numpy as np
 
@@ -43,6 +43,9 @@ qwen2p0_custom_template = "{% for message in messages %}{{'<|im_start|>' + messa
 # but we removed the forced system message.
 llama3p1_chat_template = """{{- bos_token }}\n{%- if custom_tools is defined %}\n    {%- set tools = custom_tools %}\n{%- endif %}\n{%- if not tools_in_user_message is defined %}\n    {%- set tools_in_user_message = true %}\n{%- endif %}\n{%- if not date_string is defined %}\n    {%- set date_string = \"26 Jul 2024\" %}\n{%- endif %}\n{%- if not tools is defined %}\n    {%- set tools = none %}\n{%- endif %}\n\n{#- This block extracts the system message, so we can slot it into the right place. #}\n{%- if messages[0]['role'] == 'system' %}\n    {%- set system_message = messages[0]['content']|trim %}\n    {%- set messages = messages[1:] %}\n{%- else %}\n    {%- set system_message = none %}\n{%- endif %}\n\n{%- if system_message is not none %}{#- System message + builtin tools #}\n{{- \"<|start_header_id|>system<|end_header_id|>\\n\\n\" }}\n{%- if builtin_tools is defined or tools is not none %}\n    {{- \"Environment: ipython\\n\" }}\n{%- endif %}\n{%- if builtin_tools is defined %}\n    {{- \"Tools: \" + builtin_tools | reject('equalto', 'code_interpreter') | join(\", \") + \"\\n\\n\"}}\n{%- endif %}{%- if tools is not none and not tools_in_user_message %}\n    {{- \"You have access to the following functions. To call a function, please respond with JSON for a function call.\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\\n\\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\\n\\n\" }}\n    {%- endfor %}\n{%- endif %}\n{{- system_message }}\n{{- \"<|eot_id|>\" }}\n\n{%-endif %}{#- Custom tools are passed in a user message with some extra guidance #}\n{%- if tools_in_user_message and not tools is none %}\n    {#- Extract the first user message so we can plug it in here #}\n    {%- if messages | length != 0 %}\n        {%- set first_user_message = messages[0]['content']|trim %}\n        {%- set messages = messages[1:] %}\n    {%- else %}\n        {{- raise_exception(\"Cannot put tools in the first user message when there's no first user message!\") }}\n{%- endif %}\n    {{- '<|start_header_id|>user<|end_header_id|>\\n\\n' -}}\n    {{- \"Given the following functions, please respond with a JSON for a function call \" }}\n    {{- \"with its proper arguments that best answers the given prompt.\\n\\n\" }}\n    {{- 'Respond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.' }}\n    {{- \"Do not use variables.\\n\\n\" }}\n    {%- for t in tools %}\n        {{- t | tojson(indent=4) }}\n        {{- \"\\n\\n\" }}\n    {%- endfor %}\n    {{- first_user_message + \"<|eot_id|>\"}}\n{%- endif %}\n\n{%- for message in messages %}\n    {%- if not (message.role == 'ipython' or message.role == 'tool' or 'tool_calls' in message) %}\n        {{- '<|start_header_id|>' + message['role'] + '<|end_header_id|>\\n\\n'+ message['content'] | trim + '<|eot_id|>' }}\n    {%- elif 'tool_calls' in message %}\n        {%- if not message.tool_calls|length == 1 %}\n            {{- raise_exception(\"This model only supports single tool-calls at once!\") }}\n        {%- endif %}\n        {%- set tool_call = message.tool_calls[0].function %}\n        {%- if builtin_tools is defined and tool_call.name in builtin_tools %}\n            {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' -}}\n            {{- \"<|python_tag|>\" + tool_call.name + \".call(\" }}\n            {%- for arg_name, arg_val in tool_call.arguments | items %}\n                {{- arg_name + '=\"' + arg_val + '\"' }}\n                {%- if not loop.last %}\n                    {{- \", \" }}\n                {%- endif %}\n                {%- endfor %}\n            {{- \")\" }}\n        {%- else  %}\n            {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' -}}\n            {{- '{\"name\": \"' + tool_call.name + '\", ' }}\n            {{- '\"parameters\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- \"}\" }}\n        {%- endif %}\n        {%- if builtin_tools is defined %}\n            {#- This means we're in ipython mode #}\n            {{- \"<|eom_id|>\" }}\n        {%- else %}\n            {{- \"<|eot_id|>\" }}\n        {%- endif %}\n    {%- elif message.role == \"tool\" or message.role == \"ipython\" %}\n        {{- \"<|start_header_id|>ipython<|end_header_id|>\\n\\n\" }}\n        {%- if message.content is mapping or message.content is iterable %}\n            {{- message.content | tojson }}\n        {%- else %}\n            {{- message.content }}\n        {%- endif %}\n        {{- \"<|eot_id|>\" }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}\n{%- endif %}\n"""
 
+nemotron_custom_template = "{{- bos_token }}{% for message in messages %}{{'<SPECIAL_14>' + message['role'] + '\n' + message['content'] + '<SPECIAL_15>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<SPECIAL_14>assistant\n' }}{% endif %}"
+
+nemotron_aligned_custom_template = "{{- bos_token}}{% for message in messages %}{{message['role'] + '\n' + message['content'] + '\n' + '[PREFIX]'}}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant\n' }}{% endif %}"
 
 
 @dataclass
@@ -60,6 +63,9 @@ class PromptConfig:
     has_bos: bool
     # If the tokenizer supports a separate role for system messages.
     has_system_role: bool
+    # Wether to force a specific system message.
+    force_system_message: bool = False
+    system_default: dict = None
 
 
 class MultimodalTokenizer(MegatronTokenizer):
@@ -71,6 +77,7 @@ class MultimodalTokenizer(MegatronTokenizer):
         prompt_format: str,
         special_tokens: List[str],
         image_tag_type: str,
+        force_system_message: bool = False,
     ):
         """Tokenizer with a support for non-text inputs.
 
@@ -136,6 +143,24 @@ class MultimodalTokenizer(MegatronTokenizer):
                 has_bos=False,
                 has_system_role=True,
             )
+        elif prompt_format == "nemotron5":
+            # "<|im_start|>assistant\n" is the prefix.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=3,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_233>"),
+                custom_chat_template=nemotron_custom_template,
+                has_bos=True,
+                has_system_role=True,
+            )
+        elif prompt_format == "nemotron5-aligned":
+            # "Assistant\n" is the prefix.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=2,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<SPECIAL_233>"),
+                custom_chat_template=nemotron_aligned_custom_template,
+                has_bos=True,
+                has_system_role=True,
+            )
         elif prompt_format in ("qwen2p0", "qwen2p5"):
             # "<|im_start|>assistant\n" is the prefix for assistant messages
             self._prompt_config = PromptConfig(
@@ -144,10 +169,24 @@ class MultimodalTokenizer(MegatronTokenizer):
                 custom_chat_template=qwen2p0_custom_template,
                 has_bos=False,
                 has_system_role=True,
+                force_system_message=force_system_message,
+                system_default={"role": "system",
+                                "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."}
+            )
+        elif prompt_format == "llama3p1":
+            # "<|start_header_id|>assistant<|end_header|>\n\n" is the prefix for assistant messages.
+            # That occupies 4 tokens and can be masked in the target.
+            self._prompt_config = PromptConfig(
+                assistant_prefix_len=4,
+                pad_token_id=tokenizer.convert_tokens_to_ids("<|finetune_right_pad_id|>"),
+                custom_chat_template=llama3p1_chat_template,
+                has_bos=True,
+                has_system_role=True,
             )
         else:
             raise NotImplementedError("unknown multimodal tokenizer type", prompt_format)
 
+        self._prompt_format = prompt_format
         self._image_tag = IMAGE_TAGS[image_tag_type]
 
     def _apply_image_tag(self, text: Union[str, List[Dict]]):
@@ -197,6 +236,18 @@ class MultimodalTokenizer(MegatronTokenizer):
         if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
             conversation = conversation[1:]
 
+        if self._prompt_config.force_system_message:
+            assert self._prompt_config.system_default is not None, "Trying to force system message with empty system default"
+            if conversation[0]["role"] == "system":
+                conversation[0] = self._prompt_config.system_default
+            else:
+                conversation = [self._prompt_config.system_default] + conversation
+
+        if self._prompt_format == "nemotron5-aligned":
+            for turn in conversation:
+                tmp = turn['role']
+                turn['role'] = tmp[:1].upper() + tmp[1:]
+
         # Apply possible image tag.
         conversation = self._apply_image_tag(conversation)
 
@@ -231,7 +282,7 @@ class MultimodalTokenizer(MegatronTokenizer):
 
             turn_len = len(turn_tokens)
 
-            role = turn["role"]
+            role = turn["role"].lower()
             if role in ("system", "user"):
                 target[idx : idx + turn_len] = IGNORE_INDEX
             elif role == "assistant":
