@@ -64,6 +64,9 @@ def main(
         magic_values = dict(workload.spec)
         magic_values["assets_dir"] = output_path
         magic_values["artifacts_dir"] = output_path
+        magic_values["environment"] = environment
+        magic_values["test_case"] = workload.spec.test_case
+        magic_values["name"] = workload.spec.name.format(**magic_values)
 
         file_path = (
             pathlib.Path.cwd()

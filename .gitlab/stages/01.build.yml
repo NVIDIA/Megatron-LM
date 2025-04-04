@@ -10,7 +10,7 @@
     - name: docker:24.0.5-dind
       variables:
         HEALTHCHECK_TCP_PORT: "2376"
-  timeout: 45m
+  timeout: 180m
   variables:
     DOCKER_HOST: tcp://docker:2376
     DOCKER_TLS_CERTDIR: "/certs"
@@ -18,7 +18,11 @@
     DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
     TAG: purpose/builder-large
     STAGE: jet
-    MCORE_BACKWARDS_REF: core_r0.11.0
+    MCORE_BACKWARDS_REF: ko3n1g/fix/pyt2501 # core_r0.11.0
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 90Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 90Gi
+    # KUBERNETES_SERVICE_CPU_REQUEST: 60
+    # KUBERNETES_SERVICE_CPU_LIMIT: 60
   script:
     - env
     - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
@@ -79,7 +83,7 @@ test:build_image:
         BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
       - IMAGE: CI_MCORE_DEV_IMAGE
         FILE: Dockerfile.ci.dev
-        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.10-py3
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.03-py3
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
