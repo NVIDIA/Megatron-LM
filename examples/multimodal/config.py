@@ -59,6 +59,16 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 14336
+    elif config.language_model_type == "nemotron5-8b":
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = False
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.activation_func = squared_relu
+        config.ffn_hidden_size = 21504
+        config.masked_softmax_fusion = True
+        config.attention_softmax_in_fp32 = True
     elif config.language_model_type == "yi-34b":
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
@@ -72,20 +82,6 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 20480
-    elif config.language_model_type == "qwen2.5_7B":
-        config.activation_func = torch.nn.functional.silu
-        config.add_bias_linear = False
-        config.add_qkv_bias = True
-        config.bias_activation_fusion = False
-        config.gated_linear_unit = True
-        config.apply_query_key_layer_scaling = False
-        config.layernorm_zero_centered_gamma = (
-            False  # Zero centered gamma not supported for RMSNorm
-        )
-        config.bias_dropout_fusion = False
-        config.apply_rope_fusion = False
-        config.attention_softmax_in_fp32 = True
-        config.ffn_hidden_size = 18944
     elif config.language_model_type == "qwen2.0_72B":
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
@@ -100,6 +96,61 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 29568
+    elif config.language_model_type == "qwen2.5_7B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.add_qkv_bias = True
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 18944
+    elif config.language_model_type == "qwen2.5_72B":
+        config.activation_func = torch.nn.functional.silu
+        config.add_bias_linear = False
+        config.add_qkv_bias = True
+        config.bias_activation_fusion = False
+        config.gated_linear_unit = True
+        config.apply_query_key_layer_scaling = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.apply_rope_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 29568
+    elif config.language_model_type == "nemotron5-hybrid-8b":
+        config.activation_func = squared_relu
+        config.squared_relu = True
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.apply_query_key_layer_scaling = False
+        config.gated_linear_unit = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 21504
+    elif config.language_model_type == "nemotron5-hybrid-56b":
+        config.activation_func = squared_relu
+        config.squared_relu = True
+        config.add_bias_linear = False
+        config.bias_activation_fusion = False
+        config.apply_query_key_layer_scaling = False
+        config.gated_linear_unit = False
+        config.layernorm_zero_centered_gamma = (
+            False  # Zero centered gamma not supported for RMSNorm
+        )
+        config.bias_dropout_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.ffn_hidden_size = 32768
+        config.mamba_state_dim = 256
     elif config.language_model_type == "llama3.2_1b":
         config.activation_func = torch.nn.functional.silu
         config.add_bias_linear = False
@@ -282,13 +333,23 @@ def get_vision_projection_config(config, hidden_size):
         config.ffn_hidden_size = 20480
         config.normalization = "LayerNorm"
         config.activation_func = torch.nn.functional.gelu
-    elif config.language_model_type == "qwen2.5_7B":
-        config.ffn_hidden_size = 3584
-        config.activation_func = torch.nn.functional.gelu
     elif config.language_model_type == "qwen2.0_72B":
         config.ffn_hidden_size = 29568
         config.normalization = "LayerNorm"
         config.activation_func = torch.nn.functional.gelu
+    elif config.language_model_type == "qwen2.5_7B":
+        config.ffn_hidden_size = 3584
+        config.activation_func = torch.nn.functional.gelu
+    elif config.language_model_type == "qwen2.5_72B":
+        config.ffn_hidden_size = 29568
+        config.normalization = "LayerNorm"
+        config.activation_func = torch.nn.functional.gelu
+    elif config.language_model_type == "nemotron5-hybrid-56b":
+        config.ffn_hidden_size = 32768
+        config.activation_func = squared_relu
+    elif config.language_model_type in ("nemotron5-8b", "nemotron5-hybrid-8b"):
+        config.ffn_hidden_size = 21504
+        config.activation_func = squared_relu
     elif config.language_model_type == "llama3.2_1b":
         config.ffn_hidden_size = 2048
         config.activation_func = torch.nn.functional.gelu
@@ -307,6 +368,7 @@ def get_vision_projection_config(config, hidden_size):
 class EvaluationConfig:
     """Evaluation related configuration."""
     task: str
+    dataset: str = ""
 
     temperature: float = 1.0
     top_p: float = 0.0
@@ -318,7 +380,8 @@ class EvaluationConfig:
 
     input_image_path: str = ""
     gt_path: str = ""
+    split: str = "validation"
 
-    num_partitions: int = 1
+    num_partitions: int = 0
     partition_id: int = 0
     num_samples_per_partition: int = 0
