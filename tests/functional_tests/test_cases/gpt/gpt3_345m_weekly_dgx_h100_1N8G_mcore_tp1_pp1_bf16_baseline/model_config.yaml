@@ -1,7 +1,7 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  NCCL_ALGO: Tree
+  NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
 MODEL_ARGS:
   --num-layers: 12
@@ -42,6 +42,7 @@ MODEL_ARGS:
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --ckpt-format: torch_dist
+  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --fp16: true
   --apply-query-key-layer-scaling: true

@@ -118,4 +118,9 @@ if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
 fi
 
+if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
+    echo "Suppressing errors during checkpoint recording."
+    exit 0
+fi
+
 exit ${EXIT_CODE:-0}

@@ -51,5 +51,6 @@ MODEL_ARGS:
   --encoder-pipeline-model-parallel-size: 0
   --deterministic-mode: true
   --ckpt-format: torch_dist
+  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --log-memory-to-tensorboard: true
 TEST_TYPE: regular
