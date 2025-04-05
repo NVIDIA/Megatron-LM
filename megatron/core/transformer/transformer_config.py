@@ -204,7 +204,8 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     recompute_granularity: Optional[str] = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
-    activation checkpointing where only the memory intensive part of attention is checkpointed.
+    activation checkpointing where the submodules set in --recompute-modules is checkpointed.
+    The default is "core_attn" which is the memory intensive part of attention.
     These memory intensive activations are also less compute intensive which makes activation
     checkpointing more efficient for LLMs (20B+).  See Reducing Activation Recomputation in Large
     Transformer Models (https://arxiv.org/abs/2205.05198) for more details.  'full' will checkpoint
@@ -228,6 +229,20 @@ class TransformerConfig(ModelParallelConfig):
 
     distribute_saved_activations: Optional[bool] = None
     """If True, distribute recomputed activations across the model parallel group."""
+
+    recompute_modules: Optional[List[str]] = None
+    """The submodules to recompute.
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe".
+    default: ["core_attn"].
+    "core_attn": recompute the core attention part of the transformer layer.
+    "moe_act": recompute the MoE MLP activation function.
+    "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
+    "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
+    "mlp": recompute the dense MLP submodule. 
+    "moe": recompute the MoE layer.
+    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "core_attn", "mlp", and "moe" uses normal checkpointing.
+    """
 
     ####################
     # fp8 related
@@ -678,6 +693,50 @@ class TransformerConfig(ModelParallelConfig):
                     f'distribute_saved_activations: {self.distribute_saved_activations} must be '
                     f'false when sequence parallel is enabled: {self.sequence_parallel}'
                 )
+
+        if self.recompute_modules is None:
+            self.recompute_modules = ['core_attn']
+
+        if self.recompute_granularity == 'selective':
+            if len(self.recompute_modules) > 0:
+                allowed_modules = {"core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe"}
+                invalid_modules = set(self.recompute_modules) - allowed_modules
+                assert not invalid_modules, (
+                    f'Invalid choices for recompute_modules: {invalid_modules}. '
+                    f'Allowed modules are: {allowed_modules}'
+                )
+
+            if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
+                raise ValueError(
+                    "moe_act in recompute_modules is only supported with moe_grouped_gemm."
+                )
+
+            if "mla_up_proj" in self.recompute_modules and not self.multi_latent_attention:
+                raise ValueError(
+                    "mla_up_proj in recompute_modules is only supported with "
+                    "multi_latent_attention."
+                )
+
+            if "core_attn" in self.recompute_modules:
+                warnings.warn(
+                    "If you are using transformer_engine as the transformer implementation, "
+                    "the core_attn is from transformer_engine and may be the fused version. "
+                    "For fused attention, you have no need to set 'core_attn' to recompute. "
+                    "Please check that the core_attn recompute is really needed."
+                )
+
+        if self.moe_layer_recompute:
+            warnings.warn(
+                "--moe-layer-recompute is deprecated. "
+                "Use --recompute-granularity selective --recompute-modules moe_layer instead."
+            )
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "Do not set --moe-layer-recompute with full recompute granularity. "
+                )
+            self.recompute_granularity = 'selective'
+            if "moe" not in self.recompute_modules:
+                self.recompute_modules.append("moe")
 
         if (
             self.num_layers_in_first_pipeline_stage is not None

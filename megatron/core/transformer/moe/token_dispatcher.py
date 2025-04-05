@@ -776,9 +776,10 @@ class _DeepepManager(_DispatchManager):
         group: torch.distributed.ProcessGroup,
         router_topk: int,
         permute_fusion: bool = False,
-        capacity_factor: float = None,
-        num_experts: int = None,
-        num_local_experts: int = None,
+        capacity_factor: Optional[float] = None,
+        num_experts: Optional[int] = None,
+        num_local_experts: Optional[int] = None,
+        router_dtype: Optional[str] = None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -789,8 +790,8 @@ class _DeepepManager(_DispatchManager):
         self.router_dtype = router_dtype
 
         # Metadata
-        self.token_indices = None
-        self.token_probs = None
+        self.token_indices: Optional[torch.Tensor] = None
+        self.token_probs: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
 
