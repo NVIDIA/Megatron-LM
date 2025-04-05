@@ -50,3 +50,5 @@ megatron/core/inference/
 Dockerfile.ci.lts
 Dockerfile.ci.dev
 tests/
+megatron/core/transformer/transformer_block.py
+megatron/core/transformer/transformer_layer.py
