@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -116,6 +116,10 @@ class GroupedMLP(MegatronModule):
             self.activation_func = glu
         else:
             self.activation_func = self.config.activation_func
+        self.activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "moe_act" in self.config.recompute_modules
+        )
 
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = parallel_state.get_expert_tensor_parallel_world_size()
@@ -213,6 +217,9 @@ class GroupedMLP(MegatronModule):
 
     def forward(self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor):
         """Forward step of the GroupedMLP."""
+        if self.activation_recompute:
+            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
             w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
@@ -222,9 +229,15 @@ class GroupedMLP(MegatronModule):
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
             )
 
-            intermediate_parallel = self.activation_func(fc1_output)
-
-            fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+            if self.activation_recompute:
+                intermediate_parallel = self.activation_checkpoint.checkpoint(
+                    self.activation_func, fc1_output
+                )
+                fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
+                self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
+            else:
+                intermediate_parallel = self.activation_func(fc1_output)
+                fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
         else:
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
@@ -233,10 +246,13 @@ class GroupedMLP(MegatronModule):
             w1 = self.weight1.view(self.config.hidden_size, -1)
             w2 = self.weight2.view(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
-            h = self.activation_func(h)
-            h = torch.matmul(h, w2)
-
-            fc2_output = h
+            if self.activation_recompute:
+                h = self.activation_checkpoint.checkpoint(self.activation_func, h)
+                fc2_output = torch.matmul(h, w2)
+                self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
+            else:
+                h = self.activation_func(h)
+                fc2_output = torch.matmul(h, w2)
 
         return fc2_output, None
 
@@ -649,6 +665,10 @@ class TEGroupedMLP(MegatronModule):
         )
 
         self.activation_func = self.config.activation_func
+        self.activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "moe_act" in self.config.recompute_modules
+        )
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -692,46 +712,59 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states, tokens_per_expert
         )
 
-        if self.config.bias_activation_fusion:
-            if self.activation_func == F.gelu:
-                if self.config.gated_linear_unit:
-                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
-                else:
-                    assert self.config.add_bias_linear is True
-                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                intermediate_parallel = bias_swiglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    self.config.activation_func_fp8_input_store,
-                )
-            else:
-                raise ValueError("Only support fusion of gelu and swiglu")
-        else:
-            if bias_parallel is not None:
-                shape = intermediate_parallel.shape
-                intermediate_parallel = torch.cat(
-                    [
-                        t + b
-                        for t, b in zip(
-                            torch.split(
-                                intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
-                            ),
-                            bias_parallel,
+        def bias_act_func(intermediate_parallel, bias_parallel):
+            if self.config.bias_activation_fusion:
+                if self.activation_func == F.gelu:
+                    if self.config.gated_linear_unit:
+                        intermediate_parallel = bias_geglu_impl(
+                            intermediate_parallel, bias_parallel
                         )
-                    ]
-                ).view(shape)
-            if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x = torch.chunk(x, 2, dim=-1)
-                    return self.config.activation_func(x[0]) * x[1]
-
-                intermediate_parallel = glu(intermediate_parallel)
+                    else:
+                        assert self.config.add_bias_linear is True
+                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                    )
+                else:
+                    raise ValueError("Only support fusion of gelu and swiglu")
             else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if bias_parallel is not None:
+                    shape = intermediate_parallel.shape
+                    intermediate_parallel = torch.cat(
+                        [
+                            t + b
+                            for t, b in zip(
+                                torch.split(
+                                    intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
+                                ),
+                                bias_parallel,
+                            )
+                        ]
+                    ).view(shape)
+                if self.config.gated_linear_unit:
 
-        output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+                    def glu(x):
+                        x = torch.chunk(x, 2, dim=-1)
+                        return self.config.activation_func(x[0]) * x[1]
+
+                    intermediate_parallel = glu(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+            return intermediate_parallel
+
+        if self.activation_recompute:
+            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            intermediate_parallel = self.activation_checkpoint.checkpoint(
+                bias_act_func, intermediate_parallel, bias_parallel
+            )
+            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+            self.activation_checkpoint.discard_output_and_register_recompute(output)
+        else:
+            intermediate_parallel = bias_act_func(intermediate_parallel, bias_parallel)
+            output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
         # upad and concat the output
         if self.config.fp8:
