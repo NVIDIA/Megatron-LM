@@ -18,6 +18,7 @@ from megatron.core.inference.engines.mcore_engine import MCoreEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -161,10 +162,7 @@ def add_text_generate_args(parser):
 if __name__ == "__main__":
     initialize_megatron(
         extra_args_provider=add_text_generate_args,
-        args_defaults={
-            'no_load_rng': True,
-            'no_load_optim': True,
-        },
+        args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
 
     args = get_args()
@@ -185,6 +183,12 @@ if __name__ == "__main__":
     model.eval()
 
     inference_engine = get_inference_engine(args, model)
+
+    if args.enable_cuda_graph:
+        print(f"Running warmup for CUDA graphs...")
+        inference_engine.generate(
+            prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
+        )
 
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(inference_engine, args)

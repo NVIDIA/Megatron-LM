@@ -14,7 +14,7 @@ from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.contexts import StaticInferenceContext, TokenOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
@@ -238,8 +238,12 @@ class TestTextGenerationController:
             assert (
                 all_prompt_tokens[request_id] == request.prompt_tokens
             ), "Prompt tokens should not have changed during generation"
-            assert len(request.segments) == len(request.prompt_log_probs) + len(
-                request.generated_log_probs
+            # Log probabilities are calculated based on the likelihood of a token given the
+            # preceding context. The first token lacks this dependency and is excluded from
+            # the logprobs output, which is why the +1 is necessary
+            assert (
+                len(request.segments)
+                == len(request.prompt_log_probs) + len(request.generated_log_probs) + 1
             ), "Segments should be returned for both prompt and generated tokens"
             assert len(request.prompt) + len(request.generated_text) == len(
                 request.text
@@ -322,7 +326,7 @@ class TestTextGenerationController:
             )
             active_requests[i] = inference_request
 
-        with pytest.raises(AssertionError):
+        with pytest.raises(TokenOverflowError):
             requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
                 active_requests
             )

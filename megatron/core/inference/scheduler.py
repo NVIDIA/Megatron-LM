@@ -2,6 +2,7 @@
 import functools
 import time
 import typing
+import warnings
 from collections import OrderedDict
 from typing import Dict, Optional, Type, Union
 
@@ -47,6 +48,8 @@ class Scheduler:
         arrival_time: Optional[float] = None,
         streaming: bool = False,
         inference_request: Optional[InferenceRequest] = None,
+        *,
+        inference_parameters: Optional[SamplingParams] = None,
     ) -> str:
         """Add an incoming request
 
@@ -71,6 +74,15 @@ class Scheduler:
             if len(self.active_request_pool) < self.max_batch_size
             else Status.WAITING_IN_QUEUE
         )
+
+        # Deprecation warning for `inference_parameters`.
+        if inference_parameters is not None:
+            warnings.warn(
+                "`inference_parameters` has been renamed to `sampling_params`, and the "
+                "previous name will be removed in `megatron-core` 0.13."
+            )
+            if sampling_params is None:
+                sampling_params = inference_parameters
 
         if inference_request is None:
             assert prompt is not None
@@ -173,7 +185,7 @@ class Scheduler:
         self,
         request_id: str,
         *,
-        exception: Optional[Union[BaseException, Type[BaseException]]] = None
+        exception: Optional[Union[BaseException, Type[BaseException]]] = None,
     ):
         """Cancels the given request"""
         stream = self.streams.get(request_id, None)

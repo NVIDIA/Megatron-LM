@@ -256,23 +256,18 @@ def main():
 
     memory_allocated = torch.cuda.max_memory_allocated()
 
-    if torch.distributed.get_rank() == 0:
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         for idx, result in enumerate(results):
             print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
             generated_log_probs = result.generated_log_probs
             result = {
                 'id': result.request_id,
-                'input_prompt': result.prompt,
-                'generated_text': result.generated_text,
-                'generated_tokens': result.generated_tokens,
+                'num_input_tokens': len(result.prompt_tokens),
+                'num_output_tokens': len(result.generated_tokens),
                 'latency': latency,
                 'memory_usage_GB': memory_allocated / (1024**3),
             }
-            if args.return_log_probs:
-                result['generated_log_probs'] = generated_log_probs
             print(result)
-
-    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":

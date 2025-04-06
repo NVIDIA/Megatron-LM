@@ -36,19 +36,10 @@ from ..dist_checkpointing.mapping import (
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
-from ..fp8_utils import (
-    get_fp8_scale_and_amax,
-    is_float8tensor,
-    is_mxfp8tensor,
-    quantize_param_fragment,
-)
+from ..fp8_utils import is_float8tensor, quantize_param_shard
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import (
-    MixedPrecisionOptimizer,
-    _multi_tensor_copy_this_to_that,
-    _zero_grad_group_helper,
-)
+from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
@@ -374,10 +365,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 .float()
                             )
                             model_param.clear_high_precision_init_val()
-                        elif is_mxfp8tensor(model_param):
-                            raise ValueError(
-                                "Distributed optimizer currently does not support MXFP8 parameters."
-                            )
                         else:
                             shard_main_param = shard_model_param.clone().float()
 
@@ -1934,6 +1921,57 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     main_data.append(main_param.data)
         return model_data, main_data
 
+    def _get_fp8_params_and_shard_fp32_from_fp8(self):
+        """
+        Get lists of FP8 model params, corresponding shard main params, and the starting index of
+        the shard main param in the FP8 param. Parameters in all three lists are in the same order.
+        """
+        fp8_params = []
+        shard_fp32_from_fp8 = []
+        shard_offsets_in_fp8 = []
+
+        if self.ddp_config.use_custom_fsdp:
+            buffers = []
+            for m in self.model_chunks:
+                for group in m.param_and_grad_buffer.parameter_groups:
+                    mbuf = group.model_weight_buffer
+                    buffers.append(mbuf)
+        else:
+            buffers = self.buffers
+
+        # Iterate over all parameters inside this optimizer to find FP8 parameters.
+        fp8_param_to_idx_map = {}
+        idx = 0
+        for buffer in buffers:
+            for param in buffer.params:
+                if is_float8tensor(param):
+                    fp8_params.append(param)
+                    shard_fp32_from_fp8.append(None)
+                    shard_offsets_in_fp8.append(None)
+                    fp8_param_to_idx_map[param] = idx
+                    idx += 1
+
+        def get_shard_fp32_from_fp8(shard_main_groups, model_groups):
+            """
+            Traverse the param groups and collect the fp8 params, their corresponding main params
+            and the starting offsets of the main params in the model params. Store them into three
+            different lists.
+            """
+            for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
+                    if is_float8tensor(model_param):
+                        param_range_map = self._get_model_param_range_map(model_param)
+                        param_range = param_range_map["param"]
+                        assert param_range.size == shard_main_param.nelement()
+                        idx = fp8_param_to_idx_map[model_param]
+                        shard_fp32_from_fp8[idx] = shard_main_param
+                        shard_offsets_in_fp8[idx] = param_range.start
+
+        get_shard_fp32_from_fp8(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        get_shard_fp32_from_fp8(self.shard_fp32_groups, self.model_fp32_groups)
+
+        return fp8_params, shard_fp32_from_fp8, shard_offsets_in_fp8
+
     def _copy_model_grads_to_main_grads(self):
         """
         Copy model grads to main grads.
@@ -1993,6 +2031,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 model_chunk.param_and_grad_buffer.copy_main_weights_to_model_weights()
             return
 
+        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
+        # do the work of copying data from main params to model params.
+        if self.config.use_precision_aware_optimizer:
+            return
+
+        quantize_param_shard(
+            *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
+        )
+
         # Utility method for copying group params.
         def copy_group_params(shard_main_groups, model_groups):
             for shard_main_group, model_group in zip(shard_main_groups, model_groups):
@@ -2011,26 +2058,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
 
                     if is_float8tensor(model_param):
-                        # 1. When "--fp8-param-gather" is disabled, the main param is first cast to
-                        #    BF16/FP16, and then cast to FP8, so the amax_history is calculated
-                        #    using BF16/FP16 param.
-                        # 2. When "--fp8-param-gather" is enabled, we can cast the FP32 main param
-                        #    to FP8 directly, which results in slightly different results with
-                        #    higher speed. In theory, this does not affect convergence.
-                        # TODO: The following code maintains the logic of the point-1 above. It can
-                        # be deleted if it is not necessary.
-                        shard_main_param = shard_main_param.to(model_param.dtype)
-
-                        quantize_param_fragment(
-                            shard_main_param, out=shard_model_param, param=model_param
-                        )
+                        # FP8 params are quantized in the above "quantize_param_shard" function.
+                        continue
                     else:
                         shard_model_param.data.copy_(shard_main_param)
-
-        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
-        # do the work of copying data from main params to model params.
-        if self.config.use_precision_aware_optimizer:
-            return
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
@@ -2052,6 +2083,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 model_chunk.param_and_grad_buffer.copy_model_weights_to_main_weights()
             return
 
+        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
+        # do the work of copying data from main params to model params.
+        if self.config.use_precision_aware_optimizer:
+            return
+
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -2064,72 +2100,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
                     shard_main_param.data.copy_(shard_model_param)
 
-        # When using precision-aware optimizer, main params are held by self.optimizer. It will also
-        # do the work of copying data from main params to model params.
-        if self.config.use_precision_aware_optimizer:
-            return
-
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
-
-    def _update_fp8_scale_inv_and_amax(self):
-        """
-        If detect FP8 parameters, update their `_scale_inv` and do reduce-max for their
-        `amax_history`.
-        """
-        if self.is_stub_optimizer:
-            return
-
-        if self.ddp_config.use_custom_fsdp:
-            buffers = []
-            for m in self.model_chunks:
-                for group in m.param_and_grad_buffer.parameter_groups:
-                    mbuf = group.model_weight_buffer
-                    buffers.append(mbuf)
-        else:
-            buffers = self.buffers
-
-        # Iterate over all parameters inside this optimizer to find FP8 parameters.
-        for buffer in buffers:
-            amaxes = []
-            scales = []
-            scale_invs = []
-            for param in buffer.params:
-                if is_float8tensor(param):
-                    scale, amax = get_fp8_scale_and_amax(param)
-                    amaxes.append(amax.view(1))
-                    scales.append(scale.view(1))
-                    scale_invs.append(param._scale_inv.view(1))
-                    # Reset transpose cache
-                    param._reset_caches()
-
-            # If there is no FP8 parameters, skip all operations.
-            if len(scales) > 0:
-                dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
-
-                # Update scaling factors.
-                packed_scales = torch.empty(
-                    len(scales), dtype=torch.float32, device=scales[0].device
-                )
-                packed_scale_views = [packed_scales[i].view(1) for i in range(len(scales))]
-                _multi_tensor_copy_this_to_that(scales, packed_scale_views, dummy_overflow_buf)
-                torch.reciprocal(packed_scales, out=packed_scales)
-                _multi_tensor_copy_this_to_that(packed_scale_views, scale_invs, dummy_overflow_buf)
-
-                # Reduce amaxes.
-                # Note: Assume each param has a separate amax.
-                packed_amaxes = torch.empty(
-                    len(amaxes), dtype=torch.float32, device=amaxes[0].device
-                )
-                packed_amax_views = [packed_amaxes[i].view(1) for i in range(len(amaxes))]
-                _multi_tensor_copy_this_to_that(amaxes, packed_amax_views, dummy_overflow_buf)
-                torch.distributed.all_reduce(
-                    packed_amaxes,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=buffer.data_parallel_group,
-                )
-                _multi_tensor_copy_this_to_that(packed_amax_views, amaxes, dummy_overflow_buf)
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
@@ -2138,9 +2111,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         asynchorous all-gathers that get overlapped with the next forward pass.
         """
         update_successful = super().step_with_ready_grads()
-
-        # If there is no FP8 parameters, this will do nothing.
-        self._update_fp8_scale_inv_and_amax()
 
         timers = self.config.timers
         if timers is not None:

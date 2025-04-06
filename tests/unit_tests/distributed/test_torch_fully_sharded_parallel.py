@@ -3,6 +3,7 @@ import pytest
 import torch
 
 from megatron.core.device_utils import get_xla_model
+from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
     TorchFullyShardedDataParallel,
@@ -71,4 +72,37 @@ def test_fsdp2_constructor(init_model_parallel):
     # ColumnParallelLinear is in the default list of submodules to wrap.
     assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)
     # Conv2d is not in the list of submodules to wrap.
+    assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
+
+@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
+def test_fsdp2_constructor_with_process_group(init_model_parallel):
+    """Test the FSDP2 constructor with explicit process group parameter."""
+    if not is_torch_min_version("2.4.0"):
+        pytest.skip("FSDP2 is not supported on this version of PyTorch.")
+
+    # Create a dummy model and configs.
+    config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
+    ddp_config = DistributedDataParallelConfig()
+    model = DummyModel(config)
+    model = Float16Module(config, model)
+
+    # Create a custom process group (using the default world for testing)
+    custom_process_group = parallel_state.get_data_parallel_group(with_context_parallel=True) \
+        if xm is None else parallel_state.get_data_parallel_groups(with_context_parallel=True)
+
+    # Create the sharded model with explicit process group
+    fsdp_model = TorchFullyShardedDataParallel(
+        config, ddp_config, model, process_group=custom_process_group
+    )
+
+    # Verify the process group was set correctly
+    assert fsdp_model.process_group is custom_process_group
+
+    # Check that module wrapping still works correctly
+    def _is_fsdp_wrapped_module(instance):
+        return instance.__class__.__name__.startswith("FSDP")
+
+    assert isinstance(fsdp_model, TorchFullyShardedDataParallel)
+    assert _is_fsdp_wrapped_module(fsdp_model.module.module.linear)
+    assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)
     assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)

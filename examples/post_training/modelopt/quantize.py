@@ -6,6 +6,8 @@ import os
 import sys
 import warnings
 
+from megatron.core.device_utils import get_current_device
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
 import modelopt
@@ -240,7 +242,7 @@ if __name__ == "__main__":
             all_references = args.references.split("|")
         for idx, prompt in tqdm(enumerate(all_prompts), disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = eager_generate_no_kv_cache(model, tokens.input_ids.cuda(), 32)
+            generated_ids = eager_generate_no_kv_cache(model, tokens.input_ids.to(device=get_current_device()), 32)
             generated_texts = tokenizer.batch_decode(generated_ids)
             print_rank_0("{}".format(generated_texts))
             if all_references[idx] is not None:
@@ -250,7 +252,7 @@ if __name__ == "__main__":
         dataloader = get_calib_dataloader(args.calib_size)
         for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
-            generated_ids = eager_generate_no_kv_cache(model, tokens.input_ids.cuda(), 1)
+            generated_ids = eager_generate_no_kv_cache(model, tokens.input_ids.to(device=get_current_device()), 1)
 
     unwrapped_model = unwrap_model(model)[0]
 

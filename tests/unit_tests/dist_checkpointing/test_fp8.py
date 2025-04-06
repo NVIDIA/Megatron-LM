@@ -44,7 +44,7 @@ class TestFP8:
         def get_ten(dtype: str = 'fp8'):
             if dtype == 'fp8':
                 return Float8Tensor.to_float8(
-                    torch.full((3,), Utils.rank, dtype=torch.bfloat16, device='cuda')
+                    torch.full((3,), Utils.rank, dtype=torch.bfloat16, device=get_current_device())
                 )
             elif dtype == 'bf16':
                 return torch.full((3,), Utils.rank, dtype=torch.bfloat16, device=get_current_device())
@@ -76,7 +76,7 @@ class TestFP8:
 
         def get_fp8_tensor(fill_val=1):
             return Float8Tensor.to_float8(
-                torch.full((3,), fill_val, dtype=torch.bfloat16, device='cuda')
+                torch.full((3,), fill_val, dtype=torch.bfloat16, device=get_current_device())
             )
 
         def get_state_dict(fill_val=1):

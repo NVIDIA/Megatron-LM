@@ -27,7 +27,7 @@ from megatron.core.transformer.multi_token_prediction import (
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
 xm = get_xla_model()
@@ -322,6 +322,16 @@ class GPTModel(LanguageModule):
             )
         else:
             sequence_len_offset = None
+
+        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
+        # reference held by this caller function, enabling early garbage collection for
+        # inference. Skip wrapping if decoder_input is logged after decoder completion.
+        if (
+            inference_context is not None
+            and not self.training
+            and not has_config_logger_enabled(self.config)
+        ):
+            decoder_input = WrappedTensor(decoder_input)
 
         # Run decoder.
         hidden_states = self.decoder(

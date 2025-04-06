@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from typing import Any, Dict
+import warnings
+from typing import Any, Dict, Optional
 
 import torch
 
@@ -14,17 +15,22 @@ from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper 
 class VLMInferenceWrapper(GPTInferenceWrapper):
     """Inference wrapper for VLMs"""
 
-    def prep_model_for_inference(self, prompts_tokens: torch.Tensor):
+    def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
         """A utility function for preparing model for inference
 
         The function gets called once before the auto regressive inference loop.
         It puts the model in eval mode.
 
         Args:
-            prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_seq_len]
-
+            prompts_tokens (torch.Tensor): Deprecated, will be removed in `megatron-core` 0.13
         """
-        super().prep_model_for_inference(prompts_tokens)
+        if prompts_tokens is not None:
+            warnings.warn(
+                "Passing `prompts_tokens` is deprecated and this argument will be ignored."
+                "This parameter will be removed in `megatron-core` 0.13."
+            )
+
+        super().prep_model_for_inference()
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
         self.model_is_pipeline_parallel = not (
@@ -46,11 +52,6 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # Checks if the current stage only has a vision encoder
         self._encoder_only = (
             parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
-        )
-
-        # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
-        self.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
 
     def prep_inference_input(
@@ -154,6 +155,15 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         return logits
 
     def run_one_forward_step(self, inference_input: Dict[str, Any]) -> torch.Tensor:
+        """The forward pass of the model for inference
+
+        Args:
+            inference_input (Dict[str, Any]): A dict containing the inputs for the VLM model
+
+        Returns:
+            torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size].
+            The logits are returned only in the last pipeline stage for PP models.
+        """
         tokens = inference_input["tokens"]
         num_image_tokens = (tokens == self.model.module.image_token_index).sum().item()
         num_img_embeddings = inference_input["num_img_embeddings"]

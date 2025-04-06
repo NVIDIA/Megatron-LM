@@ -18,6 +18,7 @@ from .tokenization import (
 from .forward_step import ForwardStep
 
 def generate_and_post_process(model,
+                              inference_context,
                               forward_step=ForwardStep,
                               prompts=None,
                               tokens_to_generate=0,
@@ -46,8 +47,10 @@ def generate_and_post_process(model,
     """
 
     # Main inference.
+    inference_context.reset()
     tokens, lengths, output_log_probs, logprobs_topk = generate(
         model,
+        inference_context,
         forward_step=forward_step,
         prompts=prompts,
         tokens_to_generate=tokens_to_generate,
@@ -86,6 +89,7 @@ def generate_and_post_process(model,
     return None
 
 def generate(model,
+             inference_context,
              forward_step=None,
              prompts=None,
              tokens_to_generate=0,
@@ -158,7 +162,7 @@ def generate(model,
     # Main inference function.
     # Note that the outputs are available on the first stage.
     return generate_tokens_probs_and_return_on_first_stage(
-        model, forward_step, context_tokens_tensor, context_length_tensor,
+        model, inference_context, forward_step, context_tokens_tensor, context_length_tensor,
         return_output_log_probs=return_output_log_probs,
         top_k=top_k_sampling,
         top_p=top_p_sampling,

@@ -1,62 +1,50 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-"""Sample Generate"""
+"""Sample Generate Mamba"""
 import os
 import sys
+import torch
 
 from megatron.core.device_utils import get_current_device
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
-import os
-import sys
 from argparse import Namespace
-from contextlib import nullcontext
-from typing import Union
 
+from megatron.core import mpu
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.engines.mcore_engine import MCoreEngine
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-import torch
-
-import megatron
-from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
-from megatron.core.models.gpt import GPTModel
-from megatron.training import get_model
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import import_module
-from megatron.inference.text_generation.mcore_engine_server import (
-    ModelInferenceWrapperServer,
-    run_mcore_engine,
-)
-from megatron.inference.text_generation_server import MegatronServer
-from megatron.training import print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.yaml_arguments import core_transformer_config_from_yaml
-
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
-)
-
-from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer
+from megatron.inference.text_generation import generate_and_post_process
+from megatron.inference.text_generation.mcore_engine_server import ModelInferenceWrapperServer
+from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.core.models.mamba.mamba_model import MambaModel
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training import get_model
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.inference.text_generation_server import MegatronServer
+from megatron.core.transformer import TransformerConfig
 
 
-def model_provider(
-    pre_process=True, post_process=True
-) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+def count_parameters_in_layer(model, layer_name):
+    num_params = 0
+    for name, param in model.named_parameters():
+        if layer_name in name:
+            num_params += param.numel()
+            print_rank_0(f" - {name}: {param.numel()}")
+    return num_params
+
+
+# Taken from pretrain_mamba.py
+def model_provider(pre_process=True, post_process=True) -> MambaModel:
     """Builds the model.
-
-    If you set the use_legacy_models to True, it will return the legacy GPT model and if not the core GPT model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
@@ -64,58 +52,41 @@ def model_provider(
 
 
     Returns:
-        Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
+        MambaModel: The returned model
     """
-
     args = get_args()
-    use_te = args.transformer_impl == "transformer_engine"
 
-    print_rank_0('building GPT model ...')
+    print_rank_0('building Mamba model ...')
+    config = core_transformer_config_from_args(args, TransformerConfig)
 
-    # Experimental loading arguments from yaml
-    if args.yaml_cfg is not None:
-        config = core_transformer_config_from_yaml(args, "language_model")
+    assert args.use_legacy_models == False, "Mamba only supported in Mcore!"
+
+    if args.spec is not None:
+        mamba_stack_spec = import_module(args.spec)
     else:
-        config = core_transformer_config_from_args(args)
+        raise ValueError("You must provide a valid Mamba layer spec!")
 
-    if args.use_legacy_models:
-        model = megatron.legacy.model.GPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=False,
-            pre_process=pre_process,
-            post_process=post_process,
-        )
-    else:
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            if use_te:
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
-                )
-            else:
-                transformer_layer_spec = get_gpt_layer_local_spec(
-                    args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
-                )
+    model = MambaModel(
+        config=config,
+        mamba_stack_spec=mamba_stack_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=pre_process,
+        hybrid_attention_ratio=args.hybrid_attention_ratio,
+        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
+        hybrid_override_pattern=args.hybrid_override_pattern,
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=False,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base,
+    )
 
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
-            pre_process=pre_process,
-            post_process=post_process,
-            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-            parallel_output=False,
-            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-            position_embedding_type=args.position_embedding_type,
-            rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base,
-            rope_scaling=args.use_rope_scaling,
-            rope_scaling_factor=args.rope_scaling_factor,
-        )
-
+    for l in range(model.decoder.num_layers_per_pipeline_rank):
+        layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
+        print_rank_0(f" == params layer {l}: {layer_params}")
     return model
 
 
@@ -145,8 +116,10 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
     )
 
     inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)
-    text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
-    return StaticInferenceEngine(
+    text_generation_controller = TextGenerationController(
+        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
+    )
+    return MCoreEngine(
         text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
     )
 
@@ -190,7 +163,6 @@ if __name__ == "__main__":
         args_defaults={
             'no_load_rng': True,
             'no_load_optim': True,
-            'exit_on_missing_checkpoint': True,
         },
     )
 
@@ -202,13 +174,7 @@ if __name__ == "__main__":
     args.exit_on_missing_checkpoint = True
 
     # Set up model and load checkpoint
-    load_context = nullcontext()
-    if args.fp8:
-        from transformer_engine.pytorch.fp8 import fp8_model_init
-
-        load_context = fp8_model_init()
-    with load_context:
-        model = get_model(model_provider, wrap_with_ddp=False)
+    model = get_model(model_provider, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
@@ -219,12 +185,6 @@ if __name__ == "__main__":
 
     inference_engine = get_inference_engine(args, model)
 
-    if args.enable_cuda_graph:
-        print(f"Running warmup for CUDA graphs...")
-        inference_engine.generate(
-            prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
-        )
-
     if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(inference_engine, args)
         server.run("0.0.0.0", port=args.port)
@@ -234,6 +194,9 @@ if __name__ == "__main__":
         torch.distributed.broadcast(choice, 0)
         if choice.item() == 0:
             try:
-                run_mcore_engine(inference_engine)
+                generate_and_post_process(
+                    inference_engine.text_generation_controller.inference_wrapped_model.model,
+                    inference_engine.text_generation_controller.inference_wrapped_model.inference_context
+                )
             except ValueError as ve:
                 pass

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
 from megatron.core.device_utils import get_xla_model
+import torch
 import torch.nn.functional as F
 
 from megatron.core.enums import Fp8Recipe
@@ -36,11 +37,11 @@ class TransformerConfig(ModelParallelConfig):
     """Weighting factor of Multi-Token Prediction (MTP) loss."""
 
     num_layers_in_first_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on first pipeline stage. 
+    """Number of transformer layers on first pipeline stage.
     None implies equal layer division across PP ranks."""
 
     num_layers_in_last_pipeline_stage: Optional[int] = None
-    """Number of transformer layers on last pipeline stage. 
+    """Number of transformer layers on last pipeline stage.
     None implies equal layer division across PP ranks."""
 
     account_for_embedding_in_pipeline_split: bool = False
@@ -60,7 +61,7 @@ class TransformerConfig(ModelParallelConfig):
     attention_backend: AttnBackend = AttnBackend.auto
     """Attention backend to run. By default we let transformer engine
     decide the best backend to run (except in the case of local).
-    If attention backend is local we use the local pytorch implementation in mcore. 
+    If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
 
     softmax_scale: Optional[float] = None
@@ -177,6 +178,10 @@ class TransformerConfig(ModelParallelConfig):
     """If True, run attention masking and softmax in fp32. This should be True if
     apply_query_key_layer_scaling is True."""
 
+    disable_bf16_reduced_precision_matmul: bool = False
+    """If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to 
+    prevent matmul from using reduced precision accumulation when using BF16."""
+
     ####################
     # fusion
     ####################
@@ -242,6 +247,13 @@ class TransformerConfig(ModelParallelConfig):
     """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
     choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
     uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only"""
+
+    fp8_param: bool = False
+    """If set, keep the parameters in fp8 precision to save memory. This option must be used
+    together with fp8 mode (i.e., TransformerConfig.fp8 is not None). Note that not all parameters
+    will be converted to fp8; for example, biases will remain unchanged. The parameters affected are
+    primarily the weights of GEMMs. The specific parameters that will be converted to fp8 are
+    determined by TE."""
 
     fp8_margin: int = 0
     """Margin for the scaling factor computation."""
@@ -317,7 +329,7 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to route to for each token."""
 
     moe_router_topk_limited_devices: Optional[int] = None
-    """Number of EP ranks to consider for each token in group-limited routing, 
+    """Number of EP ranks to consider for each token in group-limited routing,
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
 
@@ -326,7 +338,7 @@ class TransformerConfig(ModelParallelConfig):
     When using group-limited routing:
     1. Experts are divided into 'moe_router_num_groups' equal-sized groups
     2. For each token, 'moe_router_group_topk' groups are selected based on sum of
-    top-('moe_router_num_groups'/'moe_router_group_topk') routing scores within each group
+    top-('moe_router_topk'/'moe_router_group_topk') routing scores within each group
     3. From these selected groups, 'moe_router_topk' individual experts are chosen
     Two common use cases:
     - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
@@ -345,7 +357,7 @@ class TransformerConfig(ModelParallelConfig):
     By default, softmax is done after top-k."""
 
     moe_router_topk_scaling_factor: Optional[float] = None
-    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax 
+    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
     enabled. Defaults to None, which means no scaling."""
 
     moe_router_score_function: str = "softmax"
@@ -362,9 +374,9 @@ class TransformerConfig(ModelParallelConfig):
     See https://arxiv.org/abs/2408.15664 for details."""
 
     moe_router_bias_update_rate: float = 1e-3
-    """The expert bias is updated based on the number of assigned tokens to each expert 
+    """The expert bias is updated based on the number of assigned tokens to each expert
     in a global batch, where the bias is increased for the experts with less assigned tokens
-    and decreased for the experts with more assigned tokens. 
+    and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
     moe_grouped_gemm: bool = False
@@ -436,7 +448,7 @@ class TransformerConfig(ModelParallelConfig):
     async, and cannot be overlapped.
     "a2a": Like DeepSpeed Ulysses, scatter attention heads across the CP group, and gather to get
     full sequence of QKV.
-    "a2a+p2p": A hierarchical implementation of context parallelism to attention. 
+    "a2a+p2p": A hierarchical implementation of context parallelism to attention.
     It uses A2A communications in low-level CP groups (e.g., via NVLink),
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
@@ -448,15 +460,15 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
 
     cuda_graph_use_single_mempool: bool = False
-    """When set to true, cudagraphs will be captured inside a single mempool, in which all 
-    cudagraphs may only be used once per step. If false, cudagraphs may be reused across 
-    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation, 
-    however may greatly increase the number of cudagraphs created when the number of microbatches 
+    """When set to true, cudagraphs will be captured inside a single mempool, in which all
+    cudagraphs may only be used once per step. If false, cudagraphs may be reused across
+    microbatches. Enabling may reduce cudagraph memory overheads due to memory fragmentation,
+    however may greatly increase the number of cudagraphs created when the number of microbatches
     is high."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
-    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For 
+    This may enable cudagraphs for certain modules that are not completely cudagraph safe. For
     more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
 
     cuda_graph_warmup_steps: int = 3
@@ -542,6 +554,10 @@ class TransformerConfig(ModelParallelConfig):
                 f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'
             )
 
+        # Apply BF16 matmul precision setting if needed
+        if self.bf16 and self.disable_bf16_reduced_precision_matmul:
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(
                 f"num_attention_heads ({self.num_attention_heads}) must be a multiple of "
@@ -593,6 +609,12 @@ class TransformerConfig(ModelParallelConfig):
                         f"between 0 and number of layers per pipeline stage "
                         f"({max_bf16_layers_per_pipeline_stage})."
                     )
+
+            if self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param:
+                raise ValueError("MXFP8 currently does not support fp8_param.")
+
+        if self.fp8_param and not self.fp8:
+            raise ValueError("fp8_param must be used together with fp8 mode.")
 
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True

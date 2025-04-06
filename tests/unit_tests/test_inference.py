@@ -7,10 +7,38 @@ import torch
 
 from megatron.inference.text_generation_server import MegatronServer
 from megatron.training import tokenizer
+from tests.unit_tests.inference.engines.test_static_engine import TestStaticInferenceEngine
 from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
 
 logitsT = torch.Tensor
+
+
+@pytest.fixture
+def static_inference_engine(gpt2_tiktoken_tokenizer):
+    engine = TestStaticInferenceEngine()
+
+    # Initialize engine with given tokenizer
+    engine.setup_engine()
+    engine.static_engine.text_generation_controller.tokenizer = gpt2_tiktoken_tokenizer
+
+    # Mock model forward to comply with test expectations
+    original_forward = (
+        engine.static_engine.text_generation_controller.inference_wrapped_model.model.forward
+    )
+
+    def mocked_forward(*args, **kwargs):
+        output = original_forward(*args, **kwargs)
+        output[:, :, :] = 0
+        output[:, :-1, torch.arange(output.shape[1] - 1)] = 100
+        output[:, -1, gpt2_tiktoken_tokenizer.eos] = 100
+        return output
+
+    engine.static_engine.text_generation_controller.inference_wrapped_model.model.forward = (
+        mocked_forward
+    )
+
+    yield engine.static_engine
 
 
 @pytest.fixture
@@ -35,8 +63,8 @@ def forward_step_wrapper(gpt2_tiktoken_tokenizer):
 
 
 @pytest.fixture
-def app():
-    server = MegatronServer(None)
+def app(static_inference_engine):
+    server = MegatronServer(static_inference_engine)
     return server.app
 
 

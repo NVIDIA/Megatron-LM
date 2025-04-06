@@ -118,7 +118,7 @@ def score_and_return_on_first_stage(model, tokens: torch.Tensor, lengths: torch.
     return tokens, lengths, output_log_probs, logprobs_topk
 
 def generate_tokens_probs_and_return_on_first_stage(
-        model, forward_step, tokens, lengths,
+        model, inference_context, forward_step, tokens, lengths,
         return_output_log_probs=False,
         top_k=0, top_p=0.0, top_p_decay=0.0, top_p_bound=0.0,
         temperature=1.0,
@@ -172,7 +172,6 @@ def generate_tokens_probs_and_return_on_first_stage(
         raise ValueError("Too many tokens.  " + str(max_sequence_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
 
     # forward step.
-    inference_context = StaticInferenceContext(batch_size, args.inference_max_seq_length)
     forward_step = forward_step(model, inference_context)
 
     # Added termination_id to support the case that we want to terminate the

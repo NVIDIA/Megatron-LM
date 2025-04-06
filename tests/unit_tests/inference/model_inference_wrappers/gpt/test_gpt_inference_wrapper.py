@@ -71,9 +71,13 @@ class TestGPTInferenceWrapper:
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_inference_pipeline_parallel_small_size(self, materialize_only_last_token_logits):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
-        
-        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
+
+        batch_prompt_tokens = (
+            torch.randint(low=0, high=self.vocab_size, size=(self.batch_size, self.sequence_length))
+            .int()
+            .to(device=get_current_device())
+        )
+        self.inference_wrapped_model.prep_model_for_inference()
         self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
@@ -103,9 +107,13 @@ class TestGPTInferenceWrapper:
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_inference_pipeline_parallel_large_size(self, materialize_only_last_token_logits):
         self.setup_model(tensor_parallel_size=2, pipeline_parallel_size=2)
-        
-        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
+
+        batch_prompt_tokens = (
+            torch.randint(low=0, high=self.vocab_size, size=(self.batch_size, self.sequence_length))
+            .int()
+            .to(device=get_current_device())
+        )
+        self.inference_wrapped_model.prep_model_for_inference()
         self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )
@@ -134,9 +142,13 @@ class TestGPTInferenceWrapper:
     @pytest.mark.parametrize("materialize_only_last_token_logits", [True, False])
     def test_inference_only_tensor_parallel(self, materialize_only_last_token_logits):
         self.setup_model(tensor_parallel_size=4, pipeline_parallel_size=1)
-    
-        batch_prompt_tokens = torch.randint(low = 0, high = self.vocab_size, size=(self.batch_size, self.sequence_length)).int().to(device=get_current_device())
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
+
+        batch_prompt_tokens = (
+            torch.randint(low=0, high=self.vocab_size, size=(self.batch_size, self.sequence_length))
+            .int()
+            .to(device=get_current_device())
+        )
+        self.inference_wrapped_model.prep_model_for_inference()
         self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = (
             materialize_only_last_token_logits
         )

@@ -324,7 +324,7 @@ class TestLocalCheckpointing:
                     )
                     if async_save:
                         maybe_finalize_async_save(True)
-                        torch.distributed.barrier(group=get_default_process_group())
+                    torch.distributed.barrier(group=get_default_process_group())
                 iteration, _ = load_checkpoint(
                     model,
                     optimizer,
@@ -332,6 +332,7 @@ class TestLocalCheckpointing:
                     checkpointing_context=checkpointing_context,
                 )
                 assert iteration == 0
+                time.sleep(1)
                 assert not any((local_ckpt_dir / str(Utils.rank)).iterdir())
 
             if Utils.rank == 1:

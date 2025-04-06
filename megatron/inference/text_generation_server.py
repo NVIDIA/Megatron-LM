@@ -210,7 +210,7 @@ class MegatronServer(object):
         self.app = Flask(__name__, static_url_path='')
         api = Api(self.app)
         api.add_resource(MegatronGenerate, '/api', resource_class_args=[model, args])
-        api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model])
+        api.add_resource(MegatronCompletions, '/completions', resource_class_args=[model, args])
 
     def run(self, url, port):
         self.app.run(url, threaded=True, debug=False, port=port)

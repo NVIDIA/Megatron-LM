@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -113,7 +113,10 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
         ), f"num_layers: actual: {num_layers} config: {config.num_layers} is not divisible by pipeline_model_parallel_size: {config.pipeline_model_parallel_size}"
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
-    if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+    if (
+        parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+        and config.pipeline_model_parallel_size > 1
+    ):
         # Interleaved pipeline parallelism:
         # Number of layers in each model chunk is the number of layers in the stage,
         # divided by the number of model chunks in a stage.
@@ -129,7 +132,8 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
 
         assert (
             num_layers_per_pipeline_rank % vp_size == 0
-        ), "num_layers_per_pipeline_rank should be divisible by vp_size"
+        ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
+            should be divisible by vp_size {vp_size}"
         num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
 
         num_layers_to_build = num_layers_per_virtual_rank
@@ -265,7 +269,10 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            return build_module(layer_spec, config=self.config, layer_number=layer_number)
+            fp8_init_context = get_fp8_context(self.config, layer_number - 1, is_init=True)
+            with fp8_init_context:
+                module = build_module(layer_spec, config=self.config, layer_number=layer_number)
+            return module
 
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(
@@ -397,7 +404,7 @@ class TransformerBlock(MegatronModule):
 
     def forward(
         self,
-        hidden_states: Tensor,
+        hidden_states: Union[Tensor, WrappedTensor],
         attention_mask: Optional[Tensor],
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
@@ -418,8 +425,10 @@ class TransformerBlock(MegatronModule):
         self-attention, optional cross-attention, and feed-forward operations.
 
         Args:
-            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is the
-                sequence length, b is the batch size, and h is the hidden size.
+            hidden_states (Union[Tensor, WrappedTensor]): Input tensor of shape [s, b, h]
+                where s is the sequence length, b is the batch size, and h is the hidden size.
+                Can be passed as a WrappedTensor during inference to avoid an obsolete
+                reference in the calling function.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
             context (Tensor, optional): Context tensor for cross-attention.
@@ -439,6 +448,10 @@ class TransformerBlock(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        # Delete the obsolete reference to the initial input tensor if necessary
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
 
         if not self.pre_process:
             # See set_input_tensor()

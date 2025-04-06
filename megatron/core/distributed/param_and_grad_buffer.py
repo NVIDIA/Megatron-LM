@@ -14,7 +14,7 @@ from torch.distributed import _coalescing_manager
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor
+from ..fp8_utils import is_float8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
@@ -645,18 +645,18 @@ class _ParamAndGradBuffer:
 
             # Assign param.data to appropriate segment of self.param_data.
             if self.param_data is not None:
-                old_param_data = param.data
                 new_param_data = self._get(
                     param.data.shape, param_start_index, buffer_type=BufferType.PARAM
                 )
                 if is_float8tensor(param):
-                    param._data = new_param_data
+                    modify_underlying_storage(param, new_param_data)
                 else:
+                    old_param_data = param.data
                     param.data = new_param_data
-                assert old_param_data._base is None
-                # Copy tensor values (from initialization or checkpoint).
-                param.data.detach().copy_(old_param_data)
-                del old_param_data
+                    assert old_param_data._base is None
+                    # Copy tensor values (from initialization or checkpoint).
+                    param.data.detach().copy_(old_param_data)
+                    del old_param_data
 
             param.main_grad = self._get(
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD

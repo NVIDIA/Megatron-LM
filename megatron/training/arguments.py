@@ -377,8 +377,11 @@ def validate_args(args, defaults={}):
         if args.num_virtual_stages_per_pipeline_rank is None:
             assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
                 'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
-            num_layers = args.num_layers
-
+            if args.num_layers is not None:
+                num_layers = args.num_layers
+            else:
+                num_layers = args.decoder_num_layers
+            
             if args.account_for_embedding_in_pipeline_split:
                 num_layers += 1
 
@@ -497,7 +500,7 @@ def validate_args(args, defaults={}):
         if args.data_parallel_sharding_strategy == "optim_grads_params":
             assert args.check_weight_hash_across_dp_replicas_interval is None, \
                 'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
-        
+
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
@@ -980,6 +983,7 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['rotary_interleaved'] = args.rotary_interleaved
     kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
+    kw_args['fp8_param'] = args.fp8_param_gather
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -1273,12 +1277,12 @@ def _add_network_size_args(parser):
                        help='Number of Multi-Token Prediction (MTP) Layers.'
                        'MTP extends the prediction scope to multiple future tokens at each position.'
                        'This MTP implementation sequentially predict additional tokens '
-                       'by using D sequential modules to predict D additional tokens.')                       
+                       'by using D sequential modules to predict D additional tokens.')
     group.add_argument('--mtp-loss-scaling-factor', type=float, default=0.1,
                        help='Scaling factor of Multi-Token Prediction (MTP) loss. '
                        'We compute the average of the MTP losses across all depths, '
-                       'and multiply it the scaling factor to obtain the overall MTP loss, ' 
-                       'which serves as an additional training objective.')    
+                       'and multiply it the scaling factor to obtain the overall MTP loss, '
+                       'which serves as an additional training objective.')
     return parser
 
 
@@ -1969,6 +1973,9 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--fp16-lm-cross-entropy', action='store_true',
                        help='Move the cross entropy unreduced loss calculation'
                        'for lm head to fp16.')
+    group.add_argument('--disable-bf16-reduced-precision-matmul', action='store_true',
+                       help='If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to '
+                       'prevent matmul from using reduced precision accumulation when using BF16.')
 
     return parser
 
@@ -2434,8 +2441,8 @@ def _add_moe_args(parser):
                        choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
-    group.add_argument('--moe-router-dtype', type=str, 
-                       choices=['fp32', 'fp64'], 
+    group.add_argument('--moe-router-dtype', type=str,
+                       choices=['fp32', 'fp64'],
                        default=None,
                        help='Data type for routing computation and expert output weighted averaging. '
                             'Fp32/fp64 enhances numerical stability, especially with numerous experts. '

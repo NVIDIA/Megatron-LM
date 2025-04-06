@@ -716,10 +716,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
-                kwargs.get('inference_context') is not None
-                and kwargs['inference_context'].is_decode_only()
-                or kwargs.get('inference_params') is not None
-                and kwargs['inference_params'].is_decode_only()
+                (
+                    kwargs.get('inference_context') is not None
+                    and kwargs['inference_context'].is_decode_only()
+                )
+                or (
+                    kwargs.get('inference_params') is not None
+                    and kwargs['inference_params'].is_decode_only()
+                )
             )
         ):
             assert (

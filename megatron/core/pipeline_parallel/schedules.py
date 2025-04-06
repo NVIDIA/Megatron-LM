@@ -316,7 +316,10 @@ def forward_step(
             else torch.ones(1, device=output_tensor.device)
         )
         # Set the loss scale
-        MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+        if config.calculate_per_token_loss:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
@@ -487,7 +490,7 @@ def forward_backward_no_pipelining(
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                 current_microbatch=i,
             )
-            total_num_tokens += num_tokens.item()
+            total_num_tokens += num_tokens
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
@@ -507,7 +510,7 @@ def forward_backward_no_pipelining(
         ),
         current_microbatch=num_microbatches - 1,
     )
-    total_num_tokens += num_tokens.item()
+    total_num_tokens += num_tokens
 
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
@@ -795,18 +798,29 @@ def forward_backward_pipelining_with_interleaving(
         raise RuntimeError(msg)
 
     model_type = get_model_type(model[0])
+
     if model_type == ModelType.encoder_and_decoder:
-        raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
-
-    if decoder_seq_length is not None and decoder_seq_length != seq_length:
-        raise RuntimeError(
-            "Interleaving is not supported with a different decoder sequence length."
+        xattn_needed = get_model_xattn(model)
+        assert (
+            not xattn_needed
+        ), "Interleaving is not supported when xattn is required between encoder and decoder"
+        tensor_shape = get_tensor_shapes(
+            rank=parallel_state.get_pipeline_model_parallel_rank(),
+            model_type=model_type,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            config=config,
+            encoder_decoder_xattn=xattn_needed,
         )
-
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
-    tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
-    if config.sequence_parallel:
-        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+        tensor_shape = list(tensor_shape[0])
+    else:
+        tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+        tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
+        if config.sequence_parallel:
+            tensor_shape[0] = (
+                tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+            )
 
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
@@ -1009,7 +1023,7 @@ def forward_backward_pipelining_with_interleaving(
         output_tensors[model_chunk_id].append(output_tensor)
 
         nonlocal total_num_tokens
-        total_num_tokens += num_tokens.item()
+        total_num_tokens += num_tokens
 
         # If forward-only, no need to save tensors for a backward pass.
         if forward_only:
@@ -1846,7 +1860,7 @@ def forward_backward_pipelining_without_interleaving(
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
         send_forward(output_tensor, send_tensor_shapes, config)
-        total_num_tokens += num_tokens.item()
+        total_num_tokens += num_tokens
 
         if not forward_only:
             input_tensors.append(input_tensor)
@@ -1887,7 +1901,7 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i + num_warmup_microbatches,
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
-        total_num_tokens += num_tokens.item()
+        total_num_tokens += num_tokens
 
         if forward_only:
             send_forward(output_tensor, send_tensor_shapes, config)

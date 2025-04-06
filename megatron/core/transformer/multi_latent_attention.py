@@ -251,6 +251,7 @@ class MLASelfAttention(MultiLatentAttention):
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             attention_type="self",
+            cp_comm_type=cp_comm_type,
         )
 
         if self.config.q_lora_rank is None:
