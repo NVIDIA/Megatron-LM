@@ -10,6 +10,7 @@ from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.mamba import MambaModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
@@ -116,10 +117,16 @@ class LLaVAModel(MegatronModule):
         language_rotary_base: int = 10000,
         language_rope_scaling: bool = False,
         language_rope_scaling_factor: float = 8.0,
+        hybrid_attention_ratio: float = 1.0,
+        hybrid_mlp_ratio: float = 1.0,
+        hybrid_override_pattern: str = None,
+        fp16_lm_cross_entropy: bool = False,
         image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
         pixel_shuffle: bool = False,
         tile_tags: Optional[list] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        max_num_tiles: int = 0,
+        tokenizer_type: str = "",
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -142,15 +149,16 @@ class LLaVAModel(MegatronModule):
         self.vision_projection = None
         self.language_model = None
 
+        language_model_type = getattr(language_transformer_config, "language_model_type", "")
         self.sequence_parallel_lm = language_transformer_config.sequence_parallel
         self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
         self.context_parallel_lm = language_transformer_config.context_parallel_size
         if self.sequence_parallel_lm or self.context_parallel_lm > 1:
-            assert (
-                language_transformer_layer_spec.submodules.self_attention.submodules.core_attention
-                == TEDotProductAttention
-                and HAVE_TE
-            ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
+            if not language_model_type.startswith('nemotron5-hybrid'):
+                attn_module = language_transformer_layer_spec.submodules.self_attention
+                assert (
+                    attn_module.submodules.core_attention == TEDotProductAttention and HAVE_TE
+                ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
             if self.context_parallel_lm > 1:
                 self.cp_group = get_context_parallel_group() if cp_group is None else cp_group
                 assert (
@@ -166,12 +174,32 @@ class LLaVAModel(MegatronModule):
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+
         if self.add_decoder:
             if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
                 from megatron.core.models.huggingface.module import build_hf_model
 
                 self.language_model = build_hf_model(
                     language_transformer_config, language_transformer_config.language_model_type
+                )
+                self.language_model = build_hf_model(language_transformer_config)
+            elif language_model_type.startswith('nemotron5-hybrid'):
+                self.language_model = MambaModel(
+                    config=language_transformer_config,
+                    mamba_stack_spec=language_transformer_layer_spec,
+                    vocab_size=language_vocab_size,
+                    max_sequence_length=language_max_sequence_length,
+                    parallel_output=parallel_output,
+                    position_embedding_type=language_position_embedding_type,
+                    pre_process=self.pre_process,
+                    hybrid_attention_ratio=hybrid_attention_ratio,
+                    hybrid_mlp_ratio=hybrid_mlp_ratio,
+                    hybrid_override_pattern=hybrid_override_pattern,
+                    post_process=self.post_process,
+                    rotary_percent=language_rotary_percent,
+                    rotary_base=language_rotary_base,
+                    fp16_lm_cross_entropy=fp16_lm_cross_entropy,
+                    scatter_embedding_sequence_parallel=False,
                 )
             else:
                 self.language_model = GPTModel(
@@ -321,11 +349,14 @@ class LLaVAModel(MegatronModule):
             class_token_len,
             pixel_shuffle,
             tile_tags is not None,  # Tile tags enabled/disabled.
+            max_num_tiles,
+            tokenizer_type,
         )
 
         self.image_token_index = image_token_index
         self._pixel_shuffle = pixel_shuffle
         self._tile_tags = tile_tags
+        self._max_num_tiles = max_num_tiles
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -876,16 +907,27 @@ class LLaVAModel(MegatronModule):
                 )
             )
 
-        output = self.language_model(
-            input_ids=None,
-            position_ids=None,
-            attention_mask=attention_mask,
-            decoder_input=combined_embeddings,
-            labels=new_labels,
-            inference_context=inference_context,
-            runtime_gather_output=runtime_gather_output,
-            packed_seq_params=packed_seq_params,
-        )
+        if isinstance(self.language_model, MambaModel):
+            output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                attention_mask=attention_mask,
+                decoder_input=combined_embeddings,
+                labels=new_labels,
+                inference_context=inference_context,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                attention_mask=attention_mask,
+                decoder_input=combined_embeddings,
+                labels=new_labels,
+                inference_context=inference_context,
+                runtime_gather_output=runtime_gather_output,
+                packed_seq_params=packed_seq_params,
+            )
 
         return output, new_loss_mask
 

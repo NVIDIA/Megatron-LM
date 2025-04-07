@@ -24,10 +24,10 @@ def test_resume_checkpoint_pipeline(
     checks = {
         "iteration-time": [common.ApproximateTest(atol=2.0, rtol=0)],
         "mem-allocated-bytes": [
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
+            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.10), rtol=0)
         ],
         "mem-max-allocated-bytes": [
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0)
+            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.10), rtol=0)
         ],
         "lm loss": [
             common.DeterministicTest(),

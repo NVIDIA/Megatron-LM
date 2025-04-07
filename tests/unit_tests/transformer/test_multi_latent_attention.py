@@ -142,6 +142,52 @@ class TestParallelMLAAttention:
             output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
 
             assert config.recompute_granularity == 'selective'
+            assert "core_attn" in config.recompute_modules
+            assert output.shape[0] == sequence_length
+            assert output.shape[1] == micro_batch_size
+            assert output.shape[2] == config.hidden_size
+            assert bias.shape[0] == config.hidden_size
+
+    def test_up_proj_recomputed_gpu_forward(self):
+        if is_te_min_version("1.10.0"):
+            transformer_config = self.transformer_config
+            transformer_config.recompute_granularity = 'selective'
+            transformer_config.recompute_modules = ["mla_up_proj"]
+            checkpointed_parallel_attention = MLASelfAttention(
+                transformer_config,
+                get_gpt_layer_with_transformer_engine_spec(
+                    multi_latent_attention=True
+                ).submodules.self_attention.submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            config = checkpointed_parallel_attention.config
+
+            sequence_length = 32
+            micro_batch_size = 2
+
+            checkpointed_parallel_attention.to(device=get_current_device())
+
+            # [sequence length, batch size, hidden size]
+            hidden_states = torch.ones(
+                (
+                    sequence_length,
+                    micro_batch_size,
+                    checkpointed_parallel_attention.config.hidden_size,
+                )
+            )
+            hidden_states = hidden_states.to(device=get_current_device())
+
+            q, k, v = checkpointed_parallel_attention.get_query_key_value_tensors(hidden_states)
+            assert q.is_contiguous()
+            assert k.is_contiguous()
+            assert v.is_contiguous()
+
+            attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
+
+            output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
+
+            assert checkpointed_parallel_attention.recompute_up_proj == True
             assert output.shape[0] == sequence_length
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size

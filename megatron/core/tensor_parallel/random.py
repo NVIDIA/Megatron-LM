@@ -182,7 +182,7 @@ def initialize_rng_tracker(
 
     if inference_rng_tracker:
 
-        class InferenceDeviceRNGStatesTracker(base_tracker):
+        class InferenceDeviceRNGStatesTracker(base_tracker): # type: ignore[valid-type, misc]
             """RNG tracker for inference."""
 
             def add(self, name, seed):
@@ -277,6 +277,33 @@ def model_parallel_device_manual_seed(
     _DEVICE_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 
+def _get_all_rng_states():
+    """Get all the rng states."""
+    cpu_rng_state = torch.get_rng_state()
+    device_rng_state = get_current_rng_state()
+    device_rng_state_tracker = get_device_rng_tracker().get_states()
+    return cpu_rng_state, device_rng_state, device_rng_state_tracker
+
+
+def _set_all_rng_states(cpu_rng_state, device_rng_state, device_rng_state_tracker):
+    """Set all the rng states."""
+    torch.set_rng_state(cpu_rng_state)
+    set_current_rng_state(device_rng_state)
+    get_device_rng_tracker().set_states(device_rng_state_tracker)
+
+
+@contextlib.contextmanager
+def _fork_rng():
+    """Fork the rng state."""
+    # Store the current states.
+    current_states = _get_all_rng_states()
+    try:
+        yield
+    finally:
+        # Set the states back to what it was at the start of this function.
+        _set_all_rng_states(*current_states)
+
+
 class CheckpointFunction(torch.autograd.Function):
     """Checkpoint Function
 
@@ -293,9 +320,7 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.distribute_saved_activations = distribute_saved_activations
 
         # Copy the rng states.
-        ctx.fwd_cpu_rng_state = torch.get_rng_state()
-        ctx.fwd_device_rng_state = get_current_rng_state()
-        ctx.fwd_device_rng_state_tracker = get_device_rng_tracker().get_states()
+        ctx.rng_states = _get_all_rng_states()
 
         with torch.no_grad():
             outputs = run_function(*args)
@@ -333,25 +358,14 @@ class CheckpointFunction(torch.autograd.Function):
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)
             )
 
-        # Store the current states.
-        bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_device_rng_state = get_current_rng_state()
-        bwd_device_rng_state_tracker = get_device_rng_tracker().get_states()
+        with _fork_rng():
+            # Set the states to what it used to be before the forward pass.
+            _set_all_rng_states(*ctx.rng_states)
 
-        # Set the states to what it used to be before the forward pass.
-        torch.set_rng_state(ctx.fwd_cpu_rng_state)
-        set_current_rng_state(ctx.fwd_device_rng_state)
-        get_device_rng_tracker().set_states(ctx.fwd_device_rng_state_tracker)
-
-        # Compute the forward pass.
-        detached_inputs = detach_variable(inputs)
-        with torch.enable_grad():
-            outputs = ctx.run_function(*detached_inputs)
-
-        # Set the states back to what it was at the start of this function.
-        torch.set_rng_state(bwd_cpu_rng_state)
-        set_current_rng_state(bwd_device_rng_state)
-        get_device_rng_tracker().set_states(bwd_device_rng_state_tracker)
+            # Compute the forward pass.
+            detached_inputs = detach_variable(inputs)
+            with torch.enable_grad():
+                outputs = ctx.run_function(*detached_inputs)
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
@@ -369,3 +383,115 @@ def checkpoint(function, distribute_saved_activations, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
+
+
+class CheckpointWithoutOutputFunction(torch.autograd.Function):
+    """
+    Checkpoint Function Helper for CheckpointWithouOutput.
+    Save context for recompute.
+    """
+
+    @staticmethod
+    def forward(ctx, run_function, checkpoint_without_output_obj, *args):
+        """Forward pass."""
+        with torch.no_grad():
+            outputs = run_function(*args)
+        ctx.save_for_backward(*detach_variable(args))
+        # the CheckpointWithoutOutput object is passed in, then it can access the saved input
+        # tensors later for recomputation
+        checkpoint_without_output_obj.ctx = ctx
+        return outputs
+
+    @staticmethod
+    def backward(ctx, *args):
+        """Backward pass."""
+        inputs = ctx.saved_tensors
+        outputs = ctx.outputs
+        torch.autograd.backward(outputs, args)
+        ctx.outputs = None
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in inputs)
+        return (None, None) + grads
+
+
+class CheckpointWithoutOutput(object):
+    """
+    Checkpoint a model or part of the model and release the output.
+
+    For the normal 'checkpoint` function, the outputs of it may be cached by the following
+    operations for its backward computation. However, the output of the checkpointed function is
+    re-generated at recomputation, so the output store is not technically needed. This method can
+    manually discard the output in the forward pass and restore it by recomputation in the
+    backward pass to reduce the memory usage.
+    """
+
+    def __init__(self):
+        self.run_function = None
+        self.fwd_cpu_rng_state = None
+        self.fwd_cuda_rng_state = None
+        self.fwd_cuda_rng_state_tracker = None
+        self.ctx = None
+        self.outputs = None
+
+    def checkpoint(self, run_function, *args):
+        """Checkpoint function."""
+        self.run_function = run_function
+
+        self.rng_states = _get_all_rng_states()
+
+        outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
+        self.outputs = outputs
+        if isinstance(self.outputs, torch.Tensor):
+            self.outputs = (self.outputs,)
+        return outputs
+
+    def _recompute(self, _):
+        """Used as a hook to recompute the output."""
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), "
+                "please use .backward() if possible"
+            )
+
+        with _fork_rng():
+            _set_all_rng_states(*self.rng_states)
+
+            with torch.enable_grad():
+                outputs = self.run_function(*self.ctx.saved_tensors)
+
+        self.run_function = None
+        self.rng_states = None
+
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
+
+        # restore the recomputed memory without changing the metadata
+        with torch.no_grad():
+            for output, recomputation_output in zip(self.outputs, outputs):
+                output_size = recomputation_output.untyped_storage().size()
+                output.untyped_storage().resize_(output_size)
+                output.untyped_storage().copy_(recomputation_output.untyped_storage())
+
+        self.ctx.outputs = outputs
+        self.outputs = None
+        self.ctx = None
+
+    def discard_output_and_register_recompute(self, hook_tensor):
+        """
+        Release the output tensor storages and register the recompute function as a grad hook of
+        the hook_tensor.
+
+        Note: the caller should make sure that the output tensors are no longer used
+        in the forward pass and the gradient of the hook_tensor is computed before the recomputed
+        tensors are used.
+        """
+        # use resize to release the output tensor memory and still keep the metadata in the tensors.
+        # the metadata is still needed for backward
+        for output in self.outputs:
+            output.untyped_storage().resize_(0)
+
+        # register the recomputation as a backward hook, when the the gradient of the hook_tensor
+        # is computed, the recomputation will be triggered. The hook_tensor should be selected
+        # carefully to ensure that the tensors are recomputed before it is used by other backward
+        # computations.
+        if hook_tensor.requires_grad:
+            hook_tensor.register_hook(self._recompute)

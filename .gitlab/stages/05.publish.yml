@@ -39,7 +39,7 @@ publish:test_release_pypi_build_wheel:
     - purpose/builder-small
     - team/megatron
   variables:
-    PY_ENV: pytorch_24.10
+    PY_ENV: pytorch_25.03
     KUBERNETES_SERVICE_MEMORY_REQUEST: 16Gi
     KUBERNETES_SERVICE_MEMORY_LIMIT: 16Gi
     PUBLISH_DRYRUN: "yes"

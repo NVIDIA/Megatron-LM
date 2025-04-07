@@ -1,15 +1,29 @@
 # syntax=docker/dockerfile:1.3-labs
 
 ARG FROM_IMAGE_NAME
-FROM $FROM_IMAGE_NAME as build_causal_conv1d
-WORKDIR /opt
-RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/Dao-AILab/causal-conv1d.git@v1.2.2.post1
+FROM ${FROM_IMAGE_NAME} as mcore_image
+ENV PIP_CONSTRAINT="" 
+RUN pip3 install -U pip
 
-FROM $FROM_IMAGE_NAME as build_grouped_gemm
+FROM mcore_image as build_te
+ARG TE_COMMIT=bee4649c15a79ffcb9689ca7c0c963f5febaa28a
 WORKDIR /opt
-RUN pip3 wheel -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
+RUN git clone https://github.com/NVIDIA/TransformerEngine.git && \
+    cd TransformerEngine && \
+    git fetch origin ${TE_COMMIT} && \ 
+    git checkout ${TE_COMMIT} && \
+    git submodule init && git submodule update && \
+    pip3 wheel --no-cache-dir -v .
 
-FROM ${FROM_IMAGE_NAME} as build_experimental_flash_attention
+FROM mcore_image as build_causal_conv1d
+WORKDIR /opt
+RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE pip3 wheel --no-cache-dir -v git+https://github.com/Dao-AILab/causal-conv1d.git@v1.2.2.post1
+
+FROM mcore_image as build_grouped_gemm
+WORKDIR /opt
+RUN pip3 wheel --no-cache-dir -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
+
+FROM mcore_image as build_experimental_flash_attention
 WORKDIR /opt
 ARG EXPERIMENTAL_FLASH_ATTN_VERSION=c0f04c0b6c747914d95205867d86dd19c027d01d
 RUN --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN \
@@ -19,15 +33,15 @@ RUN --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN \
     MAX_JOBS=4 pip wheel --no-cache-dir -v $EXPERIMENTAL_FLASH_ATTN@${EXPERIMENTAL_FLASH_ATTN_VERSION} && \
     ls -al
 
-FROM $FROM_IMAGE_NAME as build_mamba_ssm
+FROM mcore_image as build_mamba_ssm
 WORKDIR /opt
 RUN git clone https://github.com/state-spaces/mamba.git && \
     cd mamba && \
     git checkout v2.2.0 && \
     sed -i "/triton/d" setup.py && \
-    MAMBA_FORCE_BUILD=TRUE pip3 wheel -v .
+    MAMBA_FORCE_BUILD=TRUE pip3 wheel --no-cache-dir -v .
 
-FROM $FROM_IMAGE_NAME as main
+FROM mcore_image as main
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
@@ -40,6 +54,7 @@ RUN apt-get update && \
 COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
 COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
 COPY --from=build_mamba_ssm /opt/mamba/mamba_ssm-*.whl ./
+COPY --from=build_te /opt/TransformerEngine/transformer_engine-*.whl ./
 
 RUN \
     --mount=type=bind,source=requirements,target=requirements \
@@ -52,8 +67,8 @@ RUN \
     --mount=type=bind,source=requirements_ci.txt,target=requirements_ci.txt \
     --mount=type=bind,source=megatron/core/__init__.py,target=megatron/core/__init__.py <<"EOF" bash -ex
 pip install -U pip
-pip install --no-cache-dir causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl
-PY_ENV=pytorch_24.10 pip install --no-cache-dir . -r requirements_mlm.txt -r requirements_ci.txt
+pip install --no-cache-dir causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl transformer_engine*.whl
+PY_ENV=pytorch_25.03 pip install --no-cache-dir . -r requirements_mlm.txt -r requirements_ci.txt
 EOF
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
@@ -82,7 +97,7 @@ EOF
 
 RUN <<"EOF" bash -ex
 pip install -U pip
-PY_ENV=pytorch_24.10 pip install --no-cache-dir -e /opt/megatron-lm
+PY_ENV=pytorch_25.03 pip install --no-cache-dir -e /opt/megatron-lm
 EOF
 
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"

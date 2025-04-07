@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
@@ -14,6 +14,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
+    MoETokenDispatcher,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -34,7 +35,7 @@ class BaseMoELayer(MegatronModule, ABC):
         config (TransformerConfig): Configuration object for the transformer model.
     """
 
-    def __init__(self, config: TransformerConfig, layer_number: int = None):
+    def __init__(self, config: TransformerConfig, layer_number: Optional[int] = None):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.expert_parallel_size = parallel_state.get_expert_model_parallel_world_size()
@@ -53,10 +54,10 @@ class BaseMoELayer(MegatronModule, ABC):
             local_expert_indices_offset + i for i in range(self.num_local_experts)
         ]
         assert all(map(lambda x: x < self.config.num_moe_experts, self.local_expert_indices))
-        self.router = None
+        self.router: TopKRouter = None
         self.experts = None
         self.shared_experts = None
-        self.token_dispatcher = None
+        self.token_dispatcher: Optional[MoETokenDispatcher] = None
         self.layer_number = layer_number
 
     @abstractmethod
@@ -78,11 +79,16 @@ class MoELayer(BaseMoELayer):
     """
 
     def __init__(
-        self, config: TransformerConfig, submodules: MoESubmodules = None, layer_number: int = None
+        self,
+        config: TransformerConfig,
+        submodules: Optional[MoESubmodules] = None,
+        layer_number: Optional[int] = None,
     ):
         self.submodules = submodules
         super(MoELayer, self).__init__(config=config, layer_number=layer_number)
-        self.moe_layer_recompute = config.moe_layer_recompute
+        self.moe_layer_recompute = (
+            config.recompute_granularity == 'selective' and "moe" in config.recompute_modules
+        )
 
         # Initialize router
         self.router = TopKRouter(config=self.config)

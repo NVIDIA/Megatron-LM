@@ -140,7 +140,10 @@ class Attention(MegatronModule, ABC):
             softmax_scale=self.config.softmax_scale,
         )
 
-        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = (
+            self.config.recompute_granularity == 'selective'
+            and "core_attn" in self.config.recompute_modules
+        )
 
         # Output.
         self.linear_proj = build_module(

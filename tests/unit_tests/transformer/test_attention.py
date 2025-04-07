@@ -112,6 +112,7 @@ class TestParallelAttention:
         output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
 
         assert config.recompute_granularity == 'selective'
+        assert "core_attn" in config.recompute_modules
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size

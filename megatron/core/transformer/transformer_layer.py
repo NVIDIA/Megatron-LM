@@ -9,8 +9,8 @@ import torch
 import torch.distributed
 from torch import Tensor
 
-from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -247,7 +247,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
-        hidden_dropout: float = None,
+        hidden_dropout: Optional[float] = None,
     ):
         super().__init__(config=config)
 
@@ -343,6 +343,21 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
+        self.recompute_input_layernorm = False
+        self.recompute_pre_mlp_layernorm = False
+        self.recompute_mlp = False
+        if self.config.recompute_granularity == 'selective':
+            if "layernorm" in self.config.recompute_modules:
+                if not isinstance(self.input_layernorm, IdentityOp):
+                    self.recompute_input_layernorm = True
+                if not isinstance(self.pre_mlp_layernorm, IdentityOp):
+                    self.recompute_pre_mlp_layernorm = True
+            if "mlp" in self.config.recompute_modules:
+                from megatron.core.transformer.moe.moe_layer import MoELayer
+
+                if not isinstance(self.mlp, MoELayer):
+                    self.recompute_mlp = True
+
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
         # TORCH_MAJOR = int(torch.__version__.split('.')[0])
@@ -423,7 +438,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Input Layer norm
-        input_layernorm_output = self.input_layernorm(hidden_states)
+        if self.recompute_input_layernorm:
+            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                self.input_layernorm, hidden_states
+            )
+        else:
+            input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
         attention_output_with_bias = self.self_attention(
@@ -437,6 +458,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
+
+        if self.recompute_input_layernorm:
+            # discard the output of the input layernorm and register the recompute
+            # as a gradient hook of attention_output_with_bias[0]
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -473,7 +501,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        if self.recompute_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                self.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         return pre_mlp_layernorm_output, residual, context
 
@@ -490,7 +524,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """
 
         # MLP.
-        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+        if self.recompute_mlp:
+            mlp_output_with_bias = tensor_parallel.checkpoint(
+                self.mlp, False, pre_mlp_layernorm_output
+            )
+        else:
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+
+        if self.recompute_pre_mlp_layernorm:
+            # discard the output of the pre-mlp layernorm and register the recompute
+            # as a gradient hook of mlp_output_with_bias[0]
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                mlp_output_with_bias[0]
+            )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?

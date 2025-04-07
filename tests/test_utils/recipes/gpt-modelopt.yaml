@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}'
+  name: "{test_case}_{environment}"
   model: gpt
   build: mcore-pyt-{environment}
   nodes: 1
@@ -36,4 +36,4 @@ products:
   - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
     products:
       - environment: [dev, lts]
-        scope: [nightly]
+        scope: [none] # revert to 'none' after fixing bug

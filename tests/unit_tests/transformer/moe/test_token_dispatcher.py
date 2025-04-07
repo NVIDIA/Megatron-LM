@@ -259,7 +259,7 @@ class MoEModelTestContainer:
 
 
 permute_fusion_params = [False]
-if is_te_min_version("1.14.0"):
+if is_te_min_version("2.1.0"):
     permute_fusion_params.append(True)
 
 

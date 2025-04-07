@@ -275,8 +275,8 @@ test:linting_secret_detection:
 test:unit_tests_x_coverage_report:
   extends: [.test_rules]
   needs:
-    - test:unit_tests_pyt(DEV)_mcore(latest)
-    - test:unit_tests_pyt(LTS)_mcore(latest)
+    - job: test:unit_tests_pyt(DEV)_mcore(latest)
+    - job: test:unit_tests_pyt(LTS)_mcore(latest)
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - arch/amd64

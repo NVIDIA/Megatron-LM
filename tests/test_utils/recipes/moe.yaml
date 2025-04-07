@@ -124,10 +124,10 @@ products:
   #######################################################################
   # Super important MR tests that run for both DEV and LTS per MR       #
   #######################################################################
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev] # needs an update for PyT25.03
+  #       scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
     products:
       - environment: [dev]

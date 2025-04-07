@@ -116,7 +116,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     ):
 
         super().__init__()
-
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         world_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -319,7 +318,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         gtd_request_count = max(1, gtd_request_count)
         gtd_request_count = self.round_up(min(gtd_request_count, self.max_requests))
         gtd_chunk_count = gtd_request_count * self.max_kv_chunk_count
-
         assert (
             gtd_request_count <= self.max_requests
         ), "gtd_request_count (%d) > max_requests (%d)." % (gtd_request_count, self.max_requests)

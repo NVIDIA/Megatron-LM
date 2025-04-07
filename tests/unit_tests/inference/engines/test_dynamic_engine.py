@@ -33,8 +33,6 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-DynamicInferenceContext.ROUNDER = 4  # decreased from 64 for unit tests.
-
 
 class Request:
     """Simple class to hold prompt tokens and output tokens."""
@@ -56,6 +54,7 @@ class Request:
 class TestConfig:
     """Test configuration args."""
 
+    DynamicInferenceContext.ROUNDER = 4
     num_requests: int = 2 * DynamicInferenceContext.round_up(1)
     max_prompt_length: int = 16
     max_output_length: int = 4
@@ -99,6 +98,7 @@ class TestDynamicInferenceEngine:
     def _build_requests(
         cls, num_requests: int, max_prompt_length: int, vocab_size: int
     ) -> List[List[int]]:
+
         prompt_lengths = torch.randint(4, max_prompt_length, (num_requests,)).tolist()
         prompts = [
             torch.randint(0, vocab_size - 1, (length,)).tolist() for length in prompt_lengths
@@ -134,7 +134,7 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _build_test_env(cls, test_config):
-
+        DynamicInferenceContext.ROUNDER = 4
         random_seed = 123
         vocab_size = 100
 
@@ -221,7 +221,7 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _run_step(cls, env):
-
+        DynamicInferenceContext.ROUNDER = 4
         # Step inference engine (i.e., generate one token per request).
         result, step_time = env.engine.step(env.sampling_params, verbose=False)
 
@@ -275,6 +275,7 @@ class TestDynamicInferenceEngine:
         )
 
     def teardown_method(self, method):
+        DynamicInferenceContext.ROUNDER = 64
         Utils.destroy_model_parallel()
 
     def test_simple(self) -> None:
@@ -305,7 +306,6 @@ class TestDynamicInferenceEngine:
 
     def test_overflow_factor(self) -> None:
         """Test overflow factor arg."""
-
         # Run test.
         env = self._run_test(
             context_buffer_overflow_factor=0.1,

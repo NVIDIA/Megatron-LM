@@ -125,6 +125,7 @@ class TestParallelTransformerBlock:
             config, layer_spec
         )
         assert selective_transformer_block.config.recompute_granularity == 'selective'
+        assert "core_attn" in selective_transformer_block.config.recompute_modules
         assert selective_transformer_block.checkpoint_core_attention
         assert selective_transformer_block.config.fp8 == fp8
 
