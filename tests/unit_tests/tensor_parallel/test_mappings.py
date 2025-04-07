@@ -5,6 +5,7 @@ from megatron.core.tensor_parallel import mappings
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.internal
 def test_CopyToModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.ones((1)).cuda() * Utils.rank
@@ -17,6 +18,7 @@ def test_CopyToModelParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_ReduceFromModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.ones((1)).cuda() * Utils.rank
@@ -32,6 +34,7 @@ def test_ReduceFromModelParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_ScatterToModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).cuda()
@@ -52,6 +55,7 @@ def test_ScatterToModelParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_GatherFromModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).cuda()
@@ -72,6 +76,7 @@ def test_GatherFromModelParallelRegion():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.internal
 def test_ScatterToSequenceParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).cuda()
