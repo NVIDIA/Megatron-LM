@@ -2,6 +2,7 @@ import os
 import random
 import sys
 import tempfile
+from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict
 
@@ -17,14 +18,40 @@ except ModuleNotFoundError:
     exceptions = ModuleType("botocore.exceptions")
     sys.modules[exceptions.__name__] = exceptions
 
+try:
+    import multistorageclient as msc
+except ModuleNotFoundError:
+    # Create mock msc module
+    msc = ModuleType("multistorageclient")
+
+    # Create mock types submodule
+    types_module = ModuleType("multistorageclient.types")
+
+    # Create Range class in types module
+    class Range:
+        def __init__(self, offset: int, size: int):
+            self.offset = offset
+            self.size = size
+
+    # Add Range class to types module
+    types_module.Range = Range  # type: ignore[attr-defined]
+
+    # Add types submodule to msc
+    msc.types = types_module
+
+    # Register the mock module in sys.modules
+    sys.modules[msc.__name__] = msc
+    sys.modules[types_module.__name__] = types_module
+
 from megatron.core.datasets.indexed_dataset import (
     IndexedDataset,
-    S3Config,
+    ObjectStorageConfig,
     _FileBinReader,
     _MMapBinReader,
+    _MultiStorageClientBinReader,
     _S3BinReader,
 )
-from megatron.core.datasets.utils_s3 import S3_PREFIX, S3Client
+from megatron.core.datasets.object_storage_utils import MSC_PREFIX, S3_PREFIX, S3Client
 from tests.unit_tests.data.test_preprocess_data import (
     build_datasets,
     dummy_jsonl,
@@ -44,6 +71,7 @@ class _LocalClient(S3Client):
         pass
 
     def download_file(self, Bucket: str, Key: str, Filename: str) -> None:
+        os.makedirs(os.path.dirname(Filename), exist_ok=True)
         os.system(f"cp {os.path.join('/', Bucket, Key)} {Filename}")
         assert os.path.exists(Filename)
 
@@ -88,6 +116,31 @@ class _LocalClientError(Exception):
 
 setattr(exceptions, "ClientError", _LocalClientError)
 
+##
+# Mock multistorageclient module
+##
+
+
+def _msc_download_file(remote_path, local_path):
+    remote_path = remote_path.removeprefix(MSC_PREFIX + "default")
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    os.system(f"cp {remote_path} {local_path}")
+
+
+def _msc_resolve_storage_client(path):
+    class StorageClient:
+        def read(self, path, byte_range):
+            with open(path, "rb") as f:
+                f.seek(byte_range.offset)
+                return f.read(byte_range.size)
+
+    return StorageClient(), path.removeprefix(MSC_PREFIX + "default")
+
+
+setattr(msc, "open", open)
+setattr(msc, "download_file", _msc_download_file)
+setattr(msc, "resolve_storage_client", _msc_resolve_storage_client)
+
 
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
@@ -99,10 +152,10 @@ def test_bin_reader():
 
         path_to_raws = os.path.join(temp_dir, "sample_raws")
         path_to_data = os.path.join(temp_dir, "sample_data")
-        path_to_s3_cache = os.path.join(temp_dir, "s3_cache")
+        path_to_object_storage_cache = os.path.join(temp_dir, "object_storage_cache")
         os.mkdir(path_to_raws)
         os.mkdir(path_to_data)
-        os.mkdir(path_to_s3_cache)
+        os.mkdir(path_to_object_storage_cache)
 
         # create the dummy resources
         dummy_jsonl(path_to_raws)
@@ -141,11 +194,25 @@ def test_bin_reader():
             indexed_dataset_mmap = IndexedDataset(prefix, multimodal=False, mmap=True)
             assert isinstance(indexed_dataset_mmap.bin_reader, _MMapBinReader)
 
+            indexed_dataset_msc = IndexedDataset(
+                MSC_PREFIX + "default" + prefix,  # use the default profile to access the filesystem
+                multimodal=False,
+                mmap=False,
+                object_storage_config=ObjectStorageConfig(
+                    path_to_idx_cache=path_to_object_storage_cache
+                ),
+            )
+            assert isinstance(indexed_dataset_msc.bin_reader, _MultiStorageClientBinReader)
+            assert len(indexed_dataset_msc) == len(indexed_dataset_file)
+            assert len(indexed_dataset_msc) == len(indexed_dataset_mmap)
+
             indexed_dataset_s3 = IndexedDataset(
                 S3_PREFIX + prefix,
                 multimodal=False,
                 mmap=False,
-                s3_config=S3Config(path_to_idx_cache=path_to_s3_cache),
+                object_storage_config=ObjectStorageConfig(
+                    path_to_idx_cache=path_to_object_storage_cache
+                ),
             )
             assert isinstance(indexed_dataset_s3.bin_reader, _S3BinReader)
 

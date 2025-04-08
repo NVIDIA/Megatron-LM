@@ -27,6 +27,7 @@ from megatron.core.utils import (
 )
 from megatron.training.activations import squared_relu
 from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
+from megatron.core.msc_utils import MultiStorageClientFeature
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -60,6 +61,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
+    parser = _add_msc_args(parser)
 
     return parser
 
@@ -91,6 +93,12 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+
+    # Args to disable MSC
+    if not args.enable_msc:
+        MultiStorageClientFeature.disable()
+        assert MultiStorageClientFeature.is_enabled() is False
+        print('WARNING: The MSC feature is disabled.')
 
     return args
 
@@ -2227,8 +2235,8 @@ def _add_data_args(parser):
                        dest='create_attention_mask_in_dataloader')
     group.add_argument('--num-dataset-builder-threads', type=int, default=1,
                        help='Number of parallel threads per rank for dataset builder')
-    group.add_argument('--s3-cache-path', type=str, default=None,
-                       help='Path to cache index files when using s3 dataloader')
+    group.add_argument('--object-storage-cache-path', type=str, default=None,
+                       help='Path to cache index files when using s3 or msc dataloader')
     return parser
 
 
@@ -2544,4 +2552,11 @@ def _add_experimental_args(parser):
                        help='Dtype of exp_avg when enabling precision-aware-optimizer')
     group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
                        help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+    return parser
+
+
+def _add_msc_args(parser):
+    group = parser.add_argument_group(title="msc")
+    group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
+                       help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
     return parser
