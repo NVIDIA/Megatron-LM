@@ -6,7 +6,7 @@ import dataclasses
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
@@ -248,6 +248,7 @@ class MoEModelTestContainer:
 permute_fusion_params = [False]
 if is_te_min_version("2.1.0"):
     permute_fusion_params.append(True)
+multihot_fusion_params = [True]
 
 
 class TestAllgatherDispatcher:
@@ -321,7 +322,10 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    def test_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("indices_to_multihot_fusion", multihot_fusion_params)
+    def test_forward_backward(self, tp_size, ep_size, permute_fusion, indices_to_multihot_fusion):
+        if indices_to_multihot_fusion:
+            config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -341,9 +345,14 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
+    @pytest.mark.parametrize("indices_to_multihot_fusion", multihot_fusion_params)
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
-    def test_capacity_forward_backward(self, tp_size, ep_size, permute_fusion):
+    def test_capacity_forward_backward(
+        self, tp_size, ep_size, permute_fusion, indices_to_multihot_fusion
+    ):
+        if indices_to_multihot_fusion:
+            config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
