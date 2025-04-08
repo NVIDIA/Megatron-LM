@@ -5,6 +5,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from megatron.core.config import ENABLE_EXPERIMENTAL
+from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.parallel_state import (
     get_expert_model_parallel_group,
     get_expert_tensor_and_model_parallel_group,
@@ -881,9 +883,14 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
-            self.dispatched_indices, self.dispatched_probs
-        )
+        if ENABLE_EXPERIMENTAL and self.permute_fusion:
+            self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
+                self.dispatched_indices, self.dispatched_probs, self.num_local_experts
+            )
+        else:
+            self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
+                self.dispatched_indices, self.dispatched_probs
+            )
         self.hidden_shape_before_permute = hidden_states.shape
         hidden_states, self.reversed_mapping_for_combine = permute(
             hidden_states,
