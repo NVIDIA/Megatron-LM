@@ -33,7 +33,7 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
-from megatron.legacy.model import Float16Module
+from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
@@ -973,7 +973,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     # Fp16 conversion.
     if args.fp16 or args.bf16:
-        model = [Float16Module(model_module, args) for model_module in model]
+        config = get_model_config(model[0])
+        model = [Float16Module(config, model_module) for model_module in model]
 
     # Before TE2.x: The model_module.bfloat16()/model_module.half() above will call the inplace
     #               copy of TE's Float8Tensor, which will write an unwanted value (amax calculated
