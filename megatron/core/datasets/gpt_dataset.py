@@ -13,8 +13,8 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
+from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
-from megatron.core.datasets.utils_s3 import S3Config, is_s3_path
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -26,13 +26,13 @@ _PAD_TOKEN_ID = -1
 class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Configuration object for Megatron Core GPT datasets"""
 
-    reset_position_ids: bool = None
+    reset_position_ids: Optional[bool] = None
     """Option to reset the position IDs in the dataset at an interval"""
 
-    reset_attention_mask: bool = None
+    reset_attention_mask: Optional[bool] = None
     """Option to reset the attention mask from the dataset"""
 
-    eod_mask_loss: bool = None
+    eod_mask_loss: Optional[bool] = None
     """Option to enable the EOD mask loss"""
 
     create_attention_mask: bool = True
@@ -48,8 +48,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        output tokens are both of the desired sequence length
     """
 
-    s3_cache_path: str = None
-    """Path for caching indices for s3 dataloading."""
+    object_storage_cache_path: Optional[str] = None
+    """Path for caching indices for s3 or msc dataloading."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
@@ -140,12 +140,15 @@ class GPTDataset(MegatronDataset):
         Returns:
             IndexedDataset: The underlying IndexedDataset
         """
-        if is_s3_path(dataset_path):
+        if is_object_storage_path(dataset_path):
+            assert config.object_storage_cache_path is not None
             return IndexedDataset(
                 dataset_path,
                 multimodal=False,
                 mmap=config.mmap_bin_files,
-                s3_config=S3Config(path_to_idx_cache=config.s3_cache_path),
+                object_storage_config=ObjectStorageConfig(
+                    path_to_idx_cache=config.object_storage_cache_path
+                ),
             )
         return IndexedDataset(dataset_path, multimodal=False, mmap=config.mmap_bin_files)
 
@@ -778,7 +781,14 @@ class MockGPTDataset(GPTDataset):
     ) -> None:
         assert config.mock
 
-        super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        super().__init__(
+            dataset,  # type: ignore[arg-type]
+            dataset_path,
+            indices,
+            num_samples,
+            index_split,
+            config,
+        )
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: MockGPTLowLevelDataset) -> int:
@@ -793,7 +803,7 @@ class MockGPTDataset(GPTDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(
+    def build_low_level_dataset(  # type: ignore[override]
         dataset_path: Optional[str], config: GPTDatasetConfig
     ) -> MockGPTLowLevelDataset:
         """Abstract method implementation
