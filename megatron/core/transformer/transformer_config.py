@@ -537,6 +537,10 @@ class TransformerConfig(ModelParallelConfig):
     mamba_num_groups: int = 8
     """The number of groups used in Mamba layers."""
 
+    mlp_chunks_for_prefill: int = 1
+    """The number of chunks along the sequence dimension to use for MLP computation
+    during prefill."""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more

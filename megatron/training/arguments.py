@@ -1090,6 +1090,9 @@ def _add_inference_args(parser):
                        type=int, default=None,
                        help='If set, this overrides the max tokens as computed '
                        'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+    group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
+                       help='Number of chunks along sequence dimension for MLP '
+                       'computation during prefill')
 
     return parser
 
