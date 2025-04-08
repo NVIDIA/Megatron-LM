@@ -3,6 +3,7 @@ import filecmp
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Tuple, Union
@@ -236,6 +237,7 @@ class TestLocalCheckpointing:
             )
             if async_save:
                 maybe_finalize_async_save(True)
+            time.sleep(0.01)  # Allow sufficient time for async cleanup to complete
             assert not ckpt_path.exists()
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(2)
             ckpt_path = checkpointing_context['local_checkpoint_manager']._local_ckpt_path_from_id(
