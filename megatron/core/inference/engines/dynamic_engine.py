@@ -85,12 +85,18 @@ class DynamicInferenceEngine(AbstractEngine):
         self.context.reset()
         self.finished_request_count = 0
 
-    def add_request(self, request_id: int, prompt: Union[str, List[int], Tensor]) -> None:
+    def add_request(
+        self,
+        request_id: int,
+        prompt: Union[str, List[int], Tensor],
+        num_tokens_to_generate: Optional[int] = None,
+    ) -> None:
         """Add request to inference context.
 
         Args:
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
+            num_tokens_to_generate (Optional[int]): Number of output tokens to generate
 
         Return:
             None.
@@ -120,7 +126,7 @@ class DynamicInferenceEngine(AbstractEngine):
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
         # Add request to context.
-        return self.context.add_request(request_id, tokens)
+        return self.context.add_request(request_id, tokens, num_tokens_to_generate)
 
     def step(
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
