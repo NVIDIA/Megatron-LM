@@ -221,6 +221,7 @@ pre:check_milestone:
 pre:check_status_of_main:
   extends: [.pre_rules]
   image: python:3.10
+  timeout: 7 days
   tags:
     - arch/amd64
     - env/prod
