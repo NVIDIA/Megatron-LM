@@ -116,12 +116,20 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
   variables:
     ENVIRONMENT: dev
     TAG: legacy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - when: on_success
 
 test:unit_tests_pyt(LTS)_mcore(legacy):
   extends: [.unit_tests_run]
   variables:
     ENVIRONMENT: lts
     TAG: legacy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - when: on_success
 
 test:unit_tests_pyt(DEV)_mcore(latest):
   extends: [.unit_tests_run]

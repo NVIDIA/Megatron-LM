@@ -135,7 +135,7 @@ def main(
             "workflow": {
                 "rules": [
                     {
-                        "if": '($CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "main") && ($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID)',
+                        "if": '($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID) && $CI_COMMIT_BRANCH == "main"',
                         "auto_cancel": {"on_new_commit": "none"},
                     },
                     {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID'},
