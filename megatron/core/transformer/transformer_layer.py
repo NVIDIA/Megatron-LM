@@ -388,7 +388,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
         pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
-        output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+        output = self._forward_mlp(
+            pre_mlp_layernorm_output, residual, kwargs.get("inference_context", None)
+        )
         return output, context
 
     def _forward_attention(
@@ -511,7 +513,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         return pre_mlp_layernorm_output, residual, context
 
-    def _forward_mlp(self, pre_mlp_layernorm_output, residual):
+    def _forward_mlp(self, pre_mlp_layernorm_output, residual, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
 
@@ -523,11 +525,31 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
-        # MLP.
+        # Potentially chunk the MLP computation during prefill to minimize the peak activation size
+        should_chunk_mlp_for_prefill = (
+            self.config.mlp_chunks_for_prefill > 1
+            and inference_context is not None
+            and not inference_context.is_decode_only()
+        )
+
         if self.recompute_mlp:
             mlp_output_with_bias = tensor_parallel.checkpoint(
                 self.mlp, False, pre_mlp_layernorm_output
             )
+        elif should_chunk_mlp_for_prefill:
+            # Chunk input along sequence dimension
+            num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
+            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+
+            # Compute outputs for each chunk
+            outputs = [self.mlp(chunk) for chunk in chunks]
+
+            # Aggregate chunk outputs
+            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
+            bias_chunks = [bias for _, bias in outputs if bias is not None]
+            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+            mlp_output_with_bias = (mlp_output, bias_output)
+
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
 

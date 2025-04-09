@@ -277,7 +277,7 @@ class TestDistributedOptimizer:
                         save_strategy,
                         process_group=parallel_state.get_default_process_group()
                     )
-                    optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
+                    optim_param_state_A = optimizer_A.chained_optimizers[0].get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
                 else:
                     # this prevents NCCL errors when changing DP. TODO: fix it properly
@@ -293,7 +293,7 @@ class TestDistributedOptimizer:
                     model, optimizer_B = setup_model_and_optimizer(
                         seed=3, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn, dist_opt=True
                     )
-                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
+                    optim_param_state_B = optimizer_B.chained_optimizers[0].get_parameter_state_dp_zero()
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     # Expect a mismatch in values - diffs[2] nonempty
                     if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0:
@@ -305,7 +305,7 @@ class TestDistributedOptimizer:
                     optim_state_dict = load(sharded_state_dict, ckpt_dir,
                                             process_group=parallel_state.get_default_process_group())
                     optimizer_B.load_state_dict(optim_state_dict)
-                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
+                    optim_param_state_B = optimizer_B.chained_optimizers[0].get_parameter_state_dp_zero()
                     # Test both param state dicts are equal
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     assert not any(map(bool, diffs)), diffs
@@ -340,7 +340,6 @@ class TestDistributedOptimizer:
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                     dist_opt=True
                 )
-
                 save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 

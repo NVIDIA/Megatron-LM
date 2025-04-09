@@ -27,5 +27,6 @@ RUN cd /nvidia-resiliency-ext-x && git fetch origin e4b22cfb45d9e078b77242b68a35
 RUN cd /nvidia-resiliency-ext-x && git reset --hard e4b22cfb45d9e078b77242b68a35d9df4947dc91
 RUN cd /nvidia-resiliency-ext-x && sed -e '/cupti_build\.py/ s/^/#/' -i pyproject.toml
 RUN cd /nvidia-resiliency-ext-x && pip3 install -e .
+RUN pip3 install multi-storage-client
 
 WORKDIR /megatron

@@ -165,17 +165,6 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                                      op=torch.distributed.ReduceOp.SUM,
                                      group=mpu.get_data_parallel_group())
 
-    # Sum across all model-parallel GPUs (tensor + pipeline).
-    if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
-                      groups=mpu.get_model_parallel_groups(), pin_layout=False)
-    else:
-        torch.distributed.all_reduce(
-            norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_model_parallel_group()
-        )
-
     # Add norm contribution from expert layers in MoEs.
     if len(moe_params_data) > 0:
         moe_norm, _ = multi_tensor_applier(
@@ -187,19 +176,59 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         moe_norm_2 = moe_norm * moe_norm
 
         if custom_fsdp_all_param_is_shared:
-            torch.distributed.all_reduce(moe_norm_2,
-                                        op=torch.distributed.ReduceOp.SUM,
-                                        group=mpu.get_expert_data_parallel_group())
+            if xm:
+                xm.all_reduce(xm.REDUCE_SUM, [moe_norm_2], 
+                            groups=mpu.get_expert_data_parallel_groups(), pin_layout=False)
+            else:
+                torch.distributed.all_reduce(moe_norm_2,
+                                            op=torch.distributed.ReduceOp.SUM,
+                                            group=mpu.get_expert_data_parallel_group())
+    # Account for MoE norm even if current rank doesn't have any expert params to prevent
+    # hang in models with un-even numbers of MoE layers.
+    # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
+    else:
+        moe_norm_2 = torch.zeros_like(norm_2)
 
-        # Sum across expert tensor, model and pipeline parallel GPUs.
+    # Reduce norm across model parallel groups (dense and expert).
+    # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
+    dense_reduce_group = mpu.get_model_parallel_group()
+    ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
+    # Expert params should sum across all model-parallel GPUs (expert + tensor + pipeline).
+    expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+    ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
+
+    # If dense and expert reduce groups are the same, sum then reduce.
+    if ranks_in_dense_reduce_group == ranks_in_expert_reduce_group:
+        norm_2 += moe_norm_2
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [moe_norm_2], 
-                          groups=mpu.get_expert_tensor_model_pipeline_parallel_groups(), pin_layout=False)
+            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
+                            groups=mpu.get_model_parallel_groups(), 
+                            pin_layout=False)
         else:
+            torch.distributed.all_reduce(
+                norm_2,
+                op=torch.distributed.ReduceOp.SUM,
+                group=dense_reduce_group
+            )
+    # If dense and expert reduce groups are different, reduce then sum.
+    else:
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
+                            groups=mpu.get_model_parallel_groups(), 
+                            pin_layout=False)
+            xm.all_reduce(xm.REDUCE_SUM, [moe_norm_2], 
+                            groups=mpu.get_expert_tensor_model_pipeline_parallel_groups(), 
+                            pin_layout=False)
+        else:
+            torch.distributed.all_reduce(
+                norm_2,
+                op=torch.distributed.ReduceOp.SUM,
+                group=dense_reduce_group
+            )
             torch.distributed.all_reduce(
                 moe_norm_2,
                 op=torch.distributed.ReduceOp.SUM,
-                group=mpu.get_expert_tensor_model_pipeline_parallel_group()
+                group=expert_reduce_group
             )
         norm_2 += moe_norm_2
 
