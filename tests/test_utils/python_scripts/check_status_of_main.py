@@ -21,29 +21,41 @@ def get_gitlab_handle():
 
 
 def most_recent_pipeline(target_branch: str):
-    pipelines = get_gitlab_handle().projects.get(PROJECT_ID).pipelines.list(ref=target_branch)
+    pipelines = (
+        get_gitlab_handle()
+        .projects.get(PROJECT_ID)
+        .pipelines.list(ref=target_branch, source="push")
+    )
     return pipelines[0]
 
 
-def is_pending(pipeline: gitlab.v4.objects.Pipeline):
-    return pipeline.attributes['status'] == 'pending' or pipeline.attributes['status'] == 'running'
+def is_pending(target_branch: str):
+    pipeline = most_recent_pipeline(target_branch)
+    is_pending = (
+        pipeline.attributes['status'] == 'pending' or pipeline.attributes['status'] == 'running'
+    )
+
+    if not is_pending:
+        logger.info(
+            f"Main pipeline {pipeline.id} finished with status {pipeline.attributes['status']}"
+        )
+
+    return is_pending
 
 
-def is_sucess(pipeline: gitlab.v4.objects.Pipeline):
+def is_sucess(target_branch: str):
+    pipeline = most_recent_pipeline(target_branch)
     return pipeline.attributes['status'] == 'success'
 
 
 @click.command()
 @click.option("--target-branch", type=str, help="Target branch to check")
 def main(target_branch: str):
-    pipeline = most_recent_pipeline(target_branch)
-    while is_pending(pipeline):
+    while is_pending(target_branch):
         logger.info(f"Waiting for branch {target_branch} to finish")
         time.sleep(60)
 
-    logger.info(f"Main pipeline {pipeline.id} finished with status {pipeline.attributes['status']}")
-
-    if not is_sucess(pipeline):
+    if not is_sucess(target_branch=target_branch):
         sys.exit(1)
 
 
