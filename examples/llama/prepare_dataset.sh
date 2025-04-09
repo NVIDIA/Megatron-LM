@@ -1,43 +1,46 @@
-TMP_DIR="tmp"
-mkdir -p $TMP_DIR
-mkdir -p ${TMP_DIR}/data
+#!/bin/bash
 
-DATA_PATH="${TMP_DIR}/data"
-TOKENIZER_MODEL=${TMP_DIR}/tokenizer.model
-DATASET="${DATASET:-wiki}" #wiki; bookcorpus
-
-# Download the tokenizer model
-if ! [ -f "$TOKENIZER_MODEL" ]; then
-wget -O $TOKENIZER_MODEL https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.model
+# Check input
+if [ -z ${TOKENIZER_MODEL+x} ]; then
+    echo "TOKENIZER_MODEL required"
+    exit 1
 fi
 
+# Setup variables
+DATA_DIR="${DATA_DIR:-data}"
+DATASET="${DATASET:-bookcorpus}" # one of wiki,bookcorpus,fineweb
+DATASET_PATH="${DATA_DIR}/data.jsonl"
+TOKENIZER_TYPE="${TOKENIZER_TYPE:-HuggingFaceTokenizer}"
+
+# Create directories
+mkdir -p ${DATA_DIR}
+
+# Download and preprocess dataset
+echo "Downloading '${DATASET}' dataset to '${DATASET_PATH}'..."
 if [ "$DATASET" == "wiki" ]; then
-    DATASET_PATH="${DATA_PATH}/wiki"
-    echo "Downloading wikipedia-en dataset to ${DATASET_PATH}..."
-
-    wget -P "$DATASET_PATH" https://a3s.fi/lumi-llm-scaling/wikipedia_20220301.en.train.jsonl
-    wget -P "$DATASET_PATH" https://a3s.fi/lumi-llm-scaling/wikipedia_20220301.en.valid.jsonl
-    wget -P "$DATASET_PATH" https://huggingface.co/gpt2/raw/main/vocab.json
-    wget -P "$DATASET_PATH" https://huggingface.co/gpt2/raw/main/merges.txt
-
-    for f in wikipedia_20220301.en.{train,valid}.jsonl; do
-        python tools/preprocess_data.py \
-            --input "$f" \
-            --output "$DATASET_PATH/$(basename $f .jsonl)" \
-            --tokenizer-type GPT2BPETokenizer \
-            --vocab-file "$DATASET_PATH/vocab.json" \
-            --merge-file "$DATASET_PATH/merges.txt" \
-            --append-eod \
-            --workers 128
-    done
+    wget -nc -O "$DATASET_PATH" https://a3s.fi/lumi-llm-scaling/wikipedia_20220301.en.train.jsonl
+elif [ "$DATASET" == "fineweb" ]; then
+    python examples/llama/fineweb/download.py --out-dir ${DATA_DIR}
+    if [ $? -ne 0 ]; then
+        echo "Download failed"
+        exit 1
+    fi
+elif [ "$DATASET" == "bookcorpus" ]; then
+    python3 examples/llama/bookcorpus/download.py --out-dir ${DATA_DIR}
+    if [ $? -ne 0 ]; then
+        echo "Download failed"
+        exit 1
+    fi
+else
+    echo "Invalid DATASET=${DATASET}, only 'wiki', 'bookcorpus' and 'fineweb' supported"
+    exit 1
 fi
 
-if [ "$DATASET" == "bookcorpus" ]; then
-    DATASET_PATH="${DATA_PATH}/bookcorpus"
-    echo "Downloading bookcorpus dataset to ${DATASET_PATH}..."
-    python3 examples/llama/prepare_bookcorpus_megatron_dataset.py --out-dir ${DATASET_PATH}
-    python3 tools/preprocess_data.py --input ${DATASET_PATH}/bookcorpus_megatron.json  --tokenizer-type GPTSentencePieceTokenizer \
-    --tokenizer-model ${TOKENIZER_MODEL} --output-prefix ${DATASET_PATH}/bookcorpus --workers `nproc` --split-sentences --partitions 2
-fi
-
-echo "Finishing data preparation!"
+# Preprocess dataset
+echo "Preprocessing '${DATASET}' dataset using '${TOKENIZER_MODEL}' tokenizer..."
+python3 tools/preprocess_data.py \
+    --input "${DATASET_PATH}"  \
+    --tokenizer-type $TOKENIZER_TYPE \
+    --tokenizer-model "${TOKENIZER_MODEL}" \
+    --output-prefix "${DATA_DIR}/data" \
+    --workers `nproc`

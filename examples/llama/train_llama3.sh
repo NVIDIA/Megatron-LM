@@ -6,11 +6,11 @@
 #################################################################################
 #set -x
 
-# set envs 
+# set envs
 export GPU_MAX_HW_QUEUES=2
 export TORCH_NCCL_HIGH_PRIORITY=1
 export NCCL_CHECKS_DISABLE=1
-export NCCL_IB_HCA=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7 
+export NCCL_IB_HCA=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
 export NCCL_IB_GID_INDEX=3
 export NCCL_CROSS_NIC=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -18,7 +18,6 @@ export NCCL_PROTO=Simple
 export RCCL_MSCCL_ENABLE=0
 export TOKENIZERS_PARALLELISM=false
 export HSA_NO_SCRATCH_RECLAIM=1
-
 
 # parsing input arguments
 for ARGUMENT in "$@"
@@ -30,7 +29,6 @@ do
 
    export "$KEY"="$VALUE"
 done
-
 
 TIME_STAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 EXP_NAME="${EXP_NAME:-perf}"
@@ -63,9 +61,10 @@ MODEL_SIZE="${MODEL_SIZE:-70}"
 TP="${TP:-8}"
 PP="${PP:-1}"
 CP="${CP:-1}"
-MBS="${MBS:-2}"
+MBS="${MBS:-1}"
 BS="${BS:-8}"
 SEQ_LENGTH="${SEQ_LENGTH:-2048}"
+MAX_POSITION_EMBEDDINGS=131072
 TOTAL_ITERS="${TOTAL_ITERS:-10}"
 SEQ_PARALLEL="${SEQ_PARALLEL:-1}" 
 CONTI_PARAMS="${CONTI_PARAMS:-0}"
@@ -75,8 +74,15 @@ MCORE="${MCORE:-1}"
 OPTIMIZER="${OPTIMIZER:-adam}"
 FSDP="${FSDP:-0}"
 RECOMPUTE="${RECOMPUTE:-0}"
+TOKENIZER_TYPE="${TOKENIZER_TYPE:-HuggingFaceTokenizer}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-NousResearch/Meta-Llama-3-8B}"
 ROPE_FUSION="${ROPE_FUSION:-1}" # 1: use rope-fusion, 0: no-rope-fusion
-MOCK_DATA="${MOCK_DATA:-1}" # 1: use mock data, 0: use real data
+LOG_INTERVAL="${LOG_INTERVAL:-1}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
+EVAL_ITERS="${EVAL_ITERS:-'-1'}"
+CKPT_FORMAT="${CKPT_FORMAT:-torch}"
+DATA_CACHE_PATH="${DATA_CACHE_PATH:-/root/cache}"
 
 if [ "$FSDP" -eq 1 ]; then
     if [ "$TP" -gt 1 ]; then
@@ -88,64 +94,39 @@ fi
 
 EXPERIMENT_DIR="experiment"
 mkdir -p $EXPERIMENT_DIR
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"$EXPERIMENT_DIR/ckpts"}
-
-DATA_DIR="${DATA_DIR:-/root/.cache/data}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:-"$DATA_DIR/tokenizer_llama3"}"
-# Download the tokenizer model
-if ! [ -d "$TOKENIZER_MODEL" ]; then
-  mkdir -p $TOKENIZER_MODEL
-  HF_TOKEN="${HF_TOKEN:-hf_xxxx}" #set huggingface access token to be able to download tokenizer
-  wget --header="Authorization: Bearer $HF_TOKEN" -O $TOKENIZER_MODEL/special_tokens_map.json https://huggingface.co/meta-llama/Llama-3.1-8B/resolve/main/special_tokens_map.json
-  wget --header="Authorization: Bearer $HF_TOKEN" -O $TOKENIZER_MODEL/tokenizer.json https://huggingface.co/meta-llama/Llama-3.1-8B/resolve/main/tokenizer.json
-  wget --header="Authorization: Bearer $HF_TOKEN" -O $TOKENIZER_MODEL/tokenizer.model https://huggingface.co/meta-llama/Llama-3.1-8B/resolve/main/original/tokenizer.model
-  wget --header="Authorization: Bearer $HF_TOKEN" -O $TOKENIZER_MODEL/tokenizer_config.json https://huggingface.co/meta-llama/Llama-3.1-8B/resolve/main/tokenizer_config.json
-
-  echo "Tokenizer files downloaded successfully to $TOKENIZER_MODEL."
-else
-  echo "Folder $TOKENIZER_MODEL already exists. Skipping download."
-fi
-
-DATA_PATH=${DATA_PATH:-"$DATA_DIR/bookcorpus_text_sentence"}
-
-MAX_POSITION_EMBEDDINGS=131072
-
 DEFAULT_LOG_DIR="${EXPERIMENT_DIR}/${NNODES}nodes_rank${NODE_RANK}_train_${MODEL_SIZE}B_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_cp${CP}_iter${TOTAL_ITERS}/TE_FP8_${TE_FP8}/${TIME_STAMP}"
 LOG_DIR="${LOG_DIR:-${DEFAULT_LOG_DIR}}"
 TRAIN_LOG="${LOG_DIR}/output_${EXP_NAME}.log"
 mkdir -p $LOG_DIR
 echo $TRAIN_LOG
 
-# gemm tuning 
+# gemm tuning
 if [ "$GEMM_TUNING" -eq 1 ]; then
-   export TE_HIPBLASLT_TUNING_RUN_COUNT=10
-   export TE_HIPBLASLT_TUNING_ALGO_COUNT=50
+    export TE_HIPBLASLT_TUNING_RUN_COUNT=10
+    export TE_HIPBLASLT_TUNING_ALGO_COUNT=50
 fi
 
 if [ "$SEQ_LENGTH" -le 8192 ]; then
-  ds_works=8
+    ds_works=8
 else
-  ds_works=24
+    ds_works=24
 fi
 
 if [[ $MODEL_SIZE -eq 8 ]]; then #llama3.1-8B
-        HIDDEN_SIZE=4096 # e.g. llama-13b: 5120
-        FFN_HIDDEN_SIZE=14336 # e.g. llama-13b: 13824
-        NUM_LAYERS=32 # e.g. llama-13b: 40
-        NUM_HEADS=32 # e.g. llama-13b: 40
-        NUM_KV_HEADS=8 
-        SEQ_LENGTH=$SEQ_LENGTH
+    HIDDEN_SIZE=4096 # e.g. llama-13b: 5120
+    FFN_HIDDEN_SIZE=14336 # e.g. llama-13b: 13824
+    NUM_LAYERS=32 # e.g. llama-13b: 40
+    NUM_HEADS=32 # e.g. llama-13b: 40
+    NUM_KV_HEADS=8
 elif [[ $MODEL_SIZE -eq 70 ]]; then
-        HIDDEN_SIZE=8192 # e.g. llama-13b: 5120
-        FFN_HIDDEN_SIZE=28672 # e.g. llama-13b: 13824
-        NUM_LAYERS=80 # e.g. llama-13b: 40
-        NUM_HEADS=64 # e.g. llama-13b: 40
-        NUM_KV_HEADS=8 # llama3 70B uses GQA 
-        SEQ_LENGTH=$SEQ_LENGTH
-        MAX_POSITION_EMBEDDINGS=$MAX_POSITION_EMBEDDINGS
+    HIDDEN_SIZE=8192 # e.g. llama-13b: 5120
+    FFN_HIDDEN_SIZE=28672 # e.g. llama-13b: 13824
+    NUM_LAYERS=80 # e.g. llama-13b: 40
+    NUM_HEADS=64 # e.g. llama-13b: 40
+    NUM_KV_HEADS=8 # llama3 70B uses GQA
 else
-        echo "Model size not supported."
-        exit 1
+    echo "Model size not supported."
+    exit 1
 fi
 
 GROUP_SIZE=$(( ${NUM_HEADS} / ${NUM_KV_HEADS} ))
@@ -185,22 +166,18 @@ if [ "$RECOMPUTE" -eq 1 ]; then
         --recompute-granularity full \
         --recompute-method block \
         "
-fi 
-
+fi
 if [ "$ROPE_FUSION" -eq 0 ]; then
     GPT_ARGS="$GPT_ARGS --no-rope-fusion"
 fi
 
 TRAIN_ARGS="--lr 1e-4 \
-        --min-lr 1e-5 \
-        --lr-decay-iters 320000 \
-        --lr-decay-style cosine \
-        --weight-decay 1.0e-1 \
-        --clip-grad 1.0 \
-        --ckpt-format torch_dist \
+    --min-lr 1e-5 \
+    --lr-decay-iters 320000 \
+    --lr-decay-style cosine \
+    --weight-decay 1.0e-1 \
+    --clip-grad 1.0 \
 "
-
-
 if [ "$OPTIMIZER" == "adam" ]; then
     TRAIN_ARGS="$TRAIN_ARGS --optimizer adam \
         --adam-beta1 0.9 \
@@ -212,7 +189,7 @@ else
 fi
 
 DATA_ARGS="
-    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-type ${TOKENIZER_TYPE} \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --dataloader-type cyclic \
     --save-interval 200000 \
@@ -222,23 +199,44 @@ DATA_ARGS="
     --eval-iters 10 \
     --num-workers $ds_works \
 "
-# For multi-node runs DATA_CACHE_PATH should point to a common path accessible by all the nodes (for eg, an NFS directory)
-DATA_CACHE_PATH="/home/cache"
-
-if [ "$MOCK_DATA" -eq 1 ];then
-    DATA_ARGS="$DATA_ARGS --mock-data --data-cache-path $DATA_CACHE_PATH"
+if [ -z ${DATA_PATH+x} ]; then
+    DATA_ARGS="$DATA_ARGS --mock-data"
+    echo "Using Mock data"
 else
-    DATA_ARGS="$DATA_ARGS --data-path $DATA_PATH --data-cache-path ${DATA_CACHE_PATH}"
+    DATA_ARGS="$DATA_ARGS --data-path $DATA_PATH"
+    echo "Using ${DATA_PATH} data"
+fi
+if [ "$NNODES" -gt 1 ]; then
+    # For multi-node runs DATA_CACHE_PATH should exist and should point to a common
+    # path accessible by all the nodes (for example, a NFS directory)"
+    DATA_ARGS="$DATA_ARGS --data-cache-path $DATA_CACHE_PATH"
 fi
 
 OUTPUT_ARGS="
-    --log-interval 1 \
-    --save-interval 5000 \
+    --log-interval $LOG_INTERVAL \
     --log-throughput \
     --no-save-optim \
-    --eval-iters -1   
+    --no-save-rng \
+    --eval-iters $EVAL_ITERS
 "
-#  --save $CHECKPOINT_PATH \
+if [ -n "$SAVE_CKPT_PATH" ]; then
+    OUTPUT_ARGS="$OUTPUT_ARGS \
+        --save-interval $SAVE_INTERVAL \
+        --eval-interval $EVAL_INTERVAL \
+        --ckpt-format $CKPT_FORMAT \
+        --save $SAVE_CKPT_PATH
+    "
+fi
+
+CKPT_LOAD_ARGS=""
+if [ -n "$LOAD_CKPT_PATH" ]; then
+    CKPT_LOAD_ARGS="$CKPT_LOAD_ARGS \
+        --exit-on-missing-checkpoint \
+        --no-load-optim \
+        --no-load-rng \
+        --use-checkpoint-args \
+        --load ${LOAD_CKPT_PATH}"
+fi
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -247,12 +245,6 @@ DISTRIBUTED_ARGS="
     --master_addr $MASTER_ADDR \
     --master_port $MASTER_PORT \
 "
-
-CKPT_LOAD_ARGS="--exit-on-missing-checkpoint \
-        --no-load-optim \
-        --use-checkpoint-args \
-        --no-load-rng"
-
 
 EXTRA_ARGS="
     --group-query-attention \
@@ -277,33 +269,33 @@ else
 fi
 
 if [ "$ENABLE_PROFILING" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --profile --use-pytorch-profiler --tensorboard-dir $LOG_DIR"
+    EXTRA_ARGS="$EXTRA_ARGS --profile --use-pytorch-profiler --tensorboard-dir $LOG_DIR"
 fi
 
 if [ "$USE_FLASH_ATTN" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --use-flash-attn"
+    EXTRA_ARGS="$EXTRA_ARGS --use-flash-attn"
 fi
 
 if [ "$SEQ_PARALLEL" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --sequence-parallel"
+    EXTRA_ARGS="$EXTRA_ARGS --sequence-parallel"
 fi
 
 if [ "$CONTI_PARAMS" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --use-contiguous-parameters-in-local-ddp"
+    EXTRA_ARGS="$EXTRA_ARGS --use-contiguous-parameters-in-local-ddp"
 fi
 
 if [ "$MCORE" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --use-mcore-models"
+    EXTRA_ARGS="$EXTRA_ARGS --use-mcore-models"
 fi
 
 if [ "$TE_FP8" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --transformer-impl=transformer_engine \
-    --fp8-margin=0 \
-    --fp8-format=hybrid \
-    --fp8-interval=1 \
-    --fp8-amax-history-len=1024 \
-    --fp8-amax-compute-algo=max \
-    --attention-softmax-in-fp32 \
+    EXTRA_ARGS="$EXTRA_ARGS --transformer-impl=transformer_engine \
+        --fp8-margin=0 \
+        --fp8-format=hybrid \
+        --fp8-interval=1 \
+        --fp8-amax-history-len=1024 \
+        --fp8-amax-compute-algo=max \
+        --attention-softmax-in-fp32 \
 "
 fi
 
@@ -314,6 +306,7 @@ run_cmd="
         $OUTPUT_ARGS \
         $EXTRA_ARGS \
         $TRAIN_ARGS \
+        $CKPT_LOAD_ARGS
 "
 
 if [ "$TEE_OUTPUT" -eq 0 ]; then 
