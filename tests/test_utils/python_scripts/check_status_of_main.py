@@ -39,7 +39,7 @@ def main(target_branch: str):
     pipeline = most_recent_pipeline(target_branch)
     while is_pending(pipeline):
         logger.info(f"Waiting for branch {target_branch} to finish")
-        time.sleep(10)
+        time.sleep(60)
 
     logger.info(f"Main pipeline {pipeline.id} finished with status {pipeline.attributes['status']}")
 
