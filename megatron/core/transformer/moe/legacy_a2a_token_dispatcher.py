@@ -55,7 +55,6 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
             ), "local_expert_indices must be continous"
         self.ep_size = config.expert_model_parallel_size
         self.tp_size = config.tensor_model_parallel_size
-        self.probs = None
         self.input_splits = None
         self.output_splits = None
         # [tp_size * ep_size, num_local_experts]. Represents the number of tokens sent
@@ -190,7 +189,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
 
     def token_permutation(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Dispatch tokens to local experts using AlltoAll communication.
 
@@ -202,13 +201,13 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
                 Shape: [num_tokens, num_experts].
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 - Permuted token embeddings for local experts.
                 - Number of tokens per expert.
+                - Permuted probs of each token produced by the router.
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
-        self.probs = probs
         self.routing_map = routing_map
         assert probs.dim() == 2, "Expected 2D tensor for probs"
         assert routing_map.dim() == 2, "Expected 2D tensor for routing map"
@@ -224,9 +223,11 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         self.hidden_shape_before_permute = hidden_states.shape
         if self.cuda_sync_point == "before_permutation_1":
             torch.cuda.current_stream().synchronize()
-        permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
-            hidden_states, routing_map, num_out_tokens=self.num_out_tokens
-        )
+        (
+            permutated_local_input_tokens,
+            permuted_probs,
+            self.reversed_local_input_permutation_mapping,
+        ) = permute(hidden_states, routing_map, probs=probs, num_out_tokens=self.num_out_tokens)
 
         # Perform expert parallel AlltoAll communication
         if self.cuda_sync_point == "before_ep_alltoall":
@@ -237,13 +238,20 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
             self.output_splits,
             self.input_splits,
         )
+        global_probs = tensor_parallel.all_to_all(
+            parallel_state.get_expert_model_parallel_group(),
+            permuted_probs,
+            self.output_splits,
+            self.input_splits,
+        )
 
         # Permutation 2: Sort tokens by local expert.
         if self.num_local_experts > 1:
-            global_input_tokens = sort_chunks_by_idxs(
+            global_input_tokens, global_probs = sort_chunks_by_idxs(
                 global_input_tokens,
                 self.num_global_tokens_per_local_expert_cpu.ravel(),
                 self.sort_input_by_local_experts,
+                probs=global_probs,
             )
 
         # Perform tensor parallel AllGather on the hidden dimension to obtain the input tokens.
@@ -255,7 +263,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         if self.cuda_sync_point == "before_finish":
             torch.cuda.current_stream().synchronize()
 
-        return global_input_tokens, tokens_per_expert
+        return global_input_tokens, tokens_per_expert, global_probs
 
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: torch.Tensor = None
@@ -283,7 +291,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
 
         # Unpermutation 2: Unsort tokens by local expert.
         if self.num_local_experts > 1:
-            hidden_states = sort_chunks_by_idxs(
+            hidden_states, _ = sort_chunks_by_idxs(
                 hidden_states,
                 self.num_global_tokens_per_local_expert_cpu.T.ravel(),
                 self.restore_output_by_local_experts,
@@ -302,7 +310,6 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         output = unpermute(
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
-            probs=self.probs,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.routing_map,
         )

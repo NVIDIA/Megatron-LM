@@ -20,9 +20,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
-from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -121,6 +119,14 @@ class GroupedMLP(MegatronModule):
             and "moe_act" in self.config.recompute_modules
         )
 
+        @jit_fuser
+        def activation_func_with_probs(x, probs):
+            dtype = x.dtype
+            res = self.activation_func(x) * probs
+            return res.to(dtype)
+
+        self.activation_func_with_probs = activation_func_with_probs
+
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = parallel_state.get_expert_tensor_parallel_world_size()
         tp_rank = parallel_state.get_expert_tensor_parallel_rank()
@@ -215,7 +221,12 @@ class GroupedMLP(MegatronModule):
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
-    def forward(self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor):
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ):
         """Forward step of the GroupedMLP."""
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -228,15 +239,16 @@ class GroupedMLP(MegatronModule):
             fc1_output = gg.ops.gmm(
                 permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
             )
-
             if self.activation_recompute:
                 intermediate_parallel = self.activation_checkpoint.checkpoint(
-                    self.activation_func, fc1_output
+                    self.activation_func_with_probs, fc1_output, permuted_probs.unsqueeze(-1)
                 )
                 fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
                 self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
             else:
-                intermediate_parallel = self.activation_func(fc1_output)
+                intermediate_parallel = self.activation_func_with_probs(
+                    fc1_output, permuted_probs.unsqueeze(-1)
+                )
                 fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
         else:
             # No token is allocated for local experts.
@@ -247,11 +259,13 @@ class GroupedMLP(MegatronModule):
             w2 = self.weight2.view(-1, self.config.hidden_size)
             h = torch.matmul(permuted_local_hidden_states, w1)
             if self.activation_recompute:
-                h = self.activation_checkpoint.checkpoint(self.activation_func, h)
+                h = self.activation_checkpoint.checkpoint(
+                    self.activation_func_with_probs, h, permuted_probs.unsqueeze(-1)
+                )
                 fc2_output = torch.matmul(h, w2)
                 self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
             else:
-                h = self.activation_func(h)
+                h = self.activation_func_with_probs(h, permuted_probs.unsqueeze(-1))
                 fc2_output = torch.matmul(h, w2)
 
         return fc2_output, None
@@ -645,6 +659,9 @@ class TEGroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
+        assert (
+            config.add_bias_linear == False
+        ), "bias not supported in TEGroupedMLP yet, please set '--disable-bias-linear' instead."
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
@@ -689,7 +706,10 @@ class TEGroupedMLP(MegatronModule):
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
 
     def forward(
-        self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of TEGroupedMLP
 
@@ -697,6 +717,7 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
             local experts.
             tokens_per_expert (torch.Tensor): The number of tokens per expert.
+            permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
 
         Return:
             output (torch.Tensor): The output of the local experts.
@@ -707,29 +728,28 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states, tokens_per_expert = self.fp8_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
+            permuted_probs, _ = self.fp8_padding(
+                permuted_probs.unsqueeze(-1), actual_tokens_per_expert
+            )
+        else:
+            permuted_probs = permuted_probs.unsqueeze(-1)
 
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
 
-        def bias_act_func(intermediate_parallel, bias_parallel):
+        def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.bias_activation_fusion:
-                if self.activation_func == F.gelu:
-                    if self.config.gated_linear_unit:
-                        intermediate_parallel = bias_geglu_impl(
-                            intermediate_parallel, bias_parallel
-                        )
-                    else:
-                        assert self.config.add_bias_linear is True
-                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-                elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                    intermediate_parallel = bias_swiglu_impl(
+                if self.activation_func == F.silu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_swiglu_impl(
                         intermediate_parallel,
                         bias_parallel,
+                        permuted_probs,
                         self.config.activation_func_fp8_input_store,
                     )
                 else:
-                    raise ValueError("Only support fusion of gelu and swiglu")
+                    raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
             else:
                 if bias_parallel is not None:
                     shape = intermediate_parallel.shape
@@ -753,17 +773,22 @@ class TEGroupedMLP(MegatronModule):
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
                     intermediate_parallel = self.activation_func(intermediate_parallel)
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * permuted_probs
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             intermediate_parallel = self.activation_checkpoint.checkpoint(
-                bias_act_func, intermediate_parallel, bias_parallel
+                bias_act_func, intermediate_parallel, bias_parallel, permuted_probs
             )
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         else:
-            intermediate_parallel = bias_act_func(intermediate_parallel, bias_parallel)
+            intermediate_parallel = bias_act_func(
+                intermediate_parallel, bias_parallel, permuted_probs
+            )
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
 
         # upad and concat the output
@@ -830,7 +855,7 @@ class SequentialMLP(MegatronModule):
             expert = MLP(self.config, submodules, is_expert=True)
             self.local_experts.append(expert)
 
-    def _pad_tensor_for_fp8(self, hidden):
+    def _pad_tensor_for_fp8(self, hidden, probs):
         """Padding tensor shape to multiples of 16."""
         actual_num_tokens = hidden.shape[0]
         divisor = 16
@@ -840,33 +865,45 @@ class SequentialMLP(MegatronModule):
                 padded_num_tokens, hidden.shape[1], dtype=hidden.dtype, device=hidden.device
             )
             hidden = torch.cat((hidden, pad_tensor), dim=0)
-        return hidden
+            pad_probs = torch.zeros(padded_num_tokens, dtype=probs.dtype, device=probs.device)
+            probs = torch.cat((probs, pad_probs), dim=0)
+        return hidden, probs
 
-    def forward(self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: torch.Tensor):
+    def forward(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        tokens_per_expert: torch.Tensor,
+        permuted_probs: torch.Tensor,
+    ):
         """Forward step of the SequentialMLP."""
         if self.num_local_experts == 1:
             if self.config.fp8:
-                hidden = self._pad_tensor_for_fp8(permuted_local_hidden_states)
-                output, output_bias = self.local_experts[0](hidden)
+                hidden, probs = self._pad_tensor_for_fp8(
+                    permuted_local_hidden_states, permuted_probs
+                )
+                output, output_bias = self.local_experts[0](hidden, probs)
                 output = output[: permuted_local_hidden_states.shape[0]]
             else:
-                output, output_bias = self.local_experts[0](permuted_local_hidden_states)
+                output, output_bias = self.local_experts[0](
+                    permuted_local_hidden_states, permuted_probs
+                )
 
             return output, output_bias
         else:
             tokens_per_expert = tokens_per_expert.tolist()
             tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert)
+            probs_list = torch.split(permuted_probs, tokens_per_expert)
 
             output_local_list = []
             output_bias_list = []
 
-            for expert, tokens in zip(self.local_experts, tokens_list):
+            for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
                 if self.config.fp8:
-                    hidden = self._pad_tensor_for_fp8(tokens)
-                    output, output_bias = expert(hidden)
+                    hidden, probs = self._pad_tensor_for_fp8(tokens, probs)
+                    output, output_bias = expert(hidden, probs)
                     output = output[: tokens.shape[0]]
                 else:
-                    output, output_bias = expert(tokens)
+                    output, output_bias = expert(tokens, probs)
                 output_local_list.append(output)
                 if self.add_bias:
                     output_bias_list.append(output_bias.expand_as(output))

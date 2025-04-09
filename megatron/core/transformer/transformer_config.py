@@ -938,13 +938,16 @@ class TransformerConfig(ModelParallelConfig):
                 multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
 
-        if (
-            self.moe_token_dispatcher_type == "alltoall_seq"
-            and self.tensor_model_parallel_size != self.expert_tensor_parallel_size
-        ):
-            raise ValueError(
-                "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
-            )
+        if self.num_moe_experts is not None:
+            assert not self.add_bias_linear, "Bias is not supported for MoE"
+
+        if self.moe_token_dispatcher_type == "alltoall_seq":
+            if self.tensor_model_parallel_size != self.expert_tensor_parallel_size:
+                raise ValueError(
+                    "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
+                )
+            if self.moe_permute_fusion:
+                raise ValueError("alltoall_seq dispatcher does not support permute fusion.")
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
@@ -1019,13 +1022,17 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_permute_fusion:
             from megatron.core.transformer.moe.moe_utils import (
                 fused_permute,
+                fused_permute_with_probs,
                 fused_sort_chunks_by_index,
+                fused_sort_chunks_by_index_with_probs,
                 fused_unpermute,
             )
 
             if (
                 fused_permute is None
+                or fused_permute_with_probs is None
                 or fused_sort_chunks_by_index is None
+                or fused_sort_chunks_by_index_with_probs is None
                 or fused_unpermute is None
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")

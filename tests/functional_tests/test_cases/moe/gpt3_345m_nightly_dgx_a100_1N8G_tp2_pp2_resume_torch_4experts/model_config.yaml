@@ -51,5 +51,7 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --fp16: true
   --apply-query-key-layer-scaling: true
+  --disable-bias-linear: true
+  --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume
