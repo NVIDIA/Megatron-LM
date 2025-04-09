@@ -1,7 +1,7 @@
 .publish_common_freeze:
   stage: publish
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
+    - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH) && $PUBLISH == "yes" && $PUBLISH_SCOPE == "code-freeze"
       when: manual
     - when: never
 
@@ -374,8 +374,6 @@ publish:code_freeze:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  variables:
-    GIT_STRATEGY: "none"
   script:
     - git fetch origin $CI_DEFAULT_BRANCH
     - git config --global user.email "mcore-bot@nvidia.com"
@@ -385,6 +383,7 @@ publish:code_freeze:
     - VERSION=$(python -c "from megatron import core; print(core.__version__)")
     - RELEASE_BRANCH=core_r$VERSION
     - git switch --force-create $RELEASE_BRANCH origin/$CI_DEFAULT_BRANCH
+    - git push -u origin $RELEASE_BRANCH
     - |
       MESSAGE='{
         "blocks": [
@@ -400,11 +399,11 @@ publish:code_freeze:
     - |
       curl -X POST -H "Content-type: application/json" --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
 
+    - git switch main
     - git switch --force-create bot/chore/bump-version
     - git add megatron/core/package_info.py
     - |
       git commit -m "chore: adjust version version"
-
     - git push -u origin bot/chore/bump-version
     - |
       curl \
