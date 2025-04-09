@@ -34,6 +34,7 @@ class TestParallelSequentialMLP:
             bias_activation_fusion=True,
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
+            add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
@@ -50,7 +51,7 @@ class TestParallelSequentialMLP:
         assert isinstance(self.sequential_mlp, MoELayer)
 
         num_weights = sum([p.numel() for p in self.sequential_mlp.parameters()])
-        assert num_weights == 3696
+        assert num_weights == 3480
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -64,10 +65,8 @@ class TestParallelSequentialMLP:
         assert output.shape[0] == 32
         assert output.shape[1] == 2
         assert output.shape[2] == sequential_mlp.config.hidden_size
-        assert output_bias.shape[2] == sequential_mlp.config.hidden_size
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
-        assert output_bias.device.type == 'cuda'
 
 
 class TestTEParallelSequentialMLP:
@@ -90,6 +89,7 @@ class TestTEParallelSequentialMLP:
             expert_model_parallel_size=2,
             tensor_model_parallel_size=2,
             sequence_parallel=True,
+            add_bias_linear=False,
         )
 
         self.local_mlp_spec = MLPSubmodules(
@@ -146,9 +146,10 @@ class TestTEParallelSequentialMLP:
             dtype=torch.bfloat16,
             device="cuda",
         )
+        probs = torch.rand((seq_len, batch_size), dtype=torch.float32, device="cuda")
 
-        output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert)
-        output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert)
+        output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert, probs)
+        output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert, probs)
         assert torch.equal(output_local, output_te)
 
     @pytest.mark.internal
@@ -171,9 +172,10 @@ class TestTEParallelSequentialMLP:
             dtype=torch.bfloat16,
             device="cuda",
         )
+        probs = torch.rand((seq_len, batch_size), dtype=torch.float32, device="cuda")
 
-        output_local, _ = local_sequential_mlp(hidden_states, tokens_per_expert)
-        output_te, _ = te_sequential_mlp(hidden_states, tokens_per_expert)
+        output_local, _ = local_sequential_mlp(hidden_states, tokens_per_expert, probs)
+        output_te, _ = te_sequential_mlp(hidden_states, tokens_per_expert, probs)
         assert torch.equal(output_local, output_te)
 
     @pytest.mark.internal
@@ -194,8 +196,10 @@ class TestTEParallelSequentialMLP:
             dtype=torch.bfloat16,
             device="cuda",
         )
-        output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert)
-        output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert)
+        probs = torch.rand((seq_len, batch_size), dtype=torch.float32, device="cuda")
+
+        output_local, _ = self.local_sequential_mlp(hidden_states, tokens_per_expert, probs)
+        output_te, _ = self.te_sequential_mlp(hidden_states, tokens_per_expert, probs)
         assert torch.equal(output_local, output_te)
 
     def teardown_method(self, method):
