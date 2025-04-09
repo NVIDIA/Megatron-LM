@@ -87,6 +87,8 @@ test:build_image:
       - IMAGE: UTILITY_IMAGE
         FILE: Dockerfile.linting
         BASE_IMAGE: python:3.10
+  rules:
+    - when: always
 
 test:build_nemo_image:
   extends: [.build_image]
