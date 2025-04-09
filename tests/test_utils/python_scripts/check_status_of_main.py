@@ -26,7 +26,7 @@ def most_recent_pipeline(target_branch: str):
 
 
 def is_pending(pipeline: gitlab.v4.objects.Pipeline):
-    return pipeline.attributes['status'] == 'pending'
+    return pipeline.attributes['status'] == 'pending' or pipeline.attributes['status'] == 'running'
 
 
 def is_sucess(pipeline: gitlab.v4.objects.Pipeline):
