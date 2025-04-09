@@ -84,7 +84,9 @@ publish:test_release_pypi_test_wheel:
   image:
     name: python:3.11
     entrypoint: [""]
-  needs: [publish:test_release_pypi_build_wheel]
+  needs:
+    - job: publish:test_release_pypi_build_wheel
+      optional: true
   parallel:
     matrix:
       - PLATFORM: arm64
@@ -175,6 +177,8 @@ publish:test_release_pypi_push_wheel:
       fi
 
   rules:
+    - if: $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
+      when: never
     - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: on_success
@@ -502,4 +506,25 @@ publish:upload_statistics:
     - if: ($CI_PIPELINE_SOURCE == 'merge_request_event' || $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train') && ($UNIT_TEST == "yes" || $INTEGRATION_TEST == "yes" || $FUNCTIONAL_TEST == "yes")
       when: always
       allow_failure: true
+    - when: never
+
+public:review_reminder:
+  stage: publish
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  script:
+    - export GITLAB_ENDPOINT
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export SLACK_WEBHOOK_URL=${SLACK_REMINDER_HOOK}
+    - export SLACK_API_TOKEN=${SLACK_API_TOKEN}
+    - python tests/test_utils/python_scripts/auto_reminder.py
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  rules:
+    - if: $CI_COMMIT_BRANCH == "ko3n1g/ci/auto-reminder"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
     - when: never

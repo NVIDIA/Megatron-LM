@@ -5,6 +5,7 @@ import gitlab
 
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 GITLAB_ENDPOINT = os.getenv('GITLAB_ENDPOINT')
+RO_API_TOKEN = os.getenv("RO_API_TOKEN")
 
 
 def get_gitlab_handle():
