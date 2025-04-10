@@ -22,7 +22,6 @@ from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.fp8_utils import is_float8tensor
-from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_submodule, log_single_rank
@@ -124,8 +123,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             self.fsdp_unit_modules = [TransformerLayer]
-            if not getattr(self.module, "share_embeddings_and_output_weights", False):
-                self.fsdp_unit_modules.append(LanguageModelEmbedding)
         self.main_weights = True
         self.data_parallel_group = parallel_state.get_data_parallel_group(
             with_context_parallel=True

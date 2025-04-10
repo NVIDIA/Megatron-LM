@@ -38,6 +38,7 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
         gated_linear_unit=glu,
+        add_bias_linear=False,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
