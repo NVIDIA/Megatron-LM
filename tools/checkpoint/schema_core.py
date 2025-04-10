@@ -61,6 +61,10 @@ class CoreLocalSchema(CoreSchema):
             "self_attn_qkv_bias" : "self_attention.linear_qkv.bias",
             "self_attn_proj_weight" : "self_attention.linear_proj.weight",
             "self_attn_proj_bias" : "self_attention.linear_proj.bias",
+            "self_attn_q_layernorm_weight" : "self_attention.q_layernorm.weight",
+            "self_attn_q_layernorm_bias" : "self_attention.q_layernorm.bias",
+            "self_attn_k_layernorm_weight" : "self_attention.k_layernorm.weight",
+            "self_attn_k_layernorm_bias" : "self_attention.k_layernorm.bias",
 
             # MLP.
             "mlp_norm_weight" : "pre_mlp_layernorm.weight",
@@ -70,6 +74,9 @@ class CoreLocalSchema(CoreSchema):
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",
             "mlp_fc2_bias" : "mlp.linear_fc2.bias",
 
+            # xielu weights
+            "mlp_xielu_alpha_p" : "mlp.activation_func.alpha_p",
+            "mlp_xielu_alpha_n" : "mlp.activation_func.alpha_n",
         } | extra_layer_schema, prefix=prefix)
 
 
@@ -86,6 +93,10 @@ class CoreTESchema(CoreSchema):
 
             "self_attn_proj_weight" : "self_attention.linear_proj.weight",
             "self_attn_proj_bias" : "self_attention.linear_proj.bias",
+            "self_attn_q_layernorm_weight" : "self_attention.q_layernorm.weight",
+            "self_attn_q_layernorm_bias" : "self_attention.q_layernorm.bias",
+            "self_attn_k_layernorm_weight" : "self_attention.k_layernorm.weight",
+            "self_attn_k_layernorm_bias" : "self_attention.k_layernorm.bias",
 
             # MLP.
             "mlp_norm_weight" : "mlp.linear_fc1.layer_norm_weight",
@@ -94,6 +105,9 @@ class CoreTESchema(CoreSchema):
             "mlp_fc1_bias" : "mlp.linear_fc1.bias",
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",
             "mlp_fc2_bias" : "mlp.linear_fc2.bias",
+            # xielu weights
+            "mlp_xielu_alpha_p" : "mlp.activation_func.alpha_p",
+            "mlp_xielu_alpha_n" : "mlp.activation_func.alpha_n",
 
         } | extra_layer_schema, prefix=prefix)
 
@@ -113,6 +127,10 @@ class CoreMoETESchema(CoreSchema):
 
             "self_attn_proj_weight" : "self_attention.linear_proj.weight",
             "self_attn_proj_bias" : "self_attention.linear_proj.bias",
+            "self_attn_q_layernorm_weight" : "self_attention.q_layernorm.weight",
+            "self_attn_q_layernorm_bias" : "self_attention.q_layernorm.bias",
+            "self_attn_k_layernorm_weight" : "self_attention.k_layernorm.weight",
+            "self_attn_k_layernorm_bias" : "self_attention.k_layernorm.bias",
 
             # MLP.
             "mlp_norm_weight" : "pre_mlp_layernorm.weight",
@@ -123,6 +141,9 @@ class CoreMoETESchema(CoreSchema):
             **{f"mlp_fc1_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc1.weight" for expert_idx in range(num_local_experts) },
             **{f"mlp_fc2_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc2.weight" for expert_idx in range(num_local_experts) },
 
+            # xielu weights
+            **{f"mlp_xielu_alpha_p.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.activation_func.alpha_p.weight" for expert_idx in range(num_local_experts) },
+            **{f"mlp_xielu_alpha_n.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.activation_func.alpha_n.weight" for expert_idx in range(num_local_experts) },
         } | extra_layer_schema, prefix=prefix)
 
 

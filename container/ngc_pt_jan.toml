@@ -1,0 +1,9 @@
+image = "/capstor/store/cscs/swissai/a06/containers/NGC-PyTorch/ngc_pt_jan.sqsh"
+
+mounts = ["/capstor", "/iopsstor", "/users"]
+
+writable = true
+
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"

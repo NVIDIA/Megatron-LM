@@ -5,7 +5,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Iterable
 
 import torch
 import transformer_engine as te
@@ -61,6 +61,71 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
+class TERMSNorm(te.pytorch.RMSNorm):
+    """
+    Extension of original TE RMSNorm to allow arbitrary weight initialization"
+    """
+    def __init__(
+        self,
+        normalized_shape: Iterable[int] | int | None = None,
+        eps: float = 1e-5,
+        sequence_parallel: Optional[bool] = None,  # legacy
+        params_dtype: Optional[torch.dtype] = None,  # deprecated
+        zero_centered_gamma: bool = False,
+        hidden_size: Optional[int] = None,  # deprecated
+        init_value: Optional[float] = None,
+        **kwargs,
+    ) -> None:
+        self.init_value = init_value
+        assert self.init_value is None or not zero_centered_gamma
+        super().__init__(
+            normalized_shape=normalized_shape,
+            eps=eps,
+            sequence_parallel=sequence_parallel,
+            params_dtype=params_dtype,
+            zero_centered_gamma=zero_centered_gamma,
+            hidden_size=hidden_size,
+            **kwargs
+        )
+
+    def reset_parameters(self, defer_init: Optional[bool] = None) -> None:
+        """Init RMSNorm parameters"""
+
+        # Check whether to defer init (deprecated)
+        if defer_init is not None:
+            warnings.warn("defer_init argument to reset_parameters function is deprecated. Set device to 'meta' instead.",
+                          DeprecationWarning, stacklevel=2)
+            if defer_init:
+                return
+
+        # Reset parameters
+        weight = self.weight
+        device = weight.device
+        if device.type == "meta":
+            device = te.pytorch.utils.canonicalize_device(None)
+
+        # Initialize param buffers
+        if not te.pytorch.utils.devices_match(weight.device, device):
+            weight = torch.empty_like(weight, device=device)
+
+        # Initialize values (only changed this block, everything else remains as parent class).
+        if self.zero_centered_gamma:
+            torch.nn.init.zeros_(weight)
+        elif self.init_value is None:
+            torch.nn.init.ones_(weight)
+        else:
+            torch.nn.init.constant_(weight, self.init_value)
+
+        # Save updated parameter
+        if not isinstance(weight, torch.nn.Parameter):
+            weight = torch.nn.Parameter(weight)
+        self.weight = weight
+
+        # Flag for sequence parallelism (custom Megatron-LM integration)
+        if getattr(self, "sequence_parallel", None) is not None:
+            self.weight.sequence_parallel = self.sequence_parallel
+
+
 class TENorm:
     """
     A conditional wrapper to initialize an instance of Transformer-Engine's
@@ -81,11 +146,12 @@ class TENorm:
             assert hasattr(
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
-            instance = te.pytorch.RMSNorm(
+            instance = TERMSNorm(
                 hidden_size=hidden_size,
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
+                init_value=config.layernorm_init,
                 **_get_extra_te_kwargs(config),
             )
         else:

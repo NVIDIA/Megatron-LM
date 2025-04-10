@@ -52,7 +52,8 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> float:
+    ensure_individual_correct: bool = False,
+) -> tuple[list[torch.Tensor], float]:
     """Calculate the norm of gradients in fp32.
 
     This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
@@ -68,25 +69,31 @@ def get_grad_norm_fp32(
             world for the distributed optimizer.
 
     Returns:
-        Total norm of the parameters (viewed as a single vector).
+        Tuple containing:
+        - List of individual gradient norms for each tensor
+        - Total norm of all parameters combined (viewed as a single vector)
     """
 
     if isinstance(grads_for_norm, torch.Tensor):
         grads_for_norm = [grads_for_norm]
 
     data_parallel_group = None
+    data_parallel_groups = []
     for grad in grads_for_norm:
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
+        data_parallel_groups.append(data_parallel_group)
 
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
 
     # Norm parameters.
     norm_type = float(norm_type)
     total_norm = 0.0
+    individual_norms = []
 
     # Calculate norm.
     if norm_type == inf:
-        total_norm = max(grad.abs().max() for grad in grads_for_norm)
+        individual_norms = [grad.abs().max() for grad in grads_for_norm]
+        total_norm = max(individual_norms)
         total_norm_cuda = torch.tensor([float(total_norm)], dtype=torch.float, device='cuda')
         # Take max across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
@@ -104,36 +111,55 @@ def get_grad_norm_fp32(
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            if grads_for_norm:
-                grad_norm, _ = multi_tensor_applier(
+            if grads_for_norm:   #### DHIA: i think we are here
+                grad_norm, grad_norms_list = multi_tensor_applier(
                     l2_norm_impl,
                     dummy_overflow_buf,
                     [grads_for_norm],
-                    False,  # no per-parameter norm
+                    True,  # also return per-parameter grad-norms (TE implementation)
                 )
             else:
                 grad_norm = torch.tensor([0], dtype=torch.float, device='cuda')
+                grad_norms_list = [torch.tensor([0], dtype=torch.float, device='cuda')] ## dhia
+
             # Since we will be summing across data parallel groups,
             # we need the pow(norm-type).
             total_norm = grad_norm**norm_type
+            individ_norms = [grad_norms_list[i]**norm_type for i in range(len(grads_for_norm))] ## dhia
 
         else:
-            for grad in grads_for_norm:
-                grad_norm = torch.norm(grad, norm_type)
-                total_norm += grad_norm**norm_type
-
+            individ_norms = [torch.norm(grad, norm_type) for grad in grads_for_norm]
+            total_norm = sum(norm**norm_type for norm in individ_norms)
+            
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
             torch.distributed.all_reduce(
                 total_norm, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
-            )
+            ) 
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
-    return total_norm
+        # reduce individ_norms
+        if ensure_individual_correct:
+            assert all(group is None for group in data_parallel_group)  # We shouldn't be using distributed optimizer.
+            individ_norms_tensor = torch.cat(individ_norms)
+            torch.distributed.all_reduce(individ_norms_tensor, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group)
+            indiv_norms = indiv_norms**(1/norm_type)
+            indiv_norms = list(indiv_norms_tensor)
 
+            #for i in range(len(individ_norms)):
+            #    if data_parallel_groups[i]:
+            #        torch.distributed.all_reduce(
+            #            individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=data_parallel_groups[i]
+            #        )
+            #    torch.distributed.all_reduce(
+            #        individ_norms[i], op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
+            #    )
+            #    individ_norms[i] = individ_norms[i].item() ** (1 / norm_type)
+            
+    return individ_norms, total_norm
 
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],

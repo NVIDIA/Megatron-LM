@@ -5,6 +5,7 @@ import os
 import sys
 import torch
 import types
+from torch.utils.data import DataLoader
 
 from schema_core import get_model_schema
 from loader_base import MegatronCheckpointLoaderBase
@@ -30,6 +31,7 @@ def add_arguments(parser):
                        help='Which Transformer implementation to use.')
 
 
+# TODO: Check if MegatronCheckpointLoaderLLM works, and we need to add the args.test_logits support.
 class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
     """
     Orchestrates loading a Megatron checkpoint and sending

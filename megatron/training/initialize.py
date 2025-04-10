@@ -30,6 +30,7 @@ from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
 from megatron.training.yaml_arguments import validate_yaml
+from megatron.core.metrics_tracking import init_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,8 @@ def initialize_megatron(
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 
             MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
+
+        init_tracker(args, args.log_intermediate_metrics)
 
     if skip_mpu_initialization:
         return None

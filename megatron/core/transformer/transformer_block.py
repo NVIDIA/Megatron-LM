@@ -20,7 +20,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import deprecate_inference_params, make_viewless_tensor, is_te_min_version
+from megatron.core.metrics_tracking import get_tracker
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -217,14 +218,14 @@ class TransformerBlock(MegatronModule):
         self,
         config: TransformerConfig,
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
-        post_layer_norm: bool = True,
+        final_layer_norm: bool = True,
         pre_process: bool = True,
         post_process: bool = True,
     ):
         super().__init__(config=config)
 
         self.submodules = _get_block_submodules(config, spec)
-        self.post_layer_norm = post_layer_norm
+        self.final_layer_norm = final_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
 
@@ -277,8 +278,8 @@ class TransformerBlock(MegatronModule):
 
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
-        # self.post_process and self.post_layer_norm guide this behavior
-        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+        # self.post_process and self.final_layer_norm guide this behavior
+        if self.submodules.layer_norm and self.post_process and self.final_layer_norm:
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
@@ -493,6 +494,9 @@ class TransformerBlock(MegatronModule):
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
+                    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+                    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+                    true_l_no = l_no + pp_rank*self.config.num_layers//pp_size
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -512,6 +516,7 @@ class TransformerBlock(MegatronModule):
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
+                    tracker.update(hidden_states, "activation", true_l_no)
 
                     if (
                         torch.is_grad_enabled()

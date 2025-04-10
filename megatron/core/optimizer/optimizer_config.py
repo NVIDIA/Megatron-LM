@@ -105,6 +105,20 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
+    # AdEMAMix
+    ademamix_alpha: float = 2.0
+    """AdEMAMix alpha coefficient mixing the slow and fast EMAs."""
+    
+    ademamix_beta3: float = 0.9999
+    """AdEMAMix beta3 parameter for slow momentum."""
+    
+    ademamix_beta3_warmup: Optional[int] = None
+    """Number of warmup steps used to increase beta3."""
+    
+    ademamix_alpha_warmup: Optional[int] = None
+    """Number of warmup steps used to increase alpha."""
+
+
     #######################
     # Distributed optimizer
     #######################
@@ -150,6 +164,8 @@ class OptimizerConfig:
 
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
+
+    log_indiv_grad_norm: bool = False
 
     barrier_with_L1_time: bool = False
     """If true, use barrier with level 1 time measurements."""

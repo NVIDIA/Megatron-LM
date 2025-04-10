@@ -19,6 +19,8 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.activations import XIELU, XIPReLU, XIPReLUP
+from megatron.core.metrics_tracking import get_tracker
 
 
 # pylint: disable=missing-class-docstring
@@ -57,6 +59,7 @@ class MLP(MegatronModule):
         self.config: TransformerConfig = config
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
+        self.layer_number = None
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
@@ -82,7 +85,14 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc1',
         )
 
-        self.activation_func = self.config.activation_func
+        if self.config.activation_func == XIELU:
+            self.activation_func = XIELU(config=self.config)
+        elif self.config.activation_func == XIPReLU:
+            self.activation_func = XIPReLU(config=self.config)
+        elif self.config.activation_func == XIPReLUP:
+            self.activation_func = XIPReLUP(config=self.config)
+        else:
+            self.activation_func = self.config.activation_func
 
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
@@ -100,7 +110,14 @@ class MLP(MegatronModule):
     def forward(self, hidden_states):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
+
+        if self.config.mlp_alpha is not None:
+            hidden_states = self.config.mlp_alpha*hidden_states
+
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+
+        tracker = get_tracker()
+        tracker.update(intermediate_parallel, "mlp_intermediate", self.layer_number - 1)
 
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
@@ -133,6 +150,8 @@ class MLP(MegatronModule):
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
 
+        tracker.update(output, "mlp_out", self.layer_number - 1)
+
         return output, output_bias
 
     # pylint: disable=missing-function-docstring
@@ -151,6 +170,9 @@ class MLP(MegatronModule):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
+
+    def set_layer_number(self, layer_number: int):
+        self.layer_number = layer_number
 
 
 # pylint: disable=missing-function-docstring
@@ -233,7 +255,7 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                 )
             if flattened_range.stop > chunk_numel:
                 # Non-empty `v` chunk
-                tensor_v = t[-(flattened_range.stop - chunk_numel) :]
+                tensor_v = t[-(flattened_range.stop - chunk_numel):]
                 flattened_range_v = slice(
                     max(chunk_numel, flattened_range.start) - chunk_numel,
                     flattened_range.stop - chunk_numel,

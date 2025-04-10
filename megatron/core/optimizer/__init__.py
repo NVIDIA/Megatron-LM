@@ -24,6 +24,8 @@ except ImportError:
         # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
         from torch.optim import AdamW as Adam, SGD
 
+from .ademamix import AdEMAMix
+
 from megatron.core import mpu
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 
@@ -99,11 +101,19 @@ def _get_param_groups(
             else:
                 # Do not regularize biases and norm parameters.
                 no_wd = name.endswith(".bias") or len(param.shape) == 1
+            print(f"WD {name} ({param.shape}) no_wd={no_wd}")
+
+            # TODO add more elegant way to disable weight decay for alpha_p and alpha_n
+            if any(keyword in name for keyword in ["alpha_p", "alpha_n", "power"]):
+                no_wd = True
 
             if scale_lr_cond is not None:
                 scale_lr = scale_lr_cond(name, param)
             else:
                 scale_lr = False
+
+            if scale_lr:
+                print(f"Parameter {name} will use lr_mult {lr_mult}")
 
             if not no_wd and not scale_lr:
                 wd_mult, _lr_mult = 1.0, 1.0
@@ -122,13 +132,13 @@ def _get_param_groups(
             ):
                 is_decoupled_lr = True
 
-            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
+            key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr, name)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
 
     param_groups = []
-    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():
+    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr, name), params in params_map.items():
         assert len(params) > 0
         param_group = {
             'params': params,
@@ -136,6 +146,7 @@ def _get_param_groups(
             'lr_mult': _lr_mult,
             'is_expert_parallel': is_expert_parallel,
             'is_decoupled_lr': is_decoupled_lr,
+            'name': name
         }
         param_groups.append(param_group)
 
@@ -346,6 +357,32 @@ def _get_megatron_optimizer_based_on_param_groups(
                                 opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
                             else:
                                 opt.initialize_state(p)
+
+        elif config.optimizer == 'ademamix':
+            kwargs = {
+                "params": param_groups,
+                "lr": config.lr,
+                "weight_decay": config.weight_decay,
+                "betas": (config.adam_beta1, config.adam_beta2, config.ademamix_beta3),
+                "alpha": config.ademamix_alpha,
+                "beta3_warmup": config.ademamix_beta3_warmup,
+                "alpha_warmup": config.ademamix_alpha_warmup,
+                "eps": config.adam_eps,
+            }
+
+            optimizer = AdEMAMix(**kwargs)
+
+            def init_state_fn(opt, config=None):
+                for group in opt.param_groups:
+                    for p in group['params']:
+                        if len(opt.state[p]) == 0:
+                            if config.adam_beta1 != 0:
+                                opt.state[p]['exp_avg_fast'] = torch.zeros_like(p.data)
+                            opt.state[p]['exp_avg_slow'] = torch.zeros_like(p.data)
+                            opt.state[p]['exp_avg_sq'] = torch.zeros_like(p.data)
+                        else:
+                            opt.initialize_state(p)
+
 
         elif config.optimizer == 'sgd':
             optimizer = SGD(

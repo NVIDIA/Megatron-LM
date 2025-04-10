@@ -186,9 +186,11 @@ class TransformerLayerSubmodules:
 
     Args:
         input_layernorm (Union[ModuleSpec, type]): Specification for the input layer normalization.
+
         self_attention (Union[ModuleSpec, type]): Specification for the self-attention mechanism.
         self_attn_bda (Union[ModuleSpec, type]): Specification for the bias-dropout-add operation
             after self-attention.
+        
         pre_cross_attn_layernorm (Union[ModuleSpec, type]): Specification for the layer
             normalization before cross-attention.
         cross_attention (Union[ModuleSpec, type]): Specification for the cross-attention mechanism.
@@ -204,8 +206,11 @@ class TransformerLayerSubmodules:
     """
 
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
+
     self_attention: Union[ModuleSpec, type] = IdentityOp
     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    attention_layerscale: ModuleSpec | type = IdentityOp
+    post_attention_layernorm: ModuleSpec | type = IdentityOp
 
     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
     cross_attention: Union[ModuleSpec, type] = IdentityOp
@@ -214,6 +219,8 @@ class TransformerLayerSubmodules:
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     mlp: Union[ModuleSpec, type] = IdentityOp
     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
+    mlp_layerscale: ModuleSpec | type = IdentityOp
+    post_mlp_layernorm: ModuleSpec | type = IdentityOp
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
@@ -301,6 +308,22 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             **attention_optional_kwargs,
         )
 
+        # [Module 2.1: PostSelfAttention Layernorm (but pre residual)]
+        self.post_attention_layernorm = build_module(
+            submodules.post_attention_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
+        # [Module 2.2: PostAttention LayerScale]
+        self.attention_layerscale = build_module(
+            submodules.attention_layerscale,
+            hidden_size=self.config.hidden_size,
+            initial_value=self.config.layer_scale,
+            sequence_parallel=self.config.sequence_parallel,
+        )
+
         # [Module 3: BiasDropoutFusion]
         self.self_attn_bda = build_module(submodules.self_attn_bda)
 
@@ -334,6 +357,22 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.mlp = build_module(submodules.mlp, config=self.config)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
+
+        # [Module 8.1: Post MLP layernorm (pre-residual).
+        self.post_mlp_layernorm = build_module(
+            submodules.post_mlp_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
+        # [Module 8.2: PostMLP LayerScale]
+        self.mlp_layerscale = build_module(
+            submodules.mlp_layerscale,
+            hidden_size=self.config.hidden_size,
+            initial_value=self.config.layer_scale,
+            sequence_parallel=self.config.sequence_parallel,
+        )
 
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
@@ -421,7 +460,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
-        attention_output_with_bias = self.self_attention(
+        attention_output, bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -432,6 +471,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
+
+        # Post Attention Layernorm.
+        attention_output = self.post_attention_layernorm(attention_output)
+        attention_output = self.attention_layerscale(attention_output)
+        attention_output_with_bias = (attention_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -485,7 +529,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """
 
         # MLP.
-        mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+        mlp_output, bias = self.mlp(pre_mlp_layernorm_output)
+        mlp_output = self.post_mlp_layernorm(mlp_output)
+        mlp_output = self.mlp_layerscale(mlp_output)
+        mlp_output_with_bias = (mlp_output, bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?

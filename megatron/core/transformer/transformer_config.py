@@ -135,6 +135,17 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    layernorm_init: Optional[float] = None
+
+    layer_scale: Optional[float] = None
+
+    qknorm_init: Optional[float] = None
+
+    dyt_bias: bool = False
+    dyt_alpha_init: float = 1.0
+
+    mlp_alpha: Optional[float] = None
+
     ####################
     # initialization
     ####################
@@ -498,6 +509,9 @@ class TransformerConfig(ModelParallelConfig):
 
     mamba_num_groups: int = 8
     """The number of groups used in Mamba layers."""
+
+    log_kurtosis: bool = False
+    """Whether to log kurtosis or not.
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

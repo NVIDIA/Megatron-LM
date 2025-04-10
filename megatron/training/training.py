@@ -3,7 +3,8 @@
 """Pretrain utilities."""
 
 import dataclasses
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 import functools
 import gc
 import logging
@@ -57,6 +58,7 @@ from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
 from megatron.training.utils import (
+    is_rank0,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
 )
@@ -82,11 +84,13 @@ from megatron.core.num_microbatches_calculator import (
     get_current_running_global_batch_size,
     get_num_microbatches,
     update_num_microbatches)
+from megatron.core.metrics_tracking import get_tracker
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
+    calc_params_l2_norm_per_param,
     check_adlr_autoresume_termination,
     logical_and_across_model_parallel_group,
     reduce_max_stat_across_model_parallel_group,
@@ -326,6 +330,8 @@ def get_start_time_from_progress_log():
     start_time = None
     start_num_floating_point_operations = None
     latest_num_floating_point_operations = 0
+    start_tokens_so_far = None
+    latest_tokens_so_far = 0
 
     def _get_field(string, type):
         return type(string.split(': ')[1])
@@ -338,20 +344,24 @@ def get_start_time_from_progress_log():
             if line_tokens[3] == "Saved checkpoint":
                 latest_num_floating_point_operations = \
                     _get_field(line_tokens[7], float)
+                latest_tokens_so_far = \
+                    _get_field(line_tokens[8], float)
             if world_size_in_line != args.world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
                 start_num_floating_point_operations = None
+                start_tokens_so_far = None
                 continue
             if line_tokens[3] == "Starting job":
                 if start_time is None:
                     start_time = line_tokens[0]
                     start_num_floating_point_operations = \
                         latest_num_floating_point_operations
+                    start_tokens_so_far = latest_tokens_so_far * 10**9
     assert start_time is not None and start_num_floating_point_operations is not None, \
         "Should have seen at least one 'Starting job' entry with same world_size"
     return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), \
-        start_num_floating_point_operations
+        start_num_floating_point_operations, start_tokens_so_far
 
 
 def preprocess_common_state_dict(common_state_dict):
@@ -588,116 +598,135 @@ def pretrain(
         non_loss_data_func (callable): A custom function to call during evaluation.
             It can run e.g. benchmarks.
     """
+    try:
+        # Initalize and get arguments, timers, and Tensorboard writer.
+        initialize_megatron(
+            extra_args_provider=extra_args_provider,
+            args_defaults=args_defaults,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks
+        )
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
-        extra_args_provider=extra_args_provider,
-        args_defaults=args_defaults,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks
-    )
+        args = get_args()
+        timers = get_timers()
 
-    args = get_args()
-    timers = get_timers()
+        if args.log_progress:
+            append_to_progress_log("Starting job")
 
-    if args.log_progress:
-        append_to_progress_log("Starting job")
+        # Initialize fault tolerance
+        # NOTE: ft_integration functions other than `setup` are no-op if the FT is not initialized
+        if args.enable_ft_package:
+            ft_integration.setup(args)
+            ft_integration.maybe_setup_simulated_fault()
 
-    # Initialize fault tolerance
-    # NOTE: ft_integration functions other than `setup` are no-op if the FT is not initialized
-    if args.enable_ft_package:
-        ft_integration.setup(args)
-        ft_integration.maybe_setup_simulated_fault()
+        # Set pytorch JIT layer fusion options and warmup JIT functions.
+        set_jit_fusion_options()
 
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+        # Adjust the startup time so it reflects the largest value.
+        # This will be closer to what scheduler will see (outside of
+        # image ... launches.
+        global _TRAIN_START_TIME
+        start_time_tensor = torch.tensor([_TRAIN_START_TIME],
+                                        dtype=torch.double,
+                                        device='cuda')
+        torch.distributed.all_reduce(start_time_tensor,
+                                    op=torch.distributed.ReduceOp.MIN)
+        _TRAIN_START_TIME = start_time_tensor.item()
 
-    # Adjust the startup time so it reflects the largest value.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches.
-    global _TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_TRAIN_START_TIME],
-                                     dtype=torch.double,
-                                     device='cuda')
-    torch.distributed.all_reduce(start_time_tensor,
-                                 op=torch.distributed.ReduceOp.MIN)
-    _TRAIN_START_TIME = start_time_tensor.item()
+        app_metrics = {}
+        app_metrics['app_start_time'] = round(_TRAIN_START_TIME * 1000.0)
+        app_metrics['app_model_init_start_time'] = round(_TRAIN_START_TIME * 1000.0)
 
-    app_metrics = {}
-    app_metrics['app_start_time'] = round(_TRAIN_START_TIME * 1000.0)
-    app_metrics['app_model_init_start_time'] = round(_TRAIN_START_TIME * 1000.0)
+        print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
+            time.time() - _TRAIN_START_TIME))
+        print_datetime('after megatron is initialized')
+        app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
-    print_rank_0('time to initialize megatron (seconds): {:.3f}'.format(
-        time.time() - _TRAIN_START_TIME))
-    print_datetime('after megatron is initialized')
-    app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        # Track E2E metrics on pretrain start
+        one_logger_utils.on_pretrain_start()
 
-    # Track E2E metrics on pretrain start
-    one_logger_utils.on_pretrain_start()
+        # Context used for persisting some state between checkpoint saves.
+        if args.non_persistent_ckpt_type == 'local':
+            try:
+                from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
+                    LocalCheckpointManager
+                from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import \
+                    parse_group_sequence, GroupWrapper
+                from nvidia_resiliency_ext.checkpointing.local.replication.strategies import \
+                    CliqueReplicationStrategy
+            except ModuleNotFoundError:
+                raise RuntimeError("The 'nvidia_resiliency_ext' module is required for local "
+                                "checkpointing but was not found. Please ensure it is installed.")
 
-    # Context used for persisting some state between checkpoint saves.
-    if args.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \
-                LocalCheckpointManager
-            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import \
-                parse_group_sequence, GroupWrapper
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import \
-                CliqueReplicationStrategy
-        except ModuleNotFoundError:
-            raise RuntimeError("The 'nvidia_resiliency_ext' module is required for local "
-                               "checkpointing but was not found. Please ensure it is installed.")
+            if args.replication:
+                repl_strategy = CliqueReplicationStrategy.from_replication_params(
+                    args.replication_jump,
+                    args.replication_factor
+                )
+            else:
+                repl_strategy = None
 
-        if args.replication:
-            repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                args.replication_jump,
-                args.replication_factor
-            )
+            checkpointing_context = {
+                'local_checkpoint_manager': LocalCheckpointManager(args.non_persistent_local_ckpt_dir,
+                                                                repl_strategy=repl_strategy
+                                                                )
+            }
         else:
-            repl_strategy = None
+            checkpointing_context = {}
 
-        checkpointing_context = {
-            'local_checkpoint_manager': LocalCheckpointManager(args.non_persistent_local_ckpt_dir,
-                                                               repl_strategy=repl_strategy
-                                                               )
-        }
-    else:
-        checkpointing_context = {}
+        def no_wd_decay_cond(name: str, param: torch.nn.Parameter) -> bool:
+            if name.endswith(".bias"):
+                return True
+            if "k_layernorm.weight" in name or "q_layernorm.weight" in name:
+                return not args.weight_decay_qk_gains
+            return len(param.shape) == 1 
 
-    # Model, optimizer, and learning rate.
-    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context)
+        def scale_lr_cond(name: str, param: torch.nn.Parameter) -> bool:
+            return ("k_layernorm.weight" in name or "q_layernorm.weight" in name) and args.no_train_qk_gains
 
-    timers('model-and-optimizer-setup').stop()
-    print_datetime('after model, optimizer, and learning rate '
-                   'scheduler are built')
-    app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-    config = get_model_config(model[0])
+        # Model, optimizer, and learning rate.
+        timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+        app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_provider, model_type, checkpointing_context=checkpointing_context,
+            no_wd_decay_cond=no_wd_decay_cond,
+            scale_lr_cond=scale_lr_cond,
+            lr_mult=0.0,
+            )
 
-    # Data stuff.
-    app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(
-        barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for i in range(len(model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
-            iterators = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
-    else:
-        train_data_iterator, valid_data_iterator, test_data_iterator \
-            = build_train_valid_test_data_iterators(
-                train_valid_test_dataset_provider)
-    timers('train/valid/test-data-iterators-setup').stop()
-    print_datetime('after dataloaders are built')
-    app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        timers('model-and-optimizer-setup').stop()
+        print_datetime('after model, optimizer, and learning rate '
+                    'scheduler are built')
+        app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+        config = get_model_config(model[0])
+
+        # Data stuff.
+        app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        timers('train/valid/test-data-iterators-setup', log_level=0).start(
+            barrier=True)
+        if args.virtual_pipeline_model_parallel_size is not None:
+            train_data_iterator = []
+            valid_data_iterator = []
+            test_data_iterator = []
+            for i in range(len(model)):
+                mpu.set_virtual_pipeline_model_parallel_rank(i)
+                iterators = build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider)
+                train_data_iterator.append(iterators[0])
+                valid_data_iterator.append(iterators[1])
+                test_data_iterator.append(iterators[2])
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator \
+                = build_train_valid_test_data_iterators(
+                    train_valid_test_dataset_provider)
+        timers('train/valid/test-data-iterators-setup').stop()
+        print_datetime('after dataloaders are built')
+        app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+    
+    except AssertionError:
+        print_rank_0("An error has been detected; Canceling pending scheduled jobs.")
+        Path(args.exit_trigger).touch()
+        raise
 
     # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(args.train_iters, args.skip_train, args.do_train,
@@ -736,6 +765,9 @@ def pretrain(
                             num_floating_point_operations_so_far, checkpointing_context,
                             train_data_iterator=train_data_iterator,
                             preprocess_common_state_dict_fn=preprocess_common_state_dict)
+            if args.log_progress:
+                compute_throughputs_and_append_to_progress_log(iteration,
+                                                            num_floating_point_operations_so_far)
 
         one_logger and one_logger.log_metrics({
             'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -762,13 +794,13 @@ def pretrain(
                                    verbose=True, write_to_tensorboard=not args.skip_train,
                                    non_loss_data_func=non_loss_data_func)
 
-    wandb_writer = get_wandb_writer()
-    if wandb_writer:
-        wandb_writer.finish()
-
     ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+
+    wandb_writer = get_wandb_writer()
+    if wandb_writer:
+        wandb_writer.finish()
 
     one_logger and one_logger.log_metrics({
         'app_finish_time': one_logger_utils.get_timestamp_in_ms()
@@ -1092,7 +1124,7 @@ def setup_model_and_optimizer(model_provider_func,
         })
         timers('load-checkpoint', log_level=0).start(barrier=True)
 
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+        args.iteration, args.num_floating_point_operations_so_far, args.tokens_so_far = load_checkpoint(
                 model, optimizer, opt_param_scheduler, checkpointing_context=checkpointing_context,
                 skip_load_to_model_and_opt=HAVE_FSDP2 and getattr(args, "use_torch_fsdp2", False) and args.ckpt_format == "torch_dist")
         timers('load-checkpoint').stop(barrier=True)
@@ -1193,7 +1225,7 @@ def train_step(forward_step_func, data_iterator,
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    update_successful, grad_norm, num_zeros_in_grad, individ_grad_norm = optimizer.step()
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -1248,13 +1280,13 @@ def train_step(forward_step_func, data_iterator,
                     numerator += val
                     denominator += 1
             loss_reduced[key] = numerator / denominator
-        return loss_reduced, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad
+        return loss_reduced, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, individ_grad_norm, num_zeros_in_grad
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, individ_grad_norm, num_zeros_in_grad
 
 
 def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_rate, iteration,
                  loss_scale, report_memory_flag, skipped_iter,
-                 grad_norm, params_norm, num_zeros_in_grad):
+                 grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad, indiv_grad_norms):
     """Log training information such as losses, timing, ...."""
     args = get_args()
     timers = get_timers()
@@ -1336,9 +1368,19 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
        (iteration % args.tensorboard_log_interval == 0):
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
+
+    if iteration % args.tensorboard_log_interval == 0:
+        tracker = get_tracker()
+        timers("tracker-aggregate", log_level=0).start(barrier=True)
+        tracker.aggregate()
+        timers("tracker-aggregate").stop()
+
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
-            wandb_writer.log({'samples vs steps': args.consumed_train_samples},
+            wandb_writer.log({
+                              'consumed-samples': args.consumed_train_samples,
+                              'consumed-tokens': args.consumed_train_samples * args.seq_length ,
+                             },
                              iteration)
         writer.add_scalar('learning-rate', learning_rate, iteration)
         writer.add_scalar('learning-rate vs samples', learning_rate,
@@ -1351,11 +1393,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
-        writer.add_scalar('batch-size', batch_size, iteration)
-        writer.add_scalar('batch-size vs samples', batch_size,
-                          args.consumed_train_samples)
-        if wandb_writer:
-            wandb_writer.log({'batch-size': batch_size}, iteration)
+        if args.rampup_batch_size:
+            writer.add_scalar('batch-size', batch_size, iteration)
+            writer.add_scalar('batch-size vs samples', batch_size,
+                            args.consumed_train_samples)
+            if wandb_writer:
+                wandb_writer.log({'batch-size': batch_size}, iteration)
         for key in loss_dict:
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
@@ -1392,6 +1435,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                               args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
+        if params_norm_per_param is not None:
+            for k, v in params_norm_per_param.items():
+                writer.add_scalar(f'params-norm/{k}', v, iteration)
+                writer.add_scalar(f'params-norm vs samples/{k}', v,
+                              args.consumed_train_samples)
+                if wandb_writer:
+                    wandb_writer.log({f'params-norm/{k}': v}, iteration)
         if args.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
@@ -1414,6 +1464,27 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+        if args.log_indiv_grad_norm:
+            for param_shape, norm in indiv_grad_norms.items():
+                writer.add_scalar(f'grad-norm/{param_shape}', norm, iteration)
+                writer.add_scalar(f'grad-norm/{param_shape} vs samples', norm,
+                               args.consumed_train_samples)
+                if wandb_writer:
+                    wandb_writer.log({f'grad-norm/{param_shape}': norm}, iteration)
+                    
+        for key, value in tracker.get_final_metrics():
+            writer.add_scalar(key, value, iteration)
+            if wandb_writer:
+                wandb_writer.log({key: value}, iteration)
+        if args.log_timers_to_tensorboard:
+            elapsed = timers("tracker-aggregate").elapsed(barrier=True)
+            if writer:
+                writer.add_scalar("tracker-agg-time", elapsed, iteration)
+            if wandb_writer:
+                wandb_writer.log({"tracker-agg-time": elapsed}, iteration)
+
+    tracker.reset()
+
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_moe_metrics(moe_loss_scale, iteration, writer, wandb_writer, total_loss_dict, args.moe_per_layer_logging)
@@ -1431,6 +1502,26 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         throughput = num_floating_point_operations(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
 
+        # Calculate tokens per second
+        tokens_per_iteration = args.global_batch_size * args.seq_length
+        tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
+        tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+        
+        # Calculate ETA
+        iterations_remaining = args.train_iters - iteration
+        eta_seconds = iterations_remaining * elapsed_time_per_iteration
+        eta = str(timedelta(seconds=int(eta_seconds)))
+
+        if writer:
+            writer.add_scalar('tokens-per-sec-per-GPU', tokens_per_sec_per_gpu, iteration)
+            writer.add_scalar('eta-seconds', eta_seconds, iteration)
+            
+        if wandb_writer:
+            wandb_writer.log({
+                'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu,
+                'eta-seconds': eta_seconds
+            }, iteration)
+
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
         if args.log_timers_to_tensorboard:
@@ -1445,18 +1536,22 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             iteration, args.train_iters)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
+        consumed_tokens = args.consumed_train_samples * args.seq_length / 1e9
+        log_string += ' consumed tokens: {:.3f}B |'.format(consumed_tokens)
         if args.skipped_train_samples > 0:
             log_string += ' skipped samples: {:12d} |'.format(
                 args.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0)
+        log_string += f" eta: {eta} |"
+        log_string += f" tokens/sec/gpu: {tokens_per_sec_per_gpu:.1f} |"
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_writer.log({'TFLOPs-per-GPU': throughput}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         log_string += f' learning rate: {learning_rate:.6E} |'
         if args.decoupled_lr is not None and (mpu.is_pipeline_first_stage(ignore_virtual=True) or
@@ -1511,28 +1606,34 @@ def compute_throughputs_and_append_to_progress_log(iteration,
     # args.num_floating_point_operations_so_far keeps track of floating-point operations
     # completed at the start of job.
     global _TRAIN_START_TIME
+    job_time = time.time() - _TRAIN_START_TIME
     job_throughput = \
         (num_floating_point_operations_so_far -
          args.num_floating_point_operations_so_far) / (
-            (time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+            job_time * 10**12 * args.world_size)
+    
+    tokens_so_far = args.consumed_train_samples * args.seq_length
+    job_token_throughput = (tokens_so_far - args.tokens_so_far) / (job_time * args.world_size)
 
     # Compute cumulative throughput since jobs of this world size were launched.
     # `get_start_time_from_progress_log` returns start time and number of floating-point
     # operations of first job of this world size.
-    start_time, start_num_floating_point_operations = get_start_time_from_progress_log()
+    start_time, start_num_floating_point_operations, start_tokens_so_far = get_start_time_from_progress_log()
     elapsed_time = (datetime.now() - start_time).total_seconds()
     cumulative_throughput = \
         (num_floating_point_operations_so_far -
          start_num_floating_point_operations) / (
             elapsed_time * 10**12 * args.world_size)
+    cumulative_token_throughput = (tokens_so_far - start_tokens_so_far) / (elapsed_time * args.world_size)    
 
-    tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
                            f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
                            f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
                            f"Floating-point operations: {num_floating_point_operations_so_far:.2e}\t"
-                           f"Tokens (in billions): {tokens_so_far / 10**9:.2f}")
+                           f"Tokens (in billions): {tokens_so_far / 10**9:.2f}\t"
+                           f"Job token throughput: {job_token_throughput:.1f} Tokens/s/GPU\t"
+                           f"Cumulative token throughput: {cumulative_token_throughput:.1f} Tokens/s/GPU")
 
 
 def enable_forward_pre_hook(model_chunks):
@@ -1646,13 +1747,13 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
     saved_checkpoint = False
     if args.exit_signal_handler:
         signal_handler = get_signal_handler()
-        if any(signal_handler.signals_received()):
+        if signal_handler.signals_received():
             if args.save:
                 save_checkpoint_and_time(iteration, model, optimizer,
                                          opt_param_scheduler,
                                          num_floating_point_operations_so_far,
                                          checkpointing_context, train_data_iterator=train_data_iterator)
-            print_datetime('exiting program after receiving SIGTERM.')
+            print_datetime('exiting program after receiving SIGUSR2.')
 
             return True
 
@@ -1704,6 +1805,21 @@ def checkpoint_and_decide_exit(model, optimizer, opt_param_scheduler, iteration,
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
+    
+    # Exit & Save triggers 
+    # NOTE(tj.solergibert) We `% args.log_interval` to not check too frequently os.path.isfile & the triggers are visible to all ranks
+    if iteration % args.log_interval == 0 and args.trigger_path is not None:
+        if os.path.isfile(args.save_trigger):
+            if args.save and not saved_checkpoint:
+                save_checkpoint_and_time(iteration, model, optimizer,
+                                opt_param_scheduler,
+                                num_floating_point_operations_so_far,
+                                checkpointing_context, train_data_iterator=train_data_iterator)
+            torch.distributed.barrier()
+            if is_rank0():
+                os.remove(args.save_trigger)
+        if os.path.isfile(args.exit_trigger):
+            return True
 
     return False
 
@@ -1896,10 +2012,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             args.skipped_train_samples += batch_size
             continue
 
+        # Determine if we should enable the tracker (i.e. if we are going to log this iteration).
+        if iteration % args.tensorboard_log_interval == 0:
+            tracker = get_tracker()
+            tracker.enable()
+
         # Run training step.
         args.curr_iteration = iteration
         ft_integration.on_training_step_start()
-        loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad = \
+        loss_dict, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, individ_grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
@@ -1958,6 +2079,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+        params_norm_per_param = None
+        if args.log_params_norm_per_param:
+            params_norm_per_param = calc_params_l2_norm_per_param(model)
+
         learning_rate = None
         decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
@@ -1970,7 +2095,9 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                           decoupled_learning_rate,
                                           iteration, loss_scale,
                                           report_memory_flag, skipped_iter,
-                                          grad_norm, params_norm, num_zeros_in_grad)
+                                          grad_norm, params_norm, params_norm_per_param, num_zeros_in_grad,
+                                          individ_grad_norm)
+        tracker.disable()  # We won't track any activation metrics during evaluation iterations.
 
         # Evaluation.
         if args.eval_interval and iteration % args.eval_interval == 0 and \
@@ -2040,6 +2167,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             wandb_writer.finish()
         ft_integration.shutdown()
         sys.exit(exit_code)
+
+    torch.distributed.barrier()
+    #if iteration >= args.train_iters and is_rank0():
+    #    print(f"Training finished after {iteration} iterations; Canceling pending scheduled jobs.")
+    #    Path(args.exit_trigger).touch()
 
     return iteration, num_floating_point_operations_so_far
 
@@ -2286,6 +2418,7 @@ def build_train_valid_test_data_loaders(
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(
             train_ds, args.consumed_train_samples)
+
         if args.skip_train:
             valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
         else:

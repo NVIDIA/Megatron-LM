@@ -1,0 +1,42 @@
+group: swissai_eval
+task:
+  - winogrande
+  - lambada_openai
+  - winogrande
+  - piqa
+  - social_iqa
+  - openbookqa
+  - arc_easy
+  - commonsense_qa
+  - triviaqa
+  - mmlu_continuation
+  - gsm8k
+  - global_mmlu_ar
+  - global_mmlu_bn
+  - global_mmlu_de
+  - global_mmlu_en
+  - global_mmlu_es
+  - global_mmlu_fr
+  - global_mmlu_hi
+  - global_mmlu_id
+  - global_mmlu_it
+  - global_mmlu_ja
+  - global_mmlu_ko
+  - global_mmlu_pt
+  - global_mmlu_sw
+  - global_mmlu_yo
+  - global_mmlu_zh
+  - wikitext
+  - lambada
+  - hellaswag
+aggregate_metric_list:
+  - metric: acc
+    aggregation: mean
+    weight_by_size: false  # Set to false if you want unweighted average
+  - metric: acc_norm
+    aggregation: mean
+    weight_by_size: false
+  - metric: perplexity
+    aggregation: mean
+metadata:
+  version: 1.0

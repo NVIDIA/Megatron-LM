@@ -1,0 +1,16 @@
+group: swissai_eval
+task:
+  - winogrande
+  - lambada
+  - hellaswag
+aggregate_metric_list:
+  - metric: acc
+    aggregation: mean
+    weight_by_size: false  # Set to false if you want unweighted average
+  - metric: acc_norm
+    aggregation: mean
+    weight_by_size: false
+  - metric: perplexity
+    aggregation: mean
+metadata:
+  version: 1.0
