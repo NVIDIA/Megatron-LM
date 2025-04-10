@@ -246,6 +246,7 @@ class TestAuxLossFreeTop2Router:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_forward_aux_free(self):
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size))

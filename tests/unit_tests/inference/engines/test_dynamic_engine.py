@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import random
 import types
 from dataclasses import dataclass
 from typing import List, Optional
@@ -37,8 +38,9 @@ DynamicInferenceContext.ROUNDER = 4  # decreased from 64 for unit tests.
 class Request:
     """Simple class to hold prompt tokens and output tokens."""
 
-    def __init__(self, prompt: List[int]):
+    def __init__(self, prompt: List[int], num_tokens_to_generate: Optional[int] = None):
         self.prompt = prompt
+        self.num_tokens_to_generate = num_tokens_to_generate
         self.output = []
         self.state = "queued"
 
@@ -64,6 +66,8 @@ class TestConfig:
     context_buffer_overflow_factor: Optional[float] = None
     context_max_requests_override: Optional[int] = None
     context_max_tokens_override: Optional[int] = None
+
+    use_fixed_output_lengths: bool = False
 
     def __post_init__(self):
 
@@ -95,13 +99,28 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _build_requests(
-        cls, num_requests: int, max_prompt_length: int, vocab_size: int
-    ) -> List[List[int]]:
+        cls,
+        num_requests: int,
+        max_prompt_length: int,
+        max_sequence_length: int,
+        vocab_size: int,
+        use_fixed_output_lengths: bool = False,
+    ) -> List[Request]:
         prompt_lengths = torch.randint(4, max_prompt_length, (num_requests,)).tolist()
+        num_tokens_to_generate: List[Optional[int]]
+        if use_fixed_output_lengths:
+            num_tokens_to_generate = [
+                random.randint(1, max_sequence_length - p) for p in prompt_lengths
+            ]
+        else:
+            num_tokens_to_generate = [None for _ in range(num_requests)]
         prompts = [
             torch.randint(0, vocab_size - 1, (length,)).tolist() for length in prompt_lengths
         ]
-        requests = [Request(p) for p in prompts]
+        requests = [
+            Request(prompt=p, num_tokens_to_generate=n)
+            for (p, n) in zip(prompts, num_tokens_to_generate)
+        ]
         return requests
 
     @classmethod
@@ -137,6 +156,7 @@ class TestDynamicInferenceEngine:
         vocab_size = 100
 
         # Random state.
+        random.seed(random_seed)
         torch.manual_seed(random_seed)
         model_parallel_cuda_manual_seed(random_seed)
 
@@ -153,7 +173,9 @@ class TestDynamicInferenceEngine:
         requests = cls._build_requests(
             num_requests=test_config.num_requests,
             max_prompt_length=test_config.max_prompt_length,
+            max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
             vocab_size=vocab_size,
+            use_fixed_output_lengths=test_config.use_fixed_output_lengths,
         )
 
         # Sampling params.
@@ -248,7 +270,12 @@ class TestDynamicInferenceEngine:
         for request_id in tqdm(range(len(env.requests)), "add requests"):
 
             # Add request.
-            env.engine.add_request(request_id, env.requests[request_id].prompt)
+            num_tokens_to_generate = env.requests[request_id].num_tokens_to_generate
+            env.engine.add_request(
+                request_id,
+                env.requests[request_id].prompt,
+                num_tokens_to_generate=num_tokens_to_generate,
+            )
             env.requests[request_id].state = "pending"
 
             # Insert gap steps between adding requests.
@@ -262,8 +289,16 @@ class TestDynamicInferenceEngine:
                 break
 
         # Validate all requests finished.
-        for request in env.requests:
+        for request_id, request in enumerate(env.requests):
             assert request.state == "finished", f"request.state == '{request.state}'."
+
+            num_tokens_to_generate = env.requests[request_id].num_tokens_to_generate
+            assert (
+                num_tokens_to_generate is None or len(request.output) == num_tokens_to_generate
+            ), (
+                f"Request {request_id} expected to generate {num_tokens_to_generate} "
+                f"tokens but generated {len(request.output)}"
+            )
 
         return env
 
@@ -287,14 +322,14 @@ class TestDynamicInferenceEngine:
 
         # Validate output tokens.
         expected_outputs = [
-            [69, 85, 55, 74, 85, 89, 25],
-            [29, 16, 33, 30, 45, 76, 41, 56, 28, 17, 17, 2, 61, 6, 98, 26],
-            [35, 78, 54, 16, 79, 98, 22, 5, 60, 0, 78],
-            [25, 59, 55, 67, 15, 58, 6, 37, 54, 47, 33],
-            [57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0, 64],
-            [85, 75, 30, 68, 23, 33, 20, 26, 69, 36, 37, 97],
-            [32, 49, 93, 24, 33, 1, 87, 30, 36, 26, 38],
-            [78, 76, 77, 11, 25, 7, 92, 97, 38, 56, 82, 32],
+            [69, 85, 55, 74, 85, 78],
+            [29, 16, 33, 30, 45, 76, 41, 56, 28, 17, 17, 2, 61, 6, 20],
+            [35, 78, 64, 59, 33, 67, 15, 58, 6, 49],
+            [54, 16, 79, 98, 22, 5, 60, 0, 1, 24],
+            [57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0],
+            [85, 75, 30, 68, 23, 33, 20, 76, 69, 36, 37, 99],
+            [32, 49, 54, 47, 22, 1, 87, 30, 36, 97],
+            [93, 24, 77, 11, 25, 7, 92, 97, 27, 56, 82],
         ]
 
         assert len(env.requests) == len(expected_outputs)
@@ -346,3 +381,7 @@ class TestDynamicInferenceEngine:
     def test_multi_add(self) -> None:
         """Test adding multiple requests simultaneously."""
         self._run_test(num_gap_steps=0)
+
+    def test_fixed_output_lengths(self) -> None:
+        """Test generating a fixed number of output tokens."""
+        self._run_test(use_fixed_output_lengths=True)
