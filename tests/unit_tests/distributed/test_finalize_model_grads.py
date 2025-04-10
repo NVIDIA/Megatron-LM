@@ -44,6 +44,7 @@ class TestAllReduceLNGrads:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("freeze_model,tp_size", [(True, 2), (False, 2)])
+    @pytest.mark.internal
     def test_allreduce_layernorm_grads(self, freeze_model, tp_size):
 
         self.tp_size = tp_size
