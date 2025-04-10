@@ -199,7 +199,6 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         params = []
         grads = []
         for model_chunk in model:
-            ddp_config = model_chunk.ddp_config
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
                 if param.requires_grad and (
                     getattr(param, 'sequence_parallel', False)
@@ -207,7 +206,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                     or 'k_layernorm' in name
                 ):
                     params.append(param)
-                    grad_attr = _get_main_grad_attr(param, ddp_config.use_custom_fsdp)
+                    grad_attr = _get_main_grad_attr(param, config.use_custom_fsdp)
                     grad = getattr(param, grad_attr)
                     grad = _unshard_if_dtensor(grad)
                     grads.append(grad.data)
@@ -220,7 +219,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
                 buf.copy_(synced)
-                grad_attr = _get_main_grad_attr(param, ddp_config.use_custom_fsdp)
+                grad_attr = _get_main_grad_attr(param, config.use_custom_fsdp)
                 orig_grad = getattr(param, grad_attr)
                 setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
 

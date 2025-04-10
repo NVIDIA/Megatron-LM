@@ -67,13 +67,9 @@ class DistributedDataParallelConfig:
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
 
-    suggested_communication_unit_size: int = None
-    """Specifies the number of elements to communicate at once during
-      FSDP (Fully Sharded Data Parallel) operations. 
-      This flag also affects FSDP all-gather prefetch behavior. Setting a larger
-      value increases the communication buffer size, while a smaller value
-      disables prefetching and may degrade performance. Adjust this value
-      based on your system's memory and performance requirements."""
+    suggested_communication_unit_size: int = 400_000_000
+    """When batch communication is needed across multiple buckets, 
+        this environment variable guides the size of communication unit size."""
 
     preserve_fp32_weights: bool = True
     """If true, preserve fp32 weights in the custom FSDP ParamAndGradBuffer."""

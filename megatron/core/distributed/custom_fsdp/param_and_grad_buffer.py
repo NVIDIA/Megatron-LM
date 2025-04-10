@@ -13,7 +13,6 @@ from enum import Enum
 from typing import Any, List, Optional, Tuple
 
 import torch
-from torch.distributed import _coalescing_manager
 
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
@@ -682,10 +681,7 @@ class ParameterGroup:
 
 
 def _get_parameter_groups(
-    module: torch.nn.Module,
-    policy: BucketingPolicy,
-    meta_device_init_fp8_params: dict,
-    bucket_group_by_fsdp_unit: bool = True,
+    module: torch.nn.Module, policy: BucketingPolicy, meta_device_init_fp8_params: dict
 ):
     """
     Get the parameter group for the given module and parameters.
@@ -788,30 +784,28 @@ def _get_parameter_groups(
         for param in group.params:
             param_to_param_group[param] = group_id
 
-    # Generate the groups of collective buckets, where each group aggregates
-    # the collectives per FSDP unit. This improves performance by reducing
-    # the number of collective calls and increasing per-collective efficiency.
-    #
-    # Set default aggregate buckets of bucket.
-    bucket_group_of_bucket = {}
-    for bucket_id in range(len(bucket_groups)):
-        bucket_group_of_bucket[bucket_id] = [bucket_id]
+    # Log buckets for all PP stages.
+    if (
+        parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    ):
+        log_strs = []
+        log_strs.append(f'Number of parameter groups for FSDP: {len(bucket_groups)}')
+        for index, group in enumerate(bucket_groups):
+            numel = 0
+            for param in group.params:
+                numel += param.numel()
+            log_strs.append(
+                f"Params for group {index+1} ({numel} elements, dtype {group.dtype}, "
+                f"has_weight_buffer: {group.model_weight_buffer is not None}, "
+                f"has_grad_buffer: {group.main_grad_buffer is not None}, "
+                f"has_main_weight_buffer: {group.main_weight_buffer is not None}):"
+            )
+            for param in group.params:
+                log_strs.append(f'\t{param_to_name[param]}')
+        log_on_each_pipeline_stage(logger, logging.INFO, '\n'.join(log_strs))
 
-    # Set aggregate buckets by FSDP units.
-    if bucket_group_by_fsdp_unit:
-        bucket_group_map = {}
-        for bucket_id, param_group in enumerate(bucket_groups):
-            if param_group.fsdp_unit_id is None:
-                continue
-            id = (param_group.fsdp_unit_id, param_group.is_expert_param)
-            if id not in bucket_group_map:
-                bucket_group_map[id] = []
-            bucket_group_map[id].append(bucket_id)
-        for bucket_group in bucket_group_map.values():
-            for bucket_id in bucket_group:
-                bucket_group_of_bucket[bucket_id] = bucket_group
-
-    return (bucket_groups, param_to_param_group, bucket_group_of_bucket)
+    return (bucket_groups, fsdp_units, param_to_param_group)
 
 
 class ParamAndGradBuffer:
@@ -906,43 +900,14 @@ class ParamAndGradBuffer:
                         meta_device_init_fp8_params[self.param_to_name[param]] = True
 
         # Get the parameter groups.
-        (self.parameter_groups, self.param_to_param_group, self.bucket_group_of_bucket) = (
-            _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
+        (self.parameter_groups, self.fsdp_units, self.param_to_param_group) = _get_parameter_groups(
+            module, bucketing_policy, meta_device_init_fp8_params
         )
+
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
 
         # Initialize the optimizer named parameters.
         self.optimizer_named_parameters = self._init_optimizer_named_parameters()
-
-        self._log_parameter_groups()
-
-    def _log_parameter_groups(self):
-        """
-        Log the parameter groups for all pipeline stages.
-        """
-        # Log buckets for all PP stages.
-        if (
-            parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0
-            and parallel_state.get_tensor_model_parallel_rank() == 0
-        ):
-            bucket_groups = self.parameter_groups
-            param_to_name = self.param_to_name
-            log_strs = []
-            log_strs.append(f'Number of parameter groups for FSDP: {len(bucket_groups)}')
-            for index, group in enumerate(bucket_groups):
-                numel = 0
-                for param in group.params:
-                    numel += param.numel()
-                log_strs.append(
-                    f"Params for group {index+1} ({numel} elements, dtype: {group.dtype}, "
-                    f"fsdp_unit_id: {group.fsdp_unit_id}, "
-                    f"has_weight_buffer: {group.model_weight_buffer is not None}, "
-                    f"has_grad_buffer: {group.main_grad_buffer is not None}, "
-                    f"has_main_weight_buffer: {group.main_weight_buffer is not None}):"
-                )
-                for param in group.params:
-                    log_strs.append(f'\t{param_to_name[param]}')
-            log_on_each_pipeline_stage(logger, logging.INFO, '\n'.join(log_strs))
 
     def _init_each_parameter_group_buffers(self, meta_device_init_fp8_params):
         """
@@ -1118,14 +1083,6 @@ class ParamAndGradBuffer:
 
                             self._reset_parameters(old_params, new_params)
                             p = group.params[item_id]
-
-                            # After resetting parameters, delete fp8 transpose cache
-                            # if we do not need keep cache.
-                            if not self.ddp_config.keep_fp8_transpose_cache_when_using_custom_fsdp:
-                                for _param in m.parameters(recurse=False):
-                                    if is_float8tensor(_param):
-                                        _param._transpose_invalid = True
-                                        _param._transpose = None
                     assert not p.is_meta, (self.param_to_name[p], module_reset_flag)
                     wbuf.set_item(item_id, p.data)
 
@@ -1240,6 +1197,14 @@ class ParamAndGradBuffer:
                     bucket = p._gbuf.fetch_bucket()
                     gbuf = p._gbuf
                     item_id = p._item_id
+                    if bucket.status == GradBucketStatus.GRAD_REDUCING:
+                        if bucket.data_operation_event:
+                            bucket.data_operation_event.wait()
+                            bucket.data_operation_event = None
+                        # Here it is assumed that main_grad is taken out and do
+                        # gradient accumulation and should not be freed up before
+                        # gradient reduction.
+                        bucket.status = GradBucketStatus.GRAD_ACCUMULATING
                     return gbuf.get_item_from_bucket(bucket, item_id).view(p.shape)
 
                 setattr(p.__class__, 'main_grad', property(main_grad_getter))
@@ -1291,7 +1256,6 @@ class ParamAndGradBuffer:
             if group.main_grad_buffer is None:
                 continue
             group.main_grad_buffer.data *= scaling_factor
-        self.update_main_grads()
 
     def zero_grad(self):
         """
@@ -1546,6 +1510,19 @@ class BucketStatus(Enum):
     READY_TO_USE = 3
 
 
+class GradBucketStatus(Enum):
+    """
+    An enumeration of possible statuses for a gradient bucket.
+
+    Attributes:
+        GRAD_ACCUMULATING (int): The gradient bucket is currently accumulating gradients.
+        GRAD_REDUCING (int): The gradient bucket is currently reducing gradients.
+    """
+
+    GRAD_ACCUMULATING = 1
+    GRAD_REDUCING = 2
+
+
 class GradReducePipeline:
     """
     Pipeline for reducing gradients.
@@ -1564,7 +1541,7 @@ class GradReducePipeline:
             for i in range(self.buffer.num_buckets)
             if self.buffer.parameter_groups[i].main_grad_buffer
         }
-        self.bucket_grad_ready_params = [set() for _ in range(self.buffer.num_buckets)]
+        self.buckets = {}
         self.cuda_stream = cuda_stream
         self.check_nans = check_nans
 
@@ -1574,73 +1551,66 @@ class GradReducePipeline:
         return self.buffer.num_buckets
 
     def reset(self):
-        """Handle the processing tasks and reset the pipeline."""
-        self.wait_for_previous_grad_reduce(0)
-        for bucket_id, grad_ready_params in enumerate(self.bucket_grad_ready_params):
-            param_list = self.buffer.parameter_groups[bucket_id].params
-            n_params = len(param_list)
-            param_to_name = self.buffer.param_to_name
-            assert len(grad_ready_params) == 0, (
-                f"Found {len(grad_ready_params)} out of {n_params} parameters that are ready for "
-                f"reduce-scatter/all-reduce, but the pipeline is being reset. "
-                f"grad_ready_params: {[param_to_name[p] for p in grad_ready_params]} "
-                f"param_list: {[param_to_name[p] for p in param_list]}"
-            )
-
+        """Reset the pipeline state."""
+        assert len(self.grad_reduce_queue) == 0, (
+            f"There are still pending reduce-scatter tasks, it is not safe to reset. "
+            f"items: {self.grad_reduce_queue.keys()}, bucket_status: {self.bucket_status}."
+        )
         for bucket_id, _ in self.bucket_status.items():
             gbuf = self.buffer.parameter_groups[bucket_id].main_grad_buffer
             gbuf.free_bucket_storage()
             self.bucket_status[bucket_id] = BucketStatus.EMPTY
+        assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
+            f"There are still pending buckets, it is not safe to reset. "
+            f"bucket_status: {self.bucket_status}."
+        )
 
-    def reduce_gradients(
-        self, params: List[torch.Tensor], suggested_queue_capacity: Optional[int] = None
-    ):
-        """Reduce the gradients for the given parameters.
+        self.buckets = {}
+
+    def place_bucket(self, bucket_id: int) -> bool:
+        """Place a full size bucket by bucket id.
         Args:
-            params (List[torch.Tensor]): The parameters.
-            suggested_queue_capacity (int, optional): The suggested queue capacity.
-                Defaults to None.
+            bucket_id (int): The bucket id.
+        Returns:
+            bool: True if the bucket is placed successfully.
         """
-        for param in params:
-            bucket_id = self.buffer.param_to_param_group[param]
-            param_group = self.buffer.parameter_groups[bucket_id]
-            if not param.requires_grad:
-                assert param_group.requires_grad is False, (
-                    f"Param {self.buffer.param_to_name[param]} has requires_grad=False, "
-                    f"but it is in a parameter group with requires_grad=True."
-                )
-                continue
-            assert param_group.requires_grad, (
-                f"Param {self.buffer.param_to_name[param]} has requires_grad=True, "
-                f"but it is in a parameter group with requires_grad=False."
-            )
+        assert bucket_id in self.bucket_status, f"Bucket {bucket_id} is not in the bucket status."
+        bucket_status = self.bucket_status[bucket_id]
+        if bucket_status == BucketStatus.READY_TO_USE:
+            return False
+        if bucket_status == BucketStatus.COMMUNICATING:
+            self.wait_for_previous_grad_reduce(0)
 
-            # Mark grad as ready for reduce-scatter/all-reduce.
-            self.bucket_grad_ready_params[bucket_id].add(param)
-            if len(self.bucket_grad_ready_params[bucket_id]) == len(param_group.params):
-                self.wait_for_previous_grad_reduce(
-                    suggested_queue_capacity=suggested_queue_capacity
-                )
-                self.mark_bucket_ready(bucket_id, async_rs=True)
+        assert bucket_id not in self.buckets, f"Bucket {bucket_id} is already allocated."
+
+        gbuf = self.buffer.parameter_groups[bucket_id].main_grad_buffer
+        bucket = gbuf.fetch_bucket()
+        requires_grad_items = sum([p.requires_grad for p in gbuf.params])
+        setattr(bucket, 'requires_grad_items', requires_grad_items)
+        setattr(bucket, 'items', [])
+
+        self.buckets[bucket_id] = bucket
+        self.bucket_status[bucket_id] = BucketStatus.READY_TO_USE
+        return True
 
     def wait_for_previous_grad_reduce(
-        self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
+        self, recommeded_queue_size: int = 1, recommeded_queue_capacity: Optional[int] = None
     ):
         """
         Wait for the previous reduce-scatter/all-reduce to finish.
         Args:
-            suggested_queue_size (int, optional): The recommended queue size. Defaults to 1.
-            suggested_queue_capacity (Optional[int], optional): The recommended queue capacity.
+            recommeded_queue_size (int, optional): The recommended queue size. Defaults to 1.
+            recommeded_queue_capacity (Optional[int], optional): The recommended queue capacity.
                 Defaults to None.
         """
-        if suggested_queue_capacity is not None:
+        if recommeded_queue_capacity is not None:
             queue_space = sum(
                 [
                     self.buffer.parameter_groups[bucket_id].main_grad_buffer.bucket_index.size
                     for _, _, bucket_id in self.grad_reduce_queue
                 ]
             )
-            while queue_space > suggested_queue_capacity:
+            while queue_space > recommeded_queue_capacity:
                 grad_reduce_event, free_up_grad_bucket, bucket_id = self.grad_reduce_queue.pop(0)
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
@@ -1648,106 +1618,92 @@ class GradReducePipeline:
                     bucket_id
                 ].main_grad_buffer.bucket_index.size
         else:
-            suggested_queue_size = max(0, min(suggested_queue_size, self.buffer.num_buckets - 1))
-            while len(self.grad_reduce_queue) > suggested_queue_size:
+            recommeded_queue_size = max(0, min(recommeded_queue_size, self.buffer.num_buckets - 1))
+            while len(self.grad_reduce_queue) > recommeded_queue_size:
                 grad_reduce_event, free_up_grad_bucket, _ = self.grad_reduce_queue.pop(0)
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
 
-    def mark_bucket_ready(self, bucket_id: int, async_rs: bool = False) -> bool:
-        """Mark the bucket ready for reduce-scatter/all-reduce, if all bucket in
-        the bucket group are ready, then do the reduce-scatter/all-reduce.
+    def mark_item_ready(self, item: torch.Tensor, async_rs: bool = False) -> bool:
+        """Mark the item ready for reduce-scatter/all-reduce.
         Args:
-            bucket_id (int): The bucket to be marked.
+            item (torch.Tensor): The item to be marked.
             async_rs (bool, optional): Whether to do the reduce-scatter/all-reduce
                 asynchronously. Defaults to False.
         Returns:
-            bool: True if the bucket is go for reduce-scatter/all-reduce.
+            bool: True if the item is go for reduce-scatter/all-reduce.
         """
-        # Prepare the bucket group for gradient reduce. Note that the
-        # some bucket parameters do not require grad, so we need to
-        # remove them from the bucket group.
-        bucket_group = self.buffer.bucket_group_of_bucket[bucket_id]
-        bucket_group = [i for i in bucket_group if self.buffer.parameter_groups[i].main_grad_buffer]
-        # If any bucket in the bucket group is not ready, skip the gradient reduce
-        # waiting for the bucket group to be all ready before executing.
-        for bucket_id in bucket_group:
-            param_group = self.buffer.parameter_groups[bucket_id]
-            if len(self.bucket_grad_ready_params[bucket_id]) != len(param_group.params):
-                return False
+        bucket_id = self.buffer.param_to_param_group[item]
+        assert bucket_id in self.buckets, f"Bucket {bucket_id} is not allocated."
+
+        scaling_factor = self.buffer.gradient_scaling_factor
+        bucket = self.buckets[bucket_id]
+        bucket.items.append(item)
+        assert len(bucket.items) <= bucket.requires_grad_items, "Too many items in the bucket."
+        if len(bucket.items) != bucket.requires_grad_items:
+            return False
+
+        self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
 
         current_stream = torch.cuda.current_stream()
         reduce_scatter_stream = (
             self.cuda_stream if self.cuda_stream is not None else torch.cuda.current_stream()
         )
         reduce_scatter_stream.wait_stream(current_stream)
-
-        dp_group = self.buffer.parameter_groups[bucket_id].main_grad_buffer.data_parallel_group
         with torch.cuda.stream(reduce_scatter_stream):
-            with _coalescing_manager(dp_group, async_ops=async_rs) as coalescing_event:
-                grad_shards = {}
-                for bucket_id in bucket_group:
-                    gbuf = self.buffer.parameter_groups[bucket_id].main_grad_buffer
-                    bucket = gbuf.fetch_bucket()
-                    scaling_factor = gbuf.gradient_scaling_factor
-                    reduce_op = gradient_reduce_preprocessing(
-                        gbuf.data, scaling_factor, gbuf.ddp_config
-                    )
-                    if gbuf.ddp_config.data_parallel_sharding_strategy == 'no_shard':
-                        torch.distributed.all_reduce(
-                            bucket.data, op=reduce_op, group=gbuf.data_parallel_group
-                        )
-                    else:
-                        grad_shard = gbuf.get_shard_from_bucket(bucket)
-                        # pylint: disable=C0301
-                        # The `grad_shard`` is part of `bucket.data`` and the following
-                        # new empty is important for memory safety, when using
-                        # TORCH_NCCL_AVOID_RECORD_STREAMS=1.
-                        # For reference: https://dev-discuss.pytorch.org/t/fsdp-cudacachingallocator-an-outsider-newb-perspective/1486
-                        grad_shard = torch.empty_like(grad_shard)
-                        torch.distributed.reduce_scatter_tensor(
-                            output=grad_shard,
-                            input=bucket.data,
-                            op=reduce_op,
-                            group=gbuf.data_parallel_group,
-                        )
-                        grad_shards[bucket_id] = grad_shard
-                    self.bucket_status[bucket_id] = BucketStatus.COMMUNICATING
-            coalescing_event.wait()
-            for bucket_id in bucket_group:
-                # Local gradient accumulate
-                gbuf = self.buffer.parameter_groups[bucket_id].main_grad_buffer
-                if gbuf.ddp_config.data_parallel_sharding_strategy != 'no_shard':
+            gbuf = self.buffer.parameter_groups[bucket_id].main_grad_buffer
+            scaling_factor = gbuf.gradient_scaling_factor
+            reduce_op = gradient_reduce_preprocessing(gbuf.data, scaling_factor, gbuf.ddp_config)
+            if gbuf.ddp_config.data_parallel_sharding_strategy == 'no_shard':
+                torch.distributed.all_reduce(
+                    bucket.data, op=reduce_op, group=gbuf.data_parallel_group
+                )
+            else:
+                grad_shard = gbuf.get_shard_from_bucket(bucket)
+                grad_shard = torch.empty_like(grad_shard)
+                torch.distributed.reduce_scatter_tensor(
+                    output=grad_shard,
+                    input=bucket.data,
+                    op=reduce_op,
+                    group=gbuf.data_parallel_group,
+                )
+                if gbuf.is_data_distributed:
                     # Gradient accumulate on local buffer
                     local_buffer = gbuf.get_shard_from_local_buffer()
-                    local_buffer += grad_shards[bucket_id]
+                    local_buffer += grad_shard
             reduce_scatter_view_out_event = reduce_scatter_stream.record_event()
+            bucket.data_operation_event = reduce_scatter_view_out_event
+            bucket.status = GradBucketStatus.GRAD_REDUCING
+            del self.buckets[bucket_id]
 
-        free_up_grad_bucket_func = {}
-        for bucket_id in bucket_group:
+        def get_closure():
+            def free_up_grad_bucket():
+                nonlocal gbuf, local_buffer, bucket_id, bucket
+                if self.check_nans:
+                    assert not torch.isnan(
+                        local_buffer
+                    ).any(), f"NaN detected in bucket {bucket_id}: {local_buffer}"
 
-            def get_closure(bucket_id):
-                def free_up_grad_bucket():
-                    self.bucket_grad_ready_params[bucket_id] = set()
-                    gbuf = self.buffer.parameter_groups[bucket_id].main_grad_buffer
-                    if gbuf.is_data_distributed:
-                        gbuf.free_bucket_storage()
-                    self.bucket_status[bucket_id] = BucketStatus.EMPTY
+                # There is a special case where this bucket is taken for
+                # gradient accumulating before it has a chance to be free-up (here),
+                # in which case we free-up here because there is still
+                # subsequent gradient reducing to be done on this bucket.
+                if gbuf.is_data_distributed and bucket.status != GradBucketStatus.GRAD_ACCUMULATING:
+                    gbuf.free_bucket_storage()
+                self.bucket_status[bucket_id] = BucketStatus.EMPTY
 
-                return free_up_grad_bucket
+            return free_up_grad_bucket
 
-            free_up_grad_bucket_func[bucket_id] = get_closure(bucket_id)
+        free_up_grad_bucket = get_closure()
 
         if async_rs:
-            for bucket_id, free_up_grad_bucket in free_up_grad_bucket_func.items():
-                self.grad_reduce_queue.append(
-                    (reduce_scatter_view_out_event, free_up_grad_bucket, bucket_id)
-                )
+            self.grad_reduce_queue.append(
+                (reduce_scatter_view_out_event, free_up_grad_bucket, bucket_id)
+            )
             return True
 
-        reduce_scatter_view_out_event.wait()
-        for free_up_grad_bucket in free_up_grad_bucket_func.values():
-            free_up_grad_bucket()
+        free_up_grad_bucket()
+
         return True
 
 
@@ -1775,19 +1731,6 @@ class AllGatherPipeline:
         self.bucket_status = {i: BucketStatus.EMPTY for i in range(self.buffer.num_buckets)}
         self.bucket_can_be_released = {i: False for i in range(self.buffer.num_buckets)}
 
-        self.bucket_to_bucket_group = {}
-        group_id = 0
-        for bucket_group in self.buffer.bucket_group_of_bucket.values():
-            new_group = False
-            for bucket_id in bucket_group:
-                if bucket_id not in self.bucket_to_bucket_group:
-                    new_group = True
-                    break
-            if new_group:
-                group_id += 1
-                for bucket_id in bucket_group:
-                    self.bucket_to_bucket_group[bucket_id] = group_id
-
     @property
     def num_buckets(self):
         """Return the number of buckets."""
@@ -1797,7 +1740,7 @@ class AllGatherPipeline:
         """Reset the pipeline state."""
         if len(self.param_gather_event_map) > 0:
             warnings.warn(
-                "There are still pending all-gather tasks, process them. "
+                "There are still pending all-gather tasks, process them."
                 f"Bucket status: {self.bucket_status}.",
                 UserWarning,
             )
@@ -1819,98 +1762,65 @@ class AllGatherPipeline:
             f"bucket_can_be_released: {self.bucket_can_be_released}."
         )
 
-    def all_gather_params(
+    def queue_bucket_to_all_gather(
         self,
-        params: List[torch.Tensor],
+        bucket_id: int,
         prefetch: bool = False,
         prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
         suggested_AG_prefetch_size: Optional[int] = None,
     ):
-        """All-gather the params. If prefetch is enabled, prefetch next buckets
-        in the order of `prefetch_order`.
+        """Performs an asynchronous all-gather operation by queuing the task bucket into
+        a dedicated queue (NCCL CUDA Stream).
+
+        This function is a part of FSDP (Fully Sharded Data Parallel)
+        implementation that handles the all-gather operation in a queue-based
+        manner. Instead of executing the all-gather immediately, it enqueues
+        the operation into a task queue, which helps manage system resources and
+        prevents overwhelming the GPU memory and communication bandwidth.
+
+        The queued all-gather operation will:
+            * Collect distributed sharded parameters from all participating processes
+            * Reconstruct the full parameter tensor
 
         Args:
-            params (List[torch.Tensor]): The list of params to be all-gathered.
+            bucket_id (int): The bucket ID to be queued for all-gathering.
             prefetch (bool, optional): Whether to prefetch the next bucket. Defaults to False.
             prefetch_order (PrefetchOrder, optional): The order of prefetching.
                 Defaults to PrefetchOrder.FORWARD_PASS_ORDER.
             suggested_AG_prefetch_size (Optional[int], optional):
                 The suggested prefetch size for all-gathering. Defaults to None.
         """
-        if len(params) == 0:
-            return
-
-        ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
-        ag_buckets = list(sorted(set(ag_buckets)))
         parameter_groups = self.buffer.parameter_groups
+        ag_buckets = [bucket_id]
 
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
         if prefetch:
-
-            def next_bucket_id(ag_buckets):
-                if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                    bucket_id = ag_buckets[0] + 1
-                    for i in ag_buckets[1:]:
-                        if i != bucket_id:
-                            break
-                        bucket_id += 1
-                else:
-                    bucket_id = ag_buckets[-1] - 1
-                    for i in reversed(ag_buckets[:-1]):
-                        if i != bucket_id:
-                            break
-                        bucket_id -= 1
-                if bucket_id < 0 or bucket_id >= self.buffer.num_buckets:
-                    return None
-                return bucket_id
-
             if suggested_AG_prefetch_size is not None:
-                bucket_id = next_bucket_id(ag_buckets)
-                while bucket_id is not None:
-                    all_gather_size = sum(
-                        [
-                            parameter_groups[i].model_weight_buffer.bucket_index.size
-                            for i in ag_buckets
-                        ]
-                    )
-                    if all_gather_size >= suggested_AG_prefetch_size:
+                all_gather_size = parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
+                while all_gather_size < suggested_AG_prefetch_size:
+                    if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
+                        next_bucket_id = bucket_id + 1
+                    else:
+                        next_bucket_id = bucket_id - 1
+                    if next_bucket_id < 0 or next_bucket_id >= self.buffer.num_buckets:
                         break
-                    ag_buckets.extend(self.buffer.bucket_group_of_bucket[bucket_id])
-                    ag_buckets = list(sorted(set(ag_buckets)))
-                    bucket_id = next_bucket_id(ag_buckets)
+
+                    next_group = parameter_groups[next_bucket_id]
+                    ag_buckets.append(next_bucket_id)
+
+                    all_gather_size += next_group.model_weight_buffer.bucket_index.size
+                    bucket_id = next_bucket_id
             else:
-                bucket_id = next_bucket_id(ag_buckets)
-                if bucket_id is not None:
-                    ag_buckets.extend(self.buffer.bucket_group_of_bucket[bucket_id])
-                    ag_buckets = list(sorted(set(ag_buckets)))
+                if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
+                    next_bucket_id = bucket_id + 1
+                else:
+                    next_bucket_id = bucket_id - 1
+                if next_bucket_id >= 0 and next_bucket_id < self.buffer.num_buckets:
+                    ag_buckets.append(next_bucket_id)
 
-        ag_buckets = [i for i in ag_buckets if self.bucket_status[i] == BucketStatus.EMPTY]
-        if len(ag_buckets) == 0:
-            return
-
-        # Divide buckets into aggregate groups
-        bucket_group_to_buckets = {}
+        # Launch all-gather operations for all buckets in ag_buckets.
         for bucket_id in ag_buckets:
-            group_id = self.bucket_to_bucket_group[bucket_id]
-            if group_id not in bucket_group_to_buckets:
-                bucket_group_to_buckets[group_id] = []
-            bucket_group_to_buckets[group_id].append(bucket_id)
-
-        # Coalesce all-gather operations for all buckets in the same data-parallel-group
-        for _, buckets in bucket_group_to_buckets.items():
-            param_group = parameter_groups[buckets[0]]
-            dp_group = param_group.model_weight_buffer.data_parallel_group
-            with _coalescing_manager(dp_group, async_ops=True) as coalescing_event:
-                for bucket_id in buckets:
-                    self.all_gather_bucket_and_set_items(bucket_id, async_op=True)
-
-                # reset param gather event with coalescing event
-                for bucket_id in buckets:
-                    _, mark_bucket_ready_to_use = self.param_gather_event_map[bucket_id]
-                    self.param_gather_event_map[bucket_id] = (
-                        coalescing_event,
-                        mark_bucket_ready_to_use,
-                    )
+            self.all_gather_bucket_and_set_items(bucket_id, async_op=True)
 
     def wait_bucket_ready(self, bucket_id, empty_ok=False):
         """Wait for the bucket to be ready."""
@@ -1965,14 +1875,15 @@ class AllGatherPipeline:
             async_op=async_op,
         )
 
-        def get_closure(bucket_id):
+        def get_closure():
             @torch.no_grad()
             def mark_bucket_ready_to_use():
+                nonlocal wbuf, bucket_id
                 self.bucket_status[bucket_id] = BucketStatus.READY_TO_USE
 
             return mark_bucket_ready_to_use
 
-        mark_bucket_ready_to_use = get_closure(bucket_id)
+        mark_bucket_ready_to_use = get_closure()
 
         if async_op:
             self.param_gather_event_map[bucket_id] = (param_gather_event, mark_bucket_ready_to_use)

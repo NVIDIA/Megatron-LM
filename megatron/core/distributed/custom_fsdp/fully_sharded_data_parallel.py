@@ -76,10 +76,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         module: Underlying model.
         fsdp_unit_modules: List of modules that should be treated as FSDP Unit,
             i.e., the minimum releasable model unit. If not provided, defaults to
-            [TransformerLayer, LanguageModelEmbedding] for GPT-like models. In
-            addition to this, it affects the granularity of the communication
-            parameter grouping and triggers aggregate collective communication
-            in fp8 mixed precision training.
+            [TransformerLayer, LanguageModelEmbedding] for GPT-like models.
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket.
@@ -125,10 +122,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         if fsdp_unit_modules is not None:
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
-            if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
-            else:
-                self.fsdp_unit_modules = []
+            self.fsdp_unit_modules = [TransformerLayer]
         self.main_weights = True
         self.data_parallel_group = parallel_state.get_data_parallel_group(
             with_context_parallel=True
@@ -183,7 +177,14 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.module,
             bucketing_policy=BucketingPolicy(
                 suggested_bucket_size=self.bucket_size,
-                fsdp_unit_modules=self.fsdp_unit_modules,
+                fsdp_unit_modules=(
+                    # Only when model weights need to be sharded, we need to
+                    # identify the minimum releasable model unit, which is the
+                    # FSDP Unit Module.
+                    self.fsdp_unit_modules
+                    if self.data_parallel_sharding_strategy == "optim_grads_params"
+                    else []
+                ),
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
             ),
             data_parallel_group=self.data_parallel_group,
@@ -207,24 +208,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         # Initialize the all-gather pipeline.
         self.all_gather_pipeline = AllGatherPipeline(self.param_and_grad_buffer)
 
-        suggested_communication_unit_size = self.ddp_config.suggested_communication_unit_size
-        if suggested_communication_unit_size is None:
-            if self.data_parallel_sharding_strategy == "optim_grads_params":
-                total_param_elements = 0
-                total_fsdp_module = 0
-                for module in self.module.modules():
-                    if isinstance(module, tuple(self.fsdp_unit_modules)):
-                        total_fsdp_module += 1
-                        total_param_elements += sum(p.numel() for p in module.parameters())
-                # The suggested size is twice the number of elements in the FSDP modules.
-                # This ensures we process the current FSDP module and attempt to prefetch
-                # the next FSDP module, making the flow of communication better.
-                suggested_communication_unit_size = total_param_elements // total_fsdp_module * 2
-            elif self.bucket_size is not None:
-                suggested_communication_unit_size = self.bucket_size * 2
-
-        self.suggested_RS_queue_capacity = suggested_communication_unit_size
-        self.suggested_AG_prefetch_size = suggested_communication_unit_size
+        self.suggested_RS_queue_capacity = self.ddp_config.suggested_communication_unit_size
+        self.suggested_AG_prefetch_size = self.ddp_config.suggested_communication_unit_size
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.
@@ -234,7 +219,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
             - Pre-forward hook: Unshards parameters before forward pass
             - Post-forward hook: Reshards parameters after forward pass
             - Pre-backward hook: Unshards parameters before backward pass
-            - Post-backward hook: Reshards parameters and reduces gradients after backward pass
+            - Post-backward hook: Reshards parameters after backward pass
+            - Gradient accumulation hook: Handles gradient accumulation and reduction across devices
 
         Args:
             root_module: The PyTorch module to register FSDP hooks on
@@ -268,7 +254,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
         `optim` and `optim_grads` do not require FSDP units because they do not
         shard model parameters.
         """
-        fsdp_unit_modules = self.fsdp_unit_modules
+        if self.data_parallel_sharding_strategy != "optim_grads_params":
+            fsdp_unit_modules = []
+        else:
+            fsdp_unit_modules = self.fsdp_unit_modules
 
         def release_module_parameters(module, *unused):
             for param in module.parameters():
@@ -291,74 +280,27 @@ class FullyShardedDataParallel(_BaseDataParallel):
             prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             wait_bucket_ready=True,
         ):
+            wait_list = []
             ag_pipeline = self.all_gather_pipeline
-            ag_pipeline.all_gather_params(
-                params=list(module.parameters()),
-                prefetch=prefetch,
-                prefetch_order=prefetch_order,
-                suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
-            )
+            for param in module.parameters():
+                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                ag_pipeline.queue_bucket_to_all_gather(
+                    bucket_id,
+                    prefetch=prefetch,
+                    prefetch_order=prefetch_order,
+                    suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
+                )
+                wait_list.append(bucket_id)
+
             if wait_bucket_ready:
-                for param in module.parameters():
-                    bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                for bucket_id in wait_list:
                     ag_pipeline.wait_bucket_ready(bucket_id)
 
-        def _grad_acc(param):
-            """
-            Accumulate the gradient in the main_grad buffer.
-            """
-            group_id = self.param_and_grad_buffer.param_to_param_group[param]
-            group = self.param_and_grad_buffer.parameter_groups[group_id]
-            if not group.requires_grad:
-                return
-
-            overwrite_main_grad = self.ddp_config.data_parallel_sharding_strategy in [
-                "optim_grads",
-                "optim_grads_params",
-            ]
-            if overwrite_main_grad:
-                if not param.grad_added_to_main_grad:
-                    if param.grad is not None:
-                        param.main_grad.copy_(param.grad)
-                        del param.grad
-                    else:
-                        param.main_grad.zero_()
-            else:
-                if not param.grad_added_to_main_grad:
-                    if param.grad is not None:
-                        param.main_grad.add_(param.grad)
-                        del param.grad
-            # Reset the grad accumulate flag.
-            param.grad_added_to_main_grad = False
-
-        self._params_require_handle_grad = set()
-
         def _post_backward(module, *unused):
-            if isinstance(module, tuple(fsdp_unit_modules)):
-                if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                    release_module_parameters(module)
-                    module._training_state = TrainingState.IDLE
-                param_list = list(module.parameters())
-            else:
-                param_list = list(module.parameters(recurse=False))
+            release_module_parameters(module)
+            module._training_state = TrainingState.IDLE
 
-            for param in param_list:
-                _grad_acc(param)
-                self._params_require_handle_grad.discard(param)
-
-            grad_reduce_every_bprop = self.ddp_config.data_parallel_sharding_strategy in [
-                "optim_grads",
-                "optim_grads_params",
-            ]
-            if grad_reduce_every_bprop or self.is_last_microbatch:
-                self.grad_reduce_pipeline.reduce_gradients(
-                    param_list, suggested_queue_capacity=self.suggested_RS_queue_capacity
-                )
-
-        def _pre_forward_param_unshard(
-            module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]
-        ):
-            # Unshard the parameters before the forward pass.
+        def _pre_forward(module: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]):
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
             if input_training_state == TrainingState.PRE_BACKWARD:
@@ -368,104 +310,72 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 module._training_state = TrainingState.FORWARD
 
             if isinstance(module, tuple(fsdp_unit_modules)):
-                param_list = list(module.parameters())
-                self.all_gather_pipeline.all_gather_params(
-                    params=param_list,
-                    prefetch=fsdp_forward_prefetch,
-                    suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
-                )
-                for param in param_list:
+                wait_list = []
+                for param in module.parameters():
                     bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                    self.all_gather_pipeline.queue_bucket_to_all_gather(
+                        bucket_id,
+                        prefetch=fsdp_forward_prefetch,
+                        suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
+                    )
+                    wait_list.append(bucket_id)
+                for bucket_id in wait_list:
                     self.all_gather_pipeline.wait_bucket_ready(bucket_id)
+
+                if not torch.is_grad_enabled():
+                    return args, kwargs
+
+                # Register the backward function to release the parameters.
+                args_list, args_spec = tree_flatten(args)
+                kwargs_list, kwargs_spec = tree_flatten(kwargs)
+                args_kwargs_list = list(args_list) + list(kwargs_list)
+                inp_tensor_indices: List[int] = []
+                inp_tensors: List[torch.Tensor] = []
+                for i, obj in enumerate(args_kwargs_list):
+                    if torch.is_tensor(obj) and obj.requires_grad:
+                        inp_tensor_indices.append(i)
+                        inp_tensors.append(obj)
+                if len(inp_tensors) == 0:
+                    return args, kwargs
+                inp_tensors = RegisterFSDPBackwardFunction.apply(
+                    functools.partial(_post_backward, module), *inp_tensors
+                )
+                for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
+                    args_kwargs_list[inp_tensor_idx] = inp_tensor
+                args_list = args_kwargs_list[: len(args_list)]
+                kwargs_list = args_kwargs_list[len(args_list) :]
+                args = tree_unflatten(args_list, args_spec)
+                kwargs = tree_unflatten(kwargs_list, kwargs_spec)
+
+                return args, kwargs
             else:
                 # All-gather the parameters in every forward pass for FSDP.
-                param_list = list(module.parameters(recurse=False))
-                self.all_gather_pipeline.all_gather_params(
-                    params=param_list,
-                    prefetch=fsdp_forward_prefetch,
-                    suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
-                )
-                for param in param_list:
+                for param in module.parameters(recurse=False):
+                    bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                    self.all_gather_pipeline.queue_bucket_to_all_gather(
+                        bucket_id,
+                        prefetch=fsdp_forward_prefetch,
+                        suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
+                    )
+                for param in module.parameters(recurse=False):
                     bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
                     self.all_gather_pipeline.wait_bucket_ready(bucket_id)
-            return args, kwargs
-
-        def _register_post_backward_hook(
-            post_backward_hook: callable,
-            module: nn.Module,
-            args: Tuple[Any, ...],
-            kwargs: Dict[str, Any],
-        ):
-            # Register the backward function to reduce gradients after the backward pass.
-            # And for optim_grads_params, we need to release the parameters after the backward pass.
-            if not torch.is_grad_enabled():
-                return args, kwargs
-
-            args_list, args_spec = tree_flatten(args)
-            kwargs_list, kwargs_spec = tree_flatten(kwargs)
-            args_kwargs_list = list(args_list) + list(kwargs_list)
-            inp_tensor_indices: List[int] = []
-            inp_tensors: List[torch.Tensor] = []
-            for i, obj in enumerate(args_kwargs_list):
-                if torch.is_tensor(obj) and obj.requires_grad:
-                    inp_tensor_indices.append(i)
-                    inp_tensors.append(obj)
-
-            if len(inp_tensors) == 0:
-                return args, kwargs
-
-            inp_tensors = RegisterFSDPBackwardFunction.apply(
-                functools.partial(post_backward_hook, module), *inp_tensors
-            )
-
-            for inp_tensor_idx, inp_tensor in zip(inp_tensor_indices, inp_tensors):
-                args_kwargs_list[inp_tensor_idx] = inp_tensor
-            args_list = args_kwargs_list[: len(args_list)]
-            kwargs_list = args_kwargs_list[len(args_list) :]
-            args = tree_unflatten(args_list, args_spec)
-            kwargs = tree_unflatten(kwargs_list, kwargs_spec)
 
             return args, kwargs
 
-        fsdp_modules = []
-        for name, module in root_module.named_modules():
-            if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
-                continue
+        if self.ddp_config.overlap_param_gather:
+            fsdp_modules = []
+            for name, module in root_module.named_modules():
+                if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                    if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
+                        continue
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
-                fsdp_modules.append(module)
+                    if isinstance(module, tuple(fsdp_unit_modules)):
+                        fsdp_modules.append(module)
 
-            self.forward_pre_hooks[f'module {name} parameter unshard'] = (
-                module.register_forward_pre_hook(
-                    _pre_forward_param_unshard, prepend=True, with_kwargs=True
+                self.forward_pre_hooks[f'module {name} parameter all-gather'] = (
+                    module.register_forward_pre_hook(_pre_forward, prepend=True, with_kwargs=True)
                 )
-            )
-            self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
-                module.register_forward_pre_hook(
-                    functools.partial(_register_post_backward_hook, _post_backward),
-                    with_kwargs=True,
-                )
-            )
-
-        def _root_post_backward(*unused):
-            # Make sure all the gradients are handled.
-            for param in self._params_require_handle_grad:
-                _grad_acc(param)
-
-            # Reduce the remain gradients.
-            grad_reduce_every_bprop = self.ddp_config.data_parallel_sharding_strategy in [
-                "optim_grads",
-                "optim_grads_params",
-            ]
-            if grad_reduce_every_bprop or self.is_last_microbatch:
-                self.grad_reduce_pipeline.reduce_gradients(
-                    list(self._params_require_handle_grad),
-                    suggested_queue_capacity=self.suggested_RS_queue_capacity,
-                )
-                self.grad_reduce_pipeline.reset()
-
-            # Reset root_pre_backward_hook_issued flag.
-            self._root_pre_backward_hook_issued = False
 
         def _pre_backward(module: nn.Module, *unused):
             module._training_state = TrainingState.PRE_BACKWARD
@@ -473,8 +383,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 all_gather_module_parameters(
                     module, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER
                 )
-
-        self._root_pre_backward_hook_issued = False
 
         def _root_pre_backward(module: nn.Module, *unused):
             """Marks the module's training state as 'pre_backward' before the
@@ -484,26 +392,13 @@ class FullyShardedDataParallel(_BaseDataParallel):
             perform reshard/unshard operations in activation recomputation
             scenarios.
             """
-            if self._root_pre_backward_hook_issued:
-                return
-            self._root_pre_backward_hook_issued = True
-
-            if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                for module in root_module.modules():
-                    if isinstance(module, tuple(fsdp_unit_modules)):
-                        module._training_state = TrainingState.PRE_BACKWARD
-                        for param in module.parameters():
-                            bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
-                            self.all_gather_pipeline.wait_bucket_ready(bucket_id, empty_ok=True)
-                            self.all_gather_pipeline.release_bucket(bucket_id)
-            self._params_require_handle_grad = set()
-            for param_group in self.param_and_grad_buffer.parameter_groups:
-                if not param_group.requires_grad:
-                    continue
-                self._params_require_handle_grad |= set(param_group.params)
-                for param in param_group.params:
-                    param.grad_added_to_main_grad = False
-            torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
+            for module in root_module.modules():
+                if isinstance(module, tuple(fsdp_unit_modules)):
+                    module._training_state = TrainingState.PRE_BACKWARD
+                    for param in module.parameters():
+                        bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                        self.all_gather_pipeline.wait_bucket_ready(bucket_id, empty_ok=True)
+                        self.all_gather_pipeline.release_bucket(bucket_id)
 
         def _post_forward(module: nn.Module, input: Any, output: Any):
             # When composing with module-hook-based activation checkpointing, the
@@ -519,7 +414,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
             release_params_fp8_transpose_cache(module.parameters(recurse=False))
 
-        if len(fsdp_unit_modules) != 0:
+        if self.data_parallel_sharding_strategy == "optim_grads_params":
             fsdp_modules = []
             for name, module in root_module.named_modules():
                 if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
@@ -539,20 +434,68 @@ class FullyShardedDataParallel(_BaseDataParallel):
                             _release_module_fp8_transpose_cache, prepend=False
                         )
                     )
-
-        # Registering all models with all parameters is to handle some special cases
-        # where the forward function of root_module is not called, but the forward
-        # functions of these equivalent modules are called instead.
-        for name, module in root_module.named_modules():
-            if len(list(module.parameters())) != len(list(root_module.parameters())):
-                continue
-
-            self.backward_pre_hooks[f"{name} _root_pre_backward"] = (
-                module.register_full_backward_pre_hook(_root_pre_backward)
+            self._root_pre_backward_hook_handle = root_module.register_full_backward_pre_hook(
+                _root_pre_backward
             )
-        self._root_pre_backward_hook_handle = root_module.register_full_backward_pre_hook(
-            _root_pre_backward
-        )
+
+        def _make_param_hook(param: torch.nn.Parameter):
+            """
+            Creates the all-reduce / reduce-scatter hook for backprop.
+            """
+
+            wait_previous_grad_reduce = not self.is_delay_grad_reduce
+
+            # FIXME: Use insert forward op to replace grad acc hook, which will
+            # be lost after parameter data movement. For example, module.cuda()
+            # will cause the registered grad acc hook to be lost.
+            def param_hook(*unused):
+                if param.requires_grad:
+                    if self.ddp_config.overlap_grad_reduce:
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+
+                    if param.grad is not None and (
+                        not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
+                    ):
+                        if self.is_delay_grad_reduce:
+                            param.main_grad.add_(param.grad.data)
+                        else:
+                            param.main_grad.copy_(param.grad.data)
+                    param.grad = None
+
+                    if self.ddp_config.overlap_grad_reduce and (
+                        not self.is_delay_grad_reduce or self.is_last_microbatch
+                    ):
+                        gr_pipeline = self.grad_reduce_pipeline
+                        bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                        gr_pipeline.place_bucket(bucket_id)
+                        go_rs = gr_pipeline.mark_item_ready(param, async_rs=True)
+                        if go_rs and wait_previous_grad_reduce:
+                            gr_pipeline.wait_for_previous_grad_reduce(
+                                recommeded_queue_capacity=self.suggested_RS_queue_capacity
+                            )
+
+            return param_hook
+
+        # Register backward gradient accumulation hook for each parameter.
+        self.grad_accs = []
+        for param in root_module.parameters():
+            bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+            wbuf = self.param_and_grad_buffer.parameter_groups[bucket_id].model_weight_buffer
+            if param.requires_grad:
+                if wbuf and wbuf.is_data_distributed:
+                    wbuf.fetch_bucket(and_allocate_params_data=True)
+
+                # Expand so we get access to grad_fn.
+                param_tmp = param.expand_as(param)
+                # Get the gradient accumulator function.
+                grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                grad_acc.register_hook(_make_param_hook(param))
+                self.grad_accs.append(grad_acc)
+
+                if wbuf and wbuf.is_data_distributed:
+                    wbuf.free_bucket_storage()
 
     @contextmanager
     def no_sync(self):
@@ -583,8 +526,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         """
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
-            first_param = list(self.module.parameters())[0]
-            self.all_gather_pipeline.all_gather_params(params=[first_param], prefetch=False)
+            self.all_gather_pipeline.queue_bucket_to_all_gather(bucket_id=0, prefetch=False)
         else:
             self.all_gather_pipeline.reset()
             for bucket_id in range(self.all_gather_pipeline.num_buckets):

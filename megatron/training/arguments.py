@@ -2065,11 +2065,9 @@ def _add_distributed_args(parser):
                        help='Sharding strategy of data parallelism.')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
-    group.add_argument('--suggested-communication-unit-size', type=int, default=None,
-                   help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
-                        'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
-                        'while a smaller value disables prefetching and may degrade performance. Adjust this value based on your system\'s memory '
-                        'and performance requirements.')
+    group.add_argument('--suggested-communication-unit-size', type=int, default=400_000_000,
+                       help='When batch communication is needed across multiple buckets, '
+                       'this environment variable guides the size of communication unit size.')
     group.add_argument('--keep-fp8-transpose-cache-when-using-custom-fsdp', action='store_true',
                        help='If set, keep the fp8 transpose cache when using custom FSDP.')
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,

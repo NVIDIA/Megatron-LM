@@ -153,11 +153,12 @@ model = FullyShardedDataParallel(
 Custom FSDP implements Fully Sharded Data Parallelism (FSDP) through a series of module hooks, gradient hooks, or by adding functions between modules. This involves inserting communications and manipulating parameters and gradients during PyTorch's module forward or backward propagation.
 
 Module hooks summary:
-- Module pre-forward hook(`module.register_forward_pre_hook`): This hook unshards model weights before the forward pass. In the case of an FSDP Unit Module, add a RegisterFSDPBackwardFunction function that will reshard model weights and reduce gradients after module backward propagation.
+- Module pre-forward hook(`module.register_forward_pre_hook`): This hook unshards model weights before the forward pass. In the case of an FSDP Unit Module, add a RegisterFSDPBackwardFunction function that will release the module's modes on backward propagation.
 - Module post-forward hook(`module.register_forward_hook`): This hook is used to reshard model weights after the forward pass.
 - Root module pre-backward hook(`root_module.register_full_backward_pre_hook`): This hook checks that all model parameters are resharded, in order to avoid unnecessary memory spikes. It also marks all modules as being in the `TrainingState.PRE_BACKWARD` state.
 - Module pre-backward hook(`module.register_full_backward_pre_hook`): This hook is used to unshard the model weights before the backward pass.
-- Root module post-backward hook(`torch.autograd.Variable._execution_engine.queue_callback`): This hook is used to make sure all gradients in the backprop are properly handled / available.
+- Gradient accumulation hook(`grad_acc.register_hook`): This hook is used to accumulate gradients and trigger the gradient reduction pipeline. 
+
 
 The gradient reduction pipeline maintains a map of gradients to FSDP parameter groups. If all gradients in an FSDP parameter group are ready, it launches a gradient reduction. Note that this assumes that the model's gradients are always generated in a certain order (reverse of `module.parameters()`), as otherwise, FSDP would maintain too many parameter group grad buffers, leading to excessive memory usage.
 
