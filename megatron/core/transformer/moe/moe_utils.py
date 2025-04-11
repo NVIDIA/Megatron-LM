@@ -6,6 +6,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 try:
@@ -20,6 +21,10 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+
+# MOE logging
+_MOE_LAYER_WISE_LOGGING_TRACKER = {}
 
 
 def switch_load_balancing_loss_func(
@@ -613,7 +618,7 @@ def save_to_aux_losses_tracker(
     if layer_number is None:
         return
 
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     if name not in tracker:
         tracker[name] = {}
         tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
@@ -624,7 +629,7 @@ def save_to_aux_losses_tracker(
 
 def clear_aux_losses_tracker():
     """Clear the auxiliary losses."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
         tracker[name]["reduce_group"] = None
@@ -633,11 +638,12 @@ def clear_aux_losses_tracker():
 
 def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
     """Collect and reduce the auxiliary losses across ranks."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     if track_names is None:
         track_names = tracker.keys()
     for name in track_names:
         values = tracker[name]["values"]
+        # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
         torch.distributed.all_reduce(
             values, group=parallel_state.get_pipeline_model_parallel_group()
@@ -665,7 +671,7 @@ def track_moe_metrics(
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     # Initialize the tracker if force_initialize is True
     if force_initialize:
         if track_names is not None:
@@ -734,6 +740,7 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         # All Reduce Across TPxCPxDP group
         torch.distributed.all_reduce(
             tokens_per_expert,
+            # TODO(Hepteract): delete the usage of the global parallel_state.
             group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
         )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
@@ -758,3 +765,28 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
             tensor.record_stream(torch.cuda.current_stream())
         tensor = cpu_tensor
     return tensor
+
+
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker."""
+    global _MOE_LAYER_WISE_LOGGING_TRACKER
+    return _MOE_LAYER_WISE_LOGGING_TRACKER
+
+
+# TODO(Hepteract): delete the usage of the global parallel_state.
+# Initialize process groups with the global parallel_state.
+def get_default_model_comm_pgs():
+    """Get the default process groups for MoE.
+
+    Returns:
+        ModelCommProcessGroups: The default process groups for MoE.
+    """
+    model_comm_pgs = ModelCommProcessGroups()
+    model_comm_pgs.ep_group = parallel_state.get_expert_model_parallel_group()
+    model_comm_pgs.tp_group = parallel_state.get_tensor_model_parallel_group()
+    model_comm_pgs.cp_group = parallel_state.get_context_parallel_group()
+    model_comm_pgs.expt_tp_group = parallel_state.get_expert_tensor_parallel_group()
+    model_comm_pgs.expt_dp_group = parallel_state.get_expert_data_parallel_group()
+    model_comm_pgs.tp_ep_group = parallel_state.get_expert_tensor_and_model_parallel_group()
+    model_comm_pgs.tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+    return model_comm_pgs

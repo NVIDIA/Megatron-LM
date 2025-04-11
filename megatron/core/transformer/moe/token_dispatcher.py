@@ -7,12 +7,6 @@ import torch
 
 from megatron.core.config import ENABLE_EXPERIMENTAL
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
-from megatron.core.parallel_state import (
-    get_expert_model_parallel_group,
-    get_expert_tensor_and_model_parallel_group,
-    get_expert_tensor_parallel_group,
-    get_expert_tensor_parallel_rank,
-)
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -20,6 +14,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.moe.fused_a2a import fused_combine, fused_dispatch
 from megatron.core.transformer.moe.moe_utils import (
+    ModelCommProcessGroups,
     get_capacity,
     maybe_move_tensor_to_cpu,
     permute,
@@ -45,35 +40,27 @@ class MoETokenDispatcher:
     MoE Token Dispatcher
     """
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(
+        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+    ) -> None:
         """
         Initialize the MoE Token Dispatcher.
+
+        Args:
+            config (TransformerConfig): Configuration for the MoE layer.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
 
-        self.tp_size = config.expert_tensor_parallel_size
-        self.ep_size = config.expert_model_parallel_size
+        self.ep_group = model_comm_pgs.ep_group
+        # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
+        self.tp_group = model_comm_pgs.expt_tp_group
+        self.tp_ep_group = model_comm_pgs.tp_ep_group
 
-    @property
-    def ep_group(self):
-        """Get expert model parallel group."""
-        return get_expert_model_parallel_group()
-
-    @property
-    def tp_group(self):
-        """Get expert tensor parallel group."""
-        return get_expert_tensor_parallel_group()
-
-    @property
-    def tp_rank(self):
-        """Get expert tensor parallel rank."""
-        return get_expert_tensor_parallel_rank()
-
-    @property
-    def tp_ep_group(self):
-        """Get expert tensor and model parallel group."""
-        return get_expert_tensor_and_model_parallel_group()
+        self.tp_size = self.tp_group.size()
+        self.tp_rank = self.tp_group.rank()
+        self.ep_size = self.ep_group.size()
 
     @abstractmethod
     def token_permutation(
@@ -120,12 +107,22 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
         """
         Initialize the zero token dropping router.
+
+        Args:
+            num_local_experts (int): Number of local experts.
+            local_expert_indices (List[int]): Indices of local experts.
+            config (TransformerConfig): Configuration for the MoE layer.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
         self.num_local_experts = num_local_experts
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
@@ -258,7 +255,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
         """
         Initialize the AlltoAll token dispatcher.
@@ -267,8 +268,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_local_experts (int): Number of local experts on the current device.
             local_expert_indices (List[int]): Indices of local experts on the current device.
             config (TransformerConfig): Configuration for the transformer model.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
         self.num_local_experts = num_local_experts
         assert config.num_moe_experts is not None
         self.num_experts = config.num_moe_experts
@@ -915,13 +917,26 @@ class _DeepepManager(_DispatchManager):
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """
-    Flexible token dispatcher for MoE models with Efficient-A2A communication kernels.
+    Flex token dispatcher using DeepEP.
     """
 
     def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
-        super().__init__(config)
+        """
+        Initialize the Flex token dispatcher.
+
+        Args:
+            num_local_experts (int): Number of local experts on the current device.
+            local_expert_indices (List[int]): Indices of local experts on the current device.
+            config (TransformerConfig): Configuration for the transformer model.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+        """
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
