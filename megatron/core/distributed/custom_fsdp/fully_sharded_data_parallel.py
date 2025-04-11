@@ -22,6 +22,7 @@ from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.fp8_utils import is_float8tensor
+from megatron.core.process_groups_config import GradCommProcessGroups
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_submodule, log_single_rank
@@ -83,6 +84,10 @@ class FullyShardedDataParallel(_BaseDataParallel):
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket.
+        grad_comm_pgs: Optional GradCommProcessGroups object. If not provided, the default
+            process groups from parallel_state will be used. If provided, module expects
+            grad_comm_pgs to have dp_cp or dp (if cp=1) and
+            expt_dp attributes(if using expert data parallelism).
     Examples:
         >>> model = GPTModel(config)
         >>> model = FullyShardedDataParallel(
@@ -102,6 +107,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
         disable_bucketing: bool = False,
         device: Optional[torch.device] = None,
+        grad_comm_pgs: Optional[GradCommProcessGroups] = None,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -114,6 +120,37 @@ class FullyShardedDataParallel(_BaseDataParallel):
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
+
+        if grad_comm_pgs is None:
+            self.dp_cp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, partial_data_parallel=False
+            )
+            self.expt_dp_group = parallel_state.get_expert_data_parallel_group()
+
+        else:
+            cp_size = getattr(config, 'context_parallel_size', 1)
+
+            if hasattr(grad_comm_pgs, 'dp_cp'):
+                self.dp_cp_group = grad_comm_pgs.dp_cp
+            elif hasattr(grad_comm_pgs, 'dp') and cp_size == 1:
+                self.dp_cp_group = grad_comm_pgs.dp
+            else:
+                raise ValueError(
+                    "Required process group missing: 'dp_cp' (or 'dp' when context_parallel_size=1)"
+                )
+
+            have_expert_parameters = False
+            for _, param in self.module.named_parameters():
+                if not getattr(param, 'allreduce', True):
+                    have_expert_parameters = True
+                    break
+            if have_expert_parameters:
+                assert hasattr(
+                    grad_comm_pgs, 'expt_dp'
+                ), 'expert process group is required when using expert parameters'
+                self.expt_dp_group = grad_comm_pgs.expt_dp
+            else:
+                self.expt_dp_group = None
 
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
@@ -130,10 +167,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
             else:
                 self.fsdp_unit_modules = []
         self.main_weights = True
-        self.data_parallel_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=True
-        )
-        self.expert_data_parallel_group = parallel_state.get_expert_data_parallel_group()
 
         # Determine if we should delay the gradient reduction.
         self.is_delay_grad_reduce = self.ddp_config.data_parallel_sharding_strategy in [
@@ -169,9 +202,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 # FIXME(@jianbinc): Will fix this issue based on Parallel Folding's EDP patch MR.
                 raise Exception("Not supported")
             else:
-                data_parallel_world_size = parallel_state.get_data_parallel_world_size(
-                    with_context_parallel=True
-                )
+                data_parallel_world_size = self.dp_cp_group.size()
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
@@ -186,8 +217,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
             ),
-            data_parallel_group=self.data_parallel_group,
-            expert_data_parallel_group=self.expert_data_parallel_group,
+            data_parallel_group=self.dp_cp_group,
+            expert_data_parallel_group=self.expt_dp_group,
             preserve_fp32_weights=self.ddp_config.preserve_fp32_weights,
             grad_reduce_in_fp32=self.ddp_config.grad_reduce_in_fp32,
             gradient_scaling_factor=gradient_scaling_factor,
@@ -672,13 +703,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                data_parallel_group = parallel_state.get_data_modulo_expert_parallel_group(
-                    with_context_parallel=True
-                )
+                data_parallel_group = self.expt_dp_group
             else:
-                data_parallel_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True
-                )
+                data_parallel_group = self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
