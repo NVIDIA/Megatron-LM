@@ -284,7 +284,7 @@ class TELinear(te.pytorch.Linear):
     def backward_dw(self):
         """Compute weight gradients during the backward pass if split_bw is enabled."""
         if self.config.split_bw:
-            super().wgrad_comp()
+            super().backward_dw()
 
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
@@ -463,7 +463,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     def backward_dw(self):
         """Compute weight gradients during the backward pass if split_bw is enabled."""
         if self.config.split_bw:
-            super().wgrad_comp()
+            super().backward_dw()
 
 
 class TEColumnParallelLinear(TELinear):
@@ -552,7 +552,7 @@ class TEColumnParallelLinear(TELinear):
     def backward_dw(self):
         """Compute weight gradients during the backward pass if split_bw is enabled."""
         if self.config.split_bw:
-            super().wgrad_comp()
+            super().backward_dw()
 
 
 class TERowParallelLinear(TELinear):
@@ -641,7 +641,7 @@ class TERowParallelLinear(TELinear):
     def backward_dw(self):
         """Compute weight gradients during the backward pass if split_bw is enabled."""
         if self.config.split_bw:
-            super().wgrad_comp()
+            super().backward_dw()
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -1164,7 +1164,7 @@ if is_te_min_version("1.9.0.dev0"):
         def backward_dw(self):
             """Compute weight gradients during the backward pass if split_bw is enabled."""
             if self.config.split_bw:
-                super().wgrad_comp()
+                super().backward_dw()
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """
