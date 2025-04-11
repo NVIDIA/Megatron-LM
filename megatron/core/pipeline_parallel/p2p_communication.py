@@ -102,12 +102,9 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
                     req.wait()
             else:
                 reqs.update(p2p_reqs)
-                for _, req in reqs:
+                for req in reqs.values():
                     req.wait()
-
-        # To protect against race condition when using batch_isend_irecv().
-        # should take this out once the bug with batch_isend_irecv is resolved.
-        torch.cuda.synchronize()
+            reqs = None
 
     recv_prev_shape = [0, 0, 0]
     if recv_prev_shape_tensor is not None:
@@ -410,11 +407,6 @@ def _communicate(
         for req in reqs if isinstance(reqs, list) else reqs.values():
             req.wait()
         reqs = None
-
-    if config.batch_p2p_comm and config.batch_p2p_sync:
-        # To protect against race condition when using batch_isend_irecv().
-        # User should assert that we have a modern enough PyTorch to not need this
-        torch.cuda.synchronize()
 
     def _handle_tensor_list(x):
         """This basically handles all the cases that we expect to see. Either the list None,
