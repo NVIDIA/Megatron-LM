@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from megatron.core.device_utils import get_current_device
+
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -57,7 +59,7 @@ def get_pos_emb_on_this_cp_rank(pos_emb: Tensor, seq_dim: int) -> Tensor:
     cp_rank = parallel_state.get_context_parallel_rank()
     cp_idx = torch.tensor(
         [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-    ).cuda(non_blocking=True)
+    ).to(device=get_current_device(), non_blocking=True)
     pos_emb = pos_emb.view(
         *pos_emb.shape[:seq_dim], 2 * cp_size, -1, *pos_emb.shape[(seq_dim + 1) :]
     )

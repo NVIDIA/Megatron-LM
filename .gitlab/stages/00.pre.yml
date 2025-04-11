@@ -221,6 +221,7 @@ pre:check_milestone:
 pre:check_status_of_main:
   extends: [.pre_rules]
   image: python:3.10
+  timeout: 7 days
   tags:
     - arch/amd64
     - env/prod
@@ -230,10 +231,10 @@ pre:check_status_of_main:
     - team/megatron
   script:
     - env
-    - pip install python-gitlab
+    - pip install --no-cache-dir python-gitlab click
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
-    - python tests/test_utils/python_scripts/check_status_of_main.py
+    - python tests/test_utils/python_scripts/check_status_of_main.py --target-branch "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
   rules:
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
       when: never

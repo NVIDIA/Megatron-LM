@@ -53,6 +53,7 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         use_cpu_initialization=True,
         gated_linear_unit=glu,
         fp8="hybrid" if fp8 else None,
+        add_bias_linear=False,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -164,10 +165,6 @@ class TestExpertLayerReconfiguration:
         """Test model saving and loading with different TP/PP/EP/ETP(expert-tensor-parallel)"""
         src_tp, src_pp, src_ep, src_etp = src_tp_pp_ep_etp
         dest_tp, dest_pp, dest_ep, dest_etp = dest_tp_pp_ep_etp
-        if expert_type == 'grouped':
-            add_bias_linear = False
-        else:
-            add_bias_linear = True
         # Save checkpoint A
         Utils.initialize_model_parallel(
             src_tp,
@@ -181,9 +178,7 @@ class TestExpertLayerReconfiguration:
         ) as ckpt_dir_A, TempNamedDir(
             tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_B'
         ) as ckpt_dir_B:
-            model_A = initialize_expert_layer(
-                1, use_glu, expert_type, add_bias_linear=add_bias_linear
-            )
+            model_A = initialize_expert_layer(1, use_glu, expert_type)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
@@ -209,9 +204,7 @@ class TestExpertLayerReconfiguration:
                 expert_tensor_parallel_size=dest_etp,
                 order=load_order,
             )
-            model_B = initialize_expert_layer(
-                1, use_glu, expert_type, add_bias_linear=add_bias_linear
-            )
+            model_B = initialize_expert_layer(1, use_glu, expert_type)
             if use_fpsl:
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
                 xm = get_xla_model()
@@ -264,10 +257,6 @@ class TestExpertLayerReconfiguration:
         """Test model saving and loading with different TP/PP/expert parallelism"""
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
-        if src_module == 'grouped' or dest_module == 'grouped':
-            add_bias_linear = False
-        else:
-            add_bias_linear = True
         # Save checkpoint A
         Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
         with TempNamedDir(
@@ -276,9 +265,7 @@ class TestExpertLayerReconfiguration:
             tmp_path_dist_ckpt / 'test_sequential_grouped_mlp_interchangeable_model_B'
         ) as ckpt_dir_B:
 
-            model_A = initialize_expert_layer(
-                1, use_glu, expert_type=src_module, add_bias_linear=add_bias_linear
-            )
+            model_A = initialize_expert_layer(1, use_glu, expert_type=src_module)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
@@ -287,9 +274,7 @@ class TestExpertLayerReconfiguration:
             Utils.destroy_model_parallel()
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
-            model_B = initialize_expert_layer(
-                1, use_glu, expert_type=dest_module, add_bias_linear=add_bias_linear
-            )
+            model_B = initialize_expert_layer(1, use_glu, expert_type=dest_module)
             load_strategy = None
             state_dict = load(
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
@@ -310,6 +295,7 @@ class TestExpertLayerReconfiguration:
             assert not any(map(bool, diffs)), diffs
             Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.11.0"),
         reason="FP8 support of TEGroupedMLP is only available in TE 1.11.0 and later.",
@@ -340,12 +326,13 @@ class TestExpertLayerReconfiguration:
         ) as ckpt_dir_B, fp8_autocast():
             tokens_per_expert = torch.tensor([16] * (8 // src_exp))
             input_tensor = torch.randn(tokens_per_expert.sum(), 16, device=get_current_device())
+            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device=get_current_device())
 
             # Save checkpoint A
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
             model_A = model_A.to(device=get_current_device())
             # fp8 meta is initialized at the first step
-            model_A(input_tensor, tokens_per_expert)
+            model_A(input_tensor, tokens_per_expert, probs)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
@@ -413,6 +400,7 @@ class TestExpertLayerReconfiguration:
 
             Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_te_min_version("1.9.0"),
         reason="TEGroupedMLP is only supported in TE 1.9.0 and later.",
@@ -425,11 +413,12 @@ class TestExpertLayerReconfiguration:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_te_grouped_linear_torch_native') as ckpt_dir:
             tokens_per_expert = torch.tensor([16] * (8 // ep_size))
             input_tensor = torch.randn(tokens_per_expert.sum(), 16, device=get_current_device())
+            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device=get_current_device())
 
             # Save checkpoint
             model = initialize_expert_layer(1, use_glu, expert_type="te_grouped")
             model = model.to(device=get_current_device())
-            model(input_tensor, tokens_per_expert)
+            model(input_tensor, tokens_per_expert, probs)
             torch.save(model.state_dict(), ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
 
             # Load checkpoint

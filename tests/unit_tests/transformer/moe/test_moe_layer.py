@@ -161,6 +161,7 @@ class TestInterleaveTransformerBlock:
             moe_ffn_hidden_size=256,
             use_cpu_initialization=True,
             num_moe_experts=2,
+            add_bias_linear=False,
         )
         self.parallel_transformer_block = TransformerBlock(
             self.transformer_config, get_gpt_decoder_block_spec(self.transformer_config, False)

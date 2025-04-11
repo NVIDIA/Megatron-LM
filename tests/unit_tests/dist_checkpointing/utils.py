@@ -181,6 +181,7 @@ def setup_model_and_optimizer(
                 tensor_model_parallel_size=tp,
                 pipeline_model_parallel_size=pp,
                 pipeline_dtype=torch.bfloat16,
+                bf16=bf16,
             )
         )
 
@@ -257,6 +258,7 @@ def setup_moe_model_and_optimizer(
                 use_te=use_te,
                 use_grouped_mlp=use_grouped_mlp,
                 use_glu=use_glu,
+                bf16=bf16,
             )
         )
 

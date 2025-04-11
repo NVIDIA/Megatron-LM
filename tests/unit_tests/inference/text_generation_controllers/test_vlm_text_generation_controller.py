@@ -5,13 +5,13 @@ import string
 import time
 from argparse import Namespace
 from collections import OrderedDict
-from typing import Dict
+from typing import Dict, List
 from unittest import mock
 
 import pytest
 import torch
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
@@ -28,10 +28,11 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestVLMTextGenerationController:
 
@@ -52,9 +53,14 @@ class TestVLMTextGenerationController:
             hidden_size=self.language_hidden_size,
             num_attention_heads=self.language_num_attention_heads,
             use_cpu_initialization=False,
+            bf16=True
         )
         vision_config = TransformerConfig(
-            num_layers=2, hidden_size=16, num_attention_heads=2, use_cpu_initialization=False
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_cpu_initialization=False,
+            bf16=True
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
@@ -62,6 +68,7 @@ class TestVLMTextGenerationController:
             ffn_hidden_size=32,
             num_attention_heads=1,
             use_cpu_initialization=False,
+            bf16=True
         )
 
         language_layer_spec = get_gpt_layer_local_spec()
@@ -85,7 +92,7 @@ class TestVLMTextGenerationController:
             patch_dim=14,
         ).to(device=get_current_device())
         self.image_token_index = self.model.image_token_index
-        self.model = Float16Module(self.model, Namespace(fp16=False, bf16=True))
+        self.model = Float16Module(self.model.config, self.model)
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.language_hidden_size,
@@ -119,7 +126,7 @@ class TestVLMTextGenerationController:
 
         batch_size: int = 1
         num_img_embeddings_per_tile: int = 576
-        imgs: torch.Tensor = torch.randn(1, 3, self.img_h, self.img_w).to(device=get_current_device())
+        imgs: torch.Tensor = torch.randn(1, 3, self.img_h, self.img_w).to(device=get_current_device(), dtype=torch.bfloat16)
         num_tiles: torch.Tensor = torch.Tensor([1]).int()
         decoder_seq_length: int = self.language_max_sequence_length
 

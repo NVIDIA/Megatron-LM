@@ -33,8 +33,9 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
-RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
-
+# Extract settings from params file
+TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
+    yq '.TEST_TYPE')
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "release")
 
 if [[ "$TEST_TYPE" == "release" ]]; then
@@ -57,24 +58,40 @@ export IS_NEMO_TEST
 # Adjust model_config for lightweight mode
 if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "true" ]]; then
     yq -i '.MODEL_ARGS."trainer.max_steps" = 2' $TRAINING_PARAMS_PATH
-    N_REPEAT=1
-elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."trainer.max_steps // "100"')
 
-    yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
-    yq -i '.MODEL_ARGS."--train-iters" = 2' $TRAINING_PARAMS_PATH
-    yq -i '.MODEL_ARGS."--save-interval" = 1' $TRAINING_PARAMS_PATH
     N_REPEAT=1
+
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+    yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
+    yq -i '.MODEL_ARGS."--exit-interval" = 4' $TRAINING_PARAMS_PATH
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."--exit-interval" // "100"')
+    N_REPEAT=1
+
+    if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+        yq -i '.MODEL_ARGS."--save-interval" = 2' $TRAINING_PARAMS_PATH
+    fi
+
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "false" && "$IS_NEMO_TEST" == "true" ]]; then
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."trainer.max_steps" // "100"')
+
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "false" && "$IS_NEMO_TEST" == "false" ]]; then
+    yq -i '.MODEL_ARGS."--exit-interval" = .MODEL_ARGS."--train-iters"' $TRAINING_PARAMS_PATH
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."--exit-interval" // "100"')
+
 fi
 
 # Extract settings from params file
-TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
-    yq '.TEST_TYPE')
 NVTE_ALLOW_NONDETERMINISTIC_ALGO=$(cat $TRAINING_PARAMS_PATH |
     yq '.ENV_VARS.NVTE_ALLOW_NONDETERMINISTIC_ALGO')
 SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
     yq '.ENV_VARS.SKIP_PYTEST')
-TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
-    yq '.MODEL_ARGS."--train-iters" // "100"')
+
+export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
 for i in $(seq 1 $N_REPEAT); do
     if [[ $i -gt 1 ]]; then
@@ -113,7 +130,7 @@ for i in $(seq 1 $N_REPEAT); do
     if [[ "$TEST_TYPE" == "ckpt-resume" ]]; then
         export CHECKPOINT_LOAD_PATH=$CHECKPOINT_SAVE_PATH
 
-        rm -rf "$CHECKPOINT_LOAD_PATH/iter_0000$TRAIN_ITERS"
+        rm -rf "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$TRAIN_ITERS")"
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2

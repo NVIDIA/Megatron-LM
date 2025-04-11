@@ -1393,19 +1393,25 @@ try:
 
     from transformer_engine.pytorch.permutation import (
         moe_permute,
+        moe_permute_with_probs,
         moe_sort_chunks_by_index,
+        moe_sort_chunks_by_index_with_probs,
         moe_unpermute,
     )
 
     fused_permute = moe_permute
-    fused_unpermute = moe_unpermute
+    fused_permute_with_probs = moe_permute_with_probs
     fused_sort_chunks_by_index = moe_sort_chunks_by_index
+    fused_sort_chunks_by_index_with_probs = moe_sort_chunks_by_index_with_probs
+    fused_unpermute = moe_unpermute
 
 except ImportError:
 
     fused_permute = None
-    fused_unpermute = None
+    fused_permute_with_probs = None
     fused_sort_chunks_by_index = None
+    fused_sort_chunks_by_index_with_probs = None
+    fused_unpermute = None
 
 try:
 
@@ -1419,4 +1425,4 @@ try:
 
 except ImportError:
 
-    te_parallel_cross_entropy = None
+    te_parallel_cross_entropy = None  # type: ignore[assignment, misc]

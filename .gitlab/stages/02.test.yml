@@ -1,5 +1,7 @@
 .test_rules:
   rules:
+    - if: $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
+      when: never
     - when: on_success
   stage: test
 
@@ -116,12 +118,28 @@ test:unit_tests_pyt(DEV)_mcore(legacy):
   variables:
     ENVIRONMENT: dev
     TAG: legacy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
 
 test:unit_tests_pyt(LTS)_mcore(legacy):
   extends: [.unit_tests_run]
   variables:
     ENVIRONMENT: lts
     TAG: legacy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
 
 test:unit_tests_pyt(DEV)_mcore(latest):
   extends: [.unit_tests_run]

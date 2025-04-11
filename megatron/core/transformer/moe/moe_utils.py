@@ -13,7 +13,9 @@ xm = get_xla_model()
 try:
     from megatron.core.extensions.transformer_engine import (
         fused_permute,
+        fused_permute_with_probs,
         fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
         fused_unpermute,
     )
 
@@ -236,6 +238,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 def permute(
     tokens,
     routing_map,
+    probs: Optional[torch.Tensor] = None,
     num_out_tokens: Optional[int] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
@@ -259,10 +262,20 @@ def permute(
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
     """
-    if fused:
+    if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
             raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
-        return fused_permute(tokens, routing_map, num_out_tokens)
+        permuted_input, sorted_indices = fused_permute(
+            tokens, routing_map, num_out_tokens=num_out_tokens
+        )
+        return permuted_input, None, sorted_indices
+
+    if fused and probs is not None:
+        if not HAVE_TE or fused_permute_with_probs is None:
+            raise ValueError(
+                "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
+            )
+        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
@@ -278,6 +291,8 @@ def permute(
         ].contiguous()
         # flatten from [num_experts, capacity] to 1D
         sorted_indices = sorted_indices.view(-1)
+        if probs is not None:
+            routing_map = routing_map.bool()
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
@@ -291,7 +306,12 @@ def permute(
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, sorted_indices
+    if probs is not None:
+        permuted_probs = probs.T.contiguous().masked_select(routing_map)
+    else:
+        permuted_probs = None
+
+    return permuted_input, permuted_probs, sorted_indices
 
 
 def unpermute(
@@ -330,7 +350,9 @@ def unpermute(
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
-        return fused_unpermute(permuted_tokens, sorted_indices, probs, restore_shape)
+        return fused_unpermute(
+            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
+        )
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
@@ -371,19 +393,36 @@ def unpermute(
 
 
 def sort_chunks_by_idxs(
-    input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor, fused: bool = False
+    input: torch.Tensor,
+    split_sizes: torch.Tensor,
+    sorted_idxs: torch.Tensor,
+    probs: Optional[torch.Tensor] = None,
+    fused: bool = False,
 ):
     """Split and sort the input tensor based on the split_sizes and sorted indices."""
-    if fused:
+    if fused and probs is None:
         if not HAVE_TE or fused_sort_chunks_by_index is None:
             raise ValueError(
                 "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
             )
-        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs)
+        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None
+
+    if fused and probs is not None:
+        if not HAVE_TE or fused_sort_chunks_by_index_with_probs is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index_with_probs is not available. "
+                "Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index_with_probs(input, probs, split_sizes, sorted_idxs)
 
     input = torch.split(input, split_sizes.tolist(), dim=0)
     output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
-    return output
+    if probs is not None:
+        probs = torch.split(probs, split_sizes.tolist(), dim=0)
+        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
+    else:
+        permuted_probs = None
+    return output, permuted_probs
 
 
 def group_limited_topk(
@@ -655,7 +694,7 @@ def track_moe_metrics(
             for key in track_names:
                 if key not in tracker:
                     tracker[key] = {}
-                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
+                    tracker[key]["values"] = torch.zeros(num_layers, device=get_current_device())
                     tracker[key]["reduce_group"] = None
                     tracker[key]["avg_group"] = None
     reduce_aux_losses_tracker_across_ranks(track_names)

@@ -50,7 +50,7 @@ class TestMoEModel(torch.nn.Module):
             expert_tensor_parallel_size=etp_size,
             bf16=True,
             params_dtype=torch.bfloat16,
-            add_bias_linear=HAVE_TE
+            add_bias_linear=False
         )
 
         if HAVE_TE:

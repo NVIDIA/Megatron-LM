@@ -59,5 +59,6 @@ MODEL_ARGS:
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --attention-backend: unfused
+  --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
 TEST_TYPE: regular

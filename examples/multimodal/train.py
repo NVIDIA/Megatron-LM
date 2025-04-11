@@ -224,7 +224,7 @@ def scaled_loss_func(loss_mask, output_tensor):
         loss_list[idx] = loss_list[idx] * math.sqrt(num_valid_labels_list[idx]) / base_num
 
     # Some ranks may not get loss tokens due to Context Parallel Sharding
-    if len(loss_list) > 0
+    if len(loss_list) > 0:
         total_loss = torch.stack(loss_list).sum()
         total_tokens = torch.ones_like(total_loss)
     elif len(loss_list) == 0 and args.context_parallel_size > 1:

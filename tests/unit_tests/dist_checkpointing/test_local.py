@@ -3,6 +3,7 @@ import filecmp
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -259,8 +260,8 @@ class TestLocalCheckpointing:
             if async_save:
                 maybe_finalize_async_save(True)
             torch.distributed.barrier(group=get_default_process_group())
-            time.sleep(1) # race condiiton between removing a file and checking it does not exist
-            assert not ckpt_path.exists(), f"rank: {Utils.rank} path: {ckpt_path}"
+            time.sleep(1)  # Allow sufficient time for async cleanup to complete
+            assert not ckpt_path.exists()
             ckpt_id = checkpointing_context['local_checkpoint_manager']._ckpt_id(2)
             ckpt_path = checkpointing_context['local_checkpoint_manager']._local_ckpt_path_from_id(
                 ckpt_id

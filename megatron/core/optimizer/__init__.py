@@ -90,12 +90,20 @@ def _get_param_groups(
     # Map (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr) to params.
     params_map = {}
     for model_chunk in model_chunks:
-        if model_chunk.ddp_config.use_custom_fsdp:
+        ddp_config = model_chunk.ddp_config
+        if ddp_config.use_custom_fsdp:
             named_parameters = model_chunk.optimizer_named_parameters()
         else:
             named_parameters = model_chunk.named_parameters()
 
         for name, param in named_parameters:
+            if (
+                ddp_config.use_custom_fsdp
+                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+            ):
+                param_shard = param
+                param = param.orig_param
+
             if not param.requires_grad:
                 continue
 
@@ -132,7 +140,13 @@ def _get_param_groups(
             key = (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr)
             if key not in params_map:
                 params_map[key] = []
-            params_map[key].append(param)
+            if (
+                ddp_config.use_custom_fsdp
+                and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+            ):
+                params_map[key].append(param_shard)
+            else:
+                params_map[key].append(param)
 
     param_groups = []
     for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():

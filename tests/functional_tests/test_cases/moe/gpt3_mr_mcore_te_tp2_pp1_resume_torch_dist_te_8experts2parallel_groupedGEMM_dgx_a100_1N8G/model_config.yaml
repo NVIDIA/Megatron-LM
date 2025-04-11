@@ -54,5 +54,6 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume

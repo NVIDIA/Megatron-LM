@@ -484,7 +484,10 @@ class _AllToAll(torch.autograd.Function):
                 all_output_splits = [ [ y.item() for y in x] for x in all_output_splits ]
 
                 max_dim = max(all_input_sizes)
-                input = torch.nn.functional.pad(input, (0, 0, 0, (max_dim - input.size()[0])), value=0.0)
+                paddings = [ 0 for _ in range(2*input.dim())]
+                paddings[-1] = (max_dim - input.size()[0])
+                paddings = tuple(paddings)
+                input = torch.nn.functional.pad(input, paddings, value=0.0)
                 all_inputs = xm.all_gather(input, dim=0, groups=group, pin_layout=False)
                 all_inputs = all_inputs.split(max_dim)
                 all_inputs = [ torch.split(x[:all_input_sizes[i]], all_input_splits[i]) for i, x in enumerate(all_inputs) ]
