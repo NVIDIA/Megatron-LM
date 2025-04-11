@@ -72,6 +72,11 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
     else:
         p2p_func = _p2p_ops
         
+    if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+        reqs = []
+    else:
+        reqs = {}
+        
     if config.use_ring_exchange_p2p:
         torch.distributed.ring_exchange(
             tensor_send_prev=send_prev_shape_tensor,
@@ -81,7 +86,7 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
             group=get_pipeline_model_parallel_group(),
         )
     else:
-        reqs = p2p_func(
+        p2p_reqs = p2p_func(
             tensor_send_prev=send_prev_shape_tensor,
             tensor_recv_prev=recv_prev_shape_tensor,
             tensor_send_next=send_next_shape_tensor,
@@ -91,8 +96,14 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
             next_pipeline_rank=get_pipeline_model_parallel_next_rank(),
         )
         if len(reqs) > 0:
-            for req in reqs:
-                req.wait()
+            if isinstance(p2p_reqs, list):
+                reqs.extend(p2p_reqs)
+                for req in reqs:
+                    req.wait()
+            else:
+                reqs.update(p2p_reqs)
+                for _, req in reqs:
+                    req.wait()
 
         # To protect against race condition when using batch_isend_irecv().
         # should take this out once the bug with batch_isend_irecv is resolved.
