@@ -18,7 +18,11 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+from megatron.core.transformer.transformer_layer import (
+    BaseTransformerLayer,
+    TransformerLayer,
+    get_transformer_layer_offset,
+)
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
@@ -272,7 +276,11 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            fp8_init_context = get_fp8_context(self.config, layer_number - 1, is_init=True)
+            fp8_init_context = get_fp8_context(
+                self.config,
+                layer_number - 1 + get_transformer_layer_offset(self.config),
+                is_init=True,
+            )
             with fp8_init_context:
                 module = build_module(layer_spec, config=self.config, layer_number=layer_number)
             return module
