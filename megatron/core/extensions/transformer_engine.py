@@ -144,6 +144,15 @@ class TELinear(te.pytorch.Linear):
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
+        if self.config.split_bw:
+            # TODO: Remove this once we have a stable release of TE
+            if get_te_version() == PkgVersion(
+                "2.3.0.dev0+7164025"
+            ) or get_te_version() == PkgVersion("2.2.0.dev0+ccd6634"):
+                extra_kwargs["split_bw"] = self.config.split_bw
+            else:
+                raise RuntimeError("Only TE with version 2.3.0.dev0+7164025 supports split_bw now.")
+
         if is_te_min_version("0.8.0"):
             if self.config.tp_comm_overlap:
                 if is_te_min_version("1.5.0"):
@@ -272,6 +281,11 @@ class TELinear(te.pytorch.Linear):
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
 
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if split_bw is enabled."""
+        if self.config.split_bw:
+            super().wgrad_comp()
+
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """
@@ -315,6 +329,15 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         extra_kwargs = _get_extra_te_kwargs(config)
+
+        if self.config.split_bw:
+            # TODO: Remove this once we have a stable release of TE
+            if get_te_version() == PkgVersion(
+                "2.3.0.dev0+7164025"
+            ) or get_te_version() == PkgVersion("2.2.0.dev0+ccd6634"):
+                extra_kwargs["split_bw"] = self.config.split_bw
+            else:
+                raise RuntimeError("Only TE with version 2.3.0.dev0+7164025 supports split_bw now.")
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         if is_te_min_version("0.11.0"):
@@ -437,6 +460,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
         )
 
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if split_bw is enabled."""
+        if self.config.split_bw:
+            super().wgrad_comp()
+
 
 class TEColumnParallelLinear(TELinear):
     """
@@ -521,6 +549,11 @@ class TEColumnParallelLinear(TELinear):
             f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
         )
 
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if split_bw is enabled."""
+        if self.config.split_bw:
+            super().wgrad_comp()
+
 
 class TERowParallelLinear(TELinear):
     """
@@ -604,6 +637,11 @@ class TERowParallelLinear(TELinear):
             f"{type(self).__name__}(in_features={self.in_features}, "
             f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
         )
+
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if split_bw is enabled."""
+        if self.config.split_bw:
+            super().wgrad_comp()
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -863,6 +901,18 @@ if is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
+
+            if self.config.split_bw:
+                # TODO: Remove this once we have a stable release of TE
+                if get_te_version() == PkgVersion(
+                    "2.3.0.dev0+7164025"
+                ) or get_te_version() == PkgVersion("2.2.0.dev0+ccd6634"):
+                    extra_kwargs["split_bw"] = self.config.split_bw
+                else:
+                    raise RuntimeError(
+                        "Only TE with version 2.3.0.dev0+7164025 supports split_bw now."
+                    )
+
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
@@ -1110,6 +1160,11 @@ if is_te_min_version("1.9.0.dev0"):
                     edp_replica_id = get_expert_data_parallel_rank()
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
+
+        def backward_dw(self):
+            """Compute weight gradients during the backward pass if split_bw is enabled."""
+            if self.config.split_bw:
+                super().wgrad_comp()
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """

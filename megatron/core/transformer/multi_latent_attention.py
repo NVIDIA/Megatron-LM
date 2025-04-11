@@ -3,7 +3,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import NoReturn, Optional, Union
 
 import torch
 
@@ -510,3 +510,29 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
         return query, key, value
+
+    def backward_dw(self) -> NoReturn:
+        """Execute weight update operations"""
+        try:
+            self._backward_kv_proj()
+            self._backward_q_proj()
+            self._backward_output_proj()
+        except Exception as e:
+            raise RuntimeError(f"Error in MLASelfAttention backward_dw: {str(e)}")
+
+    def _backward_kv_proj(self):
+        """Update weights for KV projection layers"""
+        self.linear_kv_up_proj.backward_dw()
+        self.linear_kv_down_proj.backward_dw()
+
+    def _backward_q_proj(self):
+        """Update weights for Q projection layers"""
+        if self.config.q_lora_rank is None:
+            self.linear_q_proj.backward_dw()
+        else:
+            self.linear_q_down_proj.backward_dw()
+            self.linear_q_up_proj.backward_dw()
+
+    def _backward_output_proj(self):
+        """Update weights for output projection layer"""
+        self.linear_proj.backward_dw()

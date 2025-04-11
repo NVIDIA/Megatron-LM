@@ -876,6 +876,38 @@ def validate_args(args, defaults={}):
             "as the hybrid device optimizer reuses the code path of this flag."
         )
 
+    if args.combined_1f1b:
+        # Basic requirements for combined 1F1B
+        assert args.distributed_backend == 'nccl', \
+            'combined 1F1B is only supported with NCCL backend'
+        assert args.pipeline_model_parallel_size > 1, \
+            'combined 1F1B is only supported with pipeline model parallelism'
+        assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
+            'virtual pipeline parallel should be enabled for combined 1F1B'
+
+        # Additional requirements for ep_a2a recipe
+        if args.combined_1f1b_recipe == 'ep_a2a':
+            # Expert model parallelism requirements
+            assert args.expert_model_parallel_size > 1, \
+                'Combined 1f1b recipe ep_a2a is only supported with expert model parallelism'
+            assert args.moe_token_dispatcher_type == 'alltoall', \
+                'Combined 1f1b recipe ep_a2a is only supported with alltoall token dispatcher'
+            
+            # Disable recomputation as it conflicts with combined 1F1B's memory management
+            assert args.recompute_granularity != 'full', \
+                'recompute_granularity must not be full when combined_1f1b_recipe is ep_a2a'
+            assert args.recompute_method is None, \
+                'recompute_method must be None when combined_1f1b_recipe is ep_a2a'
+            assert args.recompute_num_layers is None, \
+                'recompute_num_layers must be None when combined_1f1b_recipe is ep_a2a'
+            
+            # Disable shared expert overlap as it conflicts with ep_a2a
+            assert not args.moe_shared_expert_overlap, \
+                'moe_shared_expert_overlap is not supported when combined_1f1b_recipe is ep_a2a'
+
+        # Check split_bw compatibility with legacy groupedgemm
+        if args.split_bw and args.moe_use_legacy_grouped_gemm:
+            raise ValueError('split_bw is not supported with legacy groupedgemm implementation')
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -1357,7 +1389,7 @@ def _add_logging_args(parser):
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
                        help='Size of the tensorboard queue for pending events '
-                       'and summaries before one of the ‘add’ calls forces a '
+                       'and summaries before one of the "add" calls forces a '
                        'flush to disk.')
     group.add_argument('--log-timers-to-tensorboard', action='store_true',
                        help='If set, write timers to tensorboard.')
@@ -2485,6 +2517,14 @@ def _add_moe_args(parser):
                        help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
     group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
                        help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
+    group.add_argument('--combined-1f1b', action='store_true',
+                       help='Batch-level overlapping in 1f1b stage.')
+    group.add_argument('--combined-1f1b-recipe', type=str,
+                       choices=['ep_a2a'],
+                       default='ep_a2a',
+                       help='Options are only "ep_a2a" now.')
+    group.add_argument('--split-bw', action='store_true',
+                       help='Split dgrad and wgrad for batch-level overlapping')                       
 
     return parser
 

@@ -548,6 +548,12 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
+    def get_layer_callables(self, layer_number: int):
+        """
+        Get the callables for the layer at the given layer number.
+        """
+        return self.layers[layer_number].get_submodule_callables()
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
     ) -> ShardedStateDict:
