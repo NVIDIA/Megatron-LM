@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.moe.moe_utils import ModelCommProcessGroups
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version, make_sharded_tensor_for_checkpoint
 
@@ -31,12 +32,19 @@ class SharedExpertMLP(MLP):
     # The shared experts are scheduled into this stream to be overlapped with the dispatcher.
     stream = None
 
-    def __init__(self, config: TransformerConfig, submodules: MLPSubmodules, gate: bool):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: MLPSubmodules,
+        gate: bool,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+    ):
         config = deepcopy(config)
         assert config.add_bias_linear == False, "bias is not supported in the shared experts, "
         "please set '--disable-bias-linear' instead."
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
+        # TODO(Hepteract): pass model_comm_pgs to MLP after refactoring MLP
         super().__init__(config=config, submodules=submodules)
 
         self.use_shared_expert_gate = gate

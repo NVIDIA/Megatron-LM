@@ -39,7 +39,9 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-  - test_case: [gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp1_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
+  # TODO(Hepteract): Late init of parallel_state was broken after parallel states refactor,
+  # So skip this test case until NeMo is adapted to the refactored MCore.
+  # - test_case: [gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp1_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]

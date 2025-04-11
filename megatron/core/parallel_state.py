@@ -118,9 +118,6 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-# MOE logging
-_MOE_LAYER_WISE_LOGGING_TRACKER = {}
-
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
@@ -1992,12 +1989,6 @@ def get_all_ranks():
     return '_'.join(map(lambda x: str(x or 0), ranks))
 
 
-def get_moe_layer_wise_logging_tracker():
-    """Return the moe layer wise tracker."""
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    return _MOE_LAYER_WISE_LOGGING_TRACKER
-
-
 def destroy_model_parallel():
     """Set the groups to none."""
     global _MODEL_PARALLEL_GROUP
@@ -2119,6 +2110,3 @@ def destroy_model_parallel():
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
     # End of expert parallelism destroy.
-
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    _MOE_LAYER_WISE_LOGGING_TRACKER = {}
