@@ -159,3 +159,15 @@ class MoELayer(BaseMoELayer):
             output, mlp_bias = custom_forward(hidden_states)
 
         return output, mlp_bias
+
+    def backward_dw(self):
+        """Performs backward pass for weight gradients in MoELayer.
+
+        This method executes the backward pass for weight gradients by calling
+        backward_dw() on both the experts and shared_experts components.
+        This ensures that gradients are properly computed for all expert weights
+        in the mixture of experts layer.
+        """
+        self.experts.backward_dw()
+        if self.use_shared_expert and not self.shared_expert_overlap:
+            self.shared_experts.backward_dw()
