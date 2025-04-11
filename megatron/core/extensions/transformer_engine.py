@@ -68,7 +68,7 @@ class TENorm:
     def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
         if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size,
+                hidden_size,
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
@@ -79,7 +79,7 @@ class TENorm:
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
             instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size,
+                hidden_size,
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
