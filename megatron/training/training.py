@@ -2129,6 +2129,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if wandb_writer:
             wandb_writer.finish()
         ft_integration.shutdown()
+        one_logger_utils.finish()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far
