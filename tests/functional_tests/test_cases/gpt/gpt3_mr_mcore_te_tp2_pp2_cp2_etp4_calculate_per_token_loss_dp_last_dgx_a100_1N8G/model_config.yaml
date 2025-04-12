@@ -50,5 +50,6 @@ MODEL_ARGS:
   --attention-backend: flash
   --log-memory-to-tensorboard: true
   --use-tp-pp-dp-mapping: true
+  --expert-tensor-parallel-size: 4
   --calculate-per-token-loss: true
 TEST_TYPE: regular

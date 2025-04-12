@@ -1,6 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
 MODEL_ARGS:
   --num-layers: 12
   --hidden-size: 512
@@ -51,5 +51,5 @@ MODEL_ARGS:
   --attention-backend: flash
   --log-memory-to-tensorboard: true
   --use-tp-pp-dp-mapping: true
-  --calculate-per-token-loss: true
+  --expert-tensor-parallel-size: 4
 TEST_TYPE: regular
