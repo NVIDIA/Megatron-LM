@@ -51,5 +51,4 @@ MODEL_ARGS:
   --attention-backend: flash
   --log-memory-to-tensorboard: true
   --use-tp-pp-dp-mapping: true
-  --expert-tensor-parallel-size: 4
 TEST_TYPE: regular
