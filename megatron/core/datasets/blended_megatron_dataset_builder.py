@@ -134,42 +134,9 @@ class BlendedMegatronDatasetBuilder(object):
         for dataset in datasets:
             if dataset is not None and len(dataset) > 0:
                 if isinstance(dataset, BlendedDataset):
-                    if dataset.built_anew_on_cache_miss or any(
-                        x.built_anew_on_cache_miss for x in dataset.datasets
-                    ):
-                        log_single_rank(
-                            logger,
-                            logging.INFO,
-                            (
-                                f"Verifying NumPy indices for {type(dataset).__name__} "
-                                f"{dataset.split.name} split"
-                            ),
-                        )
-                    else:
-                        log_single_rank(
-                            logger,
-                            logging.INFO,
-                            (
-                                f"NumPy indices for {type(dataset).__name__} {dataset.split.name} "
-                                f"split are fully cached, skipping verification"
-                            ),
-                        )
-                        continue
-                    # Check blend size
-                    assert dataset.size is None or dataset.size == dataset.dataset_index.shape[0]
-                    # Check blend access of mid-level datasets
-                    dataset_indices, dataset_sizes = numpy.unique(
-                        dataset.dataset_index, return_counts=True
-                    )
-                    for i, (index, size) in enumerate(zip(dataset_indices, dataset_sizes)):
-                        if len(dataset.datasets[index]) < size:
-                            raise IndexError(
-                                f"The {dataset.split.name} blend oversamples the contributing "
-                                f"datasets  and, e.g., requests {size} samples from "
-                                f"{type(dataset.datasets[index]).__name__} {i} with size "
-                                f"{len(dataset.datasets[index])}. This is unexpected. "
-                                f"Please file an issue."
-                            )
+                    assert dataset.size is None or dataset.size == len(dataset)
+                elif isinstance(dataset, MegatronDataset):
+                    assert dataset.num_samples is None or dataset.num_samples <= len(dataset)
 
         return datasets
 
@@ -217,7 +184,7 @@ class BlendedMegatronDatasetBuilder(object):
                 sizes_per_dataset_target = _get_size_per_split_per_dataset(weights, self.sizes)
                 # The number of samples we plan to build per dataset
                 sizes_per_dataset_buffer = _get_size_per_split_per_dataset(
-                    weights, self.sizes, margin=0.5
+                    weights, self.sizes, surplus=self.config.mid_level_dataset_surplus
                 )
 
             # Build each dataset in parallel
@@ -300,7 +267,7 @@ class BlendedMegatronDatasetBuilder(object):
                         )
                         # The number of samples we plan to build per dataset
                         sizes_per_dataset_buffer = _get_size_per_split_per_dataset(
-                            weights, sizes_spoof, margin=0.5
+                            weights, sizes_spoof, surplus=self.config.mid_level_dataset_surplus
                         )
 
                     # Build each dataset in parallel
@@ -549,7 +516,7 @@ class BlendedMegatronDatasetBuilder(object):
 
 
 def _get_size_per_split_per_dataset(
-    normalized_weights: List[float], target_size_per_split: List[int], margin: float = 0.0
+    normalized_weights: List[float], target_size_per_split: List[int], surplus: float = 0.0
 ) -> List[List[int]]:
     """Determine the contribution of the MegatronDataset splits to the BlendedDataset splits
 
@@ -559,8 +526,7 @@ def _get_size_per_split_per_dataset(
         target_size_per_split (List[int]): The number of samples to target for each BlendedDataset
             split
 
-        margin (float): The relative quantity of extra samples to build per per split per dataset,
-            as a percentage
+        surplus (float): The sample surplus to build per split per dataset
 
     Returns:
         List[List[int]]: The number of samples to request per MegatronDataset per split
@@ -570,7 +536,7 @@ def _get_size_per_split_per_dataset(
     # Use margin as buffer to ensure we satiate the request
     sizes_per_dataset = [
         [
-            int(math.ceil(math.ceil(target_size * weight) * (1 + margin / 100)))
+            int(math.ceil(math.ceil(target_size * weight) * (1 + surplus)))
             for target_size in target_size_per_split
         ]
         for weight in normalized_weights
