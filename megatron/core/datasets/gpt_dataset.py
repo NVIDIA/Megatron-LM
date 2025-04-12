@@ -362,7 +362,6 @@ class GPTDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
-            self.built_anew_on_cache_miss = True
             t_beg = time.time()
 
             sequence_length = self.config.sequence_length

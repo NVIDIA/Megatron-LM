@@ -36,6 +36,7 @@ def test_mock_multimodal_dataset():
         image_w=336,
         split="990,9,1",
         tokenizer=_NullTokenizer(vocab_size=_MOCK_VOCAB_SIZE),
+        mid_level_dataset_surplus=0.005,
     )
 
     datasets = BlendedMegatronDatasetBuilder(

@@ -94,6 +94,7 @@ def core_gpt_dataset_config_from_args(args):
         reset_attention_mask=args.reset_attention_mask,
         eod_mask_loss=args.eod_mask_loss,
         create_attention_mask=args.create_attention_mask_in_dataloader,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
     )
 
 
