@@ -8,6 +8,7 @@ import os
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 from torch.distributed import ProcessGroup
@@ -258,7 +259,7 @@ def get_blocks_by_rank(
         Returns:
             Max value across all ranks.
         """
-        n_tensor = torch.cuda.LongTensor([n])
+        n_tensor = torch.tensor([n], dtype=torch.long, device=get_current_device())
         torch.distributed.all_reduce(n_tensor, op=torch.distributed.ReduceOp.MAX)
         return n_tensor.item()
 

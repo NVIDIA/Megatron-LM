@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.core import mpu, tensor_parallel
 from megatron.legacy.data.dataset_utils import create_masked_lm_predictions, \
@@ -189,8 +190,13 @@ def get_block_samples_mapping(block_dataset, title_dataset, data_prefix, num_epo
     # This should be a barrier but nccl barrier assumes
     # device_index=rank which is not the case for model
     # parallel case
-    counts = torch.tensor([1], dtype=torch.long, device='cuda')
-    torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
+    counts = torch.tensor([1], dtype=torch.long, device=get_current_device())
+    xm = get_xla_model()
+    if xm:
+        xm.all_reduce(xm.REDUCE_SUM, [counts], 
+                                    groups=mpu.get_data_parallel_groups(), pin_layout=False)
+    else:
+        torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group())
     assert counts[0].item() == torch.distributed.get_world_size(
         group=mpu.get_data_parallel_group())
 

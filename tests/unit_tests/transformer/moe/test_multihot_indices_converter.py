@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from megatron.core import config
+from megatron.core.device_utils import get_current_device
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
+from tests.unit_tests.test_utilities import Utils
 
 
 class PytorchIndicesToMultihot:
@@ -33,7 +35,9 @@ class PytorchIndicesToMultihot:
 
 # Unit test
 @pytest.mark.experimental
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_indices_to_multihot():
+    Utils.initialize_model_parallel()
     config.ENABLE_EXPERIMENTAL = True
     indices = torch.tensor(
         [
@@ -43,7 +47,7 @@ def test_indices_to_multihot():
             [-1, -1, 25, -1, -1, -1, -1, -1],
         ],
         dtype=torch.int32,
-        device='cuda',
+        device=get_current_device(),
     )
     probs_indices = torch.tensor(
         [
@@ -53,7 +57,7 @@ def test_indices_to_multihot():
             [0.0000, 0.0000, 0.1309, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],
         ],
         dtype=torch.float32,
-        device='cuda',
+        device=get_current_device(),
         requires_grad=True,
     )
     indices_pytorch = copy.deepcopy(indices)
@@ -79,3 +83,4 @@ def test_indices_to_multihot():
     ).sum() / 2
     loss_pytorch.backward()
     assert torch.allclose(probs_indices.grad, probs_indices_pytorch.grad)
+    Utils.destroy_model_parallel()

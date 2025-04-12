@@ -3,6 +3,8 @@
 import argparse
 import os
 import random
+from megatron.core.device_utils import get_distributed_backend, get_local_device_count
+from megatron.core.device_utils import get_distributed_init_method
 import numpy
 import torch
 
@@ -23,10 +25,10 @@ def set_random_seed(seed):
     random.seed(seed)
     numpy.random.seed(seed)
     torch.manual_seed(seed)
-    mpu.model_parallel_cuda_manual_seed(seed)
+    mpu.model_parallel_device_manual_seed(seed)
 
 
-def initialize_distributed(backend='nccl'):
+def initialize_distributed(backend=None):
     """Initialize torch.distributed."""
     # Get local rank in case it is provided.
     parser = argparse.ArgumentParser()
@@ -37,22 +39,14 @@ def initialize_distributed(backend='nccl'):
 
     # Get rank and world size.
     rank = int(os.getenv('RANK', '0'))
-    world_size = int(os.getenv("WORLD_SIZE", '1'))
+    world_size = int(os.getenv("WORLD_SIZE", get_local_device_count()))
 
     print('> initializing torch.distributed with local rank: {}, '
           'rank: {}, world size: {}'.format(local_rank, rank, world_size))
 
-    # Set the device id.
-    device = rank % torch.cuda.device_count()
-    if local_rank is not None:
-        device = local_rank
-    torch.cuda.set_device(device)
-
     # Call the init process.
-    init_method = 'tcp://'
-    master_ip = os.getenv('MASTER_ADDR', 'localhost')
-    master_port = os.getenv('MASTER_PORT', '6000')
-    init_method += master_ip + ':' + master_port
+    init_method = get_distributed_init_method()
+    backend = backend if backend is not None else get_distributed_backend()
     torch.distributed.init_process_group(
         backend=backend,
         world_size=world_size,

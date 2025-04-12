@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import torch
 import warnings
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -20,6 +21,9 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 try:
@@ -114,3 +118,32 @@ bert_layer_local_spec = ModuleSpec(
         },
     ),
 )
+
+if HAVE_TE:
+    bert_layer_with_transformer_engine_spec = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            self_attention=ModuleSpec(
+                module=SelfAttention,
+                params={"attn_mask_type": AttnMaskType.padding},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TELayerNormColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=IdentityOp,
+                    k_layernorm=IdentityOp,
+                ),
+            ),
+            self_attn_bda=get_bias_dropout_add,
+            mlp=ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TELayerNormColumnParallelLinear,
+                    linear_fc2=TERowParallelLinear,
+                ),
+            ),
+            mlp_bda=get_bias_dropout_add,
+        ),
+    )
+else:
+    bert_layer_with_transformer_engine_spec = bert_layer_local_spec

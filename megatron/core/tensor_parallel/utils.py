@@ -1,7 +1,10 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List, Sequence
+from typing import List, Sequence, Union
 
+import torch.distributed
+
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state
@@ -60,7 +63,7 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
         data = torch.empty(
             partition_size,
             dtype=tensor.dtype,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
             requires_grad=False,
         )
         data.copy_(tensor.view(-1)[start_index:end_index])
@@ -78,13 +81,17 @@ def gather_split_1d_tensor(tensor):
     Args:
         tensor: A Tensor or view of this rank's portion of the data.
     """
+    
     numel_gathered = torch.numel(tensor) * parallel_state.get_tensor_model_parallel_world_size()
-    gathered = torch.empty(
-        numel_gathered, dtype=tensor.dtype, device=torch.cuda.current_device(), requires_grad=False
-    )
-    dist_all_gather_func(gathered, tensor, group=parallel_state.get_tensor_model_parallel_group())
+    xm = get_xla_model()
+    if xm:
+        gathered = xm.all_gather(tensor, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False).view(numel_gathered)
+    else:
+        gathered = torch.empty(
+            numel_gathered, dtype=tensor.dtype, device=get_current_device(), requires_grad=False
+        )
+        dist_all_gather_func(gathered, tensor, group=parallel_state.get_tensor_model_parallel_group())
     return gathered
-
 
 class VocabUtility:
     """Split the vocabulary into `world_size` chunks and return the first

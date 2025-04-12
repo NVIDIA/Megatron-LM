@@ -3,6 +3,7 @@
 import contextlib
 from typing import Iterator, List, Union
 
+from megatron.core.device_utils import get_current_device, get_current_device_type
 import torch
 from torch.autograd.variable import Variable
 
@@ -269,7 +270,7 @@ def forward_step(
     set_input_tensor(input_tensor)
 
     if config.enable_autocast:
-        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+        context_manager = torch.autocast(get_current_device_type(), dtype=config.autocast_dtype)
     else:
         context_manager = contextlib.nullcontext()
     with context_manager:
@@ -474,7 +475,7 @@ def forward_backward_no_pipelining(
 
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
-    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    total_num_tokens = torch.zeros([], dtype=torch.int, device=get_current_device())
     with no_sync_func():
         for i in range(num_microbatches - 1):
             output_tensor, num_tokens = forward_step(
@@ -762,7 +763,7 @@ def forward_backward_pipelining_with_interleaving(
 
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.tensor(0, dtype=torch.int).to(device=get_current_device())
 
     forward_data_store = []
     output_tensor_grads = None
@@ -1825,7 +1826,7 @@ def forward_backward_pipelining_without_interleaving(
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.tensor(0, dtype=torch.int).to(device=get_current_device())
 
     if not forward_only:
         input_tensors = []

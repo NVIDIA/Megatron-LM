@@ -5,13 +5,26 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import partition_buckets
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec
+)
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from tests.unit_tests.test_utilities import TestModel, Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+xm = get_xla_model()
 
 class TestMoEModel(torch.nn.Module):
     def __init__(
@@ -37,16 +50,23 @@ class TestMoEModel(torch.nn.Module):
             expert_tensor_parallel_size=etp_size,
             bf16=True,
             params_dtype=torch.bfloat16,
+            add_bias_linear=False
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
-        )
+
+        if HAVE_TE:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+            )
+        else:
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+            )
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [
                 MoELayer(
                     transformer_config, transformer_layer_spec.submodules.mlp.submodules
-                ).cuda()
+                ).to(device=get_current_device())
                 for _ in range(num_layers)
             ]
         )
@@ -64,6 +84,7 @@ def get_moe_model_and_buffers(
     overlap_grad_reduce: bool,
     average_in_collective: bool,
 ):
+    model_parallel_device_manual_seed(123)
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
         use_distributed_optimizer=use_distributed_optimizer,
@@ -113,6 +134,10 @@ def test_grad_sync(
     ep_size: int,
     etp_size: int,
 ):
+    use_distributed_optimizer = use_distributed_optimizer and xm is None
+    average_in_collective = average_in_collective and xm is None
+    
+    Utils.fake_initialize_model_parallel(expert_model_parallel_size=ep_size)
     Utils.initialize_model_parallel(
         expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
     )

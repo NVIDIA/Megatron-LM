@@ -2,6 +2,7 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
@@ -11,14 +12,16 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import WrappedProcessGroup
 from megatron.core.tensor_parallel import ColumnParallelLinear
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class DummyModel(MegatronModule):
     """Setup a few modules to test the FSDP2 constructor."""
@@ -33,19 +36,18 @@ class DummyModel(MegatronModule):
             input_size=2, output_size=2, config=config, init_method=init_method_normal(0.02)
         )
         self.conv = torch.nn.Conv2d(2, 2, 1)
-
-
+    
 @pytest.fixture
 def init_model_parallel():
     """Init torch distributed."""
     Utils.initialize_model_parallel(1, 1)
     init_num_microbatches_calculator(0, None, 1, 1, 1)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
     yield  # Run the actual test.
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
 
-
+@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
 def test_fsdp2_constructor(init_model_parallel):
     """Test the FSDP2 constructor."""
     if not is_torch_min_version("2.4.0"):
@@ -73,7 +75,7 @@ def test_fsdp2_constructor(init_model_parallel):
     # Conv2d is not in the list of submodules to wrap.
     assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
 
-
+@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
 def test_fsdp2_constructor_with_process_group(init_model_parallel):
     """Test the FSDP2 constructor with explicit process group parameter."""
     if not is_torch_min_version("2.4.0"):
@@ -86,15 +88,18 @@ def test_fsdp2_constructor_with_process_group(init_model_parallel):
     model = Float16Module(config, model)
 
     # Create a custom process group (using the default world for testing)
-    custom_process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+    custom_process_group = WrappedProcessGroup(
+        process_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+        rank_groups=parallel_state.get_data_parallel_groups(with_context_parallel=True)
+    )
 
     # Create the sharded model with explicit process group
     fsdp_model = TorchFullyShardedDataParallel(
-        config, ddp_config, model, process_group=custom_process_group
+        config, ddp_config, model, group=custom_process_group
     )
 
     # Verify the process group was set correctly
-    assert fsdp_model.process_group is custom_process_group
+    assert fsdp_model.group is custom_process_group
 
     # Check that module wrapping still works correctly
     def _is_fsdp_wrapped_module(instance):

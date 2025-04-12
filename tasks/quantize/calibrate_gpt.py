@@ -4,6 +4,8 @@
 import os
 import sys
 
+from megatron.core.device_utils import get_current_device_type
+
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
@@ -125,7 +127,7 @@ def calibrate(data_loader, model):
             if iteration % args.log_interval == 0:
                 print_rank_0('> working on iteration: {}'.format(iteration))
             with te.fp8_autocast(enabled=False, calibrating=True), torch.autocast(
-                device_type='cuda', dtype=torch.bfloat16
+                device_type=get_current_device_type(), dtype=torch.bfloat16
             ):
                 output = forward_step(batch, model, config)
 
@@ -140,7 +142,7 @@ def calibrate(data_loader, model):
 
         print_rank_0(f"Compute scaling factors with FP8 autocast ...")
         with te.fp8_autocast(enabled=True), torch.autocast(
-            device_type='cuda', dtype=torch.bfloat16
+            device_type=get_current_device_type(), dtype=torch.bfloat16
         ):
             forward_step(batch, model, config)
 

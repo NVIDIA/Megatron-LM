@@ -2,6 +2,7 @@
 
 from typing import Optional, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -18,7 +19,8 @@ try:
 
     NORM_IMPL = TENorm
 except:
-    NORM_IMPL = torch.nn.LayerNorm
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    NORM_IMPL = WrappedTorchNorm
 
 
 # Note: This is under development and is missing features like position embedding interpolation.
@@ -114,7 +116,7 @@ class CLIPViTModel(VisionModule):
             padding=padding,
         )
 
-        self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
+        self.position_ids = torch.arange(self.seq_length).expand(1, -1).to(device=get_current_device())
 
         self.position_embeddings = torch.nn.Embedding(self.seq_length, self.visual_hidden_size)
 

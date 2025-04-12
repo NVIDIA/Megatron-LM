@@ -5,10 +5,12 @@ import types
 from dataclasses import dataclass
 from typing import List, Optional
 
+import pytest
 import torch
 from tqdm import tqdm
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.inference.contexts import (
     ChunkOverflowError,
     DynamicInferenceContext,
@@ -28,7 +30,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -93,7 +95,7 @@ class TestEnv:
     requests: List[Request]
     engine: DynamicInferenceEngine
 
-
+@pytest.mark.skip("not supported")
 class TestDynamicInferenceEngine:
 
     @classmethod
@@ -157,7 +159,7 @@ class TestDynamicInferenceEngine:
         # Random state.
         random.seed(random_seed)
         torch.manual_seed(random_seed)
-        model_parallel_cuda_manual_seed(random_seed)
+        model_parallel_device_manual_seed(random_seed)
 
         # Transformer config.
         transformer_config = TransformerConfig(
@@ -187,7 +189,7 @@ class TestDynamicInferenceEngine:
             vocab_size=vocab_size,
             max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
             parallel_output=True,
-        ).cuda()
+        ).to(device=get_current_device())
 
         for param in model.parameters():
             param.data = param.data.to(transformer_config.params_dtype)

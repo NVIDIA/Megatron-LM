@@ -9,6 +9,8 @@ from typing import Dict, List
 from unittest import mock
 
 import pytest
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state
@@ -26,7 +28,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.parallel_state import get_default_process_group, is_pipeline_first_stage, is_pipeline_last_stage
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -39,7 +42,7 @@ class TestTextGenerationController:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=2, pipeline_model_parallel_size=2
         )
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 12
         self.vocab_size = 100
@@ -63,7 +66,7 @@ class TestTextGenerationController:
             parallel_output=True,
             pre_process=parallel_state.is_pipeline_first_stage(),
             post_process=parallel_state.is_pipeline_last_stage(),
-        ).cuda()
+        ).to(device=get_current_device())
         if dtype == torch.bfloat16:
             gpt_model = Float16Module(gpt_model.config, gpt_model)
 
@@ -120,7 +123,7 @@ class TestTextGenerationController:
         assert str(aerror.value) == 'top-k is larger than logit size.'
 
         last_token_logits = (
-            torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
+            torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().to(device=get_current_device())
         )
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits, SamplingParams(top_k=1), self.vocab_size
@@ -137,7 +140,7 @@ class TestTextGenerationController:
 
         self.text_generation_controller.tokenizer = MockTokenizer()
         last_token_logits_top_n_input = (
-            torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda() / 10
+            torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().to(device=get_current_device()) / 10
         )
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits_top_n_input,
@@ -182,6 +185,7 @@ class TestTextGenerationController:
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
+
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_generate_all_output_tokens_static_batch(self, dtype):
         self.setup_model(dtype)
@@ -204,7 +208,7 @@ class TestTextGenerationController:
             prompt = "sample" * (i + 1)
             self.mock_tokenizer.tokenize.return_value = torch.randn(
                 self.batch_size, self.vocab_size
-            ).cuda()
+            ).to(device=get_current_device())
             prompt_tokens = torch.randint(
                 low=0, high=self.vocab_size - 1, size=(len(prompt),)
             ).tolist()
@@ -269,7 +273,7 @@ class TestTextGenerationController:
         for i in range(self.batch_size):
             self.mock_tokenizer.tokenize.return_value = torch.randn(
                 self.batch_size, self.vocab_size
-            ).cuda()
+            ).to(device=get_current_device())
             inference_request = InferenceRequest(
                 request_id=i,
                 prompt=prompt,
@@ -313,7 +317,7 @@ class TestTextGenerationController:
         for i in range(self.batch_size):
             self.mock_tokenizer.tokenize.return_value = torch.randn(
                 self.batch_size, self.vocab_size
-            ).cuda()
+            ).to(device=get_current_device())
             inference_request = InferenceRequest(
                 request_id=i,
                 prompt=prompt,

@@ -8,6 +8,44 @@ from typing import List
 import torch
 
 
+class WrappedProcessGroup(object):
+    """ Wrapped torch.distirbuted.ProcessGroup and XLA rank groups for compatibility"""
+
+    def __init__(self, process_group: torch.distributed.ProcessGroup=None, 
+                 rank_groups: List[List[int]]=None):
+        self.__process_group = process_group
+        self.__rank_groups = rank_groups if rank_groups else self.__all_rank_groups()
+
+    def __all_rank_groups(self) -> List[List[int]]:
+        """Gets all the ranks of all processes in the group.
+
+        Returns:
+            range: A List[List[int]] of ranks in the process group.
+        """
+        world_size = torch.distributed.get_world_size()
+        if self.__process_group is None:
+            return [range(world_size)]
+        
+        ranks = torch.distributed.get_process_group_ranks(self.__process_group)
+        num_sub_groups = world_size // len(ranks)
+        all_ranks = [ [ int(lr + len(ranks)*sg) for lr in range(len(ranks)) ] for sg in range(num_sub_groups)]
+        assert ranks in all_ranks, f"{ranks} not in {all_ranks}"
+        return all_ranks
+    
+    @property
+    def rank_groups(self):
+        return self.__rank_groups
+    
+    @property
+    def process_group(self):
+        return self.__process_group
+    
+    def size(self):
+        return torch.distributed.get_world_size(group=self.__process_group)
+    
+    def rank(self):
+        return torch.distributed.get_rank(group=self.__process_group)
+
 @dataclass
 class ModelCommProcessGroups:
     """Process groups for transformer model parallelism.
@@ -39,40 +77,40 @@ class ModelCommProcessGroups:
     """
 
     # _TENSOR_MODEL_PARALLEL_GROUP
-    tp: torch.distributed.ProcessGroup = field(init=False)
+    tp: WrappedProcessGroup = field(init=False)
 
     # _PIPELINE_MODEL_PARALLEL_GROUP
-    pp: torch.distributed.ProcessGroup = field(init=False)
+    pp: WrappedProcessGroup = field(init=False)
 
     # _MODEL_PARALLEL_GROUP
     mp: torch.distributed.ProcessGroup = field(init=False)
 
     # _EMBEDDING_GROUP
-    embd: torch.distributed.ProcessGroup = field(init=False)
+    embd: WrappedProcessGroup = field(init=False)
 
     # _POSITION_EMBEDDING_GROUP
-    pos_embd: torch.distributed.ProcessGroup = field(init=False)
+    pos_embd: WrappedProcessGroup = field(init=False)
 
     # _CONTEXT_PARALLEL_GROUP
-    cp: torch.distributed.ProcessGroup = field(init=False)
+    cp: WrappedProcessGroup = field(init=False)
 
     # _TENSOR_AND_CONTEXT_PARALLEL_GROUP
-    tp_cp: torch.distributed.ProcessGroup = field(init=False)
+    tp_cp: WrappedProcessGroup = field(init=False)
 
     # _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
-    hcp: List[torch.distributed.ProcessGroup] = field(init=False)
+    hcp: List[WrappedProcessGroup] = field(init=False)
 
     # _EXPERT_MODEL_PARALLEL_GROUP
-    ep: torch.distributed.ProcessGroup = field(init=False)
+    ep: WrappedProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_PARALLEL_GROUP
-    expt_tp: torch.distributed.ProcessGroup = field(init=False)
+    expt_tp: WrappedProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
-    tp_ep: torch.distributed.ProcessGroup = field(init=False)
+    tp_ep: WrappedProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
-    tp_ep_pp: torch.distributed.ProcessGroup = field(init=False)
+    tp_ep_pp: WrappedProcessGroup = field(init=False)
 
 
 @dataclass
@@ -98,16 +136,16 @@ class GradCommProcessGroups:
     """
 
     # _DATA_PARALLEL_GROUP
-    dp: torch.distributed.ProcessGroup = field(init=False)
+    dp: WrappedProcessGroup = field(init=False)
 
     # _DATA_PARALLEL_GROUP_WITH_CP
-    dp_cp: torch.distributed.ProcessGroup = field(init=False)
+    dp_cp: WrappedProcessGroup = field(init=False)
 
     # _EXPERT_DATA_PARALLEL_GROUP
-    expt_dp: torch.distributed.ProcessGroup = field(init=False)
+    expt_dp: WrappedProcessGroup = field(init=False)
 
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-    intra_dp_cp: torch.distributed.ProcessGroup = field(init=False)
+    intra_dp_cp: WrappedProcessGroup = field(init=False)
 
     # _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-    inter_dp_cp: torch.distributed.ProcessGroup = field(init=False)
+    inter_dp_cp: WrappedProcessGroup = field(init=False)

@@ -9,20 +9,24 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.dist_checkpointing.models.common import (
-    common_test_parallel_reconfiguration_e2e,
-    common_test_simple_sharded_state_dict_save_load,
-    common_test_state_dict_comparison,
-    common_test_vocab_size_padding_change,
-)
+from tests.unit_tests.dist_checkpointing.models.common import \
+    common_test_simple_sharded_state_dict_save_load, \
+    common_test_parallel_reconfiguration_e2e, \
+    common_test_state_dict_comparison, common_test_vocab_size_padding_change
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
 
-def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec, vocab_size=128, **config_kwargs):
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec if HAVE_TE else gpt_local_spec, vocab_size=128, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     default_config_kwargs = dict(
         num_layers=8,
@@ -56,6 +60,10 @@ class TestGPTModel:
     def test_sharded_state_dict_save_load(
         self, tmp_path_dist_ckpt, src_layer_spec_fn, dst_layer_spec_fn
     ):
+        if not HAVE_TE:
+            src_layer_spec_fn = gpt_local_spec
+            dst_layer_spec_fn = gpt_local_spec
+
         common_test_simple_sharded_state_dict_save_load(
             initialize_gpt_model, tmp_path_dist_ckpt, src_layer_spec_fn, dst_layer_spec_fn
         )
@@ -103,6 +111,10 @@ class TestGPTModelReconfiguration:
     ):
         """Test model saving and loading with different TP/PP"""
         Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
+        if not HAVE_TE:
+            src_layer_spec_fn = gpt_local_spec
+            dst_layer_spec_fn = gpt_local_spec
+
         common_test_parallel_reconfiguration_e2e(
             initialize_gpt_model,
             tmp_path_dist_ckpt,

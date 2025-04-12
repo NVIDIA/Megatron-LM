@@ -12,6 +12,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from megatron.core import parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
     AllGatherPipeline,
     BucketingPolicy,
@@ -25,10 +26,12 @@ from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.process_groups_config import GradCommProcessGroups
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.utils import is_submodule, log_single_rank
 
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 class TrainingState(Enum):
     """States of a FSDP parameter group, which are coupled with
@@ -109,6 +112,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         device: Optional[torch.device] = None,
         grad_comm_pgs: Optional[GradCommProcessGroups] = None,
     ):
+        assert xm is None, " Custom FullyShardedDataParallel is not supported for XLA"
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -155,7 +159,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.bucket_size = self.ddp_config.bucket_size
         if disable_bucketing:
             self.bucket_size = None
-        self.device = device if device else torch.cuda.current_device()
+        self.device = device if device else get_current_device()
 
         self.param_to_bucket_group = {}
 

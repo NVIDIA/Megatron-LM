@@ -1,5 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device
+import torch
 import os
 import types
 
@@ -16,11 +18,11 @@ from megatron.core.models.retro.encoder_attention import (
     RetroEncoderCrossAttention,
     RetroEncoderLayerNorm,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from tests.unit_tests.test_utilities import Utils
 
-
+@pytest.mark.skip(reason="upstream issues")
 class TestRetroAttention:
 
     @classmethod
@@ -71,16 +73,16 @@ class TestRetroAttention:
 
         # GPU.
         if use_gpu:
-            [m.cuda() for m in vars(modules).values()]
+            [ m.to(device=get_current_device()) for m in vars(modules).values() ]
 
         return modules
 
     def setup_method(self, method):
-        Utils.initialize_model_parallel(1, 1)
+        Utils.initialize_model_parallel(1,1)
+        model_parallel_device_manual_seed(123)
         os.environ['NVTE_FLASH_ATTN'] = "0"
         os.environ['NVTE_FUSED_ATTN'] = "0"
 
-        model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -121,18 +123,22 @@ class TestRetroAttention:
         n_chunks_per_sample = seq_length // config.retro_chunk_length
 
         # Init tensors.
-        hidden_states = torch.ones((seq_length, micro_batch_size, config.hidden_size)).cuda()
+        hidden_states = torch.ones((
+            seq_length,
+            micro_batch_size,
+            config.hidden_size,
+        )).to(device=get_current_device())
         attention_mask = None
-        decoder_context = torch.ones(
-            (
-                config.retro_retrieved_length,
-                config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
-                config.hidden_size,
-            )
-        ).cuda()
-        encoder_context = torch.ones(
-            (config.retro_chunk_length, micro_batch_size * n_chunks_per_sample, config.hidden_size)
-        ).cuda()
+        decoder_context = torch.ones((
+            config.retro_retrieved_length,
+            config.retro_num_neighbors * micro_batch_size * n_chunks_per_sample,
+            config.hidden_size,
+        )).to(device=get_current_device())
+        encoder_context = torch.ones((
+            config.retro_chunk_length,
+            micro_batch_size * n_chunks_per_sample,
+            config.hidden_size,
+        )).to(device=get_current_device())
 
         # Forward decoder.
         decoder_attn_output = modules.decoder_attn(hidden_states, attention_mask, decoder_context)

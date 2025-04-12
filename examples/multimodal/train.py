@@ -5,6 +5,7 @@ import os
 import sys
 from functools import partial
 
+from megatron.core.device_utils import get_xla_model
 import torch
 import yaml
 
@@ -267,7 +268,11 @@ def loss_func(loss_mask, output_tensor):
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+    xm = get_xla_model()
+    if xm:
+        xm.all_reduce(xm.REDUCE_SUM, [reporting_loss], groups=mpu.get_data_parallel_groups(), pin_layout=False)
+    else:
+        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 

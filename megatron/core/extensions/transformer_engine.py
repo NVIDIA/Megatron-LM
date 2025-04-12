@@ -13,6 +13,7 @@ from packaging.version import Version as PkgVersion
 from torch import Tensor
 from torch.nn.parameter import Parameter
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -30,12 +31,13 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.tensor_parallel import get_device_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
 from megatron.core.tensor_parallel.random import (
-    get_cuda_rng_tracker,
+    get_device_rng_tracker,
     get_data_parallel_rng_tracker_name,
     get_expert_parallel_rng_tracker_name,
 )
@@ -55,7 +57,7 @@ def _get_extra_te_kwargs(config: TransformerConfig):
         elif config.init_model_with_meta_device:
             extra_transformer_engine_kwargs["device"] = "meta"
         else:
-            extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
+            extra_transformer_engine_kwargs["device"] = get_current_device()
     return extra_transformer_engine_kwargs
 
 
@@ -225,7 +227,7 @@ class TELinear(te.pytorch.Linear):
             tp_group=tp_group,
             tp_size=tp_size,
             get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
             ),
             init_method=condition_init_method(config, init_method),
             bias=bias,
@@ -367,7 +369,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
             ),
             init_method=(
                 condition_init_method(config, init_method)
@@ -562,6 +564,11 @@ class TERowParallelLinear(TELinear):
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
         )
+
+        from megatron.core.tensor_parallel.layers import (
+            _initialize_affine_weight_cpu,
+        )
+        from megatron.core.tensor_parallel.utils import divide
         if config.use_cpu_initialization:
             if is_expert:
                 world_size = get_expert_tensor_parallel_world_size()
@@ -744,7 +751,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             sequence_parallel=self.config.sequence_parallel,
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=(
-                get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
             ),
             tp_group=get_tensor_model_parallel_group(check_initialized=False),
             layer_number=layer_number,
@@ -897,7 +904,7 @@ if is_te_min_version("1.9.0.dev0"):
                 tp_group=tp_group,
                 tp_size=tp_size,
                 get_rng_state_tracker=(
-                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                    get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
                 ),
                 init_method=condition_init_method(config, init_method),
                 bias=bias,
@@ -1013,7 +1020,7 @@ if is_te_min_version("1.9.0.dev0"):
                 return pickle.loads(state.detach().cpu().numpy().tobytes())
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
-                return torch.load(state, map_location="cuda")
+                return torch.load(state, map_location=get_current_device())
             else:
                 raise RuntimeError("Unsupported checkpoint format.")
 

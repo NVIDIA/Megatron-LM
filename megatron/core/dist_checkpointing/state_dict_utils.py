@@ -4,6 +4,8 @@
 
 from typing import Callable, Union
 
+import torch
+
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
     CommonStateDict,
@@ -20,6 +22,7 @@ from .validation import determine_global_metadata, validate_sharding_integrity
 def save_preprocess(
     sharded_state_dict: ShardedStateDict,
     validate_access_integrity: bool = True,
+    process_group: torch.distributed.ProcessGroup = None,
     preprocess_common_before_consistancy_check: Callable[[CommonStateDict], StateDict] = None,
 ):
     """Preprocesses the given state dictionary by applying factories,
@@ -48,8 +51,9 @@ def save_preprocess(
                 common_state_dict
             )
         validate_sharding_integrity(
-            determine_global_metadata(sharded_part)[1],
+            determine_global_metadata(sharded_part, process_group=process_group)[1],
             common_state_dict=preprocessed_common_state_dict,
+            process_group=process_group
         )
     return sharded_part, common_state_dict
 

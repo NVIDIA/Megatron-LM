@@ -8,6 +8,7 @@ from typing import AsyncGenerator, Dict, List, Optional, Union
 import torch
 from tqdm import tqdm
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import InferenceRequest
@@ -242,4 +243,4 @@ class StaticInferenceEngine(AbstractEngine):
         """Runs the engine asynchronously using asyncio"""
         loop = asyncio.get_running_loop()
 
-        await loop.run_in_executor(None, self._wrapped_run_engine, torch.cuda.current_device())
+        await loop.run_in_executor(None, self._wrapped_run_engine, get_current_device())

@@ -16,6 +16,7 @@ except:
     from torch.optim import SGD as GPUSGD
     from torch.optim import Adam as GPUAdam
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
 
@@ -49,6 +50,7 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(
     torch.__version__ < '2.3.0',
     reason=(
@@ -65,8 +67,8 @@ def test_multi_device_hybrid_optimizer(
     with_param_groups, optimizer, offload_fraction, overlap_cpu_optimizer_d2h_h2d, n_steps
 ):
     setup_seed(42)
-    net1 = Net().cuda()
-    net2 = Net().cuda()
+    net1 = Net().to(device=get_current_device())
+    net2 = Net().to(device=get_current_device())
     net2.load_state_dict(net1.state_dict())
     base_lr = 1e-3
     params = list(net1.parameters())
@@ -100,7 +102,7 @@ def test_multi_device_hybrid_optimizer(
 
     # 1. run step on optimizer, make sure there is state generated
     assert len(hdo.state_dict()["state"]) == 0  # state is empty
-    input = torch.randn(1, 3, 32, 32).cuda()
+    input = torch.randn(1, 3, 32, 32).to(device=get_current_device())
     output = net1(input)
     output.sum().backward()
     hdo.step()
@@ -122,7 +124,7 @@ def test_multi_device_hybrid_optimizer(
 
     # 3. check parameters allclose
     for _ in range(1, n_steps):
-        input = torch.randn(1, 3, 32, 32).cuda()
+        input = torch.randn(1, 3, 32, 32).to(device=get_current_device())
         output = net1(input)
         output.sum().backward()
         hdo.step()

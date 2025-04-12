@@ -1,6 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention, TENorm
+try:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention, TENorm
+    HAVE_TE = True
+except ModuleNotFoundError:
+    TEDotProductAttention = None
+    TENorm = None
+    HAVE_TE = False
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
@@ -12,17 +19,23 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 
 # Use this spec for ModelOpt PTQ and TensorRT-LLM export
 def get_mamba_stack_modelopt_spec(
     local_core_attention: bool = False, remap_te_layernorm: bool = False
 ) -> ModuleSpec:
-    """Mix the native spec with TENorm.
+    """Mix the native spec with TENorm, if HAVE_TE
 
     This is essentially the native local spec except for the layernorm implementation
     is using TENorm from Transformer-Engine.
     """
+    assert local_core_attention or HAVE_TE
+
+    core_attention = DotProductAttention if local_core_attention else TEDotProductAttention
+    layer_norm = TENorm if HAVE_TE else WrappedTorchNorm
+
     mamba_state_dict_keys_map = {}
     transformer_state_dict_keys_map = {}
     if remap_te_layernorm:
@@ -35,7 +48,7 @@ def get_mamba_stack_modelopt_spec(
     mamba_layer = ModuleSpec(
         module=MambaLayer,
         submodules=MambaLayerSubmodules(
-            norm=TENorm,
+            norm=layer_norm,
             mixer=ModuleSpec(
                 module=MambaMixer,
                 submodules=MambaMixerSubmodules(
@@ -51,7 +64,7 @@ def get_mamba_stack_modelopt_spec(
     attention_layer = ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=TENorm,
+            input_layernorm=layer_norm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -69,7 +82,7 @@ def get_mamba_stack_modelopt_spec(
     mlp_layer = ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            pre_mlp_layernorm=TENorm,
+            pre_mlp_layernorm=layer_norm,
             mlp=ModuleSpec(
                 module=MLP,
                 submodules=MLPSubmodules(

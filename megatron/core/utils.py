@@ -7,6 +7,7 @@ import hashlib
 import logging
 import math
 import operator
+import pickle
 import queue
 import socket
 import sys
@@ -21,6 +22,7 @@ from importlib.metadata import version
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from packaging.version import Version as PkgVersion
 
@@ -40,6 +42,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 try:
     _torch_version = PkgVersion(torch.__version__)
@@ -254,15 +257,22 @@ def get_te_version():
 
     global _te_version
     if _te_version is None:
-        _te_version = PkgVersion(get_te_version_str())
+        try:
+            _te_version = PkgVersion(get_te_version_str())
+        except ImportError:
+            _te_version = None
     return _te_version
 
 
 def is_te_min_version(version, check_equality=True):
     """Check if minimum version of `transformer-engine` is installed."""
-    if check_equality:
-        return get_te_version() >= PkgVersion(version)
-    return get_te_version() > PkgVersion(version)
+    te_version = get_te_version()
+    if te_version:
+        if check_equality:
+            return te_version >= PkgVersion(version)
+        return te_version > PkgVersion(version)
+    else:
+        return False
 
 
 def get_torch_version():
@@ -366,7 +376,7 @@ class GlobalMemoryBuffer:
             or self.buffer[(name, dtype)].numel() < required_len
         ):
             self.buffer[(name, dtype)] = torch.empty(
-                required_len, dtype=dtype, device=torch.cuda.current_device(), requires_grad=False
+                required_len, dtype=dtype, device=get_current_device(), requires_grad=False
             )
 
         return self.buffer[(name, dtype)][0:required_len].view(*tensor_shape)
@@ -418,7 +428,8 @@ class MakeViewlessTensor(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, inp, requires_grad):
-        """Runs the fwd pass of _kernel_make_viewless_tensor"""
+        if xm:
+            xm.mark_step()
         return _kernel_make_viewless_tensor(inp, requires_grad)
 
     @staticmethod
@@ -561,6 +572,7 @@ def check_param_hashes_across_dp_replicas(
                 ),
                 dtype=torch.uint8,
             )
+            
             if getattr(param, 'allreduce', True):
                 non_expert_params.append((model_chunk_id, param_name, param))
                 local_non_expert_param_hashes.append(param_hash)
@@ -574,20 +586,24 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
+        [
+            parallel_state.get_data_parallel_group() if not xm else parallel_state.get_data_parallel_group_gloo(), 
+            parallel_state.get_expert_data_parallel_group() if not xm else parallel_state.get_expert_data_parallel_group_gloo(),
+        ]
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
         if len(params) == 0:
             continue
-        local_param_hashes = torch.stack(local_param_hashes).cuda()
+
+        local_param_hashes = torch.stack(local_param_hashes).to(device=get_current_device()) if not xm else torch.stack(local_param_hashes).cpu()
         all_param_hashes = [
             torch.zeros_like(local_param_hashes)
             for _ in range(torch.distributed.get_world_size(all_gather_group))
         ]
         torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
 
-        # Make sure local per-parameter hash matches DP rank 0.
+        # END Make sure local per-parameter hash matches DP rank 0.
         param_hashes_match = torch.equal(local_param_hashes, all_param_hashes[0])
         if not param_hashes_match:
             for i, (model_chunk_id, param_name, param) in enumerate(params):
@@ -798,7 +814,19 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         grad_output_buffer
     ), "Length of activation and gradient buffers need to be equal!"
 
-    import fused_weight_gradient_mlp_cuda
+    try:
+        import fused_weight_gradient_mlp_cuda
+    except ImportError:
+        if config.gradient_accumulation_fusion:
+            raise RuntimeError(
+                "Gradient_accumulation_fusion set "
+                "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
+                "module is not found. To use gradient_accumulation_fusion you must "
+                "install APEX with --cpp_ext and --cuda_ext. For example: "
+                "pip install --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\" "
+                "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
+                "gradient accumulation fusion."
+            )
 
     from megatron.core.parallel_state import (
         get_global_memory_buffer,
@@ -813,10 +841,13 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
     all_gathered_input = [None, None]
     if config.sequence_parallel:
-        all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = dist_all_gather_func(
-            all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
-        )
+        if xm:
+            all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False)
+        else:
+            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
+            handle = dist_all_gather_func(
+                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
+            )
 
         all_gathered_input[0] = all_gather_buffer
         all_gather_buffer = None
@@ -851,10 +882,14 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         input = embedding_activation_buffer.pop(0)
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
-            all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = dist_all_gather_func(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-            )
+            handle = None
+            if xm:
+                all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False)
+            else:
+                all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
+                handle = dist_all_gather_func(
+                    all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+                )
 
             all_gathered_input[(i + 1) % 2] = all_gather_buffer
             all_gather_buffer = None
@@ -866,7 +901,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         drain_idx = (i + 1) % 2
         input, all_gathered_input[i % 2], grad_output = None, None, None
 
-        if config.sequence_parallel:
+        if config.sequence_parallel and handle:
             handle.wait()
 
     grad_output = grad_output_buffer.pop(0)
@@ -888,7 +923,7 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
     """
     l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
     l2_reduced = torch.norm(torch.tensor(l2))
-    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device='cuda')
+    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device=get_current_device())
     return l2_cuda, None
 
 
@@ -1151,7 +1186,7 @@ class StragglerDetector:
             self.stop_data_tm = []
             backend = torch.distributed.get_backend()
             if backend == "nccl":
-                self.dev = torch.cuda.current_device()
+                self.dev = get_current_device()
             else:
                 self.dev = torch.device("cpu")
             # cache some events
@@ -1670,6 +1705,19 @@ def is_submodule(module, parent_module, strict=True):
     return False
 
 
+def is_submodule(module, parent_module, strict=True):
+    """
+    Check if a module is a submodule of another module.
+    """
+    if strict:
+        if module is parent_module:
+            return False
+    for m in parent_module.modules():
+        if m is module:
+            return True
+    return False
+
+
 ########################
 ### context parallel ###
 ########################
@@ -1700,7 +1748,7 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                 )
                 index = torch.tensor(
                     [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-                ).cuda(non_blocking=True)
+                ).to(device=get_current_device(), non_blocking=True)
                 val = val.index_select(seq_dim, index)
                 val = val.view(*val.shape[0:seq_dim], -1, *val.shape[(seq_dim + 2) :])
                 batch[key] = val
