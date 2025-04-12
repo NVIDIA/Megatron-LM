@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}'
+  name: "{test_case}_{environment}"
   model: gpt-nemo
   build: mcore-nemo
   nodes: 1
@@ -34,14 +34,14 @@ products:
   - test_case: [gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_tp2_pp4_vp3_seq_par_overlap_p2p_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [deprecated]
   - test_case: [gpt3-nemo_126m_mr_mbs4_gbs64_mcore_te_tp1_pp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [deprecated]
   # TODO(Hepteract): Late init of parallel_state was broken after parallel states refactor,
   # So skip this test case until NeMo is adapted to the refactored MCore.
   # - test_case: [gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp1_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev]
-  #       scope: [mr]
+  #       scope: [deprecated]
