@@ -36,8 +36,7 @@ from .random import (
 from .utils import (
     gather_split_1d_tensor,
     split_tensor_along_last_dim,
-    split_tensor_into_1d_equal_chunks,
-    get_group_world_size_and_rank
+    split_tensor_into_1d_equal_chunks
 )
 
 __all__ = [

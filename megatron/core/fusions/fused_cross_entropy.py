@@ -6,6 +6,7 @@ from megatron.core.device_utils import get_xla_model
 import torch
 
 from megatron.core.jit import jit_fuser
+from megatron.core.process_groups_config import WrappedProcessGroup
 from megatron.core.tensor_parallel.cross_entropy import VocabParallelCrossEntropy
 from megatron.core.tensor_parallel.utils import VocabUtility
 
@@ -87,17 +88,17 @@ def calculate_gradients(
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, tp_group):
+    def forward(ctx, vocab_parallel_logits, target, tp_group: WrappedProcessGroup):
         """
         Forward implementation for the cross entropy loss.
         """
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         xm = get_xla_model()
         if xm:
-            xm.all_reduce(xm.REDUCE_MAX, [logits_max], groups=tp_group, pin_layout=False)
+            xm.all_reduce(xm.REDUCE_MAX, [logits_max], groups=tp_group.rank_groups, pin_layout=False)
         else:
             torch.distributed.all_reduce(
-                logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
+                logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group.process_group
             )
 
         # Get the partition's vocab indices
@@ -117,12 +118,14 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # In the fused case, tensors are batches to invoke a single
         # AllReduce call
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [predicted_logits_sum_exp_logits], groups=tp_group, pin_layout=False)
+            xm.all_reduce(xm.REDUCE_SUM, 
+                          [predicted_logits_sum_exp_logits], 
+                          groups=tp_group.rank_groups, pin_layout=False)
         else:
             torch.distributed.all_reduce(
                 predicted_logits_sum_exp_logits,
                 op=torch.distributed.ReduceOp.SUM,
-                group=tp_group,
+                group=tp_group.process_group,
             )
 
         exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)

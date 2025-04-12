@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.process_groups_config import WrappedProcessGroup
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
@@ -94,8 +95,10 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(
                     logits, labels, 
-                    parallel_state.get_tensor_model_parallel_group() if xm is None else \
-                        parallel_state.get_tensor_model_parallel_groups()
+                    WrappedProcessGroup(
+                        process_group=parallel_state.get_tensor_model_parallel_group(),
+                        rank_groups=parallel_state.get_tensor_model_parallel_groups()
+                    )
                 )
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)

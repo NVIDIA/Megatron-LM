@@ -5,6 +5,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.device_utils import get_xla_model
+from megatron.core.process_groups_config import WrappedProcessGroup
 
 try:
     import torch_xla.core.xla_model as xm
@@ -38,7 +39,7 @@ def get_device(local_rank=None):
     return device
 
 
-def all_gather_item(item, dtype, group:Optional[Union[torch.distributed.ProcessGroup, List[List[int]]]]=None, async_op=False, local_rank=None):
+def all_gather_item(item, dtype, group:Optional[WrappedProcessGroup]=None, async_op=False, local_rank=None):
     
     if not torch.distributed.is_available() or \
        not torch.distributed.is_initialized():
@@ -54,8 +55,10 @@ def all_gather_item(item, dtype, group:Optional[Union[torch.distributed.ProcessG
     tensor = torch.tensor([item], device=device, dtype=dtype)
     xm = get_xla_model()
     if xm:
-        output_tensors = list(xm.all_gather(tensor, groups=group).split(tensor.size()[0]), pin_layout=False)
+        groups = group.rank_groups if group else None
+        output_tensors = list(xm.all_gather(tensor, groups=groups).split(tensor.size()[0]), pin_layout=False)
     else:
+        group = group.process_group if group else None
         output_tensors = [
             torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
             for _ in range(group_size)
@@ -71,7 +74,8 @@ class DistributedSignalHandler:
 
     def signals_received(self):
         all_received = all_gather_item(
-            self._signal_received, dtype=torch.int32
+            self._signal_received, dtype=torch.int32, 
+            group=WrappedProcessGroup()
         )
         return all_received
 

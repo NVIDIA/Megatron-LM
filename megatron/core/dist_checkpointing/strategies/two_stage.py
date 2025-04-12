@@ -14,6 +14,8 @@ from typing import List, Optional, Tuple, Union
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
+from megatron.core.process_groups_config import WrappedProcessGroup
+
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor
 from .base import LoadShardedStrategy
@@ -234,18 +236,24 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
 
             logger.debug(
                 f'exchange {ten_meta.sharded_tensor_no_data.key}, {exchange_tensor.shape}\
-({exchange_tensor.numel()}), broadcast({src_rank} -> {self.dp_group_ranks})'
+                ({exchange_tensor.numel()}), broadcast({src_rank} -> {self.dp_group_ranks})'
             )
-            xm = get_xla_model()
-            if xm:
-                assert self.data_parallel_group_gloo is not None
-                xm.collective_broadcast([exchange_tensor],
-                         src_rank,
-                         groups=self.data_parallel_group_gloo, pin_layout=False)
-            else:
-                torch.distributed.broadcast(
-                    exchange_tensor, group=self.data_parallel_group, src=src_rank
+            if self.cpu_transfer:
+                 assert self.data_parallel_group_gloo, "Data Parallel Gloo group required for cpu transfer"
+                 torch.distributed.broadcast(
+                    exchange_tensor, group=self.data_parallel_group_gloo, src=src_rank
                 )
+            else:
+                xm = get_xla_model()
+                group = WrappedProcessGroup(process_group=self.data_parallel_group)
+                if xm:
+                    xm.collective_broadcast([exchange_tensor],
+                            src_rank,
+                            groups=group.rank_groups, pin_layout=False)
+                else:
+                    torch.distributed.broadcast(
+                        exchange_tensor, group=group.process_group, src=src_rank
+                    )
             self._distribute_data_to_state_dict(ten_meta, exchange_tensor, sharded_state_dict)
             logger.debug(f'exchange {ten_meta.sharded_tensor_no_data.key} done')
 

@@ -7,6 +7,7 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ModelCommProcessGroups, WrappedProcessGroup
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 xm = get_xla_model()
@@ -24,12 +25,16 @@ except ImportError:
     HAVE_TE = False
 
 
+# MOE logging
+_MOE_LAYER_WISE_LOGGING_TRACKER = {}
+
+
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
     topk: int,
     moe_aux_loss_coeff: float,
-    sequence_partition_group=None,
+    sequence_partition_group: WrappedProcessGroup=None,
 ):
     """Calculate the auxiliary loss for load balancing.
     Refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
@@ -56,12 +61,17 @@ def switch_load_balancing_loss_func(
     if sequence_partition_group is not None:
         # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
+        num_sub_sequence = sequence_partition_group.size()
         if xm:
-            num_sub_sequence = len(sequence_partition_group[0])
-            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], groups=sequence_partition_group, pin_layout=False)
+            xm.all_reduce(
+                xm.REDUCE_SUM, [tokens_per_expert], 
+                groups=sequence_partition_group.rank_groups, 
+                pin_layout=False
+            )
         else:
-            num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
-            torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
+            torch.distributed.all_reduce(
+                tokens_per_expert, group=sequence_partition_group.process_group
+            )
 
     num_tokens = probs.shape[0] * num_sub_sequence
     num_experts = probs.shape[1]
@@ -83,7 +93,7 @@ def sequence_load_balancing_loss_func(
     seq_length: int,
     topk: int,
     moe_aux_loss_coeff: float,
-    sequence_partition_group=None,
+    sequence_partition_group: WrappedProcessGroup=None,
 ):
     """
     Calculate the auxiliary loss in sequence-level by computing the loss for each individual sample.
@@ -116,8 +126,7 @@ def sequence_load_balancing_loss_func(
     # or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full
     # sequence.
     if sequence_partition_group is not None:
-        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group) if not xm else \
-            len(sequence_partition_group[0])
+        num_sub_sequence = sequence_partition_group.size()
         
         seq_length *= num_sub_sequence
         probs_for_aux_loss = gather_from_sequence_parallel_region(
@@ -605,8 +614,8 @@ def save_to_aux_losses_tracker(
     loss: torch.Tensor,
     layer_number: int,
     num_layers: int,
-    reduce_group: Union[torch.distributed.ProcessGroup, List[List[int]]] = None,
-    avg_group: Union[torch.distributed.ProcessGroup, List[List[int]]] = None,
+    reduce_group: WrappedProcessGroup=None,
+    avg_group: WrappedProcessGroup=None,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -614,14 +623,14 @@ def save_to_aux_losses_tracker(
         loss (torch.Tensor): The loss tensor.
         layer_number (int): Layer index of the loss.
         num_layers (int): The number of total layers.
-        reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-        mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+        reduce_group (WrappedProcessGroup): The group for reducing the loss.
+        mean_group (WrappedProcessGroup): The group for averaging the loss.
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
         return
 
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     if name not in tracker:
         tracker[name] = {}
         tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
@@ -632,7 +641,7 @@ def save_to_aux_losses_tracker(
 
 def clear_aux_losses_tracker():
     """Clear the auxiliary losses."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
         tracker[name]["reduce_group"] = None
@@ -641,11 +650,12 @@ def clear_aux_losses_tracker():
 
 def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
     """Collect and reduce the auxiliary losses across ranks."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     if track_names is None:
         track_names = tracker.keys()
     for name in track_names:
         values = tracker[name]["values"]
+        # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
         xm = get_xla_model()
         if xm:
@@ -687,7 +697,7 @@ def track_moe_metrics(
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     # Initialize the tracker if force_initialize is True
     if force_initialize:
         if track_names is not None:
@@ -785,3 +795,52 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
             tensor.record_stream(torch.cuda.current_stream())
         tensor = cpu_tensor
     return tensor
+
+
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker."""
+    global _MOE_LAYER_WISE_LOGGING_TRACKER
+    return _MOE_LAYER_WISE_LOGGING_TRACKER
+
+
+# TODO(Hepteract): delete the usage of the global parallel_state.
+# Initialize process groups with the global parallel_state.
+def get_default_model_comm_pgs():
+    """Get the default process groups for MoE.
+
+    Returns:
+        ModelCommProcessGroups: The default process groups for MoE.
+    """
+    model_comm_pgs = ModelCommProcessGroups()
+
+    model_comm_pgs.ep_group = WrappedProcessGroup(
+        process_group=parallel_state.get_expert_model_parallel_group(),
+        rank_groups=parallel_state.get_expert_model_parallel_groups())
+    
+    model_comm_pgs.tp_group = WrappedProcessGroup(
+        process_group= parallel_state.get_tensor_model_parallel_group(),
+        rank_groups= parallel_state.get_tensor_model_parallel_groups())
+   
+    model_comm_pgs.cp_group = WrappedProcessGroup(
+        process_group= parallel_state.get_context_parallel_group(),
+        rank_groups= parallel_state.get_context_parallel_groups())
+   
+   
+    model_comm_pgs.expt_tp_group = WrappedProcessGroup(
+        process_group=parallel_state.get_expert_tensor_parallel_group(),
+        rank_groups=parallel_state.get_expert_tensor_parallel_groups())
+   
+    model_comm_pgs.expt_dp_group = WrappedProcessGroup(
+        process_group=parallel_state.get_expert_data_parallel_group(),
+        rank_groups=parallel_state.get_expert_data_parallel_groups())
+    
+    model_comm_pgs.tp_ep_group = WrappedProcessGroup(
+        process_group=parallel_state.get_expert_tensor_and_model_parallel_group(),
+        rank_groups=parallel_state.get_expert_tensor_and_model_parallel_groups())
+    
+    model_comm_pgs.tp_cp_group = WrappedProcessGroup(
+        process_group=parallel_state.get_tensor_and_context_parallel_group(),
+        rank_groups=parallel_state.get_tensor_and_context_parallel_groups())
+ 
+
+    return model_comm_pgs

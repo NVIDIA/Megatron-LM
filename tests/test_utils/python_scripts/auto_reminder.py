@@ -1,9 +1,9 @@
-import json
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
 
+import click
 import gitlab
 import requests
 from slack_sdk import WebClient
@@ -24,8 +24,14 @@ if not RO_API_TOKEN:
 
 # Required reviewers
 REQUIRED_REVIEWERS = {
-    "final_reviewers": ["jcasper@nvidia.com", "eharper@nvidia.com"],  # Using email addresses
-    "expert_reviewers": [],  # Will be populated from MR description
+    "final_reviewers": [
+        "jcasper@nvidia.com",
+        "eharper@nvidia.com",
+        "shanmugamr@nvidia.com",
+        "yuya@nvidia.com",
+        "ansubramania@nvidia.com",
+    ],
+    "expert_reviewers": [],
 }
 CI_MAINTAINER = ["okoenig@nvidia.com"]  # Using email address
 
@@ -76,62 +82,48 @@ def get_recent_milestones(project):
 
 
 def get_label_times(mr):
-    """Get the earliest time when the current review label was added."""
+    """Get the earliest time when each review label was first added."""
     # Get resource label events with all pages
     events = mr.resourcelabelevents.list(get_all=True)
     print(f"Processing MR #{mr.iid}: Found {len(events)} label events")
 
-    # Determine current review stage based on current MR labels
+    # Initialize times
+    expert_review_requested_time = None
+    final_review_requested_time = None
     current_stage = None
+
+    # Process all events in chronological order
+    for event in sorted(events, key=lambda x: x.created_at):
+        if not event.label or event.action != 'add':
+            continue
+
+        label_name = event.label.get('name')
+        if label_name == 'Expert Review' and expert_review_requested_time is None:
+            expert_review_requested_time = event.created_at
+            print(f"First Expert Review added at: {expert_review_requested_time}")
+        elif label_name == 'Final Review' and final_review_requested_time is None:
+            final_review_requested_time = event.created_at
+            print(f"First Final Review added at: {final_review_requested_time}")
+
+    # If no review labels found, use MR creation time as fallback
+    if not expert_review_requested_time:
+        expert_review_requested_time = mr.created_at
+        print(
+            f"No Expert Review label found, using MR creation time: {expert_review_requested_time}"
+        )
+
+    # Determine current stage based on labels
     if 'Final Review' in mr.labels:
         current_stage = 'Final Review'
-        print(f"MR #{mr.iid} is in Final Review stage")
+        current_stage_time = final_review_requested_time
     elif 'Expert Review' in mr.labels:
         current_stage = 'Expert Review'
-        print(f"MR #{mr.iid} is in Expert Review stage")
+        current_stage_time = expert_review_requested_time
     else:
-        print(f"MR #{mr.iid} has no review stage label")
+        current_stage = None
+        current_stage_time = expert_review_requested_time
 
-    # Find earliest time for current stage
-    current_stage_time = None
-    expert_review_time = None
-
-    if current_stage:
-        # Find all add events for the current stage
-        stage_events = [
-            event
-            for event in events
-            if event.action == 'add' and event.label and event.label.get('name') == current_stage
-        ]
-
-        if stage_events:
-            earliest_event = min(stage_events, key=lambda x: x.created_at)
-            current_stage_time = earliest_event.created_at
-            print(f"Current stage: {current_stage} first added at: {current_stage_time}")
-
-            # If in Final Review, also track Expert Review time
-            if current_stage == 'Final Review':
-                expert_events = [
-                    event
-                    for event in events
-                    if event.action == 'add'
-                    and event.label
-                    and event.label.get('name') == 'Expert Review'
-                ]
-                if expert_events:
-                    earliest_expert = min(expert_events, key=lambda x: x.created_at)
-                    expert_review_time = earliest_expert.created_at
-                    print(f"First Expert Review added at: {expert_review_time}")
-
-    # If no label events found, use MR creation time as fallback
-    if not expert_review_time:
-        expert_review_time = mr.created_at
-        print(f"No Expert Review label found, using MR creation time: {expert_review_time}")
-    if not current_stage_time:
-        current_stage_time = mr.created_at
-        print(f"No review labels found, using MR creation time: {current_stage_time}")
-
-    return expert_review_time, current_stage_time, current_stage
+    return expert_review_requested_time, current_stage_time, current_stage
 
 
 def get_days_since(dt_str):
@@ -250,34 +242,65 @@ def get_required_reviewers(mr):
         if username:
             approved_users.append(username)
 
+    # Get assigned reviewers from GitLab API
+    assigned_reviewers = []
+    for reviewer in mr.reviewers:
+        if reviewer.get('username'):
+            assigned_reviewers.append(f"{reviewer['username']}@nvidia.com")
+    print(f"Assigned reviewers from GitLab: {assigned_reviewers}")
+
     # Initialize empty list for required reviewers
     required_reviewers = []
 
     # Get reviewers based on current stage
     if 'Expert Review' in mr.labels:
-        # Get assigned reviewers from GitLab API
-        assigned_reviewers = []
-        for reviewer in mr.reviewers:
-            if reviewer.get('username'):
-                assigned_reviewers.append(f"{reviewer['username']}@nvidia.com")
-        print(f"Assigned reviewers from GitLab: {assigned_reviewers}")
-
-        # Get expert reviewers from description
+        # Extract expert reviewers from MR description
         expert_reviewers = extract_expert_reviewers(mr.description)
         print(f"Expert reviewers from description: {expert_reviewers}")
 
-        # Filter assigned reviewers to only include those in expert_reviewers
-        # and exclude final reviewers
-        required_reviewers = [
-            r
-            for r in assigned_reviewers
-            if r in expert_reviewers and r not in REQUIRED_REVIEWERS["final_reviewers"]
-        ]
-        print(f"Filtered required reviewers (excluding final reviewers): {required_reviewers}")
+        # Only keep reviewers who are both assigned and in expert reviewers list
+        required_reviewers = [r for r in assigned_reviewers if r in expert_reviewers]
+        print(f"Expert reviewers after filtering: {required_reviewers}")
 
     elif 'Final Review' in mr.labels:
-        required_reviewers = REQUIRED_REVIEWERS["final_reviewers"]
-        print(f"Using final reviewers: {required_reviewers}")
+        # Get code-owners groups and their members
+        code_owners_groups = {}
+        for reviewer in mr.reviewers:
+            if reviewer.get('username'):
+                email = f"{reviewer['username']}@nvidia.com"
+                # Get groups this reviewer is part of
+                groups = reviewer.get('groups', [])
+                for group in groups:
+                    if group not in code_owners_groups:
+                        code_owners_groups[group] = set()
+                    code_owners_groups[group].add(email)
+
+        print(f"Code-owners groups: {code_owners_groups}")
+
+        # Track which groups are satisfied
+        satisfied_groups = set()
+        for group, members in code_owners_groups.items():
+            # A group is satisfied if at least one member has approved
+            if any(member.split('@')[0] in approved_users for member in members):
+                satisfied_groups.add(group)
+                print(f"Group {group} is satisfied")
+
+        # Get final reviewers who are not in satisfied groups
+        remaining_final_reviewers = []
+        for reviewer in REQUIRED_REVIEWERS["final_reviewers"]:
+            # Check if reviewer is in any satisfied group
+            reviewer_groups = set()
+            for group, members in code_owners_groups.items():
+                if reviewer in members:
+                    reviewer_groups.add(group)
+
+            # Only keep reviewer if they are not in any satisfied group
+            if not any(group in satisfied_groups for group in reviewer_groups):
+                remaining_final_reviewers.append(reviewer)
+                print(f"Keeping final reviewer {reviewer} (groups: {reviewer_groups})")
+
+        required_reviewers = remaining_final_reviewers
+        print(f"Remaining final reviewers after code-owners check: {required_reviewers}")
 
     # Filter out reviewers who have already approved
     remaining_reviewers = [
@@ -285,7 +308,7 @@ def get_required_reviewers(mr):
         for reviewer in required_reviewers
         if reviewer.split('@')[0] not in approved_users  # Compare usernames
     ]
-    print(f"Remaining reviewers: {remaining_reviewers}")  # Debug print
+    print(f"Remaining reviewers after approval check: {remaining_reviewers}")  # Debug print
     return remaining_reviewers
 
 
@@ -312,7 +335,7 @@ def get_priority(age_category):
         return "P2 :sparkles:"  # Custom sparkles for normal
 
 
-def process_mrs(project, milestones):
+def process_mrs(project, milestones, dry_run=False):
     """Process all MRs from given milestones."""
     if not any(milestones):
         print("No milestones found")
@@ -379,7 +402,7 @@ def process_mrs(project, milestones):
                 message.append(f"*Days in review*: {get_days_since(expert_review_time)}")
                 message.append(f"*Days in {review_stage}*: {get_days_since(current_stage_time)}")
 
-                # Get and display required reviewers
+                # Get and display required reviewers and missing approvals
                 required_reviewers = get_required_reviewers(mr)
                 if required_reviewers:
                     # Convert email addresses to Slack mentions
@@ -406,7 +429,7 @@ def process_mrs(project, milestones):
 
                 # Send individual message for this MR
                 print(f"Sending message for MR #{mr.iid}")
-                send_to_slack("\n".join(message))
+                send_to_slack("\n".join(message), dry_run)
 
     # Return empty string since we're sending messages directly
     return ""
@@ -444,10 +467,16 @@ def get_slack_user_id(email):
         return None
 
 
-def send_to_slack(message):
+def send_to_slack(message, dry_run=False):
     """Send message to Slack using webhook."""
     if not SLACK_WEBHOOK_URL:
         print("Warning: SLACK_REMINDER_HOOK not set, skipping Slack notification")
+        return
+
+    if dry_run:
+        print("\n=== DRY RUN - Would send to Slack ===")
+        print(message)
+        print("====================================\n")
         return
 
     payload = {"text": message, "mrkdwn": True}
@@ -468,7 +497,13 @@ def send_to_slack(message):
         print(f"Error sending to Slack webhook after retries: {e}")
 
 
-def main():
+@click.command()
+@click.option('--dry-run', is_flag=True, help='Run in dry-run mode without sending to Slack')
+def main(dry_run):
+    """Auto reminder script for MR reviews."""
+    if dry_run:
+        print("Running in DRY-RUN mode - no messages will be sent to Slack")
+
     try:
         gl = get_gitlab_handle()
         project = gl.projects.get(PROJECT_ID)
@@ -478,15 +513,15 @@ def main():
         if not current_milestone and not previous_milestone:
             message = "No active milestones found"
             print(message)
-            send_to_slack(message)
+            send_to_slack(message, dry_run)
             return
 
         # Process all MRs from both milestones
-        process_mrs(project, [current_milestone, previous_milestone])
+        process_mrs(project, [current_milestone, previous_milestone], dry_run)
     except Exception as e:
         error_message = f"Error in main execution: {str(e)}"
         print(error_message)
-        send_to_slack(error_message)
+        send_to_slack(error_message, dry_run)
         raise
 
 

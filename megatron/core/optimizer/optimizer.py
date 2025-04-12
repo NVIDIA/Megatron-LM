@@ -14,6 +14,7 @@ import torch
 import torch.distributed
 
 from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.process_groups_config import WrappedProcessGroup
 
 HAVE_APEX_OR_TE = True
 try:
@@ -159,7 +160,7 @@ class MegatronOptimizer(ABC):
 
         return grads_for_norm
 
-    def get_grad_stats_parallel_group(self) -> Union[torch.distributed.ProcessGroup, List[List[int]]]:
+    def get_grad_stats_parallel_group(self) -> WrappedProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
 
         The two most common cases are:
@@ -174,10 +175,11 @@ class MegatronOptimizer(ABC):
             )
             self.grad_stats_parallel_group = self.model_parallel_group
             delattr(self, "model_parallel_group")
-            return self.grad_stats_parallel_group
+            return WrappedProcessGroup(process_group=self.grad_stats_parallel_group)
         if hasattr(self, 'grad_stats_parallel_group'):
-            return self.grad_stats_parallel_group
-        return parallel_state.get_model_parallel_group() if xm is None else parallel_state.get_model_parallel_groups()
+            return WrappedProcessGroup(process_group=self.grad_stats_parallel_group)
+        return WrappedProcessGroup(process_group=parallel_state.get_model_parallel_group(),
+                                   rank_groups=parallel_state.get_model_parallel_groups())
 
     @abstractmethod
     def prepare_grads(self) -> bool:

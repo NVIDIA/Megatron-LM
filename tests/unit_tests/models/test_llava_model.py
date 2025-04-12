@@ -15,6 +15,7 @@ from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import WrappedProcessGroup
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -979,13 +980,17 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
                 if not hasattr(p, 'tensor_model_parallel')
             ]
         )
-        group = ps.get_tensor_model_parallel_group() if xm is None else ps.get_tensor_model_parallel_groups()
+        group = WrappedProcessGroup(
+            process_group=ps.get_tensor_model_parallel_group(),
+            rank_groups=ps.get_tensor_model_parallel_groups()
+        )
+
         test_vit_params_tensor = torch.tensor([test_vit_tp_params], dtype=torch.int32).to(device=get_current_device())
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [test_vit_params_tensor], groups=group, pin_layout=False)
+            xm.all_reduce(xm.REDUCE_SUM, [test_vit_params_tensor], groups=group.rank_groups, pin_layout=False)
         else:
             torch.distributed.all_reduce(
-                test_vit_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group
+                test_vit_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group.process_group
             )
         total_test_vit_tp_params = test_vit_params_tensor.item()
         assert total_test_vit_tp_params + test_vit_non_tp_params == base_vit_params
@@ -1007,10 +1012,10 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
         )
         test_proj_params_tensor = torch.tensor([test_proj_tp_params], dtype=torch.int32).to(device=get_current_device())
         if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [test_proj_params_tensor], groups=group, pin_layout=False)
+            xm.all_reduce(xm.REDUCE_SUM, [test_proj_params_tensor], groups=group.rank_groups, pin_layout=False)
         else:
             torch.distributed.all_reduce(
-                test_proj_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group
+                test_proj_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group.process_group
             )
         total_test_proj_tp_params = test_proj_params_tensor.item()
         assert total_test_proj_tp_params + test_proj_non_tp_params == base_proj_params

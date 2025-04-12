@@ -1950,7 +1950,7 @@ def get_tensor_and_context_parallel_rank() -> int:
 
 
 ### Expert-related parallel states functions
-def get_expert_model_parallel_group(check_initialized=True) -> int:
+def get_expert_model_parallel_group(check_initialized=True) -> ProcessGroup:
     """Get the expert-model-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
@@ -1959,7 +1959,7 @@ def get_expert_model_parallel_group(check_initialized=True) -> int:
     return _EXPERT_MODEL_PARALLEL_GROUP
 
 
-def get_expert_model_parallel_groups(check_initialized=True) -> int:
+def get_expert_model_parallel_groups(check_initialized=True) -> List[List[int]]:
     """Get the expert-model-parallel global ranks"""
     if check_initialized:
         assert (

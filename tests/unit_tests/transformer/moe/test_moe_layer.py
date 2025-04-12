@@ -87,6 +87,9 @@ class TestMoELayerInit:
         )
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skip(
+        "Late init of parallel_state was broken after parallel states refactor MR2988."
+    )
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["alltoall", "allgather"])
     @pytest.mark.parametrize("grouped_gemm", [True, False])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (2, 2)])

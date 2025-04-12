@@ -5,7 +5,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    get_moe_layer_wise_logging_tracker,
+)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
 
@@ -30,15 +33,13 @@ class AuxlossTestContainer(MoEModelTestContainer):
         torch.distributed.barrier()
         ans = self.partition_input(baseline_grad)
         assert torch.allclose(aux_loss_grad, ans, rtol=1e-5, atol=1e-5), f"Diff: {(aux_loss_grad/ans).mean()}"
-        loss = parallel_state.get_moe_layer_wise_logging_tracker()['load_balancing_loss']['values']
+        loss = get_moe_layer_wise_logging_tracker()['load_balancing_loss']['values']
         assert loss > 0, "Loss should be greater than 0"
         clear_aux_losses_tracker()
 
         with torch.no_grad():
             probs, indices = moe_layer.router(partitioned_input)
-            loss = parallel_state.get_moe_layer_wise_logging_tracker()['load_balancing_loss'][
-                'values'
-            ]
+            loss = get_moe_layer_wise_logging_tracker()['load_balancing_loss']['values']
             assert loss == 0, "Loss should be 0"
             clear_aux_losses_tracker()
 

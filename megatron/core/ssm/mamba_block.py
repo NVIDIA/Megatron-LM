@@ -168,7 +168,7 @@ class MambaStack(MegatronModule):
 
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(layer_type_list):
-            fp8_init_context = get_fp8_context(self.config, i, is_init=True)
+            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
             with fp8_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(

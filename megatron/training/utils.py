@@ -31,6 +31,7 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
+from megatron.core.process_groups_config import WrappedProcessGroup
 from megatron.training import (
     get_args,
     get_adlr_autoresume,
@@ -132,9 +133,14 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         norm_2 = torch.zeros((1,), dtype=torch.float32, device=get_current_device())
 
     if data_parallel_group is not None:
-        torch.distributed.all_reduce(norm_2,
-                                    op=torch.distributed.ReduceOp.SUM,
-                                    group=data_parallel_group)
+        group = WrappedProcessGroup(process_group=data_parallel_group)
+        if xm:
+            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
+                          groups=group.rank_groups, pin_layout=False)
+        else:
+            torch.distributed.all_reduce(norm_2,
+                                        op=torch.distributed.ReduceOp.SUM,
+                                        group=group.process_group)
 
     # Add norm contribution from params with sharded main_params. These norms need to be
     # accumulated across the DP group since the main parameters are sharded because

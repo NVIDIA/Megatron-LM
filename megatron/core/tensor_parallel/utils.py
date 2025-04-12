@@ -93,20 +93,6 @@ def gather_split_1d_tensor(tensor):
         dist_all_gather_func(gathered, tensor, group=parallel_state.get_tensor_model_parallel_group())
     return gathered
 
-def get_group_world_size_and_rank(group: Union[torch.distributed.ProcessGroup, List[List[int]]]) -> int:
-    if isinstance(group, torch.distributed.ProcessGroup):
-            world_size = torch.distributed.get_world_size(group)
-            rank = torch.distributed.get_rank(group)
-    else:
-        world_size = len(group[0])
-        rank = torch.distributed.get_rank()
-        for sub_group in group:
-            if rank in sub_group:
-                rank = sub_group.index(rank)
-                break
-
-    return world_size, rank
-
 class VocabUtility:
     """Split the vocabulary into `world_size` chunks and return the first
     and last index of the vocabulary belonging to the `rank`

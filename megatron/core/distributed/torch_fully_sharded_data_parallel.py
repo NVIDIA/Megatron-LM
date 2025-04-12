@@ -6,6 +6,7 @@ import torch
 import torch.distributed
 
 from megatron.core.device_utils import get_current_device_type, get_xla_model
+from megatron.core.process_groups_config import WrappedProcessGroup
 
 try:
     from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as fully_shard
@@ -71,7 +72,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
         },
-        process_group: Optional[ProcessGroup] = None,
+        group: Optional[WrappedProcessGroup] = None,
     ):
 
         assert (
@@ -80,18 +81,18 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         super().__init__(config=config, module=module)
 
-        if process_group is None:
-            self.process_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True
-            ) if xm is None else parallel_state.get_data_parallel_groups(
-                with_context_parallel=True
+        if group is None:
+            self.group = WrappedProcessGroup(
+                process_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+                rank_groups=parallel_state.get_data_parallel_groups(with_context_parallel=True)
             )
         else:
-            self.process_group = process_group
+            self.group = group
 
         if xm:
-            sharding_groups = self.process_group
-            sharding_world_size, sharding_rank = tensor_parallel.get_group_world_size_and_rank(self.process_group)
+            sharding_groups = self.group.rank_groups
+            sharding_world_size=self.group.size()
+            sharding_rank = self.group.rank()
             kwargs = {
                 "sharding_groups": sharding_groups, 
                 "sharding_rank": sharding_rank, 
@@ -103,7 +104,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                 "mark_step_on_finalization": True,
             }
         else:
-            self.mesh = DeviceMesh.from_group(self.process_group, get_current_device_type())
+            self.mesh = DeviceMesh.from_group(self.group.process_group, get_current_device_type())
             kwargs = {"mesh": self.mesh}
 
         def save_custom_attrs(module):

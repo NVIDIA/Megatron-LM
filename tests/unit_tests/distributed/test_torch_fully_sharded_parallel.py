@@ -12,6 +12,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import WrappedProcessGroup
 from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import MegatronModule
@@ -87,16 +88,18 @@ def test_fsdp2_constructor_with_process_group(init_model_parallel):
     model = Float16Module(config, model)
 
     # Create a custom process group (using the default world for testing)
-    custom_process_group = parallel_state.get_data_parallel_group(with_context_parallel=True) \
-        if xm is None else parallel_state.get_data_parallel_groups(with_context_parallel=True)
+    custom_process_group = WrappedProcessGroup(
+        process_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+        rank_groups=parallel_state.get_data_parallel_groups(with_context_parallel=True)
+    )
 
     # Create the sharded model with explicit process group
     fsdp_model = TorchFullyShardedDataParallel(
-        config, ddp_config, model, process_group=custom_process_group
+        config, ddp_config, model, group=custom_process_group
     )
 
     # Verify the process group was set correctly
-    assert fsdp_model.process_group is custom_process_group
+    assert fsdp_model.group is custom_process_group
 
     # Check that module wrapping still works correctly
     def _is_fsdp_wrapped_module(instance):
