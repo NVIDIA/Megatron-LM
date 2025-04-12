@@ -350,7 +350,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_etp4_dp_last_dgx_a100_1N8G]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_dp_last_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
@@ -358,7 +358,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last_dgx_a100_1N8G]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_dp_last_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
@@ -368,7 +368,7 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last_dgx_a100_1N8G]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_nondeterministic_dp_last_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
@@ -380,7 +380,7 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last_dgx_a100_1N8G]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic_dp_last_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
