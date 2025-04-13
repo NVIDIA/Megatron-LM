@@ -6,7 +6,7 @@ from packaging.version import Version as PkgVersion
 import sys
 import torch
 
-from utils import chunk_bias, chunk_weight
+from utils import _ConverterFakeProcessGroup, chunk_bias, chunk_weight
 
 class MegatronCheckpointSaverBase:
     """Orchestrates saving a Megatron checkpoint using parameters received on a multiprocessing queue.
@@ -167,7 +167,19 @@ class MegatronCheckpointSaverBase:
         mpu.set_tensor_model_parallel_rank(0)
         mpu.set_pipeline_model_parallel_rank(0)
         mpu.set_expert_model_parallel_rank(0)
+        
+        # For backward compatibility during local parallel states refactoring
+        fake_tp_group = _ConverterFakeProcessGroup(size=self.args.target_tensor_parallel_size)
+        fake_ep_group = _ConverterFakeProcessGroup(size=self.args.target_expert_parallel_size)
+        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
         fused_kernels.load(self.margs)
+        
+        try:
+            import torch_llm_debug_tools
+            torch_llm_debug_tools.vscode_debugger_local_init()
+        except ImportError:
+            pass
 
     def queue_get(self, name=None):
         """
