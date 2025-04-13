@@ -687,6 +687,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc1',
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
 
         self.activation_func = self.config.activation_func
@@ -707,6 +708,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc2',
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
 
         if self.config.fp8:
@@ -866,8 +868,13 @@ class SequentialMLP(MegatronModule):
         self.dp_group = model_comm_pgs.expt_dp_group
 
         for _ in range(self.num_local_experts):
-            # TODO(Hepteract): pass model_comm_pgs to MLP after refactoring MLP
-            expert = MLP(self.config, submodules, is_expert=True)
+            expert = MLP(
+                self.config,
+                submodules,
+                ffn_hidden_size=self.config.moe_ffn_hidden_size,
+                is_expert=True,
+                tp_group=parallel_state.get_expert_tensor_parallel_group(),
+            )
             self.local_experts.append(expert)
 
     def _pad_tensor_for_fp8(self, hidden, probs):

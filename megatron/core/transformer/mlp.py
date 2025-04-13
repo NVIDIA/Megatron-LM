@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -19,6 +20,7 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_b
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 
 # pylint: disable=missing-class-docstring
@@ -51,6 +53,8 @@ class MLP(MegatronModule):
         submodules: MLPSubmodules,
         is_expert: bool = False,
         input_size: Optional[int] = None,
+        ffn_hidden_size: int = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
 
@@ -58,14 +62,20 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        if ffn_hidden_size is None:
+            if is_expert:
+                raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")
+            warnings.warn(
+                "MLP requires ffn_hidden_size, but it was not provided. Using \
+                    config.ffn_hidden_size by default.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            ffn_hidden_size = self.config.ffn_hidden_size
+
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
-        if is_expert and self.config.moe_ffn_hidden_size != None:
-            # Experts read ffn_hidden_size from config.moe_ffn_hidden_size
-            ffn_hidden_size = self.config.moe_ffn_hidden_size
-        else:
-            # Normal MLPs read ffn_hidden_size from config.ffn_hidden_size
-            ffn_hidden_size = self.config.ffn_hidden_size
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
@@ -80,6 +90,7 @@ class MLP(MegatronModule):
             skip_bias_add=True,
             is_expert=is_expert,
             tp_comm_buffer_name='fc1',
+            tp_group=tp_group,
         )
 
         self.activation_func = self.config.activation_func
@@ -95,6 +106,7 @@ class MLP(MegatronModule):
             skip_bias_add=True,
             is_expert=is_expert,
             tp_comm_buffer_name='fc2',
+            tp_group=tp_group,
         )
 
     def forward(self, hidden_states, per_token_scale=None):
