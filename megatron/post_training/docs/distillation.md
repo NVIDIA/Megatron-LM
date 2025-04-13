@@ -49,19 +49,20 @@ kd_loss_scale: 10.0
 * `logit_layers` defines the names of the student and teacher submodules, respectively, whose outputs are the logits.
 * `intermediate_layer_pairs` defines the potentially multiple – or zero – pairs of intermediate activation layers to also perform loss on.
 * `skip_lm_loss` decides whether or not to compute and combine the original training LM loss with the KD loss
-* `kd_loss_scale` will scale the KD loss before adding it to the LM loss, if `skip_lm_loss` is `True`.
+* `kd_loss_scale` will scale the KD loss before adding it to the LM loss, if `skip_lm_loss` is `False`.
 
 ### Training
 
-Distillation is triggered by calling `megatron/inference/pretrain_gpt_modelopt.py` while the `--kd-teacher-load` argument is not empty.
-
-Use the regular arguments you would for `pretrain_gpt.py` in addition to the following:
+Distillation is triggered by calling `pretrain_gpt.py` with the additional following arguments:
 
 ```bash
 --kd-teacher-load <path-to-teacher-checkpoint>
 --kd-distill-cfg <path-to-distill-config-yaml-file>
 --export-te-mcore-model
 ```
+
+> NOTE: If the teacher checkpoint happens to be in a different format from the student's (whose format is specified via `--ckpt-format`), it can
+be distinguished separately using the additional flag `--export-kd-teacher-ckpt-format`.
 
 ## Distillation API and design
 
@@ -78,9 +79,9 @@ both defined in `megatron/inference/algos/distillation.py`.
 
 ## Restrictions
 
-* Pipeline Parallel is currently unsupported for Distillation.
+* Interleaved Pipeline Parallel is unsupported for Distillation.
 
-* Only Megatron-Core (not legacy Megatron-LM) is supported for Distillation.
+* Only Megatron-Core models (not legacy Megatron) are supported for Distillation.
 
 ## Known Issues
 

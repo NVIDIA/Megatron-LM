@@ -1,42 +1,46 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+
 """Pretrain GPT."""
 
-import torch
 from functools import partial
-from contextlib import nullcontext
-import inspect
-
 from typing import List, Optional, Tuple, Union
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.training import get_tokenizer
+
+import torch
+
 from megatron.core import mpu
-from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
-from megatron.core.rerun_state_machine import get_rerun_state_machine
-import megatron.legacy.model
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.training import pretrain
-from megatron.core.utils import StragglerDetector
-from megatron.core.transformer.spec_utils import import_module
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    get_blend_and_blend_per_split,
-)
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
 )
-from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.transformer.spec_utils import import_module
+from megatron.core.utils import StragglerDetector
+from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.utils import (
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+    get_blend_and_blend_per_split,
+)
+from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
+import megatron.legacy.model  # isort: skip
+# NOTE: Loading `megatron.legacy.model` earlier fails due to circular import
+
+try:
+    from megatron.post_training.arguments import add_modelopt_args, modelopt_args_enabled
+    from megatron.post_training.loss_func import loss_func as loss_func_modelopt
+    from megatron.post_training.model_provider import model_provider as model_provider_modelopt
+
+    has_nvidia_modelopt = True
+except ImportError:
+    has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
 
@@ -54,6 +58,10 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     args = get_args()
+
+    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
+        return model_provider_modelopt(pre_process, post_process)
+
     use_te = args.transformer_impl == "transformer_engine"
 
     if args.record_memory_history:
@@ -150,12 +158,13 @@ def get_batch(data_iterator):
 SPIKY_LOSS_FACTOR = 10
 
 
-def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
+def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None):
     """Loss function.
 
     Args:
         loss_mask (torch.Tensor): Used to mask out some portions of the loss
         output_tensor (torch.Tensor): The tensor with the losses
+        model (GPTModel, optional): The model (can be wrapped)
 
     Returns:
         the loss scalar for this micro-batch
@@ -164,6 +173,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             the data parallel ranks
     """
     args = get_args()
+
+    if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
+        return loss_func_modelopt(loss_mask, output_tensor, model=model)
 
     losses = output_tensor.float()
     loss_mask = loss_mask.view(-1).float()
@@ -244,7 +256,8 @@ def forward_step(data_iterator, model: GPTModel):
             output_tensor = model(tokens, position_ids, attention_mask,
                                 labels=labels, loss_mask=loss_mask)
 
-    return output_tensor, partial(loss_func, loss_mask)
+    # [ModelOpt]: model is needed to access ModelOpt distillation losses
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
 def is_dataset_built_on_rank():
@@ -320,4 +333,5 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
     )
