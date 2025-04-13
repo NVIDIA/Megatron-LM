@@ -63,15 +63,15 @@ workflow:
       variables: *merge_train_rule
 
     # Prevent running on merge-conflicts
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA == ''
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA == ''
       when: never
 
     # For MRs with integration suite
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables: *merge_train_rule
 
     # For MRs with nightly
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -85,7 +85,7 @@ workflow:
         PUBLISH: "no"
 
     # For MRs with weekly
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -99,7 +99,7 @@ workflow:
         PUBLISH: "no"
 
     # For MRs with heavy suite
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
