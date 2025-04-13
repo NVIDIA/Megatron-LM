@@ -385,7 +385,7 @@ def save(
         common_strategy.save_sharded_objects(sharded_objects_state_dict, checkpoint_dir)
 
     def metadata_finalize_fn():
-        if torch.distributed.get_rank() == 0:
+        if int(os.environ.get("LOCAL_RANK", 0)) == 0:
             save_config(
                 CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
                 checkpoint_dir,
