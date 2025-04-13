@@ -7,6 +7,7 @@ rm -rf /tmp/pytest*
 
 pslist=$(ps -ef | grep pytest | grep -v 'grep' | awk '{print $2}')
 
+
 if [ -z $plist ]
 then
 	torchrun --nproc_per_node=8 -m pytest -x -v -s tests/unit_tests/*.py

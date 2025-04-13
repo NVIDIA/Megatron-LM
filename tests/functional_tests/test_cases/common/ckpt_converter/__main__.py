@@ -655,7 +655,7 @@ class LLaVAPipeline(Pipeline):
     @staticmethod
     def get_test_image():
         args = get_args()
-        test_image = torch.ones((1, 3, args.img_h, args.img_w)).to("cuda")
+        test_image = torch.ones((1, 3, args.img_h, args.img_w)).to(get_current_device())
         return test_image
 
     @staticmethod
@@ -677,7 +677,7 @@ class LLaVAPipeline(Pipeline):
 
             numpy_input_ids[0] = DEFAULT_IMAGE_TOKEN_INDEX
 
-            torch_input_ids = torch.from_numpy(numpy_input_ids).to("cuda")
+            torch_input_ids = torch.from_numpy(numpy_input_ids).to(get_current_device())
 
             return torch_input_ids
         else:

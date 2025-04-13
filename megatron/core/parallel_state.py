@@ -141,6 +141,8 @@ _DATA_PARALLEL_GROUPS = []
 _TENSOR_MODEL_PARALLEL_GROUPS = []
 _CONTEXT_PARALLEL_GROUPS = []
 _DATA_PARALLEL_WITH_CP_GROUPS = []
+_INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
+_INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
 _TENSOR_AND_CONTEXT_PARALLEL_GROUPS = []
 _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS = []
 
@@ -619,7 +621,7 @@ def initialize_model_parallel(
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
-
+    partial_data_parallel=False
     """
     assert create_gloo_process_groups or  xm is None, "XLA requires create_gloo_process_groups=True"
     if encoder_pipeline_model_parallel_size is None:
@@ -827,6 +829,8 @@ def initialize_model_parallel(
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+    global _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
+    global _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
     for ranks in generator_wrapper('dp'):
@@ -888,7 +892,7 @@ def initialize_model_parallel(
                         (i + 1) * intra_partial_data_parallel_size
                     )
                 ]
-
+                _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS.append(intra_partial_data_parallel_ranks_with_cp)
                 intra_partial_data_parallel_group_with_cp = create_group(
                     intra_partial_data_parallel_ranks_with_cp,
                     timeout=timeout,
@@ -917,7 +921,7 @@ def initialize_model_parallel(
                 inter_partial_data_parallel_ranks_with_cp = ranks_with_cp[
                     i::intra_partial_data_parallel_size
                 ]
-
+                _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS.append(inter_partial_data_parallel_ranks_with_cp)
                 inter_partial_data_parallel_group_with_cp = create_group(
                     inter_partial_data_parallel_ranks_with_cp,
                     timeout=timeout,
@@ -932,6 +936,7 @@ def initialize_model_parallel(
         else:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+            _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = _DATA_PARALLEL_WITH_CP_GROUPS
 
     # Apply SHARP to DP process groups
     if use_sharp and torch.cuda.is_available():
@@ -1353,7 +1358,6 @@ def get_pipeline_model_parallel_groups() -> List[List[int]]:
 def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False) -> ProcessGroup:
     """Get the data-parallel group the caller rank belongs to."""
 
-    assert xm is None or not partial_data_parallel, "Partial data parallel not supported with XLA"
     if with_context_parallel:
         if partial_data_parallel:
             assert (
@@ -1369,20 +1373,27 @@ def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=F
         assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
         return _DATA_PARALLEL_GROUP
 
-def get_data_parallel_groups(with_context_parallel=False) -> List[List[int]]:
+def get_data_parallel_groups(with_context_parallel=False, partial_data_parallel=False) -> List[List[int]]:
+    """Get the data-parallel group the caller rank belongs to."""
+
     if with_context_parallel:
+        if partial_data_parallel:
+            assert (
+                _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS is not None
+            ), 'Intra partial data parallel group is not initialized'
+            return _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
         assert (
-            _DATA_PARALLEL_WITH_CP_GROUPS
-        ), 'data parallel with context parallel groups is not initialized'
+            _DATA_PARALLEL_WITH_CP_GROUPS is not None
+        ), 'data parallel group with context parallel combined is not initialized'
         return _DATA_PARALLEL_WITH_CP_GROUPS
     else:
-        assert _DATA_PARALLEL_GROUPS, 'data parallel groups is not initialized'
+        assert _DATA_PARALLEL_GROUPS is not None, 'data parallel group is not initialized'
+        assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
         return _DATA_PARALLEL_GROUPS
 
 def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False) -> ProcessGroup:
     """Get the Gloo data-parallel group the caller rank belongs to."""
 
-    assert xm is None or not partial_data_parallel, "Partial data parallel not supported with XLA"
     if with_context_parallel:
         if partial_data_parallel:
             assert (
@@ -1406,6 +1417,12 @@ def get_inter_partial_data_parallel_group() -> ProcessGroup:
     ), 'Inter partial data parallel group is not initialized'
     return _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
 
+def get_inter_partial_data_parallel_groups() -> List[List[int]]:
+    """Get the group spanning the different partial data-parallel groups."""
+    assert (
+        _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS is not None
+    ), 'Inter partial data parallel group is not initialized'
+    return _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
 
 def get_context_parallel_group(check_initialized=True):
     """Get the context-parallel group the caller rank belongs to."""
@@ -2281,10 +2298,15 @@ def destroy_model_parallel():
     _CONTEXT_PARALLEL_GROUPS = []
     global _DATA_PARALLEL_WITH_CP_GROUPS 
     _DATA_PARALLEL_WITH_CP_GROUPS = []
+    global _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
+    _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
+    global _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
+    _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUPS
     _TENSOR_AND_CONTEXT_PARALLEL_GROUPS = []
     global _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS
     _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS = []
+
 
     ### Expert-related parallel states destory
     global _EXPERT_MODEL_PARALLEL_GROUP
