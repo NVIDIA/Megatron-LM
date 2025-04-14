@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from transformer_engine.pytorch.module.base import get_dummy_wgrad
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_expert_tensor_parallel_rank,
@@ -42,6 +43,12 @@ try:
     import fused_weight_gradient_mlp_cuda
 except ImportError:
     _grad_accum_fusion_available = False
+
+try:
+    from custom_embedding import CustomEmbedding  # pylint: disable=unused-import
+    HAVE_CUSTOM_EMBEDDING = True
+except ModuleNotFoundError:
+    HAVE_CUSTOM_EMBEDDING = False
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'tensor_model_parallel': False,
@@ -253,11 +260,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
-        if self.deterministic_mode:
-            output_parallel = self.weight[masked_input]
+        if not HAVE_CUSTOM_EMBEDDING:
+            if self.deterministic_mode:
+                output_parallel = self.weight[masked_input]
+            else:
+                # F.embedding currently has a non-deterministic backward function
+                output_parallel = F.embedding(masked_input, self.weight)
         else:
-            # F.embedding currently has a non-deterministic backward function
-            output_parallel = F.embedding(masked_input, self.weight)
+            output_parallel = CustomEmbedding.apply(self.weight, masked_input, self.num_embeddings_per_partition)
         # Mask the output embedding.
         if self.tensor_model_parallel_size > 1:
             output_parallel[input_mask, :] = 0.0
@@ -524,19 +534,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
                 if getattr(weight, 'zero_out_wgrad', False):
-                    grad_weight = torch.zeros(
-                        weight.main_grad.shape,
-                        dtype=input.dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+                    grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype, zero=True)
                 else:
-                    grad_weight = torch.empty(
-                        weight.main_grad.shape,
-                        dtype=input.dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+                    grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
