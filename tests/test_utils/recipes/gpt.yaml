@@ -165,18 +165,6 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp1_uniform_full_recompute_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp2_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G]
-    products:
-      # - environment: [dev] Until TE is at 1.12
-      #   scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G]
     products:
       # - environment: [dev] Until TE is at 1.12
@@ -195,30 +183,6 @@ products:
         scope: [mr]
       # - environment: [lts]
       #   scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      # - environment: [lts]
-      #   scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp2_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      # - environment: [lts]
-      #   scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_disable_bias_linear_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_persistent_ckpt_disable_bias_linear_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -231,12 +195,6 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_sequence_parallel_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   # - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_swiglu_dgx_a100_1N8G]
   #   products:
   #     # - environment: [dev] # memory issue after loading from checkpoint
@@ -244,30 +202,6 @@ products:
   #     # - environment: [lts]
   #     #   scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_sequence_parallel_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_swiglu_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_untie_embeddings_and_outputs_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_calculate_per_token_loss_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
@@ -398,12 +332,6 @@ products:
   #     - environment: [lts]
   #       scope: [nightly]
 
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_no_mmap_bin_files_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   # - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev]
@@ -507,20 +435,12 @@ products:
   #######################################################################
   # Super important MR tests that run for both DEV and LTS per MR       #
   #######################################################################
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_cp2_nondeterministic_dgx_a100_1N8G]
-    products:
-      - environment: [dev, lts]
-        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G]
     products:
       - environment: [dev, lts]
         scope: [mr]
       - environment: [dev]
         scope: [mr-slim]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_dgx_a100_1N8G]
-    products:
-      - environment: [dev, lts]
-        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
     products:
       - environment: [dev, lts]
@@ -531,15 +451,7 @@ products:
         scope: [mr]
       - environment: [dev]
         scope: [mr-slim]
-  - test_case: [gpt3_mr_te_tp2_pp2_dgx_a100_1N8G]
-    products:
-      - environment: [dev, lts]
-        scope: [mr]
   - test_case: [gpt3_mr_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G]
-    products:
-      - environment: [dev, lts]
-        scope: [mr]
-  - test_case: [gpt3_mr_tp1_pp4_vp1_dgx_a100_1N8G]
     products:
       - environment: [dev, lts]
         scope: [mr]
