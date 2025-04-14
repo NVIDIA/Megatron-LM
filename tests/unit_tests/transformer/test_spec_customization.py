@@ -15,6 +15,8 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
@@ -60,6 +62,11 @@ class TestSpecCustomization:
         # specify bias dropout add with module path
         self.bda_spec = ModuleSpec(
             module=("megatron.core.fusions.fused_bias_dropout", "get_bias_dropout_add")
+        )
+
+        # Create model process groups for test.
+        self.model_comm_pgs = ModelCommProcessGroups(
+            tp=get_tensor_model_parallel_group(), cp=get_context_parallel_group()
         )
 
     def teardown_method(self, method):
@@ -148,7 +155,11 @@ class TestSpecCustomization:
         threw = False
         try:
             attn = DotProductAttention(
-                config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self',
+                model_comm_pgs=self.model_comm_pgs,
             )
         except:
             threw = True
@@ -157,7 +168,11 @@ class TestSpecCustomization:
 
         # Test TEDotProductAttention
         attn = TEDotProductAttention(
-            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            model_comm_pgs=self.model_comm_pgs,
         )
         # Make sure window-size is what we expect.
         assert attn.window_size == config.window_size
@@ -167,7 +182,11 @@ class TestSpecCustomization:
         try:
             config.window_size = 11
             attn = TEDotProductAttention(
-                config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self',
+                model_comm_pgs=self.model_comm_pgs,
             )
         except:
             threw = True
@@ -177,7 +196,11 @@ class TestSpecCustomization:
         # `None` makes this causal.
         config.window_size = None
         attn = TEDotProductAttention(
-            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            model_comm_pgs=self.model_comm_pgs,
         )
         # Make sure it's causal.
         assert attn.window_size == (-1, 0)
