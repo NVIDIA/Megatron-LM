@@ -330,14 +330,14 @@ publish:test_release_version_bump:
       fi
 
     - sed -i "/^PATCH/c\PATCH = $NEXT_PATCH" megatron/core/package_info.py
-    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = $NEXT_PRERELEASE" megatron/core/package_info.py
+    - sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '$NEXT_PRERELEASE'" megatron/core/package_info.py
 
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
     - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
     - |
       CMD=$(
-        cat <<EOF
+        cat <<'EOF'
           git switch --force-create bot/chore/bump-version && \
           git add megatron/core/package_info.py && \
           git commit -m "chore: adjust version version" && \
@@ -444,8 +444,9 @@ publish:release_version_bump:
     PUBLISH_DRYRUN: "no"
 
 publish:release_notify:
-  needs: [publish:release_pypi_push_wheel, publish:release_github]
+  needs: [publish:release_pypi_test_wheel, publish:release_pypi_push_wheel, publish:release_github]
   extends: [publish:test_release_notify, .publish_common_release]
+  dependencies: [publish:release_pypi_test_wheel]
   variables:
     PUBLISH_DRYRUN: "no"
 
