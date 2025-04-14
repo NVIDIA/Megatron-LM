@@ -11,6 +11,9 @@ import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
 from megatron.core.models.mamba import MambaModel as MCoreMambaModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
@@ -150,12 +153,18 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 
     if args.export_model_type == "GPTModel":
-        transformer_layer_spec = get_gpt_modelopt_spec(
-            config=config,
-            local_core_attention=args.export_force_local_attention,
-            remap_te_layernorm=args.export_te_mcore_model,
-            real_quant_cfg=args.export_real_quant_cfg,
-        )
+        if config.heterogeneous_block_specs:
+            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
+                config=config,
+                use_te=args.transformer_impl == "transformer_engine",
+            )
+        else:
+            transformer_layer_spec = get_gpt_modelopt_spec(
+                config=config,
+                local_core_attention=args.export_force_local_attention,
+                remap_te_layernorm=args.export_te_mcore_model,
+                real_quant_cfg=args.export_real_quant_cfg,
+            )
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,
             "vocab_size": args.padded_vocab_size,

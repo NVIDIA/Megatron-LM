@@ -21,7 +21,6 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
-    TransformerLayer,
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -282,15 +281,19 @@ class TransformerBlock(MegatronModule):
         #     coeff = self.layer_number
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
-            fp8_init_context = get_fp8_context(
-                self.config,
-                layer_number - 1 + get_transformer_layer_offset(self.config),
-                is_init=True,
-            )
+            global_layer_number = layer_number + get_transformer_layer_offset(
+                self.config
+            )  # 1-based index
+            if self.config.heterogeneous_block_specs:
+                layer_config = self.config.get_config_for_layer(global_layer_number)
+            else:
+                layer_config = self.config
+
+            fp8_init_context = get_fp8_context(layer_config, global_layer_number - 1, is_init=True)
             with fp8_init_context:
                 module = build_module(
                     layer_spec,
-                    config=self.config,
+                    config=layer_config,
                     layer_number=layer_number,
                     model_comm_pgs=self.model_comm_pgs,
                 )
@@ -593,12 +596,15 @@ class TransformerBlock(MegatronModule):
         elif isinstance(self.config.moe_layer_freq, list):
             non_homogeneous_layers = True
 
+        if self.config.heterogeneous_block_specs:
+            non_homogeneous_layers = True
+
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = TransformerLayer._get_layer_offset(self.config)
+            offset = get_transformer_layer_offset(self.config)
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long
