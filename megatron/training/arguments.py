@@ -906,8 +906,11 @@ def validate_args(args, defaults={}):
                 'moe_shared_expert_overlap is not supported when combined_1f1b_recipe is ep_a2a'
 
         # Check split_bw compatibility with legacy groupedgemm
-        if args.split_bw and args.moe_use_legacy_grouped_gemm:
-            raise ValueError('split_bw is not supported with legacy groupedgemm implementation')
+        if args.split_bw:
+            if args.moe_use_legacy_grouped_gemm:
+                raise ValueError('split_bw is not supported with legacy groupedgemm implementation')
+            if not args.transformer_impl == 'transformer_engine':
+                raise ValueError('split_bw is only supported with transformer_engine implementation')
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"

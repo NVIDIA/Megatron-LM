@@ -15,6 +15,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import get_te_version, is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -279,53 +280,54 @@ class TestA2AOverlap:
         the same results as the reference implementation.
         """
 
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=4,
-            expert_model_parallel_size=2,
-            virtual_pipeline_model_parallel_size=2,
-        )
-        config = MLATransformerConfig(
-            pipeline_model_parallel_size=4,
-            expert_model_parallel_size=2,
-            deterministic_mode=True,
-            combined_1f1b=True,
-            combined_1f1b_recipe='ep_a2a',
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            pipeline_dtype=torch.bfloat16,
-            num_layers=16,
-            hidden_size=7168,
-            add_bias_linear=False,
-            num_attention_heads=128,
-            ffn_hidden_size=18432,
-            kv_channels=128,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            multi_latent_attention=True,
-            num_moe_experts=16,
-            moe_grouped_gemm=True,
-            moe_token_dispatcher_type='alltoall',
-            moe_shared_expert_intermediate_size=2048,
-        )
-        microbatches = 4
-        with deterministic_mode():
-            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                num_experts=16,
-                moe_grouped_gemm=True,
-                qk_layernorm=True,
+        if is_te_min_version("1.9.0.dev0"):
+            Utils.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=4,
+                expert_model_parallel_size=2,
+                virtual_pipeline_model_parallel_size=2,
+            )
+            config = MLATransformerConfig(
+                pipeline_model_parallel_size=4,
+                expert_model_parallel_size=2,
+                deterministic_mode=True,
+                combined_1f1b=True,
+                combined_1f1b_recipe='ep_a2a',
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                pipeline_dtype=torch.bfloat16,
+                num_layers=16,
+                hidden_size=7168,
+                add_bias_linear=False,
+                num_attention_heads=128,
+                ffn_hidden_size=18432,
+                kv_channels=128,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
                 multi_latent_attention=True,
+                num_moe_experts=16,
+                moe_grouped_gemm=True,
+                moe_token_dispatcher_type='alltoall',
+                moe_shared_expert_intermediate_size=2048,
             )
-            model = TransformerLayer(config, transformer_layer_spec.submodules)
+            microbatches = 4
+            with deterministic_mode():
+                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                    num_experts=16,
+                    moe_grouped_gemm=True,
+                    qk_layernorm=True,
+                    multi_latent_attention=True,
+                )
+                model = TransformerLayer(config, transformer_layer_spec.submodules)
 
-            params = reset_model(model)
-            input_tensors = [build_data() for _ in range(microbatches)]
+                params = reset_model(model)
+                input_tensors = [build_data() for _ in range(microbatches)]
 
-            capture_ref = run_model_ref_with_capture(model, input_tensors, microbatches)
-            reset_model(model, params)
-            capture_a2a_overlap = run_model_a2a_overlap_with_capture(
-                model, input_tensors, microbatches
-            )
-        comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
-        assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
-        Utils.destroy_model_parallel()
+                capture_ref = run_model_ref_with_capture(model, input_tensors, microbatches)
+                reset_model(model, params)
+                capture_a2a_overlap = run_model_a2a_overlap_with_capture(
+                    model, input_tensors, microbatches
+                )
+            comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
+            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+            Utils.destroy_model_parallel()
