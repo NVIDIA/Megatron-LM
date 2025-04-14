@@ -47,6 +47,7 @@ except Exception:
     # This is a WAR for building docs, where torch is not actually imported
     _torch_version = PkgVersion("0.0.0")
 _te_version = None
+_fa_version = None
 
 
 class ExperimentalNotEnabledError(Exception):
@@ -277,6 +278,30 @@ def is_torch_min_version(version, check_equality=True):
     if check_equality:
         return get_torch_version() >= PkgVersion(version)
     return get_torch_version() > PkgVersion(version)
+
+
+def get_fa_version():
+    """Get Flash attention version from __version__; if not available use pip's. Use caching."""
+
+    def get_fa_version_str():
+        import flash_attn as fa
+
+        if hasattr(fa, '__version__'):
+            return str(fa.__version__)
+        else:
+            return version("flash-attn")
+
+    global _fa_version
+    if _fa_version is None:
+        _fa_version = PkgVersion(get_fa_version_str())
+    return _fa_version
+
+
+def is_fa_min_version(version, check_equality=True):
+    """Check if minimum version of `flash-attn` is installed."""
+    if check_equality:
+        return get_fa_version() >= PkgVersion(version)
+    return get_fa_version() > PkgVersion(version)
 
 
 def ensure_divisibility(numerator, denominator):
