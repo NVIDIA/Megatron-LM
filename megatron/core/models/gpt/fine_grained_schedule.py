@@ -651,7 +651,6 @@ def schedule_chunk_1f1b(
             f_context=f_context,
             b_context=b_context,
         )
-        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
     # tail backward
@@ -662,7 +661,6 @@ def schedule_chunk_1f1b(
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
             tmp, grad, _ = schedule_layer_1f1b(None, b_layer, b_grad=grad)
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         if b_schedule_plan is not None:
@@ -676,7 +674,6 @@ def schedule_chunk_1f1b(
             f_layer = f_schedule_plan.get_layer(i)
             torch.cuda.nvtx.range_push(f"layer_{i}f")
             f_input, tmp, _ = schedule_layer_1f1b(f_layer, None, f_input=f_input)
-            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
