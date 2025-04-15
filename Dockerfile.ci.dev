@@ -71,18 +71,50 @@ pip install --no-cache-dir causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.wh
 PY_ENV=pytorch_25.03 pip install --no-cache-dir . -r requirements_mlm.txt -r requirements_ci.txt
 EOF
 
+# Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
+ARG MCORE_REPO
+ARG MCORE_REF
+ARG MCORE_BACKWARDS_REF
+RUN <<"EOF" bash -exu
+# Checkout latest
+cd /opt
+rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+git fetch origin $MCORE_REF
+git checkout $MCORE_REF
+
+# Checkout backwards-ref
+cd /opt
+rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+git init
+git remote add origin ${MCORE_REPO}
+git fetch origin $MCORE_BACKWARDS_REF
+git checkout $MCORE_BACKWARDS_REF
+rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+EOF
+
+RUN <<"EOF" bash -ex
+pip install -U pip
+PY_ENV=pytorch_25.03 pip install --no-cache-dir -e /opt/megatron-lm
+EOF
+
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 
 ##### For NVIDIANS only #####
 FROM main as jet
+ARG CACHEBUST=0
+# COPY --from=build_experimental_flash_attention /opt/*.whl ./experimental_flash_attention/
+ARG EXPERIMENTAL_FLASH_ATTN_VERSION=c0f04c0b6c747914d95205867d86dd19c027d01d
 COPY --from=build_experimental_flash_attention /opt/*.whl ./experimental_flash_attention/
-ARG JET_API_VERSION
 RUN --mount=type=secret,id=JET_INDEX_URLS \
     --mount=type=secret,id=LOGGER_INDEX_URL \
     --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN \
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL) && \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install --no-cache-dir jet-api==$JET_API_VERSION --upgrade $JET_INDEX_URLS  && \
+    EXPERIMENTAL_FLASH_ATTN=$(cat /run/secrets/EXPERIMENTAL_FLASH_ATTN) && \
+    pip install --no-cache-dir "jet-client~=2.0" jet-api --upgrade $JET_INDEX_URLS  && \
     pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL && \
     pip install --no-cache-dir --no-build-isolation ./experimental_flash_attention/*flash_attn*.whl
 

@@ -62,6 +62,10 @@ workflow:
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
       variables: *merge_train_rule
 
+    # Prevent running on merge-conflicts
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_SHA == ''
+      when: never
+
     # For MRs with integration suite
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables: *merge_train_rule
@@ -110,7 +114,7 @@ workflow:
         PUBLISH: "no"
 
     # Default MRs
-    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result'
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
