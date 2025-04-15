@@ -24,7 +24,7 @@ except Exception:
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
-        "*weight_quantizer": {"num_bits": (4, 3), "axis": None, "fake_quant": False},
+        "*weight_quantizer": {"num_bits": (4, 3), "axis": None},
         "*input_quantizer": {"enable": False},
         "*output_layer*": {"enable": False},
         "default": {"enable": False},
@@ -35,11 +35,7 @@ FP8_PER_TENSOR_REAL_QUANT_CFG = {
 # FP8 2D blockwise real quantization config for deepseek models
 FP8_2D_BLOCKWISE_REAL_QUANT_CFG = {
     "quant_cfg": {
-        "*weight_quantizer": {
-            "num_bits": (4, 3),
-            "block_sizes": {-1: 128, -2: 128},
-            "fake_quant": False,
-        },
+        "*weight_quantizer": {"num_bits": (4, 3), "block_sizes": {-1: 128, -2: 128}},
         "*input_quantizer": {"enable": False},
         "*output_layer*": {"enable": False},
         "default": {"enable": False},
@@ -208,6 +204,7 @@ class RealQuantTransformerLayer(TransformerLayer):
             self._collect_original_tensor_info()
 
             mtq.quantize(self, mtq_cfg)
+            mtq.compress(self)
 
             delattr(self, "_modelopt_state")
 
