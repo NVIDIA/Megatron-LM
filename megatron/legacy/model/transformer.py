@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from megatron import core
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.utils import deprecate_inference_params
 from megatron.legacy.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
@@ -651,18 +652,20 @@ class ParallelAttention(MegatronModule):
             device=torch.cuda.current_device())
 
     def forward(self, hidden_states, attention_mask,
-                encoder_output=None, inference_params=None,
-                rotary_pos_emb=None):
+                encoder_output=None, inference_context=None,
+                rotary_pos_emb=None, *, inference_params=None):
         # hidden_states: [sq, b, h]
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
         is_first_step = False
-        if inference_params:
-            if self.layer_number not in inference_params.key_value_memory_dict:
-                inf_max_seq_len = inference_params.max_sequence_length
-                inf_max_batch_size = inference_params.max_batch_size
+        if inference_context:
+            if self.layer_number not in inference_context.key_value_memory_dict:
+                inf_max_seq_len = inference_context.max_sequence_length
+                inf_max_batch_size = inference_context.max_batch_size
                 inference_key_memory = self._allocate_memory(
                     inf_max_seq_len, inf_max_batch_size,
                     self.num_query_groups_per_partition)
@@ -670,12 +673,12 @@ class ParallelAttention(MegatronModule):
                     inf_max_seq_len, inf_max_batch_size,
                     self.num_query_groups_per_partition)
 
-                inference_params.key_value_memory_dict[self.layer_number] = (
+                inference_context.key_value_memory_dict[self.layer_number] = (
                     inference_key_memory, inference_value_memory)
                 is_first_step = True
             else:
                 inference_key_memory, inference_value_memory = \
-                    inference_params.key_value_memory_dict[self.layer_number]
+                    inference_context.key_value_memory_dict[self.layer_number]
 
         # =====================
         # Query, Key, and Value
@@ -745,13 +748,14 @@ class ParallelAttention(MegatronModule):
             else:
                 rotary_pos_emb = ((rotary_pos_emb,) * 2)
 
-        if inference_params:
-            batch_start = inference_params.batch_size_offset
+        if inference_context:
+            batch_start = inference_context.batch_size_offset
             batch_end = batch_start + key_layer.size(1)
             assert batch_end <= inference_key_memory.size(1)
-            sequence_start = inference_params.sequence_len_offset
+            sequence_start = inference_context.sequence_len_offset
             sequence_end = sequence_start + key_layer.size(0)
-            assert sequence_end <= inference_key_memory.size(0)
+            assert sequence_end <= inference_key_memory.size(0), ("Current sequence length is "
+            "longer than expected maximum sequence length! Increase inference_max_seq_length.")
             # Copy key and values.
             inference_key_memory[sequence_start:sequence_end,
                                  batch_start:batch_end, ...] = key_layer
@@ -1057,8 +1061,10 @@ class ParallelTransformerLayer(MegatronModule):
                                       retriever_attn_mask,
                                       norm_input,
                                       norm_output,
-                                      inference_params,
-                                      bias_dropout_add_func):
+                                      inference_context,
+                                      bias_dropout_add_func,
+                                      *,
+                                      inference_params=None):
         """Cross attention for Retro decoder.
 
         Notation:
@@ -1070,6 +1076,8 @@ class ParallelTransformerLayer(MegatronModule):
             k  : Number of neighbors.
             r  : Number of retrieved tokens (neighbors + continuation).
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ns, bs, d = norm_output.shape
         l = int(np.ceil(ns / self.retro_chunk_length))
@@ -1101,7 +1109,7 @@ class ParallelTransformerLayer(MegatronModule):
                 attention_mask=retriever_attn_mask,
                 retriever_output=chunked_output,
                 retriever_attn_mask=retriever_attn_mask,
-                inference_params=inference_params) # [r, k * bs * l , d]
+                inference_context=inference_context) # [r, k * bs * l , d]
             retriever_output = retriever_output.reshape(
                 self.retro_retrieved_length * self.retro_num_neighbors, bs * l, d) # [r * k, bs * l, d]
 
@@ -1159,8 +1167,12 @@ class ParallelTransformerLayer(MegatronModule):
                 retriever_input=None,
                 retriever_output=None,
                 retriever_attn_mask=None,
-                inference_params=None,
-                rotary_pos_emb=None):
+                inference_context=None,
+                rotary_pos_emb=None,
+                *,
+                inference_params=None):
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Update the params in case the retro param changes during inference
         # TODO: better redesign with inference param
@@ -1181,7 +1193,7 @@ class ParallelTransformerLayer(MegatronModule):
             self.self_attention(
                 norm_output,
                 attention_mask,
-                inference_params=inference_params,
+                inference_context=inference_context,
                 rotary_pos_emb=rotary_pos_emb)
 
         # Residual connection.
@@ -1247,7 +1259,7 @@ class ParallelTransformerLayer(MegatronModule):
                     retriever_attn_mask,
                     norm_input,
                     norm_output,
-                    inference_params,
+                    inference_context,
                     bias_dropout_add_func)
         else:
             raise Exception("Unsupported layer type, '%s'." %
@@ -1300,7 +1312,7 @@ class NoopTransformerLayer(MegatronModule):
     """A single 'no-op' transformer layer.
 
     The sole purpose of this layer is for when a standalone embedding layer
-    is used (i.e., args.standalone_embedding_stage == True). In this case,
+    is used (i.e., args.account_for_embedding_in_pipeline_split == True). In this case,
     zero transformer layers are assigned when pipeline rank == 0. Additionally,
     when virtual pipeline rank >= 1, zero total model parameters are created
     (virtual rank 0 contains the input embedding). This results in the model's
@@ -1318,7 +1330,7 @@ class NoopTransformerLayer(MegatronModule):
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
-                inference_params=None):
+                inference_context=None, *, inference_params=None):
         return hidden_states.clone()
 
 
@@ -1339,7 +1351,7 @@ def _get_num_layers(args, model_type, is_decoder=False):
         # or no layers at all (virtual pp rank >= 1).
         num_layers = (
             0
-            if args.standalone_embedding_stage
+            if args.account_for_embedding_in_pipeline_split
             and mpu.get_pipeline_model_parallel_rank() == 0 else
             args.num_layers // args.transformer_pipeline_model_parallel_size
         )
@@ -1556,7 +1568,7 @@ class ParallelTransformer(MegatronModule):
 
         if self.num_layers == 0:
             # When a standalone embedding stage is used (e.g.,
-            # args.standalone_embedding_stage == True), virtual pipeline ranks
+            # args.account_for_embedding_in_pipeline_split == True), virtual pipeline ranks
             # on pipeline rank 0 will have zero transformer layers assigned to
             # them. This results in the model's input and output tensors to be
             # the same, which will cause failure for certain output tensor
@@ -1681,12 +1693,16 @@ class ParallelTransformer(MegatronModule):
                 retriever_input=None,
                 retriever_output=None,
                 retriever_attn_mask=None,
-                inference_params=None,
-                rotary_pos_emb=None):
+                inference_context=None,
+                rotary_pos_emb=None,
+                *,
+                inference_params=None):
         # hidden_states: [s, b, h]
 
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         # Checks.
-        if inference_params:
+        if inference_context:
             assert self.recompute_granularity is None, \
                 'inference does not work with activation checkpointing'
 
@@ -1748,8 +1764,11 @@ class ParallelTransformer(MegatronModule):
                     forward_kwargs = {
                         'encoder_output': encoder_output,
                         'enc_dec_attn_mask': enc_dec_attn_mask,
-                        'inference_params': inference_params,
                     }
+                    if self.transformer_impl == 'local':
+                        forward_kwargs['inference_context'] = inference_context
+                    else:
+                        forward_kwargs['inference_params'] = inference_context
 
                     if self.transformer_impl == 'transformer_engine':
                         forward_kwargs['is_first_microbatch'] = is_first_microbatch

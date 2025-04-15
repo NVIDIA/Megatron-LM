@@ -7,6 +7,7 @@ See https://platform.openai.com/docs/api-reference/completions/create
 import torch
 import numpy as np
 from megatron.training import get_tokenizer
+from megatron.inference.text_generation.mcore_engine_server import run_mcore_engine
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.endpoints.common import send_do_generate, LOCK
 
@@ -36,13 +37,14 @@ def detokenize(prompt, tok) -> list[str]:
 
 
 class MegatronCompletions(Resource):
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, engine, args):
+        self.engine = engine
+        self.args = args
 
     def post(self):
         req = request.get_json()
-        tok = get_tokenizer()
-        prompts = detokenize(req["prompt"], tok)
+        tokenizer = get_tokenizer()
+        prompts = detokenize(req["prompt"], tokenizer)
 
         # convert the openai-local-completions api to the format
         # expected by the generate_and_post_process function
@@ -56,7 +58,7 @@ class MegatronCompletions(Resource):
             "random_seed": int(req.get("seed", -1)),
             "best_of": int(req.get("best_of", 1)),
             "num_completions": int(req.get("n", 1)),
-            "stop": req.get("stop", [tok.detokenize([tok.eod])]),
+            "stop": req.get("stop", [tokenizer.detokenize([tokenizer.eod])]),
             "return_output_log_probs": True,
         }
 
@@ -90,8 +92,10 @@ class MegatronCompletions(Resource):
 
         with LOCK:
             send_do_generate()
+
             result = generate_and_post_process(
-                self.model,
+                self.engine.text_generation_controller.inference_wrapped_model.model,
+                self.engine.text_generation_controller.inference_wrapped_model.inference_context,
                 add_BOS=False,
                 use_eod_token_for_early_termination=True,
                 stop_on_double_eol=True,
@@ -111,7 +115,7 @@ class MegatronCompletions(Resource):
             torch.save(
                 {
                     "args": local_kwargs,
-                    "tokenizer": tok,
+                    "tokenizer": tokenizer,
                     "prompts_plus_generations": prompts_plus_generations,
                     "prompts_plus_generations_segments": prompts_plus_generations_segments,
                     "output_log_probs": output_log_probs,
@@ -133,7 +137,7 @@ class MegatronCompletions(Resource):
                 for t, _ in enumerate(segmented_response):
                     ret_topk_logprobs[batch_idx].append(
                         {
-                            tok.detokenize([tk]): tk_ll
+                            tokenizer.detokenize([tk]): tk_ll
                             for tk, tk_ll in zip(
                                 logprobs_topk_indices[batch_idx][t], logprobs_topk[batch_idx][t]
                             )
@@ -144,7 +148,7 @@ class MegatronCompletions(Resource):
         for batch_idx, (prompt_plus_generation, prompt) in enumerate(
             zip(prompts_plus_generations, prompts)
         ):
-            tok_offsets = tok.offsets(tokens[batch_idx], prompt_plus_generation)
+            tok_offsets = tokenizer.offsets(tokens[batch_idx], prompt_plus_generation)
             if echo:
                 str_trunc_start_idx, tok_idx_start = 0, 0
             else:
@@ -176,7 +180,7 @@ class MegatronCompletions(Resource):
                     "text": truncated_generation,
                     "logprobs": {
                         "token_logprobs": [None] + truncated_generation_logprobs,
-                        "tokens": [tok.detokenize([tk]) for tk in truncated_generation_tokens],
+                        "tokens": [tokenizer.detokenize([tk]) for tk in truncated_generation_tokens],
                         "text_offset": truncated_generation_tok_offsets,
                         "top_logprobs": truncated_generation_topk_logprobs,
                     },

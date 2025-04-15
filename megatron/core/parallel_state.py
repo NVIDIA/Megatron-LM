@@ -6,7 +6,6 @@ import os
 import warnings
 from datetime import timedelta
 from functools import partial
-from itertools import cycle
 from typing import Callable, List, Optional
 
 import torch
@@ -434,6 +433,7 @@ def initialize_model_parallel(
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
     pipeline_model_parallel_split_rank: Optional[int] = None,
+    pipeline_model_parallel_comm_backend: Optional[str] = None,
     use_sharp: bool = False,
     context_parallel_size: int = 1,
     hierarchical_context_parallel_sizes: Optional[List[int]] = None,
@@ -447,6 +447,7 @@ def initialize_model_parallel(
     encoder_pipeline_model_parallel_size: Optional[int] = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
+    create_gloo_process_groups: bool = True,
 ) -> None:
     # pylint: disable=line-too-long
     """Initialize model data parallel groups.
@@ -486,6 +487,10 @@ def initialize_model_parallel(
             pipeline_model_parallel_size is 8 and
             pipeline_model_parallel_split_rank is 3, then ranks 0-2
             will be the encoder and ranks 3-7 will be the decoder.
+
+        pipeline_model_parallel_comm_backend (str, optional):
+            The backend to use for pipeline parallel communication.
+            If None, the default backend will be used.
 
         use_sharp (bool, default = False):
             Set the use of SHARP for the collective communications of
@@ -560,6 +565,10 @@ def initialize_model_parallel(
         get_position_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
             A function that takes in a list of ranks for a pipeline group, and returns
             those ranks that should have position embeddings.
+
+        create_gloo_process_groups (bool, default = True):
+            Create Gloo process groups if set to True. If set to False, Gloo process groups are
+            not created and calls to get Gloo process groups will result in assertion errors.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -704,6 +713,12 @@ def initialize_model_parallel(
         rank_offset=encoder_world_size,
     )
 
+    assert (
+        order.endswith("pp")
+        or pipeline_model_parallel_size == 1
+        or expert_data_parallel_size == data_parallel_size
+    ), "When not using pp-last rank ordering, the data parallel size of the attention and moe layers must be the same"
+
     assert decoder_rank_generator.get_ranks("pp") == expert_decoder_rank_generator.get_ranks(
         "pp"
     ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
@@ -714,7 +729,16 @@ def initialize_model_parallel(
         tensor, pipeline, data, expert, and context parallelism. If we have an encoder,
         in addition to the default decoder, we essentially instantiate two `RankGenerator`
         classes to construct the parallelism for each module separately, and we then have
-        to stitch them together for the right groups. For now, this means pp and tp-pp."""
+        to stitch them together for the right groups. For now, this means pp and tp-pp.
+
+        Let's say we have a total of 6 GPUs denoted by g0 ... g5.
+        For encoder_tp=1, encoder_pp=1, decoder_tp=2, decoder_pp=1, dp=2,
+        g0, g1 belong to encoder and g2, ..., g5 belong to decoder.
+        The present function will create with "tp-dp-pp":
+        3 data-parallel groups: [g0, g1], [g2, g4], [g3, g5]
+        4 tensor model-parallel groups: [g0], [g1], [g2, g3], [g4, g5]
+        4 pipeline model-parallel groups: [g0, g2], [g0, g3], [g1, g4], [g1, g5]
+        """
         if is_expert:
             d_ranks = expert_decoder_rank_generator.get_ranks(group_type, **kwargs)
         else:
@@ -726,9 +750,21 @@ def initialize_model_parallel(
             return
         e_ranks = encoder_rank_generator.get_ranks(group_type, **kwargs)
         if group_type == 'pp':
-            # Map 1 encoder tp rank to several decoder tp ranks, because
-            # these won't be the same size.
-            for x, y in zip(cycle(e_ranks), d_ranks):
+            # Map one encoder tp rank to several decoder tp ranks, because
+            # encoder tp and decoder tp won't be the same size.
+            # Assign this way to avoid getting the DP ranks mixed up with the PP ranks.
+            # For example, if e_ranks = [0,1,2] and d_ranks = [3,4,5,6]
+            # Should yield [0,3], [0,4], [1,5], [2,6]
+            rep = len(d_ranks) // len(e_ranks)
+            remain = len(d_ranks) % len(e_ranks)
+            e_ind = 0
+            e_rep = rep + int(e_ind < remain)
+            for i, y in enumerate(d_ranks):
+                x = e_ranks[e_ind]
+                e_rep -= 1
+                if e_rep == 0:
+                    e_ind += 1
+                    e_rep = rep + int(e_ind < remain)
                 yield x + y
         elif group_type == 'tp-pp':
             # For this group, we can just return the concatenated
@@ -763,18 +799,25 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('dp', nccl_comm_cfgs),
             group_desc='DATA_PARALLEL_GROUP',
         )
-        group_gloo = create_group(
-            ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
-        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
+            )
+        else:
+            group_gloo = None
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
             _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
     assert (
-        data_parallel_size % num_distributed_optimizer_instances == 0
-    ), 'Data parallel size should be divisible by partial DistOpt shard factor'
-    intra_partial_data_parallel_size = data_parallel_size // num_distributed_optimizer_instances
+        data_parallel_size * context_parallel_size
+    ) % num_distributed_optimizer_instances == 0, (
+        'Data parallel size should be divisible by partial DistOpt shard factor'
+    )
+    intra_partial_data_parallel_size = (
+        data_parallel_size * context_parallel_size
+    ) // num_distributed_optimizer_instances
 
     for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = create_group(
@@ -783,13 +826,15 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
             group_desc='DATA_PARALLEL_GROUP_WITH_CP',
         )
-        group_with_cp_gloo = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            backend="gloo",
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
-        )
-
+        if create_gloo_process_groups:
+            group_with_cp_gloo = create_group(
+                ranks_with_cp,
+                timeout=timeout,
+                backend="gloo",
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+            )
+        else:
+            group_with_cp_gloo = None
         if rank in ranks_with_cp:
             _DATA_PARALLEL_GROUP_WITH_CP = group_with_cp
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO = group_with_cp_gloo
@@ -811,12 +856,15 @@ def initialize_model_parallel(
                     pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
                     group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
                 )
-                intra_partial_data_parallel_group_with_cp_gloo = create_group(
-                    intra_partial_data_parallel_ranks_with_cp,
-                    timeout=timeout,
-                    backend="gloo",
-                    group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
-                )
+                if create_gloo_process_groups:
+                    intra_partial_data_parallel_group_with_cp_gloo = create_group(
+                        intra_partial_data_parallel_ranks_with_cp,
+                        timeout=timeout,
+                        backend="gloo",
+                        group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                    )
+                else:
+                    intra_partial_data_parallel_group_with_cp_gloo = None
 
                 if rank in intra_partial_data_parallel_ranks_with_cp:
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
@@ -935,13 +983,76 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+    if pipeline_model_parallel_comm_backend == 'ucc':
+        # The UCC backend provides two key benefits:
+        # 1) Achieves better bandwidth utilization than NCCL when using InfiniBand links.
+        # 2) Does not use GPU SM resources (Zero-SM), mitigating performance interference
+        #    with overlapping compute kernels.
+
+        # The UCC backend is recommended in the following cases:
+        # 1) When the exposed pipeline-parallel (PP) communications are significant.
+        #    - E.g., Pipeline parallelism with very less gradient accumulation steps.
+        #    - It may provide better performance due to improved bandwidth utilization.
+        # 2) When the critical-path pipeline stage has substantial PP-communication overlap.
+        #    - E.g., Uneven pipeline parallelism.
+        #    - It may provide better performance due to zero SM resource usage.
+        if 'CUDA_DEVICE_MAX_CONNECTIONS' in os.environ:
+            # UCC backend requires CUDA_DEVICE_MAX_CONNECTIONS variable to be larger than 1,
+            # to gurantee the overlapped UCC communications. If this environment variable is set to 1,
+            # all the UCC communication will be serialized.
+            assert (
+                os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] != '1'
+            ), "UCC-backend requires CUDA_DEVICE_MAX_CONNECTIONS > 1"
+
+        # Setting up required environment variables for ucc backend
+        #
+        # "TORCH_UCC_BLOCKING_WAIT=none" allows non-blocking waits of the communiction handle
+        # "UCC_EC_CUDA_STREAM_TASK_MODE" controls how CUDA execution engines (EC)
+        # schedule tasks on CUDA streams.
+        # "UCX_TLS" controls transport layer selection
+        # "NSYS_UCP_COMM_PARAMS=1" enables capturing ucx tracing in nsys profiling
+        # "UCX_RNDV_THRESH" controls threshold threshold for switching between
+        # eager and rendezvous (RNDV) communication protocols.
+        # "UCX_NET_DEVICES" select which network interfaces UCX should use.
+        # "UCC_CL_BASIC_TLS" controls which Transport Layers are used by
+        # the Basic Collective libraray
+
+        os.environ['TORCH_UCC_BLOCKING_WAIT'] = (
+            os.environ['TORCH_UCC_BLOCKING_WAIT']
+            if "TORCH_UCC_BLOCKING_WAIT" in os.environ
+            else 'none'
+        )
+        os.environ['UCC_EC_CUDA_STREAM_TASK_MODE'] = (
+            os.environ['UCC_EC_CUDA_STREAM_TASK_MODE']
+            if "UCC_EC_CUDA_STREAM_TASK_MODE" in os.environ
+            else 'driver'
+        )
+        os.environ['UCX_TLS'] = (
+            os.environ['UCX_TLS'] if "UCX_TLS" in os.environ else 'ib,cuda_copy'
+        )  # cuda_ipc (i.e., NVLink-enablement) will be later supported
+        os.environ['NSYS_UCP_COMM_PARAMS'] = '1'
+        os.environ['UCX_RNDV_THRESH'] = '0'
+        os.environ['UCX_NET_DEVICES'] = 'all'
+        os.environ['UCC_CL_BASIC_TLS'] = '^sharp,nccl'
+
     for ranks in generator_wrapper('pp'):
         group = create_group(
             ranks,
             timeout=timeout,
-            pg_options=get_nccl_options('pp', nccl_comm_cfgs),
+            backend=pipeline_model_parallel_comm_backend,
+            pg_options=(
+                None
+                if pipeline_model_parallel_comm_backend == 'ucc'
+                else get_nccl_options('pp', nccl_comm_cfgs)
+            ),
             group_desc='PIPELINE_MODEL_PARALLEL_GROUP',
         )
+        assert (
+            pipeline_model_parallel_comm_backend == None
+            or pipeline_model_parallel_comm_backend == 'nccl'
+            or pipeline_model_parallel_comm_backend == 'ucc'
+        ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
+
         if rank in ranks:
             if _PIPELINE_MODEL_PARALLEL_GROUP is None:
                 _PIPELINE_MODEL_PARALLEL_GROUP = group
@@ -1085,9 +1196,12 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('ep_dp', nccl_comm_cfgs),
             group_desc='EXPERT_DATA_PARALLEL_GROUP',
         )
-        group_gloo = create_group(
-            ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
-        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
+            )
+        else:
+            group_gloo = None
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -1831,6 +1945,14 @@ def get_expert_data_parallel_rank():
     """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(group=get_expert_data_parallel_group())
+    else:
+        return 0
+
+
+def get_expert_data_parallel_world_size():
+    """Return world size for the expert data parallel group."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(group=get_expert_data_parallel_group())
     else:
         return 0
 

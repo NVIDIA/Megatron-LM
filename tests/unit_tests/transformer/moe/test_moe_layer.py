@@ -42,6 +42,7 @@ class TestMoELayerInit:
             moe_router_topk=2,
             moe_aux_loss_coeff=0.01,
             moe_grouped_gemm=grouped_gemm,
+            moe_ffn_hidden_size=128,
             add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -80,7 +81,7 @@ class TestMoELayerInit:
         )
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])
+    @pytest.mark.parametrize("moe_token_dispatcher_type", ["alltoall", "allgather"])
     @pytest.mark.parametrize("grouped_gemm", [True, False])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1), (2, 2)])
     def test_moe_with_late_initialize(

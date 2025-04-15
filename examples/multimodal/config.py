@@ -113,6 +113,12 @@ def get_language_model_config(config):
         config.apply_rope_fusion = False
         config.attention_softmax_in_fp32 = True
         config.ffn_hidden_size = 8192
+    elif config.language_model_type.startswith("hf://"):
+        # Loaded from HuggingFace config file.
+        import transformers
+        hf_config = transformers.AutoConfig.from_pretrained(config.language_model_type.split("hf://")[1])
+        config.hf_config = hf_config
+        config.hidden_size = hf_config.hidden_size
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")
 
@@ -182,6 +188,27 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.normalization = 'RMSNorm'
         config.layernorm_epsilon = 1e-6
         config.apply_rope_fusion = False
+    elif config.vision_model_type == "internvit300M":
+        config.num_layers = 24
+        config.num_attention_heads = 16
+        config.num_query_groups = config.num_attention_heads
+        config.add_bias_linear = True
+        config.add_qkv_bias = True
+        config.hidden_size = 1024
+        config.kv_channels = 64
+        config.hidden_dropout = 0.0
+        config.ffn_hidden_size = 4096
+        config.gated_linear_unit = False
+        config.activation_func = torch.nn.functional.gelu
+        config.layernorm_zero_centered_gamma = False
+        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.normalization = 'LayerNorm'
+        config.layernorm_epsilon = 1e-6
+        config.apply_rope_fusion = False
+        config.qk_layernorm = False
     elif config.vision_model_type == "radio":
         config.num_layers = 32
         config.num_attention_heads = 16
@@ -202,6 +229,31 @@ def get_vision_model_config(config, apply_query_key_layer_scaling):
         config.apply_rope_fusion = False
         config.qk_layernorm = False
         config.layernorm_epsilon = 1e-6
+    elif config.vision_model_type == "radio-g":
+        config.num_layers = 40
+        config.num_attention_heads = 24
+        config.add_bias_linear = True
+        config.add_qkv_bias = True
+        config.hidden_size = 1536
+        config.ffn_hidden_size = 4096
+        config.gated_linear_unit = True
+        config.activation_func = torch.nn.functional.silu
+        config.kv_channels = 64
+        config.num_query_groups = 24
+        config.layernorm_zero_centered_gamma = False
+        config.apply_query_key_layer_scaling = apply_query_key_layer_scaling
+        config.bias_activation_fusion = False
+        config.bias_dropout_fusion = False
+        config.attention_softmax_in_fp32 = True
+        config.normalization = 'LayerNorm'
+        config.apply_rope_fusion = False
+        config.qk_layernorm = False
+        config.layernorm_epsilon = 1e-6
+    elif config.vision_model_type.startswith("hf://"):
+        import transformers
+        hf_config = transformers.AutoConfig.from_pretrained(config.vision_model_type.split("hf://")[1])
+        config.hf_config = hf_config
+        config.hidden_size = hf_config.hidden_size
     else:
         raise ValueError(f"unknown vision model type {config.vision_model_type}")
 
@@ -240,6 +292,10 @@ def get_vision_projection_config(config, hidden_size):
     elif config.language_model_type == "llama3.2_1b":
         config.ffn_hidden_size = 2048
         config.activation_func = torch.nn.functional.gelu
+        config.normalization = "LayerNorm"
+    elif config.language_model_type.startswith("hf://"):
+        config.activation_func = torch.nn.functional.gelu
+        config.ffn_hidden_size = 4096
         config.normalization = "LayerNorm"
     else:
         raise ValueError(f"unknown language model type {config.language_model_type}")

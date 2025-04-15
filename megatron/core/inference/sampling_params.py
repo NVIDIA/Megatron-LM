@@ -6,7 +6,8 @@ from dataclasses import dataclass
 class SamplingParams:
     """Inference parameters sent along with the prompts.
     This class contains request-level attributes that control the sampling techniques used when
-    generating text. This is distinct from megatron.core.InferenceParams, which is sets model-level
+    generating text. This is distinct from megatron.core.inference.contexts.BaseInferenceContext,
+        which is sets model-level
     inference attributes such as the maximum sequence length, and contains the KV cache.
 
     For an explanation of these parameters refer to this blog
@@ -20,6 +21,7 @@ class SamplingParams:
     return_log_probs: bool = False
     return_segments: bool = False  # Whether to return individually detokenized tokens
     num_tokens_to_generate: int = 30
+    top_n_logprobs: int = 0
 
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to sampling params

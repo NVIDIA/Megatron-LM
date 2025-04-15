@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}'
+  name: "{test_case}_{environment}"
   model: bert
   nodes: 1
   build: mcore-pyt-{environment}

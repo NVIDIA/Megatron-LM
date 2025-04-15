@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List
+from typing import Optional, Set
 
 import torch
 
@@ -12,12 +12,17 @@ try:
 except ImportError:
     HAVE_FSDP = False
 
+from torch.distributed import ProcessGroup
+
+from megatron.core.fp8_utils import is_float8tensor
+
 from .. import parallel_state, tensor_parallel
 from ..models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from ..models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from ..transformer.transformer_config import TransformerConfig
 from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
+from .distributed_data_parallel_config import DistributedDataParallelConfig
 
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
@@ -29,28 +34,36 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
     Args:
         config: Transformer config object.
+        ddp_config: DistributedDataParallel config object.
         module: Underlying model.
-        sub_modules_to_wrap: List of sub_modules to shard with FSDP.
+        sub_modules_to_wrap: Set of sub_modules to shard with FSDP.
             Parameters within each sub_module will be all-gathered just-in-time.
-            The default list includes the following submodules derived from the
+            The default set includes the following submodules derived from the
             GPT model architecture:
                 TransformerLayer (all Transformer layers)
                 LanguageModelEmbedding (initial embedding layer)
                 RotaryEmbedding  (initial RoPE layer)
                 tensor_parallel.ColumnParallelLinear (final output layer)
+
+            User can set _fsdp_modules attribute on submodules to set additional
+            submodules to shard with FSDP.
+        process_group: Optional ProcessGroup to use for distributed operations.
+            If None (default), the data parallel process group will be obtained from
+            parallel_state.get_data_parallel_group(with_context_parallel=True).
     """
 
     def __init__(
         self,
         config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
-        sub_modules_to_wrap: List[torch.nn.Module] = [
+        sub_modules_to_wrap: Set[torch.nn.Module] = {
             TransformerLayer,
             LanguageModelEmbedding,
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
-        ],
-        **kwargs
+        },
+        process_group: Optional[ProcessGroup] = None,
     ):
 
         assert (
@@ -58,18 +71,25 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'
 
         super().__init__(config=config, module=module)
-        self.data_parallel_group = parallel_state.get_data_parallel_group(
-            with_context_parallel=True
-        )
 
-        mesh = DeviceMesh.from_group(self.data_parallel_group, "cuda")
+        if process_group is None:
+            self.process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        else:
+            self.process_group = process_group
 
-        kwargs = {"mesh": mesh}
+        self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
+        kwargs = {"mesh": self.device_mesh}
 
         def save_custom_attrs(module):
             custom_attrs = {}
             for name, param in module.named_parameters():
                 attrs = vars(param)
+                if is_float8tensor(param):
+                    # disable fp8 transpose cache and perform transposing fp8 weights
+                    # at each micro-batch because torch-FSDP doesn't recognize the
+                    # micro-batch id, thus removing unnecessary memory stores
+                    attrs['_fp8_attrs']['transpose_invalid'] = False
+                    del attrs['_fp8_attrs']['transpose']
                 custom_attrs[name] = {k: v for k, v in attrs.items()}
             return custom_attrs
 
@@ -82,6 +102,12 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         # Save the custom attributes on Parameters before FSDP overwrites them.
         # See https://github.com/pytorch/pytorch/issues/136929.
         attrs = save_custom_attrs(self.module)
+
+        sub_modules_to_wrap = set(sub_modules_to_wrap)
+        for sub_module in self.module.modules():
+            fsdp_modules = getattr(sub_module, "_fsdp_modules", [])
+            for f in fsdp_modules:
+                sub_modules_to_wrap.add(f)
 
         prev_module = None
         for sub_module in self.module.modules():

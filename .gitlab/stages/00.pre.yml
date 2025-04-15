@@ -3,10 +3,14 @@ include:
 
 .pre_rules:
   rules:
+    - if: $CI_PIPELINE_SOURCE == 'main'
+      allow_failure: true
+      when: always
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: always
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      when: always
     - when: never
   stage: .pre
 
@@ -22,20 +26,30 @@ include:
 pre:mirror_to_github:
   rules:
     - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
     - when: never
-  tags: [mcore-docker-node-small]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: 'clone'
+    GIT_STRATEGY: "clone"
   script:
     - git checkout $CI_COMMIT_BRANCH
     - git remote add github https://ko3n1g:$GH_TOKEN@github.com/NVIDIA/Megatron-LM.git || true
     - git push -u github $CI_COMMIT_BRANCH
+  retry:
+    max: 2
 
 pre:create_ci_branches:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
     - when: never
   parallel:
     matrix:
@@ -45,15 +59,23 @@ pre:create_ci_branches:
       - branch: ci-nightly
       - branch: ci-weekly
       - branch: ci-pre-release
-  tags: [mcore-docker-node-small]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   stage: .pre
   image: python:3.10
   variables:
-    GIT_STRATEGY: 'clone'
+    GIT_STRATEGY: "clone"
   script:
     - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/adlr/megatron-lm.git"
     - git switch --force-create $branch
     - git push --force -u origin $branch
+  retry:
+    max: 2
 
 pre:label_merge_request:
   extends: [.pre_rules]
@@ -66,10 +88,20 @@ pre:label_merge_request:
     - go install .
     - cd ..
     - go install github.com/itchyny/gojq/cmd/gojq@latest
-    - |
-      echo LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}" | gojq '.labels | join(",")') > labels
   script:
+    - set -x
+    - |
+      LABELS=$(curl --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}" --url "https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}")
+    - LABELS=$(echo "$LABELS" | gojq '.labels -= ["ParallelState"]')
+    - |
+      if git --no-pager diff --merge-base origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} -- 'megatron/core/' | grep -q 'parallel_state'; then
+        LABELS=$(echo "$LABELS" | gojq '.labels += ["ParallelState"]')
+        echo "$LABELS"
+      fi
+
+    - echo LABELS=$(echo "$LABELS" | gojq '.labels | join(",")') > labels
     - gitlab-mr-labeler -f .gitlab/labeler-config.yml -t ${PROJECT_ACCESS_TOKEN_MCORE} --debug true
+    - cat labels
   after_script:
     - |
       source labels
@@ -79,11 +111,17 @@ pre:maybe_cherry_pick_commit:
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
     - when: never
-  tags: [mcore-docker-node-small]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   stage: .pre
   image: nentangso/alpine-git-curl-jq
   variables:
-    GIT_STRATEGY: 'clone'
+    GIT_STRATEGY: "clone"
   script:
     - set -x
     - set +e
@@ -163,7 +201,13 @@ pre:maybe_cherry_pick_commit:
 pre:check_milestone:
   extends: [.pre_rules]
   image: badouralix/curl-jq
-  tags: [mcore-docker-node-small]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   script:
     - env
     - |
@@ -173,3 +217,26 @@ pre:check_milestone:
         echo Please assign a Milestone to this MR!
         exit 1
       fi
+
+pre:check_status_of_main:
+  extends: [.pre_rules]
+  image: python:3.10
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - pip install python-gitlab
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - python tests/test_utils/python_scripts/check_status_of_main.py
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train' && $CI_MERGE_REQUEST_LABELS =~ /fast-track/
+      when: never
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train'
+      when: always
+    - when: never

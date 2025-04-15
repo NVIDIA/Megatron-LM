@@ -15,8 +15,9 @@ from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.utils import StragglerDetector
-from megatron.inference.arguments import add_modelopt_args
-from megatron.inference.gpt import loss_func, model_provider
+from megatron.post_training.arguments import add_modelopt_args
+from megatron.post_training.loss_func import loss_func
+from megatron.post_training.model_provider import model_provider
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,

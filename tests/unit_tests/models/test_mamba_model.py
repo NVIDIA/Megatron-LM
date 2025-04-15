@@ -3,11 +3,11 @@
 import pytest
 import torch
 
-from megatron.core import InferenceParams
+from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -16,14 +16,14 @@ class TestMambaModel:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
-        transformer_config = TransformerConfig(
+        model_config = TransformerConfig(
             num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
             hidden_size=256,  # The Mamba layer places several constraints on this
             num_attention_heads=4,
             use_cpu_initialization=True,
         )
         self.model = MambaModel(
-            config=transformer_config,
+            config=model_config,
             mamba_stack_spec=mamba_stack_spec,
             vocab_size=100,
             max_sequence_length=4,
@@ -81,7 +81,7 @@ class TestMambaModel:
     def test_inference(self):
         config: TransformerConfig = self.model.config
         micro_batch_size = 2
-        inference_params: InferenceParams = InferenceParams(
+        inference_context: BaseInferenceContext = StaticInferenceContext(
             max_batch_size=micro_batch_size, max_sequence_length=self.model.max_sequence_length
         )
         prompt_length = self.model.max_sequence_length - 1
@@ -94,7 +94,7 @@ class TestMambaModel:
                 sequence_length = prompt_length
             else:
                 sequence_length = 1
-            inference_params.sequence_len_offset = offset
+            inference_context.sequence_len_offset = offset
 
             data = list(range(sequence_length))
             input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
@@ -109,7 +109,7 @@ class TestMambaModel:
                 input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
-                inference_params=inference_params,
+                inference_context=inference_context,
             )
 
             assert logits.shape[0] == micro_batch_size

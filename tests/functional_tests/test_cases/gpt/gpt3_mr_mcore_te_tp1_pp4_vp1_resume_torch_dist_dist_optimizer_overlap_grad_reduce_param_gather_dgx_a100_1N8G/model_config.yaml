@@ -44,6 +44,7 @@ MODEL_ARGS:
   --overlap-grad-reduce: true
   --overlap-param-gather: true
   --check-weight-hash-across-dp-replicas-interval: 10
+  --disable-gloo-process-groups: true
   --ckpt-fully-parallel-load: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
@@ -51,6 +52,7 @@ MODEL_ARGS:
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
+  --ckpt-assume-constant-structure: true
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --log-memory-to-tensorboard: true

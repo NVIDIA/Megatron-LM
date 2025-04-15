@@ -1,7 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain GPT."""
 
-import os
 import torch
 from functools import partial
 from contextlib import nullcontext
@@ -34,7 +33,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 
 
 stimer = StragglerDetector()
@@ -63,6 +64,15 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             # record stack information for the trace events
             trace_alloc_record_context=True)
 
+        def oom_observer(device, alloc, device_alloc, device_free):
+            # snapshot right after an OOM happened
+            print('saving allocated state during OOM')
+            snapshot = torch.cuda.memory._snapshot()
+            from pickle import dump
+            dump(snapshot, open(f"oom_rank-{torch.distributed.get_rank()}_{args.memory_snapshot_path}", 'wb'))
+
+        torch._C._cuda_attach_out_of_memory_observer(oom_observer)
+
     print_rank_0('building GPT model ...')
     # Experimental loading arguments from yaml
     if args.yaml_cfg is not None:
@@ -84,7 +94,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
         else:
             if args.num_experts:
                 # Define the decoder block spec
-                transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te)
+                transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te, normalization=args.normalization)
             else:
                 # Define the decoder layer spec
                 if use_te:
@@ -94,39 +104,28 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
                         args.num_experts, args.moe_grouped_gemm,
-                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm)
+                        args.qk_layernorm, args.multi_latent_attention, args.moe_use_legacy_grouped_gemm,
+                        normalization=args.normalization)
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_transformer_engine=use_te)
 
-        build_model_context = nullcontext
-        build_model_context_args = {}
-        if args.fp8_param_gather:
-            try:
-                from transformer_engine.pytorch import fp8_model_init
-
-                build_model_context = fp8_model_init
-                build_model_context_args["enabled"] = True
-
-                # Check if fp8_model_init supports preserve_high_precision_init_val
-                if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
-                    build_model_context_args["preserve_high_precision_init_val"] = True
-            except:
-                raise RuntimeError("--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
-
-        with build_model_context(**build_model_context_args):
-            model = GPTModel(
-                config=config,
-                transformer_layer_spec=transformer_layer_spec,
-                vocab_size=args.padded_vocab_size,
-                max_sequence_length=args.max_position_embeddings,
-                pre_process=pre_process,
-                post_process=post_process,
-                fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-                parallel_output=True,
-                share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-                position_embedding_type=args.position_embedding_type,
-                rotary_percent=args.rotary_percent,
-                rotary_base=args.rotary_base,
-                rope_scaling=args.use_rope_scaling
-            )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base,
+            rope_scaling=args.use_rope_scaling,
+            mtp_block_spec=mtp_block_spec,
+        )
 
     return model
 
@@ -147,8 +146,8 @@ def get_batch(data_iterator):
     return batch.values()
 
 
-# define spiky loss as a variation of 20% or more
-SPIKY_LOSS_PERC = 0.2
+# define spiky loss as a loss that's 10x the max loss observed
+SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
@@ -184,11 +183,22 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=True,
         )
+        rerun_state_machine.validate_result(
+            result=loss[0],
+            rejection_func=torch.isinf,
+            message="found Inf in local forward loss calculation",
+            tolerance=0.0,        # forward pass calculations are determinisic
+            fatal=True,
+        )
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
             result=loss[0],
-            rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
+            rejection_func=partial(
+                rerun_state_machine.is_unexpectedly_large,
+                threshold=SPIKY_LOSS_FACTOR,
+                context="loss",
+            ),
             message="Spiky loss",
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=False,
@@ -197,9 +207,12 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
     local_num_tokens = loss[1].clone().detach().to(torch.int)
     return (
-        loss[0] * args.context_parallel_size,
+        loss[0].clone(),
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
@@ -224,8 +237,12 @@ def forward_step(data_iterator, model: GPTModel):
     timers('batch-generator').stop()
 
     with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
+        if args.use_legacy_models:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels)
+        else:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels, loss_mask=loss_mask)
 
     return output_tensor, partial(loss_func, loss_mask)
 

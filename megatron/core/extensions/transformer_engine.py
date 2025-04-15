@@ -5,7 +5,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Callable
+from typing import Any, Callable, Optional
 
 import torch
 import transformer_engine as te
@@ -32,12 +32,15 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.tensor_parallel import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
-from megatron.core.tensor_parallel.random import get_data_parallel_rng_tracker_name
+from megatron.core.tensor_parallel.random import (
+    get_cuda_rng_tracker,
+    get_data_parallel_rng_tracker_name,
+    get_expert_parallel_rng_tracker_name,
+)
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -51,6 +54,8 @@ def _get_extra_te_kwargs(config: TransformerConfig):
     if is_te_min_version("0.12.0"):
         if config.use_cpu_initialization:
             extra_transformer_engine_kwargs["device"] = 'cpu'
+        elif config.init_model_with_meta_device:
+            extra_transformer_engine_kwargs["device"] = "meta"
         else:
             extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
     return extra_transformer_engine_kwargs
@@ -294,13 +299,13 @@ class TELinear(te.pytorch.Linear):
         input_size: int,
         output_size: int,
         *,
-        parallel_mode: str,
+        parallel_mode: Optional[str],
         config: ModelParallelConfig,
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
         skip_weight_param_allocation: bool,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
         is_expert: bool = False,
     ):
         self.config = config
@@ -437,6 +442,17 @@ class TELinear(te.pytorch.Linear):
             return out
         return out, None
 
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Replicate cross TP/DP."""
+
+        # Provide the dist-ckpt support when TELinear is directly used
+        # It can only happen with duplicated parallel mode
+        assert (
+            self.parallel_mode == None
+        ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
+
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """
@@ -456,7 +472,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         self.config = config
 
@@ -621,7 +637,7 @@ class TEColumnParallelLinear(TELinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
@@ -704,7 +720,7 @@ class TERowParallelLinear(TELinear):
         input_is_parallel: bool,
         skip_bias_add: bool,
         is_expert: bool,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         if not input_is_parallel:
             raise ValueError(
@@ -789,10 +805,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        attention_dropout: float = None,
-        softmax_scale: float = None,
-        k_channels: int = None,
-        v_channels: int = None,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        k_channels: Optional[int] = None,
+        v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
     ):
         self.config = config
@@ -809,7 +825,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"setting query key layer scaling via argument, so these two must match."
             )
 
-        extra_kwargs = {}
+        extra_kwargs: dict[str, Any] = {}
         if is_te_min_version("0.11.0"):
             extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
         elif self.config.num_query_groups != self.config.num_attention_heads:
@@ -1008,13 +1024,13 @@ if is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
-            parallel_mode: str,
+            parallel_mode: Optional[str],
             config: ModelParallelConfig,
             init_method: Callable,
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool = False,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
             self.config = config
 
@@ -1104,27 +1120,45 @@ if is_te_min_version("1.9.0.dev0"):
                 state_list = [self._decode_extra_state(state) for state in state_list]
                 extra_fp8_variables = state_list[0]['extra_fp8_variables']
                 extra_fp8_variables['num_gemms'] = self.num_gemms
-                extra_state = {
-                    "scale_fwd": torch.cat(
-                        [state['scale_fwd'].view(-1, 1) for state in state_list], dim=1
-                    ).view(-1),
-                    "scale_inv_fwd": torch.cat(
-                        [state['scale_inv_fwd'].view(-1, 1) for state in state_list], dim=1
-                    ).view(-1),
-                    "amax_history_fwd": torch.cat(
-                        [state['amax_history_fwd'].view(-1, 1) for state in state_list], dim=1
-                    ).view(self.fp8_meta["recipe"].amax_history_len, -1),
-                    "scale_bwd": torch.cat(
-                        [state['scale_bwd'].view(-1, 1) for state in state_list], dim=1
-                    ).view(-1),
-                    "scale_inv_bwd": torch.cat(
-                        [state['scale_inv_bwd'].view(-1, 1) for state in state_list], dim=1
-                    ).view(-1),
-                    "amax_history_bwd": torch.cat(
-                        [state['amax_history_bwd'].view(-1, 1) for state in state_list], dim=1
-                    ).view(self.fp8_meta["recipe"].amax_history_len, -1),
-                    "extra_fp8_variables": extra_fp8_variables,
-                }
+                extra_state = {"extra_fp8_variables": extra_fp8_variables}
+                # TE 2.0 adds recipe in extra_state
+                if is_te_min_version("2.0.0"):
+                    extra_state['recipe'] = self.fp8_meta["recipe"]
+                # Only delayed scaling has global fp8 meta tensors. We're not using
+                # self.fp8_meta["recipe"].delayed() because it's available in TE 2.0 and later.
+                if isinstance(self.fp8_meta["recipe"], te.common.recipe.DelayedScaling):
+                    extra_state.update(
+                        {
+                            "scale_fwd": torch.cat(
+                                [state['scale_fwd'].view(-1, 1) for state in state_list], dim=1
+                            ).view(-1),
+                            "amax_history_fwd": torch.cat(
+                                [state['amax_history_fwd'].view(-1, 1) for state in state_list],
+                                dim=1,
+                            ).view(self.fp8_meta["recipe"].amax_history_len, -1),
+                            "scale_bwd": torch.cat(
+                                [state['scale_bwd'].view(-1, 1) for state in state_list], dim=1
+                            ).view(-1),
+                            "amax_history_bwd": torch.cat(
+                                [state['amax_history_bwd'].view(-1, 1) for state in state_list],
+                                dim=1,
+                            ).view(self.fp8_meta["recipe"].amax_history_len, -1),
+                        }
+                    )
+                    # TE 2.0 removes scale_inv_fwd and scale_inv_bwd
+                    if not is_te_min_version("2.0.0"):
+                        extra_state.update(
+                            {
+                                "scale_inv_fwd": torch.cat(
+                                    [state['scale_inv_fwd'].view(-1, 1) for state in state_list],
+                                    dim=1,
+                                ).view(-1),
+                                "scale_inv_bwd": torch.cat(
+                                    [state['scale_inv_bwd'].view(-1, 1) for state in state_list],
+                                    dim=1,
+                                ).view(-1),
+                            }
+                        )
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
@@ -1145,8 +1179,14 @@ if is_te_min_version("1.9.0.dev0"):
             return out, None
 
         def _encode_extra_state(self, state):
-            state_serialized = io.BytesIO()
-            torch.save(state, state_serialized)
+            # TE 2.0 changed the format of extra_state to be a byte tensor
+            if is_te_min_version("2.0.0"):
+                torch.cuda.synchronize()
+                state_serialized = bytearray(pickle.dumps(state))
+                state_serialized = torch.frombuffer(state_serialized, dtype=torch.uint8)
+            else:
+                state_serialized = io.BytesIO()
+                torch.save(state, state_serialized)
             return state_serialized
 
         def _decode_extra_state(self, state):
@@ -1169,19 +1209,33 @@ if is_te_min_version("1.9.0.dev0"):
             extra_fp8_variables = state['extra_fp8_variables']
             extra_fp8_variables['num_gemms'] = 1
             for gemm_idx in range(self.num_gemms):
-                tmp_state = {
-                    "scale_fwd": state['scale_fwd'].view(3, -1)[:, gemm_idx],
-                    "scale_inv_fwd": state['scale_inv_fwd'].view(3, -1)[:, gemm_idx],
-                    "amax_history_fwd": state['amax_history_fwd'].view(
-                        self.fp8_meta["recipe"].amax_history_len, 3, -1
-                    )[:, :, gemm_idx],
-                    "scale_bwd": state['scale_bwd'].view(2, -1)[:, gemm_idx],
-                    "scale_inv_bwd": state['scale_inv_bwd'].view(2, -1)[:, gemm_idx],
-                    "amax_history_bwd": state['amax_history_bwd'].view(
-                        self.fp8_meta["recipe"].amax_history_len, 2, -1
-                    )[:, :, gemm_idx],
-                    "extra_fp8_variables": extra_fp8_variables,
-                }
+                tmp_state = {"extra_fp8_variables": extra_fp8_variables}
+                # TE 2.0 adds recipe in extra_state
+                if is_te_min_version("2.0.0"):
+                    tmp_state['recipe'] = state['recipe']
+                # Only delayed scaling has global fp8 meta tensors. We're not using
+                # self.fp8_meta["recipe"].delayed() because it's available in TE 2.0 and later.
+                if isinstance(self.fp8_meta["recipe"], te.common.recipe.DelayedScaling):
+                    tmp_state.update(
+                        {
+                            "scale_fwd": state['scale_fwd'].view(3, -1)[:, gemm_idx],
+                            "amax_history_fwd": state['amax_history_fwd'].view(
+                                self.fp8_meta["recipe"].amax_history_len, 3, -1
+                            )[:, :, gemm_idx],
+                            "scale_bwd": state['scale_bwd'].view(2, -1)[:, gemm_idx],
+                            "amax_history_bwd": state['amax_history_bwd'].view(
+                                self.fp8_meta["recipe"].amax_history_len, 2, -1
+                            )[:, :, gemm_idx],
+                        }
+                    )
+                    # TE 2.0 removes scale_inv_fwd and scale_inv_bwd
+                    if not is_te_min_version("2.0.0"):
+                        tmp_state.update(
+                            {
+                                "scale_inv_fwd": state['scale_inv_fwd'].view(3, -1)[:, gemm_idx],
+                                "scale_inv_bwd": state['scale_inv_bwd'].view(2, -1)[:, gemm_idx],
+                            }
+                        )
                 extra_states.append(self._encode_extra_state(tmp_state))
             return extra_states
 
@@ -1231,7 +1285,11 @@ if is_te_min_version("1.9.0.dev0"):
                 assert (
                     len(replica_id) == 3
                 ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
-                sh_ten.replica_id = (*replica_id[:2], get_expert_data_parallel_rank())
+                if getattr(sh_ten, "is_data_parallel_fully_shard", False):
+                    edp_replica_id = 0
+                else:
+                    edp_replica_id = get_expert_data_parallel_rank()
+                sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
@@ -1251,7 +1309,7 @@ if is_te_min_version("1.9.0.dev0"):
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
 
             super().__init__(
@@ -1296,7 +1354,7 @@ if is_te_min_version("1.9.0.dev0"):
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
 
             super().__init__(
@@ -1324,9 +1382,9 @@ if is_te_min_version("1.9.0.dev0"):
 
 else:
 
-    TEGroupedLinear = None
-    TEColumnParallelGroupedLinear = None
-    TERowParallelGroupedLinear = None
+    TEGroupedLinear = None  # type: ignore[assignment, misc]
+    TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
+    TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
@@ -1363,12 +1421,13 @@ class TECudaRNGStatesTracker(te.pytorch.distributed.CudaRNGStatesTracker):
     """Wraps TransformerEngine's CudaRNGStatesTracker so that it is
     interchangeable with Megatron's RNG tracker"""
 
-    def __init__(self):
+    def __init__(self, is_inference_rng_tracker=False):
         super().__init__()
         self.reset()
+        self.is_inference_rng_tracker = is_inference_rng_tracker
 
     def is_initialized(self):
-        """Checks if the internal RNG state has been set wirth set_states()."""
+        """Checks if the internal RNG state has been set with set_states()."""
         return self._is_initialized
 
     def reset(self):
@@ -1460,7 +1519,7 @@ try:
 
 except ImportError:
 
-    get_cpu_offload_context = None
+    get_cpu_offload_context = None  # type: ignore[assignment, misc]
 
 try:
 
@@ -1486,7 +1545,7 @@ try:
         """
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
-        if is_te_min_version("1.11.0", check_equality=False):
+        if is_te_min_version("1.12.0", check_equality=True):
             return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens, cp_size, cp_rank)
         else:
             return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens)
@@ -1503,3 +1562,35 @@ except ImportError:
 
     Fp8Padding = None
     Fp8Unpadding = None
+
+try:
+
+    from transformer_engine.pytorch.permutation import (
+        moe_permute,
+        moe_sort_chunks_by_index,
+        moe_unpermute,
+    )
+
+    fused_permute = moe_permute
+    fused_unpermute = moe_unpermute
+    fused_sort_chunks_by_index = moe_sort_chunks_by_index
+
+except ImportError:
+
+    fused_permute = None
+    fused_unpermute = None
+    fused_sort_chunks_by_index = None
+
+try:
+
+    from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
+
+    def te_parallel_cross_entropy(
+        logits: torch.Tensor, labels: torch.Tensor, tp_group: torch.distributed.ProcessGroup
+    ):
+        """Wrapper function for TE's Cross Entropy Loss kernel"""
+        return parallel_cross_entropy(logits, labels, 0.0, False, tp_group)
+
+except ImportError:
+
+    te_parallel_cross_entropy = None

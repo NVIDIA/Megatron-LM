@@ -59,7 +59,7 @@ def validate_yaml(args, defaults={}):
         (args.world_size // args.model_parallel.tensor_model_parallel_size))
     args.model_parallel.transformer_pipeline_model_parallel_size = (
         args.model_parallel.pipeline_model_parallel_size - 1
-        if args.standalone_embedding_stage else
+        if args.account_for_embedding_in_pipeline_split else
         args.model_parallel.pipeline_model_parallel_size
     )
     # Checks.

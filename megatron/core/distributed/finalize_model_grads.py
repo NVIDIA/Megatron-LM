@@ -13,8 +13,17 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from .. import parallel_state
+from ..transformer.moe.moe_utils import get_updated_expert_bias
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import get_attr_wrapped_model, get_model_config
+
+
+def _get_main_grad_attr(param: torch.nn.Parameter, use_custom_fsdp: bool = False):
+    if use_custom_fsdp:
+        return "fsdp_managed_main_grad"
+    if hasattr(param, "main_grad"):
+        return "main_grad"
+    return "grad"
 
 
 def _unshard_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
@@ -126,10 +135,16 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
-        if model_module.share_embeddings_and_output_weights:
+
+        # If share_embeddings_and_output_weights is True, we need to maintain duplicated
+        # embedding weights in post processing stage. If use Multi-Token Prediction (MTP),
+        # we also need to maintain duplicated embedding weights in mtp process stage.
+        # So we need to allreduce grads of embedding in the embedding group in these cases.
+        if model_module.share_embeddings_and_output_weights or getattr(config, 'mtp_num_layers', 0):
             weight = model_module.shared_embedding_or_output_weight()
-            grad_attr = "main_grad" if hasattr(weight, "main_grad") else "grad"
+            grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
             orig_grad = getattr(weight, grad_attr)
             grad = _unshard_if_dtensor(orig_grad)
             torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
@@ -152,10 +167,11 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
         assert hasattr(model_module, 'position_embeddings')
         weight = model_module.position_embeddings.weight
-        grad_attr = "main_grad" if hasattr(weight, "main_grad") else "grad"
+        grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
         orig_grad = getattr(weight, grad_attr)
         grad = _unshard_if_dtensor(orig_grad)
         torch.distributed.all_reduce(grad, group=parallel_state.get_position_embedding_group())
@@ -184,14 +200,13 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
         grads = []
         for model_chunk in model:
             for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
-                if (
-                    param.requires_grad
-                    and getattr(param, 'sequence_parallel', False)
+                if param.requires_grad and (
+                    getattr(param, 'sequence_parallel', False)
                     or 'q_layernorm' in name
                     or 'k_layernorm' in name
                 ):
                     params.append(param)
-                    grad_attr = "main_grad" if hasattr(param, "main_grad") else "grad"
+                    grad_attr = _get_main_grad_attr(param, config.use_custom_fsdp)
                     grad = getattr(param, grad_attr)
                     grad = _unshard_if_dtensor(grad)
                     grads.append(grad.data)
@@ -204,9 +219,37 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
                 buf.copy_(synced)
-                grad_attr = "main_grad" if hasattr(param, "main_grad") else "grad"
+                grad_attr = _get_main_grad_attr(param, config.use_custom_fsdp)
                 orig_grad = getattr(param, grad_attr)
                 setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+
+
+def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+    """
+    Update the expert bias of the router for a global batch.
+    This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
+    """
+    tokens_per_expert_list = []
+    expert_bias_list = []
+    for model_chunk in model:
+        for module in get_attr_wrapped_model(model_chunk, 'modules')():
+            if hasattr(module, 'expert_bias'):
+                tokens_per_expert_list.append(module.local_tokens_per_expert)
+                expert_bias_list.append(module.expert_bias)
+    # For hybrid models with both MoE and Dense layers, this list can be empty.
+    if len(expert_bias_list) == 0:
+        return
+    stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
+    stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
+    stacked_updated_expert_bias = get_updated_expert_bias(
+        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+    )
+
+    for tokens_per_expert, expert_bias, updated_expert_bias in zip(
+        tokens_per_expert_list, expert_bias_list, stacked_updated_expert_bias
+    ):
+        tokens_per_expert.zero_()
+        expert_bias.copy_(updated_expert_bias)
 
 
 def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torch.Tensor] = None):
@@ -252,6 +295,9 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
+
+    if config.moe_router_enable_expert_bias:
+        _update_router_expert_bias(model, config)
 
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number

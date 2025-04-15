@@ -139,10 +139,10 @@ def read_tb_logs_as_list(
     for ea in accumulators:
         for scalar_name in ea.Tags()["scalars"]:
             if scalar_name in summaries:
-                summaries[scalar_name] = dict(
-                    **summaries[scalar_name],
-                    **{x.step: round(x.value, 5) for x in ea.Scalars(scalar_name)},
-                )
+                for x in ea.Scalars(scalar_name):
+                    if x.step not in summaries[scalar_name]:
+                        summaries[scalar_name][x.step] = round(x.value, 5)
+
             else:
                 summaries[scalar_name] = {
                     x.step: round(x.value, 5) for x in ea.Scalars(scalar_name)
@@ -165,11 +165,6 @@ def read_tb_logs_as_list(
             step_interval=step_size,
             values=values,
         )
-
-    # for metric_name, golden_value in golden_values.items():
-    #     logger.info(
-    #         f"Extracted {golden_value.end_step} values of {metric_name} from Tensorboard logs. Here are the sampled values: {golden_value.values}"
-    #     )
 
     return golden_values
 

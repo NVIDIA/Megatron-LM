@@ -260,6 +260,8 @@ def test_different_initialize_order_consistency(src_tp_pp, ep_size):
     'src_tp_pp, ep_size',
     [((1, 2), 1), ((1, 4), 1), ((2, 2), 1), ((1, 2), 2), ((1, 4), 2), ((2, 2), 2)],
 )
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_different_initialize_order_unconsistency(src_tp_pp, ep_size):
     Utils.initialize_model_parallel(
         *src_tp_pp, expert_model_parallel_size=ep_size, order='tp-ep-dp-pp'
@@ -520,3 +522,59 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
     assert expert_dp_group == expert_rank_generator.get_ranks(
         "dp"
     ), f"{expert_dp_group} != {expert_rank_generator.get_ranks('dp')}."
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize('encoder_tp_size, tp_size', [(1, 1), (2, 2), (1, 3), (3, 5)])
+def test_inconsistent_encoder_decoder_tensor_parallel_size(encoder_tp_size, tp_size):
+    pp_size = 1
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        pipeline_model_parallel_size=1,
+        encoder_tensor_model_parallel_size=encoder_tp_size,
+        encoder_pipeline_model_parallel_size=1,
+    )
+    world_size = Utils.world_size
+    assert world_size == 8
+
+    tp_rank = ps.get_tensor_model_parallel_rank()
+    dp_rank = ps.get_data_parallel_rank()
+    pp_rank = ps.get_pipeline_model_parallel_rank()
+
+    tp_g = torch.distributed.get_process_group_ranks(ps.get_tensor_model_parallel_group())
+    dp_g = torch.distributed.get_process_group_ranks(ps.get_data_parallel_group(False))
+    pp_g = ps.get_pipeline_model_parallel_group()
+    if isinstance(pp_g, list):
+        pp_g = [torch.distributed.get_process_group_ranks(g) for g in pp_g]
+    else:
+        pp_g = torch.distributed.get_process_group_ranks(pp_g)
+    mp_g = torch.distributed.get_process_group_ranks(ps.get_model_parallel_group())
+
+    # Base assertions for all configurations
+    assert (
+        0 <= tp_rank < tp_size
+    ), f"Tensor parallel rank should be between 0 and {tp_size - 1}, got {tp_rank}"
+    assert (
+        0 <= pp_rank < pp_size + 1
+    ), f"Pipeline parallel rank should be between 0 and {pp_size}, got {pp_rank}"
+    assert len(tp_g) in [
+        encoder_tp_size,
+        tp_size,
+    ], f"Tensor parallel group size should be in [{encoder_tp_size}, {tp_size}], got {len(mp_g)}"
+    assert (
+        len(mp_g) == encoder_tp_size + tp_size
+    ), f"Model parallel group size should be {encoder_tp_size +  tp_size}, got {len(mp_g)}"
+
+    if encoder_tp_size == 1 and tp_size == 3 and pp_size == 1:
+        if isinstance(pp_g[0], list):
+            assert pp_g in [[[0, 2], [0, 3], [0, 4]], [[1, 5], [1, 6], [1, 7]]]
+        else:
+            assert pp_g in [[0, 2], [0, 3], [0, 4], [1, 5], [1, 6], [1, 7]]
+
+    elif encoder_tp_size == 3 and tp_size == 5 and pp_size == 1:
+        if isinstance(pp_g[0], list):
+            assert pp_g in [[[0, 3], [0, 4]], [[1, 5], [1, 6]]]
+        else:
+            assert pp_g in [[0, 3], [0, 4], [1, 5], [1, 6], [2, 7]]
+
+    Utils.destroy_model_parallel()

@@ -3,3 +3,4 @@ directory = coverage
 
 [run]
 data_file = .coverage_$LOCAL_RANK
+relative_files = true

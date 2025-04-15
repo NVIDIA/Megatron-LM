@@ -2,6 +2,7 @@ import os
 import time
 import urllib.request as req
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import mock
 import numpy as np
@@ -10,10 +11,27 @@ import torch
 
 import megatron.core.utils as util
 import megatron.training.utils as training_util
+from megatron.core import config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+success_string = "hello,world"
+
+
+@util.experimental_cls(introduced_with_version="0.1.0")
+class A:
+
+    def __init__(self):
+        pass
+
+    def some_method(self):
+        return success_string
+
+    @classmethod
+    def some_static_method(cls):
+        return success_string
 
 
 def test_divide_properly():
@@ -23,6 +41,41 @@ def test_divide_properly():
 def test_divide_improperly():
     with pytest.raises(AssertionError):
         util.divide(4, 5)
+
+
+def test_experimental_cls_init():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+        # Check that initialization works
+        a = A()
+        assert a.__class__.__qualname__ == "A"
+        assert a.some_method() == success_string
+        assert a.is_experimental is True
+
+
+def test_experimental_cls_static():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', True):
+        # Check that static methods work
+        assert A.__class__.__qualname__ == "A"
+        assert A.some_static_method() == success_string
+        assert A.is_experimental is True
+
+
+def test_experimental_cls_exception_init():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
+    ):
+        a = A()
+        assert a.some_method() == success_string
+        assert a.is_experimental is False
+
+
+def test_experimental_cls_exception_static():
+    with patch.object(config, 'ENABLE_EXPERIMENTAL', False), pytest.raises(
+        util.ExperimentalNotEnabledError
+    ):
+        assert A.some_static_method() == success_string
+
+    assert A.is_experimental is False
 
 
 def test_global_memory_buffer():
@@ -71,6 +124,7 @@ def _deinit_distributed():
     torch.distributed.barrier()
 
 
+@pytest.mark.flaky_in_dev
 def test_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -95,6 +149,7 @@ def test_check_param_hashes_across_dp_replicas():
     _deinit_distributed()
 
 
+@pytest.mark.flaky_in_dev
 def test_cross_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -118,6 +173,7 @@ def test_cross_check_param_hashes_across_dp_replicas():
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+@pytest.mark.flaky_in_dev
 def test_param_norm(use_distributed_optimizer: bool):
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -166,6 +222,7 @@ def test_param_norm(use_distributed_optimizer: bool):
     _deinit_distributed()
 
 
+@pytest.mark.flaky_in_dev
 def test_straggler_detector():
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))

@@ -9,9 +9,23 @@ FROM $FROM_IMAGE_NAME as build_grouped_gemm
 WORKDIR /opt
 RUN pip3 wheel -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2
 
+FROM ${FROM_IMAGE_NAME} as build_experimental_flash_attention
+WORKDIR /opt
+ARG EXPERIMENTAL_FLASH_ATTN_VERSION=c0f04c0b6c747914d95205867d86dd19c027d01d
+RUN --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN \
+    EXPERIMENTAL_FLASH_ATTN=$(cat /run/secrets/EXPERIMENTAL_FLASH_ATTN) && \
+    pip uninstall -y ninja && \
+    pip install --no-cache-dir ninja && \
+    MAX_JOBS=4 pip wheel --no-cache-dir -v $EXPERIMENTAL_FLASH_ATTN@${EXPERIMENTAL_FLASH_ATTN_VERSION} && \
+    ls -al
+
 FROM $FROM_IMAGE_NAME as build_mamba_ssm
 WORKDIR /opt
-RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.2.0
+RUN git clone https://github.com/state-spaces/mamba.git && \
+    cd mamba && \
+    git checkout v2.2.0 && \
+    sed -i "/triton/d" setup.py && \
+    MAMBA_FORCE_BUILD=TRUE pip3 wheel -v .
 
 FROM $FROM_IMAGE_NAME as main
 ENV DEBIAN_FRONTEND=noninteractive
@@ -25,7 +39,7 @@ RUN apt-get update && \
 
 COPY --from=build_causal_conv1d /opt/causal_conv1d-*.whl ./
 COPY --from=build_grouped_gemm /opt/grouped_gemm-*.whl ./
-COPY --from=build_mamba_ssm /opt/mamba_ssm-*.whl ./
+COPY --from=build_mamba_ssm /opt/mamba/mamba_ssm-*.whl ./
 
 RUN \
     --mount=type=bind,source=requirements,target=requirements \
@@ -34,10 +48,12 @@ RUN \
     --mount=type=bind,source=megatron/core/package_info.py,target=megatron/core/package_info.py \
     --mount=type=bind,source=megatron/core/README.md,target=megatron/core/README.md \
     --mount=type=bind,source=megatron/core/requirements.txt,target=megatron/core/requirements.txt \
+    --mount=type=bind,source=requirements_mlm.txt,target=requirements_mlm.txt \
+    --mount=type=bind,source=requirements_ci.txt,target=requirements_ci.txt \
     --mount=type=bind,source=megatron/core/__init__.py,target=megatron/core/__init__.py <<"EOF" bash -ex
-
-pip install causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl
-PY_ENV=pytorch_24.10 pip install .
+pip install -U pip
+pip install --no-cache-dir causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl
+PY_ENV=pytorch_24.10 pip install --no-cache-dir . -r requirements_mlm.txt -r requirements_ci.txt
 EOF
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
@@ -64,14 +80,28 @@ git checkout $MCORE_BACKWARDS_REF
 rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
 EOF
 
-RUN PY_ENV=pytorch_24.10 pip install -e /opt/megatron-lm
+RUN <<"EOF" bash -ex
+pip install -U pip
+PY_ENV=pytorch_24.10 pip install --no-cache-dir -e /opt/megatron-lm
+EOF
+
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 
 ##### For NVIDIANS only #####
 FROM main as jet
 ARG CACHEBUST=0
+# COPY --from=build_experimental_flash_attention /opt/*.whl ./experimental_flash_attention/
+ARG EXPERIMENTAL_FLASH_ATTN_VERSION=c0f04c0b6c747914d95205867d86dd19c027d01d
+COPY --from=build_experimental_flash_attention /opt/*.whl ./experimental_flash_attention/
 RUN --mount=type=secret,id=JET_INDEX_URLS \
+    --mount=type=secret,id=LOGGER_INDEX_URL \
+    --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN \
+    LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL) && \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install "jet-client~=2.0" jet-api --upgrade $JET_INDEX_URLS
+    EXPERIMENTAL_FLASH_ATTN=$(cat /run/secrets/EXPERIMENTAL_FLASH_ATTN) && \
+    pip install --no-cache-dir "jet-client~=2.0" jet-api --upgrade $JET_INDEX_URLS  && \
+    pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL && \
+    pip install --no-cache-dir --no-build-isolation ./experimental_flash_attention/*flash_attn*.whl
+
 ENV PATH="$PATH:/opt/jet/bin"
 ###

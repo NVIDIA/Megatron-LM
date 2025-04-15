@@ -1,0 +1,92 @@
+.build_image:
+  extends: [.test_rules, .dind_rules]
+  stage: build
+  tags:
+    - arch/amd64
+    - origin/jet-fleet
+    - env/prod
+    - ${TAG}
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  timeout: 45m
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    TAG: purpose/builder-large
+    STAGE: jet
+    MCORE_BACKWARDS_REF: core_r0.11.0
+  script:
+    - env
+    - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
+    - env
+    - apk add bash
+    - |
+      bash -c '
+        set -x
+        env
+        eval "IMAGE=\$$IMAGE"
+        
+        docker context create tls-environment
+        docker buildx create --name container --driver=docker-container --use tls-environment
+
+        ADDITIONAL_PARAMS=()
+
+        if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH" == "main" ]]; then
+          ADDITIONAL_PARAMS+=("--pull")
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main,mode=max")
+        else
+          ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-$CI_COMMIT_REF_SLUG},mode=max")
+        fi
+
+        if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
+          ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
+        fi
+
+        echo $(git rev-parse HEAD)
+
+        DOCKER_BUILDKIT=1 docker build \
+          --secret id=JET_INDEX_URLS \
+          --secret id=LOGGER_INDEX_URL \
+          --secret id=EXPERIMENTAL_FLASH_ATTN \
+          --target $STAGE \
+          -f $FILE \
+          -t ${IMAGE}:${CI_PIPELINE_ID} \
+          --builder=container \
+          --build-arg CACHEBUST=$(cat /proc/sys/kernel/random/uuid) \
+          --build-arg MCORE_REPO=${CI_REPOSITORY_URL} \
+          --build-arg MCORE_REF=$CI_COMMIT_SHA \
+          --build-arg MCORE_BACKWARDS_REF=$MCORE_BACKWARDS_REF \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID} \
+          --cache-from type=registry,ref=${IMAGE}-buildcache:main \
+          --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+          --push \
+          --progress plain \
+          ${ADDITIONAL_PARAMS[@]} .
+        '
+  retry:
+    max: 2
+
+test:build_image:
+  extends: [.build_image]
+  parallel:
+    matrix:
+      - IMAGE: CI_MCORE_LTS_IMAGE
+        FILE: Dockerfile.ci.lts
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+      - IMAGE: CI_MCORE_DEV_IMAGE
+        FILE: Dockerfile.ci.dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.10-py3
+      - IMAGE: UTILITY_IMAGE
+        FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
+
+test:build_nemo_image:
+  extends: [.build_image]
+  variables:
+    IMAGE: CI_NEMO_IMAGE
+    FILE: Dockerfile.ci.dev
+    BASE_IMAGE: nvcr.io/nvidian/nemo:nightly

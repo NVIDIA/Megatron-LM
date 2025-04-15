@@ -1,7 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import warnings
-from typing import Optional
+from typing import Optional, Union
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
@@ -14,6 +14,12 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
     MLASelfAttentionSubmodules,
+)
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlockSubmodules,
+    get_mtp_layer_offset,
+    get_mtp_layer_spec,
+    get_mtp_num_layers_to_build,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import (
@@ -33,7 +39,6 @@ try:
         TEColumnParallelLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
-        TELinear,
         TENorm,
         TERowParallelLinear,
         TESequentialSwigluLinear,
@@ -44,6 +49,8 @@ try:
 except ImportError:
     HAVE_TE = False
 
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
 try:
     import apex  # pylint: disable=unused-import
 
@@ -52,6 +59,8 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
+    import warnings
+
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     warnings.warn('Apex is not installed. Falling back to Torch Norm')
@@ -103,13 +112,13 @@ def get_gpt_layer_with_transformer_engine_spec(
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
-                        linear_q_down_proj=TELinear,
+                        linear_q_down_proj=TEColumnParallelLinear,
                         linear_q_up_proj=(
                             TELayerNormColumnParallelLinear
                             if qk_layernorm
                             else TEColumnParallelLinear
                         ),
-                        linear_kv_down_proj=TELinear,
+                        linear_kv_down_proj=TEColumnParallelLinear,
                         linear_kv_up_proj=(
                             TELayerNormColumnParallelLinear
                             if qk_layernorm
@@ -168,6 +177,7 @@ def get_gpt_layer_local_spec(
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    normalization: Optional[str] = None,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -183,6 +193,12 @@ def get_gpt_layer_local_spec(
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
     """
+
+    # Adjust for RMS norm.
+    if normalization == "RMSNorm":
+        global LNImpl
+        LNImpl = WrappedTorchNorm
+
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
@@ -307,7 +323,7 @@ def get_mlp_module_spec(
 
 
 def get_gpt_decoder_block_spec(
-    config: TransformerConfig, use_transformer_engine: bool
+    config: TransformerConfig, use_transformer_engine: bool, normalization: Optional[str] = None
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -331,6 +347,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            normalization=normalization,
         )
     )
     moe_layer_spec = (
@@ -348,6 +365,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            normalization=normalization,
         )
     )
 
@@ -391,3 +409,41 @@ def get_gpt_decoder_block_spec(
     block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)
 
     return block_spec
+
+
+def get_gpt_mtp_block_spec(
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    use_transformer_engine: bool,
+) -> MultiTokenPredictionBlockSubmodules:
+    """GPT Multi-Token Prediction (MTP) block spec."""
+    num_layers_to_build = get_mtp_num_layers_to_build(config)
+    if num_layers_to_build == 0:
+        return None
+
+    if isinstance(spec, TransformerBlockSubmodules):
+        # get the spec for the last layer of decoder block
+        transformer_layer_spec = spec.layer_specs[-1]
+    elif isinstance(spec, ModuleSpec) and spec.module == TransformerLayer:
+        transformer_layer_spec = spec
+    else:
+        raise ValueError(f"Invalid spec: {spec}")
+
+    mtp_layer_spec = get_mtp_layer_spec(
+        transformer_layer_spec=transformer_layer_spec, use_transformer_engine=use_transformer_engine
+    )
+    mtp_num_layers = config.mtp_num_layers if config.mtp_num_layers else 0
+    mtp_layer_specs = [mtp_layer_spec] * mtp_num_layers
+
+    offset = get_mtp_layer_offset(config)
+    # split the mtp layer specs to only include the layers that are built in this pipeline stage.
+    mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
+    if len(mtp_layer_specs) > 0:
+        assert (
+            len(mtp_layer_specs) == config.mtp_num_layers
+        ), +f"currently all of the mtp layers must stage in the same pipeline stage."
+        mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
+    else:
+        mtp_block_spec = None
+
+    return mtp_block_spec
