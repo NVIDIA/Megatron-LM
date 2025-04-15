@@ -146,7 +146,7 @@ class FusedCombine(torch.autograd.Function):
         )
         ctx.handle = handle
         ctx.group = group
-
+        torch.cuda.Stream.synchronize(torch.cuda.current_stream())
         return combined_x, event
 
     @staticmethod
@@ -160,6 +160,7 @@ class FusedCombine(torch.autograd.Function):
             async_finish=False,
             allocate_on_comm_stream=False,
         )
+        torch.cuda.Stream.synchronize(torch.cuda.current_stream())
         return grad_x, None, None, None
 
 

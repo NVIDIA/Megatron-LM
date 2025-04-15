@@ -736,8 +736,10 @@ def build_model_chunk_schedule_plan(
     Returns:
         The model chunk schedule plan.
     """
-    comp_stream = get_comp_stream()
-    com_stream = get_com_stream()
+    com_stream = get_comp_stream()
+    comp_stream = get_com_stream()
+    # comp_stream = get_comp_stream()
+    # com_stream = get_com_stream()
     model_chunk_schedule_plan = ModelChunkSchedulePlan()
     event = model_chunk_schedule_plan.event
     state = model_chunk_schedule_plan.state
