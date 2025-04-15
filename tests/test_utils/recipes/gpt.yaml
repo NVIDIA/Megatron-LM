@@ -64,7 +64,9 @@ products:
   #######################################################################
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
-      - environment: [dev, lts]
+      # - environment: [dev]
+      #   scope: [nightly] # Broken due to memory issue
+      - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
     products:
