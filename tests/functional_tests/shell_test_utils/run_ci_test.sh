@@ -33,7 +33,15 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
-TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "release")
+RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
+
+TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "release")
+
+if [[ "$TEST_TYPE" == "release" ]]; then
+    export ONE_LOGGER_JOB_CATEGORY=production
+else
+    export ONE_LOGGER_JOB_CATEGORY=test
+fi
 
 mkdir -p $CHECKPOINT_SAVE_PATH
 mkdir -p $CHECKPOINT_LOAD_PATH
@@ -42,6 +50,21 @@ _CHECKPOINT_SAVE_PATH=$CHECKPOINT_SAVE_PATH
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 ROOT_DIR=$(realpath $SCRIPT_DIR/../../../)
+
+IS_NEMO_TEST=$([[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') == *nemo* ]] && echo "true" || echo "false")
+export IS_NEMO_TEST
+
+# Adjust model_config for lightweight mode
+if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "true" ]]; then
+    yq -i '.MODEL_ARGS."trainer.max_steps" = 2' $TRAINING_PARAMS_PATH
+    N_REPEAT=1
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+
+    yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
+    yq -i '.MODEL_ARGS."--train-iters" = 2' $TRAINING_PARAMS_PATH
+    yq -i '.MODEL_ARGS."--save-interval" = 1' $TRAINING_PARAMS_PATH
+    N_REPEAT=1
+fi
 
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
@@ -64,7 +87,17 @@ for i in $(seq 1 $N_REPEAT); do
     export RUN_NUMBER=1
     export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
-    export CHECKPOINT_LOAD_PATH=/tmp/checkpoints/
+
+    if [[ "$TEST_TYPE" = "frozen-start" ]]; then
+        export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
+    else
+        export CHECKPOINT_LOAD_PATH=/tmp/checkpoints/
+    fi
+
+    if [[ "$TEST_TYPE" = "release" ]]; then
+        export CHECKPOINT_LOAD_PATH=$_CHECKPOINT_LOAD_PATH
+        export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
+    fi
 
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
@@ -101,22 +134,32 @@ for i in $(seq 1 $N_REPEAT); do
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi
 
-    # Save run results
-    export PYTHONPATH=$ROOT_DIR
     if [[ "$TEST_TYPE" == "release" ]]; then
-        EXTRACT_ARGS=("--is-convergence-test")
-    else
-        EXTRACT_ARGS=("--is-normal-test")
+        SKIP_PYTEST=0
+        TRAIN_ITERS=10000000
     fi
 
-    python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-        --logs-dir $TENSORBOARD_PATH \
-        --train-iters $TRAIN_ITERS \
-        --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
-        "${EXTRACT_ARGS[@]}"
+    if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
+        echo "Skipping Pytest during checkpoint recording."
+        SKIP_PYTEST=1
+    fi
 
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
+        # Save run results
+        export PYTHONPATH=$ROOT_DIR
+        if [[ "$TEST_TYPE" == "release" ]]; then
+            EXTRACT_ARGS=("--is-convergence-test")
+        else
+            EXTRACT_ARGS=("--is-normal-test")
+        fi
+
+        python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+            --logs-dir $TENSORBOARD_PATH \
+            --train-iters $TRAIN_ITERS \
+            --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+            "${EXTRACT_ARGS[@]}"
+
         export NVTE_ALLOW_NONDETERMINISTIC_ALGO
         if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" ]]; then
             ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"

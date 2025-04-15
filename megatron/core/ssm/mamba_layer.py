@@ -13,10 +13,13 @@ from torch import Tensor
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecate_inference_params
 
 
 @dataclass
@@ -55,12 +58,15 @@ class MambaLayer(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MambaLayerSubmodules,
-        mamba_ssm_ngroups=8,
         layer_number: int = 1,
         residual_in_fp32=False,
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)
+
+        if config.enable_cuda_graph:
+            self.cudagraph_manager = CudaGraphManager(config)
+
         self.config = config
         self.submodules_config = submodules
         self.layer_number = layer_number
@@ -70,7 +76,6 @@ class MambaLayer(MegatronModule):
             submodules.mixer,
             self.config,
             d_model=self.config.hidden_size,
-            ngroups=mamba_ssm_ngroups,
             layer_number=layer_number,
         )
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
@@ -81,8 +86,10 @@ class MambaLayer(MegatronModule):
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,  # Not used in MambaLayer
-        inference_params=None,
-        rotary_pos_emb: Tensor = None,  # Not used in MambaLayer
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Tensor] = None,  # Not used in MambaLayer
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ):
         """
         Perform a forward pass through the Mamba layer.
@@ -94,12 +101,15 @@ class MambaLayer(MegatronModule):
             hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
                 b is batch size, and h is hidden size.
             attention_mask (Tensor): Mask tensor for self-attention. Not used by this layer.
-            inference_params (object, optional): Parameters for inference-time optimizations.
+            inference_context (BaseInferenceContext, optional): Parameters for inference-time
+                optimizations.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         residual = hidden_states
         if self.residual_in_fp32:
@@ -108,18 +118,32 @@ class MambaLayer(MegatronModule):
         hidden_states = hidden_states.to(dtype=self.config.params_dtype)
         hidden_states = self.norm(hidden_states)
 
-        mixer_out_with_bias = self.mixer(hidden_states, inference_params=inference_params)
+        mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
 
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(self.training, self.config.bias_dropout_fusion)(
-                mixer_out_with_bias, residual, self.hidden_dropout
-            )
+            hidden_states = self.mamba_bda(
+                training=self.training, fused=self.config.bias_dropout_fusion
+            )(mixer_out_with_bias, residual, self.hidden_dropout)
 
         return hidden_states
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """Allocate the inference cache."""
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
+
+    def __call__(self, *args, **kwargs):
+
+        # Training and validation mode CUDA graphs
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
+            return self.cudagraph_manager(self, args, kwargs)
+        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
+        elif not self.training and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs.get('attention_mask') is None
+            and kwargs['inference_context'].decode_mode
+        ):
+            return self.cudagraph_manager(self, args, kwargs)
+        return super(MegatronModule, self).__call__(*args, **kwargs)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

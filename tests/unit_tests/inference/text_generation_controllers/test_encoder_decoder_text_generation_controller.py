@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
@@ -92,7 +93,11 @@ class TestEncoderDecoderTextGenerationController:
             padded_vocab_size=self.vocab_size,
         )
 
-        inference_wrapped_model = T5InferenceWrapper(t5_model, inference_wrapper_config)
+        inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+
+        inference_wrapped_model = T5InferenceWrapper(
+            t5_model, inference_wrapper_config, inference_context
+        )
 
         self.mock_tokenizer = mock.Mock()
 
@@ -126,7 +131,7 @@ class TestEncoderDecoderTextGenerationController:
                 request_id=i,
                 prompt=prompt,
                 encoder_prompt=encoder_prompt,
-                inference_parameters=SamplingParams(num_tokens_to_generate=10),
+                sampling_params=SamplingParams(num_tokens_to_generate=10),
                 arrival_time=time.time(),
                 prompt_tokens=prompt_tokens,
                 status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,

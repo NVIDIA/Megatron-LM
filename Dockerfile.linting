@@ -17,6 +17,7 @@ RUN pip3 install --no-cache-dir \
       isort==5.13.2 \
       flake8==7.1.0 \
       pylint==3.2.6 \
+      coverage \
       mypy
 
 COPY . /opt/megatron-lm

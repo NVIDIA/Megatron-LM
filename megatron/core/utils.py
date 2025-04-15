@@ -2,6 +2,7 @@
 
 """Utility functions used throughout Megatron core"""
 import array
+import functools
 import hashlib
 import logging
 import math
@@ -12,18 +13,23 @@ import sys
 import threading
 import time
 import traceback
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
-from functools import reduce
+from functools import reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 from packaging.version import Version as PkgVersion
 
+from megatron.core import config
+from megatron.core.package_info import __version__ as mcore_version
+
 try:
     from torch.distributed._tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
 
     HAVE_DTENSOR = True
 except ImportError:
@@ -37,10 +43,185 @@ logger = logging.getLogger(__name__)
 
 try:
     _torch_version = PkgVersion(torch.__version__)
-except:
+except Exception:
     # This is a WAR for building docs, where torch is not actually imported
     _torch_version = PkgVersion("0.0.0")
 _te_version = None
+
+
+class ExperimentalNotEnabledError(Exception):
+    """Raised during calls to experimental code when ENABLE_EXPERIMENTAL not set."""
+
+
+def experimental_fn(introduced_with_version: str):
+    """A decorator that marks a function as experimental.
+    Experimental functions may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental functions have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental function
+            was called without enabling the experimental flag.
+    """
+
+    def validator(func: Callable, max_lifetime: int = 3) -> Callable:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            logger.warning(
+                "%s has reached end of life. Please migrate to a non-experimental function.",
+                func.__name__,
+            )
+
+        @wraps(func)
+        def wrapped_func(*args, **kwargs):
+
+            if config.ENABLE_EXPERIMENTAL is not True:
+                raise ExperimentalNotEnabledError(f"Flag {config.ENABLE_EXPERIMENTAL} not enabled.")
+
+            logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+
+            return func(*args, **kwargs)
+
+        return wrapped_func
+
+    return validator
+
+
+def experimental_cls(introduced_with_version: str):
+    """A decorator that marks a Class as experimental.
+    Experimental Classes may change quickly and do not guarantee backwards
+    compatiblity.
+
+    Experimental classes have a limited lifetime and should
+    either be productionized or deprecated.
+
+    Args:
+        introduced_with_version (str): A version-like string of Mcore at time of
+            introduction.
+
+    Raises:
+        ExperimentalNotEnabledError: Error raised when experimental class
+            was called without enabling the experimental flag.
+    """
+
+    def validator(cls: Callable, max_lifetime: int = 3) -> Callable:
+        """Validates the request to the experimental function.
+
+        Args:
+            func (Callable): Callee
+            max_lifetime (int, optional): Number of minor version that the experimental
+                function is allowed to exist. Defaults to 3.
+
+        Raises:
+            ExperimentalNotEnabledError: Error raised when experimental function
+                was called without enabling the experimental flag.
+
+        Returns:
+            Callable: The callee function.
+        """
+        if (
+            PkgVersion(introduced_with_version).minor + max_lifetime
+            < PkgVersion(mcore_version).minor
+        ):
+            logger.warning(
+                "%s has reached end of life. Please migrate to a non-experimental function.",
+                cls.__name__,
+            )
+
+        def wrapped_func(cls):
+
+            def guard(super: super, attr: str):
+                """Pass-through to callee attribute if experimental flag is enabled.
+
+                Args:
+                    super (super): Parent class of callee.
+                    attr (str): Attribute of callee that is being called.
+
+                Raises:
+                    ExperimentalNotEnabledError: Raised if flag is not set.
+
+                Returns:
+                    Attribute of callee.
+                """
+                if attr == "is_experimental":
+                    return config.ENABLE_EXPERIMENTAL
+
+                if config.ENABLE_EXPERIMENTAL is not True:
+                    raise ExperimentalNotEnabledError(
+                        f"Flag {config.ENABLE_EXPERIMENTAL} not enabled."
+                    )
+
+                logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
+                return super.__getattribute__(attr)
+
+            class ClassInterceptor(type):
+                """Metaclass to intercept calls from the uninitialized class."""
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.__class__ = type(cls.__qualname__, (ClassInterceptor,), {})
+
+                def __getattribute__(self, attr):
+                    """Intercepts calls like A.hello_world()"""
+                    return guard(super(), attr)
+
+            class Proxy(cls, metaclass=ClassInterceptor):
+                """Proxies calls from caller to the callee by relaying all
+                attribute calls through a guarding mechanism.
+
+                We use `__getattribute__` for relaying calls. Opposed to `__getattr__`,
+                this is called regardless of whether the attribute exists or not.
+
+                We need to distinguish two cases: callee is an instance vs. a class.
+
+                If callee is an instance, `__getattribute__` will look and find attributes
+                at the class level.
+
+                If callee is a class, `__getattribute__` will look for attributes at
+                _its_ class, which is `type`. Here, it won't find attributes.
+                We solve this a metaclass mixin which swaps `type` with a custom class
+                that supersets the callee's class. For mixins, any methods provided on
+                parent classes will be provided to the metaclass. We add a
+                `__getattribute__` to the metaclass as to allow it to fetch it from the
+                callees class.
+
+                """
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.__class__ = type(cls.__qualname__, (Proxy,), {})
+
+                def __getattribute__(self, attr):
+                    """Intercepts calls like a.hello_world()"""
+                    return guard(super(), attr)
+
+            return Proxy
+
+        return wrapped_func(cls)
+
+    return validator
 
 
 def get_torch_version():
@@ -117,6 +298,17 @@ def divide(numerator, denominator):
     the division value."""
     ensure_divisibility(numerator, denominator)
     return numerator // denominator
+
+
+def deprecate_inference_params(inference_context, inference_params):
+    """Print warning for deprecated `inference_params`."""
+    if inference_context is None and inference_params is not None:
+        warnings.warn(
+            "`inference_params` renamed to `inference_context`, and will be "
+            "removed in `megatron-core` 0.13."
+        )
+        return inference_params
+    return inference_context
 
 
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
@@ -277,21 +469,14 @@ def safely_set_viewless_tensor_data(tensor, new_data_tensor):
 
 def init_method_normal(sigma):
     """Init method based on N(0, sigma)."""
-
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=sigma)
-
-    return init_
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=sigma)
 
 
-def scaled_init_method_normal(sigma, num_layers):
+def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
     """Init method based on N(0, sigma/sqrt(2*num_layers)."""
-    std = sigma / math.sqrt(2.0 * num_layers)
+    std = sigma / math.sqrt(multiplier * num_layers)
 
-    def init_(tensor):
-        return torch.nn.init.normal_(tensor, mean=0.0, std=std)
-
-    return init_
+    return functools.partial(torch.nn.init.normal_, mean=0.0, std=std)
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
@@ -378,16 +563,13 @@ def check_param_hashes_across_dp_replicas(
     for params, local_param_hashes, all_gather_group in zip(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
-        [
-            parallel_state.get_data_parallel_group_gloo(),
-            parallel_state.get_expert_data_parallel_group_gloo(),
-        ],
+        [parallel_state.get_data_parallel_group(), parallel_state.get_expert_data_parallel_group()],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)
         if len(params) == 0:
             continue
-        local_param_hashes = torch.stack(local_param_hashes)
+        local_param_hashes = torch.stack(local_param_hashes).cuda()
         all_param_hashes = [
             torch.zeros_like(local_param_hashes)
             for _ in range(torch.distributed.get_world_size(all_gather_group))
@@ -451,6 +633,28 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
+    if hasattr(tensor, 'fully_shard_param_local_shard'):
+        assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
+        replica_id = (*replica_id[:2], 0)
+
+        sh_ten = ShardedTensor.from_rank_offsets_flat(
+            key,
+            tensor.fully_shard_param_local_shard,
+            tensor.shape,
+            *prepend_offsets,
+            (
+                tp_axis + prepend_axis_num,
+                parallel_state.get_tensor_model_parallel_rank(),
+                parallel_state.get_tensor_model_parallel_world_size(),
+            ),
+            flattened_range=slice(*tensor.fully_shard_param_local_index),
+            replica_id=replica_id,
+            prepend_axis_num=prepend_axis_num,
+            **kwargs,
+        )
+        setattr(sh_ten, 'is_data_parallel_fully_shard', True)
+        return sh_ten
+
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
@@ -478,11 +682,28 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     if HAVE_DTENSOR and isinstance(tensor, DTensor):
         # FSDP2 sharding
         dp_replica_id = 0
-        tensor = tensor._local_tensor
+        tensor = get_full_tensor_if_necessary(tensor)
         new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
     if replica_id is None:
         replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
+
+    if hasattr(tensor, 'fully_shard_param_local_shard'):
+        assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
+        replica_id = (*replica_id[:2], 0)
+
+        sh_ten = ShardedTensor.from_rank_offsets_flat(
+            key,
+            tensor.fully_shard_param_local_shard,
+            tensor.shape,
+            *prepend_offsets,
+            flattened_range=slice(*tensor.fully_shard_param_local_index),
+            replica_id=replica_id,
+            prepend_axis_num=prepend_axis_num,
+            **kwargs,
+        )
+        setattr(sh_ten, 'is_data_parallel_fully_shard', True)
+        return sh_ten
 
     return ShardedTensor.from_rank_offsets(
         key,
@@ -493,6 +714,22 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+
+
+def get_full_tensor_if_necessary(tensor):
+    """For DTensor gets full tensor if some ranks will not have a local copy"""
+    need_full_tensor = False
+    for i in range(tensor.device_mesh.ndim):
+        if (
+            isinstance(tensor.placements[i], Shard)
+            and tensor.device_mesh.shape[i] > tensor.shape[tensor.placements[i].dim]
+        ):
+            need_full_tensor = True
+            break
+
+    tensor = tensor.full_tensor() if need_full_tensor else tensor._local_tensor
+
+    return tensor
 
 
 def to_local_if_dtensor(tensor: Union[torch.Tensor, "DTensor"]) -> torch.Tensor:
@@ -519,6 +756,7 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
     # clones it if it's not contiguous:
     # https://github.com/pytorch/pytorch/blob/c47cf9bc7f9e02f649ab4ed53fe4d35732c92ab6/torch/_refs/__init__.py#L2761
     grad_output = grad_output.contiguous()
+    all_gathered_input = all_gathered_input.contiguous()
     # Convert the tensor shapes to 2D for execution compatibility
     if grad_output.dim() == 3:
         grad_output = grad_output.view(
@@ -1408,20 +1646,17 @@ __straggler__ = StragglerDetector()
 """
 
 
-# Check if Transformer Engine has Float8Tensor class
-HAVE_TE_FLOAT8TENSOR = False
-try:
-    from transformer_engine.pytorch.float8_tensor import Float8Tensor
-
-    HAVE_TE_FLOAT8TENSOR = True
-except (ImportError, ModuleNotFoundError):
-    # Float8Tensor not found
-    pass
-
-
-def is_float8tensor(tensor: torch.Tensor) -> bool:
-    """Check if a tensor is a Transformer Engine Float8Tensor"""
-    return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
+def is_submodule(module, parent_module, strict=True):
+    """
+    Check if a module is a submodule of another module.
+    """
+    if strict:
+        if module is parent_module:
+            return False
+    for m in parent_module.modules():
+        if m is module:
+            return True
+    return False
 
 
 ########################

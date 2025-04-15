@@ -1,17 +1,19 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Tuple, Union
-import inspect
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -22,11 +24,25 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import divide
+from megatron.core.utils import deprecate_inference_params, divide
 from megatron.core.metrics_tracking import get_tracker
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
+
+try:
+    from einops import rearrange
+except ImportError:
+    rearrange = None
+
+
+try:
+    from nvidia_chunked_flash_attn.flash_attn_interface import (
+        flash_attn_varlen_func as flash_decode_and_prefill_kernel,
+    )
+except ImportError:
+    flash_decode_and_prefill_kernel = None
+
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -105,6 +121,10 @@ class Attention(MegatronModule, ABC):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
+        # To support both CUDA Graphs and key value with different hidden size
+        self.key_hidden_size = self.hidden_size_per_attention_head
+        self.val_hidden_size = self.hidden_size_per_attention_head
+
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -171,112 +191,153 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
-    def _allocate_memory(self, inference_max_sequence_length, batch_size, dtype):
+    def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
 
         return torch.empty(
             inference_max_sequence_length,
             batch_size,
             self.num_query_groups_per_partition,
-            self.hidden_size_per_attention_head,
+            dim,
             dtype=dtype,
             device=torch.cuda.current_device(),
         )
 
     def _adjust_key_value_for_inference(
         self,
-        inference_params: InferenceParams,
+        inference_context: BaseInferenceContext,
         query: Tensor,
         key: Tensor,
         value: Tensor,
         rotary_pos_emb: Tensor,
-        rotary_pos_cos: Tensor = None,
-        rotary_pos_sin: Tensor = None,
-        sequence_len_offset=None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
-        Saves the generated key and value tensors to the end of the buffers in inference_params.
-        Returns the full size keys and values from the provided inference_params, as well as
+        Saves the generated key and value tensors to the end of the buffers in inference_context.
+        Returns the full size keys and values from the provided inference_context, as well as
         adjusted rotary_pos_emb.
 
-        Returns a tuple: (key, value, rotary_pos_emb)
+        Args:
+            query (Tensor): Query tensor.
+            key (Tensor): Key tensor.
+            value (Tensor): Value tensor.
+            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
+                embedding tensor(s).
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            sequence_len_offset (Optional[int]): Sequence length offset used for
+                inference CUDA graphs.
 
+        Return:
+            Tuple of: query, key, value, rotary_pos_emb, attn_mask_type.
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         attn_mask_type = self.attn_mask_type
-        if inference_params is None:
+        if inference_context is None:
             return query, key, value, rotary_pos_emb, attn_mask_type
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
         # =================================================
-        if self.layer_number not in inference_params.key_value_memory_dict:
-            inf_max_seq_length = inference_params.max_sequence_length
-            inf_max_batch_size = inference_params.max_batch_size
-            inference_key_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, key.dtype
-            )
-            inference_value_memory = self._allocate_memory(
-                inf_max_seq_length, inf_max_batch_size, value.dtype
-            )
-            inference_params.key_value_memory_dict[self.layer_number] = (
-                inference_key_memory,
-                inference_value_memory,
-            )
-        else:
-            # Get the pre-allocated buffers for this layer
-            inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
-                self.layer_number
-            ]
+        if inference_context.is_static_batching():
+            if self.layer_number not in inference_context.key_value_memory_dict:
+                inf_max_seq_length = inference_context.max_sequence_length
+                inf_max_batch_size = inference_context.max_batch_size
+                inference_key_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, self.key_hidden_size, key.dtype
+                )
+                inference_value_memory = self._allocate_memory(
+                    inf_max_seq_length, inf_max_batch_size, self.val_hidden_size, value.dtype
+                )
+                inference_context.key_value_memory_dict[self.layer_number] = (
+                    inference_key_memory,
+                    inference_value_memory,
+                )
+            else:
+                # Get the pre-allocated buffers for this layer
+                inference_key_memory, inference_value_memory = (
+                    inference_context.key_value_memory_dict[self.layer_number]
+                )
 
-        if inference_params.sequence_len_offset > 0:
+        if not inference_context.is_static_batching() or inference_context.sequence_len_offset > 0:
             # This should mean that we are past the prompt forward_step
             # and so we need to turn off masking
             attn_mask_type = AttnMaskType.no_mask
 
-        batch_start = inference_params.batch_size_offset
-        batch_end = batch_start + key.size(1)
-        assert batch_end <= inference_key_memory.size(1)
-        sequence_start = inference_params.sequence_len_offset
-        sequence_end = sequence_start + key.size(0)
-        assert sequence_end <= inference_key_memory.size(0)
+        if inference_context.is_static_batching():
+            batch_start = inference_context.batch_size_offset
+            batch_end = batch_start + key.size(1)
+            assert batch_end <= inference_key_memory.size(1)
+            sequence_start = inference_context.sequence_len_offset
+            sequence_end = sequence_start + key.size(0)
+            assert sequence_end <= inference_key_memory.size(0), (
+                "Current sequence length is longer than expected maximum sequence length! "
+                "Increase inference_max_seq_length."
+            )
 
         if self.config.flash_decode:
-            assert (
-                rotary_pos_cos is not None and rotary_pos_sin is not None
-            ), "Flash decoding requires precomputed cos and sin tensors"
-            if inference_params.sequence_len_offset > 0:  # Decode phase, not prefill
+            rotary_pos_cos_q = None
+            rotary_pos_sin_q = None
+            rotary_pos_cos_k = None
+            rotary_pos_sin_k = None
+
+            assert inference_context.is_static_batching()
+            if (
+                inference_context.sequence_len_offset > 0 and rotary_pos_cos
+            ):  # Decode phase, not prefill
                 rotary_pos_cos_q = rotary_pos_cos[sequence_end - 1 : sequence_end]
                 rotary_pos_sin_q = rotary_pos_sin[sequence_end - 1 : sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[sequence_end - 1 : sequence_end]
                 rotary_pos_sin_k = rotary_pos_sin[sequence_end - 1 : sequence_end]
-            else:  # Prefill
+            elif rotary_pos_cos is not None:  # Prefill
                 rotary_pos_cos_q = rotary_pos_cos[:sequence_end]
                 rotary_pos_sin_q = rotary_pos_sin[:sequence_end]
                 rotary_pos_cos_k = rotary_pos_cos[:sequence_end]
                 rotary_pos_sin_k = rotary_pos_sin[:sequence_end]
 
             # Flash Decoding assumes that the keys stored in the KV Cache already have RoPE applied.
-            # Apply RoPE before we store the keys to make it compatible with flash decoding kernel.
-            key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos_k, rotary_pos_sin_k)
-            query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos_q, rotary_pos_sin_q)
+            # Apply RoPE before we store the keys to make it compatible with flash decoding kernel
+            if rotary_pos_sin_q is not None and rotary_pos_sin_k is not None:
+                key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos_k, rotary_pos_sin_k)
+                query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos_q, rotary_pos_sin_q)
         else:
             rotary_pos_cos_q = None
             rotary_pos_sin_q = None
 
-        # Copy key and values.
-        inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
-        inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
-        key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
-        value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+        # Adjust rotary embeddings.
+        if rotary_pos_emb is not None:
+            q_pos_emb, k_pos_emb = rotary_pos_emb
+            if inference_context.is_static_batching():
+                q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
+                k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
+            else:
+                pass
+            rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
-        # adjust the key rotary positional embedding
-        if rotary_pos_emb is None:
-            return query, key, value, rotary_pos_emb, attn_mask_type
+        if inference_context.is_static_batching():
+            # Copy key and values.
+            inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
+            inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
+            key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
+            value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+        else:
+            # Apply rotary embeddings before appending KV cache.
+            if rotary_pos_emb is not None:
+                q_pos_emb, k_pos_emb = rotary_pos_emb
+                key = inference_context.apply_rotary_emb_key(key, k_pos_emb, self.config)
+                rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
-        q_pos_emb, k_pos_emb = rotary_pos_emb
-        q_pos_emb = q_pos_emb[sequence_start:sequence_end, :, :, :]
-        k_pos_emb = k_pos_emb[:sequence_end, :, :, :]
-        rotary_pos_emb = (q_pos_emb, k_pos_emb)
+            # Append key/value data tensors to cache.
+            inference_context.append_key_value_cache(self.layer_number, key, value)
+
+            # Read key/value *pointer* tensors from cache.
+            key, value = inference_context.key_value_cache(self.layer_number)
 
         return query, key, value, rotary_pos_emb, attn_mask_type
 
@@ -287,7 +348,7 @@ class Attention(MegatronModule, ABC):
         is "self-attn" or "cross-attn".
         """
 
-    def flash_decoding(
+    def flash_decode(
         self,
         sequence_len_offset: Tensor,
         query_layer: Tensor,
@@ -308,7 +369,6 @@ class Attention(MegatronModule, ABC):
             "Flash Decoding requires the flash_attn_with_kvcache kernel, "
             "available in the flash-attn package."
         )
-        cache_seqlens = sequence_len_offset - 1
         q = query_layer.permute(1, 0, 2, 3)
         k = key_layer.permute(1, 0, 2, 3)
         v = value_layer.permute(1, 0, 2, 3)
@@ -328,30 +388,130 @@ class Attention(MegatronModule, ABC):
             v=v,
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=sequence_len_offset,
             rotary_interleaved=False,
         )
         return out
 
-    def forward(
+    def flash_decode_and_prefill(
         self,
-        hidden_states,
-        attention_mask,
-        key_value_states=None,
-        inference_params=None,
-        rotary_pos_emb=None,
-        rotary_pos_cos=None,
-        rotary_pos_sin=None,
-        attention_bias=None,
-        packed_seq_params=None,
-        sequence_len_offset=None,
-    ):
-        """
-        Perform a forward pass through the attention module.
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        seqlen_q: Optional[int] = None,
+        seqlen_k: Optional[int] = None,
+        cu_seqlens_q: Optional[Tensor] = None,
+        cu_seqlens_k: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Flash attention kernel for mixed decode and prefill samples.
+
+        Args:
+            q (Tensor): Query tensor.
+            k (Tensor): Key tensor.
+            v (Tensor): Value tensor.
+            seqlen_q (Optional[int]): Query total sequence length.
+            seqlen_k (Optional[int]): Key total sequence length.
+            cu_seqlens_q (Optional[Tensor]): Cumulative query sequence lengths.
+            cu_seqlens_k (Optional[Tensor]): Cumulative key sequence lengths.
+
+        Return:
+            (Tensor) Attention output.
         """
 
+        assert not self.training
+
+        # Default variables.
+        if seqlen_q is None:
+            batch_size, seqlen_q = q.shape[0], q.shape[1]
+        else:
+            batch_size = 1
+        if seqlen_k is None:
+            seqlen_k = k.shape[1]
+
+        if cu_seqlens_q is None:
+            cu_seqlens_q = torch.arange(
+                0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=q.device
+            )
+
+        # turn off FA causal mask after first inference autoregressive iteration
+        # only on first autoregressive step q,k,v have same seqlen
+        # TODO: pass is_causal per sample to flash attentation
+        if cu_seqlens_k is None:
+            cu_seqlens_k = torch.arange(
+                0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=q.device
+            )
+
+        # Contiguous tensors.
+        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        # Flash attn kernel.
+        output_total = flash_decode_and_prefill_kernel(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqlen_q,
+            seqlen_k,
+            dropout_p=0,
+            softmax_scale=None,
+            causal=True,
+            num_heads_k=self.config.num_query_groups,
+        )
+        output_total = rearrange(output_total, '(b s) ... -> b s ...', b=batch_size)
+
+        return output_total
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[int] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Perform a forward pass through the attention module.
+
+        Args:
+            hidden_states (Tensor): Hidden states.
+            attention_mask (Tensor): Attention mask.
+            key_value_states (Optional[Tensor]): Key/value states (for cross attention).
+            inference_context (Optional[BaseInferenceContext]): Inference context that manages
+                KV cache.
+            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
+                embedding tensor(s).
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            attention_bias (Optional[Tensor]): Attention bias.
+            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
+            sequence_len_offset (Optional[int]): Sequence length offset used for
+                inference CUDA graphs.
+
+        Return:
+            (Tuple[Tensor, Tensor]) Attention output and bias.
+
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if inference_context and inference_context.is_dynamic_batching():
+            assert (
+                flash_decode_and_prefill_kernel is not None
+            ), "Internal use only: install package `nvidia_chunked_flash_attn`."
+
         # hidden_states: [sq, b, h]
-        if self.config.flash_decode:
+        if self.config.flash_decode and not self.training:
             rotary_pos_emb = None
         else:
             assert rotary_pos_cos is None and rotary_pos_sin is None
@@ -375,15 +535,16 @@ class Attention(MegatronModule, ABC):
         # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
         if (
             self.config.flash_decode
-            and inference_params is not None
-            and self.layer_number
-            in inference_params.key_value_memory_dict  # Decode phase if key already exists
+            and inference_context is not None
+            and inference_context.decode_mode
+            and not self.training
         ):
-            assert inference_params.sequence_len_offset is not None
-            inference_key_memory, inference_value_memory = inference_params.key_value_memory_dict[
+            assert self.layer_number in inference_context.key_value_memory_dict
+            assert inference_context.sequence_len_offset is not None
+            inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
                 self.layer_number
             ]
-            output = self.flash_decoding(
+            output = self.flash_decode(
                 sequence_len_offset=sequence_len_offset,
                 query_layer=query,
                 key_layer=key,
@@ -399,7 +560,7 @@ class Attention(MegatronModule, ABC):
             return output, bias
 
         query, key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_params,
+            inference_context,
             query,
             key,
             value,
@@ -431,10 +592,21 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
-            query = apply_rotary_pos_emb(
-                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
-            )
-            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
+
+            if q_pos_emb is not None:
+                # TODO VIJAY: simplify
+                if inference_context is None or inference_context.is_static_batching():
+                    query = apply_rotary_pos_emb(
+                        query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+                    )
+                else:
+                    query = inference_context.apply_rotary_emb_query(
+                        query, q_pos_emb, self.config, cu_seqlens_q
+                    )
+            if k_pos_emb is not None:
+                key = apply_rotary_pos_emb(
+                    key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
+                )
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -456,15 +628,29 @@ class Attention(MegatronModule, ABC):
                 packed_seq_params=packed_seq_params,
             )
         else:
-            core_attn_out = self.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                attn_mask_type=attn_mask_type,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-            )
+            if inference_context is None or inference_context.is_static_batching():
+                # Static batching attention kernel.
+                core_attn_out = self.core_attention(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                )
+
+            else:
+                # Dynamic batching attention kernel.
+                q, k, v = (query, key, value)
+                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                cu_kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+
+                core_attn_out = self.flash_decode_and_prefill(
+                    q, k, v, max_seqlen_q, max_seqlen_k, cu_query_lengths, cu_kv_lengths
+                )
+                core_attn_out = core_attn_out.squeeze(0).unsqueeze(1)
+                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case

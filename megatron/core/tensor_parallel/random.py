@@ -5,7 +5,6 @@
 
 import contextlib
 import logging
-from functools import partial
 from typing import Union
 
 import torch
@@ -131,9 +130,10 @@ class CudaRNGStatesTracker:
     cuda state.
     """
 
-    def __init__(self, use_cudagraphable_rng=False):
+    def __init__(self, use_cudagraphable_rng=False, is_inference_rng_tracker=False):
         self.reset()
         self.use_cudagraphable_rng = use_cudagraphable_rng
+        self.is_inference_rng_tracker = is_inference_rng_tracker
 
         if self.use_cudagraphable_rng:
             assert (
@@ -251,8 +251,13 @@ def initialize_rng_tracker(
         from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
 
         base_tracker = TECudaRNGStatesTracker
+        tracker_kwargs = {"is_inference_rng_tracker": inference_rng_tracker}
     else:
-        base_tracker = partial(CudaRNGStatesTracker, use_cudagraphable_rng=use_cudagraphable_rng)
+        base_tracker = CudaRNGStatesTracker
+        tracker_kwargs = {
+            "use_cudagraphable_rng": use_cudagraphable_rng,
+            "is_inference_rng_tracker": inference_rng_tracker,
+        }
 
     if inference_rng_tracker:
 
@@ -275,13 +280,17 @@ def initialize_rng_tracker(
     else:
         tracker_class = base_tracker
 
-    _CUDA_RNG_STATE_TRACKER = tracker_class()
+    _CUDA_RNG_STATE_TRACKER = tracker_class(**tracker_kwargs)
     _CUDA_RNG_STATE_TRACKER_INITIALIZED = True
 
 
-def get_cuda_rng_tracker(use_te_rng_tracker=False, inference_rng_tracker=False):
+def get_cuda_rng_tracker(
+    use_te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Get cuda rng tracker."""
-    initialize_rng_tracker(use_te_rng_tracker, inference_rng_tracker)
+    initialize_rng_tracker(use_te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
     return _CUDA_RNG_STATE_TRACKER
 
 
@@ -307,7 +316,12 @@ def get_all_rng_states() -> bool:
         return {}
 
 
-def model_parallel_cuda_manual_seed(seed, te_rng_tracker=False, inference_rng_tracker=False):
+def model_parallel_cuda_manual_seed(
+    seed: int,
+    te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
     """Initialize model parallel cuda seed.
 
     This function should be called after the model parallel is
@@ -331,7 +345,7 @@ def model_parallel_cuda_manual_seed(seed, te_rng_tracker=False, inference_rng_tr
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker)
+    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
     _CUDA_RNG_STATE_TRACKER.reset()
     # Set the default state.
     torch.cuda.manual_seed(data_parallel_seed)
@@ -354,6 +368,7 @@ class CheckpointFunction(torch.autograd.Function):
     2) the states in the model parallel tracker are also properly tracked/set/reset.
     """
 
+    # pylint: disable=missing-function-docstring
     @staticmethod
     def forward(ctx, run_function, distribute_saved_activations, *args):
         """Forward pass."""
@@ -381,6 +396,7 @@ class CheckpointFunction(torch.autograd.Function):
 
         return outputs
 
+    # pylint: disable=missing-function-docstring
     @staticmethod
     def backward(ctx, *args):
         """Backward pass."""
@@ -419,7 +435,9 @@ class CheckpointFunction(torch.autograd.Function):
             outputs = (outputs,)
 
         # filter out non tensor outputs for backward pass
-        outputs, args = zip(*filter(lambda x: torch.is_tensor(x[0]), zip(outputs, args)))
+        outputs, args = zip(
+            *filter(lambda x: torch.is_tensor(x[0]) and x[0].requires_grad, zip(outputs, args))
+        )
         torch.autograd.backward(outputs, args)
         grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else inp for inp in detached_inputs)
         return (None, None) + grads

@@ -45,8 +45,8 @@ MODEL_ARGS:
   --log-interval: 100
   --save-interval: 2000
   --eval-interval: 1000
-  --save: ${CHECKPOINT_PATH}
-  --load: ${CHECKPOINT_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --eval-iters: 10
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --log-timers-to-tensorboard: true

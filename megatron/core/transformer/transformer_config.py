@@ -1,10 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch.nn.functional as F
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.enums import AttnBackend
 
 from ..model_parallel_config import ModelParallelConfig
@@ -22,6 +24,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # model architecture
     ####################
+
     num_layers: int = 0
     """Number of transformer layers in a transformer block."""
 
@@ -53,17 +56,17 @@ class TransformerConfig(ModelParallelConfig):
     If attention backend is local we use the local pytorch implementation in mcore. 
     Users can specify exact backend by changing this config. """
 
-    softmax_scale: float = None
+    softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
-    num_query_groups: int = None
+    num_query_groups: Optional[int] = None
     """Number of query groups for group query attention. If None, normal attention is used."""
 
-    ffn_hidden_size: int = None
+    ffn_hidden_size: Optional[int] = None
     """Transformer Feed-Forward Network hidden size. This is set to 4*hidden_size
     if not provided."""
 
-    kv_channels: int = None
+    kv_channels: Optional[int] = None
     """Projection weights dimension in multi-head attention. This is set to hidden_size //
     num_attention_heads if not provided."""
 
@@ -104,7 +107,7 @@ class TransformerConfig(ModelParallelConfig):
     """Store the input of MLP activation function in FP8 for backprop to save memory.
     The stored input is casted back to the original precision before backprop compuatation."""
 
-    num_moe_experts: int = None
+    num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
 
@@ -116,7 +119,7 @@ class TransformerConfig(ModelParallelConfig):
     """If not None, then will use sliding window attention. The size of the window is specified by
     the numbers inside the tuple; -1 is special value meaning "infinite window size"."""
 
-    normalization: bool = "LayerNorm"
+    normalization: str = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
@@ -146,13 +149,13 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # initialization
     ####################
-    init_method: Callable = None
+    init_method: Optional[Callable] = None
     """Method to initialize weights. Note that bias is always set to zero. Should be a function that
     takes a single Tensor and initializes it. If None, will be set to
     megatron.core.utils.init_method_normal(init_method_std) which is torch nn init normal with
     mean=0.0 and std=init_method_std."""
 
-    output_layer_init_method: Callable = None
+    output_layer_init_method: Optional[Callable] = None
     """Method to initialize weights of the output layer of both attention and MLP blocks. If None,
     will be set to megatron.core.utils.scaled_init_method_normal(init_method_std) which is torch nn
     init normal with mean=0.0 and std=init_method_std / math.sqrt(2.0 * num_layers)."""
@@ -160,6 +163,12 @@ class TransformerConfig(ModelParallelConfig):
     init_method_std: float = 0.02
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
+
+    init_model_with_meta_device: bool = False
+    """
+    If True, initializes the model with the meta device. This is helpful for
+    training of very large models. This feature is only works when custom fsdp is turned on.
+    """
 
     ####################
     # mixed-precision
@@ -198,7 +207,7 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # activation recomputation
     ####################
-    recompute_granularity: str = None
+    recompute_granularity: Optional[str] = None
     """Determines which type of activation recompute to use.  Megatron-core supports 'selective'
     activation checkpointing where only the memory intensive part of attention is checkpointed.
     These memory intensive activations are also less compute intensive which makes activation
@@ -208,7 +217,7 @@ class TransformerConfig(ModelParallelConfig):
     If set, must be 'selective' or 'full'. 'selective' always uses all layers.
     """
 
-    recompute_method: str = None
+    recompute_method: Optional[str] = None
     """Determines which transformer layers will be recomputed. uniform will uniformly divide the
     total number of transformer layers in a transformer block and recompute the input activation of
     each divided chunk at the specified granularity.  block will recompute the input activations for
@@ -216,22 +225,27 @@ class TransformerConfig(ModelParallelConfig):
     pipeline stage will not have any activations recomputed.  If None, and recompute is enabled, all
     layers will do recomputation. If set, must be 'uniform' or 'block'."""
 
-    recompute_num_layers: int = None
+    recompute_num_layers: Optional[int] = None
     """When recompute_method is uniform, recompute_num_layers is the number of transformer layers in
     each uniformly divided recompute unit.  When recompute_method is block, recompute_num_layers is
     the number of transformer layers to recompute within each pipeline stage.  Must be None for
     'selective' activation checkpointing."""
 
-    distribute_saved_activations: bool = None
+    distribute_saved_activations: Optional[bool] = None
     """If True, distribute recomputed activations across the model parallel group."""
 
     ####################
     # fp8 related
     ####################
-    fp8: str = None
+    fp8: Optional[str] = None
     """If set, enables the use of FP8 precision through Transformer Engine. There are 2 predefined
     choices (1) 'e4m3' uniformly uses e4m3 for all FP8 tensors, (2) 'hybrid' uses e4m3 for all FP8
     activation and weight tensors and e5m2 for all FP8 output activation gradient tensors."""
+
+    fp8_recipe: Optional[str] = "delayed"
+    """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
+    choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
+    uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only"""
 
     fp8_margin: int = 0
     """Margin for the scaling factor computation."""
@@ -264,10 +278,21 @@ class TransformerConfig(ModelParallelConfig):
     tp_only_amax_red: bool = False
     """When set to True, reduce the FP8 AMAX only in the TP or TP-CP domain"""
 
+    first_last_layers_bf16: bool = False
+    """If True, retains first and last N TransformerBlocks in BF16 as opposed to FP8."""
+
+    num_layers_at_start_in_bf16: int = 1
+    """Number of layers at the start of the model to keep in BF16 precision when
+    first_last_layers_bf16 is True."""
+
+    num_layers_at_end_in_bf16: int = 1
+    """Number of layers at the end of the model to keep in BF16 precision when
+    first_last_layers_bf16 is True."""
+
     ####################
     # MoE related
     ####################
-    moe_shared_expert_intermediate_size: int = None
+    moe_shared_expert_intermediate_size: Optional[int] = None
     """Shared expert total ffn hidden size.
     It should be equal to 'num_shared_experts * ffn_size_of_each_shared_expert' if
     there are multiple shared experts.
@@ -277,14 +302,12 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared epxerts execute after the routed experts."""
 
-    moe_layer_freq: int = 1
+    moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
-    - A string containing a Python list expression that defines a custom pattern, e.g.:
-    "([1]*3+[0]*1)*3" evaluates to [1,1,1,0,1,1,1,0,1,1,1,0]
-    where 1 indicates an expert layer and 0 indicates a dense layer."""
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
-    moe_ffn_hidden_size: int = None
+    moe_ffn_hidden_size: Optional[int] = None
     """MoE Feed-Forward Network hidden size"""
 
     moe_router_load_balancing_type: str = "aux_loss"
@@ -296,21 +319,45 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
 
-    moe_router_topk_limited_devices: int = None
-    """Number of expert parallel ranks to consider for each token during routing. Perform top-k
-    routing on a subset of expert parallel ranks by first selecting N ranks for each token, then
-    conducting top-k selection among experts on these devices. None means no device limitation."""
+    moe_router_topk_limited_devices: Optional[int] = None
+    """Number of EP ranks to consider for each token in group-limited routing, 
+    DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
+    """
+
+    moe_router_num_groups: Optional[int] = None
+    """Number of groups to divide experts into for group-limited routing.
+    When using group-limited routing:
+    1. Experts are divided into 'moe_router_num_groups' equal-sized groups
+    2. For each token, 'moe_router_group_topk' groups are selected based on routing scores
+    (specifically, the sum of top-2 expert scores within each group)
+    3. From these selected groups, 'moe_router_topk' individual experts are chosen
+    Two common use cases:
+    - Device-limited routing: Set 'moe_router_num_groups' equal to expert parallel size (EP)
+    to limit each token to experts on a subset of devices
+    (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434)
+    - Node-limited routing: Set 'moe_router_num_groups' equal to number of nodes in EP group
+    to limit each token to experts on a subset of nodes
+    (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)
+    """
+
+    moe_router_group_topk: Optional[int] = None
+    """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. 
+    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection.
     By default, softmax is done after top-k."""
 
-    moe_router_topk_scaling_factor: float = None
+    moe_router_topk_scaling_factor: Optional[float] = None
     """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax 
     enabled. Defaults to None, which means no scaling."""
 
     moe_router_score_function: str = "softmax"
     """Score function for MoE routing. Can be "softmax" or "sigmoid"."""
+
+    moe_router_dtype: Optional[str] = None
+    """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
+    improve stability especially when the number of experts is large (e.g. finegrained-moe).
+    None means no changes for dtype."""
 
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
@@ -336,10 +383,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended."""
 
-    moe_z_loss_coeff: float = None  # 1e-3 would be a good start value for z-loss
+    moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
 
-    moe_input_jitter_eps: float = None
+    moe_input_jitter_eps: Optional[float] = None
     """Add noise to the input tensor by applying jitter with a specified epsilon value."""
 
     moe_token_dropping: bool = False
@@ -349,12 +396,15 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_dispatcher_type: str = "allgather"
     """The type of token dispatcher to use. The default is 'allgather'.
-    Options are 'allgather' and 'alltoall'."""
+    Options are 'allgather','alltoall' and 'flex'."""
+
+    moe_enable_deepep: bool = False
+    """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
-    moe_expert_capacity_factor: float = None
+    moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
     will be dropped. The default is None."""
 
@@ -372,10 +422,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
+    moe_permute_fusion: bool = False
+    """Fuse token rearrangement ops during token dispatching."""
+
     ##################
     # Context Parallel
     ##################
-    cp_comm_type: Union[str, List[str]] = None
+    cp_comm_type: Optional[Union[str, List[str]]] = None
     """Inter-gpu communication type for context parallelism.
     str: all layers share same communication type.
     List[str]: each layer has its separate communication type.
@@ -415,6 +468,11 @@ class TransformerConfig(ModelParallelConfig):
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
+    cuda_graph_scope: str = "full"
+    """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
+    capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
+    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
+
     ####################
     # miscellaneous
     ####################
@@ -437,7 +495,23 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    use_custom_fsdp: bool = False
+    """ Whether to use custom fsdp for training. """
+
+    is_hybrid_model: bool = False
+    """ Indicates whether this is a hybrid model. """
+
+    mamba_state_dim: int = 128
+    """The dimensionality of the state representation in Mamba layers."""
+
+    mamba_head_dim: int = 64
+    """The dimensionality of the heads in the Mamba layers."""
+
+    mamba_num_groups: int = 8
+    """The number of groups used in Mamba layers."""
+
     log_kurtosis: bool = False
+    """Whether to log kurtosis or not."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -471,6 +545,37 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.fp8:
+            # cannot support first last layer bf16 with delayed scaling
+            if self.first_last_layers_bf16 and self.fp8_recipe == Fp8Recipe.delayed:
+                raise ValueError("Delayed scaling does not support first / last layer in BF16.")
+
+            # max bf16 layers per pipeline stage
+            max_bf16_layers_per_pipeline_stage = (
+                self.num_layers // self.pipeline_model_parallel_size
+            )
+
+            # check start/end bf16 layer counts are valid
+            if self.first_last_layers_bf16:
+                if (
+                    self.num_layers_at_start_in_bf16 < 0
+                    or self.num_layers_at_start_in_bf16 > max_bf16_layers_per_pipeline_stage
+                ):
+                    raise ValueError(
+                        f"num_layers_at_start_in_bf16 ({self.num_layers_at_start_in_bf16}) must be "
+                        f"between 0 and number of layers per pipeline stage "
+                        f"({max_bf16_layers_per_pipeline_stage})."
+                    )
+                if (
+                    self.num_layers_at_end_in_bf16 < 0
+                    or self.num_layers_at_end_in_bf16 > max_bf16_layers_per_pipeline_stage
+                ):
+                    raise ValueError(
+                        f"num_layers_at_end_in_bf16 ({self.num_layers_at_end_in_bf16}) must be "
+                        f"between 0 and number of layers per pipeline stage "
+                        f"({max_bf16_layers_per_pipeline_stage})."
+                    )
+
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
@@ -482,6 +587,16 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
+
+        if self.moe_enable_deepep:
+            if self.moe_token_dispatcher_type != "flex":
+                raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
+
+        if self.moe_token_dispatcher_type == "flex":
+            if self.moe_pad_expert_input_to_capacity:
+                raise ValueError(
+                    "Flex token dispatcher does not support moe_pad_expert_input_to_capacity"
+                )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
@@ -498,10 +613,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_capacity_factor is not None:
-            if self.moe_token_dispatcher_type not in ["alltoall", "alltoall_seq"]:
-                raise ValueError(
-                    'moe_expert_capacity_factor only works with alltoall token dispatcher'
-                )
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
             if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
@@ -611,7 +722,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.num_layers_in_last_pipeline_stage is not None:
                 if self.num_layers_in_last_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+                    raise ValueError('num_layers_in_last_pipeline_stage must be larger than 0')
 
                 if self.virtual_pipeline_model_parallel_size is not None:
                     if (
@@ -729,6 +840,9 @@ class TransformerConfig(ModelParallelConfig):
                     "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
                 )
 
+            if self.multi_latent_attention:
+                raise ValueError("multi_latent_attention does not support apply_rope_fusion.")
+
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
@@ -737,7 +851,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(
-                self.init_method_std, self.num_layers
+                self.init_method_std,
+                self.num_layers,
+                multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
 
         if (
@@ -778,16 +894,32 @@ class TransformerConfig(ModelParallelConfig):
             # since softmax on a [num_tokens, 1] would yield a zero gradient.
             raise ValueError("Please use --moe-router-pre-softmax when topk is 1.")
 
-        if self.moe_router_topk_limited_devices:
-            if self.moe_router_topk_limited_devices > self.expert_model_parallel_size:
+        if self.moe_router_group_topk:
+            if self.moe_router_topk_limited_devices:
                 raise ValueError(
-                    f"moe_router_topk_limited_devices: {self.moe_router_topk_limited_devices} "
-                    f"must be smaller than expert_model_parallel_size "
-                    f"{self.expert_model_parallel_size}"
+                    "moe_router_topk_limited_devices is deprecated and replaced by "
+                    "moe_router_group_topk and moe_router_num_groups."
                 )
-
-        if self.flash_decode and self.fp8:
-            raise ValueError("FP8 inference is currently not support with flash decoding.")
+            if not self.moe_router_num_groups:
+                raise ValueError(
+                    "When using group limited routing, moe_router_num_groups must be specified."
+                )
+            else:
+                assert self.num_moe_experts % self.moe_router_num_groups == 0, (
+                    f"num_moe_experts ({self.num_moe_experts}) should be divisible by "
+                    f"moe_router_num_groups ({self.moe_router_num_groups})."
+                )
+                assert self.moe_router_group_topk <= self.moe_router_num_groups, (
+                    f"moe_router_group_topk ({self.moe_router_group_topk}) should be smaller than "
+                    f"moe_router_num_groups ({self.moe_router_num_groups})."
+                )
+        elif self.moe_router_topk_limited_devices:
+            warnings.warn(
+                "moe_router_topk_limited_devices is deprecated. Use moe_router_group_topk and "
+                "moe_router_num_groups instead."
+            )
+            self.moe_router_group_topk = self.moe_router_topk_limited_devices
+            self.moe_router_num_groups = self.expert_model_parallel_size
 
         if self.enable_cuda_graph:
             if self.cpu_offloading:
@@ -802,7 +934,21 @@ class TransformerConfig(ModelParallelConfig):
                     f"variable sequence length, please use alltoall dispatcher instead."
                 )
 
-        if self.cp_comm_type is not None:
+        if self.moe_permute_fusion:
+            from megatron.core.transformer.moe.moe_utils import (
+                fused_permute,
+                fused_sort_chunks_by_index,
+                fused_unpermute,
+            )
+
+            if (
+                fused_permute is None
+                or fused_sort_chunks_by_index is None
+                or fused_unpermute is None
+            ):
+                raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
+
+        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
@@ -817,6 +963,16 @@ class TransformerConfig(ModelParallelConfig):
             self.pipeline_model_parallel_size > 0
         ), f"Pipeline model parallel size must be larger than 0 \
             when enable --standalone-embedding-stage and --standalone-loss-stage"
+
+        if (
+            self.num_moe_experts is not None
+            and self.num_moe_experts >= 32
+            and not self.moe_router_dtype
+        ):
+            warnings.warn(
+                "Using a large number of experts (e.g. >=32) without fp32 routing. "
+                "Consider enabling moe_router_dtype for better numerical stability."
+            )
 
 
 @dataclass
@@ -845,26 +1001,32 @@ class MLATransformerConfig(TransformerConfig):
     v_head_dim: int = 128
     """Dimension of the head in the V projection."""
 
-    rotary_base: float = 10000
-    """Rotary base for the rotary embeddings."""
-
-    rotary_scaling_factor: float = 40
-    """Rotary scaling factor for the rotary embeddings."""
-
     normalization: str = "RMSNorm"
     """Default normalization layer for MLA models is RMSNorm."""
 
-    max_position_embeddings: int = 163840
-    """Maximum position embeddings for the original model."""
+    rope_type: str = "yarn"
+    """Type of RoPE to use. Default to yarn, options are rope and yarn."""
+
+    rotary_base: float = 10000
+    """Rotary base for the rotary embeddings, used by rope and yarn."""
+
+    rotary_percent: float = 1.0
+    """Rotary percent for the rotary embeddings, used by rope."""
+
+    rotary_scaling_factor: float = 40
+    """Rotary scaling factor for the rotary embeddings, used by yarn."""
+
+    max_position_embeddings: int = 4096
+    """Maximum position embeddings for the original model, used by yarn."""
 
     beta_fast: float = 32
-    """Beta fast for YaRN RoPE."""
+    """Beta fast for YaRN RoPE, used by yarn."""
 
     beta_slow: float = 1
-    """Beta slow for YaRN RoPE."""
+    """Beta slow for YaRN RoPE, used by yarn."""
 
     mscale: float = 0.707
-    """Mscale for YaRN RoPE in Multi-Latent Attention."""
+    """Mscale for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
     mscale_all_dim: float = 0.707
-    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention."""
+    """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""

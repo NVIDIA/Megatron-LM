@@ -25,17 +25,17 @@ class TestScheduler:
     def test_scheduler(self):
         prompt = "sample prompt"
         prompt_tokens = torch.randn(5)
-        inference_parameters = SamplingParams()
+        sampling_params = SamplingParams()
 
         active_request_ids = []
         for i in range(self.max_batch_size):
-            request_id = self.scheduler.add_request(prompt, prompt_tokens, inference_parameters)
+            request_id = self.scheduler.add_request(prompt, prompt_tokens, sampling_params)
             assert (
                 len(self.scheduler.active_request_pool) == i + 1
             ), f"Active request pool should have {i+1} requests, but it has only {len(self.scheduler.active_request_pool)}"
             active_request_ids.append(request_id)
 
-        request_id = self.scheduler.add_request(prompt, prompt_tokens, inference_parameters)
+        request_id = self.scheduler.add_request(prompt, prompt_tokens, sampling_params)
         assert (
             len(self.scheduler.waiting_request_pool) == 1
         ), f"Waiting request pool should have 1 request but it has {len(self.scheduler.waiting_request_pool)} requests"

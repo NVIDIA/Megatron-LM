@@ -92,6 +92,9 @@ def build_tokenizer(args, **kwargs):
             args.special_tokens,
             args.image_tag_type,
         )
+    elif args.tokenizer_type == 'NullMultimodalTokenizer':
+        assert args.vocab_size is not None
+        tokenizer = _NullMultimodalTokenizer(args.vocab_size)
     else:
         raise NotImplementedError('{} tokenizer is not ' 'implemented.'.format(args.tokenizer_type))
 
@@ -759,7 +762,21 @@ class CustomTikTokenizer(MegatronTokenizer):
         return self._model.decode(tokens)
 
     def offsets(self, ids: list[int], text: str) -> list[int]:
-        return self._model.decode_with_offsets(ids)[1]
+        try:
+            return self._model.decode_with_offsets(ids)[1]
+        except UnicodeDecodeError:
+            # Tiktoken has an unnecessary check that raises UnicodeDecodeError
+            # from `text = b"".join(token_bytes).decode("utf-8", errors="strict")`
+            # which is not needed for our use case. So we re-implement it, without
+            # the check.
+
+            token_bytes = self._model.decode_tokens_bytes(ids)
+            text_len = 0
+            offsets = []
+            for token in token_bytes:
+                offsets.append(max(0, text_len - (0x80 <= token[0] < 0xC0)))
+                text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
+            return offsets
 
     @property
     def vocab_size(self) -> int:
@@ -793,6 +810,66 @@ class _NullTokenizer(MegatronTokenizer):
             offsets.append(start_idx)
             start_idx += 1 + len(str(id_))
         return offsets
+
+    @property
+    def vocab_size(self):
+        return self._vocab_size_without_eod + 1
+
+    @property
+    def vocab(self):
+        raise NotImplementedError
+
+    @property
+    def inv_vocab(self):
+        raise NotImplementedError
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self._eod_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return None
+
+class _NullMultimodalTokenizer(MegatronTokenizer):
+    def __init__(self, vocab_size, image_token=None, image_token_id=None):
+        super().__init__(None, vocab_size=vocab_size)
+        self._vocab_size_without_eod = int(vocab_size)
+        self._eod_id = self._vocab_size_without_eod
+
+        from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, IMAGE_TOKEN
+        self._image_token = image_token if image_token is not None else IMAGE_TOKEN
+        self._image_token_id = image_token_id if image_token_id is not None else DEFAULT_IMAGE_TOKEN_INDEX
+
+    def tokenize(self, text):
+        return [int(x) for x in text.split(' ')]
+
+    def detokenize(self, ids):
+        text = [str(x) for x in ids]
+        return ' '.join(text)
+
+    def offsets(self, ids: list[int], text: str) -> list[int]:
+        offsets, start_idx = [], 0
+        for id_ in ids:
+            offsets.append(start_idx)
+            start_idx += 1 + len(str(id_))
+        return offsets
+
+    def convert_tokens_to_ids(self, tokens):
+        ids = [(int(t) if t != self._image_token else self._image_token_id) for t in tokens.split('  ')]
+        return ids if len(ids) > 1 else ids[0]
 
     @property
     def vocab_size(self):

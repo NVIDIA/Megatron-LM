@@ -16,42 +16,42 @@ def get_core_transformer_block_key(model_key):
 
 class CoreSchema(ModelSchema):
 
-    def __init__(self, model_type, layer_schema):
+    def __init__(self, model_type, layer_schema, prefix):
         block_key = get_core_transformer_block_key(model_type)
         super().__init__({
             "embeddings" : {
-                "pos" : "embedding.position_embeddings.weight",
-                "word" : "embedding.word_embeddings.weight",
+                "pos" : f"{prefix}embedding.position_embeddings.weight",
+                "word" : f"{prefix}embedding.word_embeddings.weight",
             },
-            "layer_prefix" : f"{block_key}.layers",
+            "layer_prefix" : f"{prefix}{block_key}.layers",
             "layer" : layer_schema,
             "final_norm" : {
-                "weight" : f"{block_key}.final_layernorm.weight",
-                "bias" : f"{block_key}.final_layernorm.bias",
+                "weight" : f"{prefix}{block_key}.final_layernorm.weight",
+                "bias" : f"{prefix}{block_key}.final_layernorm.bias",
             },
             "output_layer" : {
-                "weight" : "output_layer.weight",
+                "weight" : f"{prefix}output_layer.weight",
             },
             "pooler" : {
-                "weight" : "pooler.dense.weight",
-                "bias" : "pooler.dense.bias",
+                "weight" : f"{prefix}pooler.dense.weight",
+                "bias" : f"{prefix}pooler.dense.bias",
             },
             "lm_head" : {
-                "dense_weight" : "lm_head.dense.weight",
-                "dense_bias" : "lm_head.dense.bias",
-                "norm_weight" : "lm_head.layer_norm.weight",
-                "norm_bias" : "lm_head.layer_norm.bias",
+                "dense_weight" : f"{prefix}lm_head.dense.weight",
+                "dense_bias" : f"{prefix}lm_head.dense.bias",
+                "norm_weight" : f"{prefix}lm_head.layer_norm.weight",
+                "norm_bias" : f"{prefix}lm_head.layer_norm.bias",
             },
             "binary_head" : {
-                "weight" : "binary_head.weight",
-                "bias" : "binary_head.bias",
+                "weight" : f"{prefix}binary_head.weight",
+                "bias" : f"{prefix}binary_head.bias",
             },
         })
 
 
 class CoreLocalSchema(CoreSchema):
 
-    def __init__(self, model_type):
+    def __init__(self, model_type, prefix, extra_layer_schema):
         super().__init__(model_type, layer_schema={
 
             # Self attention.
@@ -73,15 +73,16 @@ class CoreLocalSchema(CoreSchema):
             "mlp_fc1_bias" : "mlp.linear_fc1.bias",
             "mlp_fc2_weight" : "mlp.linear_fc2.weight",
             "mlp_fc2_bias" : "mlp.linear_fc2.bias",
+
             # xielu weights
             "mlp_xielu_alpha_p" : "mlp.activation_func.alpha_p",
             "mlp_xielu_alpha_n" : "mlp.activation_func.alpha_n",
-        })
+        } | extra_layer_schema, prefix=prefix)
 
 
 class CoreTESchema(CoreSchema):
 
-    def __init__(self, model_type):
+    def __init__(self, model_type, prefix, extra_layer_schema):
         super().__init__(model_type, layer_schema={
 
             # Self attention.
@@ -108,12 +109,12 @@ class CoreTESchema(CoreSchema):
             "mlp_xielu_alpha_p" : "mlp.activation_func.alpha_p",
             "mlp_xielu_alpha_n" : "mlp.activation_func.alpha_n",
 
-        })
+        } | extra_layer_schema, prefix=prefix)
 
 
 class CoreMoETESchema(CoreSchema):
 
-    def __init__(self, model_type, num_experts, expert_model_parallel_size):
+    def __init__(self, model_type, num_experts, expert_model_parallel_size, prefix, extra_layer_schema):
         num_local_experts = num_experts // expert_model_parallel_size
         super().__init__(model_type, layer_schema={
 
@@ -139,11 +140,11 @@ class CoreMoETESchema(CoreSchema):
 
             **{f"mlp_fc1_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc1.weight" for expert_idx in range(num_local_experts) },
             **{f"mlp_fc2_weight.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.linear_fc2.weight" for expert_idx in range(num_local_experts) },
-            
+
             # xielu weights
             **{f"mlp_xielu_alpha_p.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.activation_func.alpha_p.weight" for expert_idx in range(num_local_experts) },
             **{f"mlp_xielu_alpha_n.{expert_idx}" : f"mlp.experts.local_experts.{expert_idx}.activation_func.alpha_n.weight" for expert_idx in range(num_local_experts) },
-        })
+        } | extra_layer_schema, prefix=prefix)
 
 
 def get_model_schema(
@@ -151,13 +152,15 @@ def get_model_schema(
     transformer_impl: T.Literal["transformer_engine", "local"],
     num_experts: T.Optional[int] = None,
     expert_model_parallel_size: T.Optional[int] = None,
+    prefix: T.Optional[str] = "",
+    extra_layer_schema: T.Optional[dict] = {},
 ) -> CoreSchema:
     if num_experts is not None and num_experts > 0:
         # Only support TE setter for MOE
         assert transformer_impl == "transformer_engine"
         assert isinstance(expert_model_parallel_size, int)
-        return CoreMoETESchema(model_type, num_experts, expert_model_parallel_size)
+        return CoreMoETESchema(model_type, num_experts, expert_model_parallel_size, prefix, extra_layer_schema)
     return {
         "local" : CoreLocalSchema,
         "transformer_engine" : CoreTESchema,
-    }[transformer_impl](model_type)
+    }[transformer_impl](model_type, prefix, extra_layer_schema)

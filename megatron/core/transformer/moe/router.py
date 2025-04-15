@@ -59,7 +59,13 @@ class Router(ABC, MegatronModule):
         if self.weight.device.type == 'cpu':
             # move weights to GPU
             self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
-        logits = torch.nn.functional.linear(input, self.weight)
+        # Convert to specified datatype for routing computation if enabled
+        router_dtype = input.dtype
+        if self.config.moe_router_dtype == 'fp32':
+            router_dtype = torch.float32
+        elif self.config.moe_router_dtype == 'fp64':
+            router_dtype = torch.float64
+        logits = torch.nn.functional.linear(input.to(router_dtype), self.weight.to(router_dtype))
         return logits
 
     @abstractmethod
@@ -169,15 +175,17 @@ class TopKRouter(Router):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
-            moe_router_topk_limited_devices=self.config.moe_router_topk_limited_devices,
-            moe_router_topk_scaling_factor=self.config.moe_router_topk_scaling_factor,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
             deterministic_mode=self.config.deterministic_mode,
             score_function=self.score_function,
             expert_bias=self.expert_bias,
         )
 
-        if self.training:
+        if self.training and torch.is_grad_enabled():
             # Apply load balancing loss
+            # Skip auxiliary loss calculations when using torch.no_grad() or checkpointing.
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             aux_loss_func = partial(
                 switch_load_balancing_loss_func,
@@ -200,14 +208,15 @@ class TopKRouter(Router):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
-            moe_router_topk_limited_devices=self.config.moe_router_topk_limited_devices,
-            moe_router_topk_scaling_factor=self.config.moe_router_topk_scaling_factor,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
             deterministic_mode=self.config.deterministic_mode,
             score_function=self.score_function,
             expert_bias=self.expert_bias,
         )
 
-        if self.training:
+        if self.training and torch.is_grad_enabled():
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
             aux_loss_func = partial(
                 sequence_load_balancing_loss_func,
@@ -260,7 +269,8 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """
-        if self.config.moe_z_loss_coeff is not None and self.training:
+        if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
+            # Skip Z loss calculations when using torch.no_grad() or checkpointing.
             moe_z_loss_coeff = (
                 self.config.moe_z_loss_coeff
                 / parallel_state.get_tensor_and_context_parallel_world_size()
@@ -329,7 +339,9 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
-                moe_router_topk_scaling_factor=self.config.moe_router_topk_scaling_factor,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
                 deterministic_mode=self.config.deterministic_mode,
                 score_function=self.score_function,
                 expert_bias=self.expert_bias,

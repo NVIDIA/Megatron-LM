@@ -3,7 +3,7 @@ import time, os
 
 from .global_vars import get_one_logger, get_args
 
-_one_logger_utils_version = "1.0.0-mlm"
+_one_logger_utils_version = "1.1.0-mlm"
 
 
 def get_timestamp_in_ms():
@@ -25,12 +25,13 @@ def on_train_start(iteration, consumed_train_samples, train_samples, seq_length,
         consumed_train_samples (int): consumed sample numbers so far
         train_samples (int): total train sample number
         seq_length (int): sequence length
-        train_iters (type): target iteration
+        train_iters (int): target iteration
         save (str): output directory to save checkpoints to
         async_save (bool): apply async checkpointing save
         log_throughput (bool): log throughput or not
         num_floating_point_operations_so_far (int): flops so far
     """
+    args = get_args()
     one_logger = get_one_logger()
 
     if one_logger:
@@ -51,7 +52,9 @@ def on_train_start(iteration, consumed_train_samples, train_samples, seq_length,
             one_logger.store_set('save_checkpoint_count', 0)
             one_logger.store_set('save_checkpoint_sync_time_total', 0.0)
 
-            train_samples_target = train_samples
+            # Derive train_samples from iters for iteration-based training
+            train_samples_target = train_samples or train_iters * args.global_batch_size
+
             train_tokens_target = seq_length * train_samples_target
             e2e_metrics = {
                 'train_samples_start': consumed_train_samples,

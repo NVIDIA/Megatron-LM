@@ -6,7 +6,8 @@ from dataclasses import dataclass
 class SamplingParams:
     """Inference parameters sent along with the prompts.
     This class contains request-level attributes that control the sampling techniques used when
-    generating text. This is distinct from megatron.core.InferenceParams, which is sets model-level
+    generating text. This is distinct from megatron.core.inference.contexts.BaseInferenceContext,
+        which is sets model-level
     inference attributes such as the maximum sequence length, and contains the KV cache.
 
     For an explanation of these parameters refer to this blog

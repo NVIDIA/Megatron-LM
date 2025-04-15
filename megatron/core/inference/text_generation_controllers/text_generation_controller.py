@@ -1,4 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 import concurrent
 import copy
 import functools
@@ -6,6 +7,7 @@ from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
@@ -16,7 +18,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from megatron.core.utils import get_model_config
 
 
 class TextGenerationController:
@@ -38,6 +40,13 @@ class TextGenerationController:
         self.model_is_pipeline_parallel = not (
             parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
         )
+
+        if hasattr(self.inference_wrapped_model.model, "module"):  # if model is Float16Module
+            self.enable_cuda_graph = (
+                self.inference_wrapped_model.model.module.config.enable_cuda_graph
+            )
+        else:
+            self.enable_cuda_graph = self.inference_wrapped_model.model.config.enable_cuda_graph
 
     def tokenize_prompt(
         self, prompt: str, add_BOS: bool = False
@@ -66,7 +75,7 @@ class TextGenerationController:
         """Detokenize the generated tokens.
 
         Args:
-            tokens_gpu_tensor (torch.Tensor): Tensor containing the generated tokens
+            tokens_gpu_tensor (torch.Tensor): Tensor containing the tokens
             lengths_gpu_tensor (torch.Tensor): Tensor containing the lengths of each sequence
             detokenize_segments (bool): If True, returns individually detokenized tokens. If False,
             returns None as second element. Helpful for understanding per-token boundaries in
@@ -250,7 +259,6 @@ class TextGenerationController:
         Returns:
             torch.Tensor: A torch tensor of shape [bs, max_seq_len] (i.e)
             max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate,
-            with extra indices for each tensor padded with mask id.
         """
         max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate
 
@@ -261,22 +269,62 @@ class TextGenerationController:
         return torch.tensor(batch_prompt_tokens_list, device=torch.cuda.current_device())
 
     def generate_output_tokens_dynamic_batch(
-        self, active_requests: OrderedDict[str, InferenceRequest]
-    ) -> OrderedDict[str, InferenceRequest]:
-        """Utility to generate the output tokens and probabilities for the prompts
-
-        This utility generates the output tokens for a dynamic batch. It will run one forward step
-        at a time, and pass control back to the engine, which will update the request pool and call
-        this method again.
+        self, sampling_params: SamplingParams, termination_id: int
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Forward step the model and update the inference context.
 
         Args:
-            active_requests (OrderedDict[str, InferenceRequest]): The input active requests.
+            sampling_params (SamplingParams): Parameters for sampling logits.
 
-        Returns:
-            OrderedDict[str, InferenceRequest]: The result for each of the incoming requests
-            after running one forward step.
+        Return:
+            (Optional[Tuple[Tensor, Tensor, Tensor]]) Current request IDs, new sample.
         """
-        raise Exception("Not implemented yet")
+
+        context = self.inference_wrapped_model.inference_context
+
+        # No tokens?
+        if context.active_token_count == 0:
+            return None
+
+        # Initialize attention state.
+        context.initialize_attention_state()
+
+        # Get flat tokens, position ids.
+        input_ids = context.current_input_ids()
+        position_ids = context.current_position_ids()
+
+        # Forward pass -> logits.
+        with torch.no_grad():
+            logits = self.inference_wrapped_model.run_one_forward_step(
+                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+            )
+
+        last_token_logits = logits.squeeze(0)
+
+        # Sample.
+        new_sample = self.sample_from_logits(
+            last_token_logits, sampling_params, vocab_size=self.tokenizer.vocab_size
+        )
+
+        # Active sequence lengths.
+        current_request_ids = context.request_ids[
+            context.paused_request_count : context.total_request_count
+        ].long()
+        active_sequence_lengths = context.get_active_sequence_lengths()
+
+        # Request finished if termination_id or length > max_sequence_length.
+        active_request_mask = (new_sample != termination_id).byte() & (
+            active_sequence_lengths < context.max_sequence_length
+        ).byte()
+        finished_idxs = (
+            torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
+        )
+        finished_request_ids = context.request_ids[finished_idxs]
+
+        # Update requests.
+        context.update_requests(active_request_mask, new_sample)
+
+        return current_request_ids, finished_request_ids, new_sample
 
     def generate_all_output_tokens_static_batch(
         self,
@@ -295,9 +343,14 @@ class TextGenerationController:
         Returns:
             OrderedDict[str, InferenceRequest]: The result for each of the incoming requests
         """
+        assert all(request.prompt_tokens is not None for request in active_requests.values())
+
         # Perform a deep copy so that the request prompt tokens do not get modified.
-        batch_prompt_tokens_list = list(
-            map(lambda request: copy.deepcopy(request.prompt_tokens), active_requests.values())
+        batch_prompt_tokens_list: List[List[int]] = list(
+            map(
+                lambda request: copy.deepcopy(request.prompt_tokens),  # type: ignore[arg-type]
+                active_requests.values(),
+            )
         )
         prompt_lengths_in_batch = torch.tensor(
             [len(prompt_tokens) for prompt_tokens in batch_prompt_tokens_list],
@@ -306,8 +359,8 @@ class TextGenerationController:
         max_prompt_length_in_batch = max(prompt_lengths_in_batch)
         min_prompt_length_in_batch = min(prompt_lengths_in_batch)
 
-        # For batch inference the inference params are the same for all request
-        sampling_params: SamplingParams = list(active_requests.values())[0].inference_parameters
+        # For batch inference the sampling params are the same for all request
+        sampling_params: SamplingParams = list(active_requests.values())[0].sampling_params
 
         # max_seq_len = max_prompt_length_in_batch + num_tokens_to_generate
         batch_prompt_tokens = self.pad_input_prompt_tokens(
@@ -316,6 +369,16 @@ class TextGenerationController:
             num_tokens_to_generate=sampling_params.num_tokens_to_generate,
         )
         batch_size, max_sequence_length = batch_prompt_tokens.shape
+
+        # Verify that output sequence length is within configured limit
+        # TODO(ksanthanam): Raise TokenOverflowError once !2518 is merged
+        inference_max_sequence_length = (
+            self.inference_wrapped_model.inference_wrapper_config.inference_max_seq_length
+        )
+        assert max_sequence_length <= inference_max_sequence_length, (
+            f"Maximum allowed sequence length was set to {inference_max_sequence_length} tokens "
+            f"but requested generation of {max_sequence_length} tokens"
+        )
 
         # Pre allocate log probs tensor
         output_log_probs = None
@@ -336,9 +399,9 @@ class TextGenerationController:
             batch_size, device=torch.cuda.current_device()
         ).cuda()
 
-        # Use model vocab size since tokenizer vocab size might not include padding
+        # Use padded vocab size because tokenizer vocab size might not include padding
         # to nearest power of 2
-        vocab_size = get_attr_wrapped_model(self.inference_wrapped_model.model, "vocab_size")
+        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = get_model_config(self.inference_wrapped_model.model).enable_cuda_graph
@@ -360,10 +423,7 @@ class TextGenerationController:
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
-        use_attention_mask = True
-
         with torch.no_grad():
-
             self.inference_wrapped_model.prep_model_for_inference(
                 prompts_tokens=batch_prompt_tokens
             )
@@ -371,6 +431,10 @@ class TextGenerationController:
             inference_input: Dict[str, Any] = self.prep_inference_input(
                 prompts_tokens=batch_prompt_tokens, active_requests=active_requests
             )
+
+            assert (
+                not self.inference_wrapped_model.inference_context.decode_mode
+            ), f"Generation must start in prefill mode"
 
             context_start_position = 0
             # Pick the context window that we need to pass through the network.
@@ -382,11 +446,23 @@ class TextGenerationController:
                     )
                 )
 
+                # Disable attention mask when using CUDA graphs for decode
                 if (
-                    not use_attention_mask
+                    enable_cuda_graph
+                    and self.inference_wrapped_model.inference_context.decode_mode
                     and "attention_mask" in inference_input_for_context_window
                 ):
                     inference_input_for_context_window["attention_mask"] = None
+
+                # Only materialize prompt log probs if the user requests log probs
+                materialize_only_last_token_logits = (
+                    self.inference_wrapped_model.inference_context.decode_mode
+                    or not sampling_params.return_log_probs
+                )
+                inference_context = self.inference_wrapped_model.inference_context
+                inference_context.materialize_only_last_token_logits = (
+                    materialize_only_last_token_logits
+                )
 
                 # Returns the final logits of shape [batch_size, context_length, vocab_size]
                 # Note: This is returned in all TP ranks or last PP stage in PP models
@@ -394,13 +470,17 @@ class TextGenerationController:
                     inference_input_for_context_window
                 )
 
-                if enable_cuda_graph:
+                if self.enable_cuda_graph:
                     create_cudagraphs()
 
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
+                    logits_seq_len = 1 if materialize_only_last_token_logits else context_length
+                    logits_shape = [batch_size, logits_seq_len, vocab_size]
+                    if parallel_state.is_pipeline_last_stage():
+                        assert logits is not None and torch.Size(logits_shape) == logits.shape
                     logits = broadcast_from_last_pipeline_stage(
-                        [batch_size, context_length, vocab_size],
+                        [batch_size, logits_seq_len, vocab_size],
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
                     )
@@ -414,7 +494,7 @@ class TextGenerationController:
                     last_token_logits, sampling_params, vocab_size
                 )
 
-                # Substitute the sampled logits only for only the prompts that
+                # Substitute the sampled logits only for the prompts that
                 # have started generating tokens
                 batch_prompt_tokens[generation_started, context_end_position] = sampled_logits[
                     generation_started
@@ -472,9 +552,9 @@ class TextGenerationController:
                 if all_prompts_done:
                     break
 
-                # Disable attention mask for CUDA graphs (decode only)
-                if use_attention_mask and enable_cuda_graph and torch.all(generation_started):
-                    use_attention_mask = False
+                # Change to decode mode if all prefill is complete
+                if torch.all(generation_started):
+                    self.inference_wrapped_model.inference_context.enable_decode_mode()
 
         # Close all streams
         if streaming_enabled:
@@ -525,12 +605,16 @@ class TextGenerationController:
                 .tolist()
             )
             request.status = Status.COMPLETED
-            request.generated_text, request.generated_segments = self.detokenize_generations(
-                required_result_tokens,
+
+            text, segments = self.detokenize_generations(
+                batch_prompt_tokens_with_generations[idx],
                 input_prompt_length + generated_sequence_lengths,
                 sampling_params.return_segments,
             )
-
+            request.text = text  # Inference server returns prompts & generations together
+            if sampling_params.return_segments:
+                request.segments = segments[0]
+            request.generated_text = text[len(request.prompt) :]
         return active_requests
 
     def prep_inference_input(
@@ -621,7 +705,7 @@ class TextGenerationController:
                 InferenceRequest(
                     request_id=request_id,
                     prompt=request.prompt,
-                    inference_parameters=request.inference_parameters,
+                    sampling_params=request.sampling_params,
                     prompt_tokens=request.prompt_tokens,
                     arrival_time=request.arrival_time,
                     status=request.status,
