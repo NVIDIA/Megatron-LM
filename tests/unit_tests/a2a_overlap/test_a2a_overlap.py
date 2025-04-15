@@ -272,7 +272,11 @@ class TestA2AOverlap:
     def teardown_method(self, method):
         pass
 
-    def test_1f1b_overlap(self):
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize(
+        "dispatcher_type", ["alltoall", "flex"]
+    )
+    def test_1f1b_overlap(self, dispatcher_type):
         """
         Tests the 1-forward-1-backward overlap optimization.
 
@@ -280,54 +284,59 @@ class TestA2AOverlap:
         the same results as the reference implementation.
         """
 
-        if is_te_min_version("1.9.0.dev0"):
-            Utils.initialize_model_parallel(
-                tensor_model_parallel_size=1,
-                pipeline_model_parallel_size=4,
-                expert_model_parallel_size=2,
-                virtual_pipeline_model_parallel_size=2,
-            )
-            config = MLATransformerConfig(
-                pipeline_model_parallel_size=4,
-                expert_model_parallel_size=2,
-                deterministic_mode=True,
-                combined_1f1b=True,
-                combined_1f1b_recipe='ep_a2a',
-                bf16=True,
-                params_dtype=torch.bfloat16,
-                pipeline_dtype=torch.bfloat16,
-                num_layers=16,
-                hidden_size=7168,
-                add_bias_linear=False,
-                num_attention_heads=128,
-                ffn_hidden_size=18432,
-                kv_channels=128,
-                hidden_dropout=0.0,
-                attention_dropout=0.0,
-                multi_latent_attention=True,
-                num_moe_experts=16,
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=4,
+            expert_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+        )
+        extra_kwargs = {}
+        if dispatcher_type == "flex":
+            extra_kwargs["moe_enable_deepep"] = True
+            extra_kwargs["moe_router_dtype"] = "fp32"
+        config = MLATransformerConfig(
+            pipeline_model_parallel_size=4,
+            expert_model_parallel_size=2,
+            deterministic_mode=True,
+            combined_1f1b=True,
+            combined_1f1b_recipe='ep_a2a',
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            num_layers=16,
+            hidden_size=7168,
+            add_bias_linear=False,
+            num_attention_heads=128,
+            ffn_hidden_size=18432,
+            kv_channels=128,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            multi_latent_attention=True,
+            num_moe_experts=16,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type=dispatcher_type,
+            moe_shared_expert_intermediate_size=2048,
+            **extra_kwargs
+        )
+        microbatches = 4
+        with deterministic_mode():
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=16,
                 moe_grouped_gemm=True,
-                moe_token_dispatcher_type='alltoall',
-                moe_shared_expert_intermediate_size=2048,
+                qk_layernorm=True,
+                multi_latent_attention=True,
             )
-            microbatches = 4
-            with deterministic_mode():
-                transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    num_experts=16,
-                    moe_grouped_gemm=True,
-                    qk_layernorm=True,
-                    multi_latent_attention=True,
-                )
-                model = TransformerLayer(config, transformer_layer_spec.submodules)
+            model = TransformerLayer(config, transformer_layer_spec.submodules)
 
-                params = reset_model(model)
-                input_tensors = [build_data() for _ in range(microbatches)]
+            params = reset_model(model)
+            input_tensors = [build_data() for _ in range(microbatches)]
 
-                capture_ref = run_model_ref_with_capture(model, input_tensors, microbatches)
-                reset_model(model, params)
-                capture_a2a_overlap = run_model_a2a_overlap_with_capture(
-                    model, input_tensors, microbatches
-                )
+            capture_ref = run_model_ref_with_capture(model, input_tensors, microbatches)
+            reset_model(model, params)
+            capture_a2a_overlap = run_model_a2a_overlap_with_capture(
+                model, input_tensors, microbatches
+            )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
             Utils.destroy_model_parallel()

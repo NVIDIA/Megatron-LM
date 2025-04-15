@@ -55,7 +55,7 @@ class MemoryStrategyRegistry:
     }
 
     @classmethod
-    def get_strategy_by_name(cls, name, is_moe):
+    def get_strategy_by_name(cls, name, is_moe, is_deepep):
         """Gets the appropriate memory strategy for a node based on its name and MoE status.
 
         Args:
@@ -65,6 +65,9 @@ class MemoryStrategyRegistry:
         Returns:
             The memory strategy to use for the node.
         """
+        # TODO: add memory strategy for deepep
+        if is_deepep:
+            return NoOpMemoryStrategy()
         if is_moe:
             return cls._strategies.get(name, cls._strategies["default"])
         return NoOpMemoryStrategy()
@@ -234,7 +237,7 @@ class TransformerLayerNode(ScheduleNode):
     transformer layer nodes (attention, MLP, etc.)
     """
 
-    def __init__(self, stream, event, state, callables, is_moe, name="default"):
+    def __init__(self, stream, event, state, callables, is_moe, is_deepep, name="default"):
         """Initialize a transformer layer node.
 
         Args:
@@ -246,7 +249,7 @@ class TransformerLayerNode(ScheduleNode):
             name (str): Node name, also used to determine memory strategy
         """
         # Get memory strategy based on node name
-        memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(name, is_moe)
+        memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(name, is_moe, is_deepep)
 
         super().__init__(
             weak_method(self.forward_impl),
@@ -327,6 +330,7 @@ class TransformerLayerSchedulePlan:
             com_stream (torch.cuda.Stream): CUDA stream for communication.
         """
         is_moe = isinstance(layer.mlp, MoELayer)
+        is_deepep = layer.is_deepep
         self.common_state = TransformerLayerState()
         # get callables for transformer layer
         attn_callable, dispatch_callable, mlp_callable, combine_callable = (
@@ -336,17 +340,17 @@ class TransformerLayerSchedulePlan:
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
         self.attn = TransformerLayerNode(
-            comp_stream, event, self.common_state, attn_callable, is_moe, name="attn"
+            comp_stream, event, self.common_state, attn_callable, is_moe, is_deepep, name="attn"
         )
         self.mlp = TransformerLayerNode(
-            comp_stream, event, self.common_state, mlp_callable, is_moe, name="mlp"
+            comp_stream, event, self.common_state, mlp_callable, is_moe, is_deepep, name="mlp"
         )
         if is_moe:
             self.dispatch = TransformerLayerNode(
-                com_stream, event, self.common_state, dispatch_callable, is_moe, name="dispatch"
+                com_stream, event, self.common_state, dispatch_callable, is_moe, is_deepep, name="dispatch"
             )
             self.combine = TransformerLayerNode(
-                com_stream, event, self.common_state, combine_callable, is_moe, name="combine"
+                com_stream, event, self.common_state, combine_callable, is_moe, is_deepep, name="combine"
             )
         else:
             self.dispatch = FakeScheduleNode()
@@ -647,6 +651,7 @@ def schedule_chunk_1f1b(
             f_context=f_context,
             b_context=b_context,
         )
+        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
 
     # tail backward
@@ -657,6 +662,7 @@ def schedule_chunk_1f1b(
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
             tmp, grad, _ = schedule_layer_1f1b(None, b_layer, b_grad=grad)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         if b_schedule_plan is not None:
@@ -670,6 +676,7 @@ def schedule_chunk_1f1b(
             f_layer = f_schedule_plan.get_layer(i)
             torch.cuda.nvtx.range_push(f"layer_{i}f")
             f_input, tmp, _ = schedule_layer_1f1b(f_layer, None, f_input=f_input)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
