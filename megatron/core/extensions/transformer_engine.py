@@ -93,7 +93,7 @@ class TENorm:
 
         return instance
 
-class TESequentialLinear(te_ops.Sequential):
+class TESequentialNormLinear(te_ops.Sequential):
     def __init__(
         self,
         input_size: int,
@@ -153,7 +153,29 @@ class TESequentialLinear(te_ops.Sequential):
             tp_size = 1
             tp_group = None
 
+        # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
+        if is_te_min_version("0.11.0"):
+            normalization = self.config.normalization
+        elif self.config.normalization != "LayerNorm":
+            te_version = get_te_version()
+            raise ValueError(
+                f"Transformer Engine v{te_version} does not support {self.config.normalization}."
+            )
+
+        if normalization == 'LayerNorm':
+            norm_layer = te_ops.LayerNorm
+        elif normalization == "RMSNorm":
+            norm_layer = te_ops.RMSNorm
+        else:
+            raise ValueError(f"Unsupported normalization: {normalization}")
+
+
         super().__init__(
+            norm_layer(
+                input_size,
+                eps=self.config.layernorm_epsilon,
+                zero_centered_gamma=self.config.layernorm_zero_centered_gamma
+                ),
             te_ops.Linear(
                 in_features=input_size,
                 out_features=output_size,
@@ -163,7 +185,6 @@ class TESequentialLinear(te_ops.Sequential):
                     get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
                 ),
                 bias=bias,
-                dtype=torch.bfloat16,
             )
         )
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
@@ -173,7 +194,7 @@ class TESequentialLinear(te_ops.Sequential):
             state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
         )
 
-class TESwigluLinear(te_ops.Sequential):
+class TESequentialSwigluLinear(te_ops.Sequential):
     """
     Wrapper for Transformer-Engine's SwiGLU + Linear layer.
 
@@ -232,7 +253,7 @@ class TESwigluLinear(te_ops.Sequential):
 
         super().__init__(
             te_ops.Quantize(forward=False, backward=True),
-            te_ops.SwiGLU(), 
+            te_ops.SwiGLU(cache_quantized_input=self.config.activation_func_fp8_input_store), 
             te_ops.Linear(
                 in_features=input_size,
                 out_features=output_size,
@@ -242,7 +263,6 @@ class TESwigluLinear(te_ops.Sequential):
                     get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
                 ),
                 bias=bias,
-                dtype=torch.bfloat16,
             )
         )
     

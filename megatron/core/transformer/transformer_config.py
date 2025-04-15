@@ -394,6 +394,10 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    use_fused_swiglu: bool = False
+    """If True, the SwiGLU activation function will be fused with the linear layer in the MLP."""
+
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
