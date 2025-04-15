@@ -466,6 +466,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
+        handle = None
         tp_group = ctx.tp_group
 
         wgrad_compute = True
@@ -988,7 +989,6 @@ class ColumnParallelLinear(torch.nn.Module):
 
         if gather_output:
             # All-gather across the partitions.
-            assert not self.sequence_parallel
             output = gather_from_tensor_model_parallel_region(output_parallel, group=self.tp_group)
         else:
             output = output_parallel
