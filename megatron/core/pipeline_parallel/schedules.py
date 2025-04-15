@@ -776,7 +776,7 @@ def forward_backward_pipelining_with_interleaving(
 
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     forward_data_store = []
     output_tensor_grads = None
@@ -1844,7 +1844,7 @@ def forward_backward_pipelining_without_interleaving(
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if not forward_only:
         input_tensors = []
