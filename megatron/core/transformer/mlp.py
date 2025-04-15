@@ -26,6 +26,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 class MLPSubmodules:
     linear_fc1: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
+    norm_linear_fc1: Union[ModuleSpec, type] = None
+    swiglu_linear_fc2: Union[ModuleSpec, type] = None
 
 
 class MLP(MegatronModule):
@@ -69,36 +71,68 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
-            self.input_size,
-            ffn_hidden_size,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=self.config.add_bias_linear,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc1',
-        )
+        self.use_fused_swiglu = (self.config.activation_func == F.silu and
+                                self.config.gated_linear_unit and
+                                self.config.tensor_model_parallel_size == 1 and
+                                self.config.use_fused_swiglu)
+        
+        if self.use_fused_swiglu:
+            self.norm_linear_fc1 = build_module(
+                submodules.norm_linear_fc1,
+                self.input_size,
+                ffn_hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                is_expert=is_expert,
+            )
 
-        self.activation_func = self.config.activation_func
+            self.swiglu_linear_fc2 = build_module(
+                submodules.swiglu_linear_fc2,
+                self.config.ffn_hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                is_expert=is_expert,
+            )
+        else:
+            self.linear_fc1 = build_module(
+                submodules.linear_fc1,
+                self.input_size,
+                ffn_hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                is_expert=is_expert,
+                tp_comm_buffer_name='fc1',
+            )
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
-        )
+            self.activation_func = self.config.activation_func
+
+            self.linear_fc2 = build_module(
+                submodules.linear_fc2,
+                self.config.ffn_hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=is_expert,
+                tp_comm_buffer_name='fc2',
+            )
 
     def forward(self, hidden_states):
         """Perform the forward pass through the MLP block."""
+        if self.use_fused_swiglu:
+            output = self.swiglu_linear_fc2(self.norm_linear_fc1(hidden_states))
+            return output, None
+        
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
