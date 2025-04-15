@@ -511,7 +511,7 @@ class TransformerConfig(ModelParallelConfig):
     """The number of groups used in Mamba layers."""
 
     log_kurtosis: bool = False
-    """Whether to log kurtosis or not.
+    """Whether to log kurtosis or not."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
