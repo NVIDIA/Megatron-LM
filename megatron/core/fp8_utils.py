@@ -182,7 +182,8 @@ if HAVE_TE:
                     )
                 elif config.fp8_recipe == Fp8Recipe.tensorwise:
                     fp8_recipe = transformer_engine.common.recipe.Float8CurrentScaling(
-                        fp8_format=fp8_format
+                        fp8_format=fp8_format,
+                        fp8_dpa=config.fp8_dot_product_attention,
                     )
                 elif config.fp8_recipe == Fp8Recipe.mxfp8:
                     fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
