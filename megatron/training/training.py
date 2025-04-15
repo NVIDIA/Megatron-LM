@@ -990,7 +990,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         timers.write(timers_to_log, writer, iteration,
                      normalizer=total_iterations)
 
-    if iteration % args.tensorboard_log_interval == 0:
+    tracker = None
+    intermediate_interval = args.tensorboard_log_interval if args.log_intermediate_metrics_interval is None else args.log_intermediate_metrics_interval
+    if iteration % intermediate_interval == 0:
         tracker = get_tracker()
         timers("tracker-aggregate", log_level=0).start(barrier=True)
         tracker.aggregate()
@@ -1103,18 +1105,20 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                 if wandb_writer:
                     wandb_writer.log({f'grad-norm/{param_shape}': norm}, iteration)
                     
-        for key, value in tracker.get_final_metrics():
-            writer.add_scalar(key, value, iteration)
-            if wandb_writer:
-                wandb_writer.log({key: value}, iteration)
-        if args.log_timers_to_tensorboard:
+        if tracker is not None:
+            for key, value in tracker.get_final_metrics():
+                writer.add_scalar(key, value, iteration)
+                if wandb_writer:
+                    wandb_writer.log({key: value}, iteration)
+        if args.log_timers_to_tensorboard and tracker is not None:
             elapsed = timers("tracker-aggregate").elapsed(barrier=True)
             if writer:
                 writer.add_scalar("tracker-agg-time", elapsed, iteration)
             if wandb_writer:
                 wandb_writer.log({"tracker-agg-time": elapsed}, iteration)
 
-    tracker.reset()
+    if tracker is not None:
+        tracker.reset()
 
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
@@ -1612,10 +1616,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
-        # Determine if we should enable the tracker (i.e. if we are going to log this iteration.
-        if iteration % args.tensorboard_log_interval == 0:
-            tracker = get_tracker()
+        # Determine if we should enable the tracker (i.e. if we are going to log this iteration).
+        intermediate_interval = args.tensorboard_log_interval if args.log_intermediate_metrics_interval is None else args.log_intermediate_metrics_interval
+        tracker = get_tracker()
+        if (iteration + 1) % intermediate_interval == 0:
             tracker.enable()
+        else:
+            tracker.disable()
 
         # Run training step.
         args.curr_iteration = iteration

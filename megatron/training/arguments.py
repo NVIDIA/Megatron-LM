@@ -1283,6 +1283,8 @@ def _add_logging_args(parser):
                        'directory.')
     group.add_argument('--log-intermediate-metrics', nargs='+', default=[], choices=["mean", "rms", "kurtosis"],
                        help='Log these metrics on all activations, qkv and mlp vectors')
+    group.add_argument('--log-intermediate-metrics-interval', type=int, default=None,
+                       help='Frequency to log the intermediate metrics (see `--log-intermediate-metrics`)')
     group.add_argument('--timing-log-level', type=int,
                        default=0, choices=range(0,3),
                        help='Granularity level to measure and report timing. '

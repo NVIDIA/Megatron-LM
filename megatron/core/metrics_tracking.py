@@ -55,6 +55,7 @@ class Tracker:
     def enable(self):
         self.enabled = True
 
+    @torch.no_grad()
     def update(self, x: torch.Tensor, name: str, layer: int):
         # x.shape = [seq, mbs, ...].
         if len(self.metrics) == 0 or not self.enabled:
@@ -65,7 +66,7 @@ class Tracker:
 
         mbs = x.size(1)
         pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-        x = x.clone().detach().transpose(0, 1).reshape(mbs, -1)  # [mbs, ...]
+        x = x.transpose(0, 1).reshape(mbs, -1)
         batch_slice = slice(self.current_mbs*mbs, (self.current_mbs + 1)*mbs)
         name_idx = self.expected_names[name][0]
         assert self.local_first_layer <= layer < pp_size*self.local_layers, f"({self.local_first_layer}, {layer}, {self.local_layers})"
@@ -88,6 +89,7 @@ class Tracker:
         if torch.all(~torch.isinf(self.partial_results[batch_slice, :, :, :])):
             self.current_mbs += 1
 
+    @torch.no_grad()
     def aggregate(self):
         if len(self.metrics) == 0:
             return

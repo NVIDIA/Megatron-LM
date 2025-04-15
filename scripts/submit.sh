@@ -2,13 +2,10 @@
 # Some constants.
 SCRIPT_VERSION=v1
 SEQ_LEN=4096
-TOKENIZER=alehc/swissai-tokenizer
+TOKENIZER=/capstor/store/cscs/swissai/a06/users/ahernnde/swissai-tokenizer/
 DATA_DIR=/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge
 CODE_PATH=$STORE/users/ahernnde/workspace/AleHD-Megatron-LM
 
-DEF_TOKENS=50
-
-TOKENS=$DEF_TOKENS
 ACTIVATION=swiglu
 QK_IMPL=apex
 DYT_ALPHA=1.0
@@ -24,7 +21,7 @@ MIN_LR=1e-8
 # Usage function.
 usage () {
 	echo "Usage: llama.sh <size> [options...]"
-	echo "<size>: 300/1"
+	echo "<size>: 300/1/8"
 	echo "Options:"
 	# Misc settings.
 	echo " --debug: Displays this message"
@@ -39,7 +36,7 @@ usage () {
 	echo " --fp8-e4m3: Use e4m3 fp8 precision instead of hybrid"
 	echo " --fp8-len <int>: fp8 history length"
 	# Training settings..
-	echo " --tokens <int> (default=$DEF_TOKENS): Amount of tokens to train with (in B)."
+	echo " --tokens <int> ): Amount of tokens to train with (in B)."
 	echo " --lr <float>: Learning rate."
 	echo " --cooldown-wd: When set weight decay will be cooldown."
 	# Architecture settings.
@@ -62,6 +59,7 @@ usage () {
 	echo " --no-train-qk-gains: Don't train QK layernorm gains"
 	# Logs.
 	echo " --log-grad: Log individual grad norms."
+	echo " --wandb-name <str>: Specify wandb name."
 }
 
 if [[ $# -eq 0 ]]; then
@@ -74,6 +72,8 @@ fi
 EXTRA_ARGS=()
 TP=1
 PP=1
+UNTIE=true
+INTERMEDIATE_METRICS_INTERVAL=1
 if [[ $1 -eq 300 ]]; then 
 	# batch_size: ~0.52M.
 	# tok/sec/gpu: ~59.5k  (4nodes, bf16).
@@ -91,11 +91,13 @@ if [[ $1 -eq 300 ]]; then
 	INIT_STD=0.001
 	SIZE=390M
 	SAVE_FREQ=10000
+	DEF_TOKENS=50
+	UNTIE=false
 elif [[ $1 -eq 1 ]]; then 
 	# batch_size: ~1.05M.
-	# tok/sec/gpu: ~36.5k (8nodes, bf16).
-	# 50B ETA: ~12h (8nodes, bf16).
-	# ckpt freq: ~1h15m (8nodes, bf16).
+	# tok/sec/gpu: ~38.5k (8nodes, bf16).
+	# 125B ETA: ~29h (8nodes, bf16).
+	# ckpt freq: ~1h10m (8nodes, bf16).
 	LAYERS=16
 	HIDDEN_SIZE=2048
 	FFN_SIZE=8192
@@ -105,9 +107,28 @@ elif [[ $1 -eq 1 ]]; then
 	GBS=256
 	ITERS=1000  # 1BT.
 	LR=0.0005
-	INIT_STD=0.01
-	SIZE=1.3B
+	INIT_STD=0.02
+	SIZE=1.5B
 	SAVE_FREQ=5000
+	DEF_TOKENS=125
+	INTERMEDIATE_METRICS_INTERVAL=10
+elif [[ $1 -eq 8 ]]; then 
+	# batch_size: ~1.1M.
+	TP=4  # TODO: TP=1 is faster but we need DP>=64 for this.
+	LAYERS=32
+	HIDDEN_SIZE=4096
+	FFN_SIZE=14336
+	NUM_HEADS=32
+	NUM_QUERY_GROUPS=8
+	MBS=4
+	GBS=512
+	ITERS=500  # 1BT.
+	LR=0.0005  # TODO: Previously baseline lr=0.00005, OP lr=0.0003.
+	INIT_STD=0.02  # TODO: Most likely OP will need larger.
+	SIZE=8B
+	SAVE_FREQ=5000
+	DEF_TOKENS=250
+	INTERMEDIATE_METRICS_INTERVAL=100
 else
 	>&2 echo "Invalid llama size: $1"
 	usage
@@ -116,6 +137,7 @@ fi
 shift
 
 # Now get the general options.
+TOKENS=$DEF_TOKENS
 ENVS=""
 SUFFIX=""
 while [[ $# -gt 0 ]]; do
@@ -185,6 +207,8 @@ while [[ $# -gt 0 ]]; do
 			NOTRAIN_GAINS=true; shift;;
 		--log-grad)
 			LOG_GRADS=true; shift;;
+		--wandb-name)
+			WANDB_NAME=$2; shift 2;;
 		*)
 			echo "Unexpected argument $1"
 			usage
@@ -318,7 +342,7 @@ DECAY_ITERS=$(($ITERS/5))
 
 if [[ $COOLDOWN_WD = true ]]; then
 	SUFFIX=$SUFFIX-coolWD
-	MIN_COOLDOWN=$(echo "print($LR*$WEIGHT_DECAY/$MIN_LR)" | python3)
+	MIN_COOLDOWN=$(echo "print($MIN_LR*$WEIGHT_DECAY/$LR)" | python3)
 	OPT_ARGS+=(--end-weight-decay-cooldown $MIN_COOLDOWN --weight-decay-cooldown-iters $DECAY_ITERS --weight-decay-cooldown-style 1-sqrt)
 fi
 
@@ -345,6 +369,9 @@ if [[ $NODES -eq 1 ]] && [[ $DEBUG = true ]]; then
 fi
 if [[ $DEBUG = true ]]; then
 	JOB_NAME=$NAME-debug
+fi
+if [[ -z ${WANDB_NAME+x} ]]; then
+	WANDB_NAME=$NAME
 fi
 
 #= WRAPPING UP: Set up the _ARGS variables that are going to be used in the end =#
@@ -378,6 +405,9 @@ LLAMA_ARGS=(
 	--adam-eps 0.00000001
 	--norm-epsilon 0.00001
 )
+if [[ $UNTIE = true ]]; then
+	LLAMA_ARGS+=(--untie-embeddings-and-output-weights)
+fi
 
 TRAINING_ARGS=(
 	--micro-batch-size $MBS
@@ -415,7 +445,7 @@ LOGGING=(
 	--eval-interval $EVAL_INTERVAL
 	--eval-iters $EVAL_ITERS
 	--wandb-project $WANDB_PROJECT
-	--wandb-exp-name $NAME
+	--wandb-exp-name $WANDB_NAME
 	--wandb-save-dir $ROOT_PATH/wandb
 	--timing-log-level 1
 	--tensorboard-log-interval 1
@@ -423,9 +453,10 @@ LOGGING=(
 	--log-throughput
 	--log-timers-to-tensorboard
 	--log-validation-ppl-to-tensorboard
+	--log-intermediate-metrics mean rms kurtosis
+	--log-intermediate-metrics-interval $INTERMEDIATE_METRICS_INTERVAL
 	--log-params-norm-per-param
 	--log-num-zeros-in-grad
-	--log-intermediate-metrics mean rms kurtosis
 	--log-params-norm
 	--log-memory-to-tensorboard
 	--log-weight-decay
