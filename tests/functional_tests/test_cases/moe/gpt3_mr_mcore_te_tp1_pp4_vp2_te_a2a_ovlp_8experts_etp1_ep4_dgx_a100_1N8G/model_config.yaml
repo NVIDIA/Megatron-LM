@@ -65,7 +65,7 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
-  # --combined-1f1b: true
-  # --combined-1f1b-recipe: ep_a2a
-  # --moe-token-dispatcher-type: alltoall
+  --combined-1f1b: true
+  --combined-1f1b-recipe: ep_a2a
+  --moe-token-dispatcher-type: alltoall
 TEST_TYPE: regular
