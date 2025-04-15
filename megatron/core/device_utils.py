@@ -6,10 +6,12 @@ try:
     import torch_xla.core.xla_model as xm
     import torch_xla.runtime as xr
     import torch_xla.distributed.xla_backend as xb
+    import torch_xla.distributed.spmd as xs
 except ImportError:
     xm = None
     xr = None
     xb = None
+    xs = None
 
 
 def get_xla_model():
@@ -19,6 +21,8 @@ def get_xla_model():
 def get_xla_runtime():
     return xr
 
+def get_xla_spmd():
+    return xs
 
 def get_current_device() -> torch.device:
     global __current_device

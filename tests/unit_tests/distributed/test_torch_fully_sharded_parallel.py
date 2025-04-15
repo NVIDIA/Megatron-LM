@@ -2,7 +2,8 @@
 import pytest
 import torch
 
-from megatron.core.device_utils import get_xla_model
+from megatron.core.device_utils import get_current_device, get_xla_model, get_xla_runtime
+
 from megatron.core import parallel_state
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.torch_fully_sharded_data_parallel import (
@@ -22,6 +23,7 @@ from megatron.core.utils import init_method_normal, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
 
 xm = get_xla_model()
+xr = get_xla_runtime()
 
 class DummyModel(MegatronModule):
     """Setup a few modules to test the FSDP2 constructor."""
@@ -40,6 +42,8 @@ class DummyModel(MegatronModule):
 @pytest.fixture
 def init_model_parallel():
     """Init torch distributed."""
+    if xr:
+        xr.use_spmd()
     Utils.initialize_model_parallel(1, 1)
     init_num_microbatches_calculator(0, None, 1, 1, 1)
     model_parallel_device_manual_seed(123)
@@ -47,7 +51,7 @@ def init_model_parallel():
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
 
-@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
+#@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
 def test_fsdp2_constructor(init_model_parallel):
     """Test the FSDP2 constructor."""
     if not is_torch_min_version("2.4.0"):
@@ -57,6 +61,7 @@ def test_fsdp2_constructor(init_model_parallel):
     config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
     ddp_config = DistributedDataParallelConfig()
     model = DummyModel(config)
+    model.to(get_current_device())
     model = Float16Module(config, model)
     ddp_config = DistributedDataParallelConfig()
 
@@ -68,14 +73,14 @@ def test_fsdp2_constructor(init_model_parallel):
         return instance.__class__.__name__.startswith("FSDP")
 
     assert isinstance(fsdp_model, TorchFullyShardedDataParallel)
-    # We manually added Linear to the list of submodules to wrap.
-    assert _is_fsdp_wrapped_module(fsdp_model.module.module.linear)
-    # ColumnParallelLinear is in the default list of submodules to wrap.
-    assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)
-    # Conv2d is not in the list of submodules to wrap.
-    assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
+    if xm is None:
+        # We manually added Linear to the list of submodules to wrap.
+        assert _is_fsdp_wrapped_module(fsdp_model.module.module.linear)
+        # ColumnParallelLinear is in the default list of submodules to wrap.
+        assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)
+        # Conv2d is not in the list of submodules to wrap.
+        assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
 
-@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
 def test_fsdp2_constructor_with_process_group(init_model_parallel):
     """Test the FSDP2 constructor with explicit process group parameter."""
     if not is_torch_min_version("2.4.0"):
@@ -85,14 +90,18 @@ def test_fsdp2_constructor_with_process_group(init_model_parallel):
     config = TransformerConfig(num_layers=1, kv_channels=1, bf16=True)
     ddp_config = DistributedDataParallelConfig()
     model = DummyModel(config)
+    model.to(get_current_device())
     model = Float16Module(config, model)
 
     # Create a custom process group (using the default world for testing)
     custom_process_group = WrappedProcessGroup(
         process_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
         rank_groups=parallel_state.get_data_parallel_groups(with_context_parallel=True)
+    ) if xm is None else WrappedProcessGroup(
+        process_group=parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+        rank_groups=parallel_state.get_data_parallel_groups(with_context_parallel=True)
     )
-
+        
     # Create the sharded model with explicit process group
     fsdp_model = TorchFullyShardedDataParallel(
         config, ddp_config, model, group=custom_process_group
@@ -106,6 +115,7 @@ def test_fsdp2_constructor_with_process_group(init_model_parallel):
         return instance.__class__.__name__.startswith("FSDP")
 
     assert isinstance(fsdp_model, TorchFullyShardedDataParallel)
-    assert _is_fsdp_wrapped_module(fsdp_model.module.module.linear)
-    assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)
-    assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
+    if xm is None:
+        assert _is_fsdp_wrapped_module(fsdp_model.module.module.linear)
+        assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)
+        assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)

@@ -2,14 +2,21 @@
 
 from typing import Optional, Set
 
+import numpy as np
 import torch
-import torch.distributed
 
-from megatron.core.device_utils import get_current_device_type, get_xla_model
+from megatron.core.device_utils import (
+    get_current_device_type, 
+    get_xla_model, 
+    get_xla_runtime, 
+    get_xla_spmd
+)
 from megatron.core.process_groups_config import WrappedProcessGroup
 
 try:
-    from torch_xla.distributed.fsdp import XlaFullyShardedDataParallel as fully_shard
+    from torch_xla.experimental.spmd_fully_sharded_data_parallel import (
+        SpmdFullyShardedDataParallel as fully_shard
+    )
     HAVE_FSDP = True
 except ImportError:
     try:
@@ -19,8 +26,6 @@ except ImportError:
         HAVE_FSDP = True
     except ImportError:
         HAVE_FSDP = False
-
-from torch.distributed import ProcessGroup
 
 from megatron.core.fp8_utils import is_float8tensor
 
@@ -33,6 +38,8 @@ from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
 xm = get_xla_model()
+xr = get_xla_runtime()
+xs = get_xla_spmd()
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
     """
@@ -90,19 +97,14 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             self.group = group
 
         if xm:
-            sharding_groups = self.group.rank_groups
-            sharding_world_size=self.group.size()
-            sharding_rank = self.group.rank()
-            kwargs = {
-                "sharding_groups": sharding_groups, 
-                "sharding_rank": sharding_rank, 
-                "sharding_world_size": sharding_world_size,
-                "reshard_after_forward": True,
-                "execute_sharding_on_init": True,
-                "optimization_barrier_in_forward": True,
-                "optimization_barrier_in_backward": True,
-                "mark_step_on_finalization": True,
-            }
+            # Define the mesh following common SPMD practice
+            num_devices = xr.global_runtime_device_count()
+            device_ids = np.array(range(num_devices))
+            mesh_shape = (len(self.group.rank_groups[0]), len(self.group.rank_groups))
+            # To be noted, the mesh must have an axis named 'fsdp', 
+            # # which the weights and activations will be sharded on.
+            self.mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'model'))
+            kwargs = {"mesh": self.mesh}
         else:
             self.mesh = DeviceMesh.from_group(self.group.process_group, get_current_device_type())
             kwargs = {"mesh": self.mesh}

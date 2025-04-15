@@ -10,13 +10,14 @@ from typing import Callable, List, Optional
 
 import torch.distributed
 
-from .device_utils import get_current_device, get_xla_model
+from .device_utils import get_current_device, get_xla_model, get_xla_runtime
 import torch
 from torch.distributed import ProcessGroup
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 xm = get_xla_model()
+xr = get_xla_runtime()
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -193,7 +194,7 @@ def create_group(
     kwargs = {
         'ranks': ranks,
         'timeout': timeout,
-        'backend': backend,
+        'backend': backend if not xr or not xr.is_spmd() else "gloo", # XLA backend is not supported with SPMD for now
         'pg_options': pg_options,
         'use_local_synchronization': use_local_synchronization,
         'group_desc': group_desc,
