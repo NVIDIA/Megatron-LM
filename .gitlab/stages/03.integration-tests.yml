@@ -75,7 +75,9 @@ integration:configure:
       - tests/test_utils/local_recipes
 
 .integration_run:
-  needs: [integration:configure]
+  needs:
+    - integration:configure
+    - test:build_image
   extends: [.integration_tests_rules]
   trigger:
     include:
@@ -88,6 +90,9 @@ integration:configure:
     CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
     GITLAB_ENDPOINT: $GITLAB_ENDPOINT
     PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    MCORE_MR_COMMIT: $MCORE_MR_COMMIT
+    MCORE_BACKWARDS_COMMIT: $MCORE_BACKWARDS_COMMIT
+
   inherit:
     variables: true
 

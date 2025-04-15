@@ -90,6 +90,12 @@ def launch_and_wait_for_completion(
                                         "RECORD_CHECKPOINTS": str(
                                             record_checkpoints == "true"
                                         ).lower(),
+                                        "RO_API_TOKEN": os.getenv("RO_API_TOKEN") or "",
+                                        "MCORE_REPO": os.getenv("CI_REPOSITORY_URL") or "",
+                                        "MCORE_MR_COMMIT": os.getenv("MCORE_MR_COMMIT") or "",
+                                        "MCORE_BACKWARDS_COMMIT": (
+                                            os.getenv("MCORE_BACKWARDS_COMMIT") or ""
+                                        ),
                                     }
                                 }
                             }
