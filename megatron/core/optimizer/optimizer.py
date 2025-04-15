@@ -957,10 +957,24 @@ class ChainedOptimizer(MegatronOptimizer):
                         if model_chunk not in self.model_chunks:
                             self.model_chunks.append(model_chunk)
                 assert self.config == getattr(optimizer, 'config', None)
-            self.is_stub_optimizer = False
+            # If all optimizers are stub optimizers, the ChainedOptimizer is also a stub optimizer
+            self.is_stub_optimizer = all(
+                getattr(optimizer, 'is_stub_optimizer', False) for optimizer in chained_optimizers
+            )
+
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
+
+    @property
+    def optimizer(self):
+        """
+        Access underlying optimizer when only one optimizer included for backward compatibility.
+        """
+        assert (
+            len(self.chained_optimizers) == 1
+        ), "ChainedOptimizer has more than one optimizer when accessing self.optimizer"
+        return self.chained_optimizers[0].optimizer
 
     @property
     def param_groups(self) -> List[dict]:
@@ -993,21 +1007,33 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.reload_model_params()
 
     def state_dict(self):
-        return [optimizer.state_dict() for optimizer in self.chained_optimizers]
+        if len(self.chained_optimizers) == 1:
+            return self.chained_optimizers[0].state_dict()
+        else:
+            return [optimizer.state_dict() for optimizer in self.chained_optimizers]
 
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
-        sharded_state_dict = {}
-        for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
-            optim_state_dict = optimizer.sharded_state_dict(
+        if len(self.chained_optimizers) == 1:
+            return self.chained_optimizers[0].sharded_state_dict(
                 model_sharded_state_dict, is_loading, **kwargs
             )
-            add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
-            sharded_state_dict[optimizer_idx] = optim_state_dict
-        return sharded_state_dict
+        else:
+            sharded_state_dict = {}
+            for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                optim_state_dict = optimizer.sharded_state_dict(
+                    model_sharded_state_dict, is_loading, **kwargs
+                )
+                add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                sharded_state_dict[optimizer_idx] = optim_state_dict
+            return sharded_state_dict
 
     def load_state_dict(self, state_dict):
+        # If there is only one optimizer, we read the state dict as a single optimizer.
+        if len(self.chained_optimizers) == 1:
+            self.chained_optimizers[0].load_state_dict(state_dict)
+            return
         if len(self.chained_optimizers) != len(state_dict):
             raise RuntimeError(
                 f'Expected {len(self.chained_optimizers)} entries'
@@ -1040,24 +1066,72 @@ class ChainedOptimizer(MegatronOptimizer):
 
         return success
 
+    def grads_states_parallel_group_is_shared(self):
+        """Check if all optimizers share the same gradient statistics parallel group."""
+        reference_group = self.chained_optimizers[0].get_grad_stats_parallel_group()
+        return all(
+            optimizer.get_grad_stats_parallel_group() == reference_group
+            for optimizer in self.chained_optimizers
+        )
+
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
+        assert self.grads_states_parallel_group_is_shared(), (
+            "Can't use get_grad_stats_parallel_group() for ChainedOptimizer, "
+            "since grads states parallel group are not shared across all optimizers"
+        )
+        return self.chained_optimizers[0].get_grad_stats_parallel_group()
+
+    @torch.no_grad()
+    def get_grad_norm(self):
+        if len(self.chained_optimizers) == 1:
+            return self.chained_optimizers[0].get_grad_norm()
+        if self.grads_states_parallel_group_is_shared():
+            grads_for_norm = []
+            for optimizer in self.chained_optimizers:
+                grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+            grad_norm = get_grad_norm_fp32(
+                grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+        else:
+            grad_norms = []
+            for optimizer in self.chained_optimizers:
+                _grad_norm = optimizer.get_grad_norm()
+                grad_norms += [_grad_norm if _grad_norm else 0.0]
+            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+        return grad_norm
+
+    @torch.no_grad()
+    def count_zeros(self):
+        if self.grads_states_parallel_group_is_shared():
+            params = []
+            for optimizer in self.chained_optimizers:
+                params += optimizer.get_parameters()
+            return count_zeros_fp32(
+                params,
+                grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
+                use_decoupled_grad=self.config.use_precision_aware_optimizer,
+            )
+        else:
+            num_zeros_in_grad = 0
+            for optimizer in self.chained_optimizers:
+                num_zeros_in_grad += (
+                    optimizer.count_zeros() if optimizer.config.log_num_zeros_in_grad else 0
+                )
+            return num_zeros_in_grad
+
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
-        if self.is_stub_optimizer:
-            return True, 0.0, 0
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
 
-        # Get grad norm.
-        grad_norms = []
-        for optimizer in self.chained_optimizers:
-            _grad_norm = optimizer.get_grad_norm()
-            grad_norms += [_grad_norm if _grad_norm else 0.0]
-        grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+        grad_norm = self.get_grad_norm()
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
+            if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
+                continue
             if optimizer.config.clip_grad > 0.0:
                 clip_grad_by_total_norm_fp32(
                     optimizer.get_parameters(),
@@ -1067,11 +1141,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
 
         # Count the zeros in the grads.
-        num_zeros_in_grad = 0
-        for optimizer in self.chained_optimizers:
-            num_zeros_in_grad += (
-                optimizer.count_zeros() if optimizer.config.log_num_zeros_in_grad else 0
-            )
+        num_zeros_in_grad = self.count_zeros()
 
         update_successful = self.step_with_ready_grads()
 
@@ -1083,6 +1153,9 @@ class ChainedOptimizer(MegatronOptimizer):
         Args:
             filename (str): path to save parameter state to.
         """
+        if len(self.chained_optimizers) == 1:
+            self.chained_optimizers[0].save_parameter_state(filename)
+            return
         save_states = False
         states = []
         for optimizer in self.chained_optimizers:
@@ -1108,6 +1181,11 @@ class ChainedOptimizer(MegatronOptimizer):
         Args:
             filename (str): path to load parameter state from.
         """
+        if len(self.chained_optimizers) == 1:
+            self.chained_optimizers[0].load_parameter_state(
+                filename, update_legacy_format=update_legacy_format
+            )
+            return
         states = None
         for idx, optimizer in enumerate(self.chained_optimizers):
             if not hasattr(optimizer, 'load_parameter_state_from_dp_zero'):

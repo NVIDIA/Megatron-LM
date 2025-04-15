@@ -88,6 +88,10 @@ def model_provider(
 
     print_rank_0('building a multimodal model ...')
     language_transformer_config = core_transformer_config_from_args(get_args())
+    if args.decoder_num_layers is not None:
+        language_transformer_config.num_layers = args.decoder_num_layers
+    else:
+        language_transformer_config.num_layers = args.num_layers
     if args.decoder_tp_comm_overlap:
         assert args.transformer_impl == "transformer_engine", \
             "TransformerEngine is needed to support Decoder TP Comm overlap"
@@ -157,11 +161,13 @@ def model_provider(
             vision_projection_config.tensor_model_parallel_size = (
                 args.encoder_tensor_model_parallel_size
             )
+    else:
+        # Vision Encoder and Projection should live on PP rank0 if not using EPP
+        vision_transformer_config.pipeline_model_parallel_size = 1
+        vision_projection_config.pipeline_model_parallel_size = 1
+
 
     vision_projection_modules = deepcopy(language_transformer_layer_spec.submodules.mlp.submodules)
-
-    if args.virtual_pipeline_model_parallel_size:
-        raise NotImplementedError("virtual pipeline model parallelism is not supported yet.")
 
     language_max_sequence_length = args.decoder_seq_length
     if args.context_parallel_size > 1:
@@ -183,10 +189,16 @@ def model_provider(
         language_position_embedding_type=args.position_embedding_type,
         language_rotary_percent=args.rotary_percent,
         language_rope_scaling=args.use_rope_scaling,
-        pre_process=pre_process,
-        post_process=post_process,
-        add_encoder=add_encoder,
-        add_decoder=add_decoder,
+        pre_process=(
+            parallel_state.is_pipeline_first_stage() or 
+            parallel_state.get_pipeline_model_parallel_rank() == args.encoder_pipeline_model_parallel_size
+        ),
+        post_process=parallel_state.is_pipeline_last_stage(),
+        add_encoder=parallel_state.is_pipeline_first_stage(),
+        add_decoder=(
+            parallel_state.is_pipeline_last_stage() or 
+            parallel_state.get_pipeline_model_parallel_rank() >= args.encoder_pipeline_model_parallel_size
+        ),
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
@@ -223,6 +235,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         image_h=args.img_h,
         image_w=args.img_w,
         preprocess_func=_preprocess_data_for_llava,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
     )
 
     print_rank_0("> building train, validation, and test datasets for multimodal ...")

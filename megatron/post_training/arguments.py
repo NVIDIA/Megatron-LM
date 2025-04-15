@@ -75,9 +75,11 @@ def add_modelopt_args(parser):
         help='Path to checkpoint to load as distillation teacher.',
     )
     group.add_argument(
-        '--export-kd-finalize',
-        action="store_true",
-        help='Export original student class back from a loaded distillation model.',
+        '--export-kd-teacher-ckpt-format',
+        type=str,
+        default=None,
+        choices=['torch', 'torch_dist', 'zarr', 'torch_dcp'],
+        help="Checkpoint format of teacher model, if different from student's.",
     )
 
     # Speculative decoding
@@ -100,3 +102,18 @@ def add_modelopt_args(parser):
     )
 
     return parser
+
+
+def modelopt_args_enabled(args):
+    """Check if any modelopt-related arguments are provided."""
+    key_args_and_defaults = {
+        "export_real_quant_cfg": "None",
+        "export_quant_cfg": None,
+        "export_kd_teacher_load": None,
+        "export_num_medusa_heads": 0,
+        "export_num_eagle_layers": 0,
+    }
+    for key, default in key_args_and_defaults.items():
+        if hasattr(args, key) and getattr(args, key) != default:
+            return True
+    return False

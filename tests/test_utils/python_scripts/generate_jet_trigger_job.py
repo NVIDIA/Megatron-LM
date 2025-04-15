@@ -109,15 +109,17 @@ def main(
     if not list_of_test_cases:
         gitlab_pipeline = {
             "stages": ["empty-pipeline-placeholder"],
+            "workflow": {
+                "rules": [
+                    {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID'},
+                    {"when": "never"},
+                ]
+            },
             "default": {"interruptible": True},
             "empty-pipeline-placeholder-job": {
                 "stage": "empty-pipeline-placeholder",
                 "image": f"{container_image}:{container_tag}",
                 "tags": tags,
-                "rules": [
-                    {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
-                    {"if": '$CI_MERGE_REQUEST_ID'},
-                ],
                 "timeout": "7 days",
                 "needs": [{"pipeline": '$PARENT_PIPELINE_ID', "job": dependent_job}],
                 "script": ["sleep 1"],
@@ -130,6 +132,17 @@ def main(
 
         gitlab_pipeline = {
             "stages": sorted(list(set([test_case.spec.model for test_case in list_of_test_cases]))),
+            "workflow": {
+                "rules": [
+                    {
+                        "if": '($CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID) && $CI_COMMIT_BRANCH == "main"',
+                        "auto_cancel": {"on_new_commit": "none"},
+                    },
+                    {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline" || $CI_MERGE_REQUEST_ID'},
+                    {"when": "never"},
+                ],
+                "auto_cancel": {"on_new_commit": "interruptible"},
+            },
             "default": {
                 "interruptible": True,
                 "retry": {"max": 2, "when": "runner_system_failure"},
@@ -194,10 +207,6 @@ def main(
                 "stage": f"{test_case.spec.model}",
                 "image": f"{container_image}:{container_tag}",
                 "tags": job_tags,
-                "rules": [
-                    {"if": '$CI_PIPELINE_SOURCE == "parent_pipeline"'},
-                    {"if": '$CI_MERGE_REQUEST_ID'},
-                ],
                 "timeout": "7 days",
                 "needs": needs,
                 "script": [" ".join(script)],

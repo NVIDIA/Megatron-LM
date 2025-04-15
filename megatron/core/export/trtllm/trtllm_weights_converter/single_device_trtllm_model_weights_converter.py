@@ -168,16 +168,20 @@ class SingleDeviceTRTLLMModelWeightsConverter:
 
             _add_to_trtllm_model_weights(val=val, layer_name=layer_name, split_type=None)
 
-        elif layer_name.endswith(
-            suffix(TRTLLMLayers.attention_dense_weight)
-        ) or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight)):
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.attention_dense_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_projection_weight))
+        ):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=0)
             _add_to_trtllm_model_weights(
                 val=split_vals, layer_name=layer_name, split_type='tensor_split'
             )
 
-        elif layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight)) or layer_name.endswith(
-            suffix(TRTLLMLayers.mlp_fc_bias)
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_fc_weight))
         ):
             split_gated_activation = self.activation in [
                 "swiglu",
@@ -193,6 +197,14 @@ class SingleDeviceTRTLLMModelWeightsConverter:
                     val=split_vals, layer_name=gate_layer_name, split_type='tensor_split'
                 )
 
+            split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=-1)
+            _add_to_trtllm_model_weights(
+                val=split_vals, layer_name=layer_name, split_type='tensor_split'
+            )
+
+        elif layer_name.endswith(suffix(TRTLLMLayers.ffn_linear_weight)) or layer_name.endswith(
+            suffix(TRTLLMLayers.attention_linear_weight)
+        ):
             split_vals = torch.chunk(val, self.export_config.inference_tp_size, axis=-1)
             _add_to_trtllm_model_weights(
                 val=split_vals, layer_name=layer_name, split_type='tensor_split'

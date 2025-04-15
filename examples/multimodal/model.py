@@ -5,7 +5,8 @@ from copy import deepcopy
 
 import torch
 from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
-from layer_specs import get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te
+from layer_specs import (get_layer_spec, get_layer_spec_te, get_mlp_module_spec, get_norm_mlp_module_spec_te,
+                         get_mamba_layer_spec_te)
 
 from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
@@ -47,6 +48,8 @@ def model_provider(
         1,
         args.pixel_shuffle,
         args.use_tile_tags,
+        args.max_num_tiles,
+        args.tokenizer_prompt_format
     )
     old_seq_length = args.seq_length
     args.seq_length = args.encoder_seq_length = num_image_embeddings
@@ -57,7 +60,7 @@ def model_provider(
             f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
         )
 
-    max_num_image_embeddings = (args.max_num_tiles + int(args.use_thumbnail)) * num_image_embeddings
+    max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
 
     assert (
         args.decoder_seq_length is not None
@@ -93,9 +96,12 @@ def model_provider(
     elif use_te:
         # Padding mask needed for SP/CP.
         padding = args.context_parallel_size > 1 and args.sequence_parallel
-        language_transformer_layer_spec = get_layer_spec_te(
-            is_vit=False, padding=padding
-        )  # TENorm detects LayerNorm/RMS automatically.
+        if args.language_model_type.startswith('nemotron5-hybrid'):
+            language_transformer_layer_spec = get_mamba_layer_spec_te(padding=padding)
+        else:
+            language_transformer_layer_spec = get_layer_spec_te(
+                is_vit=False, padding=padding
+            )  # TENorm detects LayerNorm/RMS automatically.
     else:
         language_transformer_layer_spec = get_layer_spec(
             is_vit=False, normalization=language_config.normalization
@@ -224,9 +230,15 @@ def model_provider(
         patch_dim=args.patch_dim,
         language_rotary_base=args.rotary_base,
         language_rope_scaling=args.use_rope_scaling,
+        hybrid_attention_ratio=args.hybrid_attention_ratio,
+        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
+        hybrid_override_pattern=args.hybrid_override_pattern,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
         image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
         tile_tags=tile_tags,
+        max_num_tiles=args.max_num_tiles,
+        tokenizer_type=args.tokenizer_prompt_format,
     )
 
     model.freeze(
@@ -244,12 +256,24 @@ def _get_tile_tags(args, tokenizer):
         return None
 
     # We expect the tokenized length of the tags is same.
-    thumbnail_tag_text = "<tile_global_thumbnail>"
-    if args.tokenizer_prompt_format == "nvlm-yi-34b":
-        thumbnail_tag_text = "<tile_global>"
+    if args.max_num_tiles < 10:
+        thumbnail_tag_text = "<tile_global_thumbnail>"
+        if args.tokenizer_prompt_format == "nvlm-yi-34b":
+            thumbnail_tag_text = "<tile_global>"
 
-    assert args.max_num_tiles <= 6, "Up to 6 tile tags used"
-    tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+        if args.tokenizer_prompt_format.startswith("nemotron"):
+            tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+        else:
+            tile_tags_text = [f"<tile_{i}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+    elif args.max_num_tiles <= 12:
+        thumbnail_tag_text = "<tile_global_thumbnail0>"
+        if args.tokenizer_prompt_format == "nvlm-yi-34b":
+            thumbnail_tag_text = "<tile_global0>"
+        elif args.tokenizer_prompt_format.startswith("nemotron") or args.tokenizer_prompt_format == "llama3p1":
+            thumbnail_tag_text = "<tile_global_thumbnail>"
+        tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [thumbnail_tag_text]
+    else:
+        raise ValueError("We only support max_num_tiles <= 12 when using nvlm image_tag_type")
 
     start_idx = 0
     if tokenizer._prompt_config.has_bos:

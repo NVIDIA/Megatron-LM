@@ -5,12 +5,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core.parallel_state import (
-    get_expert_model_parallel_group,
-    get_expert_tensor_and_model_parallel_group,
-    get_expert_tensor_parallel_group,
-    get_expert_tensor_parallel_rank,
-)
+from megatron.core.config import ENABLE_EXPERIMENTAL
+from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -18,6 +14,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.moe.fused_a2a import fused_combine, fused_dispatch
 from megatron.core.transformer.moe.moe_utils import (
+    ModelCommProcessGroups,
     get_capacity,
     maybe_move_tensor_to_cpu,
     permute,
@@ -43,35 +40,27 @@ class MoETokenDispatcher:
     MoE Token Dispatcher
     """
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(
+        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+    ) -> None:
         """
         Initialize the MoE Token Dispatcher.
+
+        Args:
+            config (TransformerConfig): Configuration for the MoE layer.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
 
-        self.tp_size = config.expert_tensor_parallel_size
-        self.ep_size = config.expert_model_parallel_size
+        self.ep_group = model_comm_pgs.ep_group
+        # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
+        self.tp_group = model_comm_pgs.expt_tp_group
+        self.tp_ep_group = model_comm_pgs.tp_ep_group
 
-    @property
-    def ep_group(self):
-        """Get expert model parallel group."""
-        return get_expert_model_parallel_group()
-
-    @property
-    def tp_group(self):
-        """Get expert tensor parallel group."""
-        return get_expert_tensor_parallel_group()
-
-    @property
-    def tp_rank(self):
-        """Get expert tensor parallel rank."""
-        return get_expert_tensor_parallel_rank()
-
-    @property
-    def tp_ep_group(self):
-        """Get expert tensor and model parallel group."""
-        return get_expert_tensor_and_model_parallel_group()
+        self.tp_size = self.tp_group.size()
+        self.tp_rank = self.tp_group.rank()
+        self.ep_size = self.ep_group.size()
 
     @abstractmethod
     def token_permutation(
@@ -85,7 +74,10 @@ class MoETokenDispatcher:
             routing_map (torch.Tensor): Token to expert mapping tensor.
 
         Returns:
-            torch.Tensor: Tokens tensor.
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                - Permuted token embeddings for local experts.
+                - Number of tokens per expert.
+                - Permuted probs of each token produced by the router.
         """
         raise NotImplementedError("Dispatch function not implemented.")
 
@@ -115,12 +107,22 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
         """
         Initialize the zero token dropping router.
+
+        Args:
+            num_local_experts (int): Number of local experts.
+            local_expert_indices (List[int]): Indices of local experts.
+            config (TransformerConfig): Configuration for the MoE layer.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
         self.num_local_experts = num_local_experts
         assert self.num_local_experts > 0, "Expected at least one expert"
         self.local_expert_indices = local_expert_indices
@@ -153,6 +155,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         Returns:
             permuted_local_hidden_states: Permutation of tokens to local experts group.
             tokens_per_expert: the number of tokens each local expert to process.
+            permuted_probs: the permuted probs of each token produced by the router.
         """
         self.hidden_shape = hidden_states.shape
         # [S/TP, B, H] -> [S*B/TP, H]
@@ -190,14 +193,18 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
 
         tokens_per_expert = self.local_map.sum(dim=0).long().cpu()
 
-        (permuted_local_hidden_states, self.reversed_local_input_permutation_mapping) = permute(
+        (permuted_local_hidden_states, _, self.reversed_local_input_permutation_mapping) = permute(
             hidden_states,
             self.local_map,
             num_out_tokens=tokens_per_expert.sum(),
             fused=self.config.moe_permute_fusion,
         )
 
-        return permuted_local_hidden_states, tokens_per_expert
+        self.local_probs = self.local_probs.T.contiguous().masked_select(
+            self.local_map.T.contiguous()
+        )
+
+        return permuted_local_hidden_states, tokens_per_expert, self.local_probs
 
     def token_unpermutation(self, hidden_states: torch.Tensor, bias: torch.Tensor = None):
         """
@@ -214,60 +221,27 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             output_total: un-permuted updated hidden states output from all local experts
             with shape of [S/TP, B, H]
         """
+        assert bias is None, "Bias is not supported in MoEAllGatherTokenDispatcher"
+
         # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
         # Unpermute the expert output and bias
-        permuted_probs = self.local_probs.T.contiguous().masked_select(
-            self.local_map.T.contiguous()
-        )
-        # Here may change permuted_tokens to higher precision if probs use fp32/fp64.
-        weighted_hidden_states = hidden_states * permuted_probs.unsqueeze(-1)
         unpermuted_local_hidden = unpermute(
-            weighted_hidden_states,
+            hidden_states,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.local_map,
             fused=self.config.moe_permute_fusion,
         )
-
-        unpermuted_local_bias = None
-        if self.add_bias:
-            assert bias is not None
-            weighted_bias = bias * permuted_probs.unsqueeze(-1)
-            unpermuted_local_bias = unpermute(
-                weighted_bias,
-                self.reversed_local_input_permutation_mapping,
-                restore_shape=self.hidden_shape_before_permute,
-                routing_map=self.local_map,
-                fused=self.config.moe_permute_fusion,
-            )
-
         output_total = unpermuted_local_hidden
-        output_bias_total = unpermuted_local_bias
 
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
             output_total = reduce_scatter_to_sequence_parallel_region(
-                output_total, group=self.tp_ep_group
-            )
-            if self.add_bias:
-                # Unpermute the bias across expert parallel devices.
-                # bias is duplicated across tensor parallelism ranks;
-                output_bias_total = (
-                    reduce_scatter_to_sequence_parallel_region(
-                        output_bias_total, group=self.tp_ep_group
-                    )
-                    / self.tp_size
-                )
+                output_total.to(self.local_probs.dtype), group=self.tp_ep_group
+            ).to(output_total.dtype)
 
         output_total = output_total.view(self.hidden_shape)
-        if self.add_bias:
-            output_bias_total = output_bias_total.view(self.hidden_shape)
-
-        # Restore the dtype of the output to the original dtype.
-        output_total = output_total.to(hidden_states.dtype)
-        if bias is not None:
-            output_bias_total = output_bias_total.to(bias.dtype)
-        return output_total, output_bias_total
+        return output_total, None
 
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
@@ -281,7 +255,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
 
     def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
         """
         Initialize the AlltoAll token dispatcher.
@@ -290,8 +268,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             num_local_experts (int): Number of local experts on the current device.
             local_expert_indices (List[int]): Indices of local experts on the current device.
             config (TransformerConfig): Configuration for the transformer model.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
         self.num_local_experts = num_local_experts
         assert config.num_moe_experts is not None
         self.num_experts = config.num_moe_experts
@@ -478,7 +457,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
     def token_permutation(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Dispatch tokens to local experts using AlltoAll communication.
 
@@ -494,9 +473,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             routing_map (torch.Tensor): The mapping of token to experts assignment.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                 - Permuted token embeddings for local experts.
                 - Number of tokens per expert.
+                - Permuted probs of each token produced by the router.
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
@@ -516,9 +496,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_permutation_1", tokens_per_expert
         )
         self.hidden_shape_before_permute = hidden_states.shape
-        permutated_local_input_tokens, self.reversed_local_input_permutation_mapping = permute(
+        (
+            permutated_local_input_tokens,
+            permuted_probs,
+            self.reversed_local_input_permutation_mapping,
+        ) = permute(
             hidden_states,
             routing_map,
+            probs=probs,
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
@@ -531,6 +516,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         global_input_tokens = all_to_all(
             self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
         )
+        global_probs = all_to_all(
+            self.ep_group, permuted_probs, self.output_splits, self.input_splits
+        )
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
 
@@ -541,6 +529,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 output_split_sizes = self.output_splits_tp.tolist()
             global_input_tokens = gather_from_sequence_parallel_region(
                 global_input_tokens, group=self.tp_group, output_split_sizes=output_split_sizes
+            )
+            global_probs = gather_from_sequence_parallel_region(
+                global_probs, group=self.tp_group, output_split_sizes=output_split_sizes
             )
 
         # Permutation 2: Sort tokens by local expert.
@@ -560,17 +551,29 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     .contiguous()
                     .flatten(start_dim=0, end_dim=2)
                 )
+                global_probs = (
+                    global_probs.view(
+                        self.tp_size * self.ep_size,
+                        self.num_local_experts,
+                        self.capacity,
+                        *global_probs.size()[1:],
+                    )
+                    .transpose(0, 1)
+                    .contiguous()
+                    .flatten(start_dim=0, end_dim=2)
+                )
             else:
-                global_input_tokens = sort_chunks_by_idxs(
+                global_input_tokens, global_probs = sort_chunks_by_idxs(
                     global_input_tokens,
                     self.num_global_tokens_per_local_expert.ravel(),
                     self.sort_input_by_local_experts,
+                    probs=global_probs,
                     fused=self.config.moe_permute_fusion,
                 )
 
         tokens_per_expert = self._maybe_dtoh_and_synchronize("before_finish", tokens_per_expert)
 
-        return global_input_tokens, tokens_per_expert
+        return global_input_tokens, tokens_per_expert, global_probs
 
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
@@ -609,7 +612,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     .flatten(start_dim=0, end_dim=2)
                 )
             else:
-                hidden_states = sort_chunks_by_idxs(
+                hidden_states, _ = sort_chunks_by_idxs(
                     hidden_states,
                     self.num_global_tokens_per_local_expert.T.ravel(),
                     self.restore_output_by_local_experts,
@@ -621,9 +624,12 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 input_split_sizes = None
             else:
                 input_split_sizes = self.output_splits_tp.tolist()
+            # The precision of TP reduce_scatter should be the same as the router_dtype
             hidden_states = reduce_scatter_to_sequence_parallel_region(
-                hidden_states, group=self.tp_group, input_split_sizes=input_split_sizes
-            )
+                hidden_states.to(self.probs.dtype),
+                group=self.tp_group,
+                input_split_sizes=input_split_sizes,
+            ).to(hidden_states.dtype)
 
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
@@ -639,7 +645,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             permutated_local_input_tokens,
             self.reversed_local_input_permutation_mapping,
             restore_shape=self.hidden_shape_before_permute,
-            probs=self.probs,
             routing_map=self.routing_map,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
@@ -776,9 +781,10 @@ class _DeepepManager(_DispatchManager):
         group: torch.distributed.ProcessGroup,
         router_topk: int,
         permute_fusion: bool = False,
-        capacity_factor: float = None,
-        num_experts: int = None,
-        num_local_experts: int = None,
+        capacity_factor: Optional[float] = None,
+        num_experts: Optional[int] = None,
+        num_local_experts: Optional[int] = None,
+        router_dtype: Optional[str] = None,
     ):
         self.group = group
         self.router_topk = router_topk
@@ -789,8 +795,8 @@ class _DeepepManager(_DispatchManager):
         self.router_dtype = router_dtype
 
         # Metadata
-        self.token_indices = None
-        self.token_probs = None
+        self.token_indices: Optional[torch.Tensor] = None
+        self.token_probs: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
 
@@ -877,28 +883,33 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
-            self.dispatched_indices, self.dispatched_probs
-        )
+        if ENABLE_EXPERIMENTAL and self.permute_fusion:
+            self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
+                self.dispatched_indices, self.dispatched_probs, self.num_local_experts
+            )
+        else:
+            self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
+                self.dispatched_indices, self.dispatched_probs
+            )
         self.hidden_shape_before_permute = hidden_states.shape
-        hidden_states, self.reversed_mapping_for_combine = permute(
+        assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
+        hidden_states, permuted_probs, self.reversed_mapping_for_combine = permute(
             hidden_states,
             self.dispatched_routing_map,
+            probs=self.dispatched_probs,
             num_out_tokens=sum(self.tokens_per_expert),
             fused=self.permute_fusion,
         )
-        return hidden_states
+        if self.router_dtype == "fp64":
+            permuted_probs = permuted_probs.to(torch.float64)
+        return hidden_states, permuted_probs
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
-        if self.router_dtype == "fp64":
-            self.dispatched_probs = self.dispatched_probs.to(torch.float64)
         hidden_states = unpermute(
             hidden_states,
             self.reversed_mapping_for_combine,
             restore_shape=self.hidden_shape_before_permute,
             routing_map=self.dispatched_routing_map,
-            probs=self.dispatched_probs,
             fused=self.permute_fusion,
         )
         return hidden_states
@@ -906,13 +917,26 @@ class _DeepepManager(_DispatchManager):
 
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """
-    Flexible token dispatcher for MoE models with Efficient-A2A communication kernels.
+    Flex token dispatcher using DeepEP.
     """
 
     def __init__(
-        self, num_local_experts: int, local_expert_indices: List[int], config: TransformerConfig
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
-        super().__init__(config)
+        """
+        Initialize the Flex token dispatcher.
+
+        Args:
+            num_local_experts (int): Number of local experts on the current device.
+            local_expert_indices (List[int]): Indices of local experts on the current device.
+            config (TransformerConfig): Configuration for the transformer model.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
+        """
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         self.num_local_experts = num_local_experts
         self.local_expert_indices = local_expert_indices
@@ -967,7 +991,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     def token_permutation(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
@@ -976,12 +1000,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
         self._comm_manager.setup_metadata(routing_map, probs)
         hidden_states = self._comm_manager.dispatch(hidden_states)
-        global_input_tokens = self._comm_manager.get_permuted_hidden_states_by_experts(
-            hidden_states
+        global_input_tokens, permuted_probs = (
+            self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
 
-        return global_input_tokens, tokens_per_expert
+        return global_input_tokens, tokens_per_expert, permuted_probs
 
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None

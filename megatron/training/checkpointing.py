@@ -1118,6 +1118,10 @@ def load_args_from_checkpoint(
     _set_arg('mamba_num_groups', force=True)
     _set_arg('is_hybrid_model', force=True)
 
+    # Heterogeneous args.
+    _set_arg('heterogeneous_layers_config_path', force=True)
+    _set_arg('heterogeneous_layers_config_encoded_json', force=True)
+
     # Tokenizer args.
     _set_arg('tokenizer_type', force=True)
     # Using checkpoint version might not always be safe (e.g., if running on different cluster).

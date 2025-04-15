@@ -125,6 +125,12 @@ class TRTLLMEngineBuilder:
             'use_refit': use_refit,
             'multiple_profiles': multiple_profiles,
         }
+
+        if trtllm_model_config.architecture == "DeciLMForCausalLM":
+            build_dict['strongly_typed'] = True
+            build_dict['use_fused_mlp'] = False
+            plugin_config.use_fused_mlp = False
+
         build_config = BuildConfig.from_dict(build_dict, plugin_config=plugin_config)
 
         if use_lora_plugin is not None:

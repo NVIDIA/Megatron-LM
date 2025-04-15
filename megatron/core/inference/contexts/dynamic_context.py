@@ -116,7 +116,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     ):
 
         super().__init__()
-
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         world_size = parallel_state.get_tensor_model_parallel_world_size()
@@ -177,6 +176,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
         self.request_query_lengths = torch.empty_like(self.request_ids)
+        self.request_output_lengths = torch.empty_like(self.request_ids)
         self.request_kv_length_offsets = torch.empty_like(self.request_ids)
         self.request_kv_chunk_counts = torch.empty_like(self.request_ids)
         self.request_last_kv_chunk_id = torch.empty_like(self.request_ids)
@@ -319,7 +319,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         gtd_request_count = max(1, gtd_request_count)
         gtd_request_count = self.round_up(min(gtd_request_count, self.max_requests))
         gtd_chunk_count = gtd_request_count * self.max_kv_chunk_count
-
         assert (
             gtd_request_count <= self.max_requests
         ), "gtd_request_count (%d) > max_requests (%d)." % (gtd_request_count, self.max_requests)
@@ -361,6 +360,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         lengths = self.request_kv_length_offsets + self.request_query_lengths
         lengths = lengths[self.paused_request_count : self.total_request_count]
         return lengths
+
+    def get_max_sequence_lengths(self) -> Tensor:
+        """Maximum sequence length for active requests."""
+        return self.request_output_lengths[self.paused_request_count : self.total_request_count]
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -406,7 +409,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         return key_memory_ptrs, value_memory_ptrs
 
     def apply_rotary_emb_query(
-        self, query: Tensor, query_emb: Tensor, config: TransformerConfig, cu_seqlens_q: Tensor
+        self,
+        query: Tensor,
+        query_emb: Tensor,
+        config: TransformerConfig,
+        cu_seqlens_q: Tensor,
+        cp_group: torch.distributed.ProcessGroup,
     ) -> Tensor:
         """Apply rotary embedding to query tensor.
 
@@ -415,6 +423,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             query_emb (Tensor): Query rotary embeddings.
             config (TransformerConfig): Transformer config.
             cu_seqlens_q (Tensor): Cumulative sequence lengths.
+            cp_group (torch.distributed.ProcessGroup): Process group for context parallel.
 
         Return:
             (Tensor) Query tensor after applying rotary embeddings.
@@ -422,11 +431,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         n = self.padded_active_token_count
         query_seq_idx = self.token_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
-        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q)
+        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q, cp_group)
         return query
 
     def apply_rotary_emb_key(
-        self, key: Tensor, key_emb: Tensor, config: TransformerConfig
+        self,
+        key: Tensor,
+        key_emb: Tensor,
+        config: TransformerConfig,
+        cp_group: torch.distributed.ProcessGroup,
     ) -> Tensor:
         """Apply rotary embedding to key tensor.
 
@@ -434,6 +447,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             key_emb (Tensor): Key rotary embeddings.
             config (TransformerConfig): Transformer config.
+            cp_group (torch.distributed.ProcessGroup): Process group for context parallel.
 
         Return:
             (Tensor) Key tensor after applying rotary embeddings.
@@ -443,9 +457,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
             assert key.shape[0] == n == self.max_requests
-            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config)
+            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
         else:
-            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config)
+            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
         return key
 
     def is_memory_available(self, num_chunks: int, safe: bool = False) -> bool:
@@ -628,6 +642,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset request indexes.
         self.request_ids.fill_(0)
         self.request_query_lengths.fill_(0)
+        self.request_output_lengths.fill_(0)
         self.request_kv_length_offsets.fill_(0)
         self.request_kv_chunk_counts.fill_(0)
         self.request_last_kv_chunk_id.fill_(0)
@@ -693,7 +708,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return last_token_logits
 
-    def add_request(self, request_id: int, tokens: List[int]) -> None:
+    def add_request(
+        self, request_id: int, tokens: List[int], num_tokens_to_generate: Optional[int] = None
+    ) -> None:
         """Add request to context.
 
         After a request is added, it will first do one prefill step, followed by
@@ -731,9 +748,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         if new_chunk_ids is None:
             raise ChunkOverflowError()
 
+        if num_tokens_to_generate is None:
+            num_tokens_to_generate = self.max_sequence_length - context_length
+        elif context_length + num_tokens_to_generate > self.max_sequence_length:
+            raise TokenOverflowError()
+
         # Update request state.
         self.request_ids[self.total_request_count] = request_id
         self.request_query_lengths[self.total_request_count] = context_length
+        self.request_output_lengths[self.total_request_count] = (
+            context_length + num_tokens_to_generate
+        )
         self.request_kv_length_offsets[self.total_request_count] = 0
         self.request_kv_memory[self.total_request_count][:num_chunks_needed] = new_chunk_ids
         self.request_kv_chunk_counts[self.total_request_count] = num_chunks_needed
@@ -861,6 +886,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Shift active requests left.
             self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
             self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
+            self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
             self.request_ids[dst_idxs] = self.request_ids[src_idxs]
             next_tokens[dst_idxs] = next_tokens[src_idxs]
 
@@ -910,6 +936,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
                 self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[src_idxs]
                 self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
+                self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
                 self.request_ids[dst_idxs] = self.request_ids[src_idxs]
                 next_tokens[dst_idxs] = next_tokens[src_idxs]
 

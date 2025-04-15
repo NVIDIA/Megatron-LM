@@ -6,7 +6,7 @@ import dataclasses
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
@@ -109,9 +109,11 @@ class MoEModelTestContainer:
         probs, indices = moe_layer.router(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert) = (
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
             moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
         )
+
+        permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
 
         restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
             permuted_local_hidden_states
@@ -146,7 +148,7 @@ class MoEModelTestContainer:
         local_probss = probs
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
 
-        (permuted_local_hidden_states, tokens_per_expert) = (
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
             moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
         )
 
@@ -162,6 +164,8 @@ class MoEModelTestContainer:
             * self.config.expert_model_parallel_size
             * self.config.tensor_model_parallel_size
         ), "Tokens per expert exceed the capacity"
+
+        permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
 
         permuted_local_hidden_states /= moe_layer.config.tensor_model_parallel_size
 
@@ -192,9 +196,10 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
-        (permuted_input_1, tokens_per_expert) = moe_layer.token_dispatcher.token_permutation(
-            hidden_states, probs_1, indices_1
+        (permuted_input_1, tokens_per_expert, permuted_probs_1) = (
+            moe_layer.token_dispatcher.token_permutation(hidden_states, probs_1, indices_1)
         )
+        permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
         forward_answer, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
             permuted_input_1
         )
@@ -208,9 +213,10 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
-        (permuted_input_2, tokens_per_expert) = moe_layer_2.token_dispatcher.token_permutation(
-            hidden_states, probs_2, indices_2
+        (permuted_input_2, tokens_per_expert, permuted_probs_2) = (
+            moe_layer_2.token_dispatcher.token_permutation(hidden_states, probs_2, indices_2)
         )
+        permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
         restored_hidden_states, restored_bias = moe_layer_2.token_dispatcher.token_unpermutation(
             permuted_input_2
         )
@@ -246,8 +252,9 @@ class MoEModelTestContainer:
 
 
 permute_fusion_params = [False]
-if is_te_min_version("1.14.0"):
+if is_te_min_version("2.1.0"):
     permute_fusion_params.append(True)
+multihot_fusion_params = [True]
 
 
 class TestAllgatherDispatcher:
@@ -257,7 +264,6 @@ class TestAllgatherDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
@@ -276,7 +282,6 @@ class TestAllgatherDispatcher:
 
         container.dispatcher_dropless_test()
 
-    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
@@ -294,7 +299,6 @@ class TestAllgatherDispatcher:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="allgather",
             sequence_parallel=True,
-            moe_grouped_gemm=True,
             moe_permute_fusion=permute_fusion,
             use_cpu_initialization=False,
         )
@@ -316,12 +320,14 @@ class TestFlexDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    def test_forward_backward(self, tp_size, ep_size, permute_fusion):
+    @pytest.mark.parametrize("indices_to_multihot_fusion", multihot_fusion_params)
+    def test_forward_backward(self, tp_size, ep_size, permute_fusion, indices_to_multihot_fusion):
+        if indices_to_multihot_fusion:
+            config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,
@@ -341,9 +347,14 @@ class TestFlexDispatcher:
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
+    @pytest.mark.parametrize("indices_to_multihot_fusion", multihot_fusion_params)
     @pytest.mark.flaky
     @pytest.mark.flaky_in_dev
-    def test_capacity_forward_backward(self, tp_size, ep_size, permute_fusion):
+    def test_capacity_forward_backward(
+        self, tp_size, ep_size, permute_fusion, indices_to_multihot_fusion
+    ):
+        if indices_to_multihot_fusion:
+            config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
             tp_size=tp_size,
             ep_size=ep_size,

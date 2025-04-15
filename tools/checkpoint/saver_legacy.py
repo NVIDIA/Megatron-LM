@@ -4,6 +4,8 @@ import os
 import sys
 import torch
 
+from tools.checkpoint.utils import _ConverterFakeProcessGroup
+
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron saver')
@@ -209,6 +211,10 @@ def save_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_rank(0)
     mpu.set_pipeline_model_parallel_rank(0)
     fused_kernels.load(margs)
+    
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=args.target_tensor_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
 
     # Embeddings
     # -----------
@@ -411,6 +417,8 @@ def save_checkpoint(queue, args):
                 print("ERROR: got some more data but was expecting to be done")
 
         for tp_rank in range(args.target_tensor_parallel_size):
+            fake_tp_group = mpu.get_tensor_model_parallel_group()
+            fake_tp_group.set_rank(tp_rank)
             mpu.set_tensor_model_parallel_rank(tp_rank)
             save_checkpoint(md.iteration, [models[tp_rank]], None, None,
                             num_floating_point_operations_so_far=0)

@@ -173,6 +173,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             1,
             self.args.pixel_shuffle,
             self.args.use_tile_tags,
+            self.args.max_num_tiles,
+            self.args.tokenizer_prompt_format,
         )
 
         self.txt_to_token_dict = {}
@@ -452,7 +454,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             if video_fchw.shape[0] == 0:
                 raise ValueError(f"Video {sample.__key__} {sample.__restore_key__} {sample.texts} has no frames.")
             selected_frames = torch.linspace(
-                0, video_fchw.shape[0] - 1, self.args.num_frames).long()
+                0, video_fchw.shape[0] - 1,
+                min(self.args.num_frames, video_fchw.shape[0])).long()
             video_fchw = video_fchw[selected_frames]
             imgs = []
             for video_chw in video_fchw:

@@ -30,6 +30,9 @@ class TRTLLMLayers(Enum):
     attention_dense_weight = 'transformer.layers.attention.dense.weight'
     attention_dense_bias = 'transformer.layers.attention.dense.bias'
 
+    # Deci's replace_with_linear Attention
+    attention_linear_weight = 'transformer.layers.attention.weight'
+
     # mlp layers
     mlp_fc_weight = 'transformer.layers.mlp.fc.weight'
     mlp_fc_bias = 'transformer.layers.mlp.fc.bias'
@@ -37,6 +40,12 @@ class TRTLLMLayers(Enum):
     post_layernorm_bias = 'transformer.layers.post_layernorm.bias'
     mlp_projection_weight = 'transformer.layers.mlp.proj.weight'
     mlp_projection_bias = 'transformer.layers.mlp.proj.bias'
+
+    # Deci's (nemotron-nas) FFN
+    ffn_fc_weight = 'transformer.layers.ffn.fc.weight'
+    ffn_projection_weight = 'transformer.layers.ffn.proj.weight'
+    # Deci's replace_with_linear FFN
+    ffn_linear_weight = 'transformer.layers.ffn.weight'
 
     # mixture of expert layers
     mlp_router_weight = 'transformer.layers.mlp.router.weight'

@@ -602,7 +602,10 @@ class ParallelAttention(MegatronModule):
 
         self.core_attention = CoreAttention(self.layer_number, config,
                                             self.attn_mask_type)
-        self.checkpoint_core_attention = config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = (
+            config.recompute_granularity == 'selective'
+            and "core_attn" in config.recompute_modules
+        )
 
         if self.use_flash_attn:
             self.core_attention_flash = FlashSelfAttention(
@@ -1455,7 +1458,10 @@ class ParallelTransformer(MegatronModule):
 
         self.num_microbatches_in_previous_step = -1
         self.microbatch_count = 0
-        self.checkpoint_core_attention = config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = (
+            config.recompute_granularity == 'selective'
+            and "core_attn" in config.recompute_modules
+        )
 
         # Number of layers.
         self.num_layers = _get_num_layers(args, model_type,

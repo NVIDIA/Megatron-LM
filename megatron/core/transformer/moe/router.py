@@ -2,14 +2,14 @@
 
 from abc import ABC, abstractmethod
 from functools import partial
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
+    ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
     save_to_aux_losses_tracker,
     sequence_load_balancing_loss_func,
@@ -24,18 +24,24 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 class Router(ABC, MegatronModule):
     """Base Router class"""
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(
+        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+    ) -> None:
         """
         Initialize the Router module.
 
         Args:
             config (TransformerConfig): Configuration object for the Transformer model.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
         super().__init__(config)
         self.config = config
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
+        self.tp_group = model_comm_pgs.tp_group
+        self.cp_group = model_comm_pgs.cp_group
+        self.tp_cp_group = model_comm_pgs.tp_cp_group
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.
@@ -102,13 +108,16 @@ class Router(ABC, MegatronModule):
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(
+        self, config: TransformerConfig, model_comm_pgs: Optional[ModelCommProcessGroups] = None
+    ) -> None:
         """Initialize the zero token dropping router.
 
         Args:
             config (TransformerConfig): The configuration for the transformer model.
+            model_comm_pgs (ModelCommProcessGroups, optional): Process groups for MoE operations.
         """
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
         self.score_function = self.config.moe_router_score_function
@@ -284,12 +293,13 @@ class TopKRouter(Router):
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
         if moe_aux_loss_coeff == 0:
             return activation
+
         sequence_partition_group = None
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
-            sequence_partition_group = parallel_state.get_context_parallel_group()
-            moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
-        elif parallel_state.get_tensor_and_context_parallel_world_size() > 1:
-            sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
+            sequence_partition_group = self.cp_group
+            moe_aux_loss_coeff /= self.tp_group.size()
+        elif self.tp_cp_group.size() > 1:
+            sequence_partition_group = self.tp_cp_group
 
         aux_loss = load_balancing_loss_func(
             moe_aux_loss_coeff=moe_aux_loss_coeff, sequence_partition_group=sequence_partition_group
@@ -326,10 +336,7 @@ class TopKRouter(Router):
         """
         if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
             # Skip Z loss calculations when using torch.no_grad() or checkpointing.
-            moe_z_loss_coeff = (
-                self.config.moe_z_loss_coeff
-                / parallel_state.get_tensor_and_context_parallel_world_size()
-            )
+            moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
             z_loss = z_loss_func(logits, moe_z_loss_coeff)
             scale_up = 1.0
             if self.calculate_per_token_loss:
@@ -388,7 +395,7 @@ class TopKRouter(Router):
 
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
             # Gather the logits from the TP region
-            logits = gather_from_sequence_parallel_region(logits)
+            logits = gather_from_sequence_parallel_region(logits, self.tp_group)
 
         if self.routing_type == "sinkhorn":
             scores, routing_map = self.sinkhorn_load_balancing(logits)

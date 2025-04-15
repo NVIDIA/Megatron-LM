@@ -1,23 +1,30 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import Optional
+from typing import List, Optional, Union
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 try:
     from megatron.core.extensions.transformer_engine import (
         fused_permute,
+        fused_permute_with_probs,
         fused_sort_chunks_by_index,
+        fused_sort_chunks_by_index_with_probs,
         fused_unpermute,
     )
 
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+
+# MOE logging
+_MOE_LAYER_WISE_LOGGING_TRACKER = {}
 
 
 def switch_load_balancing_loss_func(
@@ -228,6 +235,7 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
 def permute(
     tokens,
     routing_map,
+    probs: Optional[torch.Tensor] = None,
     num_out_tokens: Optional[int] = None,
     fused: bool = False,
     drop_and_pad: bool = False,
@@ -251,10 +259,20 @@ def permute(
                                        If set to true, routing_map has a fixed number of non-zeros
                                        in each column.
     """
-    if fused:
+    if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
             raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
-        return fused_permute(tokens, routing_map, num_out_tokens)
+        permuted_input, sorted_indices = fused_permute(
+            tokens, routing_map, num_out_tokens=num_out_tokens
+        )
+        return permuted_input, None, sorted_indices
+
+    if fused and probs is not None:
+        if not HAVE_TE or fused_permute_with_probs is None:
+            raise ValueError(
+                "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
+            )
+        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
@@ -270,6 +288,8 @@ def permute(
         ].contiguous()
         # flatten from [num_experts, capacity] to 1D
         sorted_indices = sorted_indices.view(-1)
+        if probs is not None:
+            routing_map = routing_map.bool()
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
@@ -283,7 +303,12 @@ def permute(
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
 
-    return permuted_input, sorted_indices
+    if probs is not None:
+        permuted_probs = probs.T.contiguous().masked_select(routing_map)
+    else:
+        permuted_probs = None
+
+    return permuted_input, permuted_probs, sorted_indices
 
 
 def unpermute(
@@ -322,7 +347,9 @@ def unpermute(
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
-        return fused_unpermute(permuted_tokens, sorted_indices, probs, restore_shape)
+        return fused_unpermute(
+            permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
+        )
 
     _, hidden = restore_shape
     input_dtype = permuted_tokens.dtype
@@ -363,19 +390,36 @@ def unpermute(
 
 
 def sort_chunks_by_idxs(
-    input: torch.Tensor, split_sizes: torch.Tensor, sorted_idxs: torch.Tensor, fused: bool = False
+    input: torch.Tensor,
+    split_sizes: torch.Tensor,
+    sorted_idxs: torch.Tensor,
+    probs: Optional[torch.Tensor] = None,
+    fused: bool = False,
 ):
     """Split and sort the input tensor based on the split_sizes and sorted indices."""
-    if fused:
+    if fused and probs is None:
         if not HAVE_TE or fused_sort_chunks_by_index is None:
             raise ValueError(
                 "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
             )
-        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs)
+        return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None
+
+    if fused and probs is not None:
+        if not HAVE_TE or fused_sort_chunks_by_index_with_probs is None:
+            raise ValueError(
+                "fused_sort_chunks_by_index_with_probs is not available. "
+                "Please install TE >= 2.1.0."
+            )
+        return fused_sort_chunks_by_index_with_probs(input, probs, split_sizes, sorted_idxs)
 
     input = torch.split(input, split_sizes.tolist(), dim=0)
     output = torch.cat([input[i] for i in sorted_idxs.tolist()], dim=0)
-    return output
+    if probs is not None:
+        probs = torch.split(probs, split_sizes.tolist(), dim=0)
+        permuted_probs = torch.cat([probs[i] for i in sorted_idxs.tolist()], dim=0)
+    else:
+        permuted_probs = None
+    return output, permuted_probs
 
 
 def group_limited_topk(
@@ -415,11 +459,9 @@ def group_limited_topk(
         Tuple[torch.Tensor, torch.Tensor]: Probs and indices tensor.
     """
     # Organize the experts into groups
-    # Select groups based on sum of top-(num_groups/group_topk) routing scores within each group
+    # Select groups based on sum of top-(topk/group_topk) routing scores within each group
     group_scores = (
-        scores.view(num_tokens, num_groups, -1)
-        .topk(num_groups // group_topk, dim=-1)[0]
-        .sum(dim=-1)
+        scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1)[0].sum(dim=-1)
     )
     group_idx = torch.topk(group_scores, k=group_topk, dim=-1, sorted=False)[1]
     group_mask = torch.zeros_like(group_scores)
@@ -576,7 +618,7 @@ def save_to_aux_losses_tracker(
     if layer_number is None:
         return
 
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     if name not in tracker:
         tracker[name] = {}
         tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
@@ -587,18 +629,21 @@ def save_to_aux_losses_tracker(
 
 def clear_aux_losses_tracker():
     """Clear the auxiliary losses."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
         tracker[name]["reduce_group"] = None
         tracker[name]["avg_group"] = None
 
 
-def reduce_aux_losses_tracker_across_ranks():
+def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
     """Collect and reduce the auxiliary losses across ranks."""
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
-    for name in tracker:
+    tracker = get_moe_layer_wise_logging_tracker()
+    if track_names is None:
+        track_names = tracker.keys()
+    for name in track_names:
         values = tracker[name]["values"]
+        # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
         torch.distributed.all_reduce(
             values, group=parallel_state.get_pipeline_model_parallel_group()
@@ -613,25 +658,55 @@ def reduce_aux_losses_tracker_across_ranks():
 
 
 def track_moe_metrics(
-    loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None, per_layer_logging=False
+    loss_scale: float,
+    iteration: int,
+    writer,
+    wandb_writer=None,
+    total_loss_dict=None,
+    per_layer_logging=False,
+    force_initialize: bool = False,
+    track_names: Optional[List[str]] = None,
+    num_layers: Optional[int] = None,
+    moe_layer_freq: Optional[Union[int, List[int]]] = None,
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
-    reduce_aux_losses_tracker_across_ranks()
-    tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+    tracker = get_moe_layer_wise_logging_tracker()
+    # Initialize the tracker if force_initialize is True
+    if force_initialize:
+        if track_names is not None:
+            for key in track_names:
+                if key not in tracker:
+                    tracker[key] = {}
+                    tracker[key]["values"] = torch.zeros(num_layers, device="cuda")
+                    tracker[key]["reduce_group"] = None
+                    tracker[key]["avg_group"] = None
+    reduce_aux_losses_tracker_across_ranks(track_names)
+
+    # Get number of MoE layers
+    if moe_layer_freq is None:
+        num_moe_layers = num_layers
+    elif isinstance(moe_layer_freq, int):
+        moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
+        num_moe_layers = sum(moe_layer_pattern)
+    elif isinstance(moe_layer_freq, list):
+        num_moe_layers = sum(moe_layer_freq)
+    else:
+        raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
     if writer is not None:
         aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
         for name, loss_list in aux_losses.items():
             if total_loss_dict is not None:
                 if name not in total_loss_dict:
-                    total_loss_dict[name] = loss_list.mean()
+                    total_loss_dict[name] = loss_list.sum() / num_moe_layers
                 else:
-                    total_loss_dict[name] += loss_list.mean()
+                    total_loss_dict[name] += loss_list.sum() / num_moe_layers
 
             # currently when using add_scalars,
             # torch.utils.add_scalars makes each timer its own run, which
             # polutes the runs list, so we just add each as a scalar
-            writer.add_scalar(name, loss_list.mean(), iteration)
+            writer.add_scalar(name, loss_list.sum() / num_moe_layers, iteration)
             if per_layer_logging:
                 for i, loss in enumerate(loss_list.tolist()):
                     writer.add_scalar(f"moe/{name}_layer_{i}", loss, iteration)
@@ -640,7 +715,7 @@ def track_moe_metrics(
             # As a workaround, we log each scalar individually first, then we can create
             # a custom panel to manually group them to a single plot.
             if wandb_writer:
-                wandb_writer.log({f"{name}": loss_list.mean()}, iteration)
+                wandb_writer.log({f"{name}": loss_list.sum() / num_moe_layers}, iteration)
                 if per_layer_logging:
                     wandb_writer.log(
                         {
@@ -665,6 +740,7 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         # All Reduce Across TPxCPxDP group
         torch.distributed.all_reduce(
             tokens_per_expert,
+            # TODO(Hepteract): delete the usage of the global parallel_state.
             group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
         )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
@@ -689,3 +765,28 @@ def maybe_move_tensor_to_cpu(tensor, as_numpy=False, record_stream=False):
             tensor.record_stream(torch.cuda.current_stream())
         tensor = cpu_tensor
     return tensor
+
+
+def get_moe_layer_wise_logging_tracker():
+    """Return the moe layer wise tracker."""
+    global _MOE_LAYER_WISE_LOGGING_TRACKER
+    return _MOE_LAYER_WISE_LOGGING_TRACKER
+
+
+# TODO(Hepteract): delete the usage of the global parallel_state.
+# Initialize process groups with the global parallel_state.
+def get_default_model_comm_pgs():
+    """Get the default process groups for MoE.
+
+    Returns:
+        ModelCommProcessGroups: The default process groups for MoE.
+    """
+    model_comm_pgs = ModelCommProcessGroups()
+    model_comm_pgs.ep_group = parallel_state.get_expert_model_parallel_group()
+    model_comm_pgs.tp_group = parallel_state.get_tensor_model_parallel_group()
+    model_comm_pgs.cp_group = parallel_state.get_context_parallel_group()
+    model_comm_pgs.expt_tp_group = parallel_state.get_expert_tensor_parallel_group()
+    model_comm_pgs.expt_dp_group = parallel_state.get_expert_data_parallel_group()
+    model_comm_pgs.tp_ep_group = parallel_state.get_expert_tensor_and_model_parallel_group()
+    model_comm_pgs.tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+    return model_comm_pgs

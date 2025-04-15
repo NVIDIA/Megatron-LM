@@ -51,3 +51,20 @@ def print_memory_usage(key, rank, num_ranks):
         mem_info.rss / 1024**3,
         100 * mem_info.rss / process.memory_percent() / 1024**3,
     ))
+
+class _ConverterFakeProcessGroup:
+    def __init__(self, rank=0, size=1):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+    def set_rank(self, rank):
+        self._rank = rank
+
+    def set_size(self, size):
+        self._size = size

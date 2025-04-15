@@ -65,6 +65,7 @@ def _get_train_data_iterator():
         reset_attention_mask=False,
         eod_mask_loss=False,
         tokenizer=_NullTokenizer(vocab_size=50),
+        mid_level_dataset_surplus=0.005,
     )
 
     datasets = BlendedMegatronDatasetBuilder(

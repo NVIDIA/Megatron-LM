@@ -335,10 +335,13 @@ class TextGenerationController:
             context.paused_request_count : context.total_request_count
         ].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
+        active_sequence_lengths += 1  # Account for the token we just generated
+        max_sequence_lengths = context.get_max_sequence_lengths()
 
-        # Request finished if termination_id or length > max_sequence_length.
-        active_request_mask = (new_sample != termination_id).byte() & (
-            active_sequence_lengths < context.max_sequence_length
+        # Request finished if termination_id or length >= max_sequence_length.
+
+        active_request_mask = (new_sample != termination_id).byte() & torch.less(
+            active_sequence_lengths, max_sequence_lengths
         ).byte()
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count

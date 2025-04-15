@@ -2,14 +2,14 @@ ENV_VARS:
   SKIP_PYTEST: 1
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  NCCL_ALGO: Tree
+  NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   DISTILL_CONFIG: '{intermediate_layer_pairs: [["decoder.final_layernorm", "decoder.final_layernorm"]], logit_layers: ["output_layer", "output_layer"], skip_lm_loss: true, kd_loss_scale: 10.0}'
 BEFORE_SCRIPT: |
   mkdir -p ${DATA_CACHE_PATH}/distill && echo $DISTILL_CONFIG | yq -P > ${DATA_CACHE_PATH}/distill/distill_config.yaml
 MODEL_ARGS:
   --export-te-mcore-model: true
-  --export-kd-teacher-load: ${CHECKPOINT_PATH}/teacher
+  --export-kd-teacher-load: ${CHECKPOINT_LOAD_PATH}/../gpt_teacher
   --export-kd-cfg: ${DATA_CACHE_PATH}/distill/distill_config.yaml
   --auto-detect-ckpt-format: true
   --num-layers: 12
@@ -60,6 +60,7 @@ MODEL_ARGS:
   --no-gradient-accumulation-fusion: true
   --use-checkpoint-opt_param-scheduler: true
   --ckpt-format: torch_dist
+  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --attention-backend: unfused

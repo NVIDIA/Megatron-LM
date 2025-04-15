@@ -91,6 +91,7 @@ def build_tokenizer(args, **kwargs):
             args.tokenizer_prompt_format,
             args.special_tokens,
             args.image_tag_type,
+            args.force_system_message,
         )
     elif args.tokenizer_type == 'NullMultimodalTokenizer':
         assert args.vocab_size is not None

@@ -1,7 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
-from typing import Iterator, List, Union
+from typing import Callable, Iterator, List, Optional, Union
 
 import torch
 from torch.autograd.variable import Variable
@@ -100,6 +100,12 @@ def get_forward_backward_func():
     first_val_step (bool, optional): Is the first step of the validation phase. Used by
         Transformer Engine modules to only update their fp8 weights only on the first validation
         step.
+
+    adjust_tensor_shapes_fn (Callable, optional): A function that adjusts the receive and send
+        tensor shapes. Only applicable in forward_backward_pipelining_without_interleaving for now.
+        Takes in a list of receive shapes and a list of send shapes and returns the adjusted
+        respective list of shapes. Thus it is not used in the other forward-backward functions
+        which have different shape handling.
 
     """
     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -439,10 +445,11 @@ def forward_backward_no_pipelining(
     num_microbatches: int,
     seq_length: int,  # unused
     micro_batch_size: int,  # unused
-    decoder_seq_length: int = None,  # unused
+    decoder_seq_length: Optional[int] = None,  # unused
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
-    first_val_step: bool = None,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
 ):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
@@ -461,6 +468,9 @@ def forward_backward_no_pipelining(
             len(data_iterator) == 1
         ), "non-pipeline-parallel schedule does not support model chunking"
         data_iterator = data_iterator[0]
+    assert (
+        adjust_tensor_shapes_fn is None
+    ), "adjust_tensor_shapes_fn is not supported for non-pipeline-parallel schedule"
 
     config = get_model_config(model)
     if config.timers is not None:
@@ -677,10 +687,11 @@ def forward_backward_pipelining_with_interleaving(
     num_microbatches: int,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: int = None,
+    decoder_seq_length: Optional[int] = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
-    first_val_step: bool = None,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -701,6 +712,9 @@ def forward_backward_pipelining_with_interleaving(
     assert isinstance(
         data_iterator, list
     ), "interleaved pipeline parallelism expected each model chunk to have a data iterator"
+    assert (
+        adjust_tensor_shapes_fn is None
+    ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
 
     config = get_model_config(model[0])
     if config.overlap_p2p_comm and config.batch_p2p_comm:
@@ -797,18 +811,29 @@ def forward_backward_pipelining_with_interleaving(
         raise RuntimeError(msg)
 
     model_type = get_model_type(model[0])
+
     if model_type == ModelType.encoder_and_decoder:
-        raise RuntimeError("Interleaving is not supported with an encoder and decoder model.")
-
-    if decoder_seq_length is not None and decoder_seq_length != seq_length:
-        raise RuntimeError(
-            "Interleaving is not supported with a different decoder sequence length."
+        xattn_needed = get_model_xattn(model)
+        assert (
+            not xattn_needed
+        ), "Interleaving is not supported when xattn is required between encoder and decoder"
+        tensor_shape = get_tensor_shapes(
+            rank=parallel_state.get_pipeline_model_parallel_rank(),
+            model_type=model_type,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            decoder_seq_length=decoder_seq_length,
+            config=config,
+            encoder_decoder_xattn=xattn_needed,
         )
-
-    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
-    tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
-    if config.sequence_parallel:
-        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+        tensor_shape = list(tensor_shape[0])
+    else:
+        tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+        tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
+        if config.sequence_parallel:
+            tensor_shape[0] = (
+                tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
+            )
 
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
@@ -1713,10 +1738,11 @@ def forward_backward_pipelining_without_interleaving(
     num_microbatches: int,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: int = None,
+    decoder_seq_length: Optional[int] = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
-    first_val_step: bool = None,
+    first_val_step: Optional[bool] = None,
+    adjust_tensor_shapes_fn: Optional[Callable] = None,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -1810,6 +1836,10 @@ def forward_backward_pipelining_without_interleaving(
         config=config,
         encoder_decoder_xattn=encoder_decoder_xattn,
     )
+    if adjust_tensor_shapes_fn is not None:
+        recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
+            recv_tensor_shapes, send_tensor_shapes
+        )
 
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None

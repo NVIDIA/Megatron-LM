@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import json
 from typing import Union
 
 import tensorrt_llm
@@ -13,6 +13,7 @@ from megatron.core.export.model_type import ModelType
 from megatron.core.export.trtllm.engine_builder.trtllm_engine_builder import TRTLLMEngineBuilder
 from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
     DEFAULT_CONVERSION_DICT,
+    NEMOTRON_NAS_CONVERSION_DICT,
 )
 from megatron.core.export.trtllm.trt_model_config import TRT_MODEL_CONFIG
 from megatron.core.export.trtllm.trt_model_type import TRT_MODEL_TYPE_STRING
@@ -33,6 +34,7 @@ class TRTLLMHelper:
 
     def __init__(
         self,
+        *,
         transformer_config: TransformerConfig,
         model_type: ModelType,
         trtllm_conversion_dict: dict = {},
@@ -40,6 +42,7 @@ class TRTLLMHelper:
         max_position_embeddings: int = None,
         rotary_percentage: int = 1.0,
         rotary_base: int = 10000,
+        rope_scaling_factor: float = 8.0,
         moe_tp_mode: int = 2,
         multi_query_mode: bool = False,
         activation: str = "gelu",
@@ -72,6 +75,8 @@ class TRTLLMHelper:
         self.transformer_config = transformer_config
         self.model_type = model_type
         self.trtllm_conversion_dict = DEFAULT_CONVERSION_DICT.copy()
+        if model_type == ModelType.nemotron_nas:
+            self.trtllm_conversion_dict.update(NEMOTRON_NAS_CONVERSION_DICT)
         self.trtllm_conversion_dict.update(trtllm_conversion_dict)
         assert position_embedding_type in [
             'learned_absolute',
@@ -81,6 +86,7 @@ class TRTLLMHelper:
         self.max_position_embeddings = max_position_embeddings
         self.rotary_percentage = rotary_percentage
         self.rotary_base = rotary_base
+        self.rope_scaling_factor = rope_scaling_factor
         self.moe_tp_mode = moe_tp_mode
         self.multi_query_mode = multi_query_mode
         self.activation = activation
@@ -179,6 +185,13 @@ class TRTLLMHelper:
                 "factor": float(self.seq_len_interpolation_factor),
             }
 
+        if self.model_type == ModelType.nemotron_nas:
+            hf_config_dict = json.loads(
+                self.transformer_config.heterogeneous_layers_config_encoded_json
+            )
+            config["block_configs"] = hf_config_dict["block_configs"]
+            config["rotary_scaling"] = {"type": "llama3", "factor": self.rope_scaling_factor}
+
         config_cls = TRT_MODEL_CONFIG[self.model_type]
         return config_cls(**config)
 
@@ -275,7 +288,12 @@ class TRTLLMHelper:
 
         if on_device_distributed_conversion:
             assert vocab_size is not None, "Need to pass in vocab_size for on device"
-            supported_model = self.model_type in [ModelType.gpt, ModelType.gptnext, ModelType.llama]
+            supported_model = self.model_type in [
+                ModelType.gpt,
+                ModelType.gptnext,
+                ModelType.llama,
+                ModelType.nemotron_nas,
+            ]
             assert (
                 supported_model
             ), "On device conversion only supported for model types gptnext and llama"

@@ -1,7 +1,7 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  NCCL_ALGO: Tree
+  NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   GPUS_PER_NODE: 7
 MODEL_ARGS:
@@ -48,6 +48,7 @@ MODEL_ARGS:
   --use-checkpoint-opt_param-scheduler: true
   --ckpt-format: torch
   --no-gradient-accumulation-fusion: true
+  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --bf16: true
   --img-h: 336
   --img-w: 336

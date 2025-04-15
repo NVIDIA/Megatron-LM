@@ -241,9 +241,7 @@ class _CudagraphRecordNode(torch.autograd.Function):
         assert (
             runner.status == _GraphStatus.BWD_READY
         ), "Tried calling the bwd cudagraph when the fwd cudagraph was expected to be called next!"
-
         runner.status = _GraphStatus.FWD_READY
-
         if not runner.bwd_graph_recorded:
             _CudagraphGlobalRecord.record_bwd_graph(runner)
             runner.bwd_graph_recorded = True
@@ -352,10 +350,12 @@ class _CudaGraphRunner(torch.nn.Module):
     If there are multiple outstanding microbatches per module, such as for pipeline parallelism,
     CudaGraphManager automatically creates multiple _CudaGraphRunners per module."""
 
-    def __init__(self, base_module, fwd_mempool, bwd_mempool):
+    def __init__(self, base_module, fwd_mempool, bwd_mempool, share_cudagraph_io_buffers=None):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
-        '_CudagraphGlobalRecord', and 'create_cudagraphs()' is called."""
+        '_CudagraphGlobalRecord', and 'create_cudagraphs()' is called. share_cudagraph_io_buffers
+        is a boolean flag to indicate whether to reuse the cudagraph input and output buffers for
+        transformer layer specific optimizations that reduce memory usage and tensor copies."""
 
         super().__init__()
 
@@ -392,22 +392,27 @@ class _CudaGraphRunner(torch.nn.Module):
 
         self.is_first_layer = None
         self.is_last_layer = None
-        self.reuse_input_output_buffer = False
-        if (
-            isinstance(base_module, TransformerLayer)
-            and isinstance(base_module.cross_attention, IdentityOp)
-        ) or isinstance(base_module, MambaLayer):
-            self.reuse_input_output_buffer = True
+        if share_cudagraph_io_buffers == False:
+            self.reuse_input_output_buffer = False
+            self.is_first_layer = True
+            self.is_last_layer = True
+        else:
+            if (
+                isinstance(base_module, TransformerLayer)
+                and isinstance(base_module.cross_attention, IdentityOp)
+            ) or isinstance(base_module, MambaLayer):
+                self.reuse_input_output_buffer = True
+                total_num_layers = base_module.config.num_layers
+                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+                vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+                if vpp_size is None:
+                    vpp_size = 1
 
-            total_num_layers = base_module.config.num_layers
-            pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-            vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-            if vpp_size is None:
-                vpp_size = 1
-
-            layers_per_chunk = total_num_layers // vpp_size // pp_size
-            self.is_first_layer = ((base_module.layer_number - 1) % layers_per_chunk) == 0
-            self.is_last_layer = (base_module.layer_number % layers_per_chunk) == 0
+                layers_per_chunk = total_num_layers // vpp_size // pp_size
+                self.is_first_layer = ((base_module.layer_number - 1) % layers_per_chunk) == 0
+                self.is_last_layer = (base_module.layer_number % layers_per_chunk) == 0
+            else:
+                self.reuse_input_output_buffer = False
 
     def get_fp8_context(self):
         """Return a new fp8 context in cudagraph mode."""
@@ -620,7 +625,14 @@ class _CudaGraphRunner(torch.nn.Module):
         # Register a noop autograd node that toggles `self.graph_status` in the bwd pass, which
         # tracks when the runner completes its bwd pass.
         # If it's the first bwd encountered by this runner, record it to _CudagraphGlobalRecord
-        out = tuple(_CudagraphRecordNode.apply(self, o) if torch.is_tensor(o) else o for o in out)
+        # We record the noop autograd node to the first output tensor. This is sufficient for
+        # TransformerLayer and MambaLayer as their output is just the hidden_states.
+        out = tuple(
+            [
+                _CudagraphRecordNode.apply(self, o) if torch.is_tensor(o) and i == 0 else o
+                for i, o in enumerate(out)
+            ]
+        )
 
         # autograd nodes return inputs as views, so clone the tensor as returning views may cause
         # issues, for instance with pipeline parallelism
@@ -754,10 +766,19 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = None):
         super().__init__()
+        """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
+        Args:
+            config: TransformerConfig object containing CUDA graph settings for memory
+                pooling, graph retention, gradient accumulation, FP8, and warmup steps.
+            share_cudagraph_io_buffers (bool, optional): If None (default) or True, enables 
+                buffer reuse optimizations for transformer and mamba layers. If False,
+                disables buffer reuse.
+        """
         rng_tracker = get_cuda_rng_tracker()
+        self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
 
         # need to delay the import here to avoid a circular import
         try:
@@ -848,7 +869,9 @@ class CudaGraphManager(torch.nn.Module):
                 if _CudagraphGlobalRecord.cudagraph_created:
                     assert False
                 else:
-                    runner = _CudaGraphRunner(megatron_module, fwd_mempool, bwd_mempool)
+                    runner = _CudaGraphRunner(
+                        megatron_module, fwd_mempool, bwd_mempool, self.share_cudagraph_io_buffers
+                    )
                     self.cudagraph_runners.append(runner)
         else:
             # Create cudagraphs for every microbatch
@@ -857,7 +880,9 @@ class CudaGraphManager(torch.nn.Module):
                 assert runner.status == _GraphStatus.FWD_READY
                 self.cudagraph_runners = self.cudagraph_runners[1:] + self.cudagraph_runners[:1]
             else:
-                runner = _CudaGraphRunner(megatron_module, fwd_mempool, bwd_mempool)
+                runner = _CudaGraphRunner(
+                    megatron_module, fwd_mempool, bwd_mempool, self.share_cudagraph_io_buffers
+                )
                 self.cudagraph_runners.append(runner)
 
         return runner

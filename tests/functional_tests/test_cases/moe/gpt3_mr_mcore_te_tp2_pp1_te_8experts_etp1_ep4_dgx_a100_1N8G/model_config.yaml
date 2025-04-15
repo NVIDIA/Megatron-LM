@@ -1,7 +1,7 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  NCCL_ALGO: Tree
+  NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
   N_REPEATS: 5
 MODEL_ARGS:
@@ -54,8 +54,10 @@ MODEL_ARGS:
   --attention-softmax-in-fp32: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
+  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --attention-backend: unfused
+  --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
 TEST_TYPE: regular

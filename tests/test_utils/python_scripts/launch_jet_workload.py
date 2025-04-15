@@ -88,9 +88,14 @@ def launch_and_wait_for_completion(
                                         "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
                                         "WANDB_EXPERIMENT": wandb_experiment or "",
                                         "RECORD_CHECKPOINTS": str(
-                                            "Record checkpoints"
-                                            in os.getenv("CI_MERGE_REQUEST_LABELS", "")
+                                            record_checkpoints == "true"
                                         ).lower(),
+                                        "RO_API_TOKEN": os.getenv("RO_API_TOKEN") or "",
+                                        "MCORE_REPO": os.getenv("CI_REPOSITORY_URL") or "",
+                                        "MCORE_MR_COMMIT": os.getenv("MCORE_MR_COMMIT") or "",
+                                        "MCORE_BACKWARDS_COMMIT": (
+                                            os.getenv("MCORE_BACKWARDS_COMMIT") or ""
+                                        ),
                                     }
                                 }
                             }

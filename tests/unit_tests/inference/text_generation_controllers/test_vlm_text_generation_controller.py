@@ -27,8 +27,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -51,9 +51,14 @@ class TestVLMTextGenerationController:
             hidden_size=self.language_hidden_size,
             num_attention_heads=self.language_num_attention_heads,
             use_cpu_initialization=False,
+            bf16=True,
         )
         vision_config = TransformerConfig(
-            num_layers=2, hidden_size=16, num_attention_heads=2, use_cpu_initialization=False
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=2,
+            use_cpu_initialization=False,
+            bf16=True,
         )
         vision_projection_config = TransformerConfig(
             num_layers=2,
@@ -61,6 +66,7 @@ class TestVLMTextGenerationController:
             ffn_hidden_size=32,
             num_attention_heads=1,
             use_cpu_initialization=False,
+            bf16=True,
         )
 
         language_layer_spec = get_gpt_layer_local_spec()
@@ -84,7 +90,7 @@ class TestVLMTextGenerationController:
             patch_dim=14,
         ).cuda()
         self.image_token_index = self.model.image_token_index
-        self.model = Float16Module(self.model, Namespace(fp16=False, bf16=True))
+        self.model = Float16Module(self.model.config, self.model)
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.language_hidden_size,

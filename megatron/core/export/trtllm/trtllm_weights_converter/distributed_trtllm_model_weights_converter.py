@@ -108,9 +108,9 @@ class DistributedTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.post_layernorm_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.post_layernorm_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
-            or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_router_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_projection_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.attention_dense_weight))
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_projection_weight))
         ):
@@ -124,10 +124,11 @@ class DistributedTRTLLMModelWeightsConverter:
 
             self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
 
-        elif layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight)) or layer_name.endswith(
-            suffix(TRTLLMLayers.mlp_fc_bias)
+        elif (
+            layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_weight))
+            or layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_bias))
+            or layer_name.endswith(suffix(TRTLLMLayers.ffn_fc_weight))
         ):
-
             split_gated_activation = self.activation in [
                 "swiglu",
                 "geglu",
@@ -140,6 +141,11 @@ class DistributedTRTLLMModelWeightsConverter:
                 self._add_to_trtllm_model_weights(val=gates[0], layer_name=gate_layer_name)
                 val = vals[0]
 
+            self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
+
+        elif layer_name.endswith(suffix(TRTLLMLayers.ffn_linear_weight)) or layer_name.endswith(
+            suffix(TRTLLMLayers.attention_linear_weight)
+        ):
             self._add_to_trtllm_model_weights(val=val, layer_name=layer_name)
 
         elif layer_name.endswith(suffix(TRTLLMLayers.attention_qkv_bias)):

@@ -51,6 +51,8 @@ class RotaryEmbedding(nn.Module):
         rope_scaling_factor (float, optional): rope scaling factor in llama 3.x. Defaults to 8.
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly
             on the GPU. Defaults to False
+        cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
+            Defaults to None.
     """
 
     def __init__(
@@ -63,6 +65,7 @@ class RotaryEmbedding(nn.Module):
         rope_scaling: bool = False,
         rope_scaling_factor: float = 8.0,
         use_cpu_initialization: bool = False,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         super().__init__()
 
@@ -79,6 +82,12 @@ class RotaryEmbedding(nn.Module):
 
         if rope_scaling:
             self.inv_freq = self._apply_scaling(self.inv_freq, factor=rope_scaling_factor)
+
+        self.cp_group = (
+            cp_group
+            if cp_group is not None
+            else parallel_state.get_context_parallel_group(check_initialized=False)
+        )
 
     def _apply_scaling(
         self,
@@ -165,10 +174,10 @@ class RotaryEmbedding(nn.Module):
             )
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if parallel_state.get_context_parallel_world_size() > 1 and not packed_seq:
+        if self.cp_group is not None and self.cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):

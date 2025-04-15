@@ -11,6 +11,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 - **Support DeepSeek's DeepEP for efficient token dispatching and combining**
 - Add fusion for token permutation and unpermutation
 - Support Uneven virtual pipeline parallel split
+- Support output-discarding checkpointing on some submodules
 
 ### Parallelism
 - **Expert Parallelism**
@@ -149,6 +150,16 @@ The overlapping relies on the envirionment setting `CUDA_DEVICE_MAX_CONNECTIONS=
 The `AllGather` and `ReduceScatter` communications in the shared experts are overlapped with `permute`/`unpermute` in the dispatcher.
 The `MLP` computation part in the shared experts are overlapped with the `AlltoAll` communications in the dispatcher.
 Both the forward and the backward pass can overlap. But to get the overlapping in the backward pass, the PyTorch version should `>= 2.2.0`.
+
+### Checkpointing
+A new output-discarding checkpointing method is also supported. This method discards the output memory of certain submodules during the forward pass and recomputes them during the backward pass, which can save memory compared to standard checkpointing. This can be enabled for specific submodules using the `--recompute-granularity selective --recompute-modules [submodule1, submodule2, ...]` argument. The supported submodules are:
+
+* `moe_act`: Recompute the GroupedMLP activation function.
+* `layernorm`: Recompute the input_layernorm and pre_mlp_layernorm (when they are not `IdentityOp`).
+* `mla_up_proj`: Recompute the MLA up projection and RoPE applying parts.
+* `core_attn`: Recompute the core attention submodule (uses standard checkpointing rather than output-discarding).
+* `mlp`: Recompute the dense MLP submodule (uses standard checkpointing rather than output-discarding) which is useful for hybrid-models like DeepSeek-V3.
+* `moe`: Recompute the MoE layer submodule (uses standard checkpointing rather than output-discarding).
 
 ### Upcycling
 Use `--moe-use-upcycling` to enable upcycling, which loads the dense model from the `--load` directory, converts it to an MoE model at runtime, and starts training. The converted model is saved to the `--save` path before training begins. Upcycling is built on distributed checkpointing, supporting parallel modes different from existing dense checkpoints, such as arbitrary expert parallelism during upcycling.

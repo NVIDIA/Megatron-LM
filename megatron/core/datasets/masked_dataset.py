@@ -169,7 +169,6 @@ class MaskedWordPieceDataset(MegatronDataset):
                 logging.INFO,
                 f"Build and save the {type(self).__name__} {self.index_split.name} indices",
             )
-            self.built_anew_on_cache_miss = True
 
             os.makedirs(path_to_cache, exist_ok=True)
 

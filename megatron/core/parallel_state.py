@@ -118,9 +118,6 @@ _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-# MOE logging
-_MOE_LAYER_WISE_LOGGING_TRACKER = {}
-
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
@@ -1240,9 +1237,10 @@ def model_parallel_is_initialized():
     return True
 
 
-def get_model_parallel_group():
+def get_model_parallel_group(check_initialized=True):
     """Get the model-parallel group the caller rank belongs to."""
-    assert _MODEL_PARALLEL_GROUP is not None, 'model parallel group is not initialized'
+    if check_initialized:
+        assert _MODEL_PARALLEL_GROUP is not None, 'model parallel group is not initialized'
     return _MODEL_PARALLEL_GROUP
 
 
@@ -1255,11 +1253,12 @@ def get_tensor_model_parallel_group(check_initialized=True):
     return _TENSOR_MODEL_PARALLEL_GROUP
 
 
-def get_pipeline_model_parallel_group():
+def get_pipeline_model_parallel_group(check_initialized=True):
     """Get the pipeline-model-parallel group the caller rank belongs to."""
-    assert (
-        _PIPELINE_MODEL_PARALLEL_GROUP is not None
-    ), 'pipeline_model parallel group is not initialized'
+    if check_initialized:
+        assert (
+            _PIPELINE_MODEL_PARALLEL_GROUP is not None
+        ), 'pipeline_model parallel group is not initialized'
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
@@ -1330,15 +1329,17 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
     return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_embedding_group():
+def get_embedding_group(check_initialized=True):
     """Get the embedding group the caller rank belongs to."""
-    assert _EMBEDDING_GROUP is not None, 'embedding group is not initialized'
+    if check_initialized:
+        assert _EMBEDDING_GROUP is not None, 'embedding group is not initialized'
     return _EMBEDDING_GROUP
 
 
-def get_position_embedding_group():
+def get_position_embedding_group(check_initialized=True):
     """Get the position embedding group the caller rank belongs to."""
-    assert _POSITION_EMBEDDING_GROUP is not None, 'position embedding group is not initialized'
+    if check_initialized:
+        assert _POSITION_EMBEDDING_GROUP is not None, 'position embedding group is not initialized'
     return _POSITION_EMBEDDING_GROUP
 
 
@@ -1382,11 +1383,12 @@ def get_tensor_and_data_parallel_group(with_context_parallel=False):
         return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 
-def get_tensor_and_context_parallel_group():
+def get_tensor_and_context_parallel_group(check_initialized=True):
     """Get the tensor- and context-parallel group the caller rank belongs to."""
-    assert (
-        _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
-    ), 'tensor and context parallel group is not initialized'
+    if check_initialized:
+        assert (
+            _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
+        ), 'tensor and context parallel group is not initialized'
     return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
 
 
@@ -1909,11 +1911,12 @@ def get_expert_tensor_and_model_parallel_rank():
         return 0
 
 
-def get_expert_tensor_model_pipeline_parallel_group():
+def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     """Get expert tensor-model-pipeline parallel group."""
-    assert (
-        _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
-    ), 'Expert tensor-model-pipeline parallel group is not initialized'
+    if check_initialized:
+        assert (
+            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
+        ), 'Expert tensor-model-pipeline parallel group is not initialized'
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
 
@@ -1992,12 +1995,6 @@ def get_all_ranks():
     return '_'.join(map(lambda x: str(x or 0), ranks))
 
 
-def get_moe_layer_wise_logging_tracker():
-    """Return the moe layer wise tracker."""
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    return _MOE_LAYER_WISE_LOGGING_TRACKER
-
-
 def destroy_model_parallel():
     """Set the groups to none."""
     global _MODEL_PARALLEL_GROUP
@@ -2029,6 +2026,9 @@ def destroy_model_parallel():
 
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
+
+    global _POSITION_EMBEDDING_GLOBAL_RANKS
+    _POSITION_EMBEDDING_GLOBAL_RANKS = None
 
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     _TENSOR_AND_DATA_PARALLEL_GROUP = None
@@ -2119,6 +2119,3 @@ def destroy_model_parallel():
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
     # End of expert parallelism destroy.
-
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    _MOE_LAYER_WISE_LOGGING_TRACKER = {}

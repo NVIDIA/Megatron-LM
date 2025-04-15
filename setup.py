@@ -29,7 +29,7 @@ long_description_content_type = "text/markdown"
 
 
 def req_file(filename, folder="requirements"):
-    environment = os.getenv("PY_ENV", "pytorch_24.10")
+    environment = os.getenv("PY_ENV", "pytorch_25.03")
 
     content = []
     with open(os.path.join(folder, environment, filename), encoding='utf-8') as f:

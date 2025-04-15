@@ -28,8 +28,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.legacy.model import Float16Module
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -52,6 +52,8 @@ class TestTextGenerationController:
             attention_backend=AttnBackend.local,
             params_dtype=dtype,
         )
+        if dtype == torch.bfloat16:
+            transformer_config.bf16 = True
 
         gpt_model = GPTModel(
             config=transformer_config,
@@ -63,7 +65,7 @@ class TestTextGenerationController:
             post_process=parallel_state.is_pipeline_last_stage(),
         ).cuda()
         if dtype == torch.bfloat16:
-            gpt_model = Float16Module(gpt_model, Namespace(fp16=False, bf16=True))
+            gpt_model = Float16Module(gpt_model.config, gpt_model)
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.hidden_size,

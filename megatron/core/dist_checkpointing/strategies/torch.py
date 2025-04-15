@@ -6,6 +6,7 @@ import os
 import pickle
 import warnings
 from collections import ChainMap, defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
@@ -526,11 +527,24 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     """
 
     def __init__(
-        self, *args, shapes_validation_sharded_tensors: Iterable[ShardedTensor] = (), **kwargs
+        self,
+        *args,
+        shapes_validation_sharded_tensors: Iterable[ShardedTensor] = (),
+        allow_shape_mismatch_sharded_tensors: Dict[str, ShardedTensor] = None,
+        **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.shapes_validation_sharded_tensors = shapes_validation_sharded_tensors
+        self.allow_shape_mismatch_sharded_tensors = allow_shape_mismatch_sharded_tensors
         self._intermediate_read_item_and_target: Optional[Tuple[ReadItem, torch.Tensor]] = None
+
+    @staticmethod
+    def _expected_shape(sh_ten):
+        return (
+            nd_flattened_tensor_reformulated_global_shape(sh_ten)
+            if is_nd_flattened_tensor(sh_ten)
+            else sh_ten.global_shape
+        )
 
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
@@ -540,10 +554,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                     f" {sorted(metadata.state_dict_metadata.keys())}"
                 )
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
-            if not is_nd_flattened_tensor(sh_ten):
-                expected_shape = sh_ten.global_shape
-            else:
-                expected_shape = nd_flattened_tensor_reformulated_global_shape(sh_ten)
+            expected_shape = self._expected_shape(sh_ten)
             if loaded_shape != expected_shape:
                 if is_nd_flattened_tensor(sh_ten) and len(sh_ten.global_shape) == 1:
                     # Handle legacy 1-D flattened tensors checkpoint format
@@ -558,10 +569,39 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                 )
                 raise CheckpointingException(_msg)
 
+    @contextmanager
+    def _temporarily_bypass_shape_validation(self):
+        """
+        Temporarily set the size of tensors to their expected shapes to bypass DCP shape validation.
+        This is used when validating the shapes during local plan creation.
+        """
+        if not self.allow_shape_mismatch_sharded_tensors:
+            yield
+            return
+
+        tensor_metadata = self.metadata.state_dict_metadata
+        metadata_with_sizes = [
+            (tensor_metadata[key], tensor_metadata[key].size, sharded_tensor)
+            for key, sharded_tensor in self.allow_shape_mismatch_sharded_tensors.items()
+        ]
+        try:
+            # Temporarily set sizes to expected shapes
+            for md, _, sharded_tensor in metadata_with_sizes:
+                md.size = self._expected_shape(sharded_tensor)
+            yield
+        finally:
+            # Restore original sizes after yield
+            for md, size, _ in metadata_with_sizes:
+                md.size = size
+
     def create_local_plan(self) -> LoadPlan:
         """Runs additional shapes validation."""
         self._validate_global_shapes(self.metadata, self.shapes_validation_sharded_tensors)
-        return super().create_local_plan()
+
+        with self._temporarily_bypass_shape_validation():
+            local_plan = super().create_local_plan()
+
+        return local_plan
 
     def resolve_tensor(self, read_item: ReadItem):
         """Override to add FP8 support.
@@ -833,6 +873,11 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             for sh_ten in nested_values(sharded_state_dict)
             if isinstance(sh_ten, ShardedTensor) and not sh_ten.allow_shape_mismatch
         ]
+        allow_shape_mismatch_sharded_tensors = {
+            sh_ten.key: sh_ten
+            for sh_ten in nested_values(sharded_state_dict)
+            if isinstance(sh_ten, ShardedTensor) and sh_ten.allow_shape_mismatch
+        }
 
         orig_sharded_state_dict = sharded_state_dict
         # MCore state dict to PyT Distributed compatible
@@ -848,7 +893,8 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             pyt_state_dict,
             fsr,
             planner=MCoreLoadPlanner(
-                shapes_validation_sharded_tensors=flexible_shape_sharded_tensors
+                shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+                allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
             ),
         )
 

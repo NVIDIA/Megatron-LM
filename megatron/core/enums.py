@@ -18,3 +18,4 @@ class Fp8Recipe(str, enum.Enum):
     delayed = "delayed"
     tensorwise = "tensorwise"
     mxfp8 = "mxfp8"
+    blockwise = "blockwise"

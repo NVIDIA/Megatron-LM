@@ -38,6 +38,8 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
         gated_linear_unit=glu,
+        add_bias_linear=False,
+        pipeline_dtype=torch.bfloat16,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
@@ -87,7 +89,15 @@ class TestMambaReconfiguration:
             tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_B'
         ) as ckpt_dir_B:
             # Save checkpoint A
-            model_A = initialize_mamba(1, use_glu)
+            model_A = initialize_mamba(
+                1,
+                use_glu,
+                tensor_model_parallel_size=src_tp,
+                pipeline_model_parallel_size=src_pp,
+                expert_model_parallel_size=src_exp,
+                # Sequence parallelism is required when using both expert and tensor parallelism
+                sequence_parallel=(src_exp > 1 and src_pp > 1),
+            )
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
@@ -103,7 +113,15 @@ class TestMambaReconfiguration:
             # Load checkpoint A with different TP/PP/expert and save as checkpoint B
             # No FPS this time, only FPL
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
-            model_B = initialize_mamba(2, use_glu)
+            model_B = initialize_mamba(
+                2,
+                use_glu,
+                tensor_model_parallel_size=dest_tp,
+                pipeline_model_parallel_size=dest_pp,
+                expert_model_parallel_size=dest_exp,
+                # Sequence parallelism is required when using both expert and tensor parallelism
+                sequence_parallel=(dest_exp > 1 and dest_pp > 1),
+            )
             if use_fpsl:
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
                 load_strategy = FullyParallelLoadStrategyWrapper(
