@@ -633,6 +633,16 @@ def validate_args(args, defaults={}):
         assert args.start_weight_decay is not None
         assert args.end_weight_decay is not None
 
+    if args.weight_decay_cooldown_style == 'constant':
+        assert args.end_weight_decay_cooldown is None
+        assert args.weight_decay_cooldown_iters is None
+        args.end_weight_decay_cooldown = args.end_weight_decay
+        args.weight_decay_cooldown_iters = 0
+    else:
+        assert args.end_weight_decay_cooldown is not None
+        assert args.weight_decay_cooldown_iters is not None
+        assert args.weight_decay_incr_style == 'constant'
+
     # Persistent fused layer norm.
     if not is_torch_min_version("1.11.0a0"):
         args.no_persist_layer_norm = True
@@ -1378,6 +1388,8 @@ def _add_logging_args(parser):
                        help='If set, calculate and log parameters norm.')
     group.add_argument('--log-params-norm-per-param', action='store_true',
                        help='If set, calculate and log norm for each parameter individually.')
+    group.add_argument('--log-weight-decay', action='store_true',
+                       help='If set, maximum weight decay across all groups will be logged')
     group.add_argument('--log-num-zeros-in-grad', action='store_true',
                        help='If set, calculate and log the number of zeros in gradient.')
     group.add_argument('--log-indiv-grad-norm', action='store_true',
@@ -1390,6 +1402,8 @@ def _add_logging_args(parser):
                        'directory.')
     group.add_argument('--log-intermediate-metrics', nargs='+', default=[], choices=["mean", "rms", "kurtosis"],
                        help='Log these metrics on all activations, qkv and mlp vectors')
+    group.add_argument('--log-intermediate-metrics-interval', type=int, default=None,
+                       help='Frequency to log the intermediate metrics (see `--log-intermediate-metrics`)')
     group.add_argument('--timing-log-level', type=int,
                        default=0, choices=range(0,3),
                        help='Granularity level to measure and report timing. '
@@ -1465,6 +1479,13 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-incr-style', type=str, default='constant',
                        choices=['constant', 'linear', 'cosine'],
                        help='Weight decay increment function.')
+    group.add_argument('--end-weight-decay-cooldown', type=float,
+                       help='End of weight decay coefficient after cooldown')
+    group.add_argument('--weight-decay-cooldown-iters', type=int, default=None,
+                       help='Number of iterations for weight decay cooldown')
+    group.add_argument('--weight-decay-cooldown-style', type=str, default='constant',
+                       choices=['constant', 'linear', 'cosine', '1-sqrt'],
+                       help='Weight decay cooldown function')
     group.add_argument('--weight-decay-qk-gains', action='store_true', help='When set, QK layernorm gains are regularized')
     group.add_argument('--no-train-qk-gains', action='store_true', help='When set, QK layernorm gains are not trained')
     group.add_argument('--clip-grad', type=float, default=1.0,
