@@ -534,6 +534,13 @@ class TransformerConfig(ModelParallelConfig):
     mamba_num_groups: int = 8
     """The number of groups used in Mamba layers."""
 
+    mamba_num_heads: Optional[int] = None
+    """The number of heads used in Mamba layers. 
+    If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
+
+    use_mamba_mem_eff_path: bool = True
+    """If True, use the memory efficient path for Mamba layers."""
+
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""

@@ -2678,8 +2678,14 @@ def _add_experimental_args(parser):
                        help='Head dimension for Mamba layers.')
     group.add_argument('--mamba-num-groups', type=int, default=8,
                        help='Number of groups for Mamba layers.')
+    group.add_argument('--mamba-num-heads', type=int, default=None,
+                       help='Number of heads for Mamba layers.'
+                       'If not set, then the number of heads will be '
+                       '--hidden-size * expand // --mamba-head-dim')
     group.add_argument('--is-hybrid-model', default=False, action="store_true",
                        help='Indicates whether the model is a hybrid model.')
+    group.add_argument('--disable-mamba-mem-eff-path', default=False, action="store_true",
+                       help='Disable Mamba efficient path.')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
