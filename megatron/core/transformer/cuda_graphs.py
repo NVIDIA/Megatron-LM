@@ -781,6 +781,7 @@ class CudaGraphManager(torch.nn.Module):
         self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
 
         # need to delay the import here to avoid a circular import
+        global HAVE_TE_GRAPHS
         try:
             from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
         except ImportError:
