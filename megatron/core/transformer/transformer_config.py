@@ -130,7 +130,7 @@ class TransformerConfig(ModelParallelConfig):
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
-    """Whether to apply LayerNorm to the query and key embeddings."""
+    """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
