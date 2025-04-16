@@ -652,7 +652,7 @@ class GroupedMLP(MegatronModule):
         Empty implementation for compatibility with SequentialMLP and TEGroupedMLP.
         """
         pass
-    
+
 
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.

@@ -225,6 +225,7 @@ class TransformerLayerSubmoduleCallables:
     def as_array(self):
         return [self.attention, self.dispatch, self.mlp, self.combine]
 
+
 # Initialize cache for sequence parallel modules
 _sequence_parallel_attr_cache = None
 
