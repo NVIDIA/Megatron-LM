@@ -37,7 +37,7 @@ megatron/core/optimizer/distrib_optimizer/
 
 # Quantization and Inference (QAT)
 [Quantization and Inference (QAT)] @mcore-reviewers/quantization-and-inference
-megatron/core/inference/
+megatron/core/inference/modelopt_support
 
 # Datasets
 [Datasets] @mcore-reviewers/datasets
