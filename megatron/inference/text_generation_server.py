@@ -180,7 +180,7 @@ class MegatronGenerate(Resource):
                 if beam_width is not None:
                     send_do_beam_search()  # Tell other ranks we're doing beam_search
                     response, response_seg, response_scores = beam_search_and_post_process(
-                        self.model,
+                        self.engine,
                         prompts=prompts,
                         tokens_to_generate=tokens_to_generate,
                         beam_size=beam_width,
