@@ -146,12 +146,10 @@ class TELinear(te.pytorch.Linear):
 
         if self.config.split_bw:
             # TODO: Remove this once we have a stable release of TE
-            if get_te_version() == PkgVersion(
-                "2.3.0.dev0+7164025"
-            ) or get_te_version() == PkgVersion("2.2.0.dev0+ccd6634"):
+            if get_te_version() == PkgVersion("2.3.0.dev0+5f16c79"):
                 extra_kwargs["split_bw"] = self.config.split_bw
             else:
-                raise RuntimeError("Only TE with version 2.3.0.dev0+7164025 supports split_bw now.")
+                raise RuntimeError("Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now.")
 
         if is_te_min_version("0.8.0"):
             if self.config.tp_comm_overlap:
@@ -339,12 +337,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         if self.config.split_bw:
             # TODO: Remove this once we have a stable release of TE
-            if get_te_version() == PkgVersion(
-                "2.3.0.dev0+7164025"
-            ) or get_te_version() == PkgVersion("2.2.0.dev0+ccd6634"):
+            if get_te_version() == PkgVersion("2.3.0.dev0+5f16c79"):
                 extra_kwargs["split_bw"] = self.config.split_bw
             else:
-                raise RuntimeError("Only TE with version 2.3.0.dev0+7164025 supports split_bw now.")
+                raise RuntimeError("Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now.")
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         if is_te_min_version("0.11.0"):
@@ -928,13 +924,11 @@ if is_te_min_version("1.9.0.dev0"):
 
             if self.config.split_bw:
                 # TODO: Remove this once we have a stable release of TE
-                if get_te_version() == PkgVersion(
-                    "2.3.0.dev0+7164025"
-                ) or get_te_version() == PkgVersion("2.2.0.dev0+ccd6634"):
+                if get_te_version() == PkgVersion("2.3.0.dev0+5f16c79"):
                     extra_kwargs["split_bw"] = self.config.split_bw
                 else:
                     raise RuntimeError(
-                        "Only TE with version 2.3.0.dev0+7164025 supports split_bw now."
+                        "Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now."
                     )
 
             extra_kwargs["ub_name"] = tp_comm_buffer_name
