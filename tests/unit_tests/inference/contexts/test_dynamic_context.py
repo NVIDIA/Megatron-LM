@@ -1,5 +1,3 @@
-from unittest.mock import patch
-
 import pytest
 import torch
 
@@ -31,6 +29,7 @@ class TestDynamicContext:
         max_sequence_length,
         buffer_size_gb,
         buffer_guarenteed_fraction,
+        chunk_size_tokens,
         buffer_overflow_factor,
         max_requests_override,
         max_tokens_override,
@@ -44,6 +43,7 @@ class TestDynamicContext:
             max_sequence_length=max_sequence_length,
             buffer_size_gb=buffer_size_gb,
             buffer_guaranteed_fraction=buffer_guarenteed_fraction,
+            chunk_size_tokens=chunk_size_tokens,
             buffer_overflow_factor=buffer_overflow_factor,
             max_requests_override=max_requests_override,
             max_tokens_override=max_tokens_override,
@@ -54,10 +54,7 @@ class TestDynamicContext:
         DynamicInferenceContext.ROUNDER = 64
         Utils.destroy_model_parallel()
 
-    @patch(
-        "megatron.core.inference.contexts.dynamic_context._get_block_size", return_value=(None, 128)
-    )
-    def test_initialize_dynamic_context(self, mock_get_block_size):
+    def test_initialize_dynamic_context(self):
         self._setup_model_parallel_group(1, 1)
         with pytest.raises(AssertionError) as error:
 
@@ -69,6 +66,7 @@ class TestDynamicContext:
                 max_sequence_length=512,
                 buffer_size_gb=0.01,
                 buffer_guarenteed_fraction=0.1,
+                chunk_size_tokens=128,
                 max_requests_override=None,
                 max_tokens_override=None,
                 buffer_overflow_factor=None,
@@ -83,6 +81,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
             max_requests_override=None,
             max_tokens_override=None,
             buffer_overflow_factor=None,
@@ -103,6 +102,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=1.0,
             buffer_guaranteed_fraction=0.1,
+            chunk_size_tokens=128,
         )
         assert not dynamic_context.is_static_batching()
 
@@ -116,6 +116,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=1.0,
             buffer_guaranteed_fraction=0.1,
+            chunk_size_tokens=128,
         )
         dynamic_context.chunk_count_avail = 10
         assert dynamic_context.is_memory_available(10)
@@ -141,6 +142,7 @@ class TestDynamicContext:
             max_sequence_length=128,
             buffer_size_gb=0.01,
             buffer_guaranteed_fraction=0.1,
+            chunk_size_tokens=32,
         )
         with pytest.raises(RequestOverflowError):
             for i in range(dynamic_context.max_requests + 1):
@@ -159,6 +161,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.1,
             buffer_guaranteed_fraction=0.1,
+            chunk_size_tokens=128,
             buffer_overflow_factor=1.0,
             max_requests_override=2,
             max_tokens_override=20,  # Setting a very low token limit
@@ -179,6 +182,7 @@ class TestDynamicContext:
             max_sequence_length=128,
             buffer_size_gb=1.0,
             buffer_guaranteed_fraction=0.1,
+            chunk_size_tokens=128,
         )
 
         # Initialize all variables
@@ -240,6 +244,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
             max_requests_override=None,
             max_tokens_override=None,
             buffer_overflow_factor=None,
@@ -271,6 +276,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
             max_requests_override=None,
             max_tokens_override=None,
             buffer_overflow_factor=None,
@@ -335,6 +341,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
             max_requests_override=None,
             max_tokens_override=None,
             buffer_overflow_factor=None,
@@ -371,6 +378,7 @@ class TestDynamicContext:
             max_sequence_length=512,
             buffer_size_gb=0.03,
             buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
             max_requests_override=None,
             max_tokens_override=None,
             buffer_overflow_factor=None,
