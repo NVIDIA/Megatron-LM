@@ -247,6 +247,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         inference_only=False,
         retrieved_neighbours=False,
         fix_newsqa=True,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         **extra_kwargs
     )
 

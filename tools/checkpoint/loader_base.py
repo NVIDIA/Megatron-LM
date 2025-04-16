@@ -5,7 +5,7 @@ import sys
 import types
 import torch
 
-from utils import print_memory_usage
+from utils import _ConverterFakeProcessGroup, print_memory_usage
 
 class MegatronCheckpointLoaderBase:
     """Orchestrates loading a Megatron checkpoint and sending
@@ -146,6 +146,12 @@ class MegatronCheckpointLoaderBase:
         mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
         mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
         mpu.set_expert_model_parallel_world_size(self.margs.expert_model_parallel_size)
+        
+        # For backward compatibility during local parallel states refactoring
+        fake_tp_group = _ConverterFakeProcessGroup(size=self.margs.tensor_model_parallel_size)
+        fake_ep_group = _ConverterFakeProcessGroup(size=self.margs.expert_model_parallel_size)
+        mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+        mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
         fused_kernels.load(self.margs)
 
     def compute_true_vocab_size(self):
@@ -190,6 +196,8 @@ class MegatronCheckpointLoaderBase:
         def get_models_for_pipeline_stage(count, dtype):
             local_models_for_stage = [[] for _ in range(vp_size)]
             for tp_rank in range(count):
+                fake_tp_group = mpu.get_tensor_model_parallel_group()
+                fake_tp_group.set_rank(tp_rank)
                 mpu.set_tensor_model_parallel_rank(tp_rank)
                 model_list = []
 

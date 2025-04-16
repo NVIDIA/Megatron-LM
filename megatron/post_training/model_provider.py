@@ -11,15 +11,16 @@ import modelopt.torch.opt as mto
 import yaml
 
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
+)
 from megatron.core.models.mamba import MambaModel as MCoreMambaModel
-from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_legacy_state_dict_pre_hook,
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
-from megatron.core.transformer.spec_utils import import_module
 from megatron.post_training.algos import distillation
 from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
 from megatron.training import get_args, print_rank_0
@@ -106,17 +107,18 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
     config.non_homogeneous_layers = True
 
     teacher = MCoreGPTModel(config=config, **model_kwargs)
-
     _add_load_convert_hooks(teacher)
 
     print_rank_0("Loading teacher checkpoint...")
     # [WAR]: load checkpoint will check checkpoint's saved args and rng state if not finetune.
     # To avoid error out on loading teacher's checkpoint, we temporarily set args.finetune to
     # True while loading the teacher checkpoint.
-    original_args_finetune = args.finetune
+    original_args_finetune, original_ckpt_format = args.finetune, args.ckpt_format
     args.finetune = True
+    if args.export_kd_teacher_ckpt_format is not None:
+        args.ckpt_format = args.export_kd_teacher_ckpt_format
     load_modelopt_checkpoint([teacher], load_arg='export_kd_teacher_load')
-    args.finetune = original_args_finetune
+    args.finetune, args.ckpt_format = original_args_finetune, original_ckpt_format
 
     return teacher
 
@@ -147,17 +149,22 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         raise ValueError(
             "ModelOpt integration only support MCore models. Use --use-mcore-modules instead."
         )
-
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 
     if args.export_model_type == "GPTModel":
-        transformer_layer_spec = get_gpt_modelopt_spec(
-            config=config,
-            local_core_attention=args.export_force_local_attention,
-            remap_te_layernorm=args.export_te_mcore_model,
-            real_quant_cfg=args.export_real_quant_cfg,
-        )
+        if config.heterogeneous_block_specs:
+            transformer_layer_spec = get_gpt_heterogeneous_layer_spec(
+                config=config,
+                use_te=args.transformer_impl == "transformer_engine",
+            )
+        else:
+            transformer_layer_spec = get_gpt_modelopt_spec(
+                config=config,
+                local_core_attention=args.export_force_local_attention,
+                remap_te_layernorm=args.export_te_mcore_model,
+                real_quant_cfg=args.export_real_quant_cfg,
+            )
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,
             "vocab_size": args.padded_vocab_size,
@@ -209,7 +216,6 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     _add_load_convert_hooks(model)
 
     # Distillation mode.
-    distill_cfg = None
     if args.export_kd_teacher_load:
         print_rank_0("Distillation: Enabled.")
 
@@ -219,28 +225,28 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         assert (
             not args.manual_gc
         ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
+        assert (
+            not args.tp_comm_overlap
+        ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."
+        if args.pipeline_model_parallel_size > 1:
+            assert (
+                args.virtual_pipeline_model_parallel_size is None
+            ), "ModelOpt Distillation currently incompatible with interleaved pipeline schedule."
 
         teacher_config = _load_teacher_model_config(args.export_kd_teacher_load)
         distill_cfg = distillation.load_distillation_config(
-            args.export_kd_cfg, student_cfg=config, teacher_cfg=teacher_config
+            args.export_kd_cfg, student_cfg=config, teacher_cfg=core_transformer_config_from_args(teacher_config)
         )
-        # Intialize DistillationModel if not already restored.
-        if str(mto.conversion.get_mode(model)) != "kd_loss" and not args.export_kd_finalize:
-            kd_config = {
-                "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
-                "criterion": distill_cfg["criterion"],
-                "loss_balancer": distill_cfg["loss_balancer"],
-            }
-            model = mtd.convert(model, mode=[("kd_loss", kd_config)])
+        kd_config = {
+            "teacher_model": (_teacher_provider, [teacher_config, model_kwargs], {}),
+            "criterion": distill_cfg["criterion"],
+            "loss_balancer": distill_cfg["loss_balancer"],
+        }
+        model = mtd.convert(model, mode=[("kd_loss", kd_config)])
 
-    if isinstance(model, mtd.DistillationModel):
-        # Export the student model and create the distillation export mode.
-        if args.export_kd_finalize:
-            print_rank_0("Distillation: Exporting student model into original model...")
-            model = mtd.export(model)
-        else:
-            assert distill_cfg is not None
-            # Additional tweaks needed for MCore/Nemo.
-            distillation.adjust_distillation_model_for_mcore(model, distill_cfg)
+        # Additional tweaks needed for MCore/Nemo.
+        # NOTE: Distillation state manually removed in this function.
+        # ModelOpt state restoration above will not return a `mtd.DistillationModel` for simplicity reasons.
+        distillation.adjust_distillation_model_for_mcore(model, distill_cfg)
 
     return model

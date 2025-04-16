@@ -22,6 +22,13 @@ import time
 _TRAIN_START_TIME = time.time()
 import torch
 
+try:
+    from megatron.post_training.algos.distillation import get_tensor_shapes_adjust_fn_for_distillation
+
+    has_nvidia_modelopt = True
+except ImportError:
+    has_nvidia_modelopt = False
+
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
@@ -158,12 +165,15 @@ def num_floating_point_operations(args, batch_size):
                 hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2 ))
 
     def mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
-                          head_dim=64, num_groups=1):
+                          head_dim=64, num_groups=1, num_heads=128):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
         # but small percent of overall layer flops
         d_in = 2 * hidden_size
-        nheads = d_in // head_dim
+        if num_heads:
+            nheads = num_heads
+        else:
+            nheads = d_in // head_dim
         return (
                 (2 * batch_size * seq_len * hidden_size * (
                         2 * d_in + 2 * num_groups * state_dim + nheads)) +  # in_proj
@@ -174,8 +184,9 @@ def num_floating_point_operations(args, batch_size):
     def hybrid_flops(batch_size, seq_len, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers,
                      mamba_state_dim=128, mamba_head_dim=64,
-                     mamba_num_groups=8, num_attn_heads=32,
-                     gqa=True, gqa_groups=8, kv_channels=None,
+                     mamba_num_groups=8, mamba_num_heads=128,
+                     num_attn_heads=32,gqa=True, 
+                     gqa_groups=8, kv_channels=None,
                      mlp_expansion=4.0, swiglu=False,
                      vocab_size=256000):
         """Calculate total FLOPs for the hybrid model."""
@@ -186,7 +197,7 @@ def num_floating_point_operations(args, batch_size):
                                                  mlp_expansion, swiglu) +
                 num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
                                                      mamba_state_dim, mamba_head_dim,
-                                                     mamba_num_groups) +
+                                                     mamba_num_groups, mamba_num_heads) +
                 (2 * batch_size * seq_len * hidden_size * vocab_size)  # logits computation
         )
         return flops_fwd * 3
@@ -372,6 +383,7 @@ def num_floating_point_operations(args, batch_size):
             mamba_state_dim=args.mamba_state_dim,
             mamba_head_dim=args.mamba_head_dim,
             mamba_num_groups=args.mamba_num_groups,
+            mamba_num_heads=args.mamba_num_heads,
             num_attn_heads=args.num_attention_heads,
             gqa=args.group_query_attention,
             gqa_groups=args.num_query_groups,
@@ -1236,6 +1248,14 @@ def train_step(forward_step_func, data_iterator,
             model_chunk.zero_grad_buffer()
         optimizer.zero_grad()
 
+        if has_nvidia_modelopt:
+            # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
+            adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
+                model, args.seq_length, args.micro_batch_size, args.decoder_seq_length
+            )
+        else:
+            adjust_tensor_shapes_fn = None
+
         # Forward pass.
         forward_backward_func = get_forward_backward_func()
         losses_reduced = forward_backward_func(
@@ -1246,7 +1266,8 @@ def train_step(forward_step_func, data_iterator,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
-            forward_only=False)
+            forward_only=False,
+            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn)
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None
@@ -2129,6 +2150,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if wandb_writer:
             wandb_writer.finish()
         ft_integration.shutdown()
+        one_logger_utils.finish()
         sys.exit(exit_code)
 
     return iteration, num_floating_point_operations_so_far

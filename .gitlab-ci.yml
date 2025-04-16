@@ -31,7 +31,7 @@ workflow:
     - if: $CI_PIPELINE_SOURCE == "web"
 
     # For push to main
-    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == 'push' && $CI_COMMIT_REF_PROTECTED == "true"
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -63,11 +63,11 @@ workflow:
       variables: *merge_train_rule
 
     # For MRs with integration suite
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run tests/
       variables: *merge_train_rule
 
     # For MRs with nightly
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -81,7 +81,7 @@ workflow:
         PUBLISH: "no"
 
     # For MRs with weekly
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
       variables:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
@@ -95,7 +95,7 @@ workflow:
         PUBLISH: "no"
 
     # For MRs with heavy suite
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run functional tests/
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
@@ -110,7 +110,7 @@ workflow:
         PUBLISH: "no"
 
     # Default MRs
-    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result'
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1

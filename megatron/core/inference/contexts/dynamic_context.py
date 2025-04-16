@@ -409,7 +409,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         return key_memory_ptrs, value_memory_ptrs
 
     def apply_rotary_emb_query(
-        self, query: Tensor, query_emb: Tensor, config: TransformerConfig, cu_seqlens_q: Tensor
+        self,
+        query: Tensor,
+        query_emb: Tensor,
+        config: TransformerConfig,
+        cu_seqlens_q: Tensor,
+        cp_group: torch.distributed.ProcessGroup,
     ) -> Tensor:
         """Apply rotary embedding to query tensor.
 
@@ -418,6 +423,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             query_emb (Tensor): Query rotary embeddings.
             config (TransformerConfig): Transformer config.
             cu_seqlens_q (Tensor): Cumulative sequence lengths.
+            cp_group (torch.distributed.ProcessGroup): Process group for context parallel.
 
         Return:
             (Tensor) Query tensor after applying rotary embeddings.
@@ -425,11 +431,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         n = self.padded_active_token_count
         query_seq_idx = self.token_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
-        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q)
+        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q, cp_group)
         return query
 
     def apply_rotary_emb_key(
-        self, key: Tensor, key_emb: Tensor, config: TransformerConfig
+        self,
+        key: Tensor,
+        key_emb: Tensor,
+        config: TransformerConfig,
+        cp_group: torch.distributed.ProcessGroup,
     ) -> Tensor:
         """Apply rotary embedding to key tensor.
 
@@ -437,6 +447,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             key_emb (Tensor): Key rotary embeddings.
             config (TransformerConfig): Transformer config.
+            cp_group (torch.distributed.ProcessGroup): Process group for context parallel.
 
         Return:
             (Tensor) Key tensor after applying rotary embeddings.
@@ -446,9 +457,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
             assert key.shape[0] == n == self.max_requests
-            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config)
+            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
         else:
-            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config)
+            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
         return key
 
     def is_memory_available(self, num_chunks: int, safe: bool = False) -> bool:

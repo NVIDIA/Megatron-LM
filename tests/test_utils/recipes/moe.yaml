@@ -13,6 +13,28 @@ spec:
   artifacts:
     /workspace/data/gpt3_data: text/the_pile/shard00
     /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/22410107
+  script_setup: |
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
     ls
     cd /opt/megatron-lm

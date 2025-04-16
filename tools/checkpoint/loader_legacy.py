@@ -7,6 +7,8 @@ import types
 
 import torch
 
+from tools.checkpoint.utils import _ConverterFakeProcessGroup
+
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Megatron loader')
@@ -137,6 +139,8 @@ def _load_checkpoint(queue, args):
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
         for rank in range(count):
+            fake_tp_group = mpu.get_tensor_model_parallel_group()
+            fake_tp_group.set_rank(rank)
             mpu.set_tensor_model_parallel_rank(rank)
             if margs.virtual_pipeline_model_parallel_size is not None:
                 model_ = []
@@ -176,6 +180,10 @@ def _load_checkpoint(queue, args):
     mpu.set_tensor_model_parallel_world_size(margs.tensor_model_parallel_size)
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
+    
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
     fused_kernels.load(margs)
 
     # Get true (non-padded) vocab size

@@ -11,6 +11,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -74,6 +75,7 @@ class TestTEParallelSequentialMLP:
         Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_model_parallel_size=2)
         model_parallel_cuda_manual_seed(123)
         num_moe_experts = 4
+        model_comm_pgs = get_default_model_comm_pgs()
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -103,12 +105,18 @@ class TestTEParallelSequentialMLP:
         self.num_local_experts = 2
         model_parallel_cuda_manual_seed(123)
         self.local_sequential_mlp = SequentialMLP(
-            self.num_local_experts, self.transformer_config, self.local_mlp_spec
+            self.num_local_experts,
+            self.transformer_config,
+            self.local_mlp_spec,
+            model_comm_pgs=model_comm_pgs,
         )
 
         model_parallel_cuda_manual_seed(123)
         self.te_sequential_mlp = SequentialMLP(
-            self.num_local_experts, self.transformer_config, self.te_mlp_spec
+            self.num_local_experts,
+            self.transformer_config,
+            self.te_mlp_spec,
+            model_comm_pgs=model_comm_pgs,
         )
 
     @pytest.mark.internal
@@ -160,9 +168,14 @@ class TestTEParallelSequentialMLP:
     @pytest.mark.internal
     def test_gpu_forward_with_one_local_expert(self):
         model_parallel_cuda_manual_seed(123)
-        local_sequential_mlp = SequentialMLP(1, self.transformer_config, self.local_mlp_spec)
+        model_comm_pgs = get_default_model_comm_pgs()
+        local_sequential_mlp = SequentialMLP(
+            1, self.transformer_config, self.local_mlp_spec, model_comm_pgs=model_comm_pgs
+        )
         model_parallel_cuda_manual_seed(123)
-        te_sequential_mlp = SequentialMLP(1, self.transformer_config, self.te_mlp_spec)
+        te_sequential_mlp = SequentialMLP(
+            1, self.transformer_config, self.te_mlp_spec, model_comm_pgs=model_comm_pgs
+        )
         seq_len = 4
         batch_size = 2
 
