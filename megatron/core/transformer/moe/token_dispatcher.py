@@ -896,7 +896,7 @@ class _DeepepManager(_DispatchManager):
             mask = self.token_probs == 0
             self.token_indices = self.token_indices.masked_fill(mask, -1)
 
-    def dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def dispatch(self, hidden_states: torch.Tensor, async_finish: bool = False, allocate_on_comm_stream: bool = False) -> torch.Tensor:
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
@@ -904,7 +904,7 @@ class _DeepepManager(_DispatchManager):
             self.token_probs = self.token_probs.float()  # downcast or upcast
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
-                hidden_states, self.token_indices, self.token_probs, self.num_experts, self.group
+                hidden_states, self.token_indices, self.token_probs, self.num_experts, self.group, async_finish=async_finish, allocate_on_comm_stream=allocate_on_comm_stream
             )
         )
         self.handle = handle
@@ -954,8 +954,8 @@ class _DeepepManager(_DispatchManager):
         """
         return self.tokens_per_expert
 
-    def combine(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, event = fused_combine(hidden_states, self.group, self.handle)
+    def combine(self, hidden_states: torch.Tensor, async_finish: bool = False, allocate_on_comm_stream: bool = False) -> torch.Tensor:
+        hidden_states, _ = fused_combine(hidden_states, self.group, self.handle, async_finish=async_finish, allocate_on_comm_stream=allocate_on_comm_stream)
         # Release the handle after combine operation
         self.handle = None
         return hidden_states

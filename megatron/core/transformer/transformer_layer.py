@@ -661,7 +661,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if self.is_deepep:
             token_dispatcher = self.mlp.token_dispatcher
             token_dispatcher._comm_manager.token_probs = permuted_probs
-            return token_dispatcher._comm_manager.dispatch(permutated_local_input_tokens), token_dispatcher._comm_manager.dispatched_probs
+            return token_dispatcher._comm_manager.dispatch(permutated_local_input_tokens, True, True), token_dispatcher._comm_manager.dispatched_probs
         else:
             dispatched_tokens, global_probs = self.mlp.token_dispatcher.dispatch_all_to_all(
                 permutated_local_input_tokens, permuted_probs
@@ -701,7 +701,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = state.residual
         if self.is_deepep:
             token_dispatcher = self.mlp.token_dispatcher
-            output = token_dispatcher._comm_manager.combine(output)
+            output = token_dispatcher._comm_manager.combine(output, True, True)
             output = output.view(token_dispatcher.hidden_shape)
         else:
             output = self.mlp.token_dispatcher.combine_all_to_all(output)
