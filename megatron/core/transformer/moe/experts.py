@@ -648,6 +648,12 @@ class GroupedMLP(MegatronModule):
 
         return sharded_state_dict
 
+    def backward_dw(self):
+        """Performs backward pass for weight gradients in Experts.
+        Empty implementation for compatibility with SequentialMLP and TEGroupedMLP.
+        """
+        pass
+    
 
 class TEGroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using TE's GroupedLinear.
