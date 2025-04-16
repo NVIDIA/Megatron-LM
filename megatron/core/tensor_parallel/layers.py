@@ -29,6 +29,7 @@ from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from ..utils import make_tp_sharded_tensor_for_checkpoint, prepare_input_tensors_for_wgrad_compute
 from .mappings import (
+    all_reduce,
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
@@ -325,11 +326,7 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups(), pin_layout=False)
-            else:
-                torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
-
+            all_reduce(tensor=grad_input, group=get_tensor_model_parallel_group(wrapped=True))
         return grad_input, None, None, None
 
 
@@ -499,13 +496,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             )
 
         if ctx.allreduce_dgrad:
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [grad_input], groups=get_tensor_model_parallel_groups(), pin_layout=False)
-            else:
-                # Asynchronous all-reduce
-                handle = torch.distributed.all_reduce(
-                    grad_input, group=get_tensor_model_parallel_group(), async_op=True
-                )
+            handle = all_reduce(tensor=grad_input, group=get_tensor_model_parallel_group(wrapped=True), async_op=True)
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
 

@@ -18,6 +18,7 @@ from torch.nn.modules.loss import _Loss
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.parallel_state import get_tensor_model_parallel_group
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.core.transformer import TransformerConfig
 from megatron.training import get_args, print_rank_0
 
@@ -237,7 +238,7 @@ class LogitsKLLoss(BaseLoss):
 
             # Maximum value along vocab dimension across all GPUs.
             teacher_logits_max, _ = torch.max(output_teacher, dim=-1)
-            torch.distributed.all_reduce(
+            all_reduce(
                 teacher_logits_max,
                 op=torch.distributed.ReduceOp.MAX,
                 group=get_tensor_model_parallel_group(),
@@ -253,7 +254,7 @@ class LogitsKLLoss(BaseLoss):
 
             # Maximum value along vocab dimension across all GPUs.
             student_logits_max, _ = torch.max(output_student, dim=-1)
-            torch.distributed.all_reduce(
+            all_reduce(
                 student_logits_max,
                 op=torch.distributed.ReduceOp.MAX,
                 group=get_tensor_model_parallel_group(),

@@ -7,6 +7,7 @@ import torch
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args
 from megatron.core import mpu, tensor_parallel
 
@@ -110,13 +111,8 @@ class MegatronModule(torch.nn.Module):
         # values.
         if mpu.is_rank_in_embedding_group():
             self.shared_embedding_or_output_weight().data = self.shared_embedding_or_output_weight().data.to(device=get_current_device())
-            xm = get_xla_model()
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [self.shared_embedding_or_output_weight().data], 
-                                    groups=mpu.get_embedding_groups(), pin_layout=False)
-            else:
-                torch.distributed.all_reduce(self.shared_embedding_or_output_weight().data,
-                                         group=mpu.get_embedding_group())
+            all_reduce(tensor=self.shared_embedding_or_output_weight().data, 
+                       group=mpu.get_embedding_group())
 
         # Ensure that encoder(first stage) and decoder(split stage) position
         # embeddings have the same initial parameter values
@@ -126,13 +122,7 @@ class MegatronModule(torch.nn.Module):
             # TODO: Support tokentype embedding.
             self.language_model.embedding.to(device=get_current_device())
             position_embeddings = self.language_model.embedding.position_embeddings
-            xm = get_xla_model()
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [position_embeddings.weight.data], 
-                                    groups=mpu.get_position_embedding_groups(), pin_layout=False)
-            else:
-                torch.distributed.all_reduce(position_embeddings.weight.data,
-                                         group=mpu.get_position_embedding_group())
+            all_reduce(tensor=position_embeddings.weight.data, group=mpu.get_position_embedding_group())
 
 
 def conversion_helper(val, conversion):

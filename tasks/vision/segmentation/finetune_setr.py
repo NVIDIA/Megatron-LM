@@ -6,6 +6,7 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 import torch.nn.functional as F
 from functools import partial
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args, get_timers
 from megatron.training import print_rank_0, print_rank_last
 from megatron.core import mpu
@@ -153,13 +154,8 @@ def segmentation():
             m.train()
         # Reduce.
         if mpu.is_pipeline_last_stage():
-            xm = get_xla_model()
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [performs], 
-                                  groups=mpu.get_data_parallel_groups(), pin_layout=False)
-            else:
-                torch.distributed.all_reduce(performs,
-                                         group=mpu.get_data_parallel_group())
+            all_reduce(tensor=performs, group=mpu.get_data_parallel_group())
+
             # Print on screen.
             # performs[int(ch), :] = [nb_tp, nb_fp, nb_tn, nb_fn]
             true_positive = performs[:, 0]

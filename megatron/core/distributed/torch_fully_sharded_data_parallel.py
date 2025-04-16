@@ -11,7 +11,7 @@ from megatron.core.device_utils import (
     get_xla_runtime, 
     get_xla_spmd
 )
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 try:
     from torch_xla.experimental.spmd_fully_sharded_data_parallel import (
@@ -89,10 +89,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         super().__init__(config=config, module=module)
 
         if group is None:
-            self.group = WrappedProcessGroup(
-                process_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-                rank_groups=parallel_state.get_data_parallel_groups(with_context_parallel=True)
-            )
+            self.group = parallel_state.get_data_parallel_group(with_context_parallel=True, wrapped=True)
         else:
             self.group = group
 

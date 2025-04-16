@@ -18,3 +18,4 @@ onelogger.log
 onelogger.err
 docker-pytorch-xla-*.sh
 test*.py
+.nfs*

@@ -8,6 +8,7 @@ from functools import partial
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args
 from megatron.training import print_rank_0, print_rank_last
 from megatron.core import mpu
@@ -108,14 +109,8 @@ def calculate_correct_answers(model, dataloader, epoch):
     # Reduce.
     if mpu.is_pipeline_last_stage():
         unreduced = torch.tensor([correct, total], dtype=torch.long, device=get_current_device())
-        xm = get_xla_model()
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [unreduced], 
-                                    groups=mpu.get_data_parallel_groups(), pin_layout=False)
-        else:
-            torch.distributed.all_reduce(unreduced,
-                                     group=mpu.get_data_parallel_group())
-
+        all_reduce(tensor=unreduced, group=mpu.get_data_parallel_group())
+        
         # Print on screen.
         correct_ans = unreduced[0].item()
         total_count = unreduced[1].item()

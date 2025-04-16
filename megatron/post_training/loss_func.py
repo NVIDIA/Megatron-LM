@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.models.gpt import GPTModel
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args
 from megatron.training.utils import average_losses_across_data_parallel_group, unwrap_model
 
@@ -27,7 +28,7 @@ def _mask_loss(output_tensor, loss_mask):
 
     if args.context_parallel_size > 1:
         loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), loss_mask.sum().view(1)])
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+        all_reduce(tensor=loss, group=mpu.get_context_parallel_group())
         loss = loss[0] / loss[1]
     else:
         loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()

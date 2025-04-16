@@ -31,7 +31,8 @@ except ImportError:
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.tensor_parallel.mappings import all_reduce
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.training import (
     get_args,
     get_adlr_autoresume,
@@ -132,15 +133,9 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     else:
         norm_2 = torch.zeros((1,), dtype=torch.float32, device=get_current_device())
 
-    if data_parallel_group is not None:
+    if data_parallel_group:
         group = WrappedProcessGroup(process_group=data_parallel_group)
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
-                          groups=group.rank_groups, pin_layout=False)
-        else:
-            torch.distributed.all_reduce(norm_2,
-                                        op=torch.distributed.ReduceOp.SUM,
-                                        group=group.process_group)
+        all_reduce(tensor=norm_2, group=group)
 
     # Add norm contribution from params with sharded main_params. These norms need to be
     # accumulated across the DP group since the main parameters are sharded because
@@ -155,15 +150,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         sharded_norm_2 = sharded_norm * sharded_norm
         # Sum over all DP groups.
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [sharded_norm_2], 
-                          groups=mpu.get_data_parallel_groups(), pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                sharded_norm_2,
-                op=torch.distributed.ReduceOp.SUM,
-                group=mpu.get_data_parallel_group()
-            )
+        all_reduce(tensor=sharded_norm_2, group=mpu.get_data_parallel_group())
         norm_2 += sharded_norm_2
 
     if custom_fsdp_all_param_is_shared:
@@ -182,13 +169,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         moe_norm_2 = moe_norm * moe_norm
 
         if custom_fsdp_all_param_is_shared:
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [moe_norm_2], 
-                            groups=mpu.get_expert_data_parallel_groups(), pin_layout=False)
-            else:
-                torch.distributed.all_reduce(moe_norm_2,
-                                            op=torch.distributed.ReduceOp.SUM,
-                                            group=mpu.get_expert_data_parallel_group())
+            all_reduce(tensor=moe_norm_2, group=mpu.get_expert_data_parallel_group())
+            
     # Account for MoE norm even if current rank doesn't have any expert params to prevent
     # hang in models with un-even numbers of MoE layers.
     # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
@@ -206,36 +188,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # If dense and expert reduce groups are the same, sum then reduce.
     if ranks_in_dense_reduce_group == ranks_in_expert_reduce_group:
         norm_2 += moe_norm_2
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
-                            groups=mpu.get_model_parallel_groups(), 
-                            pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                norm_2,
-                op=torch.distributed.ReduceOp.SUM,
-                group=dense_reduce_group
-            )
+        all_reduce(tensor=norm_2, group=dense_reduce_group)
+        
     # If dense and expert reduce groups are different, reduce then sum.
     else:
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [norm_2], 
-                            groups=mpu.get_model_parallel_groups(), 
-                            pin_layout=False)
-            xm.all_reduce(xm.REDUCE_SUM, [moe_norm_2], 
-                            groups=mpu.get_expert_tensor_model_pipeline_parallel_groups(), 
-                            pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                norm_2,
-                op=torch.distributed.ReduceOp.SUM,
-                group=dense_reduce_group
-            )
-            torch.distributed.all_reduce(
-                moe_norm_2,
-                op=torch.distributed.ReduceOp.SUM,
-                group=expert_reduce_group
-            )
+        all_reduce(tensor=norm_2, group=dense_reduce_group)
+        all_reduce(tensor=moe_norm_2, group=expert_reduce_group)
         norm_2 += moe_norm_2
 
     return norm_2.item() ** 0.5
@@ -245,13 +203,7 @@ def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
     averaged_losses = torch.cat(
         [loss.clone().detach().view(1) for loss in losses])
-    xm = get_xla_model()
-    if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [averaged_losses], 
-                                    groups=mpu.get_data_parallel_groups(), pin_layout=False)
-    else:
-        torch.distributed.all_reduce(averaged_losses,
-                                    group=mpu.get_data_parallel_group())
+    all_reduce(tensor=averaged_losses, group=mpu.get_data_parallel_group())
     averaged_losses = averaged_losses / \
         torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
@@ -269,12 +221,7 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
     if stat is None:
         stat = -1.0
     stat = torch.tensor([stat], dtype=torch.float32, device=get_current_device())
-    if xm:
-        xm.all_reduce(xm.REDUCE_MAX, [stat], groups=mpu.get_model_parallel_groups(), pin_layout=False)
-    else:
-        torch.distributed.all_reduce(
-            stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
-        )
+    all_reduce(tensor=stat, group=mpu.get_model_parallel_group(), op=torch.distributed.ReduceOp.MAX)
     if stat.item() == -1.0:
         return None
     else:
@@ -290,12 +237,7 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
     else:
         input = 0
     input = torch.tensor([input], dtype=torch.int, device=get_current_device())
-    if xm:
-        xm.all_reduce(xm.REDUCE_MIN, [input], groups=mpu.get_model_parallel_groups(), pin_layout=False)
-    else:
-        torch.distributed.all_reduce(
-            input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
-        )
+    all_reduce(tensor=input, group=mpu.get_model_parallel_group(), op=torch.distributed.ReduceOp.MIN)
     return bool(input.item())
 
 

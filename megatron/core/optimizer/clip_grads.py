@@ -8,8 +8,8 @@ import torch
 from torch import inf
 
 from megatron.core.device_utils import get_current_device, get_xla_model
-from megatron.core.parallel_state import get_data_parallel_groups, get_data_parallel_group
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.tensor_parallel.mappings import all_reduce
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 try:
     from transformer_engine.pytorch.optimizers import (
@@ -84,6 +84,9 @@ def get_grad_norm_fp32(
     for grad in grads_for_norm:
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
 
+    if data_parallel_group:
+        data_parallel_group = WrappedProcessGroup(process_group=data_parallel_group)
+
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
 
     # Norm parameters.
@@ -96,26 +99,9 @@ def get_grad_norm_fp32(
         total_norm_device = torch.tensor([float(total_norm)], dtype=torch.float, device=get_current_device())
         # Take max across all data-parallel GPUs.
         if data_parallel_group:
-            group = WrappedProcessGroup(process_group=data_parallel_group)
-            if xm:
-                xm.all_reduce(
-                    xm.REDUCE_MAX, [total_norm_device], groups=group.rank_groups, pin_layout=False
-                )
-            else:
-                torch.distributed.all_reduce(
-                    total_norm_device, op=torch.distributed.ReduceOp.MAX, group=group.process_group
-                )
+            all_reduce(tensor=total_norm_device, group=data_parallel_group, op=torch.distributed.ReduceOp.MAX)
 
-        if xm:
-            groups = grad_stats_parallel_group.rank_groups if grad_stats_parallel_group else None
-            xm.all_reduce(
-                xm.REDUCE_MAX, [total_norm_device], groups=groups, pin_layout=False
-            )
-        else:
-            group = grad_stats_parallel_group.process_group if grad_stats_parallel_group else None
-            torch.distributed.all_reduce(
-                total_norm_device, op=torch.distributed.ReduceOp.MAX, group=group
-            )
+        all_reduce(tensor=total_norm_device, group=grad_stats_parallel_group, op=torch.distributed.ReduceOp.MAX)
         total_norm = total_norm_device[0].item()
     else:
         if norm_type == 2.0:
@@ -143,24 +129,9 @@ def get_grad_norm_fp32(
 
         # Sum across all data-parallel GPUs if using FSDP and then all model-parallel GPUs.
         if data_parallel_group:
-            if xm:
-                groups = data_parallel_group.rank_groups
-                xm.all_reduce(xm.REDUCE_SUM, [total_norm], groups=groups, pin_layout=False)
-            else:
-                group = data_parallel_group.process_group
-                torch.distributed.all_reduce(
-                    total_norm, op=torch.distributed.ReduceOp.SUM, group=group
-                )
-        if xm:
-            groups = grad_stats_parallel_group.rank_groups if grad_stats_parallel_group else None
-            xm.all_reduce(
-                xm.REDUCE_SUM, [total_norm], groups=groups, pin_layout=False
-            )
-        else:
-            group = grad_stats_parallel_group.process_group if grad_stats_parallel_group else None
-            torch.distributed.all_reduce(
-                total_norm, op=torch.distributed.ReduceOp.SUM, group=group
-            )
+            all_reduce(tensor=total_norm, group=data_parallel_group)
+
+        all_reduce(tensor=total_norm, group=grad_stats_parallel_group)
         total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm
@@ -251,21 +222,10 @@ def count_zeros_fp32(
 
     # Sum across all data-parallel GPUs if using FSDP.
     if data_parallel_group:
-        if xm:
-            groups = data_parallel_group.rank_groups if data_parallel_group else None
-            xm.all_reduce(xm.REDUCE_SUM, [total_num_zeros], groups=groups, pin_layout=False)
-        else:
-            group = data_parallel_group.process_group if data_parallel_group else None
-            torch.distributed.all_reduce(
-                total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=group
-            )
+        all_reduce(tensor=total_num_zeros, group=data_parallel_group)
+    
     # Sum across all model-parallel GPUs.
-    if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [total_num_zeros], groups=grad_stats_parallel_group, pin_layout=False)
-    else:
-        torch.distributed.all_reduce(
-            total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
-        )
+    all_reduce(tensor=total_num_zeros, group=grad_stats_parallel_group)
     total_num_zeros = total_num_zeros.item()
 
     return total_num_zeros

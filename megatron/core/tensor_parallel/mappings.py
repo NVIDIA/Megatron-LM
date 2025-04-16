@@ -12,12 +12,22 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.core.utils import is_torch_min_version
 
 from .utils import split_tensor_along_last_dim
 
 xm = get_xla_model()
+if xm:
+    xm_reduce_op = {
+        torch.distributed.ReduceOp.SUM: xm.REDUCE_SUM,
+        torch.distributed.ReduceOp.MAX: xm.REDUCE_MAX,
+        torch.distributed.ReduceOp.MIN: xm.REDUCE_MIN,
+        torch.distributed.ReduceOp.PRODUCT: xm.REDUCE_MUL,
+        torch.distributed.ReduceOp.BAND: xm.REDUCE_AND,
+        torch.distributed.ReduceOp.BOR: xm.REDUCE_OR,
+    }
+
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
     dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
@@ -35,11 +45,7 @@ def _reduce(input_):
 
     # All-reduce.
     input_ = input_.contiguous()
-    if xm:
-        xm.all_reduce(xm.REDUCE_SUM, [input_], groups=get_tensor_model_parallel_groups(), pin_layout=False)
-    else:
-        torch.distributed.all_reduce(input_, group=get_tensor_model_parallel_group())
-
+    all_reduce(tensor=input_, group=get_tensor_model_parallel_group(wrapped=True))
     return input_
 
 
@@ -66,10 +72,7 @@ def _split_along_first_dim(input_, group: WrappedProcessGroup=None):
     """Split the tensor along its first dimension and keep the
     corresponding slice."""
     if group is None:
-        group = WrappedProcessGroup(
-            process_group=get_tensor_model_parallel_group(),
-            rank_groups=get_tensor_model_parallel_groups()
-        )
+        group = get_tensor_model_parallel_group(wrapped=True)
     world_size = group.size()
     rank = group.rank()
 
@@ -147,10 +150,7 @@ def _gather_along_first_dim(input_: torch.Tensor,
     """
 
     if group is None:
-        group = WrappedProcessGroup(
-            process_group=get_tensor_model_parallel_group(),
-            rank_groups=get_tensor_model_parallel_groups()
-        )
+        group = get_tensor_model_parallel_group(wrapped=True)
     world_size=group.size()
 
     # Bypass the function if we are using only 1 GPU.
@@ -169,7 +169,7 @@ def _gather_along_first_dim(input_: torch.Tensor,
                 output = get_global_memory_buffer().get_tensor(dim_size, input_.dtype, "mpu")
             else:
                 output = torch.empty(dim_size, dtype=input_.dtype, device=get_current_device())
-            dist_all_gather_func(output, input_.contiguous(), group=group.process_group)
+            dist_all_gather_func(output, input_.contiguous(), group=group)
     else:
         dim_size[0] = sum(output_split_sizes)
         if xm:
@@ -202,10 +202,7 @@ def _reduce_scatter_along_first_dim(input_: torch.Tensor,
             equal splitting is assumed. Default: None.
     """
     if group is None:
-        group = WrappedProcessGroup(
-            process_group=get_tensor_model_parallel_group(),
-            rank_groups=get_tensor_model_parallel_groups()
-        )
+        group = get_tensor_model_parallel_group(wrapped=True)
     world_size=group.size() 
     rank = group.rank()
 
@@ -632,7 +629,7 @@ def all_to_all_sp2hp(input_):
 
     """
     world_size = get_tensor_model_parallel_world_size()
-    tp_group = get_tensor_model_parallel_group()
+    tp_group = get_tensor_model_parallel_group(wrapped=True)
     input_ = input_.reshape(-1, input_.shape[-1])
     split_tensors = torch.split(
         input_, split_size_or_sections=input_.shape[-1] // world_size, dim=1
@@ -657,7 +654,7 @@ def all_to_all_hp2sp(input_):
     """
     world_size = get_tensor_model_parallel_world_size()
     input_ = input_.reshape(-1, input_.shape[-1])
-    tp_group = get_tensor_model_parallel_group()
+    tp_group = get_tensor_model_parallel_group(wrapped=True)
     input_exchanged = all_to_all(tp_group, input_)
     input_reshaped = input_exchanged.reshape(-1, input_exchanged.shape[-1])
     split_tensors = torch.split(
@@ -665,3 +662,16 @@ def all_to_all_hp2sp(input_):
     )
     output = torch.cat(split_tensors, dim=-1)
     return output
+
+
+def all_reduce(tensor: torch.Tensor, 
+               group: WrappedProcessGroup, 
+               op=torch.distributed.ReduceOp.SUM,
+               async_op:bool = False):
+    if xm:
+        assert op in xm_reduce_op, f"Reduce Op {op} not supported in XLA"
+        groups = group.rank_groups if group else None
+        xm.all_reduce(reduce_type=xm_reduce_op[op], inputs=[tensor], groups=groups, pin_layout=False)
+    else:
+        group = group.process_group if group else None
+        return torch.distributed.all_reduce(tensor=tensor, op=op, group=group, async_op=async_op)

@@ -11,6 +11,7 @@ import torch.nn as nn
 from torch.utils._pytree import tree_flatten, tree_unflatten
 
 from megatron.core import parallel_state
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
@@ -23,7 +24,7 @@ from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.fp8_utils import is_float8tensor
-from megatron.core.process_groups_config import GradCommProcessGroups, WrappedProcessGroup
+from megatron.core.process_groups_config import GradCommProcessGroups
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.fp8_utils import is_float8tensor
@@ -126,26 +127,17 @@ class FullyShardedDataParallel(_BaseDataParallel):
         )
 
         if grad_comm_pgs is None:
-            self.dp_cp_group = WrappedProcessGroup(
-                process_group=parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=False
-                ),
-                rank_groups=parallel_state.get_data_parallel_groups(
+            self.dp_cp_group = parallel_state.get_data_parallel_group(
                     with_context_parallel=True, partial_data_parallel=False
                 )
-            )
-            self.expt_dp_group = WrappedProcessGroup(
-                process_group=parallel_state.get_expert_data_parallel_group(),
-                rank_groups=parallel_state.get_expert_data_parallel_groups(),
-            )
-
+            self.expt_dp_group = parallel_state.get_expert_data_parallel_group()
         else:
             cp_size = getattr(config, 'context_parallel_size', 1)
 
             if hasattr(grad_comm_pgs, 'dp_cp'):
-                self.dp_cp_group = grad_comm_pgs.dp_cp
+                self.dp_cp_group = grad_comm_pgs.dp_cp.process_group
             elif hasattr(grad_comm_pgs, 'dp') and cp_size == 1:
-                self.dp_cp_group = grad_comm_pgs.dp
+                self.dp_cp_group = grad_comm_pgs.dp.process_group
             else:
                 raise ValueError(
                     "Required process group missing: 'dp_cp' (or 'dp' when context_parallel_size=1)"
@@ -229,7 +221,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 fsdp_unit_modules=self.fsdp_unit_modules,
                 data_parallel_sharding_strategy=self.data_parallel_sharding_strategy,
             ),
-            data_parallel_group=self.dp_cp_group.process_group,
+            data_parallel_group=self.dp_cp_group,
             expert_data_parallel_group=self.expt_dp_group,
             preserve_fp32_weights=self.ddp_config.preserve_fp32_weights,
             grad_reduce_in_fp32=self.ddp_config.grad_reduce_in_fp32,
@@ -720,8 +712,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 data_parallel_group = self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
-                src=torch.distributed.get_global_rank(data_parallel_group.process_group, 0),
-                group=data_parallel_group.process_group,
+                src=torch.distributed.get_global_rank(data_parallel_group, 0),
+                group=data_parallel_group,
             )
 
     def load_state_dict(self, state_dict, strict=True):

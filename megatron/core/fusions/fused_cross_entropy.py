@@ -6,7 +6,8 @@ from megatron.core.device_utils import get_xla_model
 import torch
 
 from megatron.core.jit import jit_fuser
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.tensor_parallel.mappings import all_reduce
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.core.tensor_parallel.cross_entropy import VocabParallelCrossEntropy
 from megatron.core.tensor_parallel.utils import VocabUtility
 
@@ -93,14 +94,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         Forward implementation for the cross entropy loss.
         """
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
-        xm = get_xla_model()
-        if xm:
-            xm.all_reduce(xm.REDUCE_MAX, [logits_max], groups=tp_group.rank_groups, pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group.process_group
-            )
-
+        all_reduce(tensor=logits_max, group=tp_group, op=torch.distributed.ReduceOp.MAX)
+        
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
         partition_vocab_size = vocab_parallel_logits.size()[-1]
@@ -117,17 +112,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         # All reduce is needed to get the chunks from other GPUs.
         # In the fused case, tensors are batches to invoke a single
         # AllReduce call
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, 
-                          [predicted_logits_sum_exp_logits], 
-                          groups=tp_group.rank_groups, pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                predicted_logits_sum_exp_logits,
-                op=torch.distributed.ReduceOp.SUM,
-                group=tp_group.process_group,
-            )
-
+        all_reduce(tensor=predicted_logits_sum_exp_logits, group=tp_group)
         exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)
 
         # Store softmax, target-mask and masked-target for backward pass.

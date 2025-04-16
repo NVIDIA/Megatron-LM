@@ -9,7 +9,8 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.tensor_parallel.mappings import all_reduce
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
@@ -95,10 +96,7 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(
                     logits, labels, 
-                    WrappedProcessGroup(
-                        process_group=parallel_state.get_tensor_model_parallel_group(),
-                        rank_groups=parallel_state.get_tensor_model_parallel_groups()
-                    )
+                    parallel_state.get_tensor_model_parallel_group()
                 )
         else:
             loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
@@ -169,14 +167,8 @@ class LanguageModule(MegatronModule):
             if parallel_state.is_rank_in_embedding_group():
                 weight = self.shared_embedding_or_output_weight()
                 weight.data = weight.data.to(device=get_current_device())
-                xm = get_xla_model()
-                if xm:
-                     xm.all_reduce(xm.REDUCE_SUM, [weight.data], groups=parallel_state.get_embedding_groups(), pin_layout=False)
-                else:
-                    torch.distributed.all_reduce(
-                        weight.data, group=parallel_state.get_embedding_group()
-                    )
-
+                all_reduce(tensor=weight.data, group=parallel_state.get_embedding_group(wrapped=True))
+    
         elif not getattr(LanguageModule, "embedding_warning_printed", False):
             logging.getLogger(__name__).warning(
                 "Distributed processes aren't initialized, so the output layer "

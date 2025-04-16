@@ -55,9 +55,9 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
             xm.mark_step()
             output = xm.all_gather(input_, groups=mpu.get_data_parallel_groups(), pin_layout=False)
         else:
-            group, rank, world_size = get_group_world_size_rank()
-            tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-            tensor_list[rank] = input_
+            group = mpu.get_data_parallel_group()
+            tensor_list = [torch.empty_like(input_) for _ in range(group.size())]
+            tensor_list[group.rank()] = input_
             torch.distributed.all_gather(tensor_list, input_, group=group)
             output = torch.cat(tensor_list, dim=0).contiguous()
 
@@ -66,7 +66,7 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        group, rank, world_size = get_group_world_size_rank()
+        _, rank, world_size = get_group_world_size_rank()
 
         assert grad_output.shape[0] % world_size == 0
         dim_size = grad_output.shape[0] // world_size

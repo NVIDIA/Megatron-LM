@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple, Union
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor
@@ -252,7 +252,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
                             groups=group.rank_groups, pin_layout=False)
                 else:
                     torch.distributed.broadcast(
-                        exchange_tensor, group=group.process_group, src=src_rank
+                        exchange_tensor, group=group, src=src_rank
                     )
             self._distribute_data_to_state_dict(ten_meta, exchange_tensor, sharded_state_dict)
             logger.debug(f'exchange {ten_meta.sharded_tensor_no_data.key} done')

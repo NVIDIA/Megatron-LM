@@ -7,6 +7,7 @@ import math
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args
 from megatron.training import print_rank_0, is_last_rank
 from megatron.training import get_tokenizer
@@ -131,14 +132,7 @@ def evaluate(data_loader, model, eval_metric):
 
             # Reduce across processes.
             if parallel_state.is_pipeline_last_stage():
-                xm = get_xla_model()
-                if xm:
-                    xm.all_reduce(xm.REDUCE_SUM, [output], 
-                                  groups=parallel_state.get_data_parallel_groups(), pin_layout=False)
-                else:
-                    torch.distributed.all_reduce(output,
-                                             group=parallel_state.get_data_parallel_group())
-
+                all_reduce(tensor=output, group=parallel_state.get_data_parallel_group())
                 total_output += output
 
     return total_output

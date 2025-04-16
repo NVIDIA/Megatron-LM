@@ -3,12 +3,13 @@
 import math
 from typing import List, Optional, Union
 
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ModelCommProcessGroups, WrappedProcessGroup
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.tensor_parallel.mappings import all_reduce, gather_from_sequence_parallel_region
 
 xm = get_xla_model()
 try:
@@ -62,16 +63,7 @@ def switch_load_balancing_loss_func(
         # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
         num_sub_sequence = sequence_partition_group.size()
-        if xm:
-            xm.all_reduce(
-                xm.REDUCE_SUM, [tokens_per_expert], 
-                groups=sequence_partition_group.rank_groups, 
-                pin_layout=False
-            )
-        else:
-            torch.distributed.all_reduce(
-                tokens_per_expert, group=sequence_partition_group.process_group
-            )
+        all_reduce(tensor=tokens_per_expert, group=sequence_partition_group)
 
     num_tokens = probs.shape[0] * num_sub_sequence
     num_experts = probs.shape[1]
@@ -657,31 +649,17 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
         values = tracker[name]["values"]
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
-        xm = get_xla_model()
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [values], 
-                                        groups=parallel_state.get_pipeline_model_parallel_groups(), pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                values, group=parallel_state.get_pipeline_model_parallel_group()
-            )
+        all_reduce(tensor=values, group=parallel_state.get_pipeline_model_parallel_group(wrapped=True))
+
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [values], 
-                                        groups=tracker[name].get('reduce_group'), pin_layout=False)
-            else:
-                torch.distributed.all_reduce(values, group=tracker[name].get('reduce_group'))
+            group = WrappedProcessGroup(tracker[name].get('reduce_group'))
+            all_reduce(tensor=values, group=group)
+            
         if tracker[name].get('avg_group') is not None:
-            if xm:
-                xm.all_reduce(xm.REDUCE_SUM, [values], 
-                                        groups=tracker[name].get('avg_group'), pin_layout=False)
-                values = values / parallel_state.get_pipeline_model_parallel_world_size()
-            else:
-                torch.distributed.all_reduce(
-                    values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
-                )
-
+            group = WrappedProcessGroup(tracker[name].get('avg_group'))
+            all_reduce(tensor=values, group=group)
+            values = values / group.size()
 
 def track_moe_metrics(
     loss_scale: float,
@@ -764,15 +742,10 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
     """
     with torch.no_grad():
         # All Reduce Across TPxCPxDP group
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [tokens_per_expert], 
-                          groups=parallel_state.get_tensor_and_data_parallel_groups(with_context_parallel=True), 
-                          pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                tokens_per_expert,
-                group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True),
-            )
+        all_reduce(
+            tensor=tokens_per_expert, 
+            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True, wrapped=True)
+        )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
         updated_expert_bias = expert_bias + torch.sign(offset) * expert_bias_update_rate
@@ -813,34 +786,13 @@ def get_default_model_comm_pgs():
     """
     model_comm_pgs = ModelCommProcessGroups()
 
-    model_comm_pgs.ep_group = WrappedProcessGroup(
-        process_group=parallel_state.get_expert_model_parallel_group(),
-        rank_groups=parallel_state.get_expert_model_parallel_groups())
-    
-    model_comm_pgs.tp_group = WrappedProcessGroup(
-        process_group= parallel_state.get_tensor_model_parallel_group(),
-        rank_groups= parallel_state.get_tensor_model_parallel_groups())
-   
-    model_comm_pgs.cp_group = WrappedProcessGroup(
-        process_group= parallel_state.get_context_parallel_group(),
-        rank_groups= parallel_state.get_context_parallel_groups())
-   
-   
-    model_comm_pgs.expt_tp_group = WrappedProcessGroup(
-        process_group=parallel_state.get_expert_tensor_parallel_group(),
-        rank_groups=parallel_state.get_expert_tensor_parallel_groups())
-   
-    model_comm_pgs.expt_dp_group = WrappedProcessGroup(
-        process_group=parallel_state.get_expert_data_parallel_group(),
-        rank_groups=parallel_state.get_expert_data_parallel_groups())
-    
-    model_comm_pgs.tp_ep_group = WrappedProcessGroup(
-        process_group=parallel_state.get_expert_tensor_and_model_parallel_group(),
-        rank_groups=parallel_state.get_expert_tensor_and_model_parallel_groups())
-    
-    model_comm_pgs.tp_cp_group = WrappedProcessGroup(
-        process_group=parallel_state.get_tensor_and_context_parallel_group(),
-        rank_groups=parallel_state.get_tensor_and_context_parallel_groups())
- 
+    model_comm_pgs.ep_group = parallel_state.get_expert_model_parallel_group(wrapped=True)
+    model_comm_pgs.tp_group = parallel_state.get_tensor_model_parallel_group(wrapped=True)
+    model_comm_pgs.cp_group = parallel_state.get_context_parallel_group(wrapped=True),
+    model_comm_pgs.expt_tp_group = parallel_state.get_expert_tensor_parallel_group(wrapped=True)
+    model_comm_pgs.expt_dp_group = parallel_state.get_expert_data_parallel_group(wrapped=True)
+    model_comm_pgs.tp_ep_group = parallel_state.get_expert_tensor_and_model_parallel_group(wrapped=True)
+    model_comm_pgs.tp_cp_group = parallel_state.get_tensor_and_context_parallel_group(wrapped=True)
+
 
     return model_comm_pgs

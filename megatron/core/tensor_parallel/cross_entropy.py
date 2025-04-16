@@ -11,6 +11,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.tensor_parallel.mappings import all_reduce
 
 from .utils import VocabUtility
 
@@ -130,12 +131,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             vocab_parallel_logits
         )
         xm = get_xla_model()
-        if xm:
-            xm.all_reduce(xm.REDUCE_MAX, [logits_max], groups=get_tensor_model_parallel_groups(), pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
-            )
+        all_reduce(tensor=logits_max, group=get_tensor_model_parallel_group(wrapped=True), 
+                   op=torch.distributed.ReduceOp.MAX)
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
@@ -151,25 +148,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         )
 
         # All reduce is needed to get the chunks from other GPUs.
-        xm = get_xla_model()
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [predicted_logits], groups=get_tensor_model_parallel_groups(), pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                predicted_logits,
-                op=torch.distributed.ReduceOp.SUM,
-                group=get_tensor_model_parallel_group(),
-            )
-
-        if xm:
-            xm.all_reduce(xm.REDUCE_SUM, [sum_exp_logits], groups=get_tensor_model_parallel_groups(), pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                sum_exp_logits,
-                op=torch.distributed.ReduceOp.SUM,
-                group=get_tensor_model_parallel_group(),
-            )
-
+        all_reduce(tensor=predicted_logits, group=get_tensor_model_parallel_group(wrapped=True))
+        all_reduce(tensor=sum_exp_logits, group=get_tensor_model_parallel_group(wrapped=True))
+    
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
             exp_logits, predicted_logits, sum_exp_logits
         )

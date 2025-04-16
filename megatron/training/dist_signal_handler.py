@@ -5,7 +5,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.device_utils import get_xla_model
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 try:
     import torch_xla.core.xla_model as xm

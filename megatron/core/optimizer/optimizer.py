@@ -14,7 +14,8 @@ import torch
 import torch.distributed
 
 from megatron.core.device_utils import get_current_device, get_xla_model
-from megatron.core.process_groups_config import WrappedProcessGroup
+from megatron.core.tensor_parallel.mappings import all_reduce
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 HAVE_APEX_OR_TE = True
 try:
@@ -160,7 +161,7 @@ class MegatronOptimizer(ABC):
 
         return grads_for_norm
 
-    def get_grad_stats_parallel_group(self) -> WrappedProcessGroup:
+    def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
 
         The two most common cases are:
@@ -175,11 +176,10 @@ class MegatronOptimizer(ABC):
             )
             self.grad_stats_parallel_group = self.model_parallel_group
             delattr(self, "model_parallel_group")
-            return WrappedProcessGroup(process_group=self.grad_stats_parallel_group)
+            return self.grad_stats_parallel_group
         if hasattr(self, 'grad_stats_parallel_group'):
-            return WrappedProcessGroup(process_group=self.grad_stats_parallel_group)
-        return WrappedProcessGroup(process_group=parallel_state.get_model_parallel_group(),
-                                   rank_groups=parallel_state.get_model_parallel_groups())
+            return self.grad_stats_parallel_group
+        return parallel_state.get_model_parallel_group()
 
     @abstractmethod
     def prepare_grads(self) -> bool:
@@ -196,7 +196,8 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm, 
+            grad_stats_parallel_group=WrappedProcessGroup(self.get_grad_stats_parallel_group())
         )
         return total_norm
 
@@ -208,7 +209,8 @@ class MegatronOptimizer(ABC):
         else:
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm, 
+            grad_stats_parallel_group=WrappedProcessGroup(self.get_grad_stats_parallel_group())
         )
 
         if params:
@@ -403,12 +405,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
 
         # Update across all model parallel instances.
-        if xm:
-            xm.all_reduce(xm.REDUCE_MAX, [self.found_inf], groups=self.get_grad_stats_parallel_group(), pin_layout=False)
-        else:
-            torch.distributed.all_reduce(
-                self.found_inf, op=torch.distributed.ReduceOp.MAX, group=self.get_grad_stats_parallel_group()
-            )
+        all_reduce(tensor=self.found_inf, group=WrappedProcessGroup(self.get_grad_stats_parallel_group()), 
+                   op=torch.distributed.ReduceOp.MAX)
         # Check for nan.
         found_inf_flag = self.found_inf.item() > 0
 
