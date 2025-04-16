@@ -46,14 +46,6 @@ class MemoryStrategyRegistry:
     should be used for each type of node in the computation graph.
     """
 
-    _strategies = {
-        "default": NoOpMemoryStrategy(),
-        "attn": NoOpMemoryStrategy(),  # Attention nodes keep their inputs
-        "dispatch": FreeInputsMemoryStrategy(),  # Dispatch nodes free inputs after use
-        "mlp": FreeInputsMemoryStrategy(),  # MLP nodes free inputs after use
-        "combine": FreeInputsMemoryStrategy(),  # Combine nodes free inputs after use
-    }
-
     @classmethod
     def get_strategy_by_name(cls, name, is_moe, is_deepep):
         """Gets the appropriate memory strategy for a node based on its name and MoE status.
@@ -65,11 +57,16 @@ class MemoryStrategyRegistry:
         Returns:
             The memory strategy to use for the node.
         """
-        # TODO: add memory strategy for deepep
-        if is_deepep:
-            return NoOpMemoryStrategy()
+        strategies = {
+            "default": NoOpMemoryStrategy(),
+            "attn": NoOpMemoryStrategy(),  # Attention nodes keep their inputs
+            "dispatch": FreeInputsMemoryStrategy() if not is_deepep else NoOpMemoryStrategy(),  # Dispatch nodes free inputs after use only for all2all
+            "mlp": FreeInputsMemoryStrategy(),  # MLP nodes free inputs after use
+            "combine": FreeInputsMemoryStrategy(),  # Combine nodes free inputs after use
+        }
+
         if is_moe:
-            return cls._strategies.get(name, cls._strategies["default"])
+            return strategies.get(name, strategies["default"])
         return NoOpMemoryStrategy()
 
 

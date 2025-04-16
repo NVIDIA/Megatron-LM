@@ -650,14 +650,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
 
     def _submodule_dispatch_forward(
-        self, permutated_local_input_tokens, permuted_probs, state=None
+        self, permutated_local_input_tokens, permuted_probs=None, state=None
     ):
         """
         Dispatches tokens to the appropriate experts based on the router output.
         """
         if self.is_deepep:
             token_dispatcher = self.mlp.token_dispatcher
-            token_dispatcher._comm_manager.token_probs = permuted_probs
+            token_dispatcher._comm_manager.token_probs = state.token_probs
             return token_dispatcher._comm_manager.dispatch(permutated_local_input_tokens, True, True), token_dispatcher._comm_manager.dispatched_probs
         else:
             dispatched_tokens, global_probs = self.mlp.token_dispatcher.dispatch_all_to_all(
@@ -665,7 +665,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
             return dispatched_tokens, global_probs
 
-    def _submodule_moe_forward(self, dispatched_tokens, global_probs, state=None):
+    def _submodule_moe_forward(self, dispatched_tokens, global_probs=None, state=None):
         """
         Performs a forward pass for the MLP submodule, including both expert-based
         and optional shared-expert computations.
@@ -673,7 +673,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         shared_expert_output = None
         if self.is_deepep:
             token_dispatcher = self.mlp.token_dispatcher
-            token_dispatcher._comm_manager.dispatched_probs = global_probs
+            token_dispatcher._comm_manager.dispatched_probs = state.dispatched_probs
             dispatched_tokens, global_probs = (
                 token_dispatcher._comm_manager.get_permuted_hidden_states_by_experts(dispatched_tokens)
             )
@@ -733,9 +733,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
     ):
         if self.is_deepep:
             node.common_state.residual = node.detach(residual)
+            node.common_state.token_probs = node.detach(permuted_probs)
             if self.mlp.use_shared_expert:
                 node.common_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
-            return permutated_local_input_tokens, permuted_probs
+            return permutated_local_input_tokens
         else:
             node.common_state.tokens_per_expert = tokens_per_expert
             node.common_state.residual = node.detach(residual)
@@ -745,7 +746,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
     def _submodule_dispatch_postprocess(self, node, dispatched_tokens, global_probs):
         if self.is_deepep:
-            return dispatched_tokens, global_probs
+            node.common_state.dispatched_probs = node.detach(global_probs)
+            return dispatched_tokens
         else:
             return dispatched_tokens, global_probs
 
