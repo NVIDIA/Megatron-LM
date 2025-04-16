@@ -237,7 +237,7 @@ class TransformerLayerNode(ScheduleNode):
     transformer layer nodes (attention, MLP, etc.)
     """
 
-    def __init__(self, stream, event, state, callables, is_moe, is_deepep, name="default"):
+    def __init__(self, stream, event, state, callables, name="default"):
         """Initialize a transformer layer node.
 
         Args:
@@ -249,7 +249,7 @@ class TransformerLayerNode(ScheduleNode):
             name (str): Node name, also used to determine memory strategy
         """
         # Get memory strategy based on node name
-        memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(name, is_moe, is_deepep)
+        memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(name, callables.is_moe, callables.is_deepep)
 
         super().__init__(
             weak_method(self.forward_impl),
@@ -329,8 +329,6 @@ class TransformerLayerSchedulePlan:
             comp_stream (torch.cuda.Stream): CUDA stream for computation.
             com_stream (torch.cuda.Stream): CUDA stream for communication.
         """
-        is_moe = isinstance(layer.mlp, MoELayer)
-        is_deepep = layer.is_deepep
         self.common_state = TransformerLayerState()
         # get callables for transformer layer
         attn_callable, dispatch_callable, mlp_callable, combine_callable = (
@@ -340,17 +338,17 @@ class TransformerLayerSchedulePlan:
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
         self.attn = TransformerLayerNode(
-            comp_stream, event, self.common_state, attn_callable, is_moe, is_deepep, name="attn"
+            comp_stream, event, self.common_state, attn_callable, name="attn"
         )
         self.mlp = TransformerLayerNode(
-            comp_stream, event, self.common_state, mlp_callable, is_moe, is_deepep, name="mlp"
+            comp_stream, event, self.common_state, mlp_callable, name="mlp"
         )
-        if is_moe:
+        if attn_callable.is_moe:
             self.dispatch = TransformerLayerNode(
-                com_stream, event, self.common_state, dispatch_callable, is_moe, is_deepep, name="dispatch"
+                com_stream, event, self.common_state, dispatch_callable, name="dispatch"
             )
             self.combine = TransformerLayerNode(
-                com_stream, event, self.common_state, combine_callable, is_moe, is_deepep, name="combine"
+                com_stream, event, self.common_state, combine_callable, name="combine"
             )
         else:
             self.dispatch = FakeScheduleNode()
@@ -736,10 +734,8 @@ def build_model_chunk_schedule_plan(
     Returns:
         The model chunk schedule plan.
     """
-    com_stream = get_comp_stream()
-    comp_stream = get_com_stream()
-    # comp_stream = get_comp_stream()
-    # com_stream = get_com_stream()
+    comp_stream = get_comp_stream()
+    com_stream = get_com_stream()
     model_chunk_schedule_plan = ModelChunkSchedulePlan()
     event = model_chunk_schedule_plan.event
     state = model_chunk_schedule_plan.state

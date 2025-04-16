@@ -347,10 +347,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.mlp = build_module(submodules.mlp, config=self.config)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
-        from megatron.core.transformer.moe.moe_layer import MoELayer
-        from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
-        if isinstance(self.mlp, MoELayer):
-            self.is_deepep = isinstance(self.mlp.token_dispatcher, MoEFlexTokenDispatcher)
+
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
@@ -781,11 +778,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         2. The input tensors.
         """
         from megatron.core.transformer.moe.moe_layer import MoELayer
-
-        is_moe = isinstance(self.mlp, MoELayer)
+        from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
+        
+        self.is_moe = isinstance(self.mlp, MoELayer)
+        if self.is_moe:
+            self.is_deepep = isinstance(self.mlp.token_dispatcher, MoEFlexTokenDispatcher)
 
         def get_func_with_default(func, default_func):
-            if is_moe:
+            if self.is_moe:
                 return func
             return default_func
 
@@ -849,6 +849,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             dispatch=SubmoduleCallables(forward=dispatch_forward),
             mlp=SubmoduleCallables(forward=mlp_forward, dw=self._submodule_mlp_dw),
             combine=SubmoduleCallables(forward=combine_forward),
+            is_moe=self.is_moe,
+            is_deepep=self.is_deepep,
         )
         return callables
 

@@ -979,7 +979,7 @@ def validate_args(args, defaults={}):
             # Expert model parallelism requirements
             assert args.expert_model_parallel_size > 1, \
                 'Combined 1f1b recipe ep_a2a is only supported with expert model parallelism'
-            assert args.moe_token_dispatcher_type == 'alltoall' or args.moe_token_dispatcher_type == 'flex', \
+            assert args.moe_token_dispatcher_type in ['alltoall', 'flex'], \
                 'Combined 1f1b recipe ep_a2a is only supported with alltoall token dispatcher'
             
             # Disable recomputation as it conflicts with combined 1F1B's memory management
