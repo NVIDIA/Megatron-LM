@@ -901,6 +901,10 @@ def validate_args(args, defaults={}):
             assert args.recompute_num_layers is None, \
                 'recompute_num_layers must be None when combined_1f1b_recipe is ep_a2a'
             
+            # Check if bf16 or fp16 is used
+            assert args.bf16 or args.fp16, \
+                'Currently, combined_1f1b_recipe ep_a2a is only supported with bf16 or fp16 model'
+            
             # Disable shared expert overlap as it conflicts with ep_a2a
             assert not args.moe_shared_expert_overlap, \
                 'moe_shared_expert_overlap is not supported when combined_1f1b_recipe is ep_a2a'
@@ -2525,7 +2529,7 @@ def _add_moe_args(parser):
     group.add_argument('--combined-1f1b-recipe', type=str,
                        choices=['ep_a2a'],
                        default='ep_a2a',
-                       help='Options are only "ep_a2a" now.')
+                       help="1) ep_a2a: Hiding expert parallelism's all-to-all communication in the combined-1f1b execution. Options are only 'ep_a2a' now.")
     group.add_argument('--split-bw', action='store_true',
                        help='Split dgrad and wgrad for batch-level overlapping')                       
 

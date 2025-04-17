@@ -426,7 +426,7 @@ def forward_backward_step(
             b_output_tensor_grad[0] = loss_node.get_grad()
 
     grad = b_output_tensor_grad[0] if b_model else None
-    with context_manager:
+    with context_manager:  # autocast context
         # schedule forward and backward
         output_tensor = schedule_chunk_1f1b(
             f_schedule_plan,
@@ -535,7 +535,9 @@ def get_default_cls_for_unwrap():
 
 
 def unwrap_model(model, module_instances=get_default_cls_for_unwrap()):
-    """Unwrap_model DistributedDataParallel and Float16Module wrapped model"""
+    """Unwrap_model DistributedDataParallel and Float16Module wrapped model
+    to return GPTModel instance
+    """
     return_list = True
     if not isinstance(model, list):
         model = [model]

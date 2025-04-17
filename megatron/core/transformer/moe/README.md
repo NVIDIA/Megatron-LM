@@ -8,6 +8,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
   - Support aux-loss-free load balancing strategy
   - Support node-limited routing
   - Support Multi-Token Prediction (MTP)
+  - Batch-level overlapping to hide EP-A2A communication
 - **Support DeepSeek's DeepEP for efficient token dispatching and combining**
 - Add fusion for token permutation and unpermutation
 - Support Uneven virtual pipeline parallel split
@@ -185,6 +186,23 @@ For manual capture with `--external-cuda-graph`, refer to the `cuda_graph_captur
 
 For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for attention layers by setting `--cuda-graph-scope=attn`, while leaving MoE layers unmodified. Note that the `--cuda-graph-scope` parameter is only applicable when using `--external-cuda-graph` mode.
 
+
+### Batch-Level EP-A2A hidding
+Enable A2A overlap in the interleaved 1F1B pipeline parallel introduced from the DSv3 DualPipe implmentation. \
+**Features** 
+- Hide ep a2a communication by batch-level overlapping
+- Compatitable with interleaved 1F1B pipeline parallel
+- Support dW&dX split for better overlapping
+
+**Usage** 
+```bash
+# Add the following flags to your training scripts
+--combined-1f1b
+--combined-1f1b-recipe ep_a2a
+# [optional] only works with specific TE version
+--split-bw
+```
+
 ### MoE Related Arguments
 | Item | Description |
 | --- | --- |
@@ -227,6 +245,9 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
 | --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
 | --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
+| --combined-1f1b | Enable batch-level overlapping in 1f1b stage. |
+| --combined-1f1b-recipe | Choice of the overlapping recipe of `combined-1f1b` execution. `ep_a2a` is only supported recipe currently. |
+| --split-bw | Enable split dgrad and wgrad for `combined-1f1b` execution. Increasing room to hide communication latency by more finegrained control. |
 
 </details>
 
