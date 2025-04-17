@@ -786,6 +786,12 @@ def validate_args(args, defaults={}):
                 "settings for best performance. sequence parallelism requires setting the "
                 f"environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while {fsdp_impl} "
                 "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
+        elif args.combined_1f1b:
+            warnings.warn("Try not to use tensor model parallelism or context parallelism with combined_1f1b. "
+                         "Using tensor/context model parallelism requires setting the environment "
+                         "variable CUDA_DEVICE_MAX_CONNECTIONS to 1. "
+                         "While combined_1f1b requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
+                         "for better parallelization.")
         else:
             assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
