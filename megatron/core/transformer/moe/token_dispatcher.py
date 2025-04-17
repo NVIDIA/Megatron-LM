@@ -453,33 +453,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.preprocess_event = torch.cuda.current_stream().record_event()
         return num_tokens_per_local_expert
 
-    def meta_prepare(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
-    ):
-        """
-        Prepare metadata for token dispatching.
-
-        This method initializes the necessary metadata for token dispatching, including
-        the hidden shape, probabilities, and routing map. It also performs preprocessing
-        on the routing map to calculate the number of tokens per expert.
-
-        Args:
-            hidden_states (torch.Tensor): Input token embeddings.
-            probs (torch.Tensor): The probabilities of token to experts assignment.
-            routing_map (torch.Tensor): The mapping of token to experts assignment.
-
-        Returns:
-            torch.Tensor: The number of tokens assigned to each expert.
-        """
-        self.hidden_shape = hidden_states.shape
-        self.probs = probs
-        self.routing_map = routing_map
-        assert probs.dim() == 2, "Expected 2D tensor for probs"
-        assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
-        assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
-        tokens_per_expert = self.preprocess(self.routing_map)
-        return tokens_per_expert
-
     def sync_meta_dtoh(self, point):
         """
         Synchronize metadata from device to host at a specific synchronization point.
@@ -515,7 +488,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             torch.Tensor: Preprocessed hidden states ready for dispatching.
             torch.Tensor: Preprocessed probs ready for dispatching.
+            torch.Tensor: Number of tokens per expert.
         """
+        self.hidden_shape = hidden_states.shape
+        self.probs = probs
+        self.routing_map = routing_map
+        assert probs.dim() == 2, "Expected 2D tensor for probs"
+        assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
+        assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
+        tokens_per_expert = self.preprocess(self.routing_map)
+
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
@@ -535,7 +517,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
         )
-        return permutated_local_input_tokens, permuted_probs
+        return permutated_local_input_tokens, permuted_probs, tokens_per_expert
 
     def dispatch_all_to_all(self, permutated_local_input_tokens, permuted_probs):
         """
@@ -654,8 +636,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 - Permuted probs of each token produced by the router.
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
-        tokens_per_expert = self.meta_prepare(hidden_states, probs, routing_map)
-        permutated_local_input_tokens, permuted_probs = self.dispatch_preprocess(
+        permutated_local_input_tokens, permuted_probs, tokens_per_expert = self.dispatch_preprocess(
             hidden_states, routing_map, probs
         )
         global_input_tokens, global_probs = self.dispatch_all_to_all(
@@ -1067,9 +1048,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         ).contiguous()
         return routing_map, probs
 
-    def token_permutation(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def dispatch_preprocess(self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor):
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
@@ -1077,19 +1056,43 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         routing_map, probs = self._initialize_metadata(routing_map, probs)
 
         self._comm_manager.setup_metadata(routing_map, probs)
-        hidden_states = self._comm_manager.dispatch(hidden_states)
+        return hidden_states, self._comm_manager.token_probs, None
+
+    def dispatch_all_to_all(self, hidden_states: torch.Tensor, probs: torch.Tensor = None, async_finish: bool = True, allocate_on_comm_stream: bool = True):
+        return self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream), self._comm_manager.dispatched_probs
+
+    def dispatch_postprocess(self, hidden_states: torch.Tensor):
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
+        return global_input_tokens, tokens_per_expert, permuted_probs
+
+    def token_permutation(
+        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        hidden_states, _, _ = self.dispatch_preprocess(hidden_states, routing_map, probs)
+        hidden_states, _ = self.dispatch_all_to_all(hidden_states, async_finish=False, allocate_on_comm_stream=False)
+        global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(hidden_states)
 
         return global_input_tokens, tokens_per_expert, permuted_probs
 
+    def combine_preprocess(self, hidden_states: torch.Tensor):
+        hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
+        return hidden_states
+    
+    def combine_all_to_all(self, hidden_states: torch.Tensor, async_finish: bool = True, allocate_on_comm_stream: bool = True):
+        return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
+
+    def combine_postprocess(self, hidden_states: torch.Tensor):
+        return hidden_states.view(self.hidden_shape)
+    
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert bias is None, "Bias is not supported in MoEFlexTokenDispatcher"
-        hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
-        hidden_states = self._comm_manager.combine(hidden_states)
-
-        return hidden_states.view(self.hidden_shape), None
+        hidden_states = self.combine_preprocess(hidden_states)
+        hidden_states = self.combine_all_to_all(hidden_states, False, False)
+        hidden_states = self.combine_postprocess(hidden_states)
+        
+        return hidden_states, None
