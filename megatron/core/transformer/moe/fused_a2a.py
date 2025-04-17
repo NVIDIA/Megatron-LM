@@ -131,6 +131,7 @@ class FusedDispatch(torch.autograd.Function):
         """Backward pass of fused dispatch."""
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         handle = ctx.handle
+        previous_event = None
         if ctx.async_finish:
             previous_event = EventOverlap(EventHandle())
         grad_x, grad_token_probs, after_event = buffer.combine(
