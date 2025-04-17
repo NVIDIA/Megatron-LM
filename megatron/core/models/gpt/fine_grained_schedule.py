@@ -60,13 +60,14 @@ class MemoryStrategyRegistry:
         strategies = {
             "default": NoOpMemoryStrategy(),
             "attn": NoOpMemoryStrategy(),  # Attention nodes keep their inputs
-            "dispatch": FreeInputsMemoryStrategy() if not is_deepep else NoOpMemoryStrategy(),  # Dispatch nodes free inputs after use only for all2all
+            "dispatch": FreeInputsMemoryStrategy() if not is_deepep else NoOpMemoryStrategy(),  # deepep dispatch inputs share same storage with moe inputs
             "mlp": FreeInputsMemoryStrategy(),  # MLP nodes free inputs after use
             "combine": FreeInputsMemoryStrategy(),  # Combine nodes free inputs after use
         }
 
         if is_moe:
             return strategies.get(name, strategies["default"])
+        # For dense layers [attn, fake, mlp, fake], the inputs of mlp are required for backward
         return NoOpMemoryStrategy()
 
 
