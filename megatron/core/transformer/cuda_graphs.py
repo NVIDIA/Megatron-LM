@@ -760,6 +760,7 @@ class CudaGraphManager(torch.nn.Module):
         rng_tracker = get_cuda_rng_tracker()
 
         # need to delay the import here to avoid a circular import
+        global HAVE_TE_GRAPHS
         try:
             from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
         except ImportError:

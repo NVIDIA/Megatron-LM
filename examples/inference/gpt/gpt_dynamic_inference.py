@@ -32,6 +32,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
     add_common_inference_args(parser)
 
+    group = parser.add_argument_group(title='Dynamic inference')
+    group.add_argument("--inference-ckpt-non-strict", action="store_true",
+                       help="Load checkpoint with `strict=False`.")
+    
+
     return parser
 
 
@@ -46,7 +51,12 @@ def get_model() -> MegatronModule:
     # Load checkpoint.
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
-    load_checkpoint(model, None, None)
+    load_checkpoint(
+        ddp_model=model,
+        optimizer=None,
+        opt_param_scheduler=None,
+        strict=not args.inference_ckpt_non_strict,
+    )
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
