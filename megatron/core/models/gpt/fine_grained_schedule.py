@@ -169,7 +169,8 @@ class PreProcessNode(ScheduleNode):
 class PostProcessNode(ScheduleNode):
     """Node responsible for postprocessing operations in the model.
 
-    This node handles final layer normalization and output computation.
+    This node handles final layer normalization and output layer computation
+    after the main transformer layers.
     """
 
     def __init__(self, gpt_model, model_chunk_state, event, stream):
@@ -239,9 +240,8 @@ class TransformerLayerNode(ScheduleNode):
         Args:
             stream (torch.cuda.Stream): CUDA stream for execution
             event (torch.cuda.Event): Synchronization event
-            common_state: State shared within a transformer layer
-            callables: The callables contain forward and dw function
-            forward_ctx: Context for forward computation, for moe,
+            common_state (TransformerLayerState): State shared within a transformer layer
+            callables (Callable): The callables contain forward and dw function
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
         """
@@ -320,11 +320,11 @@ class TransformerLayerSchedulePlan:
         """Initializes a transformer layer schedule plan.
 
         Args:
-            layer: The transformer layer to schedule.
-            event: CUDA event for synchronization.
-            chunk_state: State shared across the model chunk.
-            comp_stream: CUDA stream for computation.
-            com_stream: CUDA stream for communication.
+            layer (TransformerLayer): The transformer layer to schedule.
+            event (torch.cuda.Event): CUDA event for synchronization.
+            chunk_state (ModelChunkState): State shared across the model chunk.
+            comp_stream (torch.cuda.Stream): CUDA stream for computation.
+            com_stream (torch.cuda.Stream): CUDA stream for communication.
         """
         is_moe = isinstance(layer.mlp, MoELayer)
         self.common_state = TransformerLayerState()
@@ -385,15 +385,15 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         """Schedules forward and backward passes for model chunks.
 
         Args:
-            f_schedule_plan: Forward schedule plan.
-            b_schedule_plan: Backward schedule plan.
-            grad: Gradient for backward computation.
-            f_context: Context for forward computation.
-            b_context: Context for backward computation.
-            pre_forward: Callback for preprocessing in forward pass.
-            pre_backward: Callback for preprocessing in backward pass.
-            post_forward: Callback for postprocessing in forward pass.
-            post_backward: Callback for postprocessing in backward pass.
+            f_schedule_plan (ModelChunkSchedulePlan): Forward schedule plan.
+            b_schedule_plan (ModelChunkSchedulePlan): Backward schedule plan.
+            grad (Tensor): Gradient for backward computation.
+            f_context (VppContextManager or None): The VppContextManager for the forward pass.
+            b_context (VppContextManager or None): The VppContextManager for the backward pass
+            pre_forward (Callable): Callback for preprocessing in forward pass.
+            pre_backward (Callable): Callback for preprocessing in backward pass.
+            post_forward (Callable): Callback for postprocessing in forward pass.
+            post_backward (Callable): Callback for postprocessing in backward pass.
 
         Returns:
             The output of the forward pass.
@@ -481,15 +481,15 @@ def schedule_layer_1f1b(
     parallelism and efficiency.
 
     Args:
-        f_layer: Forward layer (for current microbatch)
-        b_layer: Backward layer (for previous microbatch)
-        f_input: Input for forward computation
-        b_grad: Gradient for backward computation
-        pre_forward: Callback to get forward input if not provided
-        pre_backward: Callback to get backward gradient if not provided
-        pre_backward_dw: Callback for weight gradient computation
-        f_context: Context for forward computation
-        b_context: Context for backward computation
+        f_layer (TransformerLayerSchedulePlan): Forward layer (for current microbatch)
+        b_layer (TransformerLayerSchedulePlan): Backward layer (for previous microbatch)
+        f_input (Tensor): Input for forward computation
+        b_grad (Tensor): Gradient for backward computation
+        pre_forward (Callable): Callback to get forward input if not provided
+        pre_backward (Callable): Callback to get backward gradient if not provided
+        pre_backward_dw (Callable): Callback for weight gradient computation
+        f_context (VppContextManager or None): The VppContextManager for the forward pass.
+        b_context (VppContextManager or None): The VppContextManager for the backward pass
 
     Returns:
         Functions or values for next iteration's computation
@@ -594,7 +594,7 @@ def schedule_chunk_1f1b(
     if f_schedule_plan:
         # pp output send/receive sync
         if pre_forward is not None:
-            with f_context:
+            with f_context:  # virtual pipeline parallel context
                 pre_forward()
         f_schedule_plan.record_current_stream()
 
@@ -614,14 +614,14 @@ def schedule_chunk_1f1b(
         if b_schedule_plan is not None:
             assert grad is not None
             if b_schedule_plan.post_process is not None:
-                with b_context:
+                with b_context:  # virtual pipeline parallel context
                     tmp = b_schedule_plan.post_process.backward(grad)
 
             if pre_backward is not None:
                 # pp grad send receive sync here, safe for now, maybe not safe in the future
                 with torch.cuda.stream(get_com_stream()):
                     b_schedule_plan.wait_current_stream()
-                    with b_context:
+                    with b_context:  # virtual pipeline parallel context
                         pre_backward()
                     b_schedule_plan.record_current_stream()
 
