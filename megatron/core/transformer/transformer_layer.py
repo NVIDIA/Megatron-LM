@@ -747,6 +747,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         from megatron.core.transformer.moe.token_dispatcher import MoEFlexTokenDispatcher
         
         self.is_moe = isinstance(self.mlp, MoELayer)
+        self.is_deepep = False
         if self.is_moe:
             self.is_deepep = isinstance(self.mlp.token_dispatcher, MoEFlexTokenDispatcher)
 
