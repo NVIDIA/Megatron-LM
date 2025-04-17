@@ -207,6 +207,8 @@ def telemetrics_and_exit(
                     pd.Timestamp.now(tz='UTC')
                     - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz='UTC')
                 ).total_seconds(),
+                "is_merge_request": os.getenv("CI_MERGE_REQUEST_IID") is not None,
+                "ci_merge_request_iid": os.getenv("CI_MERGE_REQUEST_IID"),
             }
         ]
     )
