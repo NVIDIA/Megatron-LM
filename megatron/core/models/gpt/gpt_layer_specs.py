@@ -308,7 +308,7 @@ def get_mlp_module_spec(
             submodules=MLPSubmodules(
                 linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
                 linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
-                norm_linear_fc1=TESequentialiNormLinear if use_te else ColumnParallelLinear,
+                norm_linear_fc1=TESequentialNormLinear if use_te else ColumnParallelLinear,
                 swiglu_linear_fc2=TESequentialSwigluLinear if use_te else RowParallelLinear,
             ),
         )
