@@ -1367,17 +1367,27 @@ except ImportError:
 
 try:
 
-    from transformer_engine.pytorch.attention import FusedRoPEFunc
+    from transformer_engine.pytorch.attention import apply_rotary_pos_emb
 
     def fused_apply_rotary_pos_emb(
-        t: torch.Tensor, freqs: torch.Tensor, transpose_output_memory: bool = False
+        t: torch.Tensor,
+        freqs: torch.Tensor,
+        transpose_output_memory: bool = False,
+        interleaved: bool = False,
     ) -> torch.Tensor:
         """Apply rotary positional embedding to input tensor T in `sbhd` format."""
         if transpose_output_memory:
             warnings.warn(
                 "transpose_output_memory is not supported by TE's fused RoPE and will be ignored."
             )
-        return FusedRoPEFunc.apply(t, freqs, "sbhd")
+        if is_te_min_version("2.3.0.dev0"):
+            return apply_rotary_pos_emb(
+                t, freqs, tensor_format="sbhd", interleaved=interleaved, fused=True
+            )
+        else:
+            if interleaved:
+                raise ValueError("Only TE >= 2.3.0.dev0 supports interleaved fused RoPE.")
+            return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
 
     def fused_apply_rotary_pos_emb_thd(
         t: torch.Tensor,
@@ -1390,9 +1400,19 @@ try:
         Apply rotary positional embedding to input tensor T in `thd` format with CP support.
         """
         if is_te_min_version("1.12.0", check_equality=True):
-            return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens, cp_size, cp_rank)
+            return apply_rotary_pos_emb(
+                t,
+                freqs,
+                tensor_format="thd",
+                fused=True,
+                cu_seqlens=cu_seqlens,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+            )
         else:
-            return FusedRoPEFunc.apply(t, freqs, "thd", cu_seqlens)
+            return apply_rotary_pos_emb(
+                t, freqs, tensor_format="thd", fused=True, cu_seqlens=cu_seqlens
+            )
 
 except ImportError:
 
