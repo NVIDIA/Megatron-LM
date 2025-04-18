@@ -87,7 +87,8 @@ def deterministic_mode():
         yield
     finally:
         for k in envs:
-            del os.environ[k]
+            if k in os.environ:
+                del os.environ[k]
 
 
 def run_model_ref_with_capture(model, input_tensors, iterations):
@@ -273,7 +274,8 @@ class TestA2AOverlap:
         pass
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type", ["alltoall", "flex"])
+    # TODO: Add flex dispatcher test back in when CI image installs DeepEP.
+    @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
     def test_1f1b_overlap(self, dispatcher_type):
         """
         Tests the 1-forward-1-backward overlap optimization.
