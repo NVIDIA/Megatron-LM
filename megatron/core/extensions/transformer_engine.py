@@ -152,7 +152,7 @@ class TELinear(te.pytorch.Linear):
                 extra_kwargs["delay_wgrad_compute"] = self.config.split_bw
             else:
                 raise RuntimeError(
-                    f"Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now {get_te_version()}."
+                    f"Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now."
                 )
 
         if is_te_min_version("0.8.0"):

@@ -19,7 +19,6 @@ from megatron.core.pipeline_parallel.combined_1f1b import (
 )
 from megatron.core.transformer import transformer_layer
 from megatron.core.transformer.module import float16_to_fp32
-from megatron.core.transformer.moe.moe_layer import MoELayer
 
 
 def weak_method(method):
