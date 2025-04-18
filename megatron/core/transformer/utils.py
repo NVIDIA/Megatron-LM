@@ -234,6 +234,7 @@ class TransformerLayerSubmoduleCallables:
             submodule.is_moe = self.is_moe
             submodule.is_deepep = self.is_deepep
 
+
 # Initialize cache for sequence parallel modules
 _sequence_parallel_attr_cache = None
 
@@ -302,4 +303,3 @@ def set_model_to_sequence_parallel(model, set_to=False):
     for attr, modules in _sequence_parallel_attr_cache[model_id].items():
         for module in modules:
             setattr(module, attr, set_to)
-

@@ -1073,6 +1073,19 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
+        """
+        Preprocesses the hidden states and routing information before dispatching tokens to experts.
+        Args:
+            hidden_states (torch.Tensor): Input hidden states to be processed
+            routing_map (torch.Tensor): Map indicating which expert each token should be routed to
+            probs (torch.Tensor): Routing probabilities for each token-expert pair
+
+        Returns:
+            Tuple containing:
+            - torch.Tensor: Reshaped hidden states
+            - torch.Tensor: Token probabilities from the communication manager
+            - None: Placeholder for compatibility
+        """
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
@@ -1089,12 +1102,21 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):
+        """
+        Performs all-to-all communication to dispatch tokens across expert parallel ranks.
+        """
         return (
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
             self._comm_manager.dispatched_probs,
         )
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor):
+        """
+        Post-processes the dispatched hidden states after all-to-all communication.
+
+        This method retrieves the permuted hidden states by experts, calculates the number of tokens
+        per expert, and returns the processed data ready for expert processing.
+        """
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
@@ -1104,6 +1126,14 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
     def token_permutation(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Permutes tokens according to the routing map and dispatches them to experts.
+
+        This method implements the token permutation process in three steps:
+        1. Preprocess the hidden states and routing information
+        2. Perform all-to-all communication to dispatch tokens
+        3. Post-process the dispatched tokens for expert processing
+        """
         hidden_states, _, _ = self.dispatch_preprocess(hidden_states, routing_map, probs)
         hidden_states, _ = self.dispatch_all_to_all(
             hidden_states, async_finish=False, allocate_on_comm_stream=False
@@ -1115,6 +1145,12 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         return global_input_tokens, tokens_per_expert, permuted_probs
 
     def combine_preprocess(self, hidden_states: torch.Tensor):
+        """
+        Pre-processes the hidden states before combining them after expert processing.
+
+        This method restores the hidden states to their original ordering before expert processing
+        by using the communication manager's restoration function.
+        """
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
         return hidden_states
 
@@ -1124,14 +1160,30 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):
+        """
+        Performs all-to-all communication to combine tokens after expert processing.
+        """
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
+        """
+        Post-processes the combined hidden states after all-to-all communication.
+
+        This method reshapes the combined hidden states to match the original input shape.
+        """
         return hidden_states.view(self.hidden_shape)
 
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Reverses the token permutation process to restore the original token order.
+
+        This method implements the token unpermutation process in three steps:
+        1. Pre-process the hidden states to restore their original ordering
+        2. Perform all-to-all communication to combine tokens
+        3. Post-process the combined tokens to match the original input shape
+        """
         assert bias is None, "Bias is not supported in MoEFlexTokenDispatcher"
         hidden_states = self.combine_preprocess(hidden_states)
         hidden_states = self.combine_all_to_all(hidden_states, False, False)
