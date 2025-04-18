@@ -1,3 +1,4 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-ENABLE_EXPERIMENTAL = False
+# Todo: remove this after testing
+ENABLE_EXPERIMENTAL = True

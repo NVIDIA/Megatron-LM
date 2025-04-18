@@ -653,6 +653,9 @@ def schedule_chunk_1f1b(
         )
         torch.cuda.nvtx.range_pop()
 
+    # tail forward
+    f_input = layer_pre_forward()
+    del layer_pre_forward
     # tail backward
     grad = layer_pre_backward()
     del layer_pre_backward
@@ -663,12 +666,12 @@ def schedule_chunk_1f1b(
             tmp, grad, _ = schedule_layer_1f1b(None, b_layer, b_grad=grad)
             torch.cuda.nvtx.range_pop()
 
-        if b_schedule_plan is not None:
-            b_schedule_plan.pre_process.backward(grad)
+        # if b_schedule_plan is not None:
+        #     b_schedule_plan.pre_process.backward(grad)
 
-    # tail forward
-    f_input = layer_pre_forward()
-    del layer_pre_forward
+    # # tail forward
+    # f_input = layer_pre_forward()
+    # del layer_pre_forward
     with f_context:
         for i in range(overlaped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
@@ -676,8 +679,8 @@ def schedule_chunk_1f1b(
             f_input, tmp, _ = schedule_layer_1f1b(f_layer, None, f_input=f_input)
             torch.cuda.nvtx.range_pop()
 
-        if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
-            f_input = f_schedule_plan.post_process.forward(f_input)
+        # if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+        #     f_input = f_schedule_plan.post_process.forward(f_input)
 
     # output pp send receive, overlapped with attn backward
     if f_schedule_plan is not None and post_forward is not None:
@@ -695,6 +698,13 @@ def schedule_chunk_1f1b(
     # The last wgrad of attention
     layer_pre_backward_dw()
     del layer_pre_backward_dw
+
+    with f_context:
+        if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+            f_input = f_schedule_plan.post_process.forward(f_input)
+    with b_context:
+        if b_schedule_plan is not None:
+            b_schedule_plan.pre_process.backward(grad)
 
     if f_schedule_plan:
         f_schedule_plan.wait_current_stream()
