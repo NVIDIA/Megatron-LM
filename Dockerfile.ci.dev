@@ -8,11 +8,15 @@ RUN pip3 install -U pip
 FROM mcore_image as build_te
 ARG TE_COMMIT=bee4649c15a79ffcb9689ca7c0c963f5febaa28a
 WORKDIR /opt
-RUN git clone https://github.com/NVIDIA/TransformerEngine.git && \
+COPY patches/nemo_2.3.0_te.patch .
+RUN \
+    git clone https://github.com/NVIDIA/TransformerEngine.git && \
     cd TransformerEngine && \
     git fetch origin ${TE_COMMIT} && \ 
     git checkout ${TE_COMMIT} && \
+    patch -p1 < /opt/nemo_2.3.0_te.patch && \
     git submodule init && git submodule update && \
+    rm /opt/nemo_2.3.0_te.patch && \
     pip3 wheel --no-cache-dir -v .
 
 FROM mcore_image as build_causal_conv1d
