@@ -15,7 +15,7 @@
 workflow:
   rules:
     # Do not trigger for forks
-    - if: $CI_PROJECT_NAMESPACE != "ADLR"
+    - if: $CI_PROJECT_NAMESPACE != "ADLR" || $CI_MERGE_REQUEST_PROJECT_PATH != "ADLR/megatron-lm"
       when: never
 
     # ci-branches only for schedule
