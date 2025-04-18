@@ -868,14 +868,6 @@ def validate_args(args, defaults={}):
             "as the hybrid device optimizer reuses the code path of this flag."
         )
 
-    # MoE loss and include embedding and loss layer check
-    if args.num_experts is not None:
-        if args.moe_router_load_balancing_type != "none" or args.moe_z_loss_coeff is not None:
-            assert not args.account_for_embedding_in_pipeline_split, \
-                "Cannot support load balancing loss and z loss with --account-for-embedding-in-pipeline-split"
-            assert not args.account_for_loss_in_pipeline_split, \
-                "Cannot support load balancing loss and z loss with --account-for-loss-in-pipeline-split"
-
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"

@@ -575,7 +575,4 @@ def get_megatron_optimizer(
             )
         )
 
-    if len(optimizers) == 1:
-        return optimizers[0]
-
     return ChainedOptimizer(optimizers)
