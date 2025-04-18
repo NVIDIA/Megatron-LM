@@ -373,6 +373,13 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             fp32_param = self.param_to_fp32_param[param]
             fp32_param.data.copy_(v["master_param"])
 
+    def update_fp32_param_by_new_param(self):
+        """
+        Update the fp32 parameters by the new parameters.
+        """
+        for param, fp32_param in self.param_to_fp32_param.items():
+            fp32_param.data.copy_(param)
+
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
             """
