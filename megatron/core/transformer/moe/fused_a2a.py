@@ -3,19 +3,19 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
-from megatron.core import parallel_state
+import os
 
 try:
     from deep_ep import Buffer
     from deep_ep.utils import EventOverlap, EventHandle
     HAVE_DEEP_EP = True
+    Buffer.set_num_sms(int(os.environ.get("DEEP_EP_SM_NUMS", 20)))
 except ImportError:
     HAVE_DEEP_EP = False
 
 import torch
 
 _buffer = None
-
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for a tensor.
@@ -61,7 +61,6 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         or _buffer.num_nvl_bytes < num_nvl_bytes
         or _buffer.num_rdma_bytes < num_rdma_bytes
     ):
-        Buffer.set_num_sms(parallel_state.get_expert_model_parallel_world_size())
         _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer
 
