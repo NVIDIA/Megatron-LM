@@ -25,6 +25,7 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
         save_dir (str): path of the root save folder for all checkpoints
         iteration (int): iteration of the checkpoint
     """
+    checkpoint_path = str(Path(checkpoint_path).resolve())
 
     wandb_writer = get_wandb_writer()
 
