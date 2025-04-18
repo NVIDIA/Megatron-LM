@@ -3,6 +3,8 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+from megatron.core import parallel_state
+
 try:
     from deep_ep import Buffer
     from deep_ep.utils import EventOverlap, EventHandle
@@ -59,6 +61,7 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         or _buffer.num_nvl_bytes < num_nvl_bytes
         or _buffer.num_rdma_bytes < num_rdma_bytes
     ):
+        Buffer.set_num_sms(parallel_state.get_expert_model_parallel_world_size())
         _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
     return _buffer
 
