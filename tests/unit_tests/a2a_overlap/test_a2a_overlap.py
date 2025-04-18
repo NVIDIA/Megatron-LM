@@ -273,9 +273,7 @@ class TestA2AOverlap:
         pass
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize(
-        "dispatcher_type", ["alltoall", "flex"]
-    )
+    @pytest.mark.parametrize("dispatcher_type", ["alltoall", "flex"])
     def test_1f1b_overlap(self, dispatcher_type):
         """
         Tests the 1-forward-1-backward overlap optimization.
@@ -283,7 +281,6 @@ class TestA2AOverlap:
         This test verifies that the all-to-all overlap optimization produces
         the same results as the reference implementation.
         """
-
 
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1,
@@ -317,7 +314,7 @@ class TestA2AOverlap:
             moe_grouped_gemm=True,
             moe_token_dispatcher_type=dispatcher_type,
             moe_shared_expert_intermediate_size=2048,
-            **extra_kwargs
+            **extra_kwargs,
         )
         microbatches = 4
         with deterministic_mode():

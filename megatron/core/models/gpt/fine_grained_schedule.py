@@ -60,7 +60,9 @@ class MemoryStrategyRegistry:
         strategies = {
             "default": NoOpMemoryStrategy(),
             "attn": NoOpMemoryStrategy(),  # Attention nodes keep their inputs
-            "dispatch": FreeInputsMemoryStrategy() if not is_deepep else NoOpMemoryStrategy(),  # deepep dispatch inputs share same storage with moe inputs
+            "dispatch": (
+                FreeInputsMemoryStrategy() if not is_deepep else NoOpMemoryStrategy()
+            ),  # deepep dispatch inputs share same storage with moe inputs
             "mlp": FreeInputsMemoryStrategy(),  # MLP nodes free inputs after use
             "combine": FreeInputsMemoryStrategy(),  # Combine nodes free inputs after use
         }
@@ -247,7 +249,9 @@ class TransformerLayerNode(ScheduleNode):
             name (str): Node name, also used to determine memory strategy
         """
         # Get memory strategy based on node name
-        memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(name, callables.is_moe, callables.is_deepep)
+        memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(
+            name, callables.is_moe, callables.is_deepep
+        )
 
         super().__init__(
             weak_method(self.forward_impl),

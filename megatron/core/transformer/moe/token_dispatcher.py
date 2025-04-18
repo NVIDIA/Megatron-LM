@@ -877,7 +877,12 @@ class _DeepepManager(_DispatchManager):
             mask = self.token_probs == 0
             self.token_indices = self.token_indices.masked_fill(mask, -1)
 
-    def dispatch(self, hidden_states: torch.Tensor, async_finish: bool = False, allocate_on_comm_stream: bool = False) -> torch.Tensor:
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
         # DeepEP only supports float32 probs
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
@@ -885,7 +890,13 @@ class _DeepepManager(_DispatchManager):
             self.token_probs = self.token_probs.float()  # downcast or upcast
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
-                hidden_states, self.token_indices, self.token_probs, self.num_experts, self.group, async_finish=async_finish, allocate_on_comm_stream=allocate_on_comm_stream
+                hidden_states,
+                self.token_indices,
+                self.token_probs,
+                self.num_experts,
+                self.group,
+                async_finish=async_finish,
+                allocate_on_comm_stream=allocate_on_comm_stream,
             )
         )
         self.handle = handle
@@ -935,8 +946,19 @@ class _DeepepManager(_DispatchManager):
         """
         return self.tokens_per_expert
 
-    def combine(self, hidden_states: torch.Tensor, async_finish: bool = False, allocate_on_comm_stream: bool = False) -> torch.Tensor:
-        hidden_states, _ = fused_combine(hidden_states, self.group, self.handle, async_finish=async_finish, allocate_on_comm_stream=allocate_on_comm_stream)
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = False,
+        allocate_on_comm_stream: bool = False,
+    ) -> torch.Tensor:
+        hidden_states, _ = fused_combine(
+            hidden_states,
+            self.group,
+            self.handle,
+            async_finish=async_finish,
+            allocate_on_comm_stream=allocate_on_comm_stream,
+        )
         # Release the handle after combine operation
         self.handle = None
         return hidden_states
@@ -1048,7 +1070,9 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         ).contiguous()
         return routing_map, probs
 
-    def dispatch_preprocess(self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor):
+    def dispatch_preprocess(
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+    ):
         self.hidden_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
 
@@ -1058,8 +1082,17 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs, None
 
-    def dispatch_all_to_all(self, hidden_states: torch.Tensor, probs: torch.Tensor = None, async_finish: bool = True, allocate_on_comm_stream: bool = True):
-        return self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream), self._comm_manager.dispatched_probs
+    def dispatch_all_to_all(
+        self,
+        hidden_states: torch.Tensor,
+        probs: torch.Tensor = None,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ):
+        return (
+            self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
+            self._comm_manager.dispatched_probs,
+        )
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor):
         global_input_tokens, permuted_probs = (
@@ -1072,21 +1105,30 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states, _, _ = self.dispatch_preprocess(hidden_states, routing_map, probs)
-        hidden_states, _ = self.dispatch_all_to_all(hidden_states, async_finish=False, allocate_on_comm_stream=False)
-        global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(hidden_states)
+        hidden_states, _ = self.dispatch_all_to_all(
+            hidden_states, async_finish=False, allocate_on_comm_stream=False
+        )
+        global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(
+            hidden_states
+        )
 
         return global_input_tokens, tokens_per_expert, permuted_probs
 
     def combine_preprocess(self, hidden_states: torch.Tensor):
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
         return hidden_states
-    
-    def combine_all_to_all(self, hidden_states: torch.Tensor, async_finish: bool = True, allocate_on_comm_stream: bool = True):
+
+    def combine_all_to_all(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ):
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
         return hidden_states.view(self.hidden_shape)
-    
+
     def token_unpermutation(
         self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1094,5 +1136,5 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states = self.combine_preprocess(hidden_states)
         hidden_states = self.combine_all_to_all(hidden_states, False, False)
         hidden_states = self.combine_postprocess(hidden_states)
-        
+
         return hidden_states, None

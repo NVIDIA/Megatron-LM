@@ -7,7 +7,8 @@ import os
 
 try:
     from deep_ep import Buffer
-    from deep_ep.utils import EventOverlap, EventHandle
+    from deep_ep.utils import EventHandle, EventOverlap
+
     HAVE_DEEP_EP = True
     Buffer.set_num_sms(int(os.environ.get("DEEP_EP_SM_NUMS", 20)))
 except ImportError:
@@ -16,6 +17,7 @@ except ImportError:
 import torch
 
 _buffer = None
+
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
     """Calculate the number of hidden bytes for a tensor.
@@ -69,7 +71,16 @@ class FusedDispatch(torch.autograd.Function):
     """Fused dispatch operation for MoE routing combining computation and communication."""
 
     @staticmethod
-    def forward(ctx, x, token_indices, token_probs, num_experts, group, async_finish=False, allocate_on_comm_stream=False):
+    def forward(
+        ctx,
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
         """Forward pass of fused dispatch."""
         previous_event = None
         if async_finish:
@@ -108,7 +119,7 @@ class FusedDispatch(torch.autograd.Function):
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
-            previous_event=event, # wait in deepep::intra/inter_dispatch
+            previous_event=event,  # wait in deepep::intra/inter_dispatch
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
@@ -161,12 +172,16 @@ class FusedCombine(torch.autograd.Function):
             previous_event = EventOverlap(EventHandle())
         buffer = get_buffer(group, get_hidden_bytes(x))
         combined_x, _, after_event = buffer.combine(
-            x, handle=handle, async_finish=async_finish, previous_event=previous_event, allocate_on_comm_stream=allocate_on_comm_stream
+            x,
+            handle=handle,
+            async_finish=async_finish,
+            previous_event=previous_event,
+            allocate_on_comm_stream=allocate_on_comm_stream,
         )
         # Make sure current stream is synchronized
         if async_finish:
             after_event.current_stream_wait()
-        
+
         ctx.handle = handle
         ctx.group = group
         ctx.async_finish = async_finish
@@ -195,7 +210,15 @@ class FusedCombine(torch.autograd.Function):
 
 if HAVE_DEEP_EP:
 
-    def fused_dispatch(x, token_indices, token_probs, num_experts, group, async_finish=False, allocate_on_comm_stream=False):
+    def fused_dispatch(
+        x,
+        token_indices,
+        token_probs,
+        num_experts,
+        group,
+        async_finish=False,
+        allocate_on_comm_stream=False,
+    ):
         """Perform fused dispatch operation if deep_ep is available.
 
         Args:
@@ -210,7 +233,13 @@ if HAVE_DEEP_EP:
             Result of FusedDispatch
         """
         return FusedDispatch.apply(
-            x.contiguous(), token_indices, token_probs, num_experts, group, async_finish, allocate_on_comm_stream
+            x.contiguous(),
+            token_indices,
+            token_probs,
+            num_experts,
+            group,
+            async_finish,
+            allocate_on_comm_stream,
         )
 
     def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
