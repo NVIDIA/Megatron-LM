@@ -28,8 +28,8 @@ class TestDynamicContext:
         num_attention_heads,
         max_sequence_length,
         buffer_size_gb,
-        buffer_guarenteed_fraction,
         chunk_size_tokens,
+        buffer_guarenteed_fraction,
         buffer_overflow_factor,
         max_requests_override,
         max_tokens_override,
@@ -91,6 +91,9 @@ class TestDynamicContext:
         assert dynamic_context.chunk_count_total == 491
         assert dynamic_context.max_requests == 122
         assert dynamic_context.max_tokens == 62848
+
+        # Check initializations to -1
+        assert torch.all(dynamic_context.request_ids == -1)
 
     def test_is_static_batching(self):
         self._setup_model_parallel_group(1, 1)
@@ -198,15 +201,15 @@ class TestDynamicContext:
         dynamic_context.request_kv_chunk_counts.fill_(1)
         dynamic_context.request_last_kv_chunk_id.fill_(1)
         dynamic_context.request_last_kv_chunk_offset.fill_(1)
-        dynamic_context.token_input_ids.fill_(1)
-        dynamic_context.token_pos_ids.fill_(1)
+        dynamic_context.token_to_input_ids.fill_(1)
+        dynamic_context.token_to_pos_ids.fill_(1)
         dynamic_context.token_to_request_idx.fill_(1)
-        dynamic_context.token_to_kv_seq_idx.fill_(1)
+        dynamic_context.token_to_position_in_request.fill_(1)
         dynamic_context.token_to_chunk_idx.fill_(1)
-        dynamic_context.token_to_local_kv_seq_idx.fill_(1)
+        dynamic_context.token_to_local_position_within_kv_chunk.fill_(1)
         dynamic_context.chunk_count_avail = 5
         dynamic_context.memory_buffer.fill_(1)
-        dynamic_context.request_kv_memory.fill_(1)
+        dynamic_context.request_to_kv_chunk_ids.fill_(1)
 
         # Call reset
         dynamic_context.reset()
@@ -218,21 +221,20 @@ class TestDynamicContext:
         assert dynamic_context.padded_active_token_count == 0
         assert dynamic_context.padded_active_sample_count == 0
         assert dynamic_context.paused_tokens is None
-        assert torch.all(dynamic_context.request_ids == 0)
+        assert torch.all(dynamic_context.request_ids == -1)
         assert torch.all(dynamic_context.request_query_lengths == 0)
         assert torch.all(dynamic_context.request_kv_length_offsets == 0)
         assert torch.all(dynamic_context.request_kv_chunk_counts == 0)
-        assert torch.all(dynamic_context.request_last_kv_chunk_id == 0)
+        assert torch.all(dynamic_context.request_last_kv_chunk_id == -1)
         assert torch.all(dynamic_context.request_last_kv_chunk_offset == 0)
-        assert torch.all(dynamic_context.token_input_ids == 0)
-        assert torch.all(dynamic_context.token_pos_ids == 0)
-        assert torch.all(dynamic_context.token_to_request_idx == 0)
-        assert torch.all(dynamic_context.token_to_kv_seq_idx == 0)
-        assert torch.all(dynamic_context.token_to_chunk_idx == 0)
-        assert torch.all(dynamic_context.token_to_local_kv_seq_idx == 0)
+        assert torch.all(dynamic_context.token_to_input_ids == 0)
+        assert torch.all(dynamic_context.token_to_pos_ids == 0)
+        assert torch.all(dynamic_context.token_to_request_idx == -1)
+        assert torch.all(dynamic_context.token_to_position_in_request == 0)
+        assert torch.all(dynamic_context.token_to_chunk_idx == -1)
+        assert torch.all(dynamic_context.token_to_local_position_within_kv_chunk == 0)
         assert dynamic_context.chunk_count_avail == dynamic_context.chunk_count_total - 1
-        assert torch.all(dynamic_context.memory_buffer == 0)
-        assert torch.all(dynamic_context.request_kv_memory == 0)
+        assert torch.all(dynamic_context.request_to_kv_chunk_ids == -1)
 
     def test_allocate_and_release_memory_chunks(self):
         self._setup_model_parallel_group(1, 1)
@@ -289,28 +291,28 @@ class TestDynamicContext:
         assert dynamic_context.total_request_count == 1
         assert dynamic_context.active_token_count == context_length
         assert dynamic_context.request_ids[0] == 0
-        assert torch.all(dynamic_context.request_ids[1:] == 0)
+        assert torch.all(dynamic_context.request_ids[1:] == -1)
         assert dynamic_context.request_query_lengths[0] == context_length
         assert dynamic_context.request_kv_length_offsets[0] == 0
-        assert dynamic_context.request_kv_memory[0].cpu().detach().numpy().tolist() == [
+        assert dynamic_context.request_to_kv_chunk_ids[0].cpu().detach().numpy().tolist() == [
             488,
             489,
-            0,
-            0,
+            -1,
+            -1,
         ]
         assert dynamic_context.request_kv_chunk_counts[0] == 2
         assert dynamic_context.request_last_kv_chunk_id[0] == 489
         assert dynamic_context.request_last_kv_chunk_offset[0].item() == 15
         assert torch.all(
-            dynamic_context.token_pos_ids[0:context_length]
+            dynamic_context.token_to_pos_ids[0:context_length]
             == torch.arange(0, context_length, dtype=torch.long, device='cuda')
         )
         assert torch.all(
-            dynamic_context.token_input_ids[0:context_length]
+            dynamic_context.token_to_input_ids[0:context_length]
             == torch.arange(0, context_length, dtype=torch.long, device='cuda')
         )
         assert torch.all(
-            dynamic_context.token_to_kv_seq_idx[0:context_length]
+            dynamic_context.token_to_position_in_request[0:context_length]
             == torch.arange(0, context_length, dtype=torch.long, device='cuda')
         )
         assert torch.all(
@@ -326,7 +328,7 @@ class TestDynamicContext:
             == 489
         )
         assert torch.all(
-            dynamic_context.token_to_local_kv_seq_idx[0:context_length]
+            dynamic_context.token_to_local_position_within_kv_chunk[0:context_length]
             == torch.arange(0, context_length, dtype=torch.long, device='cuda')
             % dynamic_context.chunk_size_tokens
         )
@@ -348,14 +350,14 @@ class TestDynamicContext:
         )
 
         # This case should just reset and return since all requests are finished
-        active_request_mask = torch.Tensor([0, 0, 0])
+        active_requests_mask = torch.Tensor([0, 0, 0])
         dynamic_context.paused_request_count = 0
         dynamic_context.total_request_count = 3
         dynamic_context.request_kv_chunk_counts[0:3] = 1
         new_chunk_ids = dynamic_context.allocate_memory_chunks(3, safe=True)
-        dynamic_context.request_kv_memory[0:3, 0] = new_chunk_ids
+        dynamic_context.request_to_kv_chunk_ids[0:3, 0] = new_chunk_ids
         dynamic_context.update_requests(
-            active_requests=active_request_mask, next_tokens=torch.tensor([0, 1, 2])
+            active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
         assert dynamic_context.total_request_count == 0
 
@@ -384,7 +386,7 @@ class TestDynamicContext:
             buffer_overflow_factor=None,
         )
 
-        active_request_mask = torch.Tensor([1, 0, 1, 1, 1, 0, 0, 1]).cuda().int()
+        active_requests_mask = torch.Tensor([1, 0, 1, 1, 1, 0, 0, 1]).cuda().int()
         next_tokens = torch.arange(2, 10, device='cuda').int()
         dynamic_context.paused_request_count = 2
         dynamic_context.paused_tokens = torch.Tensor([0, 1]).cuda().int()
@@ -394,17 +396,17 @@ class TestDynamicContext:
         # So here it will raise an assertion error
         with pytest.raises(AssertionError) as error:
             dynamic_context.update_requests(
-                active_requests=active_request_mask, next_tokens=next_tokens
+                active_requests_mask=active_requests_mask, new_tokens=next_tokens
             )
 
         total_request_count = 10
         dynamic_context.chunk_count_avail -= 11  # We align 11 chunks to the 10 requests we have. 3rd request alone we setup like it requires 2 chunks
         dynamic_context.total_request_count = total_request_count
 
-        dynamic_context.request_kv_memory[0:total_request_count, 0] = torch.arange(
+        dynamic_context.request_to_kv_chunk_ids[0:total_request_count, 0] = torch.arange(
             dynamic_context.chunk_count_avail, dynamic_context.chunk_count_avail + 10
         )
-        dynamic_context.request_kv_memory[3][
+        dynamic_context.request_to_kv_chunk_ids[3][
             1
         ] = dynamic_context.chunk_count_avail  # Assign one extra chunk  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
@@ -430,9 +432,15 @@ class TestDynamicContext:
         dynamic_context.request_last_kv_chunk_offset[5:7] = dynamic_context.chunk_size_tokens - 1
 
         dynamic_context.update_requests(
-            active_requests=active_request_mask, next_tokens=next_tokens
+            active_requests_mask=active_requests_mask, new_tokens=next_tokens
         )
 
+        # Then set up the test data
+        dynamic_context.request_ids[0:10] = torch.tensor(
+            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device=torch.cuda.current_device()
+        )
+
+        # Now verify the values
         assert dynamic_context.request_ids[0:10].cpu().numpy().tolist() == [
             0,
             1,
@@ -463,29 +471,142 @@ class TestDynamicContext:
             10,
             10,
         ]
-        assert dynamic_context.token_input_ids[
+        assert dynamic_context.token_to_input_ids[
             : dynamic_context.active_token_count
         ].cpu().numpy().tolist() == [0, 1, 5, 6, 4, 2, 9]
 
-        assert dynamic_context.token_pos_ids[
+        assert dynamic_context.token_to_pos_ids[
             : dynamic_context.active_token_count
         ].cpu().numpy().tolist() == [128, 128, 128, 128, 11, 11, 11]
 
         # The first 4 requests will require an extra chunk.
         assert torch.all(
-            dynamic_context.request_kv_memory[0:10].cpu()
+            dynamic_context.request_to_kv_chunk_ids[0:10].cpu()
             == torch.tensor(
                 [
-                    [479, 482, 0, 0],
-                    [480, 479, 0, 0],
-                    [484, 486, 0, 0],
-                    [485, 487, 0, 0],
-                    [483, 0, 0, 0],
-                    [481, 0, 0, 0],
-                    [488, 0, 0, 0],
-                    [486, 0, 0, 0],
-                    [487, 0, 0, 0],
-                    [488, 0, 0, 0],
+                    [479, 482, -1, -1],
+                    [480, 479, -1, -1],
+                    [484, 486, -1, -1],
+                    [485, 487, -1, -1],
+                    [483, -1, -1, -1],
+                    [481, -1, -1, -1],
+                    [488, -1, -1, -1],
+                    [486, -1, -1, -1],
+                    [487, -1, -1, -1],
+                    [488, -1, -1, -1],
                 ]
             )
         )
+
+    def test_release_memory_chunks_for_finished_requests(self):
+        """Test that memory chunks are correctly released for finished requests."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
+            max_requests_override=None,
+            max_tokens_override=None,
+            buffer_overflow_factor=None,
+        )
+
+        # Set up the initial state with 5 requests
+        # Allocate 5 chunks for 5 requests
+        initial_chunks = dynamic_context.allocate_memory_chunks(5, safe=True)
+        dynamic_context.total_request_count = 5
+        dynamic_context.paused_request_count = 0
+
+        # Record the available chunks before releasing memory
+        initial_available_chunks = dynamic_context.chunk_count_avail
+
+        # Assign chunks to the requests (one chunk per request)
+        for i in range(5):
+            dynamic_context.request_to_kv_chunk_ids[i, 0] = initial_chunks[i]
+            dynamic_context.request_query_lengths[i] = 1
+            dynamic_context.request_ids[i] = i
+
+        # Create an active_requests_mask where requests 0, 2, and 4 are finished (0),
+        # and requests 1 and 3 are still active (1)
+        active_requests_mask = torch.tensor([0, 1, 0, 1, 0], device=torch.cuda.current_device())
+
+        # Call update_requests with these parameters
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=torch.tensor([10, 11, 12, 13, 14], device=torch.cuda.current_device()),
+        )
+
+        # After the update, we should have released 3 chunks (for requests 0, 2, and 4)
+        # and have 2 active requests (1 and 3)
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.active_token_count == 2
+
+        # Verify that 3 chunks were released by checking the available chunks
+        assert dynamic_context.chunk_count_avail == initial_available_chunks + 3
+
+    def test_finished_requests_with_multiple_chunks(self):
+        """Test that all memory chunks are correctly released for finished requests that use multiple chunks."""
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
+            max_requests_override=None,
+            max_tokens_override=None,
+            buffer_overflow_factor=None,
+        )
+
+        # Set up the initial state with 3 requests, where some use multiple chunks
+        # Allocate 6 chunks in total for the requests
+        initial_chunks = dynamic_context.allocate_memory_chunks(6, safe=True)
+        dynamic_context.total_request_count = 3
+        dynamic_context.paused_request_count = 0
+
+        # Record the available chunks before releasing memory
+        initial_available_chunks = dynamic_context.chunk_count_avail
+
+        # Assign chunks to the requests:
+        # - Request 0: 1 chunk
+        # - Request 1: 2 chunks
+        # - Request 2: 3 chunks
+        dynamic_context.request_to_kv_chunk_ids[0, 0] = initial_chunks[0]
+
+        dynamic_context.request_to_kv_chunk_ids[1, 0] = initial_chunks[1]
+        dynamic_context.request_to_kv_chunk_ids[1, 1] = initial_chunks[2]
+
+        dynamic_context.request_to_kv_chunk_ids[2, 0] = initial_chunks[3]
+        dynamic_context.request_to_kv_chunk_ids[2, 1] = initial_chunks[4]
+        dynamic_context.request_to_kv_chunk_ids[2, 2] = initial_chunks[5]
+
+        dynamic_context.request_kv_chunk_counts[0] = 1
+        dynamic_context.request_kv_chunk_counts[1] = 2
+        dynamic_context.request_kv_chunk_counts[2] = 3
+
+        for i in range(3):
+            dynamic_context.request_query_lengths[i] = 1
+            dynamic_context.request_ids[i] = i
+
+        # Create an active_requests_mask where all requests are finished
+        active_requests_mask = torch.tensor([0, 0, 0], device=torch.cuda.current_device())
+
+        # Call update_requests with these parameters
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=torch.tensor([10, 11, 12], device=torch.cuda.current_device()),
+        )
+
+        # After the update, we should have released all 6 chunks and have 0 active requests
+        assert dynamic_context.total_request_count == 0
+        assert dynamic_context.active_token_count == 0
+
+        # Verify that all 6 chunks were released by checking the available chunks
+        assert dynamic_context.chunk_count_avail == initial_available_chunks + 6
