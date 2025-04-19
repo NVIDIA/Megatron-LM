@@ -498,6 +498,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
+    use_fused_swiglu: bool = False
+    """If True, the SwiGLU activation function will be fused with the linear layer in the MLP."""
+
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width 
     in rope calculation. """

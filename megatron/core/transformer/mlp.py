@@ -19,13 +19,16 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+import transformer_engine.pytorch as te
 
 # pylint: disable=missing-class-docstring
 @dataclass
 class MLPSubmodules:
     linear_fc1: Union[ModuleSpec, type] = None
     linear_fc2: Union[ModuleSpec, type] = None
+    swiglu_linear_fc2: Union[ModuleSpec, type] = None
+    norm_linear_fc1: Union[ModuleSpec, type] = None
 
 
 class MLP(MegatronModule):
@@ -58,6 +61,9 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
+        self.fuse_swiglu_fc2 = True
+
+        # If this is a gated linear unit we double the output width, see https://arxiv.org/pdf/2002.05202.pdf
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
         if is_expert and self.config.moe_ffn_hidden_size != None:
@@ -69,71 +75,106 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
-            self.input_size,
-            ffn_hidden_size,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=self.config.add_bias_linear,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc1',
-        )
+        self.use_fused_swiglu = (self.config.activation_func == F.silu and
+                                self.config.gated_linear_unit and
+                                self.config.tensor_model_parallel_size == 1 and
+                                self.config.use_fused_swiglu)
 
-        self.activation_func = self.config.activation_func
+        if self.use_fused_swiglu:
+            self.norm_linear_fc1 = build_module(
+                submodules.norm_linear_fc1,
+                self.input_size,
+                ffn_hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                is_expert=is_expert,
+                tp_comm_buffer_name='fc1',
+            )
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
-        )
+            self.swiglu_linear_fc2 = build_module(
+                submodules.swiglu_linear_fc2,
+                self.config.ffn_hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=is_expert,
+                tp_comm_buffer_name='fc2',
+            )
+        else:
+            self.linear_fc1 = build_module(
+                submodules.linear_fc1,
+                self.input_size,
+                ffn_hidden_size,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                is_expert=is_expert,
+                tp_comm_buffer_name='fc1',
+            )
+
+            self.activation_func = self.config.activation_func
+
+            self.linear_fc2 = build_module(
+                submodules.linear_fc2,
+                self.config.ffn_hidden_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=is_expert,
+                tp_comm_buffer_name='fc2',
+            )
+
 
     def forward(self, hidden_states):
         """Perform the forward pass through the MLP block."""
-        # [s, b, 4 * h/p]
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
-
-        if self.config.bias_activation_fusion:
-            if self.activation_func == F.gelu:
-                if self.config.gated_linear_unit:
-                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
-                else:
-                    assert self.config.add_bias_linear is True
-                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                intermediate_parallel = bias_swiglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    self.config.activation_func_fp8_input_store,
-                )
-            else:
-                raise ValueError("Only support fusion of gelu and swiglu")
+        if self.use_fused_swiglu:
+            output = self.swiglu_linear_fc2(self.norm_linear_fc1(hidden_states))
+            return output, None
         else:
-            if bias_parallel is not None:
-                intermediate_parallel = intermediate_parallel + bias_parallel
-            if self.config.gated_linear_unit:
-
-                def glu(x):
-                    x = torch.chunk(x, 2, dim=-1)
-                    return self.config.activation_func(x[0]) * x[1]
-
-                intermediate_parallel = glu(intermediate_parallel)
+         # [s, b, 4 * h/p]
+            intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+            if self.config.bias_activation_fusion:
+                if self.activation_func == F.gelu:
+                    if self.config.gated_linear_unit:
+                        intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+                    else:
+                        assert self.config.add_bias_linear is True
+                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                    )
+                else:
+                    raise ValueError("Only support fusion of gelu and swiglu")
             else:
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+                if bias_parallel is not None:
+                    intermediate_parallel = intermediate_parallel + bias_parallel
+                if self.config.gated_linear_unit:
 
-        # [s, b, h]
-        output, output_bias = self.linear_fc2(intermediate_parallel)
+                    def glu(x):
+                        x = torch.chunk(x, 2, dim=-1)
+                        return self.config.activation_func(x[0]) * x[1]
 
-        return output, output_bias
+                    intermediate_parallel = glu(intermediate_parallel)
+                else:
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
+
+            # [s, b, h]
+            output, output_bias = self.linear_fc2(intermediate_parallel)
+            return output, output_bias
 
     # pylint: disable=missing-function-docstring
     def sharded_state_dict(
