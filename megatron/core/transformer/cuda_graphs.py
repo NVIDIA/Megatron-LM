@@ -59,10 +59,9 @@ def _set_capture_end():
 def _check_supported_type(arg):
     """Check if arg is a supported type for cudagraph input/outputs."""
 
-    from megatron.core.inference.contexts import (  # guard against circular import
-        DynamicInferenceContext,
-        StaticInferenceContext,
-    )
+    # Import inference contexts here to guard against circular import.
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.contexts.static_context import StaticInferenceContext
 
     _SUPPORTED_TYPES = {
         torch.Tensor,

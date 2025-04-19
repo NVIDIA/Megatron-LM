@@ -6,7 +6,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from typing import List
 
-from megatron.core.inference.contexts import (
+from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
