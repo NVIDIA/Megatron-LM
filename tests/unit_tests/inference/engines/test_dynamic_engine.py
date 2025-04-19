@@ -9,7 +9,7 @@ import torch
 from tqdm import tqdm
 
 from megatron.core import parallel_state
-from megatron.core.inference.contexts import (
+from megatron.core.inference.contexts.dynamic_context import (
     ChunkOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,

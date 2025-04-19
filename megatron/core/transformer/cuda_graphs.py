@@ -59,10 +59,9 @@ def _set_capture_end():
 def _check_supported_type(arg):
     """Check if arg is a supported type for cudagraph input/outputs."""
 
-    from megatron.core.inference.contexts import (  # guard against circular import
-        DynamicInferenceContext,
-        StaticInferenceContext,
-    )
+    # Import inference contexts here to guard against circular import.
+    from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+    from megatron.core.inference.contexts.static_context import StaticInferenceContext
 
     _SUPPORTED_TYPES = {
         torch.Tensor,
@@ -760,6 +759,7 @@ class CudaGraphManager(torch.nn.Module):
         rng_tracker = get_cuda_rng_tracker()
 
         # need to delay the import here to avoid a circular import
+        global HAVE_TE_GRAPHS
         try:
             from megatron.core.extensions.transformer_engine import TECudaRNGStatesTracker
         except ImportError:
