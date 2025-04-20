@@ -1319,9 +1319,10 @@ def model_parallel_is_initialized():
     return True
 
 
-def get_model_parallel_group(wrapped=False):
+def get_model_parallel_group(check_initialized=True, wrapped=False):
     """Get the model-parallel group the caller rank belongs to."""
-    assert _MODEL_PARALLEL_GROUP is not None, 'model parallel group is not initialized'
+    if check_initialized:
+        assert _MODEL_PARALLEL_GROUP is not None, 'model parallel group is not initialized'
     return WrappedProcessGroup(
         process_group=_MODEL_PARALLEL_GROUP,
         rank_groups=get_model_parallel_groups() if xm else None
@@ -1350,11 +1351,12 @@ def get_tensor_model_parallel_groups(check_initialized=True) -> List[List[int]]:
         ), 'tensor model parallel group is not initialized'
     return _TENSOR_MODEL_PARALLEL_GROUPS
 
-def get_pipeline_model_parallel_group(wrapped=False):
+def get_pipeline_model_parallel_group(check_initialized=True, wrapped=False):
     """Get the pipeline model parallel group the caller rank belongs to."""
-    assert (
-        _PIPELINE_MODEL_PARALLEL_GROUP is not None
-    ), 'pipeline_model parallel group is not initialized'
+    if check_initialized:
+        assert (
+            _PIPELINE_MODEL_PARALLEL_GROUP is not None
+        ), 'pipeline_model parallel group is not initialized'
     return WrappedProcessGroup(
         process_group=_PIPELINE_MODEL_PARALLEL_GROUP,
         rank_groups=get_pipeline_model_parallel_groups() if xm else None
@@ -1483,16 +1485,19 @@ def get_context_parallel_global_ranks(check_initialized=True) -> List[int]:
     return _CONTEXT_PARALLEL_GLOBAL_RANKS
 
 
-def get_hierarchical_context_parallel_groups(check_initialized=True):
+def get_hierarchical_context_parallel_groups(check_initialized=True, wrapped=False):
     """Get the inner ring of context parallel group the caller rank belongs to."""
     if check_initialized:
         assert _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is not None
-    return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    return WrappedProcessGroup(
+        process_group=_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    ) if wrapped else _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_embedding_group(wrapped=False):
+def get_embedding_group(check_initialized=True, wrapped=False):
     """Get the embedding group the caller rank belongs to."""
-    assert _EMBEDDING_GROUP is not None, 'embedding group is not initialized'
+    if check_initialized:
+        assert _EMBEDDING_GROUP is not None, 'embedding group is not initialized'
     return WrappedProcessGroup(
         process_group=_EMBEDDING_GROUP,
         rank_groups=get_embedding_groups() if xm else None
@@ -1502,9 +1507,10 @@ def get_embedding_groups() -> List[List[int]]:
     assert _EMBEDDING_GROUPS, 'embedding groups is not initialized'
     return _EMBEDDING_GROUPS
 
-def get_position_embedding_group(wrapped=False):
+def get_position_embedding_group(check_initialized=True, wrapped=False):
     """Get the position embedding group the caller rank belongs to."""
-    assert _POSITION_EMBEDDING_GROUP is not None, 'position embedding group is not initialized'
+    if check_initialized:
+        assert _POSITION_EMBEDDING_GROUP is not None, 'position embedding group is not initialized'
     return WrappedProcessGroup(
         process_group=_POSITION_EMBEDDING_GROUP,
         rank_groups=get_position_embedding_groups() if xm else None
@@ -1606,11 +1612,12 @@ def get_tensor_and_data_parallel_groups(with_context_parallel=False) -> List[Lis
         ), 'tensor and data parallel groups is not initialized'
         return _TENSOR_AND_DATA_PARALLEL_GROUPS
 
-def get_tensor_and_context_parallel_group(wrapped=False):
+def get_tensor_and_context_parallel_group(check_initialized=True, wrapped=False):
     """Get the tensor and context parallel group the caller rank belongs to."""
-    assert (
-        _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
-    ), 'tensor and context parallel group is not initialized'
+    if check_initialized:
+        assert (
+            _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
+        ), 'tensor and context parallel group is not initialized'
     return WrappedProcessGroup(
         process_group=_TENSOR_AND_CONTEXT_PARALLEL_GROUP,
         rank_groups=get_tensor_and_context_parallel_groups() if xm else None
@@ -2180,11 +2187,12 @@ def get_expert_tensor_and_model_parallel_rank() -> int:
         return 0
 
 
-def get_expert_tensor_model_pipeline_parallel_group(wrapped=False):
+def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True, wrapped=False):
     """Get expert tensor-model-pipeline parallel group."""
-    assert (
-        _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
-    ), 'Expert tensor-model-pipeline parallel group is not initialized'
+    if check_initialized:
+        assert (
+            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
+        ), 'Expert tensor-model-pipeline parallel group is not initialized'
     return WrappedProcessGroup(
         process_group=_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP,
         rank_groups=get_expert_tensor_model_pipeline_parallel_groups() if xm else None
@@ -2313,6 +2321,9 @@ def destroy_model_parallel():
 
     global _POSITION_EMBEDDING_GROUP
     _POSITION_EMBEDDING_GROUP = None
+
+    global _POSITION_EMBEDDING_GLOBAL_RANKS
+    _POSITION_EMBEDDING_GLOBAL_RANKS = None
 
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     _TENSOR_AND_DATA_PARALLEL_GROUP = None

@@ -5,19 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import Tensor
-
 from megatron.core.device_utils import get_current_device
-
-try:
-    from nvidia_chunked_flash_attn.flash_attn_interface import _get_block_size
-except ModuleNotFoundError:
-
-    def _get_block_size(*args, **kwargs):
-        raise Exception(
-            "Install package `nvidia_chunked_flash_attn` to use " "inference dynamic batching."
-        )
-
-
 from megatron.core import parallel_state
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
@@ -86,6 +74,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             that will occur.
         buffer_size_gb (float): Total buffer size (GB), shared by main and
             fallback contexts.
+        chunk_size_tokens (int): Size of KV cache chunk size.
         buffer_guaranteed_fraction (float): Fraction of the memory buffer that is
             reserved to guarantee that one or more active requests are able to
             run to completion. Without reserving this memory, paused requests are
@@ -110,6 +99,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_sequence_length: int,
         buffer_size_gb: float,
         buffer_guaranteed_fraction: float,
+        chunk_size_tokens: int = 256,
         buffer_overflow_factor: Optional[float] = None,
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
@@ -124,7 +114,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
-        self.chunk_size_tokens = _get_block_size(get_current_device(), kv_channels, False, True)[1]
+        self.chunk_size_tokens = chunk_size_tokens
         self.chunk_size_bytes = (
             dtype_size_bytes
             * 2  # key, value
@@ -213,9 +203,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Memory buffer.
         self.memory_buffer = torch.full(
             (
-                self.chunk_count_total,
                 2,  # key and value
                 self.num_layers,
+                self.chunk_count_total,
                 self.chunk_size_tokens,
                 num_attention_heads_per_partition,
                 hidden_size_per_attention_head,
@@ -224,40 +214,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             dtype=self.params_dtype,
             device=get_current_device(),
         )
-
-        # Precompute base pointers for all chunks and layers.
-        chunk_idxs = torch.arange(self.chunk_count_total, device=get_current_device())
-        layer_idxs = torch.arange(self.num_layers, device=get_current_device())
-        row_idx = chunk_idxs.repeat_interleave(self.num_layers)
-        col_idx = layer_idxs.repeat(self.chunk_count_total)
-
-        memory_buffer_data_ptr = self.memory_buffer.data_ptr()
-        dtype_size_bytes = params_dtype.itemsize
-
-        self.key_memory_buffer_pointers = torch.empty(
-            self.chunk_count_total,
-            self.num_layers,
-            dtype=torch.long,
-            device=get_current_device(),
-        )
-        self.value_memory_buffer_pointers = torch.empty(
-            self.chunk_count_total,
-            self.num_layers,
-            dtype=torch.long,
-            device=get_current_device(),
-        )
-
-        self.key_memory_buffer_pointers[row_idx, col_idx] = dtype_size_bytes * (
-            row_idx * self.memory_buffer[0].numel() + col_idx * self.memory_buffer[0][0][0].numel()
-        )
-        self.value_memory_buffer_pointers[row_idx, col_idx] = dtype_size_bytes * (
-            row_idx * self.memory_buffer[0].numel()
-            + col_idx * self.memory_buffer[0][0][0].numel()
-            + self.memory_buffer[0][0].numel()
-        )
-
-        self.key_memory_buffer_pointers += memory_buffer_data_ptr
-        self.value_memory_buffer_pointers += memory_buffer_data_ptr
 
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
@@ -277,19 +233,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         # TODO: @lmcafee, only use `_decode_only` tensors when both of the
         # following conditions are met: 1) decode-only step, and 2) cuda graphs
         # are enabled.
-        self.curr_chunk_key_ptrs_decode_only = torch.full(
-            (self.num_layers, self.max_requests * self.max_kv_chunk_count),
-            0,
-            dtype=torch.long,
-            device=get_current_device(),
-        )
-
-        self.curr_chunk_value_ptrs_decode_only = torch.full(
-            (self.num_layers, self.max_requests * self.max_kv_chunk_count),
-            0,
-            dtype=torch.long,
-            device=get_current_device(),
-        )
 
         self.query_seq_lengths_decode_only = torch.full(
             (self.max_requests,), 0, dtype=torch.int32, device=get_current_device()
@@ -302,6 +245,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.cu_kv_seq_lengths_decode_only = torch.full(
             (self.max_requests + 1,), 0, dtype=torch.int32, device=get_current_device()
+        )
+
+        self.kv_memory_decode_only = torch.full(
+            (self.max_requests, self.max_kv_chunk_count),
+            0,
+            dtype=torch.int,
+            device=get_current_device(),
         )
 
         # Guaranteed active requests.
@@ -353,7 +303,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def cu_kv_lengths(self) -> Tensor:
         """Cumulative key/value sequence lengths."""
-        return self.cu_kv_seq_lengths, self.max_seqlen_k
+        return self.cu_kv_seq_lengths, self.kv_seq_lengths_decode_only, self.max_seqlen_k
 
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
@@ -380,10 +330,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         key = key.squeeze(1)
         value = value.squeeze(1)
 
-        self.memory_buffer[chunk_idx, 0, layer_number - 1, local_kv_seq_idx] = key[
+        self.memory_buffer[0, layer_number - 1, chunk_idx, local_kv_seq_idx] = key[
             : self.padded_active_token_count
         ]
-        self.memory_buffer[chunk_idx, 1, layer_number - 1, local_kv_seq_idx] = value[
+        self.memory_buffer[1, layer_number - 1, chunk_idx, local_kv_seq_idx] = value[
             : self.padded_active_token_count
         ]
 
@@ -397,19 +347,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
             to chunks within the chunked memory buffer.
         """
-        key_memory_ptrs = self.curr_chunk_key_ptrs[layer_number - 1]
-        value_memory_ptrs = self.curr_chunk_value_ptrs[layer_number - 1]
-        key_memory_ptrs = key_memory_ptrs.view(
-            self.padded_active_sample_count, self.max_kv_chunk_count
+        return (
+            self.memory_buffer[0, layer_number - 1],
+            self.memory_buffer[1, layer_number - 1],
+            self.block_table,
         )
-        value_memory_ptrs = value_memory_ptrs.view(
-            self.padded_active_sample_count, self.max_kv_chunk_count
-        )
-
-        return key_memory_ptrs, value_memory_ptrs
 
     def apply_rotary_emb_query(
-        self, query: Tensor, query_emb: Tensor, config: TransformerConfig, cu_seqlens_q: Tensor
+        self,
+        query: Tensor,
+        query_emb: Tensor,
+        config: TransformerConfig,
+        cu_seqlens_q: Tensor,
+        cp_group: torch.distributed.ProcessGroup,
     ) -> Tensor:
         """Apply rotary embedding to query tensor.
 
@@ -418,6 +368,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             query_emb (Tensor): Query rotary embeddings.
             config (TransformerConfig): Transformer config.
             cu_seqlens_q (Tensor): Cumulative sequence lengths.
+            cp_group (torch.distributed.ProcessGroup): Process group for context parallel.
 
         Return:
             (Tensor) Query tensor after applying rotary embeddings.
@@ -427,11 +378,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         n = self.padded_active_token_count
         query_seq_idx = self.token_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
-        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q)
+        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q, cp_group)
         return query
 
     def apply_rotary_emb_key(
-        self, key: Tensor, key_emb: Tensor, config: TransformerConfig
+        self,
+        key: Tensor,
+        key_emb: Tensor,
+        config: TransformerConfig,
+        cp_group: torch.distributed.ProcessGroup,
     ) -> Tensor:
         """Apply rotary embedding to key tensor.
 
@@ -439,6 +394,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             key (Tensor): Key tensor.
             key_emb (Tensor): Key rotary embeddings.
             config (TransformerConfig): Transformer config.
+            cp_group (torch.distributed.ProcessGroup): Process group for context parallel.
 
         Return:
             (Tensor) Key tensor after applying rotary embeddings.
@@ -450,9 +406,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
             assert key.shape[0] == n == self.max_requests
-            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config)
+            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
         else:
-            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config)
+            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
         return key
 
     def is_memory_available(self, num_chunks: int, safe: bool = False) -> bool:
@@ -527,9 +483,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.cu_kv_seq_lengths = None
         self.cu_kv_seq_lengths_decode_only.fill_(0)
         self.kv_seq_lengths_decode_only.fill_(0)
-        self.curr_chunk_ids = None
-        self.curr_chunk_key_ptrs = None
-        self.curr_chunk_value_ptrs = None
+        self.kv_memory_decode_only.fill_(0)
+        self.block_table = None
 
     def initialize_attention_state(self) -> None:
         """Initialize attention state so that every layer can use it"""
@@ -553,7 +508,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ]
         if self.is_decode_only():
             self.query_seq_lengths_decode_only[
-                self.paused_request_count : self.total_request_count
+                0 : self.total_request_count - self.paused_request_count
             ] = query_lengths
             cu_query_lengths_decode_only = torch.cumsum(self.query_seq_lengths_decode_only, dim=0)
             self.cu_query_seq_lengths_decode_only[1:] = cu_query_lengths_decode_only
@@ -574,7 +529,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_lengths = kv_lengths[self.paused_request_count : self.total_request_count]
         if self.is_decode_only():
             self.kv_seq_lengths_decode_only[
-                self.paused_request_count : self.total_request_count
+                0 : self.total_request_count - self.paused_request_count
             ] = kv_lengths
             cu_kv_lengths_decode_only = torch.cumsum(self.kv_seq_lengths_decode_only, dim=0)
             self.cu_kv_seq_lengths_decode_only[1:] = cu_kv_lengths_decode_only
@@ -590,26 +545,16 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cu_kv_seq_lengths[1:] = torch.cumsum(kv_lengths, dim=0)
             self.max_seqlen_k = kv_lengths.max().item()
 
+        kv_memory = self.request_kv_memory[self.paused_request_count : self.total_request_count]
         if self.is_decode_only():
-            self.curr_chunk_ids = self.request_kv_memory.flatten()
-            self.curr_chunk_key_ptrs_decode_only.copy_(
-                self.key_memory_buffer_pointers[self.curr_chunk_ids].t().contiguous()
+            self.kv_memory_decode_only[0 : self.total_request_count - self.paused_request_count] = (
+                kv_memory
             )
-            self.curr_chunk_value_ptrs_decode_only.copy_(
-                self.value_memory_buffer_pointers[self.curr_chunk_ids].t().contiguous()
-            )
-            self.curr_chunk_key_ptrs = self.curr_chunk_key_ptrs_decode_only
-            self.curr_chunk_value_ptrs = self.curr_chunk_value_ptrs_decode_only
+            self.block_table = self.kv_memory_decode_only
         else:
-            self.curr_chunk_ids = self.request_kv_memory[
+            self.block_table = self.request_kv_memory[
                 self.paused_request_count : self.total_request_count
-            ].view(-1)
-            self.curr_chunk_key_ptrs = (
-                self.key_memory_buffer_pointers[self.curr_chunk_ids].t().contiguous()
-            )
-            self.curr_chunk_value_ptrs = (
-                self.value_memory_buffer_pointers[self.curr_chunk_ids].t().contiguous()
-            )
+            ]
 
     def reset(self) -> None:
         """Reset entire context.

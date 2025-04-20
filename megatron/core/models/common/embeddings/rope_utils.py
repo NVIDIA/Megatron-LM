@@ -48,15 +48,20 @@ except ImportError:
 __all__ = ['apply_rotary_emb_flash']
 
 
-def get_pos_emb_on_this_cp_rank(pos_emb: Tensor, seq_dim: int) -> Tensor:
+def get_pos_emb_on_this_cp_rank(
+    pos_emb: Tensor, seq_dim: int, cp_group: torch.distributed.ProcessGroup
+) -> Tensor:
     """Get the position embedding on the current context parallel rank.
 
     Args:
         pos_emb (Tensor): Positional embedding tensor
         seq_dim (int): Sequence dimension
+        cp_group (torch.distributed.ProcessGroup): The context parallel group
     """
-    cp_size = parallel_state.get_context_parallel_world_size()
-    cp_rank = parallel_state.get_context_parallel_rank()
+    if cp_group is None:
+        raise ValueError("cp_group must be provided to get positional embedding per CP rank")
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
     cp_idx = torch.tensor(
         [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
     ).to(device=get_current_device(), non_blocking=True)
@@ -145,6 +150,7 @@ def _apply_rotary_pos_emb_thd(
     rotary_interleaved: bool = False,
     multi_latent_attention: bool = False,
     mscale: float = 1.0,
+    cp_group: torch.distributed.ProcessGroup = None,
 ) -> Tensor:
     """A baseline implementation of applying RoPE for `thd` format.
 
@@ -153,13 +159,16 @@ def _apply_rotary_pos_emb_thd(
         cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
         with shape [b + 1] and dtype torch.int32.
         freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
+        cp_group (torch.distributed.ProcessGroup): The context parallel group
 
     Returns:
         Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
     """
 
-    cp_size = parallel_state.get_context_parallel_world_size()
-    cp_rank = parallel_state.get_context_parallel_rank()
+    if cp_group is None:
+        raise ValueError("cp_group must be provided for THD format RoPE")
+    cp_size = cp_group.size()
+    cp_rank = cp_group.rank()
     cu_seqlens = cu_seqlens // cp_size
     seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
 
@@ -183,11 +192,16 @@ def apply_rotary_pos_emb(
     config: TransformerConfig,
     cu_seqlens: Optional[Tensor] = None,
     mscale: float = 1.0,
+    cp_group: torch.distributed.ProcessGroup = None,
 ):
     """
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
     """
+
+    # Keep for backward compatibility. Will deprecate in the future.
+    if cp_group is None:
+        cp_group = parallel_state.get_context_parallel_group()
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
@@ -205,16 +219,12 @@ def apply_rotary_pos_emb(
                 return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
-            cp_size = parallel_state.get_context_parallel_world_size()
+            cp_size = cp_group.size()
             if cp_size > 1:
                 if not is_te_min_version("1.11.0", check_equality=False):
                     raise ValueError("Only TE >= 1.12 supports RoPE fusion for THD format with CP.")
                 return fused_apply_rotary_pos_emb_thd(
-                    t,
-                    cu_seqlens,
-                    freqs,
-                    cp_size=cp_size,
-                    cp_rank=parallel_state.get_context_parallel_rank(),
+                    t, cu_seqlens, freqs, cp_size=cp_size, cp_rank=cp_group.rank()
                 )
             else:
                 return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
@@ -235,6 +245,7 @@ def apply_rotary_pos_emb(
                 rotary_interleaved=config.rotary_interleaved,
                 multi_latent_attention=config.multi_latent_attention,
                 mscale=mscale,
+                cp_group=cp_group,
             )
 
 

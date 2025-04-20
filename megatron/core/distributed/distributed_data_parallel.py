@@ -2,6 +2,7 @@
 
 import logging
 from contextlib import contextmanager
+from typing import Optional
 
 import torch
 
@@ -10,6 +11,7 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor
+from ..process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import log_single_rank
@@ -46,6 +48,8 @@ class DistributedDataParallel(_BaseDataParallel):
         disable_bucketing: If true, force assign all parameters to a single bucket. If false,
             use standard bucketing policy: assign parameters to smaller buckets and all-reduce
             per bucket _if_ overlap_grad_reduce is True and pp_rank is 0.
+        grad_comm_pgs: Optional gradient communication process groups.
+        model_comm_pgs: Optional model parallel communication process groups.
 
     """
 
@@ -55,6 +59,8 @@ class DistributedDataParallel(_BaseDataParallel):
         ddp_config: DistributedDataParallelConfig,
         module: torch.nn.Module,
         disable_bucketing: bool = False,
+        grad_comm_pgs: Optional[GradCommProcessGroups] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -80,13 +86,112 @@ class DistributedDataParallel(_BaseDataParallel):
             logging.INFO,
             f'Setting up DistributedDataParallel with config {self.ddp_config}',
         )
+        if grad_comm_pgs is None and model_comm_pgs is None:
+            self.dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False, partial_data_parallel=False
+            ) if not xm else parallel_state.get_data_parallel_group_gloo(
+                with_context_parallel=False, partial_data_parallel=False
+            )
+            self.dp_cp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, partial_data_parallel=False
+            ) if not xm else parallel_state.get_data_parallel_group_gloo(
+                with_context_parallel=True, partial_data_parallel=False
+            ) 
+            self.intra_dp_cp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, partial_data_parallel=True
+            ) if not xm else parallel_state.get_data_parallel_group_gloo(
+                with_context_parallel=True, partial_data_parallel=True
+            )
+            self.expt_dp_group = parallel_state.get_expert_data_parallel_group() \
+                if not xm else parallel_state.get_expert_data_parallel_group_gloo()
+            if self.ddp_config.num_distributed_optimizer_instances > 1:
+                self.inter_dp_cp_group = parallel_state.get_inter_partial_data_parallel_group()
+
+            self.pp_group = parallel_state.get_pipeline_model_parallel_group()
+            self.ep_group = parallel_state.get_expert_model_parallel_group()
+        elif grad_comm_pgs is not None and model_comm_pgs is not None:
+            # 1. dp group - this is always required
+            if not hasattr(grad_comm_pgs, 'dp'):
+                raise ValueError("dp process group is required but not provided in grad_comm_pgs")
+            self.dp_group = grad_comm_pgs.dp
+
+            # 2. dp_cp group:
+            # - If provided in grad_comm_pgs, use it
+            # - Otherwise check context_parallel_size
+            #   - If cp_size is 1, use same as dp
+            #   - If cp_size > 1, raise error as dp_cp is needed
+            if hasattr(grad_comm_pgs, 'dp_cp'):
+                self.dp_cp_group = grad_comm_pgs.dp_cp
+            else:
+                cp_size = getattr(config, 'context_parallel_size', 1)
+                if cp_size == 1:
+                    # If no context parallelism, dp_cp is same as dp
+                    self.dp_cp_group = self.dp_group
+                else:
+                    raise ValueError(
+                        "dp_cp process group is required when context_parallel_size > 1 "
+                        "but not provided in grad_comm_pgs"
+                    )
+            # 3. Handle intra_dp_cp and inter_dp_cp based on optimizer instances:
+            if self.ddp_config.num_distributed_optimizer_instances == 1:
+                # With a single optimizer instance:
+                # - intra_dp_cp is same as dp_cp
+                # - inter_dp_cp is not needed
+                self.intra_dp_cp_group = self.dp_cp_group
+            else:
+                # With multiple optimizer instances, both groups must be provided
+                if not (
+                    hasattr(grad_comm_pgs, 'intra_dp_cp') and hasattr(grad_comm_pgs, 'inter_dp_cp')
+                ):
+                    raise ValueError(
+                        "intra_dp_cp and inter_dp_cp process groups are required "
+                        "when using multiple optimizer instances (>1) "
+                        "but not provided in grad_comm_pgs"
+                    )
+                self.intra_dp_cp_group = grad_comm_pgs.intra_dp_cp
+                self.inter_dp_cp_group = grad_comm_pgs.inter_dp_cp
+
+            # 4. Handle expert data parallel group
+            if hasattr(grad_comm_pgs, 'expt_dp'):
+                self.expt_dp_group = grad_comm_pgs.expt_dp
+            else:
+                # Create a new group with just the current rank
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    "No expert data parallel group provided in grad_comm_pgs, "
+                    "creating a new one with just the current rank",
+                )
+                # Ideally we dont want any expt_dp_group if not using expt_dp
+                # but downstream code expects.
+                # this is used to check size and calculate scaling factor.
+                self.expt_dp_group = torch.distributed.new_group(
+                    ranks=[torch.distributed.get_rank()]
+                )
+
+            # 5. pp and ep group
+            if not all([hasattr(model_comm_pgs, 'pp'), hasattr(model_comm_pgs, 'ep')]):
+                raise ValueError(
+                    "pp and ep process groups are required but not provided in model_comm_pgs"
+                )
+            self.pp_group = model_comm_pgs.pp
+            self.ep_group = model_comm_pgs.ep
+
+        else:
+            raise ValueError(
+                "Grad and model comm process groups must be provided or both must be None"
+            )
 
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
         # disable_bucketing is True (e.g., we might not want to break up model parameters
         # into buckets for model chunks after the first in the interleaved schedule).
         self.bucket_size = self.ddp_config.bucket_size
-        if parallel_state.get_pipeline_model_parallel_rank() > 0:
+        if isinstance(self.pp_group, list):
+            pp_rank = self.pp_group[0].rank()
+        else:
+            pp_rank = self.pp_group.rank()
+        if pp_rank > 0:
             self.bucket_size = None
         if disable_bucketing:
             self.bucket_size = None
@@ -162,9 +267,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)] = indices
 
             if not config.calculate_per_token_loss:
-                target_gradient_scaling_factor = 1.0 / parallel_state.get_data_parallel_world_size(
-                    with_context_parallel=True
-                )
+                target_gradient_scaling_factor = 1.0 / self.dp_cp_group.size()
                 if self.ddp_config.average_in_collective:
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
@@ -178,12 +281,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         # For expert parameters, gradient_scaling_factor is edp_size/dp_size.
                         assert (gradient_scaling_factor == 1) or (
                             gradient_scaling_factor
-                            == (
-                                parallel_state.get_expert_data_parallel_world_size()
-                                / parallel_state.get_data_parallel_world_size(
-                                    with_context_parallel=True
-                                )
-                            )
+                            == (self.expt_dp_group.size() / self.dp_cp_group.size())
                         )
                 else:
                     assert gradient_scaling_factor == target_gradient_scaling_factor
@@ -218,16 +316,14 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
                 assert (
-                    parallel_state.get_expert_model_parallel_world_size() == 1
+                    self.ep_group.size() == 1
                 ), "Partial DistOpt cannot support MoE models with expert parallelism."
                 assert (
                     self.ddp_config.use_distributed_optimizer
                 ), 'Partial DistOpt cannot be used without DistOpt'
                 communication_stream = torch.cuda.Stream(device=get_current_device())
                 for bucket_group in bucket_groups:
-                    bucket_group.inter_distributed_optimizer_instance_group = (
-                        parallel_state.get_inter_partial_data_parallel_group()
-                    )
+                    bucket_group.inter_distributed_optimizer_instance_group = self.inter_dp_cp_group
                     bucket_group.communication_stream = communication_stream
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
@@ -276,34 +372,23 @@ class DistributedDataParallel(_BaseDataParallel):
             #   3. Final result is scaled by 1/dp_size as desired
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
-                expert_gradient_scaling_factor = (
-                    parallel_state.get_expert_data_parallel_world_size()
-                    / parallel_state.get_data_parallel_world_size(with_context_parallel=True)
-                )
+                expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
             else:
-                data_parallel_world_size = parallel_state.get_data_parallel_world_size(
-                    with_context_parallel=True
-                )
+                data_parallel_world_size = self.dp_cp_group.size()
 
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
-        data_parallel_group = parallel_state.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True) \
-            if xm is None else parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
-            dense_params,
-            data_parallel_group,
-            gradient_scaling_factor=gradient_scaling_factor,
+            dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor
         )
 
-        expert_data_parallel_group = parallel_state.get_expert_data_parallel_group() \
-            if xm is None else parallel_state.get_expert_data_parallel_group_gloo()
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
                 expert_parallel_params,
-                expert_data_parallel_group,
+                self.expt_dp_group,
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
@@ -525,17 +610,9 @@ class DistributedDataParallel(_BaseDataParallel):
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if is_expert_parallel:
-                data_parallel_group = parallel_state.get_expert_data_parallel_group(
-                    with_context_parallel=True
-                ) if xm is None else parallel_state.get_expert_data_parallel_group_gloo(
-                    with_context_parallel=True
-                ) 
+                data_parallel_group = self.expt_dp_group
             else:
-                data_parallel_group = parallel_state.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=True
-                ) if xm is None else parallel_state.get_data_parallel_group_gloo(
-                    with_context_parallel=True
-                )
+                data_parallel_group = self.intra_dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

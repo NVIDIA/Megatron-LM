@@ -32,6 +32,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -63,6 +64,7 @@ class TestConfig:
     num_gap_steps: int = 2
 
     context_buffer_size_gb: float = 0.1  # enough room for all tokens.
+    context_chunk_size_tokens: int = 256
     context_buffer_guaranteed_fraction: float = 0.01
     context_buffer_overflow_factor: Optional[float] = None
     context_max_requests_override: Optional[int] = None
@@ -143,6 +145,7 @@ class TestDynamicInferenceEngine:
             max_sequence_length=max_sequence_length,
             buffer_size_gb=test_config.context_buffer_size_gb,
             buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
+            chunk_size_tokens=test_config.context_chunk_size_tokens,
             buffer_overflow_factor=test_config.context_buffer_overflow_factor,
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
@@ -312,6 +315,9 @@ class TestDynamicInferenceEngine:
         DynamicInferenceContext.ROUNDER = 64
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_simple(self) -> None:
         """Simple test that runs without errors, and validates output."""
 
@@ -338,6 +344,9 @@ class TestDynamicInferenceEngine:
         for request, expected_output in zip(env.requests, expected_outputs):
             assert request.output == expected_output
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_overflow_factor(self) -> None:
         """Test overflow factor arg."""
         # Run test.
@@ -351,6 +360,9 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.max_requests == 1120
         assert env.engine.context.max_tokens == 1120
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_request_overflow(self) -> None:
         """Test request overflow."""
         try:
@@ -359,6 +371,9 @@ class TestDynamicInferenceEngine:
             return
         raise Exception("failed.")
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_token_overflow(self) -> None:
         """Test token overflow."""
         try:
@@ -367,6 +382,9 @@ class TestDynamicInferenceEngine:
             return
         raise Exception("failed.")
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_chunk_overflow(self) -> None:
         """Test chunk overflow."""
         env = self._build_test_env(TestConfig())
@@ -379,10 +397,16 @@ class TestDynamicInferenceEngine:
             return
         raise Exception("failed.")
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_multi_add(self) -> None:
         """Test adding multiple requests simultaneously."""
         self._run_test(num_gap_steps=0)
 
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     def test_fixed_output_lengths(self) -> None:
         """Test generating a fixed number of output tokens."""
         self._run_test(use_fixed_output_lengths=True)

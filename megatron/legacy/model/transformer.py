@@ -246,7 +246,7 @@ class SwitchMLP(MegatronModule):
 
         # TODO pre allocate memory
         output = torch.empty(dim_size, dtype=local_indices.dtype,
-                             device=torch.cuda.current_device())
+                             device=get_current_device())
         torch.distributed._all_gather_base(
             output, local_indices.contiguous(), group=self.tp_ep_group
         )

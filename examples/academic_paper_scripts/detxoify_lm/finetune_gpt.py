@@ -113,7 +113,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             random_seed=args.seed,
             sequence_length=args.seq_length,
             path_to_cache=args.data_cache_path,
-            return_document_ids=False
+            return_document_ids=False,
+            mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         )
     ).build()
     print_rank_0("> finished creating finetuning GPT datasets ...")
@@ -128,7 +129,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
             random_seed=1234,
             sequence_length=2048,
             path_to_cache=args.data_cache_path,
-            return_document_ids=False
+            return_document_ids=False,
+            mid_level_dataset_surplus=args.mid_level_dataset_surplus,
         )
     ).build()
     print_rank_0("> finished creating pretrained GPT datasets ...")

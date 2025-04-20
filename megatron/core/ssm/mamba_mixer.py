@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Union
 
@@ -113,12 +114,9 @@ class MambaMixer(MegatronModule):
         config: TransformerConfig,
         submodules: MambaMixerSubmodules,
         d_model,
-        d_state=128,
         d_conv=4,
         conv_init=None,
         expand=2,
-        headdim=64,
-        ngroups=8,
         A_init_range=(1, 16),
         D_has_hdim=False,
         rmsnorm=True,
@@ -132,35 +130,73 @@ class MambaMixer(MegatronModule):
         conv_bias=True,
         # Fused kernel and sharding options
         chunk_size=128,
-        use_mem_eff_path=True,
         layer_number=None,
+        use_mem_eff_path=None,
+        d_state=None,
+        headdim=None,
+        ngroups=None,
     ):
         super().__init__(config)
         self.config = config
         self.d_model = d_model
-        self.d_state = d_state
         self.d_conv = d_conv
         self.conv_init = conv_init
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
-        self.headdim = headdim
-        self.ngroups = ngroups
         self.D_has_hdim = D_has_hdim
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
-        self.use_mem_eff_path = use_mem_eff_path
         self.layer_number = layer_number
 
-        if self.config.mamba_state_dim is not None:
-            self.d_state = self.config.mamba_state_dim
-        if self.config.mamba_head_dim is not None:
-            self.headdim = self.config.mamba_head_dim
-        if self.config.mamba_num_groups is not None:
-            self.ngroups = self.config.mamba_num_groups
+        # Check for deprecated arguments and raise warnings
+        if use_mem_eff_path is not None:
+            warnings.warn(
+                "The 'use_mem_eff_path' argument is deprecated and will be removed in the future. "
+                "Please use the value from the TransformerConfig object instead.",
+                DeprecationWarning,
+            )
+        if d_state is not None:
+            warnings.warn(
+                "The 'd_state' argument is deprecated and will be removed in the future. "
+                "Please use the value from the TransformerConfig object instead.",
+                DeprecationWarning,
+            )
+        if headdim is not None:
+            warnings.warn(
+                "The 'headdim' argument is deprecated and will be removed in the future. "
+                "Please use the value from the TransformerConfig object instead.",
+                DeprecationWarning,
+            )
+        if ngroups is not None:
+            warnings.warn(
+                "The 'ngroups' argument is deprecated and will be removed in the future. "
+                "Please use the value from the TransformerConfig object instead.",
+                DeprecationWarning,
+            )
 
-        assert self.d_inner % self.headdim == 0
-        self.nheads = self.d_inner // self.headdim
+        self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        self.d_state = self.config.mamba_state_dim
+        self.headdim = self.config.mamba_head_dim
+        self.ngroups = self.config.mamba_num_groups
+
+        assert self.d_state is not None and self.d_state > 0
+        assert self.headdim is not None and self.headdim > 0
+        assert self.ngroups is not None and self.ngroups > 0
+
+        if self.config.mamba_num_heads is not None:
+            self.nheads = self.config.mamba_num_heads
+            assert self.nheads > 0
+            self.d_inner = self.nheads * self.headdim
+        else:
+            assert self.d_inner % self.headdim == 0
+            self.nheads = self.d_inner // self.headdim
+
+        if self.config.fp8:
+            assert (2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads) % 16 == 0, (
+                "For FP8, the innermost dimension of the Mamba layer "
+                "input projection output tensor must be a multiple of 16."
+            )
 
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         assert self.d_inner % self.tensor_model_parallel_size == 0

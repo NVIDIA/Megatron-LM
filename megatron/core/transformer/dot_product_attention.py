@@ -11,6 +11,7 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.device_utils import get_xla_model, get_current_device
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -44,6 +45,7 @@ class DotProductAttention(MegatronModule):
         attention_dropout: float = None,
         softmax_scale: float = None,
         cp_comm_type: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(config=config)
 
@@ -64,7 +66,16 @@ class DotProductAttention(MegatronModule):
         projection_size = self.config.kv_channels * self.config.num_attention_heads
 
         # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        if model_comm_pgs is None:
+            # For backward compatibility, remove in v0.14 and raise error
+            # raise ValueError("DotProductAttention was called without ModelCommProcessGroups")
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp'])
+        else:
+            assert hasattr(
+                model_comm_pgs, 'tp'
+            ), "DotProductAttention model_comm_pgs must have tp process group"
+
+        world_size = model_comm_pgs.tp.size()
         self.hidden_size_per_partition = divide(projection_size, world_size)
         self.hidden_size_per_attention_head = divide(projection_size, config.num_attention_heads)
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)

@@ -5,14 +5,14 @@ from __future__ import annotations
 import logging
 import math
 from functools import lru_cache
+from typing import Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state
-from megatron.core.device_utils import get_current_device
 from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.device_utils import get_current_device
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,8 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow (float, optional): Slow beta value for Yarn RoPE. Defaults to 1.
         mscale (float, optional): Mscale value for Yarn RoPE. Defaults to 1.
         mscale_all_dim (float, optional): Mscale all dim value for Yarn RoPE. Defaults to 0.
+        cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
+            Defaults to None.
     """
 
     def __init__(
@@ -55,6 +57,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow: float = 1.0,
         mscale: float = 1.0,
         mscale_all_dim: float = 0.0,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.dim = kv_channels
         self.rotary_base = rotary_base
@@ -82,6 +85,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             seq_len_interpolation_factor,
             rotary_base,
             use_cpu_initialization,
+            cp_group,
         )
 
     @lru_cache(maxsize=32)
@@ -136,10 +140,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
         emb = emb[:, None, None, :]
-        if parallel_state.get_context_parallel_world_size() > 1:
+        if self.cp_group is not None and self.cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb, _mscale
 
 

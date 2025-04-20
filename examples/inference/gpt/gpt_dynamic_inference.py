@@ -80,6 +80,7 @@ def get_inference_context(
         max_sequence_length=max_sequence_length,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,

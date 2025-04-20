@@ -10,6 +10,8 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 try:
     import modelopt.torch.quantization as mtq
@@ -23,7 +25,7 @@ except Exception:
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
-        "*weight_quantizer": {"num_bits": (4, 3), "axis": None, "fake_quant": False},
+        "*weight_quantizer": {"num_bits": (4, 3), "axis": None},
         "*input_quantizer": {"enable": False},
         "*output_layer*": {"enable": False},
         "default": {"enable": False},
@@ -34,11 +36,7 @@ FP8_PER_TENSOR_REAL_QUANT_CFG = {
 # FP8 2D blockwise real quantization config for deepseek models
 FP8_2D_BLOCKWISE_REAL_QUANT_CFG = {
     "quant_cfg": {
-        "*weight_quantizer": {
-            "num_bits": (4, 3),
-            "block_sizes": {-1: 128, -2: 128},
-            "fake_quant": False,
-        },
+        "*weight_quantizer": {"num_bits": (4, 3), "block_sizes": {-1: 128, -2: 128}},
         "*input_quantizer": {"enable": False},
         "*output_layer*": {"enable": False},
         "default": {"enable": False},
@@ -115,6 +113,7 @@ class Linear(torch.nn.Linear):
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
+        tp_group: Optional[WrappedProcessGroup] = None,
     ):
         self.config = config
 
@@ -131,6 +130,9 @@ class Linear(torch.nn.Linear):
 
         if grad_output_buffer is not None:
             raise ValueError('torch.nn.Linear does not support grad_output_buffer != None')
+
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert, wrapped=True)
+        assert tp_group.size() == 1, "Not supported for TP size > 1"
 
         super().__init__(
             in_features=input_size, out_features=output_size, bias=bias, dtype=config.params_dtype
@@ -203,6 +205,7 @@ class RealQuantTransformerLayer(TransformerLayer):
             self._collect_original_tensor_info()
 
             mtq.quantize(self, mtq_cfg)
+            mtq.compress(self)
 
             delattr(self, "_modelopt_state")
 

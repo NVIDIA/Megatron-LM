@@ -7,8 +7,12 @@ import torch.distributed
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
-from megatron.core import parallel_state
-from megatron.core.utils import divide, is_torch_min_version
+from megatron.core.utils import (
+    divide,
+    get_tensor_model_parallel_group_if_none,
+    is_torch_min_version,
+)
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -42,7 +46,7 @@ def split_tensor_along_last_dim(
     return tensor_list
 
 
-def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
+def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False, tp_group=None):
     """Break a tensor into equal 1D chunks across tensor parallel ranks.
 
     Returns a Tensor or View with this rank's portion of the data.
@@ -56,8 +60,9 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
                            Default is False
 
     """
-    partition_size = torch.numel(tensor) // parallel_state.get_tensor_model_parallel_world_size()
-    start_index = partition_size * parallel_state.get_tensor_model_parallel_rank()
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
+    partition_size = torch.numel(tensor) // tp_group.size()
+    start_index = partition_size * tp_group.rank()
     end_index = start_index + partition_size
     if new_buffer:
         data = torch.empty(
@@ -72,7 +77,7 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False):
     return data
 
 
-def gather_split_1d_tensor(tensor):
+def gather_split_1d_tensor(tensor, tp_group=None):
     """Opposite of split_tensor_into_1d_equal_chunks. Gather values from tensor
     model parallel ranks.
 
@@ -82,15 +87,17 @@ def gather_split_1d_tensor(tensor):
         tensor: A Tensor or view of this rank's portion of the data.
     """
     
-    numel_gathered = torch.numel(tensor) * parallel_state.get_tensor_model_parallel_world_size()
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
+    numel_gathered = torch.numel(tensor) * tp_group.size()
     xm = get_xla_model()
     if xm:
-        gathered = xm.all_gather(tensor, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False).view(numel_gathered)
+        gathered = xm.all_gather(tensor, groups=tp_group.rank_groups, pin_layout=False).view(numel_gathered)
     else:
-        gathered = torch.empty(
-            numel_gathered, dtype=tensor.dtype, device=get_current_device(), requires_grad=False
-        )
-        dist_all_gather_func(gathered, tensor, group=parallel_state.get_tensor_model_parallel_group())
+        gathered = torch.empty(numel_gathered, dtype=tensor.dtype, device=get_current_device(), 
+                               requires_grad=False)
+        dist_all_gather_func(gathered, tensor, group=tp_group.process_group)
+    
+    
     return gathered
 
 class VocabUtility:

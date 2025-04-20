@@ -135,9 +135,9 @@ class FullyShardedDataParallel(_BaseDataParallel):
             cp_size = getattr(config, 'context_parallel_size', 1)
 
             if hasattr(grad_comm_pgs, 'dp_cp'):
-                self.dp_cp_group = grad_comm_pgs.dp_cp.process_group
+                self.dp_cp_group = grad_comm_pgs.dp_cp
             elif hasattr(grad_comm_pgs, 'dp') and cp_size == 1:
-                self.dp_cp_group = grad_comm_pgs.dp.process_group
+                self.dp_cp_group = grad_comm_pgs.dp
             else:
                 raise ValueError(
                     "Required process group missing: 'dp_cp' (or 'dp' when context_parallel_size=1)"

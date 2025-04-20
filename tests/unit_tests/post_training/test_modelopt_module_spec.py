@@ -11,6 +11,7 @@ from megatron.core import dist_checkpointing
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
+    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -27,6 +28,12 @@ from megatron.core.utils import get_te_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch_size: int = 2):
     inference_context: StaticInferenceContext = StaticInferenceContext(
@@ -73,9 +80,10 @@ class TestModelOptGPTModel:
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         self.default_model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=100,
             max_sequence_length=4,
         )
@@ -150,6 +158,49 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
         )
 
 
+class TestModelOptLlama4MoE(TestModelOptGPTModel):
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_device_manual_seed(123)
+
+        # Early version of TE DotProductAttention does not support
+        # q, k, v to have different shapes.
+        self._test_inference = get_te_version() > Version("1.10")
+
+        transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=512,
+            num_attention_heads=8,
+            add_bias_linear=False,
+            num_moe_experts=2,
+            moe_layer_freq=[0, 1],
+            moe_ffn_hidden_size=128,
+            moe_shared_expert_intermediate_size=128,
+            qk_layernorm=True,
+            use_cpu_initialization=True,
+        )
+        default_spec = get_gpt_decoder_block_spec(
+            transformer_config, use_transformer_engine=True, qk_l2_norm=True
+        )
+        self.default_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=default_spec,
+            vocab_size=100,
+            max_sequence_length=8,
+        )
+        modelopt_spec = get_gpt_modelopt_spec(
+            transformer_config, remap_te_layernorm=True, qk_l2_norm=True
+        )
+        # Ensure that a GPTModel can be built with the modelopt spec.
+        self.modelopt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=modelopt_spec,
+            vocab_size=100,
+            max_sequence_length=8,
+        )
+
+
 class TestModelOptMambaModel(TestModelOptGPTModel):
 
     def setup_method(self, method):
@@ -188,24 +239,31 @@ def test_get_gpt_modelopt_spec_interface():
         "local_core_attention": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "remap_te_layernorm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "real_quant_cfg": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "qk_l2_norm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
     expected_defaults = {
         "local_core_attention": False,
         "remap_te_layernorm": False,
         "real_quant_cfg": "None",
+        "qk_l2_norm": False,
     }
 
-    # Check parameter kinds
-    for param_name, param in sig.parameters.items():
-        assert param_name in expected_params.keys(), f"Unexpected parameter: {param_name}"
-        assert param.kind is expected_params[param_name], f"Wrong kind for parameter: {param_name}"
+    # Check expected parameters are in function signature
+    for param_name, param_kind in expected_params.items():
+        assert param_name in sig.parameters, f"Unexpected parameter: {param_name}"
+        assert (
+            param_kind is sig.parameters[param_name].kind
+        ), f"Wrong kind for parameter: {param_name}"
 
     # Check default values
-    defaults = {
+    sig_defaults = {
         k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
-    assert defaults == expected_defaults, "Default values do not match the expected ones."
+    for k, v in expected_defaults.items():
+        assert (
+            k in sig_defaults and v == sig_defaults[k]
+        ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."
 
 
 def test_get_mamba_stack_modelopt_spec_interface():

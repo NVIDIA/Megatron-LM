@@ -131,7 +131,7 @@ class TransformerConfig(ModelParallelConfig):
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
-    """Whether to apply LayerNorm to the query and key embeddings."""
+    """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -535,9 +535,19 @@ class TransformerConfig(ModelParallelConfig):
     mamba_num_groups: int = 8
     """The number of groups used in Mamba layers."""
 
+    mamba_num_heads: Optional[int] = None
+    """The number of heads used in Mamba layers. 
+    If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
+
+    use_mamba_mem_eff_path: bool = True
+    """If True, use the memory efficient path for Mamba layers."""
+
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""
+
+    heterogeneous_block_specs: bool = False
+    """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -547,7 +557,6 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
 
         if get_xla_model() is not None:
-            import warnings
 
             if self.masked_softmax_fusion:
                 warnings.warn("XLA model fallback: masked_softmax_fusion=False")
@@ -641,8 +650,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError('num_moe_experts must be non-negative.')
 
-        if self.moe_ffn_hidden_size is None:
+        if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
+            warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
+
+        if self.num_moe_experts is None:
+            assert (
+                self.moe_ffn_hidden_size is None
+            ), "moe_ffn_hidden_size must be None when num_experts is not set."
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":

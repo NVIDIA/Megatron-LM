@@ -8,7 +8,7 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -25,9 +25,10 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import deprecate_inference_params, divide
+from megatron.core.utils import deprecate_inference_params, divide, is_fa_min_version
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -37,20 +38,11 @@ try:
 except ImportError:
     rearrange = None
 
-
 try:
-    from nvidia_chunked_flash_attn.flash_attn_interface import (
-        flash_attn_varlen_func as flash_decode_and_prefill_kernel,
-    )
-except ImportError:
-    flash_decode_and_prefill_kernel = None
-
-
-try:
-    from flash_attn import flash_attn_with_kvcache
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 except:
+    flash_attn_varlen_func = None
     flash_attn_with_kvcache = None
-
 
 try:
     import transformer_engine  # pylint: disable=unused-import
@@ -105,6 +97,7 @@ class Attention(MegatronModule, ABC):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(config=config)
 
@@ -118,8 +111,21 @@ class Attention(MegatronModule, ABC):
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
-        # Per attention head and per partition values.
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
+                required_pgs=['tp', 'cp']
+            )
+        else:
+            assert hasattr(
+                model_comm_pgs, 'tp'
+            ), "Attention model_comm_pgs must have tp process group"
+            assert hasattr(
+                model_comm_pgs, 'cp'
+            ), "Attention model_comm_pgs must have cp process group"
+        self.model_comm_pgs = model_comm_pgs
+
+        # Per attention head and per partition values
+        world_size = self.model_comm_pgs.tp.size()
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )
@@ -138,6 +144,7 @@ class Attention(MegatronModule, ABC):
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
+            model_comm_pgs=self.model_comm_pgs,
         )
 
         self.checkpoint_core_attention = (
@@ -223,7 +230,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Saves the generated key and value tensors to the end of the buffers in inference_context.
         Returns the full size keys and values from the provided inference_context, as well as
@@ -241,14 +248,14 @@ class Attention(MegatronModule, ABC):
                 inference CUDA graphs.
 
         Return:
-            Tuple of: query, key, value, rotary_pos_emb, attn_mask_type.
+            Tuple of: query, key, value, rotary_pos_emb, attn_mask_type, block_table.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         attn_mask_type = self.attn_mask_type
         if inference_context is None:
-            return query, key, value, rotary_pos_emb, attn_mask_type
+            return query, key, value, rotary_pos_emb, attn_mask_type, None
 
         # =================================================
         # Pre-allocate memory for key-values for inference.
@@ -328,6 +335,7 @@ class Attention(MegatronModule, ABC):
                 pass
             rotary_pos_emb = (q_pos_emb, k_pos_emb)
 
+        block_table = None
         if inference_context.is_static_batching():
             # Copy key and values.
             inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
@@ -338,16 +346,18 @@ class Attention(MegatronModule, ABC):
             # Apply rotary embeddings before appending KV cache.
             if rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
-                key = inference_context.apply_rotary_emb_key(key, k_pos_emb, self.config)
+                key = inference_context.apply_rotary_emb_key(
+                    key, k_pos_emb, self.config, self.model_comm_pgs.cp
+                )
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
 
             # Append key/value data tensors to cache.
             inference_context.append_key_value_cache(self.layer_number, key, value)
 
             # Read key/value *pointer* tensors from cache.
-            key, value = inference_context.key_value_cache(self.layer_number)
+            key, value, block_table = inference_context.key_value_cache(self.layer_number)
 
-        return query, key, value, rotary_pos_emb, attn_mask_type
+        return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
     def get_query_key_value_tensors(self, hidden_states, key_value_states):
@@ -406,10 +416,12 @@ class Attention(MegatronModule, ABC):
         q: Tensor,
         k: Tensor,
         v: Tensor,
-        seqlen_q: Optional[int] = None,
-        seqlen_k: Optional[int] = None,
-        cu_seqlens_q: Optional[Tensor] = None,
-        cu_seqlens_k: Optional[Tensor] = None,
+        max_seqlen_q,
+        max_seqlen_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqlens_k,
+        block_table,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
 
@@ -417,60 +429,42 @@ class Attention(MegatronModule, ABC):
             q (Tensor): Query tensor.
             k (Tensor): Key tensor.
             v (Tensor): Value tensor.
-            seqlen_q (Optional[int]): Query total sequence length.
-            seqlen_k (Optional[int]): Key total sequence length.
-            cu_seqlens_q (Optional[Tensor]): Cumulative query sequence lengths.
-            cu_seqlens_k (Optional[Tensor]): Cumulative key sequence lengths.
-
+            max_seqlen_q (int): Query total sequence length.
+            max_seqlen_k (int): Key total sequence length.
+            cu_seqlens_q (Tensor): Cumulative query sequence lengths.
+            cu_seqlens_k (Tensor): Cumulative key sequence lengths.
+            seqlens_k (Tensor): key sequence lengths.
+            block_table (Tensor): KV cache chunk ids for all samples.
         Return:
             (Tensor) Attention output.
         """
 
         assert not self.training
 
-        # Default variables.
-        if seqlen_q is None:
-            batch_size, seqlen_q = q.shape[0], q.shape[1]
-        else:
-            batch_size = 1
-        if seqlen_k is None:
-            seqlen_k = k.shape[1]
-
-        if cu_seqlens_q is None:
-            cu_seqlens_q = torch.arange(
-                0, (batch_size + 1) * seqlen_q, step=seqlen_q, dtype=torch.int32, device=q.device
-            )
-
-        # turn off FA causal mask after first inference autoregressive iteration
-        # only on first autoregressive step q,k,v have same seqlen
-        # TODO: pass is_causal per sample to flash attentation
-        if cu_seqlens_k is None:
-            cu_seqlens_k = torch.arange(
-                0, (batch_size + 1) * seqlen_k, step=seqlen_k, dtype=torch.int32, device=q.device
-            )
-
-        # Contiguous tensors.
-        q, k, v = [rearrange(x, 'b s ... -> (b s) ...') for x in [q, k, v]]
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
-
         # Flash attn kernel.
-        output_total = flash_decode_and_prefill_kernel(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqlen_q,
-            seqlen_k,
-            dropout_p=0,
-            softmax_scale=None,
-            causal=True,
-            num_heads_k=self.config.num_query_groups,
-        )
-        output_total = rearrange(output_total, '(b s) ... -> b s ...', b=batch_size)
-
+        if max_seqlen_q > 1:
+            q = q.squeeze(1)
+            output_total = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                causal=True,
+                block_table=block_table,
+            )
+            output_total = output_total.unsqueeze(1)
+        else:  # decode only
+            output_total = flash_attn_with_kvcache(
+                q=q,
+                k_cache=k,
+                v_cache=v,
+                cache_seqlens=seqlens_k,
+                causal=True,
+                block_table=block_table,
+            )
         return output_total
 
     def forward(
@@ -514,9 +508,9 @@ class Attention(MegatronModule, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert (
-                flash_decode_and_prefill_kernel is not None
-            ), "Internal use only: install package `nvidia_chunked_flash_attn`."
+            assert is_fa_min_version(
+                "2.7.3"
+            ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
         if self.config.flash_decode and not self.training and inference_context is not None:
@@ -568,15 +562,17 @@ class Attention(MegatronModule, ABC):
             output, bias = self.linear_proj(context_layer)
             return output, bias
 
-        query, key, value, rotary_pos_emb, attn_mask_type = self._adjust_key_value_for_inference(
-            inference_context,
-            query,
-            key,
-            value,
-            rotary_pos_emb,
-            rotary_pos_cos,
-            rotary_pos_sin,
-            sequence_len_offset,
+        query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
+            self._adjust_key_value_for_inference(
+                inference_context,
+                query,
+                key,
+                value,
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+            )
         )
 
         if packed_seq_params is not None:
@@ -606,15 +602,23 @@ class Attention(MegatronModule, ABC):
                 # TODO VIJAY: simplify
                 if inference_context is None or inference_context.is_static_batching():
                     query = apply_rotary_pos_emb(
-                        query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+                        query,
+                        q_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_q,
+                        cp_group=self.model_comm_pgs.cp,
                     )
                 else:
                     query = inference_context.apply_rotary_emb_query(
-                        query, q_pos_emb, self.config, cu_seqlens_q
+                        query, q_pos_emb, self.config, cu_seqlens_q, self.model_comm_pgs.cp
                     )
             if k_pos_emb is not None:
                 key = apply_rotary_pos_emb(
-                    key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv
+                    key,
+                    k_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    cp_group=self.model_comm_pgs.cp,
                 )
 
             # TODO, can apply positional embedding to value_layer so it has
@@ -653,12 +657,19 @@ class Attention(MegatronModule, ABC):
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
                 core_attn_out = self.flash_decode_and_prefill(
-                    q, k, v, max_seqlen_q, max_seqlen_k, cu_query_lengths, cu_kv_lengths
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_query_lengths,
+                    cu_kv_lengths,
+                    kv_lengths,
+                    block_table,
                 )
-                core_attn_out = core_attn_out.squeeze(0).unsqueeze(1)
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -691,6 +702,7 @@ class SelfAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(
             config=config,
@@ -699,6 +711,7 @@ class SelfAttention(Attention):
             attn_mask_type=attn_mask_type,
             attention_type="self",
             cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
         )
 
         self.linear_qkv = build_module(
@@ -879,6 +892,7 @@ class CrossAttention(Attention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(
             config=config,
@@ -887,6 +901,7 @@ class CrossAttention(Attention):
             attn_mask_type=attn_mask_type,
             attention_type="cross",
             cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:

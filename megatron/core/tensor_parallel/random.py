@@ -238,6 +238,9 @@ def model_parallel_device_manual_seed(
     te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
+    tp_rank: int = None,
+    ep_rank: int = None,
+    etp_rank: int = None,
 ):
     """Initialize model parallel device seed.
 
@@ -256,9 +259,15 @@ def model_parallel_device_manual_seed(
     It is different among expert-tensor and expert-model parallel GPUs, and the same
     across expert-data parallel groups.
     """
+    if tp_rank is None:
+        tp_rank = get_tensor_model_parallel_rank()
+    if ep_rank is None:
+        ep_rank = get_expert_model_parallel_rank()
+    if etp_rank is None:
+        etp_rank = get_expert_tensor_parallel_rank()
     # 2718 is just for fun and any POSITIVE value will work.
     offset = seed + 2718
-    tensor_model_parallel_seed = offset + get_tensor_model_parallel_rank()
+    tensor_model_parallel_seed = offset + tp_rank
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
@@ -271,9 +280,7 @@ def model_parallel_device_manual_seed(
     # and model parallel state.
     _DEVICE_RNG_STATE_TRACKER.add(_MODEL_PARALLEL_RNG_TRACKER_NAME, tensor_model_parallel_seed)
 
-    expert_parallel_seed = (
-        seed + 1024 + 100 * get_expert_model_parallel_rank() + get_expert_tensor_parallel_rank()
-    )
+    expert_parallel_seed = seed + 1024 + 100 * ep_rank + etp_rank
     _DEVICE_RNG_STATE_TRACKER.add(_EXPERT_PARALLEL_RNG_TRACKER_NAME, expert_parallel_seed)
 
 

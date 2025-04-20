@@ -57,7 +57,7 @@ xm = get_xla_model()
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
-    grad_stats_parallel_group: WrappedProcessGroup = None,
+    grad_stats_parallel_group = None,
 ) -> float:
     """Calculate the norm of gradients in fp32.
 

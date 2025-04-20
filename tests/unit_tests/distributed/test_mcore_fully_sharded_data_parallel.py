@@ -93,7 +93,7 @@ class TestFullyShardedDataParallel:
 
         # Get dp process group from device mesh
         dp_group = device_mesh.get_group(mesh_dim="dp")
-        grad_comm_pgs.dp = WrappedProcessGroup(dp_group)
+        grad_comm_pgs.dp = dp_group
 
         # Wrap second model with explicit process groups
         fsdp_model2 = FullyShardedDataParallel(

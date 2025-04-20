@@ -9,6 +9,8 @@ import torch
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 
@@ -28,6 +30,7 @@ from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
+from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
@@ -68,6 +71,11 @@ class TestSpecCustomization:
         # specify bias dropout add with module path
         self.bda_spec = ModuleSpec(
             module=("megatron.core.fusions.fused_bias_dropout", "get_bias_dropout_add")
+        )
+
+        # Create model process groups for test.
+        self.model_comm_pgs = ModelCommProcessGroups(
+            tp=get_tensor_model_parallel_group(wrapped=True), cp=get_context_parallel_group(wrapped=True)
         )
 
     def teardown_method(self, method):
@@ -157,7 +165,11 @@ class TestSpecCustomization:
         threw = False
         try:
             attn = DotProductAttention(
-                config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self',
+                model_comm_pgs=self.model_comm_pgs,
             )
         except:
             threw = True
@@ -166,7 +178,11 @@ class TestSpecCustomization:
 
         # Test TEDotProductAttention
         attn = TEDotProductAttention(
-            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            model_comm_pgs=self.model_comm_pgs,
         )
         # Make sure window-size is what we expect.
         assert attn.window_size == config.window_size
@@ -176,7 +192,11 @@ class TestSpecCustomization:
         try:
             config.window_size = 11
             attn = TEDotProductAttention(
-                config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+                config,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                attention_type='self',
+                model_comm_pgs=self.model_comm_pgs,
             )
         except:
             threw = True
@@ -186,7 +206,11 @@ class TestSpecCustomization:
         # `None` makes this causal.
         config.window_size = None
         attn = TEDotProductAttention(
-            config, layer_number=1, attn_mask_type=AttnMaskType.causal, attention_type='self'
+            config,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            model_comm_pgs=self.model_comm_pgs,
         )
         # Make sure it's causal.
         assert attn.window_size == (-1, 0)
@@ -248,3 +272,34 @@ class TestSpecCustomization:
         assert out1.shape[0] == sequence_length == out2.shape[0]
         assert out1.shape[1] == micro_batch_size == out2.shape[1]
         assert out1.shape[2] == transformer_config.hidden_size == out2.shape[2]
+
+    def test_l2_qk_norm(self):
+        """Test L2 normalization for QK vectors using local spec."""
+        layer_spec = get_gpt_layer_local_spec(qk_l2_norm=True)
+
+        # Build the self-attention module from the spec
+        self_attention = build_module(
+            layer_spec.submodules.self_attention, config=self.config, layer_number=1
+        )
+
+        assert isinstance(self_attention, SelfAttention)
+        # Verify that q_layernorm and k_layernorm are L2Norm instances
+        assert isinstance(self_attention.q_layernorm, L2Norm)
+        assert isinstance(self_attention.k_layernorm, L2Norm)
+
+        # Test forward pass
+        sequence_length = 32
+        micro_batch_size = 2
+        self_attention.to(get_current_device())
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.config.hidden_size)
+        ).to(get_current_device())
+
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(get_current_device())
+
+        output, bias = self_attention(hidden_states=hidden_states, attention_mask=attention_mask)
+
+        # Assert output shape is same as input shape
+        assert output.shape == hidden_states.shape

@@ -104,7 +104,7 @@ class A:
     def test_global_memory_buffer():
         global_memory_buffer = util.GlobalMemoryBuffer()
         obtained_tensor = global_memory_buffer.get_tensor((3, 2), torch.float32, "test_tensor")
-        expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=torch.cuda.current_device())
+        expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=get_current_device())
         assert obtained_tensor.shape == expected_tensor.shape
 
 

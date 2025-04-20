@@ -23,6 +23,7 @@ from megatron.core.transformer.multi_token_prediction import (
     get_mtp_num_layers_to_build,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -75,6 +76,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    qk_l2_norm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -86,6 +88,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with TE modules
@@ -105,6 +108,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     )
 
     if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -144,7 +148,6 @@ def get_gpt_layer_with_transformer_engine_spec(
         # for QKLayerNorm if TE Version < 1.9;
         # we instead use the Apex implementation.
         qk_norm = TENorm if is_te_min_version("1.9.0") else FusedLayerNorm
-
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -155,8 +158,12 @@ def get_gpt_layer_with_transformer_engine_spec(
                         linear_qkv=TELayerNormColumnParallelLinear,
                         core_attention=TEDotProductAttention,
                         linear_proj=TERowParallelLinear,
-                        q_layernorm=qk_norm if qk_layernorm else IdentityOp,
-                        k_layernorm=qk_norm if qk_layernorm else IdentityOp,
+                        q_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
+                        k_layernorm=(
+                            L2Norm if qk_l2_norm else (qk_norm if qk_layernorm else IdentityOp)
+                        ),
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
@@ -175,6 +182,7 @@ def get_gpt_layer_local_spec(
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -186,6 +194,7 @@ def get_gpt_layer_local_spec(
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with Megatron-Core modules
@@ -210,6 +219,7 @@ def get_gpt_layer_local_spec(
     )
 
     if multi_latent_attention:
+        assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
@@ -247,8 +257,12 @@ def get_gpt_layer_local_spec(
                         linear_qkv=ColumnParallelLinear,
                         core_attention=DotProductAttention,
                         linear_proj=RowParallelLinear,
-                        q_layernorm=LNImpl if qk_layernorm else IdentityOp,
-                        k_layernorm=LNImpl if qk_layernorm else IdentityOp,
+                        q_layernorm=(
+                            L2Norm if qk_l2_norm else (LNImpl if qk_layernorm else IdentityOp)
+                        ),
+                        k_layernorm=(
+                            L2Norm if qk_l2_norm else (LNImpl if qk_layernorm else IdentityOp)
+                        ),
                     ),
                 ),
                 self_attn_bda=get_bias_dropout_add,
@@ -319,7 +333,10 @@ def get_mlp_module_spec(
 
 
 def get_gpt_decoder_block_spec(
-    config: TransformerConfig, use_transformer_engine: bool, normalization: Optional[str] = None
+    config: TransformerConfig,
+    use_transformer_engine: bool,
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -335,6 +352,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            qk_l2_norm=qk_l2_norm,
         )
         if use_transformer_engine
         else get_gpt_layer_local_spec(
@@ -344,6 +362,7 @@ def get_gpt_decoder_block_spec(
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
+            qk_l2_norm=qk_l2_norm,
         )
     )
     moe_layer_spec = (
@@ -353,6 +372,7 @@ def get_gpt_decoder_block_spec(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
+            qk_l2_norm=qk_l2_norm,
         )
         if use_transformer_engine
         else get_gpt_layer_local_spec(
@@ -362,6 +382,7 @@ def get_gpt_decoder_block_spec(
             multi_latent_attention=config.multi_latent_attention,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
             normalization=normalization,
+            qk_l2_norm=qk_l2_norm,
         )
     )
 

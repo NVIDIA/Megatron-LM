@@ -1,4 +1,5 @@
 import logging
+import traceback
 import torch
 
 
@@ -14,7 +15,7 @@ class WrappedProcessGroup(object):
 
     def __init__(self, process_group: torch.distributed.ProcessGroup=torch.distributed.group.WORLD,
                  rank_groups: Optional[List[List[int]]]=None):
-        self.__process_group = process_group
+        self.__process_group = process_group 
         self.__rank_groups = rank_groups if rank_groups else self.__all_rank_groups() if xm else None
 
     def __all_rank_groups(self) -> List[List[int]]:
@@ -25,6 +26,10 @@ class WrappedProcessGroup(object):
         """
         
         try:
+            if isinstance(self.__process_group, list):
+                self.__rank_groups = self.__process_group
+                return
+            
             world_size = torch.distributed.get_world_size()
             if self.__process_group is None or self.__process_group == torch.distributed.group.WORLD:
                 return [range(world_size)]
@@ -36,7 +41,7 @@ class WrappedProcessGroup(object):
             logger.info(f"process_group: {self.__process_group}, all_ranks: {all_ranks}")
             return all_ranks
         except Exception as e:
-            logger.warning(str(e))
+            logger.warning(f"process_group: {self.__process_group}")
             return None
 
     @property

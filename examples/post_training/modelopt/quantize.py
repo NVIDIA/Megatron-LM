@@ -34,8 +34,8 @@ QUANT_CFG_CHOICES = {
     "int8": mtq.INT8_DEFAULT_CFG,
     "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
     "fp8": mtq.FP8_DEFAULT_CFG,
-    "fp8_real_quant": mtq.FP8_PER_TENSOR_REAL_QUANT_CFG,
-    "fp8_blockwise_real_quant": mtq.FP8_2D_BLOCKWISE_REAL_QUANT_CFG,
+    "fp8_real_quant": mtq.FP8_DEFAULT_CFG,
+    "fp8_blockwise_real_quant": mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
     "int4_awq": mtq.INT4_AWQ_CFG,
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
     "int4": mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
@@ -266,6 +266,8 @@ if __name__ == "__main__":
             unwrapped_model.calibration_mode = False
         else:
             mtq.quantize(unwrapped_model, mtq_config, ptq_forward_loop_func)
+        if "real_quant" in args.export_quant_cfg:
+            mtq.compress(unwrapped_model)
 
     print_rank_0(f"Fake Quantized Model:\n {unwrapped_model}")
 

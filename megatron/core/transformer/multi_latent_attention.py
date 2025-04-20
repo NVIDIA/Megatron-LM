@@ -14,6 +14,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
@@ -61,6 +62,7 @@ class MultiLatentAttention(Attention):
         attn_mask_type: AttnMaskType,
         attention_type: str,
         cp_comm_type: Optional[str] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ) -> None:
 
         super().__init__(
@@ -69,6 +71,7 @@ class MultiLatentAttention(Attention):
             layer_number=layer_number,
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
+            model_comm_pgs=model_comm_pgs,
         )
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads
@@ -93,6 +96,7 @@ class MultiLatentAttention(Attention):
                 self.config.qk_pos_emb_head_dim,
                 rotary_percent=self.config.rotary_percent,
                 rotary_base=self.config.rotary_base,
+                cp_group=self.model_comm_pgs.cp,
             )
         elif self.config.rope_type == "yarn":
             assert not self.config.apply_rope_fusion, "MLA Yarn RoPE does not support RoPE fusion"
@@ -105,6 +109,7 @@ class MultiLatentAttention(Attention):
                 beta_slow=self.config.beta_slow,
                 mscale=self.config.mscale,
                 mscale_all_dim=self.config.mscale_all_dim,
+                cp_group=self.model_comm_pgs.cp,
             )
         else:
             raise ValueError(
@@ -123,6 +128,7 @@ class MultiLatentAttention(Attention):
                 k_channels=self.q_head_dim,
                 v_channels=self.config.v_head_dim,
                 cp_comm_type=cp_comm_type,
+                model_comm_pgs=self.model_comm_pgs,
             )
         else:
             self.core_attention = build_module(
@@ -133,7 +139,9 @@ class MultiLatentAttention(Attention):
                 attention_type=self.attention_type,
                 softmax_scale=self.softmax_scale,
                 cp_comm_type=cp_comm_type,
+                model_comm_pgs=self.model_comm_pgs,
             )
+        
 
         # Output.
         self.linear_proj = build_module(
@@ -194,7 +202,7 @@ class MultiLatentAttention(Attention):
         # Adjust key, value for inference
         # ===================================================
         # rotary_pos_emb = None
-        query, key, value, _, attn_mask_type = self._adjust_key_value_for_inference(
+        query, key, value, _, attn_mask_type, _ = self._adjust_key_value_for_inference(
             inference_context, query, key, value, rotary_pos_emb=None
         )
 
@@ -255,6 +263,7 @@ class MLASelfAttention(MultiLatentAttention):
         layer_number: int,
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         super().__init__(
             config=config,
@@ -263,6 +272,7 @@ class MLASelfAttention(MultiLatentAttention):
             attn_mask_type=attn_mask_type,
             attention_type="self",
             cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
         )
 
         if self.config.q_lora_rank is None:
@@ -494,6 +504,7 @@ class MLASelfAttention(MultiLatentAttention):
                 config=self.config,
                 cu_seqlens=cu_seqlens_q,
                 mscale=mscale,
+                cp_group=self.model_comm_pgs.cp,
             )
             k_pos_emb = apply_rotary_pos_emb(
                 k_pos_emb,
@@ -501,6 +512,7 @@ class MLASelfAttention(MultiLatentAttention):
                 config=self.config,
                 cu_seqlens=cu_seqlens_kv,
                 mscale=mscale,
+                cp_group=self.model_comm_pgs.cp,
             )
 
             # query: [s, b, n, 192]

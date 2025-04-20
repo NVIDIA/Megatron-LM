@@ -6,12 +6,13 @@ import argparse
 import dataclasses
 import json
 import os
+from pathlib import Path
 import types
 import warnings
-from packaging.version import Version as PkgVersion
 
 import torch
 import torch.nn.functional as F
+from packaging.version import Version as PkgVersion
 
 from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing.validation import StrictHandling
@@ -20,14 +21,18 @@ from megatron.core.models.retro.utils import (
     get_gpt_data_dir as get_retro_data_dir,
 )
 from megatron.core.rerun_state_machine import RerunStateMachine
-from megatron.core.transformer import TransformerConfig, MLATransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+    HeterogeneousTransformerConfig,
+    MLPConfig,
+)
 from megatron.core.utils import (
-    is_torch_min_version,
     get_torch_version,
+    is_torch_min_version,
 )
 from megatron.training.activations import squared_relu
-from megatron.training.utils import update_use_dist_ckpt, get_device_arch_version
+from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 try:
@@ -64,6 +69,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
+    parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
@@ -115,6 +121,80 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         print('WARNING: The MSC feature is disabled.')
 
     return args
+
+
+def validate_model_config_args_from_heterogeneous_config(args):
+    """Validate model config arguments from heterogeneous config.
+
+    This function takes model arguments and validates them based on a heterogeneous layer configuration.
+    The heterogeneous config can be provided either as a path to a JSON file or as an encoded JSON string.
+
+    The function enforces certain model architecture choices like SiLU activation, RMSNorm, grouped query attention,
+    and RoPE positional embeddings. It also sets model dimensions like number of layers, hidden size, and attention heads
+    based on the heterogeneous config.
+
+    Args:
+        args: Model configuration arguments to be overridden. Expected to have attributes:
+            - heterogeneous_layers_config_path (str): Path to JSON config file
+            - heterogeneous_layers_config_encoded_json (str): Encoded JSON config string
+
+    Returns:
+        None
+    """
+    if (
+        args.heterogeneous_layers_config_path is None
+        and args.heterogeneous_layers_config_encoded_json is None
+    ):
+        return
+
+    if args.heterogeneous_layers_config_encoded_json is None:
+        args.heterogeneous_layers_config_encoded_json = Path(
+            args.heterogeneous_layers_config_path
+        ).read_text()
+
+    hf_config_dict = types.SimpleNamespace(**json.loads(args.heterogeneous_layers_config_encoded_json))
+
+    assert hf_config_dict.hidden_act == "silu", (
+        f"hidden_act in heterogeneous config is {hf_config_dict.hidden_act}, should be silu"
+    )
+
+    n_kv_heads_in_group = [
+        config["attention"]["n_heads_in_group"] for config in hf_config_dict.block_configs 
+        if config["attention"]["n_heads_in_group"] is not None
+    ]
+    assert all(num == n_kv_heads_in_group[0] for num in n_kv_heads_in_group), "num query head must be consistent across all layers"
+
+    args_to_validate = {
+        "swiglu": True,
+        "normalization": "RMSNorm",
+        "group_query_attention": True,
+        "position_embedding_type": "rope",
+        "rotary_percent": 1.0,
+        "use_rope_scaling": True,
+        "use_rotary_position_embeddings": True,
+        "num_layers": hf_config_dict.num_hidden_layers,
+        "hidden_size": hf_config_dict.hidden_size,
+        "num_attention_heads": hf_config_dict.num_attention_heads,
+        "untie_embeddings_and_output_weights": not hf_config_dict.tie_word_embeddings,
+        "rotary_base": hf_config_dict.rope_theta,
+        "rope_scaling_factor": hf_config_dict.rope_scaling["factor"],
+        "num_query_groups": hf_config_dict.num_attention_heads // n_kv_heads_in_group[0],
+    }
+
+    incompatible_args = {}
+    for key, value in args_to_validate.items():
+        provided_value = getattr(args, key, None)
+        if provided_value != value:
+            incompatible_args[key] = (provided_value, value)
+
+    if incompatible_args:
+        incompatible_args_str = ', '.join([
+            f"{k}: {provided_value} (provided) != {value} (expected)"
+            for k, (provided_value, value) in incompatible_args.items()
+        ])
+        raise ValueError(
+            f"Arguments differ from heterogeneous config: {incompatible_args_str}"
+        )
 
 
 def load_retro_config(retro_project_dir):
@@ -229,6 +309,9 @@ def validate_args(args, defaults={}):
                 LocalCheckpointManager
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
+        
+    # validate model config args from heterogeneous config (if provided).
+    validate_model_config_args_from_heterogeneous_config(args)
 
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
@@ -783,9 +866,9 @@ def validate_args(args, defaults={}):
         args.num_experts = None
     if args.num_experts is not None:
         assert args.spec is None, "Model Spec must be None when using MoEs"
-
-    if args.moe_ffn_hidden_size is None:
+    if args.num_experts is not None and args.moe_ffn_hidden_size is None:
         args.moe_ffn_hidden_size = args.ffn_hidden_size
+        print("Warning: moe_ffn_hidden_size is not set, using ffn_hidden_size for MoE instead.")
 
     # Context parallel
     if args.context_parallel_size > 1:
@@ -875,6 +958,7 @@ def validate_args(args, defaults={}):
 
     if args.inference_dynamic_batching:
         assert args.inference_dynamic_batching_buffer_size_gb is not None
+        assert args.inference_dynamic_batching_chunk_size % 256 == 0, "chunk size should be a multiple of 256"
         assert args.inference_dynamic_batching_buffer_guaranteed_fraction is not None
 
     # MoE upcycling check
@@ -967,6 +1051,10 @@ def core_transformer_config_from_args(args, config_class=None):
 
     if args.multi_latent_attention:
         config_class = MLATransformerConfig
+    
+    if args.heterogeneous_layers_config_path is not None:
+        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
+        config_class = HeterogeneousTransformerConfig
 
     # Translate args to core transformer configuration
     kw_args = {}
@@ -1020,7 +1108,7 @@ def _add_transformer_engine_args(parser):
                        dest='fp8')
     # per tensor current scaling recipe selection
     group.add_argument('--fp8-recipe', default='delayed',
-                       choices=['tensorwise', 'delayed', 'mxfp8'],
+                       choices=['tensorwise', 'delayed', 'mxfp8', 'blockwise'],
                        help='Which fp8 recipe to use for FP8 tensors in the forward and backward pass',
                        dest='fp8_recipe')
     # delayed scaling only configs
@@ -1109,6 +1197,10 @@ def _add_inference_args(parser):
                        type=float, default=40.,
                        help='Total buffer size (GB) allocated for the chunked KV '
                        'memory.')
+    group.add_argument('--inference-dynamic-batching-chunk-size',
+                       type=int, default=256,
+                       help='KV cache chunk size. '
+                       'It should be a multiple of 256')
     group.add_argument('--inference-dynamic-batching-buffer-guaranteed-fraction',
                        type=float, default=0.2,
                        help='Space is reserved within the inference context '
@@ -2283,6 +2375,8 @@ def _add_data_args(parser):
                        help='Number of parallel threads per rank for dataset builder')
     group.add_argument('--object-storage-cache-path', type=str, default=None,
                        help='Path to cache index files when using s3 or msc dataloader')
+    group.add_argument('--mid-level-dataset-surplus', type=float, default=0.005,
+                       help='The sample surplus to build for the mid-level datasets(s)')
     return parser
 
 
@@ -2550,6 +2644,56 @@ def _add_mla_args(parser):
 
     return parser
 
+def _add_heterogeneous_args(parser):
+    """
+    Heterogeneous models refer to transformer architectures where individual layers can differ 
+    in configuration. Specifically:
+        - Attention or MLP layers can be replaced with either a linear layer or a no-op 
+        - MLP intermediate dimensions can vary between layers
+    We use the format of the HuggingFace config files in llama nemotron models to define the architecture.
+    For example, https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json
+
+    Most notably, the "block_config" maps to a list of attention and mlp configurations for each layer.
+    For example, the "block_config" for a 2 layer model is:
+     "block_configs": [
+        {
+            "attention": {
+                "n_heads_in_group": 8,
+                "no_op": false,
+                "replace_with_linear": false,
+            },
+            "ffn": {
+                "ffn_mult": 2.625,
+                "no_op": false,
+                "replace_with_linear": false,
+            }
+        },
+        {
+            "attention": {
+                "n_heads_in_group": null,
+                "no_op": true,
+                "replace_with_linear": false,
+            },
+            "ffn": {
+                "ffn_mult": 2.625,
+                "no_op": false,
+                "replace_with_linear": false,
+            }
+        }
+    ]
+    """
+    group = parser.add_argument_group(title="heterogeneous architecture")
+    group.add_argument('--heterogeneous-layers-config-path', type=str, default=None,
+                       help='Path to json file containing heterogeneous model configuration. '
+                       'Use the format of the HuggingFace config files in llama nemotron '
+                       'models, e.g. https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json.')
+    group.add_argument('--heterogeneous-layers-config-encoded-json', type=str, default=None,
+                       help='This is encoded json string of the heterogeneous model configuration. Used to keep the content '
+                       'of the heterogeneous model specification in args when the model is loaded from a checkpoint. '
+                       'Use the format of the HuggingFace config files in llama nemotron '
+                       'models, e.g. https://huggingface.co/nvidia/Llama-3_3-Nemotron-Super-49B-v1/resolve/main/config.json.')
+    return parser
+
 def _add_experimental_args(parser):
     group = parser.add_argument_group(title='experimental')
 
@@ -2580,8 +2724,14 @@ def _add_experimental_args(parser):
                        help='Head dimension for Mamba layers.')
     group.add_argument('--mamba-num-groups', type=int, default=8,
                        help='Number of groups for Mamba layers.')
+    group.add_argument('--mamba-num-heads', type=int, default=None,
+                       help='Number of heads for Mamba layers.'
+                       'If not set, then the number of heads will be '
+                       '--hidden-size * expand // --mamba-head-dim')
     group.add_argument('--is-hybrid-model', default=False, action="store_true",
                        help='Indicates whether the model is a hybrid model.')
+    group.add_argument('--disable-mamba-mem-eff-path', default=False, action="store_true",
+                       help='Disable Mamba efficient path.')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 

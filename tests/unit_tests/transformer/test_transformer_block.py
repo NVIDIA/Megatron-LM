@@ -1,19 +1,26 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_current_device_type
+import copy
 from contextlib import nullcontext
 
 import pytest
 import torch
 import pytest 
+from packaging import version
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
@@ -240,3 +247,171 @@ class TestPipelineParallelTransformerBlock:
             ), f"total build layers {total_build_layers} should be equal to num_layers {num_layers}"
         parallel_state.set_pipeline_model_parallel_world_size(None)
         parallel_state.set_virtual_pipeline_model_parallel_world_size(None)
+
+
+class TestProcessGroupTransformerBlock:
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Device mesh feature requires PyTorch 2.3 or later",
+    )
+    @pytest.mark.parametrize(
+        "tp_size,cp_size,dp_size,use_custom_pg",
+        [(2, 2, 2, True), (2, 4, 1, True), (2, 2, 2, False), (2, 4, 1, False)],
+    )
+    def test_pg_input_args(self, tp_size, cp_size, dp_size, use_custom_pg):
+        """
+        Test TransformerBlock with custom process groups.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+        )
+        model_parallel_device_manual_seed(123)
+        if use_custom_pg:
+            # Create custom process groups
+            device_mesh = torch.distributed.init_device_mesh(
+                get_current_device_type(), (dp_size, tp_size, cp_size), mesh_dim_names=("dp", "tp", "cp")
+            )
+            # Get process groups from device mesh
+            tp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="tp"))
+            cp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="cp"))
+            # Create ModelCommProcessGroups with custom process groups
+            model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
+        else:
+            # Rely on TransformerBlock to create default process groups
+            model_comm_pgs = None
+
+        self.transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
+        self.transformer_block = TransformerBlock(
+            self.transformer_config,
+            transformer_layer_spec,
+            model_comm_pgs=model_comm_pgs,
+        )
+        self.transformer_block.to(get_current_device())
+
+        sequence_length = 128
+        micro_batch_size = 1
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.transformer_block.config.hidden_size),
+            device=get_current_device(),
+        )
+
+        hidden_states = self.transformer_block(hidden_states=hidden_states, attention_mask=None)
+
+        assert hidden_states.shape[0] == sequence_length
+        assert hidden_states.shape[1] == micro_batch_size
+        assert hidden_states.shape[2] == self.transformer_block.config.hidden_size
+
+
+class TestMixedProcessGroups:
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Device mesh feature requires PyTorch 2.3 or later",
+    )
+    @pytest.mark.parametrize("tp_size,cp_size", [(2, 4)])
+    def test_mixed_pg_transformer_block(self, tp_size, cp_size, monkeypatch):
+        """
+        Test TransformerBlock with custom process groups.
+        """
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
+        )
+        model_parallel_device_manual_seed(123)
+
+        # Create a new build_layers method that uses interleaved attention
+        def _build_layers_with_interleaved_attention(self):
+            def build_layer(layer_spec, layer_number):
+                fp8_init_context = get_fp8_context(self.config, layer_number - 1, is_init=True)
+                if layer_number % 4 == 0:
+                    config = self.local_attn_config
+                    model_comm_pgs = self.local_pgs
+                else:
+                    config = self.config
+                    model_comm_pgs = self.model_comm_pgs
+                with fp8_init_context:
+                    module = build_module(
+                        layer_spec,
+                        config=config,
+                        layer_number=layer_number,
+                        model_comm_pgs=model_comm_pgs,
+                    )
+                return module
+
+            # Modify TransformerConfig and ModelCommProcessGroups for local attention
+            self.local_attn_config = copy.deepcopy(self.config)
+            self.local_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+            self.local_attn_config.context_parallel_size = 1
+            self.local_pgs.cp = WrappedProcessGroup(
+                process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+            )
+
+            # offset is implicit in TransformerLayer
+            self.layers = torch.nn.ModuleList(
+                [
+                    build_layer(layer_spec, i + 1)
+                    for i, layer_spec in enumerate(self.submodules.layer_specs)
+                ]
+            )
+
+            # Copied from TransformerBlock.build_layers
+            if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+                self.final_layernorm = build_module(
+                    self.submodules.layer_norm,
+                    config=self.config,
+                    hidden_size=self.config.hidden_size,
+                    eps=self.config.layernorm_epsilon,
+                )
+            else:
+                self.final_layernorm = None  # Either this or nn.Identity
+
+        # Replace the default build_layers method
+        monkeypatch.setattr(
+            TransformerBlock, "_build_layers", _build_layers_with_interleaved_attention
+        )
+
+        self.transformer_config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            context_parallel_size=cp_size if HAVE_TE else 1,
+            bf16=True,
+        )
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
+        self.transformer_block = TransformerBlock(
+            self.transformer_config, transformer_layer_spec
+        )
+        self.transformer_block.to(get_current_device()).bfloat16()
+
+        sequence_length = 128
+        micro_batch_size = 1
+
+        # [sequence length, batch size, hidden size]
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.transformer_block.config.hidden_size),
+            dtype=torch.bfloat16,
+            device=get_current_device(),
+        )
+
+        hidden_states = self.transformer_block(hidden_states=hidden_states, attention_mask=None)
+
+        assert hidden_states.shape[0] == sequence_length
+        assert hidden_states.shape[1] == micro_batch_size
+        assert hidden_states.shape[2] == self.transformer_block.config.hidden_size

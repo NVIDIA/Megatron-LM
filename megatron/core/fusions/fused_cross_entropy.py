@@ -89,7 +89,7 @@ def calculate_gradients(
 
 class _VocabParallelCrossEntropy(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, vocab_parallel_logits, target, tp_group: WrappedProcessGroup):
+    def forward(ctx, vocab_parallel_logits, target, tp_group):
         """
         Forward implementation for the cross entropy loss.
         """

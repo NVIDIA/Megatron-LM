@@ -1137,7 +1137,12 @@ def load_args_from_checkpoint(
     _set_arg('mamba_state_dim', force=True)
     _set_arg('mamba_head_dim', force=True)
     _set_arg('mamba_num_groups', force=True)
+    _set_arg('mamba_num_heads', force=True)
     _set_arg('is_hybrid_model', force=True)
+
+    # Heterogeneous args.
+    _set_arg('heterogeneous_layers_config_path', force=True)
+    _set_arg('heterogeneous_layers_config_encoded_json', force=True)
 
     # Tokenizer args.
     _set_arg('tokenizer_type', force=True)

@@ -18,20 +18,15 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_context_parallel_global_ranks,
     get_context_parallel_group,
     get_expert_data_parallel_rank,
     get_expert_model_parallel_rank,
     get_expert_model_parallel_world_size,
-    get_expert_tensor_parallel_group,
-    get_expert_tensor_parallel_rank,
-    get_expert_tensor_parallel_world_size,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
 )
 from megatron.core.tensor_parallel import get_device_rng_tracker, get_expert_parallel_rng_tracker_name
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
@@ -45,7 +40,12 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.utils import (
+    get_te_version,
+    get_tensor_model_parallel_group_if_none,
+    is_te_min_version,
+)
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 
 def _get_extra_te_kwargs(config: TransformerConfig):
@@ -128,6 +128,7 @@ class TELinear(te.pytorch.Linear):
         skip_weight_param_allocation: bool,
         tp_comm_buffer_name: Optional[str] = None,
         is_expert: bool = False,
+        tp_group: Optional[WrappedProcessGroup] = None,
     ):
         self.config = config
 
@@ -181,6 +182,13 @@ class TELinear(te.pytorch.Linear):
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
+        if parallel_mode == "duplicated":
+            assert tp_group is None, "duplicated linear should not have tp_group set"
+            tp_size = 1
+        else:
+            assert tp_group is not None, "Parallel linear should always have tp_group set"
+            tp_size = tp_group.size()
+
         self.expert_parallel = self.config.expert_model_parallel_size > 1
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
@@ -201,13 +209,6 @@ class TELinear(te.pytorch.Linear):
             te_parallel_mode = None
         else:
             # Disable communications in TE when using TP or EP by
-            # making TE agnostic of model parallel.
-            if is_expert:
-                tp_group = get_expert_tensor_parallel_group(check_initialized=False)
-                tp_size = get_expert_tensor_parallel_world_size()
-            else:
-                tp_group = get_tensor_model_parallel_group(check_initialized=False)
-                tp_size = get_tensor_model_parallel_world_size()
             explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
             if explicit_expert_comm:
@@ -224,7 +225,8 @@ class TELinear(te.pytorch.Linear):
             out_features=output_size,
             sequence_parallel=self.config.sequence_parallel,
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            tp_group=tp_group,
+            # Pass None if not initialized for backward compatibility with the ckpt converter.
+            tp_group=tp_group if torch.distributed.is_initialized() else None,
             tp_size=tp_size,
             get_rng_state_tracker=(
                 get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
@@ -294,6 +296,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[WrappedProcessGroup] = None,
     ):
         self.config = config
 
@@ -308,6 +311,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 'Transformer Engine linear layers do not support skip_weight_param_allocation'
             )
 
+        # TODO: For backward compatibility, remove in v0.15.
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert, wrapped=True)
+
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
         # tell TE to not return the bias, and return None
@@ -317,6 +323,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         extra_kwargs = _get_extra_te_kwargs(config)
+        self.tp_size = tp_group.size()
+        self.tp_rank = tp_group.rank()
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         if is_te_min_version("0.11.0"):
@@ -366,7 +374,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             eps=self.config.layernorm_epsilon,
             sequence_parallel=self.config.sequence_parallel,
             fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-            tp_group=get_tensor_model_parallel_group(check_initialized=False),
+            tp_group=tp_group if torch.distributed.is_initialized() else None,
             tp_size=self.config.tensor_model_parallel_size,
             get_rng_state_tracker=(
                 get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
@@ -384,11 +392,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             **extra_kwargs,
         )
 
-        world_size = get_tensor_model_parallel_world_size()
-        rank = get_tensor_model_parallel_rank()
-
         if config.use_cpu_initialization:
-            output_size_per_partition = divide(output_size, world_size)
+            output_size_per_partition = divide(output_size, self.tp_size)
             _ = _initialize_affine_weight_cpu(
                 self.weight,
                 output_size,
@@ -398,8 +403,8 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 init_method=condition_init_method(config, init_method),
                 stride=1,
                 return_master_weight=False,
-                rank=rank,
-                world_size=world_size,
+                rank=self.tp_rank,
+                world_size=self.tp_size,
                 skip_set_tensor_parallel_attributes=True,
             )
             if bias:
@@ -459,9 +464,13 @@ class TEColumnParallelLinear(TELinear):
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[WrappedProcessGroup] = None,
     ):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert, wrapped=True)
+        world_size = tp_group.size()
+        rank = tp_group.rank()
 
         super().__init__(
             input_size=input_size,
@@ -478,15 +487,10 @@ class TEColumnParallelLinear(TELinear):
             is_expert=is_expert,
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
         )
 
         if config.use_cpu_initialization:
-            if is_expert:
-                world_size = get_expert_tensor_parallel_world_size()
-                rank = get_expert_tensor_parallel_rank()
-            else:
-                world_size = get_tensor_model_parallel_world_size()
-                rank = get_tensor_model_parallel_rank()
             output_size_per_partition = divide(output_size, world_size)
             _ = _initialize_affine_weight_cpu(
                 self.weight,
@@ -542,11 +546,13 @@ class TERowParallelLinear(TELinear):
         skip_bias_add: bool,
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
+        tp_group: Optional[WrappedProcessGroup] = None,
     ):
         if not input_is_parallel:
             raise ValueError(
                 "Transformer Engine linear layers do not support input_is_parallel = False"
             )
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert, wrapped=True)
 
         super().__init__(
             input_size=input_size,
@@ -563,6 +569,7 @@ class TERowParallelLinear(TELinear):
             skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
+            tp_group=tp_group,
         )
 
         from megatron.core.tensor_parallel.layers import (
@@ -570,12 +577,8 @@ class TERowParallelLinear(TELinear):
         )
         from megatron.core.tensor_parallel.utils import divide
         if config.use_cpu_initialization:
-            if is_expert:
-                world_size = get_expert_tensor_parallel_world_size()
-                rank = get_expert_tensor_parallel_rank()
-            else:
-                world_size = get_tensor_model_parallel_world_size()
-                rank = get_tensor_model_parallel_rank()
+            world_size = tp_group.size()
+            rank = tp_group.rank()
             input_size_per_partition = divide(input_size, world_size)
             self.master_weight = _initialize_affine_weight_cpu(
                 self.weight,
@@ -636,6 +639,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         k_channels: Optional[int] = None,
         v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
         self.config = config
         self.te_forward_mask_type = False
@@ -662,6 +666,26 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"num_attention_heads ({self.config.num_attention_heads}))"
             )
 
+        if model_comm_pgs is None:
+            # For backward compatibility, remove in v0.14 and raise error
+            # raise ValueError("TEDotProductAttention was called without ModelCommProcessGroups")
+            model_comm_pgs = ModelCommProcessGroups(
+                tp=get_tensor_model_parallel_group(check_initialized=False, wrapped=True),
+                cp=get_context_parallel_group(check_initialized=False, wrapped=True),
+                hcp=get_hierarchical_context_parallel_groups(check_initialized=False, wrapped=True),
+            )
+        else:
+            assert hasattr(
+                model_comm_pgs, 'tp'
+            ), "TEDotProductAttention model_comm_pgs must have tp pg"
+            assert hasattr(
+                model_comm_pgs, 'cp'
+            ), "TEDotProductAttention model_comm_pgs must have cp pg"
+            if cp_comm_type == "a2a+p2p":
+                assert hasattr(
+                    model_comm_pgs, 'hcp'
+                ), "TEDotProductAttention model_comm_pgs must have hierarchical cp pg"
+
         if is_te_min_version("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
             # older version don't need attention_type
@@ -677,9 +701,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
-            extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
-            extra_kwargs["cp_global_ranks"] = get_context_parallel_global_ranks(
-                check_initialized=False
+            extra_kwargs["cp_group"] = model_comm_pgs.cp.process_group
+            extra_kwargs["cp_global_ranks"] = torch.distributed.get_process_group_ranks(
+                model_comm_pgs.cp.process_group
             )
             extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
             if is_te_min_version("1.10.0"):
@@ -753,7 +777,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             get_rng_state_tracker=(
                 get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
             ),
-            tp_group=get_tensor_model_parallel_group(check_initialized=False),
+            tp_group=model_comm_pgs.tp.process_group,
             layer_number=layer_number,
             **extra_kwargs,
         )
@@ -857,6 +881,7 @@ if is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool = False,
             tp_comm_buffer_name: Optional[str] = None,
+            tp_group: Optional[WrappedProcessGroup] = None,
         ):
             self.config = config
 
@@ -878,12 +903,9 @@ if is_te_min_version("1.9.0.dev0"):
 
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
-            if is_expert:
-                tp_group = get_expert_tensor_parallel_group(check_initialized=False)
-                tp_size = get_expert_tensor_parallel_world_size()
-            else:
-                tp_group = get_tensor_model_parallel_group(check_initialized=False)
-                tp_size = get_tensor_model_parallel_world_size()
+            tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert, wrapped=True)
+            tp_size = tp_group.size()
+
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
             if self.explicit_expert_comm:
@@ -901,7 +923,7 @@ if is_te_min_version("1.9.0.dev0"):
                 out_features=output_size,
                 sequence_parallel=self.config.sequence_parallel,
                 fuse_wgrad_accumulation=self.config.gradient_accumulation_fusion,
-                tp_group=tp_group,
+                tp_group=tp_group if torch.distributed.is_initialized() else None,
                 tp_size=tp_size,
                 get_rng_state_tracker=(
                     get_device_rng_tracker if get_device_rng_tracker().is_initialized() else None
@@ -1136,6 +1158,7 @@ if is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
+            tp_group: Optional[WrappedProcessGroup] = None,
         ):
 
             super().__init__(
@@ -1149,6 +1172,7 @@ if is_te_min_version("1.9.0.dev0"):
                 skip_bias_add=skip_bias_add,
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
+                tp_group=tp_group,
             )
 
         def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
@@ -1181,6 +1205,7 @@ if is_te_min_version("1.9.0.dev0"):
             skip_bias_add: bool,
             is_expert: bool,
             tp_comm_buffer_name: Optional[str] = None,
+            tp_group: Optional[WrappedProcessGroup] = None,
         ):
 
             super().__init__(
@@ -1194,6 +1219,7 @@ if is_te_min_version("1.9.0.dev0"):
                 skip_bias_add=skip_bias_add,
                 is_expert=is_expert,
                 tp_comm_buffer_name=tp_comm_buffer_name,
+                tp_group=tp_group,
             )
 
         def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):

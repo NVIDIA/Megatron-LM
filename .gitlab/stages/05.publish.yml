@@ -179,7 +179,7 @@ publish:test_release_pypi_push_wheel:
   rules:
     - if: $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
       when: never
-    - if: $UNIT_TEST == 'yes' && $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
       allow_failure: true
       when: on_success
     - when: on_success
@@ -271,24 +271,27 @@ publish:test_release_notify:
     - echo $PUBLISH_DRYRUN
     - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
     - |
-      MESSAGE='{
+      cat << EOF > message.json
+      {
           "blocks": [
             {
               "type": "section",
               "text": {
                 "type": "mrkdwn",
-                    "text": "Releasebot 🤖: Megatron-Core released <'$URL'|core_r'"$RELEASE_NUMBER"'> 🚀"
+                "text": "Releasebot 🤖: Megatron-Core released <${URL}|core_r${RELEASE_NUMBER}> 🚀"
               }
             }
           ]
-        }'
+      }
+      EOF
 
-    - echo "$MESSAGE"
+    - cat message.json
+
     - |
       CMD=$(echo curl \
         -X POST \
         -H "Content-type: application/json" \
-        --data "$MESSAGE" ${MCORE_NOTIFICATION_HOOK_MAIN}
+        -d @message.json ${MCORE_NOTIFICATION_HOOK_MAIN}
       )
 
       if [[ "$PUBLISH_DRYRUN" == "yes" ]]; then
@@ -505,7 +508,7 @@ publish:upload_statistics:
     - export DASHBOARD_ENDPOINT
     - python tests/test_utils/python_scripts/dashboard.py --pipeline-id ${CI_PIPELINE_ID}
   rules:
-    - if: ($CI_PIPELINE_SOURCE == 'merge_request_event' || $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train') && ($UNIT_TEST == "yes" || $INTEGRATION_TEST == "yes" || $FUNCTIONAL_TEST == "yes")
+    - if: ($CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' || $CI_MERGE_REQUEST_EVENT_TYPE == 'merge_train') && ($UNIT_TEST == "yes" || $INTEGRATION_TEST == "yes" || $FUNCTIONAL_TEST == "yes")
       when: always
       allow_failure: true
     - when: never

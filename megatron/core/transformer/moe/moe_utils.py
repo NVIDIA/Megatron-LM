@@ -35,7 +35,7 @@ def switch_load_balancing_loss_func(
     tokens_per_expert: torch.Tensor,
     topk: int,
     moe_aux_loss_coeff: float,
-    sequence_partition_group: WrappedProcessGroup=None,
+    sequence_partition_group=None,
 ):
     """Calculate the auxiliary loss for load balancing.
     Refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
@@ -85,7 +85,7 @@ def sequence_load_balancing_loss_func(
     seq_length: int,
     topk: int,
     moe_aux_loss_coeff: float,
-    sequence_partition_group: WrappedProcessGroup=None,
+    sequence_partition_group=None,
 ):
     """
     Calculate the auxiliary loss in sequence-level by computing the loss for each individual sample.
@@ -606,8 +606,8 @@ def save_to_aux_losses_tracker(
     loss: torch.Tensor,
     layer_number: int,
     num_layers: int,
-    reduce_group: WrappedProcessGroup=None,
-    avg_group: WrappedProcessGroup=None,
+    reduce_group=None,
+    avg_group=None,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -788,11 +788,10 @@ def get_default_model_comm_pgs():
 
     model_comm_pgs.ep_group = parallel_state.get_expert_model_parallel_group(wrapped=True)
     model_comm_pgs.tp_group = parallel_state.get_tensor_model_parallel_group(wrapped=True)
-    model_comm_pgs.cp_group = parallel_state.get_context_parallel_group(wrapped=True),
+    model_comm_pgs.cp_group = parallel_state.get_context_parallel_group(wrapped=True)
     model_comm_pgs.expt_tp_group = parallel_state.get_expert_tensor_parallel_group(wrapped=True)
     model_comm_pgs.expt_dp_group = parallel_state.get_expert_data_parallel_group(wrapped=True)
     model_comm_pgs.tp_ep_group = parallel_state.get_expert_tensor_and_model_parallel_group(wrapped=True)
     model_comm_pgs.tp_cp_group = parallel_state.get_tensor_and_context_parallel_group(wrapped=True)
-
 
     return model_comm_pgs

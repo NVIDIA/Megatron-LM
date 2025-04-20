@@ -3,12 +3,7 @@
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
-from megatron.core.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_groups,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_src_rank,
-)
+from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 _MAX_DATA_DIM = 5
 
@@ -23,13 +18,14 @@ def _check_data_types(keys, data, target_dtype):
         )
 
 
-def _build_key_size_numel_dictionaries(keys, data):
+def _build_key_size_numel_dictionaries(keys, data, tp_group=None):
     """Build the size on rank 0 and broadcast."""
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
     max_dim = _MAX_DATA_DIM
     sizes = [0 for _ in range(max_dim) for _ in keys]
 
     # Pack the sizes on rank zero.
-    if get_tensor_model_parallel_rank() == 0:
+    if tp_group.rank() == 0:
         offset = 0
         for key in keys:
             assert data[key].dim() < max_dim, 'you should increase MAX_DATA_DIM'
@@ -41,14 +37,11 @@ def _build_key_size_numel_dictionaries(keys, data):
     # Move to GPU and broadcast.
     sizes_device = torch.tensor(sizes, dtype=torch.long, device=get_current_device())
     xm = get_xla_model()
+    group_ranks = torch.distributed.get_process_group_ranks(group=tp_group.process_group)
     if xm:
-        xm.collective_broadcast([sizes_device],
-                         get_tensor_model_parallel_src_rank(),
-                         groups=get_tensor_model_parallel_groups(), pin_layout=False)
+        xm.collective_broadcast([sizes_device], group_ranks[0], groups=tp_group.rank_groups, pin_layout=False)
     else:
-        torch.distributed.broadcast(
-            sizes_device, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
-        )
+        torch.distributed.broadcast(sizes_device, group_ranks[0], group=tp_group.process_group)
 
     # Move back to cpu and unpack.
     sizes_cpu = sizes_device.cpu()
@@ -73,7 +66,7 @@ def _build_key_size_numel_dictionaries(keys, data):
     return key_size, key_numel, total_numel
 
 
-def broadcast_data(keys, data, datatype):
+def broadcast_data(keys, data, datatype, tp_group=None):
     """Broadcast data from rank zero of each model parallel group to the
     members of the same model parallel group.
 
@@ -82,13 +75,14 @@ def broadcast_data(keys, data, datatype):
         data: data dictionary of string keys and cpu tensor values.
         datatype: torch data type of all tensors in data associated
                   with keys.
+        tp_group: the tensor model parallel group to broadcast to.
     """
     # Build (key, size) and (key, number of elements) dictionaries along
     # with the total number of elements on all ranks.
     key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys, data)
-
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
     # Pack on rank zero.
-    if get_tensor_model_parallel_rank() == 0:
+    if tp_group.rank() == 0:
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
@@ -98,14 +92,11 @@ def broadcast_data(keys, data, datatype):
 
     # Broadcast
     xm = get_xla_model()
+    group_ranks = torch.distributed.get_process_group_ranks(group=tp_group.process_group)
     if xm:
-        xm.collective_broadcast([flatten_data],
-                         get_tensor_model_parallel_src_rank(),
-                         groups=get_tensor_model_parallel_groups(), pin_layout=False)
+        xm.collective_broadcast([flatten_data], group_ranks[0], groups=tp_group.rank_groups, pin_layout=False)
     else:
-        torch.distributed.broadcast(
-            flatten_data, get_tensor_model_parallel_src_rank(), group=get_tensor_model_parallel_group()
-        )
+        torch.distributed.broadcast(flatten_data, group_ranks[0], group=tp_group.process_group)
 
     # Unpack
     output = {}

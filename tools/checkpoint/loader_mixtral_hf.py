@@ -8,6 +8,8 @@ import transformers
 from tqdm import tqdm
 import types
 
+from tools.checkpoint.utils import _ConverterFakeProcessGroup
+
 
 def add_arguments(parser):
     group = parser.add_argument_group(title='Mixtral HF loader.')
@@ -238,6 +240,12 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     mpu.set_expert_model_parallel_world_size(margs.expert_model_parallel_size)
+    
+    # For backward compatibility during local parallel states refactoring
+    fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
+    fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
+    mpu._TENSOR_MODEL_PARALLEL_GROUP = fake_tp_group
+    mpu._EXPERT_MODEL_PARALLEL_GROUP = fake_ep_group
     fused_kernels.load(margs)
 
     # Metadata.
