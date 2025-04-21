@@ -516,6 +516,9 @@ class TransformerConfig(ModelParallelConfig):
 
     mamba_num_groups: int = 8
     """The number of groups used in Mamba layers."""
+    
+    use_fused_swiglu: bool = False
+    """If True, the SwiGLU activation function will be fused with the linear layer in the MLP."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
