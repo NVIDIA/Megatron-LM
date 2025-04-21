@@ -233,6 +233,7 @@ def initialize_rng_tracker(
     use_te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
+    force_reset: bool = False,
 ):
     """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
     Megatron or TransformerEngine's implementation.
@@ -240,6 +241,10 @@ def initialize_rng_tracker(
     """
     global _CUDA_RNG_STATE_TRACKER
     global _CUDA_RNG_STATE_TRACKER_INITIALIZED
+    if force_reset:
+        _CUDA_RNG_STATE_TRACKER = None
+        _CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+
     if _CUDA_RNG_STATE_TRACKER_INITIALIZED:
         return
 
