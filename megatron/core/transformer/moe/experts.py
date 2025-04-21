@@ -138,11 +138,11 @@ class GroupedMLP(MegatronModule):
 
         self.activation_func_with_probs = activation_func_with_probs
 
-        self.ep_group = model_comm_pgs.ep_group
+        self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
-        self.tp_group = model_comm_pgs.expt_tp_group
+        self.tp_group = model_comm_pgs.expt_tp
         # use model_comm_pgs.expt_dp_group as data parallel group in this module.
-        self.dp_group = model_comm_pgs.expt_dp_group
+        self.dp_group = model_comm_pgs.expt_dp
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
@@ -668,7 +668,7 @@ class TEGroupedMLP(MegatronModule):
             config.add_bias_linear == False
         ), "bias not supported in TEGroupedMLP yet, please set '--disable-bias-linear' instead."
 
-        self.ep_group = model_comm_pgs.ep_group
+        self.ep_group = model_comm_pgs.ep
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = self.config.moe_ffn_hidden_size
@@ -863,9 +863,10 @@ class SequentialMLP(MegatronModule):
         self.add_bias = config.add_bias_linear
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
-        self.ep_group = model_comm_pgs.ep_group
+        self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_dp_group as data parallel group in this module.
-        self.dp_group = model_comm_pgs.expt_dp_group
+        # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
+        self.dp_group = model_comm_pgs.expt_dp
 
         for _ in range(self.num_local_experts):
             expert = MLP(

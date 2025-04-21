@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -16,10 +17,18 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, is_te_min_version, make_viewless_tensor
+from megatron.core.utils import (
+    deprecate_inference_params,
+    is_te_min_version,
+    log_single_rank,
+    make_viewless_tensor,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def get_transformer_layer_offset(config: TransformerConfig):
@@ -248,7 +257,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
-        model_comm_pgs: ModelCommProcessGroups = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         super().__init__(config=config)
 
@@ -342,7 +351,30 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             eps=self.config.layernorm_epsilon,
         )
         # [Module 8: MLP block]
-        self.mlp = build_module(submodules.mlp, config=self.config)
+        additional_mlp_kwargs = {}
+        # import here to avoid circular import
+        from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        # MLP expects tp_group but MoELayer expects model_comm_pgs to be passed in.
+        # We can change MLP to accept model_comm_pgs but it makes the logic implicit
+        # The conditional below is to make the logic explicit
+        # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
+        if isinstance(submodules.mlp, ModuleSpec):
+            if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
+                additional_mlp_kwargs["model_comm_pgs"] = model_comm_pgs
+            elif submodules.mlp.module == MLP:
+                assert hasattr(
+                    model_comm_pgs, 'tp'
+                ), 'TP process group is required for MLP in TransformerLayer'
+                additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
+            else:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Unknown MLP type: {type(submodules.mlp)}. Using default kwargs.",
+                )
+        self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
@@ -359,7 +391,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 if not isinstance(self.pre_mlp_layernorm, IdentityOp):
                     self.recompute_pre_mlp_layernorm = True
             if "mlp" in self.config.recompute_modules:
-                from megatron.core.transformer.moe.moe_layer import MoELayer
 
                 if not isinstance(self.mlp, MoELayer):
                     self.recompute_mlp = True
