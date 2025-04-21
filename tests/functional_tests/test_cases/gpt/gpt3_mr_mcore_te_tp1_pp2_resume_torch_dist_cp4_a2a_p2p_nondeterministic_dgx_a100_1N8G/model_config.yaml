@@ -39,7 +39,7 @@ MODEL_ARGS:
   --pipeline-model-parallel-size: 2
   --context-parallel-size: 4
   --cp-comm-type: a2a+p2p
-  --hierarchical-context-parallel-sizes: 2 2
+  --hierarchical-context-parallel-sizes: "[2 2]"
   --sequence-parallel: true
   --hidden-dropout: 0.0
   --attention-dropout: 0.0
@@ -48,7 +48,7 @@ MODEL_ARGS:
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
-  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
   --attention-backend: flash

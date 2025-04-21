@@ -26,6 +26,7 @@ if not RO_API_TOKEN:
 REQUIRED_REVIEWERS = {
     "final_reviewers": [
         "jcasper@nvidia.com",
+        "dnarayanan@nvidia.com",
         "eharper@nvidia.com",
         "shanmugamr@nvidia.com",
         "yuya@nvidia.com",
@@ -178,7 +179,7 @@ def get_required_reviewers(mr):
     review_group = [
         reviewer
         for reviewer in review_group
-        if reviewer in assigned_reviewers and reviewer not in approved_users
+        if (reviewer in assigned_reviewers) and (reviewer not in approved_users)
     ]
 
     if review_group is None or len(review_group) == 0:

@@ -1846,7 +1846,7 @@ def is_inside_decoder(rank=None) -> bool:
     return False
 
 
-def get_pipeline_model_parallel_decoder_start() -> int:
+def get_pipeline_model_parallel_decoder_start() -> Optional[int]:
     """Return decoder start rank (if encoder pipeline parallelism is set)."""
     global _PIPELINE_MODEL_PARALLEL_DECODER_START
     return _PIPELINE_MODEL_PARALLEL_DECODER_START

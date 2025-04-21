@@ -2076,6 +2076,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         an intermediary.
         """
         if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer.update_fp32_param_by_new_param()
             return
 
         if self.ddp_config.use_custom_fsdp:

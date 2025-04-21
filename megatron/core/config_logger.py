@@ -11,10 +11,12 @@ from megatron.core import parallel_state
 
 
 def get_config_logger_path(config):
+    """Get the path to the config logger directory."""
     return getattr(config, 'config_logger_dir', '')
 
 
 def has_config_logger_enabled(config):
+    """Check if config logger is enabled."""
     return get_config_logger_path(config) != ''
 
 
@@ -43,6 +45,10 @@ def get_path_with_count(path):
 
 
 class JSONEncoderWithMcoreTypes(json.JSONEncoder):
+    """
+    Custom JSON encoder that serializes according to types in mcore.
+    """
+
     def default(self, o):
         if type(o).__name__ in ['function', 'ProcessGroup']:
             return str(o)
@@ -76,7 +82,7 @@ class JSONEncoderWithMcoreTypes(json.JSONEncoder):
             return str(o)
 
 
-def log_config_to_disk(config, dict_data, prefix=''):
+def log_config_to_disk(config, dict_data, prefix='', rank_str=''):
     """
     Encodes the input dict (dict_data) using the JSONEncoderWithMcoreTypes
     and dumps to disk, as specified via path
@@ -84,16 +90,20 @@ def log_config_to_disk(config, dict_data, prefix=''):
     path = get_config_logger_path(config)
     assert path is not None, 'Expected config_logger_dir to be non-empty in config.'
 
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
     if 'self' in dict_data:
         if prefix == '':
             prefix = type(dict_data['self']).__name__
         del dict_data['self']
 
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
+    # the caller of the funcion can decide the most informative string
+    # rank_str defaults to '0_0_0_0_0' format (tp_dp_cp_pp_ep ranks)
+    if rank_str == '':
+        rank_str = parallel_state.get_all_ranks()
 
-    rank = parallel_state.get_all_ranks()
-    path = get_path_with_count(os.path.join(path, f'{prefix}.rank_{rank}'))
+    path = get_path_with_count(os.path.join(path, f'{prefix}.rank_{rank_str}'))
     if type(dict_data).__name__ == 'OrderedDict':
         torch.save(dict_data, f'{path}.pth')
     else:

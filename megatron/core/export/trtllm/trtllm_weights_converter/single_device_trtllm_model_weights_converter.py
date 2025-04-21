@@ -10,6 +10,7 @@ from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
 from megatron.core.export.trtllm.trtllm_layers import NON_TRANSFORMER_LAYERS_NAMES, TRTLLMLayers
 from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_prefix as suffix
+from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -183,12 +184,7 @@ class SingleDeviceTRTLLMModelWeightsConverter:
             or layer_name.endswith(suffix(TRTLLMLayers.mlp_fc_bias))
             or layer_name.endswith(suffix(TRTLLMLayers.ffn_fc_weight))
         ):
-            split_gated_activation = self.activation in [
-                "swiglu",
-                "geglu",
-                "fast-swiglu",
-                "fast-geglu",
-            ]
+            split_gated_activation = is_gated_activation(self)
             if split_gated_activation:
                 val, gate = torch.chunk(val, 2, axis=-1)
                 gate_layer_name = layer_name.replace("fc", "gate")
