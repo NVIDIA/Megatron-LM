@@ -48,9 +48,9 @@ class BaseMoELayer(MegatronModule, ABC):
         super(BaseMoELayer, self).__init__(config)
         self.config = config
         self.layer_number = layer_number
-        self.ep_group = model_comm_pgs.ep_group
+        self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
-        self.tp_group = model_comm_pgs.expt_tp_group
+        self.tp_group = model_comm_pgs.expt_tp
         ep_size = self.ep_group.size()
         ep_rank = self.ep_group.rank()
         assert ep_size > 0, "Expected non-negative expert parallel size"

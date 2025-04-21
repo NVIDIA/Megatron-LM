@@ -782,11 +782,11 @@ def get_default_model_comm_pgs():
         ModelCommProcessGroups: The default process groups for MoE.
     """
     model_comm_pgs = ModelCommProcessGroups()
-    model_comm_pgs.ep_group = parallel_state.get_expert_model_parallel_group()
-    model_comm_pgs.tp_group = parallel_state.get_tensor_model_parallel_group()
-    model_comm_pgs.cp_group = parallel_state.get_context_parallel_group()
-    model_comm_pgs.expt_tp_group = parallel_state.get_expert_tensor_parallel_group()
-    model_comm_pgs.expt_dp_group = parallel_state.get_expert_data_parallel_group()
-    model_comm_pgs.tp_ep_group = parallel_state.get_expert_tensor_and_model_parallel_group()
-    model_comm_pgs.tp_cp_group = parallel_state.get_tensor_and_context_parallel_group()
+    model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group()
+    model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group()
+    model_comm_pgs.cp = parallel_state.get_context_parallel_group()
+    model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()
+    model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
+    model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
     return model_comm_pgs
