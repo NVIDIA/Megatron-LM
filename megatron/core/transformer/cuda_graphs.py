@@ -388,7 +388,10 @@ class _CudaGraphRunner(torch.nn.Module):
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
         from megatron.core.ssm.mamba_layer import MambaLayer
-        from megatron.core.transformer.transformer_layer import TransformerLayer
+        from megatron.core.transformer.transformer_layer import (
+            BaseTransformerLayer,
+            TransformerLayer,
+        )
 
         self.is_first_layer = None
         self.is_last_layer = None
@@ -397,10 +400,25 @@ class _CudaGraphRunner(torch.nn.Module):
             self.is_first_layer = True
             self.is_last_layer = True
         else:
-            if (
-                isinstance(base_module, TransformerLayer)
-                and isinstance(base_module.cross_attention, IdentityOp)
-            ) or isinstance(base_module, MambaLayer):
+            self.is_transformer_decoder_layer = False
+            self.reuse_input_output_buffer = False
+
+            # decides if this is an LLM layer
+            is_potential_decoder_layer = isinstance(
+                base_module, (TransformerLayer, BaseTransformerLayer, MambaLayer)
+            )
+
+            if is_potential_decoder_layer:
+                if isinstance(base_module, TransformerLayer) and not isinstance(
+                    base_module.cross_attention, IdentityOp
+                ):
+                    self.is_transformer_decoder_layer = False
+                else:
+                    self.is_transformer_decoder_layer = True
+            else:
+                self.is_transformer_decoder_layer = False
+
+            if self.is_transformer_decoder_layer:
                 self.reuse_input_output_buffer = True
                 total_num_layers = base_module.config.num_layers
                 pp_size = parallel_state.get_pipeline_model_parallel_world_size()
