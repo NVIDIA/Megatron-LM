@@ -230,7 +230,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
 
         # Permutation 1: input to AlltoAll input
         self.hidden_shape_before_permute = hidden_states.shape
-        if self.cuda_sync_point == "before_permutation_1":
+        if self.cuda_sync_point == "before_permutation_1" and torch.cuda.is_available():
             torch.cuda.current_stream().synchronize()
         (
             permutated_local_input_tokens,
@@ -239,7 +239,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         ) = permute(hidden_states, routing_map, probs=probs, num_out_tokens=self.num_out_tokens)
 
         # Perform expert parallel AlltoAll communication
-        if self.cuda_sync_point == "before_ep_alltoall":
+        if self.cuda_sync_point == "before_ep_alltoall" and torch.cuda.is_available():
             torch.cuda.current_stream().synchronize()
         global_input_tokens = tensor_parallel.all_to_all(
             self.ep_group, permutated_local_input_tokens, self.output_splits, self.input_splits
@@ -263,7 +263,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
             global_input_tokens = tensor_parallel.all_gather_last_dim_from_tensor_parallel_region(
                 global_input_tokens, group=self.tp_group
             )
-        if self.cuda_sync_point == "before_finish":
+        if self.cuda_sync_point == "before_finish" and torch.cuda.is_available():
             torch.cuda.current_stream().synchronize()
 
         return global_input_tokens, tokens_per_expert, global_probs

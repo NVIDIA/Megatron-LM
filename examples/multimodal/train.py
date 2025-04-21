@@ -5,8 +5,11 @@ import os
 import sys
 from functools import partial
 
+from megatron.core.device_utils import get_xla_model
 import torch
 import yaml
+
+from megatron.core.tensor_parallel.mappings import all_reduce
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -235,10 +238,10 @@ def scaled_loss_func(loss_mask, output_tensor):
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
 
     if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+        all_reduce(loss, group=mpu.get_context_parallel_group())
 
     reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
+    all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
@@ -264,11 +267,10 @@ def loss_func(loss_mask, output_tensor):
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
 
     if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+        all_reduce(loss, group=mpu.get_context_parallel_group())
 
     reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
+    all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
     # loss[0] is a view of loss, so it has ._base not None, which triggers assert error

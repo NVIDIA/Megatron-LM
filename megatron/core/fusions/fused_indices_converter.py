@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.utils import experimental_fn
 
 
@@ -160,13 +161,13 @@ class IndicesToMultihot(torch.autograd.Function):
         ), "indices and probs_indices must have the same shape"
         topk = indices.shape[1]
         multihot_indices = torch.empty(
-            (num_of_tokens, num_of_local_experts), dtype=torch.bool, device="cuda"
+            (num_of_tokens, num_of_local_experts), dtype=torch.bool, device=get_current_device()
         )
         probs_in_multihot = torch.empty(
-            (num_of_tokens, num_of_local_experts), dtype=probs_indices.dtype, device="cuda"
+            (num_of_tokens, num_of_local_experts), dtype=probs_indices.dtype, device=get_current_device()
         )
         position_map = torch.empty(
-            (num_of_tokens, num_of_local_experts), dtype=torch.int32, device="cuda"
+            (num_of_tokens, num_of_local_experts), dtype=torch.int32, device=get_current_device()
         )
         grid = (num_of_tokens,)
         _indices_to_multihot_kernel[grid](
@@ -208,7 +209,7 @@ class IndicesToMultihot(torch.autograd.Function):
 
         # Initialize the gradient of the indices and probs_indices
         grad_probs_indices = torch.empty(
-            (num_of_tokens, topk), dtype=grad_probs_in_multihot.dtype, device="cuda"
+            (num_of_tokens, topk), dtype=grad_probs_in_multihot.dtype, device=get_current_device()
         )
 
         grid = (num_of_tokens,)

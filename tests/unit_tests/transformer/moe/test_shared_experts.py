@@ -3,12 +3,14 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device, get_current_device_type, get_xla_model
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestSharedExperts:
 
@@ -18,11 +20,11 @@ class TestSharedExperts:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     def test_gpu_forward(self):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         print("done intializing")
         num_moe_experts = 2
         transformer_config = TransformerConfig(
@@ -51,20 +53,21 @@ class TestSharedExperts:
         num_weights = sum([p.numel() for p in self.moe_layer.parameters()])
         assert num_weights == 3480 + 1152
         assert self.moe_layer.shared_experts is not None
-        assert self.moe_layer.shared_experts.stream is None
+        if torch.cuda.is_available():
+            assert self.moe_layer.shared_experts.stream is None
         assert self.moe_layer.token_dispatcher.shared_experts is None
 
         moe_layer = self.moe_layer
-        moe_layer.cuda()
+        moe_layer.to(device=get_current_device())
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((32, 2, moe_layer.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         output, _ = moe_layer(hidden_states)
         assert output.shape[0] == 32
         assert output.shape[1] == 2
         assert output.shape[2] == moe_layer.config.hidden_size
         assert output.dtype == torch.float32
-        assert output.device.type == 'cuda'
+        assert output.device.type == get_current_device_type()
 
 
 class TestSharedExpertsOverlap:
@@ -75,11 +78,11 @@ class TestSharedExpertsOverlap:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     def test_gpu_forward(self):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         print("done intializing")
         num_moe_experts = 2
         transformer_config = TransformerConfig(
@@ -110,17 +113,18 @@ class TestSharedExpertsOverlap:
         num_weights = sum([p.numel() for p in self.moe_layer.parameters()])
         assert num_weights == 3480 + 1152
         assert self.moe_layer.shared_experts is not None
-        assert self.moe_layer.shared_experts.stream is not None
+        if torch.cuda.is_available():
+            assert self.moe_layer.shared_experts.stream is not None
         assert self.moe_layer.token_dispatcher.shared_experts is not None
 
         moe_layer = self.moe_layer
-        moe_layer.cuda()
+        moe_layer.to(device=get_current_device())
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((32, 2, moe_layer.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         output, _ = moe_layer(hidden_states)
         assert output.shape[0] == 32
         assert output.shape[1] == 2
         assert output.shape[2] == moe_layer.config.hidden_size
         assert output.dtype == torch.float32
-        assert output.device.type == 'cuda'
+        assert output.device.type == get_current_device_type()

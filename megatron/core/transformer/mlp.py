@@ -21,6 +21,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 
 # pylint: disable=missing-class-docstring
@@ -54,7 +55,7 @@ class MLP(MegatronModule):
         is_expert: bool = False,
         input_size: Optional[int] = None,
         ffn_hidden_size: int = None,
-        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        tp_group: Optional[WrappedProcessGroup] = None,
     ):
         super().__init__(config=config)
 
@@ -62,7 +63,7 @@ class MLP(MegatronModule):
 
         self.input_size = input_size if input_size != None else self.config.hidden_size
 
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert, wrapped=True)
         if ffn_hidden_size is None:
             if is_expert:
                 raise ValueError("MoE MLP requires `ffn_hidden_size`, but it was not provided.")

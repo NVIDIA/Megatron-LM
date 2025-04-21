@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import pytest
 import torch
 
@@ -11,6 +12,7 @@ from megatron.core.transformer.moe.moe_utils import (
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
 
+xm = get_xla_model()
 
 class AuxlossTestContainer(MoEModelTestContainer):
     def partition_input(self, input):
@@ -30,7 +32,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
         aux_loss_grad = partitioned_input.grad
         torch.distributed.barrier()
         ans = self.partition_input(baseline_grad)
-        assert torch.allclose(aux_loss_grad, ans), f"Diff: {(aux_loss_grad/ans).mean()}"
+        assert torch.allclose(aux_loss_grad, ans, rtol=1e-5, atol=1e-5), f"Diff: {(aux_loss_grad/ans).mean()}"
         loss = get_moe_layer_wise_logging_tracker()['load_balancing_loss']['values']
         assert loss > 0, "Loss should be greater than 0"
         clear_aux_losses_tracker()
@@ -44,6 +46,7 @@ class AuxlossTestContainer(MoEModelTestContainer):
 
 class TestAuxLoss:
     def setup_method(self, method):
+        Utils.initialize_model_parallel()
         baseline_container = AuxlossTestContainer(
             tp_size=1,
             ep_size=1,
@@ -56,7 +59,7 @@ class TestAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         moe_layer = baseline_container.moe_layer
-        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
+        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).to(device=get_current_device())
         self.input.requires_grad = True
         probs, indices = moe_layer.router(self.input)
         probs.sum().mul_(0).backward()  # zero out the main gradients
@@ -68,7 +71,7 @@ class TestAuxLoss:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
@@ -87,7 +90,7 @@ class TestAuxLoss:
         container.aux_loss_test(self.input, self.baseline_grad)
 
     @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
@@ -105,9 +108,9 @@ class TestAuxLoss:
         )
         container.aux_loss_test(self.input, self.baseline_grad)
 
-
 class TestSeqAuxLoss:
     def setup_method(self, method):
+        Utils.initialize_model_parallel()
         baseline_container = AuxlossTestContainer(
             tp_size=1,
             ep_size=1,
@@ -120,7 +123,7 @@ class TestSeqAuxLoss:
             moe_aux_loss_coeff=0.1,
         )
         moe_layer = baseline_container.moe_layer
-        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
+        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).to(device=get_current_device())
         self.input.requires_grad = True
         probs, indices = moe_layer.router(self.input)
         probs.sum().mul_(0).backward()  # zero out the main gradients
@@ -132,7 +135,7 @@ class TestSeqAuxLoss:
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )

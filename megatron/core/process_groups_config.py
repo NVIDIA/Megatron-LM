@@ -7,6 +7,7 @@ from typing import List, Optional
 
 import torch
 
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.core import parallel_state
 
 
@@ -41,40 +42,40 @@ class ModelCommProcessGroups:
     """
 
     # _TENSOR_MODEL_PARALLEL_GROUP
-    tp: torch.distributed.ProcessGroup = field(init=False)
+    tp: WrappedProcessGroup = field(init=False)
 
     # _PIPELINE_MODEL_PARALLEL_GROUP
-    pp: torch.distributed.ProcessGroup = field(init=False)
+    pp: WrappedProcessGroup = field(init=False)
 
     # _MODEL_PARALLEL_GROUP
-    mp: torch.distributed.ProcessGroup = field(init=False)
+    mp: WrappedProcessGroup = field(init=False)
 
     # _EMBEDDING_GROUP
-    embd: torch.distributed.ProcessGroup = field(init=False)
+    embd: WrappedProcessGroup = field(init=False)
 
     # _POSITION_EMBEDDING_GROUP
-    pos_embd: torch.distributed.ProcessGroup = field(init=False)
+    pos_embd: WrappedProcessGroup = field(init=False)
 
     # _CONTEXT_PARALLEL_GROUP
-    cp: torch.distributed.ProcessGroup = field(init=False)
+    cp: WrappedProcessGroup = field(init=False)
 
     # _TENSOR_AND_CONTEXT_PARALLEL_GROUP
-    tp_cp: torch.distributed.ProcessGroup = field(init=False)
+    tp_cp: WrappedProcessGroup = field(init=False)
 
     # _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
-    hcp: List[torch.distributed.ProcessGroup] = field(init=False)
+    hcp: List[WrappedProcessGroup] = field(init=False)
 
     # _EXPERT_MODEL_PARALLEL_GROUP
-    ep: torch.distributed.ProcessGroup = field(init=False)
+    ep: WrappedProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_PARALLEL_GROUP
-    expt_tp: torch.distributed.ProcessGroup = field(init=False)
+    expt_tp: WrappedProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
-    tp_ep: torch.distributed.ProcessGroup = field(init=False)
+    tp_ep: WrappedProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
-    tp_ep_pp: torch.distributed.ProcessGroup = field(init=False)
+    tp_ep_pp: WrappedProcessGroup = field(init=False)
 
     def __init__(self, **kwargs):
         for key in kwargs:
@@ -82,7 +83,7 @@ class ModelCommProcessGroups:
                 setattr(self, key, kwargs[key])
             else:
                 raise ValueError(f"Unknown attribute: {key}")
-
+      
     @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """
@@ -104,7 +105,7 @@ class ModelCommProcessGroups:
         invalid_pgs = [pg for pg in required_pgs if pg not in all_pgs]
         if invalid_pgs:
             raise ValueError(f"Invalid process groups requested: {invalid_pgs}")
-
+  
         # Mapping of attribute names to their initialization functions
         pg_to_func = {
             'tp': parallel_state.get_tensor_model_parallel_group,
@@ -122,7 +123,7 @@ class ModelCommProcessGroups:
         }
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group
-        init_dict = {pg: pg_to_func[pg](False) for pg in required_pgs}
+        init_dict = {pg: pg_to_func[pg](check_initialized=False, wrapped=True) for pg in required_pgs}
 
         return cls(**init_dict)
 

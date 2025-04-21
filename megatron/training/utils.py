@@ -6,6 +6,7 @@ import os
 import sys
 from datetime import datetime
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 try:
@@ -17,17 +18,21 @@ except ImportError:
     except ImportError:
 
         import warnings
-        warnings.warn(
-            f'Transformer Engine and Apex are not installed. '
-            'Falling back to local implementations of '
-            'multi_tensor_applier and multi_tensor_l2norm'
-        )
+
+        if torch.cuda.is_available():
+            warnings.warn(
+                f'Transformer Engine and Apex are not installed. '
+                'Falling back to local implementations of '
+                'multi_tensor_applier and multi_tensor_l2norm'
+            )
 
         from megatron.core.utils import (
             local_multi_tensor_l2_norm as multi_tensor_l2norm,
             local_multi_tensor_applier as multi_tensor_applier,
         )
 
+from megatron.core.tensor_parallel.mappings import all_reduce
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.training import (
     get_args,
     get_adlr_autoresume,
@@ -51,6 +56,7 @@ try:
 except ImportError:
     ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
 
+xm = get_xla_model()
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     return_list = True
@@ -115,7 +121,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
                         params_data.append(param.data)
 
     # Calculate norm.
-    dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+    dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
     if len(params_data) > 0:
         norm, _ = multi_tensor_applier(
             multi_tensor_l2norm,
@@ -125,18 +131,17 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         norm_2 = norm * norm
     else:
-        norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+        norm_2 = torch.zeros((1,), dtype=torch.float32, device=get_current_device())
 
-    if data_parallel_group is not None:
-        torch.distributed.all_reduce(norm_2,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=data_parallel_group)
+    if data_parallel_group:
+        group = WrappedProcessGroup(process_group=data_parallel_group)
+        all_reduce(tensor=norm_2, group=group)
 
     # Add norm contribution from params with sharded main_params. These norms need to be
     # accumulated across the DP group since the main parameters are sharded because
     # of distributed optimizer.
     if len(sharded_params_data) > 0:
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int,device=get_current_device())
         sharded_norm, _ = multi_tensor_applier(
             multi_tensor_l2norm,
             dummy_overflow_buf,
@@ -145,11 +150,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         )
         sharded_norm_2 = sharded_norm * sharded_norm
         # Sum over all DP groups.
-        torch.distributed.all_reduce(
-            sharded_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=mpu.get_data_parallel_group()
-        )
+        all_reduce(tensor=sharded_norm_2, group=mpu.get_data_parallel_group())
         norm_2 += sharded_norm_2
 
     if custom_fsdp_all_param_is_shared:
@@ -168,9 +169,8 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         moe_norm_2 = moe_norm * moe_norm
 
         if custom_fsdp_all_param_is_shared:
-            torch.distributed.all_reduce(moe_norm_2,
-                                        op=torch.distributed.ReduceOp.SUM,
-                                        group=mpu.get_expert_data_parallel_group())
+            all_reduce(tensor=moe_norm_2, group=mpu.get_expert_data_parallel_group())
+            
     # Account for MoE norm even if current rank doesn't have any expert params to prevent
     # hang in models with un-even numbers of MoE layers.
     # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
@@ -188,23 +188,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # If dense and expert reduce groups are the same, sum then reduce.
     if ranks_in_dense_reduce_group == ranks_in_expert_reduce_group:
         norm_2 += moe_norm_2
-        torch.distributed.all_reduce(
-            norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=dense_reduce_group
-        )
+        all_reduce(tensor=norm_2, group=dense_reduce_group)
+        
     # If dense and expert reduce groups are different, reduce then sum.
     else:
-        torch.distributed.all_reduce(
-            norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=dense_reduce_group
-        )
-        torch.distributed.all_reduce(
-            moe_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=expert_reduce_group
-        )
+        all_reduce(tensor=norm_2, group=dense_reduce_group)
+        all_reduce(tensor=moe_norm_2, group=expert_reduce_group)
         norm_2 += moe_norm_2
 
     return norm_2.item() ** 0.5
@@ -214,8 +203,7 @@ def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
     averaged_losses = torch.cat(
         [loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(averaged_losses,
-                                 group=mpu.get_data_parallel_group())
+    all_reduce(tensor=averaged_losses, group=mpu.get_data_parallel_group())
     averaged_losses = averaged_losses / \
         torch.distributed.get_world_size(group=mpu.get_data_parallel_group())
 
@@ -232,10 +220,8 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
     """
     if stat is None:
         stat = -1.0
-    stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
-    )
+    stat = torch.tensor([stat], dtype=torch.float32, device=get_current_device())
+    all_reduce(tensor=stat, group=mpu.get_model_parallel_group(), op=torch.distributed.ReduceOp.MAX)
     if stat.item() == -1.0:
         return None
     else:
@@ -250,15 +236,17 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
         input = 1
     else:
         input = 0
-    input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
-    )
+    input = torch.tensor([input], dtype=torch.int, device=get_current_device())
+    all_reduce(tensor=input, group=mpu.get_model_parallel_group(), op=torch.distributed.ReduceOp.MIN)
     return bool(input.item())
 
 
 def report_memory(name):
     """Simple GPU memory report."""
+
+    if not torch.cuda.is_available():
+        return
+    
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
     string += ' | allocated: {}'.format(
@@ -469,7 +457,15 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     def _broadcast(item):
        if item is not None:
-           torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), group=mpu.get_tensor_model_parallel_group())
+            xm = get_xla_model()
+            if xm:
+                xm.collective_broadcast([item],
+                                mpu.get_tensor_model_parallel_src_rank(),
+                                groups=mpu.get_tensor_model_parallel_groups(), 
+                                pin_layout=False)
+            else:
+                torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), 
+                                            group=mpu.get_tensor_model_parallel_group())
 
     if mpu.get_tensor_model_parallel_rank() == 0:
 
@@ -479,11 +475,11 @@ def get_batch_on_this_tp_rank(data_iterator):
            data = None
 
        batch = {
-           'tokens': data["tokens"].cuda(non_blocking = True),
-           'labels': data["labels"].cuda(non_blocking = True),
-           'loss_mask': data["loss_mask"].cuda(non_blocking = True),
-           'attention_mask': None if "attention_mask" not in data else data["attention_mask"].cuda(non_blocking = True),
-           'position_ids': data["position_ids"].cuda(non_blocking = True)
+           'tokens': data["tokens"].to(get_current_device()),
+           'labels': data["labels"].to(get_current_device()),
+           'loss_mask': data["loss_mask"].to(get_current_device()),
+           'attention_mask': None if "attention_mask" not in data else data["attention_mask"].to(get_current_device()),
+           'position_ids': data["position_ids"].to(get_current_device())
        }
 
        if args.pipeline_model_parallel_size == 1:
@@ -511,16 +507,16 @@ def get_batch_on_this_tp_rank(data_iterator):
 
     else:
 
-       tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-       labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
-       loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = torch.cuda.current_device())
+       tokens=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = get_current_device())
+       labels=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = get_current_device())
+       loss_mask=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.float32 , device = get_current_device())
        if args.create_attention_mask_in_dataloader:
            attention_mask=torch.empty(
-                (args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = torch.cuda.current_device()
+                (args.micro_batch_size,1,args.seq_length,args.seq_length), dtype = torch.bool , device = get_current_device()
             )
        else:
            attention_mask=None
-       position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = torch.cuda.current_device())
+       position_ids=torch.empty((args.micro_batch_size,args.seq_length), dtype = torch.int64 , device = get_current_device())
 
        if args.pipeline_model_parallel_size == 1:
            _broadcast(tokens)

@@ -1,10 +1,27 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.extensions.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
+import torch
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+try: 
+    from megatron.core.extensions.transformer_engine import (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    HAVE_TE= True
+except ImportError: 
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    import warnings
+
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
+    
+    HAVE_TE = False
+
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -30,12 +47,12 @@ except ImportError:
     warnings.warn('Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 
-
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
-    '''
-    Returns ViT layer spec with Transformer Engine layers
-    '''
+
+    if not HAVE_TE:
+        return get_vit_layer_with_local_spec()
+    
     mlp = _get_mlp_module_spec(use_te=True)
     return ModuleSpec(
         module=TransformerLayer,
@@ -81,7 +98,6 @@ def get_vit_layer_with_local_spec() -> ModuleSpec:
             mlp_bda=get_bias_dropout_add,
         ),
     )
-
 
 # Helper function to get module spec for MLP/MoE
 def _get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:

@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.device_utils import get_xla_model, get_current_device
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
@@ -17,6 +18,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
 
+xm = get_xla_model()
 
 class DotProductAttention(MegatronModule):
     """
@@ -153,9 +155,15 @@ class DotProductAttention(MegatronModule):
         key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
-        )
+        if xm:
+            matmul_input_buffer = torch.empty(
+                (output_size[0] * output_size[1], output_size[2], output_size[3]), 
+                dtype=query.dtype, device=get_current_device(), requires_grad=False
+            )
+        else:
+            matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+                (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu"
+            )
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
@@ -180,7 +188,7 @@ class DotProductAttention(MegatronModule):
         # seem a bit unusual, but is taken from the original Transformer paper.
 
         if not self.config.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
+            with tensor_parallel.get_device_rng_tracker().fork():
                 attention_probs = self.attention_dropout(attention_probs)
         else:
             attention_probs = self.attention_dropout(attention_probs)
@@ -214,4 +222,5 @@ class DotProductAttention(MegatronModule):
         new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
         context = context.view(*new_context_shape)
 
+            
         return context

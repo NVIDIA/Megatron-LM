@@ -7,6 +7,7 @@
 from abc import ABC
 import csv
 from collections import OrderedDict
+from megatron.core.device_utils import get_current_device
 import numpy as np
 
 import torch
@@ -29,10 +30,10 @@ def get_nq_dataset(qa_data, split):
 
 
 def process_nq_batch(batch):
-    query_tokens = batch['token_ids'].long().cuda()
-    query_mask = (batch['token_mask'] < 0.5).cuda()
-    query_types = batch['token_types'].long().cuda()
-    query_len = batch['seq_len'].long().cuda()
+    query_tokens = batch['token_ids'].long().to(device=get_current_device())
+    query_mask = (batch['token_mask'] < 0.5).to(device=get_current_device())
+    query_types = batch['token_types'].long().to(device=get_current_device())
+    query_len = batch['seq_len'].long().to(device=get_current_device())
     reference = batch['reference']
 
     return query_tokens, query_mask, query_types, query_len, reference

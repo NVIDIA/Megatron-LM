@@ -5,6 +5,7 @@ from functools import lru_cache
 from operator import itemgetter
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 from megatron.core import parallel_state
@@ -29,7 +30,7 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
 @lru_cache(maxsize=32)
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
-    return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
+    return torch.triu(torch.ones(sq, sq, device=get_current_device()), diagonal=1).bool()
 
 
 # pylint: disable=missing-function-docstring

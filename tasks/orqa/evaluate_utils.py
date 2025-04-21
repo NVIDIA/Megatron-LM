@@ -1,5 +1,7 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.device_utils import get_local_device_count
 import torch
 
 from megatron.training import get_args, print_rank_0
@@ -109,23 +111,30 @@ class ORQAEvaluator(object):
                                                                     split)
         local_rank = args.local_rank
         rank = torch.distributed.get_rank()
-        device_count = torch.cuda.device_count()
+        device_count = get_local_device_count()
         num_nodes = torch.distributed.get_world_size() // device_count
         node_id = rank // device_count
 
+        groups = []
         for node in range(num_nodes):
             start_rank = node * device_count
             end_rank = (node + 1) * device_count
             ranks_list = list(range(start_rank, end_rank))
+
+            groups.append(ranks_list)
             node_group = create_group(ranks=ranks_list, group_desc=f'QA_EVALUATOR_NODE_GROUP')
 
             if node_id == node:
                 device_start_rank = start_rank
                 group = node_group
-        
-        input_ = torch.empty_like(query_tensor).copy_(query_tensor).detach_()
-        tensor_list = [torch.empty_like(input_) for _ in range(device_count)]
-        torch.distributed.all_gather(tensor_list, query_tensor, group=group)
+                
+        xm = get_xla_model()
+        if xm:
+            tensor_list = list(xm.all_gather(query_tensor, groups=groups, pin_layout=False).split(query_tensor.size()[0]), pin_layout=False)
+        else:
+            input_ = torch.empty_like(query_tensor).copy_(query_tensor).detach_()
+            tensor_list = [torch.empty_like(input_) for _ in range(device_count)]
+            torch.distributed.all_gather(tensor_list, query_tensor, group=group)
 
         if local_rank == 0 and self.mips_index is not None:
             all_query_tensor = torch.cat(tensor_list, dim=0).contiguous()
@@ -133,19 +142,30 @@ class ORQAEvaluator(object):
             distance, topkindex = self.mips_index.search_mips_index(
                 all_query_tensor, top_k=args.faiss_topk_retrievals, 
                 reconstruct=False)
-            distance = torch.from_numpy(distance).cuda()
-            topkindex = torch.LongTensor(topkindex).cuda()
+            distance = torch.from_numpy(distance).to(device=get_current_device())
+            topkindex = torch.LongTensor(topkindex).to(device=get_current_device())
 
         if local_rank != 0:
             distance = torch.empty(device_count * len(query_tensor), \
-                args.faiss_topk_retrievals, dtype=torch.float32).cuda()
+                args.faiss_topk_retrievals, dtype=torch.float32).to(device=get_current_device())
             topkindex = torch.empty(device_count * len(query_tensor), \
-                args.faiss_topk_retrievals, dtype=torch.int64).cuda()
+                args.faiss_topk_retrievals, dtype=torch.int64).to(device=get_current_device())
 
-        torch.distributed.broadcast(distance, src=device_start_rank, \
-            group=group)
-        torch.distributed.broadcast(topkindex, src=device_start_rank, \
-            group=group)
+        xm = get_xla_model()
+        if xm:
+            xm.collective_broadcast([distance],
+                            device_start_rank,
+                            groups=groups, 
+                            pin_layout=False)
+            xm.collective_broadcast([topkindex],
+                            device_start_rank,
+                            groups=groups, 
+                            pin_layout=False)
+        else:
+            torch.distributed.broadcast(distance, src=device_start_rank, \
+                group=group)
+            torch.distributed.broadcast(topkindex, src=device_start_rank, \
+                group=group)
 
         distance = torch.split(distance, len(query_tensor), dim=0)\
             [local_rank]

@@ -3,12 +3,13 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -17,6 +18,11 @@ from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+    HAVE_TE =True
+except ImportError:
+    HAVE_TE = False
 
 class TestMoELayerInit:
     def setup_method(self, method):
@@ -110,9 +116,15 @@ class TestMoELayerInit:
             bf16=True,
             params_dtype=torch.bfloat16,
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
-        )
+
+        if HAVE_TE:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
+            )
+        else:
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=grouped_gemm
+            )
 
         # Fake initialization as NeMo does
         Utils.fake_initialize_model_parallel(
@@ -120,7 +132,7 @@ class TestMoELayerInit:
         )
         moe_layer = MoELayer(
             transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        ).cuda()
+        ).to(device=get_current_device())
 
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, expert_model_parallel_size=ep_size
@@ -128,7 +140,7 @@ class TestMoELayerInit:
         _set_random_seed(seed_=123, data_parallel_random_init=False)
 
         input_data = torch.randn(
-            16, 4, hidden_size, device=torch.cuda.current_device(), dtype=torch.bfloat16
+            16, 4, hidden_size, device=get_current_device(), dtype=torch.bfloat16
         )
         output = moe_layer(input_data)
 
@@ -143,7 +155,7 @@ class TestInterleaveTransformerBlock:
     @pytest.mark.parametrize("moe_layer_freq", [2, eval("[0,1,1,1]"), eval("[0]*2+[1]*2")])
     def test_interleave_transformer_block(self, moe_layer_freq):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.transformer_config = TransformerConfig(
             num_layers=4,
             hidden_size=64,
@@ -176,13 +188,13 @@ class TestInterleaveTransformerBlock:
         config: TransformerConfig = parallel_transformer_block.config
         sequence_length = 32
         micro_batch_size = 2
-        parallel_transformer_block.cuda()
+        parallel_transformer_block.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones((sequence_length, micro_batch_size, config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
         hidden_states = parallel_transformer_block(
             hidden_states=hidden_states, attention_mask=attention_mask
         )

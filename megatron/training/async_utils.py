@@ -9,19 +9,24 @@ import logging
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue, AsyncRequest
 from megatron.training import get_args
 from megatron.training.utils import print_rank_0
+from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
 # Singleton manager of async calls
-# The default is `TemporalAsyncCaller`
-_async_calls_queue = AsyncCallsQueue()
+_async_calls_queue = None
 
 
 def init_persistent_async_worker():
     global _async_calls_queue
     # Recreate the async_calls_queue for persistent worker
     # This duplicate step is for backward compatiblity
-    _async_calls_queue = AsyncCallsQueue(persistent=True)
+    _async_calls_queue = AsyncCallsQueue(persistent=True, process_group=mpu.get_default_process_group())
+
+
+def init_temporal_async_worker():
+    global _async_calls_queue
+    _async_calls_queue = AsyncCallsQueue(process_group=mpu.get_default_process_group())
 
 
 def schedule_async_save(async_request: AsyncRequest):
@@ -30,6 +35,9 @@ def schedule_async_save(async_request: AsyncRequest):
     Args:
         async_request (AsyncRequest): the async save request.
     """
+    global _async_calls_queue
+    if _async_calls_queue is None:
+        _async_calls_queue = AsyncCallsQueue(process_group=mpu.get_default_process_group())
     _async_calls_queue.schedule_async_request(async_request)
 
 
@@ -47,6 +55,10 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
     if not args.async_save:
         return
 
+    global _async_calls_queue
+    if _async_calls_queue is None:
+        _async_calls_queue = AsyncCallsQueue(process_group=mpu.get_default_process_group())
+
     if blocking and not is_empty_async_queue():
         print_rank_0('Unfinalized async checkpoint saves. Finalizing them synchronously now.')
 
@@ -62,4 +74,5 @@ def is_empty_async_queue() -> bool:
     Returns:
         bool: True if there is any ongoing async call.
     """
-    return _async_calls_queue.get_num_unfinalized_calls() == 0
+    global _async_calls_queue
+    return _async_calls_queue is None or _async_calls_queue.get_num_unfinalized_calls() == 0

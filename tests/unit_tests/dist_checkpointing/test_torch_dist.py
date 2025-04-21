@@ -6,8 +6,11 @@ import pickle
 from copy import deepcopy
 from dataclasses import fields
 
+import pytest
 import torch
 
+from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
@@ -15,7 +18,9 @@ from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQu
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
+@pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
 class TestCachedMetadata:
     def setup_method(self, method):
         pass
@@ -46,30 +51,41 @@ class TestCachedMetadata:
 
         loaded_non_cached, loaded_cached = None, None
         md_non_cached, md_cached = None, None
-        with TempNamedDir(tmp_path_dist_ckpt / 'ckpt_dir') as ckpt_dir:
-            save(sharded_state_dict_non_cached, ckpt_dir, async_sharded_save=False)
-            loaded_non_cached = load(sharded_state_dict_non_cached, ckpt_dir)
+        with TempNamedDir(tmp_path_dist_ckpt / 'ckpt_dir', 
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
+            save(sharded_state_dict_non_cached, ckpt_dir, async_sharded_save=False, 
+                 process_group=parallel_state.get_default_process_group())
+            loaded_non_cached = load(sharded_state_dict_non_cached, ckpt_dir, 
+                                     process_group=parallel_state.get_default_process_group())
             md_path = ckpt_dir / '.metadata'
             with md_path.open('rb') as f:
                 md_non_cached = pickle.load(f)
 
-        save_strategy = deepcopy(get_default_save_sharded_strategy())
+        save_strategy = get_default_save_sharded_strategy()
+        save_pg = save_strategy.process_group
+        save_strategy.process_group = None
+        save_strategy = deepcopy(save_strategy)
         save_strategy.use_cached_ckpt_structure = True
+        save_strategy.process_group = save_pg
+
         # Run over 3 iterations with cached metadata enabled
         # The 3rd iteration will run with cached metadata
         # `ckpt_dir` at the 3rd iteration 2 will be maintained for comparison
         ckpt_dir = None
         for i in range(3):
-            ckpt_dir = TempNamedDir(tmp_path_dist_ckpt / f'ckpt_dir_${i}_cached')
+            ckpt_dir = TempNamedDir(tmp_path_dist_ckpt / f'ckpt_dir_${i}_cached',
+                                    process_group=parallel_state.get_default_process_group())
             save(
                 sharded_state_dict_cached,
                 ckpt_dir.__enter__(),
                 save_strategy,
                 async_sharded_save=False,
+                process_group=parallel_state.get_default_process_group()
             )
             if i < 2:
                 ckpt_dir.cleanup()
-        loaded_cached = load(sharded_state_dict_cached, ckpt_dir.__enter__())
+        loaded_cached = load(sharded_state_dict_cached, ckpt_dir.__enter__(), 
+                             process_group=parallel_state.get_default_process_group())
         md_path = ckpt_dir.__enter__() / '.metadata'
 
         with md_path.open('rb') as f:
@@ -99,8 +115,9 @@ class TestCPUTensors:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_cpu_tensors_dont_take_too_much_space(self, tmp_path_dist_ckpt):
-        large_cuda_tensor = torch.ones(1_000_000, dtype=torch.float, device='cuda')
+        large_cuda_tensor = torch.ones(1_000_000, dtype=torch.float, device=get_current_device())
         large_cpu_tensor = torch.ones(1_000_000, dtype=torch.float)
         # Create small tensors which are a view of a large tensor
         sharded_state_dict = {

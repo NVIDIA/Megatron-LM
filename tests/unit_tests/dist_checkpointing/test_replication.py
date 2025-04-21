@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.parallel_state import get_default_process_group
 from megatron.training.arguments import parse_args
 
 nvidia_resiliency_ext = pytest.importorskip(
@@ -18,6 +19,7 @@ nvidia_resiliency_ext = pytest.importorskip(
     reason="nvidia_resiliency_ext is required for local checkpointing tests",
 )
 
+from megatron.core.device_utils import get_current_device, get_distributed_backend, get_xla_model
 from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
     LocalCheckpointManager,
 )
@@ -36,6 +38,7 @@ from tests.unit_tests.dist_checkpointing import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 def equal_(a, b):
     def bool_generator():
@@ -51,24 +54,25 @@ def equal_(a, b):
 
     return all(bool_generator())
 
-
 @pytest.mark.parametrize(('tp,pp'), [(2, 4), (1, 1)])
 def test_all_gather_batch(tp, pp):
     Utils.initialize_model_parallel(tp, pp)
-    torch.cuda.set_device(dist.get_rank())
-    t0 = torch.arange(4, device="cuda").reshape((2, 2))
-    t1 = torch.arange(6, device="cuda").reshape((3, 1, 2))
-    t2 = torch.arange(12, device="cuda").reshape((2, 3, 2))
+    device = torch.device("cpu") if xm else get_current_device()
+    backend = None if xm is None else "gloo"
+    t0 = torch.arange(4, device=device).reshape((2, 2))
+    t1 = torch.arange(6, device=device).reshape((3, 1, 2))
+    t2 = torch.arange(12, device=device).reshape((2, 3, 2))
     test_ranks = [0, 3, 7]
-    test_group = GroupWrapper(dist.new_group(test_ranks))
-    rank = dist.get_rank()
-    if rank not in test_ranks:
-        dist.barrier()
-        return
-    batch = [[t1, t2], [t0], []]
-    pred_batch = test_group.all_gather_batch(batch[test_group.my_group_rank])
-    assert equal_(batch, pred_batch)
-    dist.barrier()
+    other_ranks = [ 1, 2, 4, 5, 6]
+    repl_groups = [ test_ranks, other_ranks]
+    repl_groups_init = [dist.new_group(ranks=g, backend=backend) for g in repl_groups]
+    my_process_group = GroupWrapper.from_list_of_groups(repl_groups_init)
+    rank = dist.get_rank(get_default_process_group())
+    if rank in test_ranks:
+        batch = [[t1, t2], [t0], []]
+        pred_batch = my_process_group.all_gather_batch(batch[my_process_group.my_group_rank])
+        assert equal_(batch, pred_batch)
+    dist.barrier(get_default_process_group())
 
 
 # TODO: Use mock local checkpointing?
@@ -107,12 +111,14 @@ class TestLocalCheckpointingReplication:
             mock_args.non_persistent_ckpt_type = 'local'
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
-            repl_groups_init = [dist.new_group(g) for g in repl_groups]
+            backend = None if xm is None else "gloo"
+            repl_groups_init = [dist.new_group(ranks=g, backend=backend) for g in repl_groups]
             my_process_group = GroupWrapper.from_list_of_groups(repl_groups_init)
             repl_strategy = CliqueReplicationStrategy(my_process_group, target_device="cpu")
             self.checkpointing_context = {
                 'local_checkpoint_manager': LocalCheckpointManager(
-                    self.local_ckpt_dir, repl_strategy=repl_strategy
+                    self.local_ckpt_dir, repl_strategy=repl_strategy,
+                    group = get_default_process_group()
                 )
             }
             self.local_ckpt_dir /= str(dist.get_rank())
@@ -136,15 +142,16 @@ class TestLocalCheckpointingReplication:
             )
             if async_save:
                 maybe_finalize_async_save(True)
+                torch.distributed.barrier(get_default_process_group())
 
-            my_group = [group for group in repl_groups if dist.get_rank() in group][0]
+            my_group = [group for group in repl_groups if dist.get_rank(get_default_process_group()) in group][0]
             assert {f"iter_0000001_{rank}_local.pt" for rank in my_group} == {
                 f.name for f in self.local_ckpt_dir.rglob("*")
             }
         with self.post_init(tmp_dir_per_class, tp, pp, async_save, algo, repl_groups):
 
             ranks_to_break = [6, 3, 4]
-            if dist.get_rank() in ranks_to_break:
+            if dist.get_rank(get_default_process_group()) in ranks_to_break:
                 rmtree(self.local_ckpt_dir)
                 os.makedirs(self.local_ckpt_dir)
 
@@ -158,6 +165,6 @@ class TestLocalCheckpointingReplication:
                 checkpointing_context=self.checkpointing_context,
             )
             assert iteration == 1
+            torch.distributed.barrier(get_default_process_group())
         # Perform cleanup to ensure no side effects on subsequent tests
-        torch.distributed.barrier()
         rmtree(self.local_ckpt_dir)

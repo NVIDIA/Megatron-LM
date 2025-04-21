@@ -26,6 +26,11 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import deprecate_inference_params
 
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE=False
 
 @dataclass
 class MLASelfAttentionSubmodules:
@@ -112,18 +117,31 @@ class MultiLatentAttention(Attention):
                 "'rope' and 'yarn'"
             )
 
-        self.core_attention = build_module(
-            submodules.core_attention,
-            config=self.config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type,
-            attention_type=self.attention_type,
-            softmax_scale=self.softmax_scale,
-            k_channels=self.q_head_dim,
-            v_channels=self.config.v_head_dim,
-            cp_comm_type=cp_comm_type,
-            model_comm_pgs=self.model_comm_pgs,
-        )
+        if HAVE_TE:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                k_channels=self.q_head_dim,
+                v_channels=self.config.v_head_dim,
+                cp_comm_type=cp_comm_type,
+                model_comm_pgs=self.model_comm_pgs,
+            )
+        else:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                softmax_scale=self.softmax_scale,
+                cp_comm_type=cp_comm_type,
+                model_comm_pgs=self.model_comm_pgs,
+            )
+        
 
         # Output.
         self.linear_proj = build_module(

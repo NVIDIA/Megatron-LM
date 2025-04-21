@@ -7,18 +7,18 @@ from typing import List, Optional
 import torch
 from packaging.version import Version as PkgVersion
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
 
 # Check if Transformer Engine is installed
-HAVE_TE = False
 try:
     import transformer_engine  # pylint: disable=W0611
 
     HAVE_TE = True
 except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
-    pass
+    HAVE_TE = False
 
 # Check if Transformer Engine has Float8Tensor class
 # Float8Tensor is used in delayed scaling before TE2.1
@@ -35,7 +35,7 @@ try:
     HAVE_TE_FLOAT8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # Float8Tensor not found
-    pass
+    Float8Tensor = None
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
@@ -174,7 +174,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
 
         # Update scaling factors.
         packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)
@@ -261,7 +261,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
 
         # Update scaling factors.
         packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)

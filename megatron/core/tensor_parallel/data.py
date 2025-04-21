@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
@@ -19,7 +20,7 @@ def _check_data_types(keys, data, target_dtype):
 
 def _build_key_size_numel_dictionaries(keys, data, tp_group=None):
     """Build the size on rank 0 and broadcast."""
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
     max_dim = _MAX_DATA_DIM
     sizes = [0 for _ in range(max_dim) for _ in keys]
 
@@ -34,12 +35,16 @@ def _build_key_size_numel_dictionaries(keys, data, tp_group=None):
             offset += max_dim
 
     # Move to GPU and broadcast.
-    sizes_cuda = torch.tensor(sizes, dtype=torch.long, device='cuda')
-    group_ranks = torch.distributed.get_process_group_ranks(group=tp_group)
-    torch.distributed.broadcast(sizes_cuda, group_ranks[0], group=tp_group)
+    sizes_device = torch.tensor(sizes, dtype=torch.long, device=get_current_device())
+    xm = get_xla_model()
+    group_ranks = torch.distributed.get_process_group_ranks(group=tp_group.process_group)
+    if xm:
+        xm.collective_broadcast([sizes_device], group_ranks[0], groups=tp_group.rank_groups, pin_layout=False)
+    else:
+        torch.distributed.broadcast(sizes_device, group_ranks[0], group=tp_group.process_group)
 
     # Move back to cpu and unpack.
-    sizes_cpu = sizes_cuda.cpu()
+    sizes_cpu = sizes_device.cpu()
     key_size = {}
     key_numel = {}
     total_numel = 0
@@ -75,19 +80,23 @@ def broadcast_data(keys, data, datatype, tp_group=None):
     # Build (key, size) and (key, number of elements) dictionaries along
     # with the total number of elements on all ranks.
     key_size, key_numel, total_numel = _build_key_size_numel_dictionaries(keys, data)
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
     # Pack on rank zero.
     if tp_group.rank() == 0:
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
-        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
+        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).to(device=get_current_device())
     else:
-        flatten_data = torch.empty(total_numel, device=torch.cuda.current_device(), dtype=datatype)
+        flatten_data = torch.empty(total_numel, device=get_current_device(), dtype=datatype)
 
     # Broadcast
-    group_ranks = torch.distributed.get_process_group_ranks(group=tp_group)
-    torch.distributed.broadcast(flatten_data, group_ranks[0], group=tp_group)
+    xm = get_xla_model()
+    group_ranks = torch.distributed.get_process_group_ranks(group=tp_group.process_group)
+    if xm:
+        xm.collective_broadcast([flatten_data], group_ranks[0], groups=tp_group.rank_groups, pin_layout=False)
+    else:
+        torch.distributed.broadcast(flatten_data, group_ranks[0], group=tp_group.process_group)
 
     # Unpack
     output = {}

@@ -73,11 +73,13 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         self,
         strategy: SaveShardedStrategy,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
         do_cache_distribution: bool = False,
     ):
         super().__init__(strategy.backend, strategy.version)
         self.base_strategy = strategy
         self.parallelization_group = parallelization_group
+        self.process_group = process_group
         self.do_cache_distribution = do_cache_distribution
 
         self.cached_distribution: Optional[ShardDistribution] = None
@@ -124,7 +126,11 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
         )
         if self.cached_distribution is None:
             # First time applying the parallelization
-            validate_sharding_integrity(determine_global_metadata(sharded_state_dict)[1])
+            global_metadata = determine_global_metadata(sharded_state_dict, process_group=self.process_group)[1]
+            validate_sharding_integrity(
+                global_metadata=global_metadata,
+                process_group=self.process_group
+            )
         if self.do_cache_distribution:
             self.cached_distribution = precomputed_distribution
         end = time()
@@ -265,8 +271,9 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
                     f'Missing shards after fully parallel loading: {missing_shards}'
                 )
 
-            with debug_time("torch.cuda.synchronize", logger):
-                torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                with debug_time("torch.cuda.synchronize", logger):
+                    torch.cuda.synchronize()
 
         all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
 
@@ -275,7 +282,8 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
             raise CheckpointingException(
                 f'Missing object shards after fully parallel loading: {missing_object_shards}'
             )
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
         self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)

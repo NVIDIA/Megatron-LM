@@ -4,6 +4,7 @@
 
 import math
 import einops
+from megatron.core.device_utils import get_current_device
 import torch
 import apex
 import torch.nn.functional as F
@@ -173,7 +174,7 @@ class VitBackbone(MegatronModule):
                     torch.randn(1, CLASS_TOKEN_LENGTH, self.hidden_size)
                 )
                 torch.nn.init.zeros_(self.cls_token)
-            self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
+            self.position_ids = torch.arange(self.seq_length).expand(1, -1).to(device=get_current_device())
 
             # Linear encoder
             self.linear_encoder = torch.nn.Linear(

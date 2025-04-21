@@ -6,6 +6,7 @@ from functools import partial
 import sys
 
 import math
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 import torch.nn.functional as F
 
@@ -21,15 +22,19 @@ from tasks.orqa.supervised.eval_utils import process_batch, task_collate_fn
 from tasks.orqa.evaluate_utils import ORQAEvaluator
 
 # input_ is a 2D tensor
-def check_and_append_tensor_for_gather(group, rank, world_size, input_):
+def check_and_append_tensor_for_gather(group, rank, world_size, input_, groups=None):
 
     # gather the size of the first dimension of the tensor from all ranks
     current_length = input_.size()[0]
     first_dim = torch.tensor([[current_length]], 
-        device=torch.cuda.current_device())
-    input_list = [torch.empty_like(first_dim) for _ in range(world_size)]
-    input_list[rank].copy_(first_dim)
-    torch.distributed.all_gather(input_list, first_dim, group=group)
+        device=get_current_device())
+    xm = get_xla_model()
+    if xm:
+        input_list = list(xm.all_gather(first_dim, groups=groups, pin_layout=False).split(first_dim.size()[0]), pin_layout=False)
+    else:
+        input_list = [torch.empty_like(first_dim) for _ in range(world_size)]
+        input_list[rank].copy_(first_dim)
+        torch.distributed.all_gather(input_list, first_dim, group=group)
     all_input_list = torch.cat(input_list, dim=0).contiguous()
     max_length = torch.max(all_input_list)
 
@@ -74,11 +79,11 @@ def orqa(Dataset):
 
         if neg_context_tokens is not None:
             neg_context_tokens = check_and_append_tensor_for_gather(group,
-                rank, world_size, neg_context_tokens)
+                rank, world_size, neg_context_tokens, groups=mpu.get_data_parallel_groups())
             neg_context_mask = check_and_append_tensor_for_gather(group,
-                rank, world_size, neg_context_mask)
+                rank, world_size, neg_context_mask, groups=mpu.get_data_parallel_groups())
             neg_context_types = check_and_append_tensor_for_gather(group,
-                rank, world_size, neg_context_types)
+                rank, world_size, neg_context_types, groups=mpu.get_data_parallel_groups())
 
         if neg_context_tokens is not None:
             context_tokens = torch.cat([context_tokens, neg_context_tokens])
@@ -103,11 +108,17 @@ def orqa(Dataset):
         query_logits, context_logits = output_tensor
 
         if world_size > 1:
+            xm = get_xla_model()
+            groups = mpu.get_data_parallel_groups()
             input_ = torch.empty_like(context_logits).copy_(\
                 context_logits).detach_()
-            tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-            tensor_list[rank].copy_(input_)
-            torch.distributed.all_gather(tensor_list, input_, group=group)
+           
+            if xm:
+                tensor_list = list(xm.all_gather(input_, groups=groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
+            else:
+                tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+                tensor_list[rank].copy_(input_)
+                torch.distributed.all_gather(tensor_list, input_, group=group)
 
             # Check if all-gather happens in order
             assert tensor_list[rank].sum().item() == \
@@ -120,9 +131,12 @@ def orqa(Dataset):
             # Query tensors
             input_ = torch.empty_like(query_logits).copy_(\
                 query_logits).detach_()
-            tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-            tensor_list[rank].copy_(input_)
-            torch.distributed.all_gather(tensor_list, input_, group=group)
+            if xm:
+                tensor_list = list(xm.all_gather(input_, groups=groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
+            else:
+                tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
+                tensor_list[rank].copy_(input_)
+                torch.distributed.all_gather(tensor_list, input_, group=group)
 
             # Check if all-gather happens in order
             assert tensor_list[rank].sum().item() == query_logits.sum().item()
@@ -149,10 +163,10 @@ def orqa(Dataset):
             for i in range(world_size):
                 j = i * local_context_size
                 labels.extend(list(range(j, j + local_batch_size)))
-            labels = torch.LongTensor(labels).cuda()
+            labels = torch.LongTensor(labels).to(device=get_current_device())
             assert len(labels) == global_batch_size
         else:
-            labels = torch.arange(global_batch_size).long().cuda()
+            labels = torch.arange(global_batch_size).long().to(device=get_current_device())
 
         # Cross-entropy loss.
         softmax_scores = F.log_softmax(retrieval_scores, dim=1)

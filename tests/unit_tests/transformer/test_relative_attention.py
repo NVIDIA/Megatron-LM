@@ -5,14 +5,14 @@ import torch
 import torch.nn.init as init
 
 from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestRelativePositionEmbedding:
     def setup_method(self):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.num_heads = 12
         self.relative_pos_emb = RelativePositionEmbedding(
             bidirectional=True,

@@ -2,17 +2,30 @@
 
 from typing import Optional, Set
 
+import numpy as np
 import torch
 
-try:
-    from torch.distributed import DeviceMesh
-    from torch.distributed._composable.fsdp import fully_shard
+from megatron.core.device_utils import (
+    get_current_device_type, 
+    get_xla_model, 
+    get_xla_runtime, 
+    get_xla_spmd
+)
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
+try:
+    from torch_xla.experimental.spmd_fully_sharded_data_parallel import (
+        SpmdFullyShardedDataParallel as fully_shard
+    )
     HAVE_FSDP = True
 except ImportError:
-    HAVE_FSDP = False
+    try:
+        from torch.distributed import DeviceMesh
+        from torch.distributed._composable.fsdp import fully_shard
 
-from torch.distributed import ProcessGroup
+        HAVE_FSDP = True
+    except ImportError:
+        HAVE_FSDP = False
 
 from megatron.core.fp8_utils import is_float8tensor
 
@@ -24,6 +37,9 @@ from ..transformer.transformer_layer import TransformerLayer
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
+xm = get_xla_model()
+xr = get_xla_runtime()
+xs = get_xla_spmd()
 
 class TorchFullyShardedDataParallel(_BaseDataParallel):
     """
@@ -63,7 +79,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
         },
-        process_group: Optional[ProcessGroup] = None,
+        group: Optional[WrappedProcessGroup] = None,
     ):
 
         assert (
@@ -72,13 +88,23 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         super().__init__(config=config, module=module)
 
-        if process_group is None:
-            self.process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        if group is None:
+            self.group = parallel_state.get_data_parallel_group(with_context_parallel=True, wrapped=True)
         else:
-            self.process_group = process_group
+            self.group = group
 
-        self.device_mesh = DeviceMesh.from_group(self.process_group, "cuda")
-        kwargs = {"mesh": self.device_mesh}
+        if xm:
+            # Define the mesh following common SPMD practice
+            num_devices = xr.global_runtime_device_count()
+            device_ids = np.array(range(num_devices))
+            mesh_shape = (len(self.group.rank_groups[0]), len(self.group.rank_groups))
+            # To be noted, the mesh must have an axis named 'fsdp', 
+            # # which the weights and activations will be sharded on.
+            self.mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'model'))
+            kwargs = {"mesh": self.mesh}
+        else:
+            self.mesh = DeviceMesh.from_group(self.group.process_group, get_current_device_type())
+            kwargs = {"mesh": self.mesh}
 
         def save_custom_attrs(module):
             custom_attrs = {}
