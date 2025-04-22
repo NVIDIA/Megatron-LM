@@ -8,6 +8,8 @@ from datetime import timedelta
 from functools import partial
 from typing import Callable, List, Optional
 
+import einops
+import numpy as np
 import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
@@ -48,6 +50,9 @@ _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
 _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 # Parallel state values changed on the fly
 _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
@@ -97,7 +102,7 @@ _CONTEXT_PARALLEL_GROUP = None
 # destination rank when exchanging KV/dKV between context parallel_ranks
 _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 # Hierarchical context parallel groups
-_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = []
+_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 
 # Data parallel group information with context parallel combined.
 _DATA_PARALLEL_GROUP_WITH_CP = None
@@ -107,13 +112,15 @@ _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = None
 # Partial Data parallel group information with context parallel combined.
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
-_INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = None
 
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
 
 # combined parallel group of TP, DP, and CP used for fp8
 _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = None
+
+# Paralel group of all GPUs in a distributed optimizer instance
+_INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
@@ -285,10 +292,16 @@ def generate_masked_orthogonal_rank_groups(
     return ranks
 
 
-def create_hierarchical_parallel_groups(
-    rank, ranks, group_size, hierarchical_group_sizes, pg_options
+def create_hierarchical_groups(
+    rank,
+    ranks,
+    hierarchical_group_sizes,
+    create_gloo_process_groups=False,
+    pg_options=None,
+    timeout=None,
+    group_desc=None,
 ):
-    """Create hierarchical groups for one parallelism.
+    """Create hierarchical groups for a set of ranks.
     Taking a group size of 16 as example, so we have a total of 16 GPUs denoted by g0 ... g15.
     If the hierarchical group sizes are [2,2,4], we use 2 GPUs in the first and second level
     of sub-groups, and 4 GPUs in the last level of sub groups. The present function will
@@ -302,25 +315,40 @@ def create_hierarchical_parallel_groups(
     """
 
     hierarchical_groups = []
-    accumulated_group_sizes = 1
-    processed_group_sizes = 1
-    for level, hierarchical_group_size in enumerate(hierarchical_group_sizes):
-        accumulated_group_sizes *= hierarchical_group_size
-        for k in range(group_size // accumulated_group_sizes):
-            for j in range(processed_group_sizes):
-                global_sub_ranks = [
-                    ranks[j + i * processed_group_sizes + k * accumulated_group_sizes]
-                    for i in range(hierarchical_group_size)
-                ]
-                sub_group = create_group(
-                    global_sub_ranks,
-                    pg_options=pg_options,
-                    group_desc=f'HIERARCHICAL_CONTEXT_PARALLEL_GROUP_L{level}',
+    hierarchical_groups_gloo = []
+    if not isinstance(pg_options, list):
+        pg_options = [pg_options] * len(hierarchical_group_sizes)
+    for level in range(len(hierarchical_group_sizes)):
+        rearranged_ranks = einops.rearrange(
+            np.array(ranks),
+            "(l s u) -> (l u) s",
+            u=int(np.prod(hierarchical_group_sizes[:level])),
+            s=hierarchical_group_sizes[level],
+            l=int(np.prod(hierarchical_group_sizes[level + 1 :])),
+        ).tolist()
+        for sub_ranks in rearranged_ranks:
+            sub_group = create_group(
+                sub_ranks,
+                timeout=timeout,
+                pg_options=pg_options[level],
+                group_desc=f'HIERARCHICAL_{group_desc}_L{level}',
+            )
+            if create_gloo_process_groups:
+                sub_group_gloo = create_group(
+                    sub_ranks,
+                    timeout=timeout,
+                    backend='gloo',
+                    pg_options=pg_options[level],
+                    group_desc=f'HIERARCHICAL_{group_desc}_GLOO_L{level}',
                 )
-                if rank in global_sub_ranks:
-                    hierarchical_groups.append(sub_group)
-        processed_group_sizes *= hierarchical_group_size
-    return hierarchical_groups
+            else:
+                sub_group_gloo = None
+            if rank in sub_ranks:
+                hierarchical_groups.append(sub_group)
+                hierarchical_groups_gloo.append(sub_group_gloo)
+    assert rank not in ranks or len(hierarchical_groups) == len(hierarchical_group_sizes)
+    assert rank not in ranks or len(hierarchical_groups_gloo) == len(hierarchical_group_sizes)
+    return hierarchical_groups, hierarchical_groups_gloo
 
 
 class RankGenerator(object):
@@ -786,7 +814,6 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
-    global _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
     for ranks in generator_wrapper('dp'):
@@ -838,54 +865,32 @@ def initialize_model_parallel(
             _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP = ranks_with_cp
 
         if num_distributed_optimizer_instances > 1:
-            # Create groups for Partial DistOpt, one for intra-partial DP domain
-            # Another for inter-partial DP domain
+            # Create groups for intra-partial DP domain
             for i in range(num_distributed_optimizer_instances):
-                intra_partial_data_parallel_ranks_with_cp = ranks_with_cp[
+                intra_partial_dp_ranks_with_cp = ranks_with_cp[
                     (i * intra_partial_data_parallel_size) : (
                         (i + 1) * intra_partial_data_parallel_size
                     )
                 ]
-
-                intra_partial_data_parallel_group_with_cp = create_group(
-                    intra_partial_data_parallel_ranks_with_cp,
+                intra_partial_dp_group_with_cp = create_group(
+                    intra_partial_dp_ranks_with_cp,
                     timeout=timeout,
                     pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
                     group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
                 )
                 if create_gloo_process_groups:
-                    intra_partial_data_parallel_group_with_cp_gloo = create_group(
-                        intra_partial_data_parallel_ranks_with_cp,
+                    intra_partial_dp_group_with_cp_gloo = create_group(
+                        intra_partial_dp_ranks_with_cp,
                         timeout=timeout,
                         backend="gloo",
                         group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
                     )
                 else:
-                    intra_partial_data_parallel_group_with_cp_gloo = None
-
-                if rank in intra_partial_data_parallel_ranks_with_cp:
-                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
-                        intra_partial_data_parallel_group_with_cp
-                    )
+                    intra_partial_dp_group_with_cp_gloo = None
+                if rank in intra_partial_dp_ranks_with_cp:
+                    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = intra_partial_dp_group_with_cp
                     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = (
-                        intra_partial_data_parallel_group_with_cp_gloo
-                    )
-
-            for i in range(intra_partial_data_parallel_size):
-                inter_partial_data_parallel_ranks_with_cp = ranks_with_cp[
-                    i::intra_partial_data_parallel_size
-                ]
-
-                inter_partial_data_parallel_group_with_cp = create_group(
-                    inter_partial_data_parallel_ranks_with_cp,
-                    timeout=timeout,
-                    pg_options=get_nccl_options('inter_dp_cp', nccl_comm_cfgs),
-                    group_desc='INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
-                )
-
-                if rank in inter_partial_data_parallel_ranks_with_cp:
-                    _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = (
-                        inter_partial_data_parallel_group_with_cp
+                        intra_partial_dp_group_with_cp_gloo
                     )
         else:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
@@ -926,14 +931,19 @@ def initialize_model_parallel(
             _CONTEXT_PARALLEL_GROUP = group
             _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
         if hierarchical_context_parallel_sizes:
+            assert np.prod(hierarchical_context_parallel_sizes) == context_parallel_size
             global _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
-            _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS += create_hierarchical_parallel_groups(
+            hierarchical_groups, _ = create_hierarchical_groups(
                 rank,
                 ranks,
-                context_parallel_size,
                 hierarchical_context_parallel_sizes,
-                get_nccl_options('hcp', nccl_comm_cfgs),
+                create_gloo_process_groups=False,
+                pg_options=get_nccl_options('hcp', nccl_comm_cfgs),
+                timeout=timeout,
+                group_desc='CONTEXT_PARALLEL_GROUP',
             )
+            if rank in ranks:
+                _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -1185,6 +1195,25 @@ def initialize_model_parallel(
     assert _EXPERT_DATA_PARALLEL_GROUP is None, 'Expert data group is already initialized'
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, 'Expert data group-gloo is already initialized'
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    assert (
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
+    ), 'Intra partial expert data group is already initialized'
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    assert (
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is None
+    ), 'Intra partial expert data group-gloo is already initialized'
+    global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    assert (
+        _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
+    ), 'Inter partial expert data group is already initialized'
+
+    assert (
+        expert_data_parallel_size % num_distributed_optimizer_instances == 0
+    ), 'Expert data parallel size should be divisible by partial DistOpt shard factor'
+    intra_partial_expert_data_parallel_size = (
+        expert_data_parallel_size // num_distributed_optimizer_instances
+    )
 
     for ranks in generator_wrapper('dp', is_expert=True):
         group = create_group(
@@ -1202,7 +1231,52 @@ def initialize_model_parallel(
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
+
+        if num_distributed_optimizer_instances > 1:
+            # Create groups for Partial DistOpt, one for intra-partial DP domain
+            # Another for inter-partial DP domain
+            hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
+                rank,
+                ranks,
+                [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
+                create_gloo_process_groups=create_gloo_process_groups,
+                pg_options=[
+                    get_nccl_options('intra_ep_dp', nccl_comm_cfgs),
+                    get_nccl_options('inter_ep_dp', nccl_comm_cfgs),
+                ],
+                timeout=timeout,
+                group_desc='EXPERT_DATA_PARALLEL_GROUP',
+            )
+            if rank in ranks:
+                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0]
+                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
+                _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
+        else:
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
     ### End of expert related parallel groups initialization
+
+    # build the intra distributed optimizer instance group
+    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    assert (
+        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
+    ), 'Intra distributed optimizer instance group is already initialized'
+
+    model_parallel_group_id = 0
+    intra_dist_opt_ranks = []
+    for ranks in generator_wrapper('tp-ep-pp', is_expert=True):
+        model_parallel_group_id += 1
+        intra_dist_opt_ranks.extend(ranks)
+        if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
+            intra_dist_opt_instance_group = create_group(
+                intra_dist_opt_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('intra_dist_opt_instance', nccl_comm_cfgs),
+                group_desc='INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP',
+            )
+            if rank in intra_dist_opt_ranks:
+                _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+            intra_dist_opt_ranks = []
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to
@@ -1296,14 +1370,6 @@ def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_paral
         assert _DATA_PARALLEL_GROUP_GLOO is not None, 'data parallel group-gloo is not initialized'
         assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
         return _DATA_PARALLEL_GROUP_GLOO
-
-
-def get_inter_partial_data_parallel_group():
-    """Get the group spanning the different partial data-parallel groups."""
-    assert (
-        _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
-    ), 'Inter partial data parallel group is not initialized'
-    return _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
 
 
 def get_context_parallel_group(check_initialized=True):
@@ -1920,47 +1986,88 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
 
-def get_expert_data_parallel_group(check_initialized=True):
+def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_parallel=False):
     """Get expert data parallel group."""
-    if check_initialized:
-        assert (
-            _EXPERT_DATA_PARALLEL_GROUP is not None
-        ), 'Expert data parallel group is not initialized'
-    return _EXPERT_DATA_PARALLEL_GROUP
+    if partial_expert_data_parallel:
+        if check_initialized:
+            assert (
+                _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None
+            ), 'Intra partial expert data parallel group is not initialized'
+        return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    else:
+        if check_initialized:
+            assert (
+                _EXPERT_DATA_PARALLEL_GROUP is not None
+            ), 'Expert data parallel group is not initialized'
+        return _EXPERT_DATA_PARALLEL_GROUP
 
 
-def get_data_modulo_expert_parallel_group():
+def get_data_modulo_expert_parallel_group(partial_expert_data_parallel=False):
     """[Deprecated] Get expert data parallel group."""
     warnings.warn(
         "get_data_modulo_expert_parallel_group is deprecated, please use "
         "get_expert_data_parallel_group instead.",
         DeprecationWarning,
     )
-    return get_expert_data_parallel_group()
+    return get_expert_data_parallel_group(partial_expert_data_parallel=partial_expert_data_parallel)
 
 
-def get_expert_data_parallel_group_gloo():
+def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
     """Get expert data parallel group-gloo."""
-    assert (
-        _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-    ), 'Expert data parallel group-gloo is not initialized'
-    return _EXPERT_DATA_PARALLEL_GROUP_GLOO
+    if partial_expert_data_parallel:
+        assert (
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        ), 'Intra partial expert data parallel group-gloo is not initialized'
+        return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    else:
+        assert (
+            _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        ), 'Expert data parallel group-gloo is not initialized'
+        return _EXPERT_DATA_PARALLEL_GROUP_GLOO
 
 
-def get_expert_data_parallel_rank():
+def get_expert_data_parallel_rank(partial_expert_data_parallel=False):
     """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_expert_data_parallel_group())
+        return torch.distributed.get_rank(
+            group=get_expert_data_parallel_group(
+                partial_expert_data_parallel=partial_expert_data_parallel
+            )
+        )
     else:
         return 0
 
 
-def get_expert_data_parallel_world_size():
+def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
     """Return world size for the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(group=get_expert_data_parallel_group())
+        return torch.distributed.get_world_size(
+            group=get_expert_data_parallel_group(
+                partial_expert_data_parallel=partial_expert_data_parallel
+            )
+        )
     else:
         return 0
+
+
+def get_intra_distributed_optimizer_instance_group():
+    """Get the group of all GPUs in a distributed optimizer instance."""
+    assert (
+        _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
+    ), 'Intra distributed optimizer instance group is not initialized'
+    return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+
+
+def get_inter_distributed_optimizer_instance_group():
+    """Get the group spanning the different distributed optimizer instances.
+    Attention and MLP/Expert share same inter-instance group, so only built
+    inter_partial_expert_data_parallel_group, and return it at here.
+    """
+    assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
+        'Attention and MLP/Expert share same inter distributed optimize instance group, '
+        'which has not been initialized'
+    )
+    return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
 
 ### End of expert-related functions region
@@ -2121,4 +2228,24 @@ def destroy_model_parallel():
     ):
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
+
+    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
+    if (
+        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
+        and torch.distributed.distributed_c10d._world.pg_map.get(
+            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO, None
+        )
+        is not None
+    ):
+        torch.distributed.destroy_process_group(_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO)
+    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = None
+
+    global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+    _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
     # End of expert parallelism destroy.
+
+    global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None

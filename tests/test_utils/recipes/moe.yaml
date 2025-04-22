@@ -111,6 +111,12 @@ products:
         scope: [mr]
       # - environment: [lts]
       #   scope: [nightly] # non-determinism
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      # - environment: [lts]
+      #   scope: [nightly] # non-determinism
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G]
     products:
       - environment: [dev]
