@@ -332,9 +332,9 @@ class TransformerLayerSchedulePlan:
         """
         self.common_state = TransformerLayerState()
         # get submodules for transformer layer
-        attn_module, dispatch_module, mlp_module, combine_module = (
-            layer.get_submodule_callables(chunk_state).as_array()
-        )
+        attn_module, dispatch_module, mlp_module, combine_module = layer.get_submodule_callables(
+            chunk_state
+        ).as_array()
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy

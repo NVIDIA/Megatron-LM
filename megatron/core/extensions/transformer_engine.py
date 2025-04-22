@@ -146,13 +146,15 @@ class TELinear(te.pytorch.Linear):
 
         if self.config.delay_wgrad_compute:
             # TODO: Remove this once we have a stable release of TE
-            if get_te_version() == PkgVersion(
-                "2.3.0.dev0+5f16c79"
-            ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025") or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e"):
+            if (
+                get_te_version() == PkgVersion("2.3.0.dev0+5f16c79")
+                or get_te_version() == PkgVersion("2.3.0.dev0+7164025")
+                or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e")
+            ):
                 extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
             else:
                 raise RuntimeError(
-                    f"Only TE with version 2.3.0.dev0+5f16c79 supports delay_wgrad_compute now. {get_te_version()}"
+                    f"Only TE with version 2.3.0.dev0+5f16c79 supports delay_wgrad_compute now."
                 )
 
         if is_te_min_version("0.8.0"):
@@ -341,12 +343,16 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
 
         if self.config.delay_wgrad_compute:
             # TODO: Remove this once we have a stable release of TE
-            if get_te_version() == PkgVersion(
-                "2.3.0.dev0+5f16c79"
-            ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025") or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e"):
+            if (
+                get_te_version() == PkgVersion("2.3.0.dev0+5f16c79")
+                or get_te_version() == PkgVersion("2.3.0.dev0+7164025")
+                or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e")
+            ):
                 extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
             else:
-                raise RuntimeError("Only TE with version 2.3.0.dev0+5f16c79 supports delay_wgrad_compute now.")
+                raise RuntimeError(
+                    "Only TE with version 2.3.0.dev0+5f16c79 supports delay_wgrad_compute now."
+                )
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         if is_te_min_version("0.11.0"):
@@ -930,9 +936,11 @@ if is_te_min_version("1.9.0.dev0"):
 
             if self.config.delay_wgrad_compute:
                 # TODO: Remove this once we have a stable release of TE
-                if get_te_version() == PkgVersion(
-                    "2.3.0.dev0+5f16c79"
-                ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025") or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e"):
+                if (
+                    get_te_version() == PkgVersion("2.3.0.dev0+5f16c79")
+                    or get_te_version() == PkgVersion("2.3.0.dev0+7164025")
+                    or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e")
+                ):
                     extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
                 else:
                     raise RuntimeError(
@@ -1185,7 +1193,10 @@ if is_te_min_version("1.9.0.dev0"):
             return sharded_state_dict
 
         def backward_dw(self):
-            """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+            """
+            Compute weight gradients during the backward pass
+            if delay_wgrad_compute is enabled.
+            """
             if self.config.delay_wgrad_compute:
                 super().backward_dw()
 

@@ -411,7 +411,9 @@ class ModelParallelConfig:
                     f"combined_1f1b_recipe {self.combined_1f1b_recipe} not supported, "
                     f"supported recipes are 'ep_a2a' now."
                 )
-        if self.delay_wgrad_compute and not (self.combined_1f1b and self.combined_1f1b_recipe == "ep_a2a"):
+        if self.delay_wgrad_compute and not (
+            self.combined_1f1b and self.combined_1f1b_recipe == "ep_a2a"
+        ):
             raise ValueError(
                 "Delaying wgrad compute only works when setting --combined-1f1b and "
                 "--combined-1f1b-recipe ep_a2a"
