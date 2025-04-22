@@ -99,21 +99,31 @@ else
     fi
 
     # Store the output in a variable first
-    TRAINING_PARAMS_STR=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + " " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    TRAINING_PARAMS_STR=$(yq '... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
     # Build space-separated string while preserving quotes
     TRAINING_PARAMS_FROM_CONFIG=""
     while IFS= read -r line; do
         if [[ -n "$line" ]]; then
-            # If value is "true", just use the key
-            if [[ "$line" =~ true$ ]]; then
-                TRAINING_PARAMS_FROM_CONFIG+="${line% true} "
-            # If value contains spaces, wrap it in quotes
-            elif [[ "$line" =~ .*[[:space:]].* ]]; then
-                key="${line%% *}"
-                value="${line#* }"
+
+            key="${line%%:*}"
+            value="${line#*: }"
+            value="$(echo "$value" | xargs)" # trim whitespace
+            # Case 1: true
+            if [[ "$value" == "true" ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="${key} "
+
+            # Case 2: value is wrapped in [ ]
+            elif echo "$value" | grep -Eq '^\[[^]]+\]$'; then
+                # Strip square brackets from value using sed
+                value=$(echo "$value" | sed 's/^\[//;s/\]$//')
+                TRAINING_PARAMS_FROM_CONFIG+="$key $value "
+
+            # Case 3: contains spaces
+            elif [[ "$value" == *" "* ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
+            # Case 4: default
             else
-                TRAINING_PARAMS_FROM_CONFIG+="$line "
+                TRAINING_PARAMS_FROM_CONFIG+="$key $value "
             fi
         fi
     done <<<"$TRAINING_PARAMS_STR"

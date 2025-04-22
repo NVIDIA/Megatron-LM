@@ -26,6 +26,7 @@ if not RO_API_TOKEN:
 REQUIRED_REVIEWERS = {
     "final_reviewers": [
         "jcasper@nvidia.com",
+        "dnarayanan@nvidia.com",
         "eharper@nvidia.com",
         "shanmugamr@nvidia.com",
         "yuya@nvidia.com",
@@ -123,8 +124,10 @@ def get_mcore_reviewers():
 
 
 def get_days_in_stage(mr, stage):
-    """Get the earliest time when each review label was first added."""
-    for event in sorted(mr.resourcelabelevents.list(get_all=True), key=lambda x: x.created_at):
+    """Get the latest time when each review label was added."""
+    for event in sorted(
+        mr.resourcelabelevents.list(get_all=True), key=lambda x: x.created_at, reverse=True
+    ):
         if event.label.get('name') == stage and event.action == 'add':
             return get_days_since(event.created_at)
 
@@ -165,7 +168,8 @@ def get_required_reviewers(mr):
     elif get_current_review_stage(mr) == 'Final Review':
         review_group = REQUIRED_REVIEWERS["final_reviewers"]
         # Get pipeline status
-        pipeline = mr.pipelines.list()[0] if mr.pipelines.list() else None
+        mr_pipelines = mr.pipelines.list(sort='desc', order_by='created_at')
+        pipeline = mr_pipelines[0] if mr_pipelines else None
         if pipeline and pipeline.status != 'success':
             review_group = []
 
@@ -175,7 +179,7 @@ def get_required_reviewers(mr):
     review_group = [
         reviewer
         for reviewer in review_group
-        if reviewer in assigned_reviewers and reviewer not in approved_users
+        if (reviewer in assigned_reviewers) and (reviewer not in approved_users)
     ]
 
     if review_group is None or len(review_group) == 0:

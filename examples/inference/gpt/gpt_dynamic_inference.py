@@ -6,7 +6,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from typing import List
 
-from megatron.core.inference.contexts import (
+from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
@@ -32,6 +32,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
     add_common_inference_args(parser)
 
+    group = parser.add_argument_group(title='Dynamic inference')
+    group.add_argument("--inference-ckpt-non-strict", action="store_true",
+                       help="Load checkpoint with `strict=False`.")
+    
+
     return parser
 
 
@@ -46,7 +51,12 @@ def get_model() -> MegatronModule:
     # Load checkpoint.
     assert args.load is not None
     args.exit_on_missing_checkpoint = True
-    load_checkpoint(model, None, None)
+    load_checkpoint(
+        ddp_model=model,
+        optimizer=None,
+        opt_param_scheduler=None,
+        strict=not args.inference_ckpt_non_strict,
+    )
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"
@@ -80,6 +90,7 @@ def get_inference_context(
         max_sequence_length=max_sequence_length,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
+        chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,

@@ -23,6 +23,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 : ${INFERENCE_DYNAMIC_BATCHING_BUFFER_GUARANTEED_FRACTION=0.05}
 
 : ${ENGINE=dynamic}
+: ${EXTRA_ARGS=""}
 # NSIGHT_PREFIX=/path/to/nsight/profile
 
 # --inference-rng-tracker \ # ... re-add after bugfix.
@@ -69,6 +70,7 @@ ARGS=" \
     --inference-dynamic-batching-buffer-guaranteed-fraction ${INFERENCE_DYNAMIC_BATCHING_BUFFER_GUARANTEED_FRACTION} \
     \
     --enable-cuda-graph \
+    ${EXTRA_ARGS} \
 "
 
 if [[ -v PROMPTS ]]; then

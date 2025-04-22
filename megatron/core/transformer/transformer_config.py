@@ -130,7 +130,7 @@ class TransformerConfig(ModelParallelConfig):
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
 
     qk_layernorm: bool = False
-    """Whether to apply LayerNorm to the query and key embeddings."""
+    """Whether to apply `normalization` type of normalization to the query and key embeddings."""
 
     test_mode: bool = False
     """Whether to run real-time tests."""
@@ -923,7 +923,11 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.apply_rope_fusion:
             if self.rotary_interleaved:
-                raise ValueError("rotary_interleaved does not work with apply_rope_fusion.")
+                if not is_te_min_version("2.3.0.dev0"):
+                    raise ValueError(
+                        "rotary_interleaved does not work with apply_rope_fusion for "
+                        "TE < 2.3.0.dev0. Please install TE >= 2.3.0.dev0"
+                    )
 
             from megatron.core.models.common.embeddings.rope_utils import (
                 fused_apply_rotary_pos_emb,

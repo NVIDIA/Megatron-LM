@@ -52,10 +52,10 @@ class MoETokenDispatcher:
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
 
-        self.ep_group = model_comm_pgs.ep_group
+        self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
-        self.tp_group = model_comm_pgs.expt_tp_group
-        self.tp_ep_group = model_comm_pgs.tp_ep_group
+        self.tp_group = model_comm_pgs.expt_tp
+        self.tp_ep_group = model_comm_pgs.tp_ep
 
         self.tp_size = self.tp_group.size()
         self.tp_rank = self.tp_group.rank()

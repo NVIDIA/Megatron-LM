@@ -15,12 +15,13 @@ from megatron.core.models.common.embeddings.relative_pos_embedding import Relati
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.mappings import scatter_to_tensor_model_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, get_tensor_model_parallel_group_if_none
 
 
 class T5LMHead(MegatronModule):
@@ -42,6 +43,7 @@ class T5LMHead(MegatronModule):
         vocab_size: int,
         pre_process: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super(T5LMHead, self).__init__(config=config)
 
@@ -59,6 +61,7 @@ class T5LMHead(MegatronModule):
             skip_bias_add=not share_embeddings_and_output_weights,
             gather_output=not self.parallel_output,
             skip_weight_param_allocation=pre_process and share_embeddings_and_output_weights,
+            tp_group=tp_group,
         )
 
     def forward(self, hidden_states: Tensor, word_embeddings_weight: Tensor) -> Tensor:
@@ -148,6 +151,7 @@ class T5Model(LanguageModule):
         relative_attention_max_distance: int = 128,
         add_encoder: bool = True,
         add_decoder: bool = True,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
 
         super(T5Model, self).__init__(config=config)
@@ -167,6 +171,11 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            )
+        self.tp_group = get_tensor_model_parallel_group_if_none(model_comm_pgs.tp)
 
         self.model_type = ModelType.encoder_and_decoder
 
@@ -185,6 +194,7 @@ class T5Model(LanguageModule):
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=self.position_embedding_type,
+                tp_group=self.tp_group,
             )
             if position_embedding_type == "learned_absolute":
                 self.position_embeddings = self.embedding.position_embeddings
@@ -199,6 +209,7 @@ class T5Model(LanguageModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=model_comm_pgs.cp,
             )
 
         # Relative Position Embeddings
@@ -229,6 +240,7 @@ class T5Model(LanguageModule):
                 spec=encoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                model_comm_pgs=model_comm_pgs,
             )
         else:
             self.encoder = None
@@ -240,6 +252,7 @@ class T5Model(LanguageModule):
                 spec=decoder_spec,
                 pre_process=self.pre_process,
                 post_process=self.post_process,
+                model_comm_pgs=model_comm_pgs,
             )
         else:
             self.decoder = None
@@ -252,6 +265,7 @@ class T5Model(LanguageModule):
                 self.vocab_size,
                 self.pre_process,
                 self.share_embeddings_and_output_weights,
+                tp_group=self.tp_group,
             )
             self.output_layer = self.lm_head.output_layer
 
@@ -328,7 +342,9 @@ class T5Model(LanguageModule):
                 # the last (num_heads dimension)
                 attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
                 # Then, scatter to TP region
-                attention_bias_parallel = scatter_to_tensor_model_parallel_region(attention_bias)
+                attention_bias_parallel = scatter_to_tensor_model_parallel_region(
+                    attention_bias, self.tp_group
+                )
                 # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
                 encoder_attention_bias_parallel = torch.permute(
                     attention_bias_parallel, (0, 3, 1, 2)
@@ -385,7 +401,9 @@ class T5Model(LanguageModule):
             # the last (num_heads dimension)
             attention_bias = torch.permute(attention_bias, (0, 2, 3, 1))
             # Then, scatter to TP region
-            attention_bias_parallel = scatter_to_tensor_model_parallel_region(attention_bias)
+            attention_bias_parallel = scatter_to_tensor_model_parallel_region(
+                attention_bias, self.tp_group
+            )
             # Lastly, revert the dimension back to [1, num_head, seqlen_q, seqlen_kv]
             decoder_attention_bias_parallel = torch.permute(attention_bias_parallel, (0, 3, 1, 2))
 

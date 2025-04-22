@@ -20,11 +20,12 @@ logger = logging.getLogger(__name__)
 # Prefer fused RoPE from Apex as we need the `transpose_output_memory` argument for the bshd trick.
 # See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2469.
 try:
+    # pylint: disable=unused-import
     from apex.transformer.functional import fused_apply_rotary_pos_emb
 except ImportError:
     try:
         from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
-    except:
+    except ImportError:
         fused_apply_rotary_pos_emb = None
 
 
@@ -196,6 +197,7 @@ def apply_rotary_pos_emb(
     Reroute to the appropriate apply_rotary_pos_emb function depending on
     fused/unfused kernels, or bshd (conventional) / thd (packed seq) format
     """
+    global fused_apply_rotary_pos_emb, fused_apply_rotary_pos_emb_thd
 
     # Keep for backward compatibility. Will deprecate in the future.
     if cp_group is None:
@@ -213,8 +215,23 @@ def apply_rotary_pos_emb(
                     mscale=mscale,
                 )
             else:
-                assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
-                return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
+                if config.rotary_interleaved:
+                    try:
+                        from megatron.core.extensions.transformer_engine import (
+                            fused_apply_rotary_pos_emb,
+                        )
+
+                        return fused_apply_rotary_pos_emb(t, freqs, interleaved=True)
+                    except ImportError:
+                        raise ImportError(
+                            "TE interleaved fused RoPE is not available."
+                            "Please install TE >= 2.3.0.dev0."
+                        )
+                else:
+                    assert (
+                        fused_apply_rotary_pos_emb is not None
+                    ), "apply_rope_fusion is not available."
+                    return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
             cp_size = cp_group.size()
