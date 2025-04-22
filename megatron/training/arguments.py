@@ -999,12 +999,16 @@ def validate_args(args, defaults={}):
             assert not args.moe_shared_expert_overlap, \
                 'moe_shared_expert_overlap is not supported when combined_1f1b_recipe is ep_a2a'
 
-        # Check split_bw compatibility with legacy groupedgemm
-        if args.split_bw:
-            if args.moe_use_legacy_grouped_gemm:
-                raise ValueError('split_bw is not supported with legacy groupedgemm implementation')
-            if not args.transformer_impl == 'transformer_engine':
-                raise ValueError('split_bw is only supported with transformer_engine implementation')
+    # Check delay_wgrad_compute compatibility
+    if args.delay_wgrad_compute:
+        assert args.combined_1f1b and args.combined_1f1b_recipe == 'ep_a2a', \
+            'delay_wgrad_compute is only supported when combined_1f1b and combined_1f1b_recipe is ep_a2a'
+        assert not args.moe_use_legacy_grouped_gemm, \
+            'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+        assert args.transformer_impl == 'transformer_engine', \
+            'delay_wgrad_compute is only supported with transformer_engine implementation'
+        assert not args.overlap_grad_reduce, \
+            'delay_wgrad_compute is not supported with overlap_grad_reduce'
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -2630,8 +2634,8 @@ def _add_moe_args(parser):
                        choices=['ep_a2a'],
                        default='ep_a2a',
                        help="1) ep_a2a: Hiding expert parallelism's all-to-all communication in the combined-1f1b execution. Options are only 'ep_a2a' now.")
-    group.add_argument('--split-bw', action='store_true',
-                       help='Split dgrad and wgrad for batch-level overlapping')                       
+    group.add_argument('--delay-wgrad-compute', action='store_true',
+                       help='Delay the wgrad compute for batch-level overlapping')                       
 
     return parser
 
