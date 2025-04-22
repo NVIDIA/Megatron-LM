@@ -21,6 +21,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+from megatron.core.fp8_utils import get_fp8_context
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -162,16 +163,9 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            # lm_head in fp8 if (asked for AND no tied embeddings)
-            if config.lm_head_in_fp8 and self.share_embeddings_and_output_weights:
-                warnings.warn(
-                    "`lm_head_in_fp8` cannot be enabled when embeddings and output weights are tied. " \
-                    "This would raise an error because TE layers do not support skip_weight_param_allocation. \n" \
-                    "Setting lm_head_in_fp8 to False..."
-                )
-                config.lm_head_in_fp8=False
-
-            if config.lm_head_in_fp8:
+            # lm_head in fp8 if 1) asked for   AND   2) no tied embeddings 
+            # lm-head-in-fp8 is overriden to False in `arguments.py` if lm-head is tied to embeddings.
+            if self.config.lm_head_in_fp8:
                 self.output_layer = TEColumnParallelLinear(
                     config.hidden_size,
                     self.vocab_size,
@@ -334,9 +328,14 @@ class GPTModel(LanguageModule):
             and inference_context.materialize_only_last_token_logits
         ):
             hidden_states = hidden_states[-1:, :, :]
-        logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
+        
+        if self.config.lm_head_in_fp8:
+            with get_fp8_context(self.config):  # needs to be tested
+                logits, _ = self.output_layer(hidden_states)
+        else:
+            logits, _ = self.output_layer(
+                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            )
 
         if has_config_logger_enabled(self.config):
             payload = OrderedDict(
