@@ -2167,8 +2167,11 @@ def _add_distributed_args(parser):
     group.add_argument('--num-distributed-optimizer-instances', type=int, default=1,
                        help='Number of Distributed Optimizer copies across Data Parallel domain.')
     group.add_argument('--use-torch-fsdp2', action='store_true',
-                       help="Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel."
-                       "It is still not in a stable release stage, and may therefore contain bugs or other potential issues.")
+                       help='Use the torch FSDP2 implementation. FSDP2 has not been tested with pipeline parallelism, '
+                       'and may contain bugs.')
+    group.add_argument('--torch-fsdp2-no-reshard-after-forward', action='store_false', dest='torch_fsdp2_reshard_after_forward',
+                       help='Whether to reshard weights after forward pass when using PyTorch FSDP2. '
+                       'Set to enable FSDP ZeRO-2.')
     group.add_argument('--context-parallel-size', type=int, default=1,
                        help='Degree of context parallelism.')
     group.add_argument('--cp-comm-type', nargs='+', type=str, default=["p2p"],
