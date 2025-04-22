@@ -148,11 +148,11 @@ class TELinear(te.pytorch.Linear):
             # TODO: Remove this once we have a stable release of TE
             if get_te_version() == PkgVersion(
                 "2.3.0.dev0+5f16c79"
-            ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025"):
+            ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025") or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e"):
                 extra_kwargs["delay_wgrad_compute"] = self.config.split_bw
             else:
                 raise RuntimeError(
-                    f"Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now."
+                    f"Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now. {get_te_version()}"
                 )
 
         if is_te_min_version("0.8.0"):
@@ -343,7 +343,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             # TODO: Remove this once we have a stable release of TE
             if get_te_version() == PkgVersion(
                 "2.3.0.dev0+5f16c79"
-            ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025"):
+            ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025") or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e"):
                 extra_kwargs["delay_wgrad_compute"] = self.config.split_bw
             else:
                 raise RuntimeError("Only TE with version 2.3.0.dev0+5f16c79 supports split_bw now.")
@@ -932,7 +932,7 @@ if is_te_min_version("1.9.0.dev0"):
                 # TODO: Remove this once we have a stable release of TE
                 if get_te_version() == PkgVersion(
                     "2.3.0.dev0+5f16c79"
-                ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025"):
+                ) or get_te_version() == PkgVersion("2.3.0.dev0+7164025") or get_te_version() == PkgVersion("2.3.0.dev0+2a7087e"):
                     extra_kwargs["delay_wgrad_compute"] = self.config.split_bw
                 else:
                     raise RuntimeError(
