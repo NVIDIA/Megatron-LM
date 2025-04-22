@@ -1554,7 +1554,7 @@ def get_pipeline_model_parallel_split_rank():
     return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
 
 
-def is_pipeline_first_stage(ignore_virtual=False):
+def is_pipeline_first_stage(ignore_virtual=True):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
         if (
@@ -1565,7 +1565,7 @@ def is_pipeline_first_stage(ignore_virtual=False):
     return get_pipeline_model_parallel_rank() == 0
 
 
-def is_pipeline_last_stage(ignore_virtual=False):
+def is_pipeline_last_stage(ignore_virtual=True):
     """Return True if in the last pipeline-model-parallel stage, False otherwise."""
     if not ignore_virtual:
         virtual_pipeline_model_parallel_world_size = (
@@ -1580,7 +1580,7 @@ def is_pipeline_last_stage(ignore_virtual=False):
     return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
 
 
-def is_rank_in_embedding_group(ignore_virtual=False):
+def is_rank_in_embedding_group(ignore_virtual=True):
     """Return true if current rank is in embedding group, False otherwise."""
     rank = torch.distributed.get_rank()
     global _EMBEDDING_GLOBAL_RANKS
