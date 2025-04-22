@@ -432,7 +432,7 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
     See _communicate for argument details.
     """
 
-    if core.parallel_state.is_pipeline_first_stage():
+    if core.parallel_state.is_pipeline_first_stage(ignore_virtual=False):
         input_tensor = None
     else:
         if config.timers is not None:
@@ -455,7 +455,7 @@ def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Ten
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage():
+    if core.parallel_state.is_pipeline_last_stage(ignore_virtual=False):
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -479,7 +479,7 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
     See _communicate for argument details.
     """
 
-    if not core.parallel_state.is_pipeline_last_stage():
+    if not core.parallel_state.is_pipeline_last_stage(ignore_virtual=False):
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
         _communicate(
@@ -499,7 +499,7 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
 
     See _communicate for argument details.
     """
-    if not core.parallel_state.is_pipeline_first_stage():
+    if not core.parallel_state.is_pipeline_first_stage(ignore_virtual=False):
         if config.timers is not None:
             config.timers('backward-send', log_level=2).start()
         _communicate(
@@ -521,7 +521,7 @@ def send_forward_recv_backward(
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage():
+    if core.parallel_state.is_pipeline_last_stage(ignore_virtual=False):
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -546,7 +546,7 @@ def send_backward_recv_forward(
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_first_stage():
+    if core.parallel_state.is_pipeline_first_stage(ignore_virtual=False):
         input_tensor = None
     else:
         if config.timers is not None:

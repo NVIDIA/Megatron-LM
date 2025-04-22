@@ -283,7 +283,7 @@ class Pipeline:
             attention_mask = attention_mask.unsqueeze(0)
 
         # Other TP ranks on PP rank 0.
-        elif parallel_state.is_pipeline_first_stage():
+        elif parallel_state.is_pipeline_first_stage(ignore_virtual=False):
             input_ids = torch.empty(
                 (args.micro_batch_size, args.seq_length),
                 dtype=torch.int64,
@@ -311,7 +311,7 @@ class Pipeline:
             attention_mask = None
 
         # Broadcast.
-        if parallel_state.is_pipeline_first_stage():
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
             broadcast(input_ids)
             broadcast(attention_mask)
             broadcast(position_ids)
@@ -366,13 +366,13 @@ class Pipeline:
             forward_only=True,
             collect_non_loss_data=True,
         )
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor = data[0]["output_tensor"]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
         else:
             output_tensor_gathered = None
@@ -392,10 +392,10 @@ class Pipeline:
                     p.normal_(0, 0.1)
 
             # Synchronize embeddings.
-            if meta.mp.pp != 1 and parallel_state.is_rank_in_embedding_group():
-                if parallel_state.is_pipeline_first_stage():
+            if meta.mp.pp != 1 and parallel_state.is_rank_in_embedding_group(ignore_virtual=False):
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                     emb = models[0].module.module.shared_embedding_or_output_weight()
-                elif parallel_state.is_pipeline_last_stage():
+                elif parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                     emb = models[-1].module.module.shared_embedding_or_output_weight()
                 else:
                     raise Exception("should be either first/last pipeline rank.")
@@ -731,13 +731,13 @@ class LLaVAPipeline(Pipeline):
             collect_non_loss_data=True,
         )
 
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor = data[0]["output_tensor"][0]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
         else:
             output_tensor_gathered = None
