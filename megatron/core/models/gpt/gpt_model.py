@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params
-
+from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.

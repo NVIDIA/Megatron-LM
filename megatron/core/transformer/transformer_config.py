@@ -146,6 +146,9 @@ class TransformerConfig(ModelParallelConfig):
 
     mlp_alpha: Optional[float] = None
 
+    lm_head_in_fp8: bool = False
+    """Whether to use FP8 for the lm_head layer."""
+    
     ####################
     # initialization
     ####################
