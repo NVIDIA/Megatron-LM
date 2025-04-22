@@ -39,9 +39,10 @@ RUN --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN \
 
 FROM mcore_image as build_mamba_ssm
 WORKDIR /opt
+ARG MAMBA_REF=2e16fc3062cdcd4ebef27a9aa4442676e1c7edf4
 RUN git clone https://github.com/state-spaces/mamba.git && \
     cd mamba && \
-    git checkout v2.2.0 && \
+    git checkout ${MAMBA_REF} && \
     sed -i "/triton/d" setup.py && \
     MAMBA_FORCE_BUILD=TRUE pip3 wheel --no-cache-dir -v .
 
