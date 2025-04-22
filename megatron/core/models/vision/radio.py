@@ -10,6 +10,7 @@ from torch import nn
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -103,8 +104,14 @@ class RADIOViTModel(VisionModule):
         self.pos_dropout = pos_dropout
         self.has_cpe = has_cpe
 
-        self.embedder = nn.Linear(
-            3 * self.patch_dim * self.patch_dim, self.visual_hidden_size, bias=embedder_bias
+        # Using non-TE version so we can force gather_output
+        self.embedder = ColumnParallelLinear(
+            input_size=3 * self.patch_dim * self.patch_dim,
+            output_size=self.visual_hidden_size,
+            bias=embedder_bias,
+            config=transformer_config,
+            gather_output=True,
+            init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
         )
 
         self.model_type = ModelType.encoder_or_decoder
@@ -165,7 +172,7 @@ class RADIOViTModel(VisionModule):
             px=px,
             xx=self.patch_dim,
         )
-        x = self.embedder(x)  # [batch, seq_length, hidden_size]
+        x, _ = self.embedder(x)  # [batch, seq_length, hidden_size]
 
         x, _ = self.apply_pos_enc(x, input_size=input_size)
 

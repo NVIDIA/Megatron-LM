@@ -324,7 +324,7 @@ class MegatronOptimizer(ABC):
         """
 
     @staticmethod
-    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor]:
+    def _extract_common_per_param_step(state_dict) -> Union[int, torch.Tensor, None]:
         common_step = None
         for param_idx, param_state in state_dict['state'].items():
             param_step = param_state.get('step', None)
@@ -689,7 +689,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             this=model_data, that=main_data, overflow_buf=self._dummy_overflow_buf
         )
 
-    def state_dict(self):
+    def state_dict(self, is_loading: bool = False):
+        if is_loading:
+            self.init_state_fn(self.optimizer, self.config)
+
         state_dict = {}
         state_dict['optimizer'] = self.optimizer.state_dict()
         if self.grad_scaler:
@@ -739,7 +742,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        state_dict['optimizer']['state']['common_step'] = step
+        if step:
+            state_dict['optimizer']['state']['common_step'] = step
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -916,7 +920,8 @@ class FP32Optimizer(MegatronOptimizer):
         optim_state_to_sharding_state(state_dict, id_to_sharded_param_map, exclude_keys="step")
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
-        state_dict['state']['common_step'] = step
+        if step:
+            state_dict['state']['common_step'] = step
         return state_dict
 
 

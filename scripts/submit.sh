@@ -6,12 +6,14 @@ TOKENIZER=/capstor/store/cscs/swissai/a06/users/ahernnde/swissai-tokenizer/
 DATA_DIR=/capstor/store/cscs/swissai/a06/datasets_tokenized/megatron/sai/swissai-fineweb-edu-filterrobots-merge
 CODE_PATH=$STORE/users/ahernnde/workspace/AleHD-Megatron-LM
 
+
 ACTIVATION=swiglu
 QK_IMPL=apex
 DYT_ALPHA=1.0
 NODES=1
 TIME=1-00:00:00
 MARGIN=0
+FP8_FIRST_AND_LAST=0
 PARTITION=normal
 PRECISION=hybrid
 FP8LEN=1024
@@ -31,6 +33,8 @@ usage () {
 	# FP8 settings.
 	echo " --fp8: Enables fp8"
 	echo " --fp8-dpa: Enables fp8 DPA"
+	echo " --fp8-tensorwise: Use tensorwise scaling"
+	echo " --fp8-first-and-last-bf16 <int>: Specifies how many first and last layers are done in bf16"
 	echo " --fp8-margin: fp8 margin"
 	echo " --fp8-dpa-nobwd: Disables fp8 DPA for backward"
 	echo " --fp8-e4m3: Use e4m3 fp8 precision instead of hybrid"
@@ -153,6 +157,10 @@ while [[ $# -gt 0 ]]; do
 			TIME=$2; shift 2;;
 		--fp8)
 			FP8=true; shift;;
+		--fp8-tensorwise)
+			TENSORWISE=true; shift;;
+		--fp8-first-and-last-bf16)
+			FP8_FIRST_AND_LAST=$2; shift 2;;
 		--fp8-dpa)
 			FP8DPA=true; shift;;
 		--fp8-margin)
@@ -229,7 +237,11 @@ if [[ $FP8 = true ]]; then
 			ENVS="$ENVS NVTE_FP8_DPA_BWD=0"
 		fi
 	fi
-	if [[ $MARGIN -ne 0 ]]; then
+	if [[ $TENSORWISE = true ]]; then
+		SUFFIX=$SUFFIX-fp8TW
+		FP8_ARGS+=(--fp8-recipe tensorwise)
+		MAYBE_INSTALL_TE="NVTE_FRAMEWORK=pytorch pip install git+https://github.com/NVIDIA/TransformerEngine.git@release_v2.2"
+	elif [[ $MARGIN -ne 0 ]]; then
 		SUFFIX=$SUFFIX-fp8margin$MARGIN
 	fi
 	if [[ $PRECISION != hybrid ]]; then
@@ -237,6 +249,10 @@ if [[ $FP8 = true ]]; then
 	fi
 	if [[ $FP8LEN -ne 1024 ]]; then
 		SUFFIX=$SUFFIX-fp8len$FP8LEN
+	fi
+	if [[ $FP8_FIRST_AND_LAST -ge 0 ]]; then
+		SUFFIX=$SUFFIX-fp8safe$FP8_FIRST_AND_LAST
+		FP8_ARGS+=(--first-last-layers-bf16 --num-layers-at-start-in-bf16 $FP8_FIRST_AND_LAST --num-layers-at-end-in-bf16 $FP8_FIRST_AND_LAST)
 	fi
 fi
 
@@ -520,6 +536,7 @@ export MASTER_ADDR=\$(hostname)
 
 srun -l --unbuffered numactl --membind=0-3 bash -c "
 	cd $CODE_PATH
+	$MAYBE_INSTALL_TE
 	export PYTHONPATH=\$PWD
 	eval \"$ENVS\" $CMD
 "

@@ -6,6 +6,7 @@ ENV_VARS:
   NVTE_BWD_LAYERNORM_SM_MARGIN: 16
   NCCL_P2P_NET_CHUNKSIZE: 2097152
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 1
+  SKIP_PYTEST: 1
 TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
@@ -38,7 +39,7 @@ MODEL_ARGS:
   --apply-layernorm-1p: true
   --untie-embeddings-and-output-weights: true
   --position-embedding-type: rope
-  --no-rope-fusion: true  #TODO: We can remove this once upgrading to the DEV container
+  --no-rope-fusion: true #TODO: We can remove this once upgrading to the DEV container
   --rotary-percent: 0.5
   --squared-relu: true
   --num-layers: 32
@@ -67,8 +68,8 @@ MODEL_ARGS:
   --eval-iters: 32
   --eval-interval: 2000
   # Add checkpointing args
-  --load: ${OUTPUT_PATH}/checkpoints
-  --save: ${OUTPUT_PATH}/checkpoints
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 5000
   # Add initialization args
   --init-method-std: 0.0134

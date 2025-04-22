@@ -4,13 +4,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from shutil import rmtree
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest import mock
 
 import pytest
 import torch
 import torch.distributed as dist
+
+from megatron.training.arguments import parse_args
 
 nvidia_resiliency_ext = pytest.importorskip(
     "nvidia_resiliency_ext",
@@ -92,7 +93,7 @@ class TestLocalCheckpointingReplication:
     def post_init(self, root_tmp_dir, tp, pp, async_save, algo, repl_groups):
         Utils.initialize_model_parallel(tp, pp)
 
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         with mock.patch(
             'megatron.training.checkpointing.get_args', new=lambda: mock_args
         ), mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args), mock.patch(

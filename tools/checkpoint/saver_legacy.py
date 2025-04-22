@@ -165,6 +165,8 @@ def save_checkpoint(queue, args):
                 print(f"Overwriting default {arg} value {getattr(margs, arg)} with value from checkpoint {value}.")
                 setattr(margs, arg, value)
 
+    margs.inference_batch_times_seqlen_threshold = -1
+
     validate_args(margs)
 
     # Use MLM models.

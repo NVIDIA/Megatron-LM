@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: '{test_case}_{environment}_{tag}'
+  name: "{test_case}_{environment}_{tag}"
   model: unit-tests
   nodes: 1
   build: mcore-pyt-{environment}
@@ -46,7 +46,14 @@ spec:
       MARKER_ARG+=" and $element"
     done
 
-    IGNORE_TEST_CASES=$(cat /opt/megatron-lm/tests/test_utils/recipes/unit-tests.yaml | yq eval 'with(.products[].test_case; del(.[] | select(. == env(BUCKET)))) | .products[].test_case[]' | tr " " "\n")
+    IGNORE_TEST_CASES=$(cat /opt/megatron-lm/tests/test_utils/recipes/unit-tests.yaml | \
+      yq eval '
+        with(.products[].test_case; del(.[] | select(. == env(BUCKET)))) 
+        | .products[].test_case[]
+      ' \
+      | tr " " "\n"
+    )
+
     IGNORE_ARGS=()
     while IFS= read -r test_case; do
       if [[ $test_case == *\** ]]; then
@@ -77,12 +84,37 @@ spec:
         --redirects "3"
     )
 
-    for i in $(seq $UNIT_TEST_REPEAT); do
-      CMD=$(echo torchrun ${{DISTRIBUTED_ARGS[@]}} -m pytest -xvs --cov-report=term --cov-report=html --cov=megatron/core --no-cov-on-fail ${{IGNORE_ARGS[@]}} -m "'${{MARKER_ARG}}'" $BUCKET)
-      
-      eval "$CMD" || EXIT_CODE=$?
+    # Reduce memory usage by NCCL
+    export NCCL_MAX_NCHANNELS=1
+    export NCCL_NVLS_ENABLE=0
+    export ONE_LOGGER_JOB_CATEGORY=test
 
+    for i in $(seq $UNIT_TEST_REPEAT); do
+      echo "Running prod test suite."
+      CMD=$(echo torchrun ${{DISTRIBUTED_ARGS[@]}} -m pytest \
+        -xvs \
+        --cov-report=term \
+        --cov-branch \
+        --cov=megatron/core \
+        --cov-report xml:coverage.xml \
+        --no-cov-on-fail ${{IGNORE_ARGS[@]}} \
+        -m "'not experimental and ${{MARKER_ARG}}'" $BUCKET)
+      eval "$CMD"
+
+      if [[ "$TAG" == "latest" ]]; then
+        CMD=$(echo torchrun ${{DISTRIBUTED_ARGS[@]}} -m pytest \
+          -xvs \
+          --experimental \
+          -m "'experimental and ${{MARKER_ARG}}'" $BUCKET)
+        
+        eval "$CMD"
+      fi
+          
     done
+
+    ls -al 
+    cp .coverage_0 {assets_dir}/coverage_report
+    cp coverage.xml {assets_dir}
 
 products:
   - test_case: [tests/unit_tests/data/]

@@ -77,5 +77,11 @@ def add_multimodal_extra_args(parser):
     group.add_argument(
         "--use-loss-scaling", action="store_true", default=False, help="Scale loss based on conversation turn length (in tokens)."
     )
+    group.add_argument(
+        "--use-area-weighted-aspect-ratio", action="store_true", default=False,
+        help=(
+            "When --use-tiling is True, find the aspect ratio to use based on the original ",
+            "image aspect ratio and the area covered by the tiles.")
+    )
 
     return parser

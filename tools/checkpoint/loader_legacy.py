@@ -66,6 +66,7 @@ def _load_checkpoint(queue, args):
                 '--load', args.load_dir,
                 '--position-embedding-type', args.position_embedding_type,
                 '--exit-on-missing-checkpoint',
+                '--use-mp-args-from-checkpoint-args',
                 '--no-one-logger',
                 ]
 

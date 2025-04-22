@@ -5,10 +5,11 @@ from typing import List, Literal, Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import InferenceParams, parallel_state, tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.relative_pos_embedding import RelativePositionEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -19,6 +20,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import deprecate_inference_params
 
 
 class T5LMHead(MegatronModule):
@@ -266,8 +268,10 @@ class T5Model(LanguageModule):
         lm_labels: Tensor = None,
         encoder_hidden_states: Tensor = None,
         output_encoder_hidden_only: bool = False,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> Tensor:
         """Forward pass.
 
@@ -278,11 +282,13 @@ class T5Model(LanguageModule):
             decoder_attn_mask (Tensor): self-attention mask for decoder
             encoder_decoder_attn_mask (Tensor): cross-attention mask between encoder and decoder
             lm_labels (Tensor): labels for decoder output
-            inference_params (InferenceParams): relevant arguments for inferencing
+            inference_context (BaseInferenceContext): relevant arguments for inferencing
 
         Returns:
             Tensor: loss tensor
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
 
         ## Encoder forward
         if encoder_hidden_states is None:
@@ -303,7 +309,7 @@ class T5Model(LanguageModule):
             rotary_pos_emb = None
             if self.position_embedding_type == 'rope':
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_params, self.encoder, encoder_input, self.config, packed_seq_params
+                    inference_context, self.encoder, encoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -311,7 +317,7 @@ class T5Model(LanguageModule):
             encoder_attention_bias_parallel = None
             if self.position_embedding_type == 'relative':
                 query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
-                    inference_params, self.encoder, encoder_input, self.config
+                    inference_context, self.encoder, encoder_input, self.config
                 )
                 key_seq_length = query_seq_length
                 attention_bias = self.encoder_relative_pos_emb(query_seq_length, key_seq_length)
@@ -333,7 +339,7 @@ class T5Model(LanguageModule):
                 encoder_hidden_states = self.encoder(
                     hidden_states=encoder_input,
                     attention_mask=encoder_attn_mask,
-                    inference_params=inference_params,
+                    inference_context=inference_context,
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=encoder_attention_bias_parallel,
                 )
@@ -360,7 +366,7 @@ class T5Model(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config, packed_seq_params
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
@@ -368,7 +374,7 @@ class T5Model(LanguageModule):
         decoder_attention_bias_parallel = None
         if self.position_embedding_type == 'relative':
             query_seq_length = RelativePositionEmbedding.get_relative_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
+                inference_context, self.decoder, decoder_input, self.config
             )
             key_seq_length = query_seq_length
             attention_bias = self.decoder_relative_pos_emb(query_seq_length, key_seq_length)
@@ -389,7 +395,7 @@ class T5Model(LanguageModule):
             attention_mask=decoder_attn_mask,
             context=encoder_hidden_states,
             context_mask=encoder_decoder_attn_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
             attention_bias=decoder_attention_bias_parallel,
         )

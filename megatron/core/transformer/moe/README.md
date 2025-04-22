@@ -1,7 +1,15 @@
-# Megatron Core MoE Key Features
+# Megatron Core MoE
 
-Megatron-Core offers rich parallelism mappings, combining Expert Parallelism with tensor, data, sequence, and pipeline parallelism. This boosts Mixtral 8X7B bf16 training to achieve **468 TFLOPS** as of MCore v0.9.
+Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly integrating Expert Parallelism with tensor, data, sequence, and pipeline parallelism. With MCore v0.9, we've achieved remarkable performance of **468 TFLOPS** for Mixtral 8X7B bf16 training. Additionally, we support state-of-the-art MoE model architectures including DeepSeek-V3 and Qwen-MoE.
 
+### What's New
+- **Support for DeepSeek-V3 architecture**
+  - Enable TP for MLA and DeepSeek-V3
+  - Support aux-loss-free load balancing strategy
+  - Support node-limited routing
+- **Support DeepSeek's DeepEP for efficient token dispatching and combining**
+- Add fusion for token permutation and unpermutation
+- Support Uneven virtual pipeline parallel split
 
 ### Parallelism
 - **Expert Parallelism**
@@ -11,6 +19,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 - **Context Parallelism**:
     - Split the sequence dimension to support long context training.
 - **Richer parallel mappings**: EP can be combined with DP/TP/PP/CP for handling larger MoE variants.
+- **MoE Parallel Folding**: Support for setting different parallelism strategies for Attention and MoE components, enabling more flexible and efficient model sharding. See detailed documentation below.
 - **Full distributed optimizer support.**
 
 ### Router and Load Balancing
@@ -22,6 +31,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
     - Aux-loss-free load balancing strategy
 
 ### Performance Optimizations
+- (Experimental) **DeepEP** is integrated for efficient token communication in large-scale MoE training.
 - GroupedGEMM when num local experts > 1
     - Supported dtype: bf16
     - Performance improvements for larger MoE models
@@ -31,54 +41,20 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 ### Token Dispatch Mechanism
 - Dropless / No token drop
 - Token drop, with or without padding to capacity
+- Token permutation / Unpermutation fusion
 
 ### Ease of use
 - Checkpoint converter for Mixtral models, see the [example](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mixtral) for details.
+- MoE Layer Frequency to customize the hybrid MoE/Dense layer architecture
 - Distributed checkpoining
 - Per-layer logging
 - Upcycling Support
-- Granular upcycling
 
 ## Upcoming features
-- New Parallelism for Large-scale MoE training
-- FP8 support for GroupedGEMM
-- Token permutation / Unpermutation fusion
 - TopK Router Fusion
-- MoE Layer Frequency
+- Multi-token Prediction
 
 # User Guide
-
-### MoE Related Arguments
-
-| Item | Description |
-| --- | --- |
-| --num-experts | Number of Experts in MoE (None means no MoE) |
-| --expert-model-parallel-size | Degree of expert model parallelism. Default is 1. |
-| --moe-ffn-hidden-size | MoE Feed-Forward Network hidden size. Default is None. |
-| --expert-tensor-parallel-size | Degree of tensor model parallelism of expert layer. Default is same to --tensor-model-parallel-size. |
-| --moe-layer-freq | Frequency between MoE layers and Dense layers. Accepts either: 1) An integer N for 1:N ratio (one expert layer for every N-1 dense layers), 2) A string "N" for the same ratio, or 3) A string with Python list expression for custom patterns like `([1]*3+[0]*1)*3` which gives [1,1,1,0,1,1,1,0,1,1,1,0] where 1=expert layer and 0=dense layer. Examples: `([0]+[1]*23)` for 1 dense layer followed by 23 experts layers, `([1]*3+[0]*2)*2` for three expert layers followed by two dense layers, repeated twice. Default is 1. |
-| --moe-grouped-gemm | When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine. |
-| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
-| --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
-| --moe-router-score-function | Score function for MoE routing. Can be "softmax" or "sigmoid". Default is "softmax". |
-| --moe-router-pre-softmax | Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k. |
-| --moe-router-topk-limited-devices | Number of expert parallel ranks to consider for each token during routing. Perform top-k routing on a subset of expert parallel ranks by first selecting N ranks for each token, then conducting top-k selection among experts on these devices. None means no device limitation. Default is None, which means no limited devices. |
-| --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
-| --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
-| --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
-| --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
-| --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
-| --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |
-| --moe-token-dispatcher-type | Determines the token dispatcher type. Choices are "allgather", "alltoall" and "alltoall_seq". Default is "allgather". We recommend using 'alltoall' if expert parallelism is applied. We have upgraded the "alltoall" dispatcher in place during MCore v0.9, while retaining the original implementation, renamed as "alltoall_seq".|
-| --moe-per-layer-logging | Enable per-layer logging for MoE, currently supports auxiliary loss and z loss. |
-| --moe-expert-capacity-factor | The capacity factor for each expert, None means no token will be dropped. Default is None. |
-| --moe-pad-expert-input-to-capacity | Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set. |
-| --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
-| --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
-| --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
-| --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
-| --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
-
 
 ## Usage
 
@@ -89,6 +65,7 @@ To train a top-2 MoE model with 8 experts and auxiliary loss, include the follow
 --num-experts 8
 --expert-model-parallel-size 8
 --moe-grouped-gemm
+--moe-permute-fusion
 --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, none. Default is aux_loss.
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
@@ -179,6 +156,68 @@ We currently only support the default upcycling strategy, which duplicates the e
 
 Note: The MoE model structure is defined through script arguments. All MoE-related arguments (such as `--num-experts`) can be customized; however, other model structure arguments must be consistent with those of the dense model.
 
+### Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching
+- [DeepSeek-DeepEP](https://github.com/deepseek-ai/deepep) provides a highly optimized implementation for MoE token dispatching and combining operations, specifically designed for large-scale MoE training scenarios.
+- DeepEP is particularly recommended for training large-scale, fine-grained MoE architectures such as DeepSeek-V3 and other advanced MoE models.
+- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
+
+### CUDA Graph Support
+CUDA Graph functionality can be enabled through two options:
+
+1. `--enable-cuda-graph`: Automatically captures graphs during runtime (just-in-time)
+2. `--external-cuda-graph`: Requires manual graph capture before runtime (ahead-of-time)
+
+Note: These two options cannot be enabled simultaneously.
+
+For manual capture with `--external-cuda-graph`, refer to the `cuda_graph_capture()` and `cuda_graph_set_manual_hooks()` functions in `megatron/training/training.py`.
+
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for attention layers by setting `--cuda-graph-scope=attn`, while leaving MoE layers unmodified. Note that the `--cuda-graph-scope` parameter is only applicable when using `--external-cuda-graph` mode.
+
+### MoE Related Arguments
+| Item | Description |
+| --- | --- |
+| --num-experts | Number of Experts in MoE (None means no MoE) |
+| --expert-model-parallel-size | Degree of expert model parallelism. Default is 1. |
+| --moe-ffn-hidden-size | MoE Feed-Forward Network hidden size. Default is None. |
+
+<details>
+<summary> View all MoE related arguments. </summary>
+
+| Item | Description |
+| --- | --- |
+| --num-experts | Number of Experts in MoE (None means no MoE) |
+| --expert-model-parallel-size | Degree of expert model parallelism. Default is 1. |
+| --moe-ffn-hidden-size | MoE Feed-Forward Network hidden size. Default is None. |
+| --expert-tensor-parallel-size | Degree of tensor model parallelism of expert layer. Default is same to --tensor-model-parallel-size. |
+| --moe-layer-freq | Frequency between MoE layers and Dense layers. Accepts either: 1) An integer N for 1:N ratio (one expert layer for every N-1 dense layers), 2) A string "N" for the same ratio, or 3) A string with Python list expression for custom patterns like `([1]*3+[0]*1)*3` which gives [1,1,1,0,1,1,1,0,1,1,1,0] where 1=expert layer and 0=dense layer. Examples: `([0]+[1]*23)` for 1 dense layer followed by 23 experts layers, `([1]*3+[0]*2)*2` for three expert layers followed by two dense layers, repeated twice. Default is 1. |
+| --moe-grouped-gemm | When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine. |
+| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
+| --moe-router-dtype | Data type for routing computation and expert output weighted averaging. Options are 'fp32' and 'fp64'. This can improve numerical stability, particularly when using a large number of experts. The throughput/memory impact should be negligible when used with --moe-permute-fusion. Default is None (no dtype promotion). |
+| --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
+| --moe-router-score-function | Score function for MoE routing. Can be "softmax" or "sigmoid". Default is "softmax". |
+| --moe-router-pre-softmax | Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k. |
+| --moe-router-num-groups | Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.  Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)) |
+| --moe-router-group-topk | Number of selected groups for group-limited routing. |
+| --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
+| --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
+| --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
+| --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
+| --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
+| --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |
+| --moe-token-dispatcher-type | Determines the token dispatcher type. Choices are "allgather", "alltoall" and "alltoall_seq". Default is "allgather". We recommend using 'alltoall' if expert parallelism is applied. We have upgraded the "alltoall" dispatcher in place during MCore v0.9, while retaining the original implementation, renamed as "alltoall_seq".|
+| --moe-enable-deepep | (Experimental) Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex. |
+| --moe-per-layer-logging | Enable per-layer logging for MoE, currently supports auxiliary loss and z loss. |
+| --moe-expert-capacity-factor | The capacity factor for each expert, None means no token will be dropped. Default is None. |
+| --moe-pad-expert-input-to-capacity | Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set. |
+| --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
+| --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
+| --moe-permute-fusion | Fuse token rearrangement ops during token dispatching. |
+| --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
+| --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
+| --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
+
+</details>
+
 ## MoE training example:
 <details>
 <summary>Click here. </summary>
@@ -240,6 +279,7 @@ MOE_ARGS=(
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
+    --moe-permute-fusion
 )
 
 DATA_ARGS=(
@@ -363,6 +403,7 @@ By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 - Dispatcher `allgather` is the default option. It achieves better performance and efficiency when only tensor parallelism is used or when the Top-k value is very large.
 - Dispatcher `alltoall` is recommended if expert parallelism is applied.
 - Dispatcher `alltoall_seq` is the original implementation of `alltoall` and is retained for potential compatibility risk.
+- Dispatcher `flex` is a new dispatcher decouples communication group from model parallelism. Currently, only the DeepEP backend is supported for by setting `--moe-enable-deepep`.
 
 **Enable Communication Overlap**
 - Enable `--overlap-param-gather` and `--overlap-grad-reduce` with distributed optimizer.
@@ -378,6 +419,10 @@ MoE suffers from a severe load imbalance issue when the router is under-trained,
 Therefore, there are two recommended ways during the first 200 steps to avoid the OOM problem, which can be removed after the token distribution is more stable:
 1. Increase the `expert-tensor-parallel-size` and decrease `expert-model-parallel-size` to replace EP with TP in MoELayer, this can prevent the load imbalancing between EP ranks. Since current ETP implementation has some memeory overhead, you can further enable activation recomputation only for MoE Layer by adding `--moe-layer-recompute`.
 2. Setting capacity factor to a relatively small number like 1.0 by adding `--moe-token-capacity-factor 1.0`.
+
+**Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching**
+- The primary advantage of DeepEP is its cross-node token communication efficiency, which delivers substantial performance improvements when deploying expert parallelism across multiple nodes with large TopK values.
+- To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
 
 ### Reference Best Parallel Mapping
 

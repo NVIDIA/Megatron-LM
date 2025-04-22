@@ -15,15 +15,17 @@ import torch.nn.functional as F
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.utils import deprecate_inference_params
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -140,14 +142,22 @@ class MambaMixer(MegatronModule):
         self.d_inner = int(self.expand * self.d_model)
         self.headdim = headdim
         self.ngroups = ngroups
-        assert self.d_inner % self.headdim == 0
-        self.nheads = self.d_inner // self.headdim
         self.D_has_hdim = D_has_hdim
         self.rmsnorm = rmsnorm
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_number = layer_number
+
+        if self.config.mamba_state_dim is not None:
+            self.d_state = self.config.mamba_state_dim
+        if self.config.mamba_head_dim is not None:
+            self.headdim = self.config.mamba_head_dim
+        if self.config.mamba_num_groups is not None:
+            self.ngroups = self.config.mamba_num_groups
+
+        assert self.d_inner % self.headdim == 0
+        self.nheads = self.d_inner // self.headdim
 
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
         assert self.d_inner % self.tensor_model_parallel_size == 0
@@ -210,8 +220,7 @@ class MambaMixer(MegatronModule):
             ).clamp(min=dt_init_floor)
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
             inv_dt = dt + torch.log(-torch.expm1(-dt))
-            with torch.no_grad():
-                self.dt_bias = nn.Parameter(inv_dt)
+            self.dt_bias = nn.Parameter(inv_dt)
             # Our initialization would set all Linear.bias to zero,
             # need to mark this one as _no_reinit
             self.dt_bias._no_reinit = True
@@ -220,6 +229,7 @@ class MambaMixer(MegatronModule):
 
             # name.endswith("bias") in param_grouping.py
             self.dt_bias._no_weight_decay = True
+            setattr(self.dt_bias, 'tensor_model_parallel', True)
 
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
             A = torch.empty(
@@ -266,18 +276,30 @@ class MambaMixer(MegatronModule):
             tp_comm_buffer_name='fc2',
         )
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(
+        self,
+        hidden_states,
+        inference_context=None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+    ):
         """
         hidden_states: (nL, B, D) / (L B D)
         Returns: same shape as hidden_states
         """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         _, batch, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
-        if inference_params is not None:
+        if inference_context is not None:
+            assert (
+                inference_context.is_static_batching()
+            ), "Mamba does not currently support dynamic inference batching."
             assert not self.config.sequence_parallel
-            conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
-            if inference_params.seqlen_offset > 0:
+            conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
+            if inference_context.seqlen_offset > 0:
                 # The states are updated inplace
                 out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out, out_bias
@@ -290,7 +312,7 @@ class MambaMixer(MegatronModule):
         # transpose: l b pd --> b l pd
         xz = rearrange(xz, "l b d -> b l d").contiguous()
 
-        if self.use_mem_eff_path and inference_params is None:
+        if self.use_mem_eff_path and inference_context is None:
             assert ssm_state is None
 
             if self.conv1d.bias is not None:
@@ -551,9 +573,14 @@ class MambaMixer(MegatronModule):
         )
         return conv_state, ssm_state
 
-    def _get_states_from_cache(self, inference_params, batch_size, initialize_states=False):
+    def _get_states_from_cache(
+        self, inference_context, batch_size, initialize_states=False, *, inference_params=None
+    ):
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
         assert self.layer_number is not None
-        if self.layer_number not in inference_params.key_value_memory_dict:
+        if self.layer_number not in inference_context.key_value_memory_dict:
             conv_state = torch.zeros(
                 batch_size,
                 self.conv1d.weight.shape[0],
@@ -569,9 +596,9 @@ class MambaMixer(MegatronModule):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            inference_params.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
+            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
         else:
-            conv_state, ssm_state = inference_params.key_value_memory_dict[self.layer_number]
+            conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
             # TODO: What if batch size changes between generation, and we reuse the same states?
             if initialize_states:
                 conv_state.zero_()

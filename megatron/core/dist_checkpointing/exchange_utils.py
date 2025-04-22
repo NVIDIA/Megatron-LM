@@ -325,7 +325,10 @@ def exchange_loaded_tensors_gather_rounds(
                         # this during state dict load.
                         # TODO: remove it once the bug is fixed
                         if is_float8tensor(local_ten):
-                            local_ten = local_ten.from_float8()
+                            try:
+                                local_ten = local_ten.from_float8()
+                            except Exception as e:
+                                local_ten = local_ten.dequantize()
                             all_loaded_tensors[shard_id] = local_ten
 
                     round_tensors.append(local_ten)
@@ -483,7 +486,10 @@ def exchange_loaded_tensors_broadcast(
         # this during state dict load.
         # TODO: remove it once the bug is fixed
         if is_float8tensor(local_ten):
-            local_ten = local_ten.from_float8()
+            try:
+                local_ten = local_ten.from_float8()
+            except Exception as e:
+                local_ten = local_ten.dequantize()
             all_loaded_tensors[shard_id] = local_ten
 
         global_src_rank = (

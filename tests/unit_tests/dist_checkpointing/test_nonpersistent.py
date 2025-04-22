@@ -2,11 +2,11 @@
 
 import filecmp
 import os
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
+from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import (
     _NON_PERSISTENT_CKPT_SUBDIR,
     load_checkpoint,
@@ -35,7 +35,7 @@ class TestNonPersistentSaveAndLoad:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         with TempNamedDir(
             tmp_path_dist_ckpt / "test_non_persistent"
         ) as non_persistent_ckpt_dir, mock.patch(
@@ -123,7 +123,7 @@ class TestLegacySaveAndLoad:
         model, optimizer = setup_model_and_optimizer(1, tp, pp)
         opt_param_scheduler = None
 
-        mock_args = SimpleNamespace()
+        mock_args = parse_args(ignore_unknown_args=True)
         with TempNamedDir(tmp_path_dist_ckpt / "test_legacy") as legacy_ckpt_dir, mock.patch(
             'megatron.training.checkpointing.get_args', new=lambda: mock_args
         ), mock.patch("megatron.training.checkpointing.update_num_microbatches"):

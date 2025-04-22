@@ -7,6 +7,7 @@ import signal
 import sys
 import tempfile
 import time
+import zipfile
 from typing import List, Optional
 
 import click
@@ -19,7 +20,6 @@ from jetclient.services.dtos.pipeline import PipelineStatus
 from tests.test_utils.python_scripts import common
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
-GITLAB_PREFIX = "assets/basic/tests-unit-tests-data-{environment}-{tag}/"
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,7 @@ def launch_and_wait_for_completion(
     tag: Optional[str],
     run_name: Optional[str],
     wandb_experiment: Optional[str],
+    enable_lightweight_mode: bool,
 ) -> jetclient.JETPipeline:
     cluster_config = {"account": account}
     if partition is not None:
@@ -57,49 +58,66 @@ def launch_and_wait_for_completion(
 
     n_submission_attempts = 0
     while n_submission_attempts < 3:
-        pipeline = jetclient.JETClient(
-            customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
-        ).workloads.submit(
-            workloads=common.load_workloads(
-                test_case=test_case,
-                n_repeat=n_repeat,
-                time_limit=time_limit,
-                tag=tag,
-                scope=scope,
-                container_image=container_image,
-                container_tag=container_tag,
-                environment=environment,
-                record_checkpoints=record_checkpoints,
-            ),
-            config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
-            custom_config={
-                "launchers": {cluster: cluster_config},
-                "executors": {
-                    "jet-ci": {
-                        "environments": {
-                            cluster: {
-                                "variables": {
-                                    "RUN_NAME": run_name or "",
-                                    "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
-                                    "WANDB_EXPERIMENT": wandb_experiment or "",
+        try:
+            pipeline = jetclient.JETClient(
+                customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
+            ).workloads.submit(
+                workloads=common.load_workloads(
+                    test_case=test_case,
+                    n_repeat=n_repeat,
+                    time_limit=(1200 if enable_lightweight_mode else time_limit),
+                    tag=tag,
+                    scope=scope,
+                    container_image=container_image,
+                    container_tag=container_tag,
+                    environment=environment,
+                    record_checkpoints=record_checkpoints,
+                ),
+                config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
+                custom_config={
+                    "launchers": {cluster: cluster_config},
+                    "executors": {
+                        "jet-ci": {
+                            "environments": {
+                                cluster: {
+                                    "variables": {
+                                        "RUN_NAME": run_name or "",
+                                        "ENABLE_LIGHTWEIGHT_MODE": str(
+                                            enable_lightweight_mode
+                                        ).lower(),
+                                        "WANDB_API_KEY": os.getenv("WANDB_API_KEY") or "",
+                                        "WANDB_EXPERIMENT": wandb_experiment or "",
+                                        "RECORD_CHECKPOINTS": str(
+                                            "Record checkpoints"
+                                            in os.getenv("CI_MERGE_REQUEST_LABELS", "")
+                                        ).lower(),
+                                    }
                                 }
                             }
                         }
-                    }
+                    },
+                    "outputs": {
+                        "enabled": True,
+                        "artifacts_storages": [common.resolve_artifact_config(cluster)],
+                    },
                 },
-                "outputs": {
-                    "enabled": True,
-                    "artifacts_storages": [common.resolve_artifact_config(cluster)],
-                },
-            },
-            wait_for_validation=True,
-            max_wait_time=(60 * 60),
-        )
+                wait_for_validation=True,
+                max_wait_time=(60 * 60),
+            )
+        except jetclient.clients.gitlab.GitlabAPIError as e:
+            logger.error(f"Faced {str(e)}. Waiting and retrying...")
+            n_submission_attempts += 1
+            time.sleep(2**n_submission_attempts * 5)
+            continue
+
         if pipeline.get_status() == PipelineStatus.SUBMISSION_FAILED:
             n_submission_attempts += 1
             logger.info("Submission failed, attempt again (%s/3)", str(n_submission_attempts))
             continue
         break
+
+    if n_submission_attempts == 3:
+        sys.exit(1)
 
     register_pipeline_terminator(pipeline=pipeline)
 
@@ -126,16 +144,10 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[
         assets_path = assets_base_path / f"restart={restart_idx}"
         assets_path.mkdir(parents=True, exist_ok=True)
         for asset in assets:
-            (assets_path / asset.source_path.removeprefix(GITLAB_PREFIX)).parent.mkdir(
-                parents=True, exist_ok=True
-            )
-            with open(assets_path / asset.source_path.removeprefix(GITLAB_PREFIX), "w") as fh:
+            (assets_path / asset.source_path).parent.mkdir(parents=True, exist_ok=True)
+            with open(assets_path / asset.source_path, "w") as fh:
                 dest = pathlib.Path(fh.name)
-                logger.info(
-                    "Downloading log %s to %s",
-                    asset.source_path.removeprefix(GITLAB_PREFIX),
-                    str(dest),
-                )
+                logger.info("Downloading log %s to %s", asset.source_path, str(dest))
                 asset.download(dest)
     return assets
 
@@ -200,6 +212,15 @@ def parse_finished_training(logs: List[str]) -> Optional[bool]:
     type=str,
     help="Wandb experiment (only relevant for release tests)",
 )
+@click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Wandb experiment (only relevant for release tests)",
+)
 def main(
     model: str,
     test_case: str,
@@ -216,12 +237,10 @@ def main(
     container_image: Optional[str] = None,
     run_name: Optional[str] = None,
     wandb_experiment: Optional[str] = None,
+    enable_lightweight_mode: bool = False,
 ):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
-
-    global GITLAB_PREFIX
-    GITLAB_PREFIX = GITLAB_PREFIX.format(environment=environment, tag=tag)
 
     model_config_path = pathlib.Path(
         BASE_PATH
@@ -270,13 +289,13 @@ def main(
             run_name=run_name,
             wandb_experiment=wandb_experiment,
             record_checkpoints=record_checkpoints,
+            enable_lightweight_mode=enable_lightweight_mode,
         )
-
-        main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
 
         n_download_attempt = 0
         while n_download_attempt < 3:
             try:
+                main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
                 jet_log = main_job.get_logs()
                 logs = extract_logs_to_string(logs=jet_log)
                 download_job_assets(logs=jet_log, iteration=n_iteration)
@@ -286,12 +305,13 @@ def main(
                 requests.exceptions.ConnectionError,
                 json.decoder.JSONDecodeError,
                 UnicodeDecodeError,
+                zipfile.BadZipFile,
             ) as e:
                 logger.error(e)
-                time.sleep((3**n_download_attempt) * 60)
+                time.sleep(2 * n_download_attempt * 15)
                 n_download_attempt += 1
                 no_log = True
-            except KeyError as e:
+            except (KeyError, IndexError) as e:
                 logger.error(e)
                 no_log = True
                 break
@@ -306,12 +326,35 @@ def main(
             n_attempts += 1
             continue
 
-        print(f"Logs:\n{concat_logs}")
+        if test_type != "release":
+            print(f"Logs:\n{concat_logs}")
 
-        success = pipeline.get_status() == PipelineStatus.SUCCESS
-        logger.info("Pipeline terminated with status %s", pipeline.get_status().name)
+        n_status_attempts = 0
+        status = None
+        while n_status_attempts < 3:
+            try:
+                status = pipeline.get_status()
+                break
+            except jetclient.clients.gitlab.GitlabAPIError:
+                logging.info("Could not fetch status, try again")
+                time.sleep(2 * n_status_attempts * 15)
+                n_status_attempts += 1
+
+        if status is None:
+            continue
+
+        success = status == PipelineStatus.SUCCESS
+        logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
+            if (
+                "The server socket has failed to listen on any local network address."
+                in concat_logs
+            ):
+                logger.error("TCP error, attempt restart.")
+                n_attempts += 1
+                continue
+
             sys.exit(int(not success))  # invert for exit 0
 
         if test_type != "release":
@@ -322,7 +365,8 @@ def main(
                 "Some NCCL operations have failed or timed out." in concat_logs
                 or "uncorrectable ECC error encountered" in concat_logs
                 or "illegal memory access" in concat_logs
-                or "illegal instruction" in concat_logs in concat_logs
+                or "illegal instruction" in concat_logs
+                or "torch.distributed.DistNetworkError" in concat_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1

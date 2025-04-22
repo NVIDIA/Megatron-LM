@@ -19,6 +19,11 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
+    pipeline_model_parallel_comm_backend: Optional[str] = None
+    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
+       If None, the default backend will be used.
+    """
+
     pipeline_model_parallel_size: int = 1
     """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
 
@@ -210,6 +215,11 @@ class ModelParallelConfig:
     cross_entropy_loss_fusion: bool = False
     """If this is enabled, the fused cross entropy implementation would be used.
        Defaults to False.
+    """
+
+    cross_entropy_fusion_impl: str = 'native'
+    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
+       from Transformer Engine library is used. Defaults to 'native'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False

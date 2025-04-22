@@ -2,12 +2,13 @@
 
 """ Utilities for transforming state_dict."""
 
-from typing import Callable
+from typing import Callable, Union
 
 from .dict_utils import dict_list_map_inplace, extract_matching_values
 from .mapping import (
     CommonStateDict,
     ShardedStateDict,
+    ShardedTensor,
     ShardedTensorFactory,
     StateDict,
     apply_factories,
@@ -39,6 +40,7 @@ def save_preprocess(
     apply_factories(sharded_state_dict)
     _, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
     sharded_part, common_state_dict = extract_sharded_base(sharded_state_dict)
+    sharded_part = filter_out_empty_flatten_tensor(sharded_part)
     if validate_access_integrity:
         preprocessed_common_state_dict = common_state_dict
         if preprocess_common_before_consistancy_check:
@@ -69,6 +71,7 @@ def load_preprocess(sharded_state_dict: ShardedStateDict):
     # Create a copy of sharded_state_dict as the passed in state dict may have
     # references that prevent tensors from being deallocated
     sharded_state_dict, _ = extract_matching_values(sharded_state_dict, lambda x: True)
+    sharded_state_dict = filter_out_empty_flatten_tensor(sharded_state_dict)
 
     sh_ten_factories, _ = extract_matching_values(
         sharded_state_dict,
@@ -83,3 +86,27 @@ def load_preprocess(sharded_state_dict: ShardedStateDict):
     nonpersistent_state_dict, sharded_state_dict = extract_nonpersistent(sharded_state_dict)
     dict_list_map_inplace(lambda o: o.unwrap(), nonpersistent_state_dict)
     return sharded_state_dict, nonpersistent_state_dict, sh_ten_factories
+
+
+def filter_out_empty_flatten_tensor(sharded_state_dict: Union[dict, list]):
+    """
+    Filter out ShardedTensors with empty flatten_range.
+    These tensors can cause the PyTorch check in failure.
+
+    Args:
+        sharded_state_dict: state dict possibly containing ShardedTensor objects
+    """
+    # Filter out ShardedTensors with empty flatten_range.
+    # These tensors can cause the PyTorch check in
+    # `TorchShardedTensor._init_from_local_shards_and_global_metadata` to fail.
+    # This situation may occur in custom Fully Sharded Data Parallel (FSDP) cases.
+    sharded_state_dict, _ = extract_matching_values(
+        sharded_state_dict,
+        lambda v: not (
+            isinstance(v, ShardedTensor)
+            and v.flattened_range
+            and v.flattened_range.start == v.flattened_range.stop
+        ),
+    )
+
+    return sharded_state_dict

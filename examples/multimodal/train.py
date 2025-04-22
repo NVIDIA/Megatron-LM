@@ -18,6 +18,7 @@ from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
+from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -26,10 +27,10 @@ from megatron.core.parallel_state import (
     is_pipeline_last_stage,
 )
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.training.utils import is_last_rank
+from megatron.training.utils import is_last_rank, get_batch_on_this_cp_rank
 
 
-def get_batch(data_iterator):
+def get_batch(data_iterator, image_token_index, img_seq_len):
     """Generate a batch
 
     Note: attn_mask_type in layer_specs.py sets the attention mask. Attention mask is None here.
@@ -67,11 +68,19 @@ def get_batch(data_iterator):
     cu_lengths = tensor_parallel.broadcast_data(["cu_lengths"], data, torch.int32)["cu_lengths"]
     max_lengths = tensor_parallel.broadcast_data(["max_lengths"], data, torch.int32)["max_lengths"]
 
-    # No image input (text-only sample) if the dataloader produced a dummy image.
+    # No image input (text-only sample) if the dataloader returned a size 1 image.
     if imgs.shape == torch.Size([1, 1]):
-        # FIXME: text-only data can cause a hang if the vision model is own its own pipeline rank and --freeze-ViT is enabled.
-        imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
-        num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
+        # model and then add image embeddings with a zero multiplier.
+        if args.use_torch_fsdp2:
+            imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
+            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
+        else:
+            # Similar workaround is not needed without FSDP and we can use an empty image.
+            # FIXME: text-only data can cause still cause a hang in the special case where
+            # the vision model is own its own pipeline rank and --freeze-ViT is enabled.
+            imgs = torch.tensor([], dtype=torch.float32, device=data_text.device)
+            num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
 
     # Last pipeline parallel stage doesn't need images.
     if pp_size > 1 and is_pipeline_last_stage():
@@ -110,6 +119,24 @@ def get_batch(data_iterator):
     loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
     torch.cuda.nvtx.range_pop()
 
+    # If context parallel is enabled, must shard inputs to CP ranks.
+    if args.context_parallel_size > 1 or args.sequence_parallel:
+        assert tokens.shape[0], "micro-batch-size > 1 not supported yet with CP"
+
+        num_image_tokens = torch.sum(tokens == image_token_index).item()
+        num_image_embeddings = img_seq_len * imgs.shape[0] - num_image_tokens
+        seq_len = text_length + num_image_embeddings
+
+        # CP expects sequence length is divisible by CP size so apply padding.
+        mp_padding_needed = context_parallel.get_padding(
+            seq_len, args.context_parallel_size,
+            args.tensor_model_parallel_size, args.sequence_parallel,
+        )
+        tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed)) for item in (tokens, position_ids, labels, loss_mask)]
+
+        # Get PackedSeqParams that indicate the amount of padding for TransformerEngine.
+        packed_seq_params = context_parallel.get_packed_seq_params(tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True)
+
     return (
         tokens,
         labels,
@@ -142,7 +169,7 @@ def get_mask_start_and_end_idx(arr):
     """
     Returns a list of tuples holding the start and end index in arr of the non-zeros contiguuous
     sub arrays.
-    
+
     For instance, if arr = [0, 1, 0, 0, 1, 1]
     get_mask_start_and_end_idx(arr) = [(1, 1), (4, 5)]
     such that arr[1:1+1] = [1] and arr[4:5+1] = [1, 1]
@@ -173,6 +200,7 @@ def scaled_loss_func(loss_mask, output_tensor):
 
     Where we use the loss mask to infer the start / end of the conversation turns.
     """
+    args = get_args()
     losses = output_tensor.float()
 
     loss_list = []
@@ -194,24 +222,39 @@ def scaled_loss_func(loss_mask, output_tensor):
         # normalize loss for each turn
         loss_list[idx] = loss_list[idx] * math.sqrt(num_valid_labels_list[idx]) / base_num
 
-    total_loss = torch.stack(loss_list).sum()
-    total_tokens = torch.ones_like(total_loss)
+    # Some ranks may not get loss tokens due to Context Parallel Sharding
+    if len(loss_list) > 0
+        total_loss = torch.stack(loss_list).sum()
+        total_tokens = torch.ones_like(total_loss)
+    elif len(loss_list) == 0 and args.context_parallel_size > 1:
+        total_tokens = loss_mask.sum()
+        total_loss = torch.sum(losses.view(-1) * loss_mask)
+    else:
+        raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
 
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
     return (
-        total_loss,
+        loss[0].clone(),
         local_num_tokens,
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
 
 
 def loss_func(loss_mask, output_tensor):
+    args = get_args()
+
     losses = output_tensor.float()
 
     loss_mask = loss_mask.contiguous().view(-1).float()
@@ -220,12 +263,22 @@ def loss_func(loss_mask, output_tensor):
     total_loss = torch.sum(losses.view(-1) * loss_mask)
     loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
 
+    if args.context_parallel_size > 1:
+        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+
     reporting_loss = loss.clone().detach()
     torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
     local_num_tokens = loss[1].clone().detach().to(torch.int)
 
-    return (total_loss, local_num_tokens, {'lm loss': (reporting_loss[0], reporting_loss[1])})
+    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
+    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
+    # on loss[0] fixes this
+    return (
+        loss[0].clone(),
+        local_num_tokens,
+        {'lm loss': (reporting_loss[0], reporting_loss[1])}
+    )
 
 
 def forward_step(data_iterator, model: LLaVAModel):
@@ -252,7 +305,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         images,
         num_image_tiles,
         packed_seq_params,
-    ) = get_batch(data_iterator)
+    ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(

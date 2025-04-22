@@ -8,6 +8,7 @@ import click
 import gitlab
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
+PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ def main(pipeline_id: int):
         f"https://{os.getenv('GITLAB_ENDPOINT')}", private_token=os.getenv("RO_API_TOKEN")
     )
 
-    project = gl.projects.get(19378)
+    project = gl.projects.get(PROJECT_ID)
     pipeline = project.pipelines.get(pipeline_id)
     print(pipeline.bridges.list())
 

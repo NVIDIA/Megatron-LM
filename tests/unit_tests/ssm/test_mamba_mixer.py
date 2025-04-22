@@ -6,7 +6,7 @@ import torch
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
