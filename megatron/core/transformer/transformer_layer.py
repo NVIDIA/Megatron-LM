@@ -616,11 +616,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
         probs, routing_map = self.mlp.router(pre_mlp_layernorm_output)
-        local_tokens, probs, tokens_per_expert = self.mlp.token_dispatcher.dispatch_preprocess(
+        local_tokens, probs = self.mlp.token_dispatcher.dispatch_preprocess(
             pre_mlp_layernorm_output, routing_map, probs
         )
 
-        return (local_tokens, probs, hidden_states, pre_mlp_layernorm_output, tokens_per_expert)
+        return (local_tokens, probs, hidden_states, pre_mlp_layernorm_output)
 
     def _submodule_dispatch_forward(self, local_tokens, probs, state=None):
         """
@@ -648,7 +648,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             dispatched_tokens, permuted_probs = token_dispatcher.dispatch_postprocess(
                 dispatched_tokens, probs
             )
-            tokens_per_expert = state.tokens_per_expert
+            tokens_per_expert = token_dispatcher.tokens_per_expert
+            token_dispatcher.tokens_per_expert = None
         expert_output, mlp_bias = self.mlp.experts(
             dispatched_tokens, tokens_per_expert, permuted_probs
         )
@@ -683,14 +684,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.mlp.backward_dw()
 
     def _submodule_attn_router_postprocess(
-        self, node, local_tokens, probs, residual, pre_mlp_layernorm_output, tokens_per_expert
+        self, node, local_tokens, probs, residual, pre_mlp_layernorm_output
     ):
         node.common_state.residual = node.detach(residual)
         if self.mlp.use_shared_expert:
             node.common_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
 
-        if not self.is_deepep:
-            node.common_state.tokens_per_expert = tokens_per_expert
         return local_tokens, probs
 
     def _submodule_dispatch_postprocess(self, node, dispatched_tokens, probs):
