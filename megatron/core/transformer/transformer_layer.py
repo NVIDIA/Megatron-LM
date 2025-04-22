@@ -755,7 +755,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
     def get_submodule_callables(self, chunk_state):
         """
-        The forward callables take 2 parts of inputs:
+        The forward submodules take 2 parts of inputs:
         1. The ScheduleNode object.
         2. The input tensors.
         """
@@ -827,7 +827,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         mlp_forward = partial(callable_wrapper, mlp_func, mlp_postprocess_func)
         combine_forward = partial(callable_wrapper, combine_func, combine_postprocess_func)
 
-        callables = TransformerLayerSubmoduleCallables(
+        submodules = TransformerLayerSubmoduleCallables(
             attention=SubmoduleCallables(forward=attn_forward, dw=self._submodule_attn_router_dw),
             dispatch=SubmoduleCallables(forward=dispatch_forward),
             mlp=SubmoduleCallables(forward=mlp_forward, dw=self._submodule_mlp_dw),
@@ -835,7 +835,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             is_moe=self.is_moe,
             is_deepep=self.is_deepep,
         )
-        return callables
+        return submodules
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None

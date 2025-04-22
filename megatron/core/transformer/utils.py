@@ -199,7 +199,7 @@ def sharded_state_dict_default(
 @dataclass
 class SubmoduleCallables:
     """
-    Holds references to forward, dgrad, and dw (weight-grad) callables
+    Holds references to forward, dgrad, and dw (weight-grad) functions
     for a particular submodule.
     """
 
