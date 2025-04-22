@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
@@ -161,19 +162,41 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                self.vocab_size,
-                config=config,
-                init_method=config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                gather_output=not self.parallel_output,
-                skip_weight_param_allocation=self.pre_process
-                and self.share_embeddings_and_output_weights,
-                embedding_activation_buffer=self.embedding_activation_buffer,
-                grad_output_buffer=self.grad_output_buffer,
-            )
+            # lm_head in fp8 if (asked for AND no tied embeddings)
+            if config.lm_head_in_fp8 and self.share_embeddings_and_output_weights:
+                warnings.warn(
+                    "`lm_head_in_fp8` cannot be enabled when embeddings and output weights are tied. " \
+                    "This would raise an error because TE layers do not support skip_weight_param_allocation. \n" \
+                    "Setting lm_head_in_fp8 to False..."
+                )
+                config.lm_head_in_fp8=False
+
+            if config.lm_head_in_fp8:
+                self.output_layer = TEColumnParallelLinear(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=config.init_method,
+                    gather_output=not self.parallel_output,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    skip_weight_param_allocation=False,
+                )
+            else:
+                self.output_layer = tensor_parallel.ColumnParallelLinear(
+                    config.hidden_size,
+                    self.vocab_size,
+                    config=config,
+                    init_method=config.init_method,
+                    bias=False,
+                    skip_bias_add=False,
+                    gather_output=not self.parallel_output,
+                    skip_weight_param_allocation=self.pre_process
+                    and self.share_embeddings_and_output_weights,
+                    embedding_activation_buffer=self.embedding_activation_buffer,
+                    grad_output_buffer=self.grad_output_buffer,
+                )
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
