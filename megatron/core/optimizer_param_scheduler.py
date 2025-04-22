@@ -119,6 +119,14 @@ class OptimizerParamScheduler:
                 coeff = 0.5 * (math.cos(math.pi * cooldown_ratio) + 1.0)
             elif self.wd_cooldown_style == '1-sqrt':
                 coeff = 1.0 - math.sqrt(cooldown_ratio)
+            elif self.wd_cooldown_style == '1-2.2rt':
+                coeff = 1.0 - cooldown_ratio**0.45
+            elif self.wd_cooldown_style == '1-2.5rt':
+                coeff = 1.0 - cooldown_ratio**0.4
+            elif self.wd_cooldown_style == '1-cbrt':
+                coeff = 1.0 - cooldown_ratio**0.333
+            elif self.wd_cooldown_style == '1-qbrt':
+                coeff = 1.0 - cooldown_ratio**0.25
             else:
                 raise Exception(f'{self.wd_cooldown_style} weight decay cooldown style is not supported.')
             delta_wd = self.end_wd - self.end_cooldown_wd

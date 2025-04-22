@@ -5,7 +5,7 @@ from megatron.core import parallel_state
 
 
 class Tracker:
-    known_metrics = {"mean", "rms", "kurtosis"}
+    known_metrics = {"mean", "rms", "kurtosis", "underflow", "overflow"}
     expected_names = {"activation": (0, "sp"),
                       "mlp_intermediate": (1, "tp"),
                       "mlp_out": (2, "none"),
@@ -30,6 +30,12 @@ class Tracker:
             idx += 1
         if "kurtosis" in self.metrics:
             self.intermediate_metrics_map["sum_of_4th_powers"] = idx
+            idx += 1
+        if "underflow" in self.metrics:
+            self.intermediate_metrics_map["underflow"] = idx
+            idx += 1
+        if "overflow" in self.metrics:
+            self.intermediate_metrics_map["overflow"] = idx
             idx += 1
 
         self.final_metrics_map = {metric: idx for idx, metric in enumerate(self.metrics)}
@@ -85,6 +91,16 @@ class Tracker:
             if "kurtosis" in self.metrics:
                 idx = (batch_slice, local_layer, self.intermediate_metrics_map["sum_of_4th_powers"], name_idx)
                 self.partial_results[idx] = torch.sum(x_squared**2, dim=1).float()
+        if "underflow" in self.metrics or "overflow" in self.metrics:
+            absx = torch.abs(x)
+            if "underflow" in self.metrics:
+                idx = (batch_slice, local_layer, self.intermediate_metrics_map["underflow"], name_idx)
+                amin = torch.min(absx)
+                self.partial_results[idx] = torch.count_nonzero(absx == amin)
+            if "overflow" in self.metrics:
+                idx = (batch_slice, local_layer, self.intermediate_metrics_map["overflow"], name_idx)
+                amax = torch.amax(absx)
+                self.partial_results[idx] = torch.count_nonzero(absx == amax)
 
         if torch.all(~torch.isinf(self.partial_results[batch_slice, :, :, :])):
             self.current_mbs += 1
@@ -149,6 +165,16 @@ class Tracker:
                 kurtosis = mean_of_4th_power/mean_of_2nd_power**2
                 kurtosis_id = self.final_metrics_map["kurtosis"]
                 final_metrics[:, kurtosis_id, :] = torch.mean(kurtosis, dim=0)
+        if "underflow" in self.metrics:
+            underflow_intermediate_id = self.intermediate_metrics_map["underflow"]
+            underflow_final_id = self.final_metrics_map["underflow"]
+            underflow = torch.mean(self.partial_results[:, :, underflow_intermediate_id, :]/name_parallel_factor/self._shapes, dim=0)
+            final_metrics[:, underflow_final_id, :] = underflow
+        if "overflow" in self.metrics:
+            overflow_intermediate_id = self.intermediate_metrics_map["overflow"]
+            overflow_final_id = self.final_metrics_map["overflow"]
+            overflow = torch.mean(self.partial_results[:, :, overflow_intermediate_id, :]/name_parallel_factor/self._shapes, dim=0)
+            final_metrics[:, overflow_final_id, :] = overflow
 
         # DP all_reduce.
         dp_group = parallel_state.get_data_parallel_group()

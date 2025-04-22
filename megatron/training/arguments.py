@@ -1281,7 +1281,7 @@ def _add_logging_args(parser):
                        help='If set, log progress (in terms of number of processed tokens and '
                        'number of floating-point operations) to progress.txt file in checkpoint '
                        'directory.')
-    group.add_argument('--log-intermediate-metrics', nargs='+', default=[], choices=["mean", "rms", "kurtosis"],
+    group.add_argument('--log-intermediate-metrics', nargs='+', default=[], choices=["mean", "rms", "kurtosis", "underflow", "overflow"],
                        help='Log these metrics on all activations, qkv and mlp vectors')
     group.add_argument('--log-intermediate-metrics-interval', type=int, default=None,
                        help='Frequency to log the intermediate metrics (see `--log-intermediate-metrics`)')
@@ -1365,7 +1365,7 @@ def _add_regularization_args(parser):
     group.add_argument('--weight-decay-cooldown-iters', type=int, default=None,
                        help='Number of iterations for weight decay cooldown')
     group.add_argument('--weight-decay-cooldown-style', type=str, default='constant',
-                       choices=['constant', 'linear', 'cosine', '1-sqrt'],
+                       choices=['constant', 'linear', 'cosine', '1-sqrt', '1-cbrt', '1-qbrt', '1-2.5rt', '1-2.2rt'],
                        help='Weight decay cooldown function')
     group.add_argument('--weight-decay-qk-gains', action='store_true', help='When set, QK layernorm gains are regularized')
     group.add_argument('--no-train-qk-gains', action='store_true', help='When set, QK layernorm gains are not trained')

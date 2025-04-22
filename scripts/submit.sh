@@ -111,7 +111,7 @@ elif [[ $1 -eq 1 ]]; then
 	SIZE=1.5B
 	SAVE_FREQ=5000
 	DEF_TOKENS=125
-	INTERMEDIATE_METRICS_INTERVAL=10
+	INTERMEDIATE_METRICS_INTERVAL=100
 elif [[ $1 -eq 8 ]]; then 
 	# batch_size: ~1.1M.
 	TP=4  # TODO: TP=1 is faster but we need DP>=64 for this.
@@ -126,9 +126,9 @@ elif [[ $1 -eq 8 ]]; then
 	LR=0.0005  # TODO: Previously baseline lr=0.00005, OP lr=0.0003.
 	INIT_STD=0.02  # TODO: Most likely OP will need larger.
 	SIZE=8B
-	SAVE_FREQ=5000
+	SAVE_FREQ=2500
 	DEF_TOKENS=250
-	INTERMEDIATE_METRICS_INTERVAL=100
+	INTERMEDIATE_METRICS_INTERVAL=1000
 else
 	>&2 echo "Invalid llama size: $1"
 	usage
