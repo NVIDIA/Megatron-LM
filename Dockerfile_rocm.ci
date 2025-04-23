@@ -53,14 +53,14 @@ RUN git clone https://github.com/state-spaces/mamba mamba &&\
 
 # Clone TE repo and submodules
 WORKDIR ${STAGE_DIR}
-ARG TE_COMMIT=bb061adec6b2ec865514808bb660aafb54383222
+
+ARG TE_BRANCH=release_v1.13_rocm
 ENV NVTE_FRAMEWORK=pytorch
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH_OVERRIDE}
 ENV NVTE_USE_HIPBLASLT=1
-RUN git clone --recursive https://github.com/ROCm/TransformerEngine.git &&\
-    cd TransformerEngine &&\
-    git fetch origin ${TE_COMMIT} && \
-    git checkout ${TE_COMMIT} && \
+RUN git clone --recursive -b ${TE_BRANCH} https://github.com/ROCm/TransformerEngine.git && \
+    cd TransformerEngine && \
+    echo "TransformerEngine at commit:" $(git rev-parse HEAD) && \
     pip install .
 
 RUN git clone https://github.com/caaatch22/grouped_gemm.git &&\
