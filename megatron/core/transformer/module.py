@@ -20,7 +20,7 @@ _HALF_TYPES = (torch.HalfTensor, torch.cuda.HalfTensor)
 _BF16_TYPES = (torch.BFloat16Tensor, torch.cuda.BFloat16Tensor)
 
 
-def param_is_not_shared(param):
+def param_is_not_shared(param):  # pylint: disable=missing-function-docstring
     return not hasattr(param, 'shared') or not param.shared
 
 
@@ -102,6 +102,17 @@ class MegatronModule(torch.nn.Module):
 
 
 def conversion_helper(val, conversion):
+    """Recursively applies a conversion function to values in nested data structures.
+
+    Args:
+        val: A single value or a nested structure (tuple/list) of values to convert
+        conversion (callable): A function that performs the desired conversion on a single value
+
+    Returns:
+        The converted value, maintaining the same nested structure as the input.
+        If input is a single value, returns the converted value.
+        If input is a tuple/list, returns a tuple/list with all elements converted.
+    """
     if not isinstance(val, (tuple, list)):
         return conversion(val)
     rtn = [conversion_helper(v, conversion) for v in val]
@@ -111,6 +122,13 @@ def conversion_helper(val, conversion):
 
 
 def fp32_to_float16(val, float16_convertor):
+    """Converts floating-point values from fp32 to fp16.
+
+    Args:
+        val: The value to convert. Can be a single number, a tuple, or a list.
+        float16_convertor: A function that converts a single fp32 value to fp16
+    """
+
     def half_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
@@ -123,6 +141,12 @@ def fp32_to_float16(val, float16_convertor):
 
 
 def float16_to_fp32(val):
+    """Converts floating-point values from fp16 to fp32.
+
+    Args:
+        val: The value to convert. Can be a single number, a tuple, or a list.
+    """
+
     def float_conversion(val):
         val_typecheck = val
         if isinstance(val_typecheck, (Parameter, Variable)):
@@ -169,18 +193,20 @@ class Float16Module(MegatronModule):
 
         self.float16_convertor = float16_convertor
 
-    def set_input_tensor(self, input_tensor):
+    def set_input_tensor(self, input_tensor):  # pylint: disable=missing-function-docstring
         return self.module.set_input_tensor(input_tensor)
 
-    def forward(self, *inputs, **kwargs):
-        if parallel_state.is_pipeline_first_stage():
+    def forward(self, *inputs, **kwargs):  # pylint: disable=missing-function-docstring
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             outputs = float16_to_fp32(outputs)
         return outputs
 
-    def state_dict(self, destination=None, prefix='', keep_vars=False):
+    def state_dict(
+        self, destination=None, prefix='', keep_vars=False
+    ):  # pylint: disable=missing-function-docstring
         return self.module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)
 
     def state_dict_for_save_checkpoint(self, prefix='', keep_vars=False):
@@ -191,5 +217,7 @@ class Float16Module(MegatronModule):
         """Retrieve sharded_state_dict from the module being wrapped."""
         return self.module.sharded_state_dict(prefix, *args, **kwargs)
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(
+        self, state_dict, strict=True
+    ):  # pylint: disable=missing-function-docstring
         self.module.load_state_dict(state_dict, strict=strict)

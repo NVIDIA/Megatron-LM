@@ -84,8 +84,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 with_context_parallel=True, partial_data_parallel=True
             )
             self.expt_dp_group = parallel_state.get_expert_data_parallel_group()
+            self.intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
+                partial_expert_data_parallel=True
+            )
             if self.ddp_config.num_distributed_optimizer_instances > 1:
-                self.inter_dp_cp_group = parallel_state.get_inter_partial_data_parallel_group()
+                self.inter_dist_opt_group = (
+                    parallel_state.get_inter_distributed_optimizer_instance_group()
+                )
 
             self.pp_group = parallel_state.get_pipeline_model_parallel_group()
             self.ep_group = parallel_state.get_expert_model_parallel_group()
@@ -112,26 +117,8 @@ class DistributedDataParallel(_BaseDataParallel):
                         "dp_cp process group is required when context_parallel_size > 1 "
                         "but not provided in grad_comm_pgs"
                     )
-            # 3. Handle intra_dp_cp and inter_dp_cp based on optimizer instances:
-            if self.ddp_config.num_distributed_optimizer_instances == 1:
-                # With a single optimizer instance:
-                # - intra_dp_cp is same as dp_cp
-                # - inter_dp_cp is not needed
-                self.intra_dp_cp_group = self.dp_cp_group
-            else:
-                # With multiple optimizer instances, both groups must be provided
-                if not (
-                    hasattr(grad_comm_pgs, 'intra_dp_cp') and hasattr(grad_comm_pgs, 'inter_dp_cp')
-                ):
-                    raise ValueError(
-                        "intra_dp_cp and inter_dp_cp process groups are required "
-                        "when using multiple optimizer instances (>1) "
-                        "but not provided in grad_comm_pgs"
-                    )
-                self.intra_dp_cp_group = grad_comm_pgs.intra_dp_cp
-                self.inter_dp_cp_group = grad_comm_pgs.inter_dp_cp
 
-            # 4. Handle expert data parallel group
+            # 3. Handle expert data parallel group
             if hasattr(grad_comm_pgs, 'expt_dp'):
                 self.expt_dp_group = grad_comm_pgs.expt_dp
             else:
@@ -148,6 +135,31 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.expt_dp_group = torch.distributed.new_group(
                     ranks=[torch.distributed.get_rank()]
                 )
+
+            # 4. Handle intra_dp_cp, intra_expt_dp, and inter_dist_opt
+            #    based on optimizer instances:
+            if self.ddp_config.num_distributed_optimizer_instances == 1:
+                # With a single optimizer instance:
+                # - intra_dp_cp is same as dp_cp
+                # - intra_expt_dp is same as expt_dp
+                # - inter_dist_opt is not needed
+                self.intra_dp_cp_group = self.dp_cp_group
+                self.intra_expt_dp_group = self.expt_dp_group
+            else:
+                # With multiple optimizer instances, both groups must be provided
+                if not (
+                    hasattr(grad_comm_pgs, 'intra_dp_cp')
+                    and hasattr(grad_comm_pgs, 'intra_expt_dp')
+                    and hasattr(grad_comm_pgs, 'inter_dist_opt')
+                ):
+                    raise ValueError(
+                        "intra_dp_cp, intra_expt_dp, and inter_dist_opt "
+                        "process groups are required when using multiple optimizer "
+                        "instances (>1) but not provided in grad_comm_pgs"
+                    )
+                self.intra_dp_cp_group = grad_comm_pgs.intra_dp_cp
+                self.intra_expt_dp_group = grad_comm_pgs.intra_expt_dp
+                self.inter_dist_opt_group = grad_comm_pgs.inter_dist_opt
 
             # 5. pp and ep group
             if not all([hasattr(model_comm_pgs, 'pp'), hasattr(model_comm_pgs, 'ep')]):
@@ -296,14 +308,13 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
                 assert (
-                    self.ep_group.size() == 1
-                ), "Partial DistOpt cannot support MoE models with expert parallelism."
-                assert (
                     self.ddp_config.use_distributed_optimizer
                 ), 'Partial DistOpt cannot be used without DistOpt'
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
-                    bucket_group.inter_distributed_optimizer_instance_group = self.inter_dp_cp_group
+                    bucket_group.inter_distributed_optimizer_instance_group = (
+                        self.inter_dist_opt_group
+                    )
                     bucket_group.communication_stream = communication_stream
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
@@ -368,7 +379,7 @@ class DistributedDataParallel(_BaseDataParallel):
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
                 expert_parallel_params,
-                self.expt_dp_group,
+                self.intra_expt_dp_group,
                 gradient_scaling_factor=expert_gradient_scaling_factor,
             )
         )
@@ -590,7 +601,7 @@ class DistributedDataParallel(_BaseDataParallel):
             if is_expert_parallel:
                 data_parallel_group = self.expt_dp_group
             else:
-                data_parallel_group = self.intra_dp_cp_group
+                data_parallel_group = self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

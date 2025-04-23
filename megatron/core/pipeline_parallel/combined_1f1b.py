@@ -445,7 +445,7 @@ def forward_backward_step(
     if f_model is not None:
         with f_context:
             num_tokens = torch.tensor(0, dtype=torch.int)
-            if parallel_state.is_pipeline_last_stage():
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                 if not collect_non_loss_data:
                     loss_node = ScheduleNode(
                         loss_func,

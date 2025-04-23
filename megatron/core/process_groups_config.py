@@ -147,7 +147,8 @@ class GradCommProcessGroups:
         dp_cp: Data and context parallel group
         expt_dp: Expert data parallel group
         intra_dp_cp: Intra partial data parallel group
-        inter_dp_cp: Inter partial data parallel group
+        intra_expt_dp: Intra partial expert data parallel group
+        inter_dist_opt: Inter distributed optimizer instance group
 
     Example:
         # Create instance and set needed process groups
@@ -170,5 +171,8 @@ class GradCommProcessGroups:
     # _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     intra_dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
-    # _INTER_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-    inter_dp_cp: torch.distributed.ProcessGroup = field(init=False)
+    # _INTRA_EXPERT_DATA_PARALLEL_GROUP
+    intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
+    inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)

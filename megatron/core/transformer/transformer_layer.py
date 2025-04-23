@@ -169,7 +169,7 @@ def get_transformer_layer_offset(config: TransformerConfig):
                 # Reduce the offset of embedding layer from the total layer number
                 if (
                     config.account_for_embedding_in_pipeline_split
-                    and not parallel_state.is_pipeline_first_stage()
+                    and not parallel_state.is_pipeline_first_stage(ignore_virtual=False)
                 ):
                     offset -= 1
             else:
@@ -178,7 +178,7 @@ def get_transformer_layer_offset(config: TransformerConfig):
                 # Reduce the offset of embedding layer from the total layer number
                 if (
                     config.account_for_embedding_in_pipeline_split
-                    and not parallel_state.is_pipeline_first_stage()
+                    and not parallel_state.is_pipeline_first_stage(ignore_virtual=False)
                 ):
                     offset -= 1
     else:
