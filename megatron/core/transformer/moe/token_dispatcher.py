@@ -455,7 +455,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ), "cuda_sync_point must be after cuda_dtoh_point."
         return num_tokens_per_local_expert
 
-
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
@@ -599,7 +598,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     fused=self.config.moe_permute_fusion,
                 )
 
-        self.tokens_per_expert = self._maybe_dtoh_and_synchronize("before_finish", self.tokens_per_expert)
+        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_finish", self.tokens_per_expert
+        )
 
         return global_input_tokens, global_probs
 
