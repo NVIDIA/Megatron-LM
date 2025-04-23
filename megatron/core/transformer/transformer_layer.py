@@ -934,12 +934,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         """
         hidden_states, context = self._forward_attention(*args, **kwargs)
 
-        cuda_graph_outputs = []
-        if self.config.cuda_graph_scope == "attn":
-            cuda_graph_outputs += [hidden_states]
-        else:
-            output = self._forward_mlp(hidden_states)
-            cuda_graph_outputs.append(output)
+        if self.config.cuda_graph_scope == "full":
+            hidden_states = self._forward_mlp(hidden_states)
+        cuda_graph_outputs = [hidden_states]
+
         if context is not None:
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
