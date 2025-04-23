@@ -236,20 +236,20 @@ class TransformerLayerNode(ScheduleNode):
     transformer layer nodes (attention, MLP, etc.)
     """
 
-    def __init__(self, stream, event, state, callables, name="default"):
+    def __init__(self, stream, event, state, submodule, name="default"):
         """Initialize a transformer layer node.
 
         Args:
             stream (torch.cuda.Stream): CUDA stream for execution
             event (torch.cuda.Event): Synchronization event
             common_state (TransformerLayerState): State shared within a transformer layer
-            callables (Callable): The callables contain forward and dw function
+            submodule (SubmoduleCallables): The submodule contain forward and dw function
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
         """
         # Get memory strategy based on node name
         memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(
-            name, callables.is_moe, callables.is_deepep
+            name, submodule.is_moe, submodule.is_deepep
         )
 
         super().__init__(
@@ -261,7 +261,7 @@ class TransformerLayerNode(ScheduleNode):
             name=name,
         )
         self.common_state = state
-        self.callables = callables
+        self.submodule = submodule
         self.detached = tuple()
         self.before_detached = tuple()
 
@@ -275,7 +275,7 @@ class TransformerLayerNode(ScheduleNode):
 
     def forward_impl(self, *args):
         """Implements the forward pass for the transformer layer node."""
-        return self.callables.forward(self, *args)
+        return self.submodule.forward(self, *args)
 
     def backward_impl(self, outputs, output_grad):
         """Implements the backward pass for the transformer layer node."""
@@ -290,7 +290,7 @@ class TransformerLayerNode(ScheduleNode):
     def dw(self):
         """Computes the weight gradients for the transformer layer node."""
         with torch.cuda.nvtx.range(f"{self.name} wgrad"):
-            self.callables.dw()
+            self.submodule.dw()
 
 
 class TransformerLayerState:
@@ -331,25 +331,25 @@ class TransformerLayerSchedulePlan:
             com_stream (torch.cuda.Stream): CUDA stream for communication.
         """
         self.common_state = TransformerLayerState()
-        # get callables for transformer layer
-        attn_callable, dispatch_callable, mlp_callable, combine_callable = (
-            layer.get_submodule_callables(chunk_state).as_array()
-        )
+        # get submodules for transformer layer
+        attn_module, dispatch_module, mlp_module, combine_module = layer.get_submodule_callables(
+            chunk_state
+        ).as_array()
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
         self.attn = TransformerLayerNode(
-            comp_stream, event, self.common_state, attn_callable, name="attn"
+            comp_stream, event, self.common_state, attn_module, name="attn"
         )
         self.mlp = TransformerLayerNode(
-            comp_stream, event, self.common_state, mlp_callable, name="mlp"
+            comp_stream, event, self.common_state, mlp_module, name="mlp"
         )
-        if attn_callable.is_moe:
+        if attn_module.is_moe:
             self.dispatch = TransformerLayerNode(
-                com_stream, event, self.common_state, dispatch_callable, name="dispatch"
+                com_stream, event, self.common_state, dispatch_module, name="dispatch"
             )
             self.combine = TransformerLayerNode(
-                com_stream, event, self.common_state, combine_callable, name="combine"
+                com_stream, event, self.common_state, combine_module, name="combine"
             )
         else:
             self.dispatch = FakeScheduleNode()

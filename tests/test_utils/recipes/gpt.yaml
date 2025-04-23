@@ -189,12 +189,12 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  # - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G]
-  #   products:
-  #     # - environment: [dev] Until TE is at 1.12
-  #     #   scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly] # Broken
+  - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G]
+    products:
+      #     # - environment: [dev] Until TE is at 1.12
+      #     #   scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_dgx_a100_1N8G]
     products:
       - environment: [dev]

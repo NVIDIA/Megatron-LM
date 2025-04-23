@@ -207,6 +207,8 @@ def telemetrics_and_exit(
                     pd.Timestamp.now(tz='UTC')
                     - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz='UTC')
                 ).total_seconds(),
+                "is_merge_request": os.getenv("CI_MERGE_REQUEST_IID") is not None,
+                "ci_merge_request_iid": os.getenv("CI_MERGE_REQUEST_IID"),
             }
         ]
     )
@@ -429,7 +431,13 @@ def main(
                 n_nondeterminism_attemps += 1
                 continue
 
-            sys.exit(1)
+            telemetrics_and_exit(
+                success=False,
+                test_case=test_case,
+                environment=environment,
+                pipeline_id=int(os.getenv("PARENT_PIPELINE_ID", 0)),
+                is_integration_test=enable_lightweight_mode,
+            )
 
         if parse_failed_job(logs=logs):
             n_attempts += 1

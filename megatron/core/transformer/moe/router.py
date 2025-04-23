@@ -39,9 +39,9 @@ class Router(ABC, MegatronModule):
         self.num_experts = self.config.num_moe_experts
         self.moe_aux_loss_func = None
         self.layer_number = None
-        self.tp_group = model_comm_pgs.tp_group
-        self.cp_group = model_comm_pgs.cp_group
-        self.tp_cp_group = model_comm_pgs.tp_cp_group
+        self.tp_group = model_comm_pgs.tp
+        self.cp_group = model_comm_pgs.cp
+        self.tp_cp_group = model_comm_pgs.tp_cp
 
         # Initialize the gate weights.
         # TODO: Add support for GPU initialization, which requires updating the golden values.

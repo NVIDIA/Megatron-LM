@@ -1607,7 +1607,7 @@ def is_inside_decoder(rank=None) -> bool:
     return False
 
 
-def get_pipeline_model_parallel_decoder_start() -> int:
+def get_pipeline_model_parallel_decoder_start() -> Optional[int]:
     """Return decoder start rank (if encoder pipeline parallelism is set)."""
     global _PIPELINE_MODEL_PARALLEL_DECODER_START
     return _PIPELINE_MODEL_PARALLEL_DECODER_START
@@ -1920,9 +1920,12 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
 
-def get_expert_data_parallel_group():
+def get_expert_data_parallel_group(check_initialized=True):
     """Get expert data parallel group."""
-    assert _EXPERT_DATA_PARALLEL_GROUP is not None, 'Expert data parallel group is not initialized'
+    if check_initialized:
+        assert (
+            _EXPERT_DATA_PARALLEL_GROUP is not None
+        ), 'Expert data parallel group is not initialized'
     return _EXPERT_DATA_PARALLEL_GROUP
 
 

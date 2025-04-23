@@ -29,7 +29,7 @@ class ModelCommProcessGroups:
         expt_tp: Expert tensor parallel group
         tp_ep: Tensor and expert parallel group
         tp_ep_pp: Tensor, expert, and pipeline parallel group
-
+        expt_dp: Expert data parallel group
     Example:
         # Create instance and set needed process groups
         model_pgs = ModelCommProcessGroups()
@@ -76,6 +76,13 @@ class ModelCommProcessGroups:
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
     tp_ep_pp: torch.distributed.ProcessGroup = field(init=False)
 
+    # MoE layers need expt_dp group for sharded state dict
+    # we need this workaround until distributed checkpoint is refactored
+    # to have sharded_state_dict can take the PG and pass it down
+    # TODO (Hepteract): remove this once distributed checkpoint is refactored
+    # _EXPERT_DATA_PARALLEL_GROUP
+    expt_dp: torch.distributed.ProcessGroup = field(init=False)
+
     def __init__(self, **kwargs):
         for key in kwargs:
             if key in [field.name for field in fields(self)]:
@@ -119,6 +126,8 @@ class ModelCommProcessGroups:
             'tp_ep_pp': parallel_state.get_expert_tensor_model_pipeline_parallel_group,
             'embd': parallel_state.get_embedding_group,
             'pos_embd': parallel_state.get_position_embedding_group,
+            # TODO (Hepteract): remove this once distributed checkpoint is refactored
+            'expt_dp': parallel_state.get_expert_data_parallel_group,
         }
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group

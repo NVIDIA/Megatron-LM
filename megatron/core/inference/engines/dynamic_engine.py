@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (

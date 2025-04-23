@@ -318,8 +318,8 @@ class ModelParallelConfig:
     combined_1f1b_recipe: str = 'ep_a2a'
     """Recipe to use for combined 1F1B. Currently only 'ep_a2a' is supported."""
 
-    split_bw: bool = False
-    """If true, split dgrad and wgrad for better overlapping in combined 1F1B."""
+    delay_wgrad_compute: bool = False
+    """If true, delay the wgrad compute for better overlapping in combined 1F1B."""
 
     ###################
     # CPU Offloading
@@ -411,8 +411,10 @@ class ModelParallelConfig:
                     f"combined_1f1b_recipe {self.combined_1f1b_recipe} not supported, "
                     f"supported recipes are 'ep_a2a' now."
                 )
-        if self.split_bw and not (self.combined_1f1b and self.combined_1f1b_recipe == "ep_a2a"):
+        if self.delay_wgrad_compute and not (
+            self.combined_1f1b and self.combined_1f1b_recipe == "ep_a2a"
+        ):
             raise ValueError(
-                "Spliting dgrad and wgrad only works when setting --combined-1f1b and "
+                "Delaying wgrad compute only works when setting --combined-1f1b and "
                 "--combined-1f1b-recipe ep_a2a"
             )

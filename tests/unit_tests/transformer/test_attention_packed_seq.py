@@ -11,9 +11,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-# Note: this test requires TE >= 0.13 as well as Flash Attention to run
-# FIXME this unit test doesn't work in the current test container. to be fixed soon
-"""
+
 def make_test_packed_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -26,6 +24,7 @@ def make_test_packed_seq_params(sequence_length):
         qkv_format='thd',
     )
     return packed_seq_params
+
 
 def make_test_packed_padded_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 18, 44, 52, 96, 118]).cuda()
@@ -47,16 +46,25 @@ def make_test_packed_padded_seq_params(sequence_length):
 class TestParallelAttentionWithPackedSequence:
 
     def setup_method(self, method):
-        Utils.initialize_model_parallel(1,1)
+        Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         # use BF16 and a large enough hidden size to enable FlashAttention for thd format.
-        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True,
-                                                    bf16=True, params_dtype=torch.bfloat16,
-                                                    pipeline_dtype=torch.bfloat16, autocast_dtype=torch.bfloat16)
-        self.parallel_attention = SelfAttention(self.transformer_config,
-                                                get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
-                                                layer_number=1,
-                                                attn_mask_type=AttnMaskType.causal)
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            autocast_dtype=torch.bfloat16,
+        )
+        self.parallel_attention = SelfAttention(
+            self.transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -74,13 +82,17 @@ class TestParallelAttentionWithPackedSequence:
         self.parallel_attention.cuda()
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+        )
         hidden_states = hidden_states.cuda().to(torch.bfloat16)
 
         attention_mask = None
 
         packed_seq_params = make_test_packed_seq_params(sequence_length)
-        output, bias = self.parallel_attention(hidden_states, attention_mask, packed_seq_params=packed_seq_params)
+        output, bias = self.parallel_attention(
+            hidden_states, attention_mask, packed_seq_params=packed_seq_params
+        )
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
@@ -97,14 +109,20 @@ class TestParallelAttentionWithPackedSequence:
         self.parallel_attention.cuda()
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+        )
         hidden_states = hidden_states.cuda().to(torch.bfloat16)
 
         attention_mask = None
-        rotary_pos_emb = torch.ones(sequence_length, 1, 1, self.parallel_attention.config.kv_channels).cuda()
-        
+        rotary_pos_emb = torch.ones(
+            sequence_length, 1, 1, self.parallel_attention.config.kv_channels
+        ).cuda()
+
         packed_seq_params = make_test_packed_seq_params(sequence_length)
-        output, bias = self.parallel_attention(hidden_states, attention_mask, packed_seq_params=packed_seq_params)
+        output, bias = self.parallel_attention(
+            hidden_states, attention_mask, packed_seq_params=packed_seq_params
+        )
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
@@ -115,11 +133,13 @@ class TestParallelAttentionWithPackedSequence:
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
-        transformer_config.recompute_granularity='selective'
-        checkpointed_parallel_attention = SelfAttention(transformer_config,
-                                                        get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
-                                                        layer_number=1,
-                                                        attn_mask_type=AttnMaskType.causal)
+        transformer_config.recompute_granularity = 'selective'
+        checkpointed_parallel_attention = SelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        )
         config = checkpointed_parallel_attention.config
 
         sequence_length = 32
@@ -136,13 +156,16 @@ class TestParallelAttentionWithPackedSequence:
         attention_mask = None
 
         packed_seq_params = make_test_packed_seq_params(sequence_length)
-        output, bias = checkpointed_parallel_attention(hidden_states, attention_mask, packed_seq_params=packed_seq_params)
+        output, bias = checkpointed_parallel_attention(
+            hidden_states, attention_mask, packed_seq_params=packed_seq_params
+        )
 
         assert config.recompute_granularity == 'selective'
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
+
 
 # Note: this test requires TE >= 1.8 as well as cuDNN FusedAttention to run
 class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPackedSequence):
@@ -156,17 +179,19 @@ class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPac
         self.parallel_attention.cuda()
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+        )
         hidden_states = hidden_states.cuda().to(torch.bfloat16)
 
         attention_mask = None
 
         packed_seq_params = make_test_packed_padded_seq_params(sequence_length)
-        output, bias = self.parallel_attention(hidden_states, attention_mask, packed_seq_params=packed_seq_params)
+        output, bias = self.parallel_attention(
+            hidden_states, attention_mask, packed_seq_params=packed_seq_params
+        )
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
-        assert bias.shape[0] == config.hidden_size
-"""
