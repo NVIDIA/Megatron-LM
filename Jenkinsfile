@@ -10,13 +10,19 @@ def clean_up_docker_images() {
     }
 }
 
-def clean_docker_build_cache() {
-    sh 'docker system prune -f --volumes || true'
+def clean_workspace() {
+    if (env.WORKSPACE) {
+        sh "sudo find ${WORKSPACE} -mindepth 1 -maxdepth 1 -exec rm -rf '{}' \\;"
+    }
 }
 
 pipeline {
     agent {
         label 'build-only'
+    }
+
+    options {
+        disableConcurrentBuilds(abortPrevious: true)
     }
 
     parameters {
@@ -37,7 +43,6 @@ pipeline {
     stages {
         stage('Build Docker Image') {
             steps {
-                clean_docker_build_cache()
                 script {
 
                     // Generate a unique UUID for the Docker image name
@@ -80,10 +85,11 @@ pipeline {
             }
             post {
                 always {
-                // Archive test results
-                script {
-                    archiveArtifacts artifacts: 'test_report.csv', allowEmptyArchive: true
-                    clean_up_docker_images()
+                    // Archive test results
+                    script {
+                        archiveArtifacts artifacts: 'test_report.csv', allowEmptyArchive: true
+                        clean_up_docker_images()
+                        clean_workspace()
                     }
                 }
             }

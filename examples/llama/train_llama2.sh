@@ -6,11 +6,11 @@
 #################################################################################
 # set -x
 
-# set envs 
+# set envs
 export GPU_MAX_HW_QUEUES=2
 export TORCH_NCCL_HIGH_PRIORITY=1
 export NCCL_CHECKS_DISABLE=1
-export NCCL_IB_HCA=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7 
+export NCCL_IB_HCA=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
 export NCCL_IB_GID_INDEX=3
 export NCCL_CROSS_NIC=0
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -18,7 +18,6 @@ export NCCL_PROTO=Simple
 export RCCL_MSCCL_ENABLE=0
 export TOKENIZERS_PARALLELISM=false
 export HSA_NO_SCRATCH_RECLAIM=1
-
 
 # parsing input arguments
 for ARGUMENT in "$@"
@@ -30,7 +29,6 @@ do
 
    export "$KEY"="$VALUE"
 done
-
 
 TIME_STAMP=$(date +"%Y-%m-%d_%H-%M-%S")
 EXP_NAME="${EXP_NAME:-perf}"
@@ -46,10 +44,8 @@ GPUS_PER_NODE=`python3 -c "import torch; print(torch.cuda.device_count())"`
 
 # single node config, Change for multinode config
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
-#MASTER_ADDR="${MASTER_ADDR:-tw015}"
 MASTER_PORT="${MASTER_PORT:-6020}"
 NNODES="${NNODES:-1}"
-#NNODES="${NNODES:-2}"
 NODE_RANK="${NODE_RANK:-0}"
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
@@ -65,21 +61,38 @@ MODEL_SIZE="${MODEL_SIZE:-70}"
 TP="${TP:-8}"
 PP="${PP:-1}"
 CP="${CP:-1}"
-MBS="${MBS:-2}"
+MBS="${MBS:-1}"
 BS="${BS:-8}"
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
-TOTAL_ITERS="${TOTAL_ITERS:-5}"
+MAX_POSITION_EMBEDDINGS=32000
+TOTAL_ITERS="${TOTAL_ITERS:-10}"
 SEQ_PARALLEL="${SEQ_PARALLEL:-1}" 
 CONTI_PARAMS="${CONTI_PARAMS:-0}"
 TE_FP8="${TE_FP8:-0}"  # 0: disable FP8, 1: enable FP8
 GEMM_TUNING="${GEMM_TUNING:-1}"
 MCORE="${MCORE:-1}"
 OPTIMIZER="${OPTIMIZER:-adam}"
-FSDP="${FSDP:-1}"
+FSDP="${FSDP:-0}"
 RECOMPUTE="${RECOMPUTE:-0}"
-TOKENIZER_TYPE="${TOKENIZER_TYPE:-HuggingFaceTokenizer}"
 ROPE_FUSION="${ROPE_FUSION:-1}" # 1: use rope-fusion, 0: no-rope-fusion
-MOCK_DATA="${MOCK_DATA:-0}" # 1: use mock data, 0: use real data
+LOG_INTERVAL="${LOG_INTERVAL:-1}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-5000}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-5000}"
+CKPT_FORMAT="${CKPT_FORMAT:-torch}"
+EVAL_ITERS="${EVAL_ITERS:-'-1'}"
+DATA_CACHE_PATH="${DATA_CACHE_PATH:-/root/cache}"
+
+TOKENIZER_TYPE="${TOKENIZER_TYPE:-HuggingFaceTokenizer}"
+if [ "$TOKENIZER_TYPE" == "Llama2Tokenizer" ]; then
+    if [ ! -z ${TOKENIZER_MODEL+x} ]; then
+        echo "do not provide TOKENIZER_MODEL for Llama2Tokenizer TOKENIZER_TYPE"
+        exit 1
+    fi
+    TOKENIZER_MODEL="/tmp/tokenizer.model"
+    wget -O "$TOKENIZER_MODEL" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.model
+else
+    TOKENIZER_MODEL="${TOKENIZER_MODEL:-NousResearch/Llama-2-7b-chat-hf}"
+fi
 
 if [ "$FSDP" -eq 1 ] && [ "$TP" -gt 1 ]; then
     echo "It is not recommended to use FSDP and TP together. Disabling TP."
@@ -89,71 +102,39 @@ fi
 
 EXPERIMENT_DIR="experiment"
 mkdir -p $EXPERIMENT_DIR
-CHECKPOINT_PATH=${CHECKPOINT_PATH:-"$EXPERIMENT_DIR/ckpts"}
-
-
-DATA_DIR="${DATA_DIR:-/root/.cache/data}"
-DATA_PATH=${DATA_PATH:-"$DATA_DIR/bookcorpus_text_sentence"}
-
-TOKENIZER_MODEL="$DATA_DIR/tokenizer_llama2"
-if ! [ -d "$TOKENIZER_MODEL" ]; then
-    echo "Creating directory and downloading tokenizer files..."
-    mkdir -p "$TOKENIZER_MODEL"
-    wget -O "$TOKENIZER_MODEL/special_tokens_map.json" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/special_tokens_map.json
-    wget -O "$TOKENIZER_MODEL/tokenizer.json" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.json
-    wget -O "$TOKENIZER_MODEL/tokenizer.model" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer.model
-    wget -O "$TOKENIZER_MODEL/tokenizer_config.json" https://huggingface.co/NousResearch/Llama-2-7b-chat-hf/resolve/main/tokenizer_config.json
-    echo "Tokenizer files downloaded successfully to $TOKENIZER_MODEL."
-else
-    echo "Folder $TOKENIZER_MODEL already exists. Skipping download."
-fi
-
-if [ "$TOKENIZER_TYPE" == "Llama2Tokenizer" ]; then
-    echo "Using Llama2Tokenizer."
-    TOKENIZER_MODEL="$TOKENIZER_MODEL/tokenizer.model"  
-    echo "$TOKENIZER_MODEL"
-else
-    echo "Using HuggingFaceTokenizer."
-fi
-
-MAX_POSITION_EMBEDDINGS=32000
-
 DEFAULT_LOG_DIR="${EXPERIMENT_DIR}/${NNODES}nodes_rank${NODE_RANK}_train_${MODEL_SIZE}B_mbs${MBS}_bs${BS}_tp${TP}_pp${PP}_cp${CP}_iter${TOTAL_ITERS}/TE_FP8_${TE_FP8}/${TIME_STAMP}"
 LOG_DIR="${LOG_DIR:-${DEFAULT_LOG_DIR}}"
 TRAIN_LOG="${LOG_DIR}/output_${EXP_NAME}.log"
 mkdir -p $LOG_DIR
 echo $TRAIN_LOG
 
-# gemm tuning 
+# gemm tuning
 if [ "$GEMM_TUNING" -eq 1 ]; then
-   export TE_HIPBLASLT_TUNING_RUN_COUNT=10
-   export TE_HIPBLASLT_TUNING_ALGO_COUNT=50
+    export TE_HIPBLASLT_TUNING_RUN_COUNT=10
+    export TE_HIPBLASLT_TUNING_ALGO_COUNT=50
 fi
 
 if [ "$SEQ_LENGTH" -le 8192 ]; then
-  ds_works=8
+    ds_works=8
 else
-  ds_works=24
+    ds_works=24
 fi
 
 if [[ $MODEL_SIZE -eq 7 ]]; then #llama2-7B
-        HIDDEN_SIZE=4096 # e.g. llama-13b: 5120
-        FFN_HIDDEN_SIZE=11008 # e.g. llama-13b: 13824
-        NUM_LAYERS=32 # e.g. llama-13b: 40
-        NUM_HEADS=32 # e.g. llama-13b: 40
-        NUM_KV_HEADS=32 # No GQA for llama2 7b.
-        SEQ_LENGTH=$SEQ_LENGTH
+    HIDDEN_SIZE=4096 # e.g. llama-13b: 5120
+    FFN_HIDDEN_SIZE=11008 # e.g. llama-13b: 13824
+    NUM_LAYERS=32 # e.g. llama-13b: 40
+    NUM_HEADS=32 # e.g. llama-13b: 40
+    NUM_KV_HEADS=32 # No GQA for llama2 7b.
 elif [[ $MODEL_SIZE -eq 70 ]]; then
-        HIDDEN_SIZE=8192 # e.g. llama-13b: 5120
-        FFN_HIDDEN_SIZE=28672 # e.g. llama-13b: 13824
-        NUM_LAYERS=80 # e.g. llama-13b: 40
-        NUM_HEADS=64 # e.g. llama-13b: 40
-        NUM_KV_HEADS=8 # llama3 70B uses GQA
-        SEQ_LENGTH=$SEQ_LENGTH
-        MAX_POSITION_EMBEDDINGS=$MAX_POSITION_EMBEDDINGS
+    HIDDEN_SIZE=8192 # e.g. llama-13b: 5120
+    FFN_HIDDEN_SIZE=28672 # e.g. llama-13b: 13824
+    NUM_LAYERS=80 # e.g. llama-13b: 40
+    NUM_HEADS=64 # e.g. llama-13b: 40
+    NUM_KV_HEADS=8 # llama3 70B uses GQA
 else
-        echo "Model size not supported."
-        exit 1
+    echo "Model size not supported."
+    exit 1
 fi
 
 GROUP_SIZE=$(( ${NUM_HEADS} / ${NUM_KV_HEADS} ))
@@ -188,12 +169,11 @@ GPT_ARGS="
     --no-masked-softmax-fusion \
 "
 if [ "$RECOMPUTE" -eq 1 ]; then
-    GPT_ARGS="$GPT_ARGS --recompute-num-layers 80 \
+    GPT_ARGS="$GPT_ARGS --recompute-num-layers $NUM_LAYERS \
         --recompute-granularity full \
         --recompute-method block \
         "
-fi 
-
+fi
 if [ "$ROPE_FUSION" -eq 0 ]; then
     GPT_ARGS="$GPT_ARGS --no-rope-fusion"
 fi
@@ -204,11 +184,8 @@ TRAIN_ARGS="--lr 1e-4 \
         --lr-decay-style cosine \
         --weight-decay 1.0e-1 \
         --clip-grad 1.0 \
-        --ckpt-format torch_dist \
 "
-#   --use-torch-fsdp2 requires --ckpt-format torch_dist
-
-
+# Note that --use-torch-fsdp2 requires --ckpt-format torch_dist
 if [ "$OPTIMIZER" == "adam" ]; then
     TRAIN_ARGS="$TRAIN_ARGS --optimizer adam \
         --adam-beta1 0.9 \
@@ -231,21 +208,44 @@ DATA_ARGS="
     --eval-iters 10 \
     --num-workers $ds_works \
 "
-
-if [ "$MOCK_DATA" -eq 1 ];then
+if [ -z ${DATA_PATH+x} ]; then
     DATA_ARGS="$DATA_ARGS --mock-data"
+    echo "Using Mock data"
 else
     DATA_ARGS="$DATA_ARGS --data-path $DATA_PATH"
+    echo "Using ${DATA_PATH} data"
+fi
+if [ "$NNODES" -gt 1 ]; then
+    # For multi-node runs DATA_CACHE_PATH should exist and should point to a common
+    # path accessible by all the nodes (for example, a NFS directory)"
+    DATA_ARGS="$DATA_ARGS --data-cache-path $DATA_CACHE_PATH"
 fi
 
 OUTPUT_ARGS="
-    --log-interval 1 \
-    --save-interval 5000 \
+    --log-interval $LOG_INTERVAL \
     --log-throughput \
     --no-save-optim \
-    --eval-iters -1   
+    --no-save-rng \
+    --eval-iters $EVAL_ITERS
 "
-#  --save $CHECKPOINT_PATH \
+if [ -n "$SAVE_CKPT_PATH" ]; then
+    OUTPUT_ARGS="$OUTPUT_ARGS \
+        --save-interval $SAVE_INTERVAL \
+        --eval-interval $EVAL_INTERVAL \
+        --ckpt-format $CKPT_FORMAT \
+        --save $SAVE_CKPT_PATH
+    "
+fi
+
+CKPT_LOAD_ARGS=""
+if [ -n "$LOAD_CKPT_PATH" ]; then
+    CKPT_LOAD_ARGS="$CKPT_LOAD_ARGS \
+        --exit-on-missing-checkpoint \
+        --no-load-optim \
+        --no-load-rng \
+        --use-checkpoint-args \
+        --load ${LOAD_CKPT_PATH}"
+fi
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE \
@@ -255,12 +255,6 @@ DISTRIBUTED_ARGS="
     --master_port $MASTER_PORT \
 "
 
-CKPT_LOAD_ARGS="--exit-on-missing-checkpoint \
-        --no-load-optim \
-        --use-checkpoint-args \
-        --no-load-rng"
-
-
 EXTRA_ARGS="
     --group-query-attention \
     --num-query-groups $NUM_GROUPS \
@@ -269,7 +263,6 @@ EXTRA_ARGS="
     --distributed-timeout-minutes 120 \
     --overlap-grad-reduce \
 "
-
 
 if [ "$FSDP" -eq 1 ]; then
     EXTRA_ARGS="$EXTRA_ARGS --use-torch-fsdp2"
@@ -285,23 +278,23 @@ else
 fi
 
 if [ "$ENABLE_PROFILING" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --profile --use-pytorch-profiler --tensorboard-dir $LOG_DIR"
+    EXTRA_ARGS="$EXTRA_ARGS --profile --use-pytorch-profiler --tensorboard-dir $LOG_DIR"
 fi
 
 if [ "$USE_FLASH_ATTN" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --use-flash-attn"
+    EXTRA_ARGS="$EXTRA_ARGS --use-flash-attn"
 fi
 
 if [ "$SEQ_PARALLEL" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --sequence-parallel"
+    EXTRA_ARGS="$EXTRA_ARGS --sequence-parallel"
 fi
 
 if [ "$CONTI_PARAMS" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --use-contiguous-parameters-in-local-ddp"
+    EXTRA_ARGS="$EXTRA_ARGS --use-contiguous-parameters-in-local-ddp"
 fi
 
 if [ "$MCORE" -eq 1 ]; then
-EXTRA_ARGS="$EXTRA_ARGS --use-mcore-models"
+    EXTRA_ARGS="$EXTRA_ARGS --use-mcore-models"
 fi
 
 if [ "$TE_FP8" -eq 1 ]; then
@@ -322,6 +315,7 @@ run_cmd="
         $OUTPUT_ARGS \
         $EXTRA_ARGS \
         $TRAIN_ARGS \
+        $CKPT_LOAD_ARGS
 "
 
 if [ "$TEE_OUTPUT" -eq 0 ]; then 
@@ -366,4 +360,10 @@ echo "elapsed time per iteration: $ETPI" |& tee -a $TRAIN_LOG
 TIME_PER_ITER=$(python3 mean_log_value.py tmp.txt 2>/dev/null | awk '{printf "%.6f", $0}')
 TGS=$(awk -v bs="$BS" -v sl="$SEQ_LENGTH" -v tpi="$TIME_PER_ITER" -v ws="$WORLD_SIZE" 'BEGIN {printf "%.6f", bs * sl * 1000/ (tpi * ws)}')
 echo "tokens/GPU/s: $TGS" |& tee -a $TRAIN_LOG
+rm tmp.txt
+
+# Extract memory usage
+grep -Eo 'mem usages: [^|]*' "$TRAIN_LOG" | sed -E 's/.*mem usages: ([0-9\.]+).*/\1/' > tmp.txt
+MEMUSAGE=$(python3 mean_log_value.py tmp.txt)
+echo "mem usages: $MEMUSAGE" |& tee -a "$TRAIN_LOG"
 rm tmp.txt
