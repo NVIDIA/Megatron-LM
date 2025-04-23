@@ -215,6 +215,7 @@ class TestFullyParallelSaveAndLoad:
             expected_keys_saved_by_current_rank,
         )
 
+    @pytest.mark.internal
     @pytest.mark.parametrize("parallelization_along_dp", [False, True])
     def test_load_distribution(self, parallelization_along_dp, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 1)
@@ -336,6 +337,7 @@ class TestFullyParallelSaveAndLoad:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_only_necessary_exchanges_performed_during_load(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(2, 1)
 
