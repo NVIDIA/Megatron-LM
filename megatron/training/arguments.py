@@ -338,7 +338,7 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
-              'hierarchical context-parallel sizes: {}'
+              'hierarchical context-parallel sizes: {}, '
               'tensor-model-parallel size: {}, '
               'encoder-tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {}, '
