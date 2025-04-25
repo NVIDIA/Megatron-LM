@@ -131,7 +131,7 @@ products:
   - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
     products:
       - environment: [dev, lts]
-        scope: [none] # revert to 'nightly' after fixing bug
+        scope: [nightly]
   #######################################################################
   # Weekly tests: Run both DEV and LTS unless something is flaky        #
   #######################################################################
