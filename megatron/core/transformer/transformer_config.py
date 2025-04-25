@@ -178,7 +178,7 @@ class TransformerConfig(ModelParallelConfig):
     apply_query_key_layer_scaling is True."""
 
     disable_bf16_reduced_precision_matmul: bool = False
-    """If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to 
+    """If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to
     prevent matmul from using reduced precision accumulation when using BF16."""
 
     ####################
@@ -243,7 +243,7 @@ class TransformerConfig(ModelParallelConfig):
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
-    "mlp": recompute the dense MLP submodule. 
+    "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
     "core_attn", "mlp", and "moe" uses normal checkpointing.
@@ -260,7 +260,8 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe: Optional[str] = "delayed"
     """If set, enables the use of FP8 precision through Transformer Engine. There are 3 predefined
     choices (1) 'tensorwise' uses per tensor current scaling recipe, (2) 'delayed'
-    uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only"""
+    uses delayed scaling recipe, 3) 'mxfp8' for Blackwell architecture only,
+    4) 'blockwise' for blockwise scaling recipe."""
 
     fp8_param: bool = False
     """If set, keep the parameters in fp8 precision to save memory. This option must be used
@@ -519,7 +520,7 @@ class TransformerConfig(ModelParallelConfig):
     """ Whether we should instantiate a separate RNG tracker for inference. """
 
     mrope_section: Optional[List[int]] = None
-    """ Multimodal rope section is for channel dimension of temporal, height and width 
+    """ Multimodal rope section is for channel dimension of temporal, height and width
     in rope calculation. """
 
     is_hybrid_model: bool = False

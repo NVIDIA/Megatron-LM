@@ -10,6 +10,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, mpu, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import (
@@ -33,17 +34,12 @@ SUPPORTED_ATTN_MASK = [
 
 
 try:
-    from megatron.core.extensions.transformer_engine import (
-        TEColumnParallelLinear,
-        TEDelayedScaling,
-        TENorm,
-    )
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm
 
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
 
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 try:
     import apex  # pylint: disable=unused-import
@@ -389,6 +385,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        self.offload_context = nullcontext()
 
     def forward(
         self,
@@ -444,29 +441,10 @@ class MultiTokenPredictionLayer(MegatronModule):
         else:
             rng_context = nullcontext()
 
+        # Unlike transformer_block.py which needs to support mixed-precision in different layers,
+        # currently MTP only use global fp8 context.
         if self.config.fp8:
-            import transformer_engine  # To keep out TE dependency when not training in fp8
-
-            if self.config.fp8 == "e4m3":
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif self.config.fp8 == "hybrid":
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
-            else:
-                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-            fp8_recipe = TEDelayedScaling(
-                config=self.config,
-                fp8_format=fp8_format,
-                override_linear_precision=(False, False, not self.config.fp8_wgrad),
-            )
-            fp8_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(
-                    with_context_parallel=True, tp_only_amax_red=self.tp_only_amax_red
-                )
-            fp8_context = transformer_engine.pytorch.fp8_autocast(
-                enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
-            )
+            fp8_context = get_fp8_context(self.config)
         else:
             fp8_context = nullcontext()
 
@@ -488,6 +466,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # For sequence parallel, scatter after linear_fc and before transformer layer.
             if self.sequence_parallel:
                 hidden_states = scatter_to_sequence_parallel_region(hidden_states)
+
             hidden_states, _ = self.transformer_layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,

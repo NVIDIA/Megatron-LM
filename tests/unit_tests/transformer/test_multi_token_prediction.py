@@ -35,6 +35,7 @@ try:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
 
     HAVE_TE = True
+    from megatron.core.utils import is_te_min_version
 except ImportError:
     HAVE_TE = False
 
@@ -212,7 +213,6 @@ class TestMultiTokenPrediction:
         args.bf16 = True
         if fp8 is not None:
             args.fp8 = 'e4m3'
-            args.bf16 = False
         args.add_bias_linear = False
         args.swiglu = True
 
@@ -279,7 +279,10 @@ class TestMultiTokenPrediction:
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None
 
-    @pytest.mark.skip("Skipping FP8 support test since it is not ready")
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("1.7.0"),
+        reason="Only transformer-engine>=1.7.0 supports MoE FP8 training",
+    )
     def test_fp8_support(self):
         """Test MTP with FP8 training enabled."""
         tp_size = 1
