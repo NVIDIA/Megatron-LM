@@ -44,7 +44,7 @@ class NotDeterminsticError(Exception):
 
 
 class ApproximateTest(Test):
-    atol: Optional[Union[int, float]] = 0
+    atol: Union[int, float] = 0
     atol_func: Optional[Callable] = None
     rtol: float = 1e-5
 
@@ -196,84 +196,70 @@ def pipeline(
     all_test_passed = True
     failed_metrics = []
 
-    for golden_value_key, golden_value in golden_values.items():
+    for metric_name, metric_thresholds in checks.items():
 
-        try:
-            if golden_value_key not in list(tensorboard_logs.keys()):
-                raise MissingTensorboardLogsError(
-                    f"Metric {golden_value_key} not found in Tensorboard logs! Please modify `model_config.yaml` to record it."
-                )
+        if metric_name not in list(tensorboard_logs.keys()):
+            raise MissingTensorboardLogsError(
+                f"Metric {metric_name} not found in Tensorboard logs! Please modify `model_config.yaml` to record it."
+            )
 
-            if golden_value_key not in checks or (golden_value_key in checks and len(checks) == 0):
-                logger.debug(
-                    "For metric `%s`, no check was defined. Will fall back to `DeterminsticTest` with exact thresholds.",
-                    golden_value_key,
-                )
-                test = DeterministicTest()
-            else:
-                # For approximate tests, we cannot use deterministic
-                if compare_approximate_results is True:
-                    tests = _filter_checks(checks[golden_value_key], TypeOfTestResult.APPROXIMATE)
+        for test in metric_thresholds:
 
-                # For deterministic, we can fall back to approximate
-                else:
-                    tests = _filter_checks(
-                        checks[golden_value_key], TypeOfTestResult.DETERMINISTIC
-                    ) or _filter_checks(checks[golden_value_key], TypeOfTestResult.APPROXIMATE)
+            if (
+                compare_approximate_results
+                and test.type_of_test_result == TypeOfTestResult.DETERMINISTIC
+            ):
+                continue
 
-                if len(tests) != 1:
-                    raise SkipMetricError(
-                        f"No {'approximate' if compare_approximate_results is True else 'deterministic'} check found for {golden_value_key}: SKIPPED"
+            try:
+
+                golden_value = golden_values[metric_name]
+                golden_value_list = list(golden_value.values.values())
+                actual_value_list = [
+                    value
+                    for value_step, value in tensorboard_logs[metric_name].values.items()
+                    if value_step in golden_value.values.keys()
+                ]
+
+                if metric_name == "iteration-time":
+                    actual_value_list = actual_value_list[3:-1]
+                    golden_value_list = golden_value_list[3:-1]
+                    logger.info(
+                        "For metric `%s`, the first 3 and the last scalars are removed from the list to reduce noise.",
+                        metric_name,
                     )
 
-                test = tests[0]
+                actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
+                golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
 
-            golden_value_list = list(golden_value.values.values())
-            actual_value_list = [
-                value
-                for value_step, value in tensorboard_logs[golden_value_key].values.items()
-                if value_step in golden_value.values.keys()
-            ]
+                if not np.allclose(
+                    actual_value_list,
+                    golden_value_list,
+                    rtol=test.rtol,
+                    atol=(
+                        test.atol_func(actual_value_list, golden_value_list)
+                        if test.atol_func is not None
+                        else test.atol
+                    ),
+                ):
+                    logger.info("Actual values: %s", ", ".join([str(v) for v in actual_value_list]))
+                    logger.info("Golden values: %s", ", ".join([str(v) for v in golden_value_list]))
+                    raise test.error_message(metric_name)
 
-            if golden_value_key == "iteration-time":
-                actual_value_list = actual_value_list[3:-1]
-                golden_value_list = golden_value_list[3:-1]
-                logger.info(
-                    "For metric `%s`, the first 3 and the last scalars are removed from the list to reduce noise.",
-                    golden_value_key,
-                )
+                result = f"{test.type_of_test_result.name} test for metric {metric_name}: PASSED"
+                result_code = 0
 
-            actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
-            golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
+            except (NotApproximateError, NotDeterminsticError, MissingTensorboardLogsError) as e:
+                result = str(e)
+                result_code = 1
+            except SkipMetricError:
+                logger.info(f"{test.type_of_test_result.name} test for {metric_name}: SKIPPED")
+                continue
 
-            if not np.allclose(
-                actual_value_list,
-                golden_value_list,
-                rtol=test.rtol,
-                atol=(
-                    test.atol_func(actual_value_list, golden_value_list)
-                    if test.atol_func is not None
-                    else test.atol
-                ),
-            ):
-                logger.info("Actual values: %s", ", ".join([str(v) for v in actual_value_list]))
-                logger.info("Golden values: %s", ", ".join([str(v) for v in golden_value_list]))
-                raise test.error_message(golden_value_key)
-
-            result = f"{test.type_of_test_result.name} test for metric {golden_value_key}: PASSED"
-            result_code = 0
-
-        except (NotApproximateError, NotDeterminsticError, MissingTensorboardLogsError) as e:
-            result = str(e)
-            result_code = 1
-        except SkipMetricError:
-            logger.info(f"{test.type_of_test_result.name} test for {golden_value_key}: SKIPPED")
-            continue
-
-        log_emitter = logger.info if result_code == 0 else logger.error
-        log_emitter(result)
-        if result_code == 1:
-            all_test_passed = False
-            failed_metrics.append(golden_value_key)
+            log_emitter = logger.info if result_code == 0 else logger.error
+            log_emitter(result)
+            if result_code == 1:
+                all_test_passed = False
+                failed_metrics.append(metric_name)
 
     assert all_test_passed, f"The following metrics failed: {', '.join(failed_metrics)}"

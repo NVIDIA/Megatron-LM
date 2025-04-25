@@ -1,7 +1,5 @@
 import logging
-from typing import Dict
 
-import numpy as np
 import yaml
 
 from tests.functional_tests.python_test_utils import common, test_regular_pipeline
@@ -9,9 +7,30 @@ from tests.functional_tests.python_test_utils import common, test_regular_pipeli
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+CHECK_THRESHOLDS = {
+    "iteration-time": [common.ApproximateTest(atol=2.0, rtol=0)],
+    "mem-allocated-bytes": [
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.10), rtol=0)
+    ],
+    "mem-max-allocated-bytes": [
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.10), rtol=0)
+    ],
+    "lm loss": [
+        common.DeterministicTest(),
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
+    ],
+    "num-zeros": [
+        common.DeterministicTest(),
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.20), rtol=0),
+    ],
+}
+
 
 def test_resume_checkpoint_pipeline(
-    compare_approximate_results: bool, tensorboard_path: str, train_iters: int
+    compare_approximate_results: bool,
+    tensorboard_path: str,
+    train_iters: int,
+    model_config_path: str,
 ):
 
     first_run_values = common.read_tb_logs_as_list(
@@ -21,23 +40,15 @@ def test_resume_checkpoint_pipeline(
         tensorboard_path, index=1, train_iters=train_iters, start_idx=(train_iters // 2) + 1
     )
 
-    checks = {
-        "iteration-time": [common.ApproximateTest(atol=2.0, rtol=0)],
-        "mem-allocated-bytes": [
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.10), rtol=0)
-        ],
-        "mem-max-allocated-bytes": [
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.10), rtol=0)
-        ],
-        "lm loss": [
-            common.DeterministicTest(),
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
-        ],
-        "num-zeros": [
-            common.DeterministicTest(),
-            common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.20), rtol=0),
-        ],
-    }
+    with open(model_config_path) as f:
+        model_config = yaml.safe_load(f)
+
+    checks_types = (
+        model_config["METRICS"]
+        if "METRICS" in model_config
+        else ["iteration-time", "lm loss", "num-zeros"]
+    )
+    checks = {metric: CHECK_THRESHOLDS[metric] for metric in checks_types}
 
     if (
         len(
@@ -74,4 +85,5 @@ def test_resume_checkpoint_pipeline(
         golden_values=first_run_values,
         tensorboard_logs=second_run_values,
         checks=checks,
+        model_config_path=model_config_path,
     )
