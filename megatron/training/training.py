@@ -45,7 +45,7 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.core.transformer.module import Float16Module
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 
@@ -1070,31 +1070,33 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             DP = DDP
 
         config = get_model_config(model[0])
-
-        kwargs = {}
-        for f in dataclasses.fields(DistributedDataParallelConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
-        kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
-        kwargs['check_for_large_grads'] = args.check_for_large_grads
-        if args.ddp_num_buckets is not None:
-            assert args.ddp_bucket_size is None, \
-                "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
-            assert args.ddp_num_buckets > 0, \
-                "--ddp-num-buckets must be greater than 0"
-            kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
+ 
+        if getattr(args, "use_torch_fsdp2", False):
+            reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+            ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
         else:
-            kwargs['bucket_size'] = args.ddp_bucket_size
-        kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
-        kwargs['average_in_collective'] = args.ddp_average_in_collective
-        if args.use_custom_fsdp and args.use_precision_aware_optimizer:
-            kwargs["preserve_fp32_weights"] = False
-        ddp_config = DistributedDataParallelConfig(**kwargs)
+            kwargs = {}
+            for f in dataclasses.fields(DistributedDataParallelConfig):
+                if hasattr(args, f.name):
+                    kwargs[f.name] = getattr(args, f.name)
+            kwargs['grad_reduce_in_fp32'] = args.accumulate_allreduce_grads_in_fp32
+            kwargs['check_for_nan_in_grad'] = args.check_for_nan_in_loss_and_grad
+            kwargs['check_for_large_grads'] = args.check_for_large_grads
+            if args.ddp_num_buckets is not None:
+                assert args.ddp_bucket_size is None, \
+                    "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
+                assert args.ddp_num_buckets > 0, \
+                    "--ddp-num-buckets must be greater than 0"
+                kwargs['bucket_size'] = num_parameters // args.ddp_num_buckets
+            else:
+                kwargs['bucket_size'] = args.ddp_bucket_size
+            kwargs['pad_buckets_for_high_nccl_busbw'] = args.ddp_pad_buckets_for_high_nccl_busbw
+            kwargs['average_in_collective'] = args.ddp_average_in_collective
+            if args.use_custom_fsdp and args.use_precision_aware_optimizer:
+                kwargs["preserve_fp32_weights"] = False
+            ddp_config = DistributedDataParallelConfig(**kwargs)
 
-        if not getattr(args, "use_torch_fsdp2", False):
             # In the custom FSDP and DDP use path, we need to initialize the bucket size.
-
             # If bucket_size is not provided as an input, use sane default.
             # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
             # ring-reduce implementations are large enough to remain bandwidth-bound rather than
