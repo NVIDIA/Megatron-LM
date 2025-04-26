@@ -25,6 +25,11 @@ def add_modelopt_export_args(parser):
     """Add additional arguments for ModelOpt hf-like export."""
     group = parser.add_argument_group(title='ModelOpt hf-like export')
     group.add_argument(
+        "--export-extra-modules",
+        action="store_true",
+        help="Export extra modules such as Medusa, EAGLE, or MTP.",
+    )
+    group.add_argument(
         "--pretrained-model-name",
         type=str,
         help="A pretrained model hosted inside a model repo on huggingface.co.",
@@ -56,6 +61,7 @@ if __name__ == "__main__":
     mtex.export_mcore_gpt_to_hf(
         unwrapped_model,
         args.pretrained_model_name,
+        export_extra_modules=args.export_extra_modules,
         dtype=torch.bfloat16,
         export_dir=args.export_dir,
     )
