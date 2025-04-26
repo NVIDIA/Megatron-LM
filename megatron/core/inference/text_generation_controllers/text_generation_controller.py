@@ -690,7 +690,9 @@ class TextGenerationController:
             request.status = Status.COMPLETED
 
             text, segments = self.detokenize_generations(
-                batch_prompt_tokens_with_generations[idx],
+                batch_prompt_tokens_with_generations[
+                    idx, : (input_prompt_length + required_sequence_length)
+                ],
                 input_prompt_length + generated_sequence_lengths,
                 sampling_params.return_segments,
             )
