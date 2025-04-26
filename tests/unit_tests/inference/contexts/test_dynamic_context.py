@@ -88,7 +88,7 @@ class TestDynamicContext:
         )
         assert dynamic_context.gtd_chunk_count == 256
         assert dynamic_context.gtd_request_count == 64
-        assert dynamic_context.chunk_count_total == 491
+        assert dynamic_context.chunk_allocator.chunk_count_total == 491
         assert dynamic_context.max_requests == 122
         assert dynamic_context.max_tokens == 62848
 
@@ -121,18 +121,18 @@ class TestDynamicContext:
             buffer_guaranteed_fraction=0.1,
             chunk_size_tokens=128,
         )
-        dynamic_context.chunk_count_avail = 10
-        assert dynamic_context.is_memory_available(10)
-        assert not dynamic_context.is_memory_available(11)
+        dynamic_context.chunk_allocator.chunk_count_avail = 10
+        assert dynamic_context.chunk_allocator.is_memory_available(10)
+        assert not dynamic_context.chunk_allocator.is_memory_available(11)
 
-        assert dynamic_context.is_memory_available(1)
-        dynamic_context.chunk_count_avail = 0
-        assert not dynamic_context.is_memory_available(1)
+        assert dynamic_context.chunk_allocator.is_memory_available(1)
+        dynamic_context.chunk_allocator.chunk_count_avail = 0
+        assert not dynamic_context.chunk_allocator.is_memory_available(1)
 
-        dynamic_context.chunk_count_avail = 10
+        dynamic_context.chunk_allocator.chunk_count_avail = 10
         dynamic_context.gtd_chunk_count = 5
-        assert dynamic_context.is_memory_available(6)
-        assert not dynamic_context.is_memory_available(6, safe=True)
+        assert dynamic_context.chunk_allocator.is_memory_available(6)
+        assert not dynamic_context.chunk_allocator.is_memory_available(6, safe=True)
 
     def test_request_overflow(self):
         self._setup_model_parallel_group(1, 1)
@@ -207,7 +207,7 @@ class TestDynamicContext:
         dynamic_context.token_to_position_in_request.fill_(1)
         dynamic_context.token_to_chunk_idx.fill_(1)
         dynamic_context.token_to_local_position_within_kv_chunk.fill_(1)
-        dynamic_context.chunk_count_avail = 5
+        dynamic_context.chunk_allocator.chunk_count_avail = 5
         dynamic_context.memory_buffer.fill_(1)
         dynamic_context.request_to_kv_chunk_ids.fill_(1)
 
@@ -233,7 +233,10 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.token_to_position_in_request == 0)
         assert torch.all(dynamic_context.token_to_chunk_idx == -1)
         assert torch.all(dynamic_context.token_to_local_position_within_kv_chunk == 0)
-        assert dynamic_context.chunk_count_avail == dynamic_context.chunk_count_total - 1
+        assert (
+            dynamic_context.chunk_allocator.chunk_count_avail
+            == dynamic_context.chunk_allocator.chunk_count_total - 1
+        )
         assert torch.all(dynamic_context.request_to_kv_chunk_ids == -1)
 
     def test_allocate_and_release_memory_chunks(self):
@@ -252,20 +255,22 @@ class TestDynamicContext:
             buffer_overflow_factor=None,
         )
 
-        assert dynamic_context.allocate_memory_chunks(4).cpu().detach().numpy().tolist() == [
-            486,
-            487,
-            488,
-            489,
-        ]
-        assert dynamic_context.chunk_count_avail == 486
-        dynamic_context.release_memory_chunks(torch.tensor([488, 489], device='cuda'))
-        assert dynamic_context.chunk_count_avail == 488
-        assert dynamic_context.allocate_memory_chunks(1).item() == 489
-        assert dynamic_context.chunk_count_avail == 487
+        assert dynamic_context.chunk_allocator.allocate_memory_chunks(
+            4
+        ).cpu().detach().numpy().tolist() == [486, 487, 488, 489]
+        assert dynamic_context.chunk_allocator.chunk_count_avail == 486
+        dynamic_context.chunk_allocator.release_memory_chunks(
+            torch.tensor([488, 489], device='cuda')
+        )
+        assert dynamic_context.chunk_allocator.chunk_count_avail == 488
+        assert dynamic_context.chunk_allocator.allocate_memory_chunks(1).item() == 489
+        assert dynamic_context.chunk_allocator.chunk_count_avail == 487
         # Should return None since we allocate more chunks than what we have.
         assert (
-            dynamic_context.allocate_memory_chunks(dynamic_context.chunk_count_avail + 100) == None
+            dynamic_context.chunk_allocator.allocate_memory_chunks(
+                dynamic_context.chunk_allocator.chunk_count_avail + 100
+            )
+            == None
         )
 
     def test_add_request(self):
@@ -354,7 +359,7 @@ class TestDynamicContext:
         dynamic_context.paused_request_count = 0
         dynamic_context.total_request_count = 3
         dynamic_context.request_kv_chunk_counts[0:3] = 1
-        new_chunk_ids = dynamic_context.allocate_memory_chunks(3, safe=True)
+        new_chunk_ids = dynamic_context.chunk_allocator.allocate_memory_chunks(3, safe=True)
         dynamic_context.request_to_kv_chunk_ids[0:3, 0] = new_chunk_ids
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
@@ -400,15 +405,18 @@ class TestDynamicContext:
             )
 
         total_request_count = 10
-        dynamic_context.chunk_count_avail -= 11  # We align 11 chunks to the 10 requests we have. 3rd request alone we setup like it requires 2 chunks
+        dynamic_context.chunk_allocator.chunk_count_avail -= 11  # We align 11 chunks to the 10 requests we have. 3rd request alone we setup like it requires 2 chunks
         dynamic_context.total_request_count = total_request_count
 
         dynamic_context.request_to_kv_chunk_ids[0:total_request_count, 0] = torch.arange(
-            dynamic_context.chunk_count_avail, dynamic_context.chunk_count_avail + 10
+            dynamic_context.chunk_allocator.chunk_count_avail,
+            dynamic_context.chunk_allocator.chunk_count_avail + 10,
         )
         dynamic_context.request_to_kv_chunk_ids[3][
             1
-        ] = dynamic_context.chunk_count_avail  # Assign one extra chunk  to request 3.
+        ] = (
+            dynamic_context.chunk_allocator.chunk_count_avail
+        )  # Assign one extra chunk  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
         # For 0, 1, 5, 6, the total number of tokens in last chunk is chunk size -1, so that they will all need extra chunks
         dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.chunk_size_tokens - 1
@@ -517,12 +525,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 5 requests
         # Allocate 5 chunks for 5 requests
-        initial_chunks = dynamic_context.allocate_memory_chunks(5, safe=True)
+        initial_chunks = dynamic_context.chunk_allocator.allocate_memory_chunks(5, safe=True)
         dynamic_context.total_request_count = 5
         dynamic_context.paused_request_count = 0
 
         # Record the available chunks before releasing memory
-        initial_available_chunks = dynamic_context.chunk_count_avail
+        initial_available_chunks = dynamic_context.chunk_allocator.chunk_count_avail
 
         # Assign chunks to the requests (one chunk per request)
         for i in range(5):
@@ -546,7 +554,7 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 2
 
         # Verify that 3 chunks were released by checking the available chunks
-        assert dynamic_context.chunk_count_avail == initial_available_chunks + 3
+        assert dynamic_context.chunk_allocator.chunk_count_avail == initial_available_chunks + 3
 
     def test_finished_requests_with_multiple_chunks(self):
         """Test that all memory chunks are correctly released for finished requests that use multiple chunks."""
@@ -567,12 +575,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 3 requests, where some use multiple chunks
         # Allocate 6 chunks in total for the requests
-        initial_chunks = dynamic_context.allocate_memory_chunks(6, safe=True)
+        initial_chunks = dynamic_context.chunk_allocator.allocate_memory_chunks(6, safe=True)
         dynamic_context.total_request_count = 3
         dynamic_context.paused_request_count = 0
 
         # Record the available chunks before releasing memory
-        initial_available_chunks = dynamic_context.chunk_count_avail
+        initial_available_chunks = dynamic_context.chunk_allocator.chunk_count_avail
 
         # Assign chunks to the requests:
         # - Request 0: 1 chunk
@@ -609,4 +617,4 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 0
 
         # Verify that all 6 chunks were released by checking the available chunks
-        assert dynamic_context.chunk_count_avail == initial_available_chunks + 6
+        assert dynamic_context.chunk_allocator.chunk_count_avail == initial_available_chunks + 6
