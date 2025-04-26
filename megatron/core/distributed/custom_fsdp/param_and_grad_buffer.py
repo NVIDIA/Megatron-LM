@@ -1168,33 +1168,6 @@ class ParamAndGradBuffer:
                     p.fully_shard_param_local_shard = local_shard
                     p.fully_shard_param_local_index = wbuf.locate_item_in_global_item(item_id)
 
-                    def disable_shard_param_to_function(*unused):
-                        """Prevents users from accessing the 'to' operation
-                        on parameters after sharding.
-
-                        This restriction helps maintain data integrity and
-                        proper sharding behavior by disabling direct 'to'
-                        device/dtype operations on sharded parameters.
-                        """
-                        raise RuntimeError(
-                            "Your model is wrapped by MCore Custom FSDP. All "
-                            "parameter dtypes and devices must be set before FSDP "
-                            "wrapping. After FSDP wrapping, parameter storage "
-                            "is sharded and you cannot modify parameter "
-                            "dtypes or devices."
-                        )
-
-                    setattr(p, 'to', disable_shard_param_to_function)
-
-                    def disable_shard_param_cpu_function(*unused):
-                        warnings.warn(
-                            "The parameters are sharded by custom fsdp, "
-                            "and no actual cpu operation is performed."
-                        )
-                        return torch.empty([], device='cpu')
-
-                    setattr(p, 'cpu', disable_shard_param_cpu_function)
-
             if wbuf and wbuf.is_data_distributed:
                 wbuf.free_bucket_storage()
 
@@ -1356,19 +1329,31 @@ class ParamAndGradBuffer:
 
     def update_main_grads(self):
         """Update the main gradients for preparing the optimizer step."""
+        update_shard_main_grad = self.ddp_config.data_parallel_sharding_strategy in [
+            'optim',
+            'optim_grads',
+            'optim_grads_params',
+        ]
         for _, param in self.optimizer_named_parameters:
             param.reset_attribute()
             orig_param = param.orig_param
             group = self.parameter_groups[self.param_to_param_group[orig_param]]
             item_id = group.main_grad_buffer.param_idx[orig_param]
             optimizer_grad = group.main_grad_buffer.get_item(
-                item_id, only_shard=group.main_weight_buffer.is_data_distributed
+                item_id, only_shard=update_shard_main_grad
             )
-            setattr(
-                param,
-                'grad',
-                optimizer_grad.to(param.dtype) if optimizer_grad.numel() > 0 else None,
-            )
+            # The presence of main_grad_buffer but no main_weight_buffer means
+            # that a precision-aware optimizer is used.
+            if group.main_weight_buffer is None:
+                setattr(
+                    param, 'decoupled_grad', optimizer_grad if optimizer_grad.numel() > 0 else None
+                )
+            else:
+                setattr(
+                    param,
+                    'grad',
+                    optimizer_grad.to(param.dtype) if optimizer_grad.numel() > 0 else None,
+                )
 
     @property
     def num_buckets(self):
@@ -2053,3 +2038,47 @@ class ResetParametersContext:
 
     def __exit__(self, *exc_details):
         self.stack.__exit__(*exc_details)
+
+
+def override_sharded_param_methods_with_safety_checks(params, all_gather_pipeline):
+    """
+    Override the methods of the parameters to prevent undefined behavior.
+    Args:
+        params (List[torch.Tensor]): The parameters to add hint on shard to functions.
+        all_gather_pipeline (AllGatherPipeline): The all-gather pipeline.
+    """
+    for p in params:
+        to_function = p.to
+        cpu_function = p.cpu
+
+        def override_sharded_param_to_function_closure(p, to_function):
+            def override_sharded_param_to_function(*args, **kwargs):
+                bucket_id = all_gather_pipeline.buffer.param_to_param_group[p]
+                status = all_gather_pipeline.bucket_status[bucket_id]
+                if status == BucketStatus.READY_TO_USE:
+                    return to_function(*args, **kwargs)
+                raise RuntimeError(
+                    "This parameter is already shard by MCore FSDP and the "
+                    "shared-state parameter does not support 'to' function."
+                    "please define the dtype and device of the parameter before FSDP wrap."
+                )
+
+            return override_sharded_param_to_function
+
+        setattr(p, 'to', override_sharded_param_to_function_closure(p, to_function))
+
+        def override_sharded_param_cpu_function_closure(p, cpu_function):
+            def override_sharded_param_cpu_function(*args, **kwargs):
+                bucket_id = all_gather_pipeline.buffer.param_to_param_group[p]
+                status = all_gather_pipeline.bucket_status[bucket_id]
+                if status == BucketStatus.READY_TO_USE:
+                    return cpu_function(*args, **kwargs)
+                warnings.warn(
+                    "The parameters are sharded by MCore FSDP, and no actual "
+                    "cpu operation is performed."
+                )
+                return torch.empty([], device='cpu')
+
+            return override_sharded_param_cpu_function
+
+        setattr(p, 'cpu', override_sharded_param_cpu_function_closure(p, cpu_function))
