@@ -152,6 +152,10 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
     if args.spec is not None:
         raise ValueError("ModelOpt integration does not support custom args.spec.")
 
+    # Llama-4 Scout/Maverick support
+    config.qk_l2_norm = args.export_qk_l2_norm 
+    config.moe_apply_probs_on_input = args.export_moe_apply_probs_on_input 
+
     if args.export_model_type == "GPTModel":
         if config.heterogeneous_block_specs:
             transformer_layer_spec = get_gpt_heterogeneous_layer_spec(

@@ -28,9 +28,10 @@ if [ -z ${MLM_MODEL_CFG} ]; then
     exit 1
 fi
 
-if [ -z ${MLM_MODEL_CFG} ]; then
-    printf "${MLM_ERROR} Variable ${PURPLE}MLM_MODEL_CFG${WHITE} must be set!\n"
-    exit 1
+if [ -z ${MLM_ENV_SETUP} ]; then
+    printf "${MLM_WARNING} Variable ${PURPLE}MLM_ENV_SETUP${WHITE} not set! (only needed when launching with slurm)\n"
+else
+    source ${MLM_ENV_SETUP}
 fi
 
 if [ -z ${MLM_EXTRA_ARGS} ]; then
@@ -57,10 +58,14 @@ if [ -z ${PP} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}PP${WHITE} not set! (default: ${PP})\n"
 fi
 
+if [ -z ${DP} ]; then
+    DP=1
+    printf "${MLM_WARNING} Variable ${PURPLE}DP${WHITE} not set! (default: ${DP})\n"
+fi
 
-#launch_config="torchrun --nproc_per_node=$((TP * EP * PP))"
+
 if [ -z ${LAUNCH_SCRIPT} ]; then
-    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((TP * EP * PP))"
+    LAUNCH_SCRIPT="torchrun --nproc_per_node=$((TP * EP * PP * DP))"
 fi
 
 # Install TensorRT Model Optimizer if haven't.
