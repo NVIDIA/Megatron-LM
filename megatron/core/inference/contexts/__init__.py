@@ -3,6 +3,7 @@
 import warnings
 
 from .base_context import BaseInferenceContext
+from .dynamic_chunk_allocator import ChunkAllocator
 from .static_context import StaticInferenceContext
 
 warnings.warn(
