@@ -94,6 +94,7 @@ def get_inference_context(
         buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
     )
 
     return context

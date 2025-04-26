@@ -106,14 +106,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_overflow_factor: Optional[float] = None,
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
+        tensor_model_parallel_size: Optional[int] = None,
     ):
 
         super().__init__()
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        if tensor_model_parallel_size is None:
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            tp_size = tensor_model_parallel_size
         hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, world_size)
+        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
