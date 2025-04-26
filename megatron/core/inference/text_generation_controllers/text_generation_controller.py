@@ -9,10 +9,14 @@ from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributed import ProcessGroup
 
-from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
+from megatron.core.inference.communication_utils import (
+    broadcast_from_last_pipeline_stage,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from megatron.core.inference.contexts.dynamic_context import TokenOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -32,15 +36,23 @@ class TextGenerationController:
         inference_wrapped_model (AbstractModelInferenceWrapper): A model that
             is wrapped using the specs given in the abstract_model_inference_wrapper.py
         tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
+        pp_group (ProcessGroup): Process group for pipeline parallelism
     """
 
-    def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
+    def __init__(
+        self,
+        inference_wrapped_model: AbstractModelInferenceWrapper,
+        tokenizer,
+        pp_group: ProcessGroup = None,
+    ):
         self.inference_wrapped_model = inference_wrapped_model
         self.tokenizer = tokenizer
 
+        self.pp_group = pp_group
+
         # For models without pipeline parallelism, is_first_stage and is_last_stage returns True
         self.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+            is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
     def tokenize_prompt(
@@ -541,7 +553,7 @@ class TextGenerationController:
                 if enable_cuda_graph:
                     # Undo padding up to maximum batch size if necessary
                     batch_prompt_tokens = padded_batch_prompt_tokens[:batch_size]
-                    if parallel_state.is_pipeline_last_stage():
+                    if is_pipeline_last_stage(self.pp_group):
                         logits = logits[:batch_size]
 
                     create_cudagraphs()
@@ -552,12 +564,13 @@ class TextGenerationController:
                     context_length = context_end_position - context_start_position
                     logits_seq_len = 1 if materialize_only_last_token_logits else context_length
                     logits_shape = [batch_size, logits_seq_len, vocab_size]
-                    if parallel_state.is_pipeline_last_stage():
+                    if is_pipeline_last_stage(self.pp_group):
                         assert logits is not None and torch.Size(logits_shape) == logits.shape
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, vocab_size],
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
+                        pp_group=self.pp_group,
                     )
                 # Indicates which of the input prompts have started generating tokens.
                 # A 1D boolean tensor with [batch_size] elements (i.e) The shortest
