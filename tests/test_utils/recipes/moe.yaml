@@ -129,13 +129,12 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  # TODO: Enable this test once the compatibility issue is fixed
-  # - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
 
   # - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
   #   products:
