@@ -68,6 +68,7 @@ class TestConfig:
     context_buffer_overflow_factor: Optional[float] = None
     context_max_requests_override: Optional[int] = None
     context_max_tokens_override: Optional[int] = None
+    tensor_model_parallel_size: int = 1
 
     use_fixed_output_lengths: bool = False
 
@@ -148,6 +149,7 @@ class TestDynamicInferenceEngine:
             buffer_overflow_factor=test_config.context_buffer_overflow_factor,
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
+            tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
         )
 
         return context
@@ -155,6 +157,12 @@ class TestDynamicInferenceEngine:
     @classmethod
     def _build_test_env(cls, test_config):
         DynamicInferenceContext.ROUNDER = 4
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=1,
+        )
+
         random_seed = 123
         vocab_size = 100
 
@@ -170,6 +178,7 @@ class TestDynamicInferenceEngine:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
         )
 
         # Requests.
@@ -304,11 +313,6 @@ class TestDynamicInferenceEngine:
             )
 
         return env
-
-    def setup_method(self, method):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-        )
 
     def teardown_method(self, method):
         DynamicInferenceContext.ROUNDER = 64

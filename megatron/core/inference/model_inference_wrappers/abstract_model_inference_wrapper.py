@@ -9,6 +9,8 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.inference.communication_utils import (
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
 )
@@ -17,6 +19,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ModelCommProcessGroups
 
 
 # pylint: disable=line-too-long
@@ -34,6 +37,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             hidden size, vocab size etc.
         inference_context (BaseInferenceContext): Context for managing KV
             cache and other inference params.
+        model_comm_pgs (ModelCommProcessGroups): Process groups for model communication.
     """
 
     def __init__(
@@ -41,6 +45,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]
         inference_wrapper_config: InferenceWrapperConfig,
         inference_context: Optional[BaseInferenceContext] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ):
         assert not isinstance(
             model, Iterable
@@ -62,6 +67,17 @@ class AbstractModelInferenceWrapper(abc.ABC):
             inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
 
         self.inference_context = inference_context
+
+        if model_comm_pgs is None:
+            # For backward compatibility, remove in v0.14 and raise error
+            # raise ValueError("TEDotProductAttention was called without ModelCommProcessGroups")
+            model_comm_pgs = ModelCommProcessGroups(
+                tp=parallel_state.get_tensor_model_parallel_group(),
+                pp=parallel_state.get_pipeline_model_parallel_group(),
+            )
+
+        self.tp_group = model_comm_pgs.tp
+        self.pp_group = model_comm_pgs.pp
 
     @property
     def inference_params(self):
@@ -98,7 +114,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
         self.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+            is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
         self.inference_context.reset()
@@ -185,7 +201,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """
         tokens = inference_input["tokens"]
         logits = self._forward(inference_input)
-        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits, self.tp_group)
         if self.inference_context.is_static_batching():
             self.inference_context.sequence_len_offset += tokens.size(1)
 
@@ -211,22 +227,24 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         batch_size, seq_len = self._get_batch_size_and_seq_len(tokens, recv_buffer_seq_len)
         recv_buffer = None
-        if not parallel_state.is_pipeline_first_stage():
+        if not is_pipeline_first_stage(self.pp_group):
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
-            recv_from_prev_pipeline_rank_(recv_buffer)
+            recv_from_prev_pipeline_rank_(recv_buffer, self.pp_group)
 
         self.model.set_input_tensor(recv_buffer)
         output_tensor = self._forward(inference_input)
 
-        if not parallel_state.is_pipeline_last_stage():
-            send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
+        if not is_pipeline_last_stage(self.pp_group):
+            send_to_next_pipeline_rank(
+                output_tensor.type(dtype=self.pipeline_communication_dtype), self.pp_group
+            )
 
         self.inference_context.sequence_len_offset += seq_len
 
         logits = None
-        if parallel_state.is_pipeline_last_stage():
+        if is_pipeline_last_stage(self.pp_group):
             logits = output_tensor
-            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits, self.tp_group)
 
             # Explicitly cast logits to expected dtype
             logits = logits.to(self.inference_wrapper_config.params_dtype)
@@ -267,7 +285,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         logits = None
         # Preallocate memory for output logits.
-        if parallel_state.is_pipeline_last_stage():
+        if is_pipeline_last_stage(self.pp_group):
             logits_seq_len = 1 if materialize_only_last_token_logits else seq_len
             logits = torch.empty(
                 (batch_size, logits_seq_len, self.inference_wrapper_config.padded_vocab_size),
@@ -276,7 +294,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             )
 
         recv_buffer = None
-        if not parallel_state.is_pipeline_first_stage():
+        if not is_pipeline_first_stage(self.pp_group):
             recv_buffer = self._allocate_recv_buffer(micro_batch_size, seq_len)
         for micro_batch_index in range(num_micro_batches):
             start = micro_batch_index * micro_batch_size
@@ -289,8 +307,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if current_micro_batch_size != micro_batch_size:
                 recv_buffer = self._allocate_recv_buffer(current_micro_batch_size, seq_len)
 
-            if not parallel_state.is_pipeline_first_stage():
-                recv_from_prev_pipeline_rank_(recv_buffer)
+            if not is_pipeline_first_stage(self.pp_group):
+                recv_from_prev_pipeline_rank_(recv_buffer, self.pp_group)
 
             self.model.set_input_tensor(recv_buffer)
 
@@ -304,20 +322,20 @@ class AbstractModelInferenceWrapper(abc.ABC):
                 }
             )
 
-            if not parallel_state.is_pipeline_last_stage():
-                send_to_next_pipeline_rank(output_tensor)
+            if not is_pipeline_last_stage(self.pp_group):
+                send_to_next_pipeline_rank(output_tensor, self.pp_group)
 
             self.inference_context.batch_size_offset += current_micro_batch_size
 
-            if parallel_state.is_pipeline_last_stage():
+            if is_pipeline_last_stage(self.pp_group):
                 output_tensor = tensor_parallel.gather_from_tensor_model_parallel_region(
-                    output_tensor
+                    output_tensor, self.tp_group
                 )
                 assert logits is not None
                 logits[start:end, ...] = output_tensor
 
         # Explicitly cast logits to expected dtype
-        if parallel_state.is_pipeline_last_stage():
+        if is_pipeline_last_stage(self.pp_group):
             assert logits is not None
             logits = logits.to(self.inference_wrapper_config.params_dtype)
 

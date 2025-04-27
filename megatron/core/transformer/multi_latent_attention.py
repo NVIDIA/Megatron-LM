@@ -269,6 +269,7 @@ class MLASelfAttention(MultiLatentAttention):
                 bias=False,
                 skip_bias_add=False,
                 is_expert=False,
+                tp_comm_buffer_name='q_proj',
             )
 
         else:
@@ -283,6 +284,7 @@ class MLASelfAttention(MultiLatentAttention):
                 skip_bias_add=False,
                 gather_output=False,
                 is_expert=False,
+                tp_comm_buffer_name='q_down_proj',
             )
 
             self.linear_q_up_proj = build_module(
@@ -295,6 +297,7 @@ class MLASelfAttention(MultiLatentAttention):
                 bias=False,
                 skip_bias_add=False,
                 is_expert=False,
+                tp_comm_buffer_name='q_up_proj',
             )
 
         self.linear_kv_down_proj = build_module(
@@ -307,6 +310,7 @@ class MLASelfAttention(MultiLatentAttention):
             skip_bias_add=False,
             gather_output=False,
             is_expert=False,
+            tp_comm_buffer_name='kv_down_proj',
         )
 
         self.linear_kv_up_proj = build_module(
@@ -319,6 +323,7 @@ class MLASelfAttention(MultiLatentAttention):
             bias=False,
             skip_bias_add=False,
             is_expert=False,
+            tp_comm_buffer_name='kv_up_proj',
         )
 
         if self.config.q_lora_rank is not None:

@@ -715,13 +715,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                             # Allocate dummy tensors.
                             numel = len(param_range_map["gbuf_world"])
-                            init_shard = lambda: torch.empty(
-                                (numel,), dtype=torch.float32, device=torch.cuda.current_device()
+                            init_shard = lambda dtype=torch.float32: torch.empty(
+                                (numel,), dtype=dtype, device=torch.cuda.current_device()
                             )
 
-                            tensors = {"exp_avg": init_shard(), "exp_avg_sq": init_shard()}
+                            # For precision_aware_optimizer, the empty tensors should also be
+                            #  initialized with the correct dtype.
+                            tensors = {
+                                "exp_avg": init_shard(self.config.exp_avg_dtype),
+                                "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
+                            }
                             if self.config.use_precision_aware_optimizer:
-                                tensors["master_param"] = init_shard()
+                                if self.config.store_param_remainders and self.config.bf16:
+                                    tensors["master_param"] = init_shard(torch.int16)
+                                else:
+                                    tensors["master_param"] = init_shard(
+                                        self.config.main_params_dtype
+                                    )
                             state_dict_state.append((state_order, tensors))
 
             # Sort by state order (see method docstring for details).

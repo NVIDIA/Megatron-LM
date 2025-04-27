@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -16,7 +18,9 @@ def _indices_to_multihot_kernel(
     probs_in_multihot_ptr,
     position_map_ptr,
     num_of_local_experts: tl.constexpr,
+    num_of_local_experts_next_power_of_2: tl.constexpr,
     topk: tl.constexpr,
+    topk_next_power_of_2: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     '''
@@ -51,22 +55,31 @@ def _indices_to_multihot_kernel(
                 [0.0, 0.3, 0.4, 0.0]
             ]
     '''
+    # Prepare the [0, topk) row
+    topk_row = tl.arange(0, topk_next_power_of_2)
+    topk_row = tl.where(topk_row < topk, topk_row, -1)
+    topk_row_mask = topk_row != -1
+    # Prepare the [0, num_of_local_experts) row
+    num_exp_row = tl.arange(0, num_of_local_experts_next_power_of_2)
+    num_exp_row = tl.where(num_exp_row < num_of_local_experts, num_exp_row, -1)
+    num_exp_row_mask = num_exp_row != -1
+
     # Load a [1, topk] row from the indices buffer
     row_idx = tl.program_id(0)
-    indices_row = tl.load(indices_ptr + row_idx * topk + tl.arange(0, topk))
-    probs_row = tl.load(probs_in_indices_ptr + row_idx * topk + tl.arange(0, topk))
+    indices_row = tl.load(indices_ptr + row_idx * topk + topk_row, mask=topk_row_mask)
+    indices_row = tl.where(topk_row_mask, indices_row, -1)
+    probs_row = tl.load(probs_in_indices_ptr + row_idx * topk + topk_row, mask=topk_row_mask)
 
     # Get the position of the each index in the indices_row, which is saved for backwards
-    position_row = tl.arange(0, topk)
-    position_row = tl.where(indices_row != -1, position_row, -1)
+    position_row = tl.where(indices_row != -1, topk_row, -1)
     # Mask of the valid indices
     mask = (indices_row != -1) & (indices_row < num_of_local_experts)
 
     row_idx_offset = row_idx * num_of_local_experts
     # Store to initialize
-    tl.store(multihot_indices_ptr + row_idx_offset + tl.arange(0, num_of_local_experts), 0)
-    tl.store(probs_in_multihot_ptr + row_idx_offset + tl.arange(0, num_of_local_experts), 0)
-    tl.store(position_map_ptr + row_idx_offset + tl.arange(0, num_of_local_experts), -1)
+    tl.store(multihot_indices_ptr + row_idx_offset + num_exp_row, 0, mask=num_exp_row_mask)
+    tl.store(probs_in_multihot_ptr + row_idx_offset + num_exp_row, 0, mask=num_exp_row_mask)
+    tl.store(position_map_ptr + row_idx_offset + num_exp_row, -1, mask=num_exp_row_mask)
     # Use barrier to make sure the initialization is done
     tl.debug_barrier()
     # Store the indices and probs_in_indices
@@ -83,7 +96,9 @@ def _multihot_to_indices_kernel(
     position_map_ptr,
     probs_indices_ptr,
     num_of_local_experts: tl.constexpr,
+    num_of_local_experts_next_power_of_2: tl.constexpr,
     topk: tl.constexpr,
+    topk_next_power_of_2: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     '''
@@ -113,17 +128,27 @@ def _multihot_to_indices_kernel(
                 [0.1, 0.9]
             ]
     '''
+    # Prepare the [0, topk) row
+    topk_row = tl.arange(0, topk_next_power_of_2)
+    topk_row = tl.where(topk_row < topk, topk_row, -1)
+    topk_row_mask = topk_row != -1
+    # Prepare the [0, num_of_local_experts) row
+    num_exp_row = tl.arange(0, num_of_local_experts_next_power_of_2)
+    num_exp_row = tl.where(num_exp_row < num_of_local_experts, num_exp_row, -1)
+    num_exp_row_mask = num_exp_row != -1
+
     # Load a [1, num_of_local_experts] row from the local routing map
     row_idx = tl.program_id(0)
-    ptr_offset = row_idx * num_of_local_experts + tl.arange(0, num_of_local_experts)
-    probs_in_multihot_row = tl.load(probs_in_multihot_ptr + ptr_offset)
+    ptr_offset = row_idx * num_of_local_experts + num_exp_row
+    probs_in_multihot_row = tl.load(probs_in_multihot_ptr + ptr_offset, mask=num_exp_row_mask)
 
     # Get the original position of the valid value in the the indices
-    position_map_row = tl.load(position_map_ptr + ptr_offset)
+    position_map_row = tl.load(position_map_ptr + ptr_offset, mask=num_exp_row_mask)
+    position_map_row = tl.where(num_exp_row_mask, position_map_row, -1)
     mask = position_map_row != -1
 
     # Store to initialize
-    tl.store(probs_indices_ptr + row_idx * topk + tl.arange(0, topk), 0)
+    tl.store(probs_indices_ptr + row_idx * topk + topk_row, 0, mask=topk_row_mask)
     # Use barrier to make sure the initialization is done
     tl.debug_barrier()
     # Restore the indices and probs_indices
@@ -168,6 +193,9 @@ class IndicesToMultihot(torch.autograd.Function):
         position_map = torch.empty(
             (num_of_tokens, num_of_local_experts), dtype=torch.int32, device="cuda"
         )
+        # Compute the next power of 2 for the topk and num_of_local_experts
+        topk_next_power_of_2 = 2 ** int(math.ceil(math.log2(topk)))
+        num_of_local_experts_next_power_of_2 = 2 ** int(math.ceil(math.log2(num_of_local_experts)))
         grid = (num_of_tokens,)
         _indices_to_multihot_kernel[grid](
             indices,
@@ -176,7 +204,9 @@ class IndicesToMultihot(torch.autograd.Function):
             probs_in_multihot,
             position_map,
             num_of_local_experts,
+            num_of_local_experts_next_power_of_2,
             topk,
+            topk_next_power_of_2,
             BLOCK_SIZE=32,  # use only 1 warp per block
             num_warps=1,
         )
@@ -210,6 +240,9 @@ class IndicesToMultihot(torch.autograd.Function):
         grad_probs_indices = torch.empty(
             (num_of_tokens, topk), dtype=grad_probs_in_multihot.dtype, device="cuda"
         )
+        # Compute the next power of 2 for the topk and num_of_local_experts
+        topk_next_power_of_2 = 2 ** int(math.ceil(math.log2(topk)))
+        num_of_local_experts_next_power_of_2 = 2 ** int(math.ceil(math.log2(num_of_local_experts)))
 
         grid = (num_of_tokens,)
         _multihot_to_indices_kernel[grid](
@@ -219,7 +252,9 @@ class IndicesToMultihot(torch.autograd.Function):
             position_map,
             grad_probs_indices,
             num_of_local_experts,
+            num_of_local_experts_next_power_of_2,
             topk,
+            topk_next_power_of_2,
             BLOCK_SIZE=32,  # use only 1 warp per block
             num_warps=1,
         )

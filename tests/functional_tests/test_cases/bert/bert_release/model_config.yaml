@@ -46,3 +46,9 @@ MODEL_ARGS:
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --attention-backend: unfused
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
