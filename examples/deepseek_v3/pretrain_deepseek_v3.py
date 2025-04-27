@@ -37,7 +37,6 @@ from megatron.training.arguments import get_patch_args
 from megatron.training.tokenizer import build_tokenizer
 from megatron.training.global_vars import get_tokenizer
 
-from megatron.core.models.deepseekv2.layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
@@ -62,7 +61,7 @@ def model_provider(
     assert not args.use_legacy_models, "Only support mcore models."
     
     if not args.use_legacy_models:
-        print_rank_0("building deepseek_v2 model ...")
+        print_rank_0("building deepseek_v3 model ...")
         if args.num_experts:
             # Define the decoder block spec
             transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te)

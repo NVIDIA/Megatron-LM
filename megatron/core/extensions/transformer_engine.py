@@ -5,7 +5,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Callable
+from typing import Any, Callable, Optional
 
 import torch
 import transformer_engine as te
@@ -35,6 +35,8 @@ from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     set_tensor_model_parallel_attributes,
 )
+from megatron.core.tensor_parallel.random import get_data_parallel_rng_tracker_name
+
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -68,7 +70,7 @@ class TENorm:
     def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
         if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
-                hidden_size=hidden_size,
+                hidden_size,
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
@@ -79,7 +81,7 @@ class TENorm:
                 te.pytorch, "RMSNorm"
             ), "Transformer-Engine >= v0.11 required to use this feature"
             instance = te.pytorch.RMSNorm(
-                hidden_size=hidden_size,
+                hidden_size,
                 eps=eps,
                 sequence_parallel=config.sequence_parallel,
                 zero_centered_gamma=config.layernorm_zero_centered_gamma,
@@ -98,6 +100,14 @@ class TELinear(te.pytorch.Linear):
     Note that if Megatron's parallel_state has not been initialized
     yet, the tp_group passed to TE will be None and must be set later
     via set_tensor_parallel_group().
+    
+    parallel_mode currently supports 3 different values:
+        - "column": Split the weight matrix along output dimension (used in TEColumnParallelLinear)
+        - "row": Split the weight matrix along input dimension (used in TERowParallelLinear)
+        - "duplicated": No tensor parallelism and weight is duplicated across TP ranks
+        - Note: For expert linear layers, we will disable communication logic here
+                as TP communication is handled in token_dispatcher.
+
     """
 
     def __init__(
@@ -105,13 +115,13 @@ class TELinear(te.pytorch.Linear):
         input_size: int,
         output_size: int,
         *,
-        parallel_mode: str,
+        parallel_mode: Optional[str],
         config: ModelParallelConfig,
         init_method: Callable,
         bias: bool,
         skip_bias_add: bool,
         skip_weight_param_allocation: bool,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
         is_expert: bool = False,
     ):
         self.config = config
@@ -170,27 +180,39 @@ class TELinear(te.pytorch.Linear):
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
-            rng_tracker_name = None
+            if parallel_mode == "duplicated":
+                rng_tracker_name = get_data_parallel_rng_tracker_name()
+            else:
+                rng_tracker_name = None
+
         if is_te_min_version("1.7.0"):
             extra_kwargs["rng_tracker_name"] = rng_tracker_name
 
-        # Disable communications in TE when using TP or EP by making TE agnostic of model parallel.
-        if is_expert:
-            tp_group = get_expert_tensor_parallel_group(check_initialized=False)
-            tp_size = get_expert_tensor_parallel_world_size()
-        else:
-            tp_group = get_tensor_model_parallel_group(check_initialized=False)
-            tp_size = get_tensor_model_parallel_world_size()
-        explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
-
-        if explicit_expert_comm:
-            if parallel_mode == "column":
-                output_size = divide(output_size, tp_size)
-            elif parallel_mode == "row":
-                input_size = divide(input_size, tp_size)
-            parallel_mode = None
-            tp_size = 1
+        te_parallel_mode = parallel_mode
+        if parallel_mode == "duplicated":
+            # Handle non-parallel case
             tp_group = None
+            tp_size = 1
+            explicit_expert_comm = False
+            te_parallel_mode = None
+        else:
+            # Disable communications in TE when using TP or EP by
+            # making TE agnostic of model parallel.
+            if is_expert:
+                tp_group = get_expert_tensor_parallel_group(check_initialized=False)
+                tp_size = get_expert_tensor_parallel_world_size()
+            else:
+                tp_group = get_tensor_model_parallel_group(check_initialized=False)
+                tp_size = get_tensor_model_parallel_world_size()
+            explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
+            if explicit_expert_comm:
+                if parallel_mode == "column":
+                    output_size = divide(output_size, tp_size)
+                elif parallel_mode == "row":
+                    input_size = divide(input_size, tp_size)
+                te_parallel_mode = None
+                tp_size = 1
+                tp_group = None
 
         super().__init__(
             in_features=input_size,
@@ -205,12 +227,21 @@ class TELinear(te.pytorch.Linear):
             init_method=condition_init_method(config, init_method),
             bias=bias,
             return_bias=self.te_return_bias,
-            parallel_mode=parallel_mode,
+            parallel_mode=te_parallel_mode,
             **extra_kwargs,
         )
 
         for param in self.parameters():
-            setattr(param, 'allreduce', not (is_expert and self.expert_parallel))
+            if is_expert:
+                # Reduce the gradient on the expert_data_parallel group for expert linear layers
+                setattr(param, 'allreduce', not self.expert_parallel)
+            else:
+                # Reduce the gradient on DP group
+                setattr(param, 'allreduce', True)
+                if parallel_mode == "duplicated":
+                    # Reduce the gradient further on the TP group since the weight is
+                    # duplicated across TP ranks
+                    setattr(param, 'sequence_parallel', self.config.sequence_parallel)
 
     def forward(self, x):
         """Forward."""
@@ -246,7 +277,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         self.config = config
 
@@ -405,7 +436,7 @@ class TEColumnParallelLinear(TELinear):
         skip_bias_add: bool,
         is_expert: bool,
         skip_weight_param_allocation: bool = False,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         if gather_output:
             raise ValueError('Transformer Engine linear layers do not support gather_output = True')
@@ -482,7 +513,7 @@ class TERowParallelLinear(TELinear):
         input_is_parallel: bool,
         skip_bias_add: bool,
         is_expert: bool,
-        tp_comm_buffer_name: str = None,
+        tp_comm_buffer_name: Optional[str] = None,
     ):
         if not input_is_parallel:
             raise ValueError(
@@ -561,10 +592,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        attention_dropout: float = None,
-        softmax_scale: float = None,
-        k_channels: int = None,
-        v_channels: int = None,
+        attention_dropout: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
+        k_channels: Optional[int] = None,
+        v_channels: Optional[int] = None,
         cp_comm_type: str = "p2p",
     ):
         self.config = config
@@ -581,7 +612,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"setting query key layer scaling via argument, so these two must match."
             )
 
-        extra_kwargs = {}
+        extra_kwargs: dict[str, Any] = {}
         if is_te_min_version("0.11.0"):
             extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
         elif self.config.num_query_groups != self.config.num_attention_heads:
@@ -784,13 +815,13 @@ if is_te_min_version("1.9.0.dev0"):
             input_size: int,
             output_size: int,
             *,
-            parallel_mode: str,
+            parallel_mode: Optional[str],
             config: ModelParallelConfig,
             init_method: Callable,
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool = False,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
             self.config = config
 
@@ -1027,7 +1058,7 @@ if is_te_min_version("1.9.0.dev0"):
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
 
             super().__init__(
@@ -1072,7 +1103,7 @@ if is_te_min_version("1.9.0.dev0"):
             bias: bool,
             skip_bias_add: bool,
             is_expert: bool,
-            tp_comm_buffer_name: str = None,
+            tp_comm_buffer_name: Optional[str] = None,
         ):
 
             super().__init__(
@@ -1100,9 +1131,9 @@ if is_te_min_version("1.9.0.dev0"):
 
 else:
 
-    TEGroupedLinear = None
-    TEColumnParallelGroupedLinear = None
-    TERowParallelGroupedLinear = None
+    TEGroupedLinear = None  # type: ignore[assignment, misc]
+    TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
+    TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
@@ -1193,25 +1224,25 @@ class TEDotProductAttentionMLA(te.pytorch.DotProductAttention):
             )
 
         extra_kwargs = {}
-        if _te_version >= packaging.version.Version("0.11.0"):
+        if get_te_version() >= PkgVersion("0.11.0"):
             extra_kwargs["num_gqa_groups"] = self.config.num_query_groups
         elif self.config.num_query_groups != self.config.num_attention_heads:
             raise ValueError(
-                f"Transformer Engine v{_te_version} does not support Grouped Query Attention, "
+                f"Transformer Engine v{get_te_version()} does not support Grouped Query Attention, "
                 f"use a newer version of Transformer Engine. "
                 f"(num_query_groups ({self.config.num_query_groups}) != "
                 f"num_attention_heads ({self.config.num_attention_heads}))"
             )
 
-        if _te_version >= packaging.version.Version("0.10.0"):
+        if get_te_version() >= PkgVersion("0.10.0"):
             extra_kwargs["attention_type"] = attention_type
             # older version don't need attention_type
 
-        if _te_version > packaging.version.Version("0.12.0"):
+        if get_te_version() > PkgVersion("0.12.0"):
             self.te_forward_mask_type = True
 
         # Only Transformer-Engine version >= 1.0.0 supports context parallelism
-        if _te_version >= packaging.version.Version("1.0.0"):
+        if get_te_version() >= PkgVersion("1.0.0"):
             if getattr(TEDotProductAttention, "cp_stream") is None:
                 TEDotProductAttention.cp_stream = torch.cuda.Stream()
             extra_kwargs["cp_group"] = get_context_parallel_group(check_initialized=False)
@@ -1234,9 +1265,9 @@ class TEDotProductAttentionMLA(te.pytorch.DotProductAttention):
 
         if config.window_size is not None:
             # Check version
-            assert _te_version >= packaging.version.Version(
+            assert get_te_version() >= PkgVersion(
                 "1.2.0"
-            ), f"Transformer-Engine version ({str(_te_version)}) must be >= 1.2.0 to support sliding window attention."
+            ), f"Transformer-Engine version ({str(get_te_version())}) must be >= 1.2.0 to support sliding window attention."
             extra_kwargs['window_size'] = config.window_size
 
         super().__init__(
@@ -1269,12 +1300,12 @@ class TEDotProductAttentionMLA(te.pytorch.DotProductAttention):
             dataclasses.asdict(packed_seq_params) if packed_seq_params is not None else {}
         )
         # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set after init
-        if self.config.apply_rope_fusion and _te_version > packaging.version.Version("0.13.0"):
+        if self.config.apply_rope_fusion and get_te_version() > PkgVersion("0.13.0"):
             self.qkv_format = 'bshd'
 
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
-        if _te_version < packaging.version.Version("1.3.0"):
+        if get_te_version() < PkgVersion("1.3.0"):
             # TE 1.3.0 introduces precomputing max_seqlen to remove unnecessary kernels and D2H copies (#555)
             # These two arguments did not exist prior to 1.3.0
             packed_seq_kwargs.pop("max_seqlen_q", None)
@@ -1292,7 +1323,7 @@ class TEDotProductAttentionMLA(te.pytorch.DotProductAttention):
                 value = value.as_strided(value.shape, key.stride())
 
         if self.te_forward_mask_type:
-            if qkv_format == 'thd' and _te_version >= packaging.version.Version("1.7.0"):
+            if qkv_format == 'thd' and get_te_version() >= PkgVersion("1.7.0"):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True, so the only
                 # acceptable mask types are `padding_causal` and `padding`. These do not necessarily indicate
                 # there are padded tokens in the sequence.
@@ -1396,7 +1427,7 @@ try:
 
 except ImportError:
 
-    get_cpu_offload_context = None
+    get_cpu_offload_context = None  # type: ignore[assignment, misc]
 
 try:
 
@@ -1433,3 +1464,21 @@ except ImportError:
 
     Fp8Padding = None
     Fp8Unpadding = None
+
+try:
+
+    from transformer_engine.pytorch.permutation import (
+        moe_permute,
+        moe_sort_chunks_by_index,
+        moe_unpermute,
+    )
+
+    fused_permute = moe_permute
+    fused_unpermute = moe_unpermute
+    fused_sort_chunks_by_index = moe_sort_chunks_by_index
+
+except ImportError:
+
+    fused_permute = None
+    fused_unpermute = None
+    fused_sort_chunks_by_index = None

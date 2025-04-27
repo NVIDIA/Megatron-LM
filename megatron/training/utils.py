@@ -480,3 +480,108 @@ def get_batch_on_this_tp_rank(data_iterator):
 
 def update_use_dist_ckpt(args):
     args.use_dist_ckpt = args.ckpt_format != "torch"
+
+def get_batch_on_this_tp_rank_idxmap_sft(data_iterator):
+    args = get_args()
+    tokenizer = get_tokenizer()
+    def _broadcast(item):
+        if item is None:
+            return
+        torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(),
+                                    group=mpu.get_tensor_model_parallel_group())
+        
+    if mpu.get_tensor_model_parallel_rank() == 0:
+
+        if isinstance(data_iterator, dict):
+            data = data_iterator
+        else:
+            data = next(data_iterator)
+
+        # sanity check
+        assert data['tokens'].shape[-1] == 2 * args.seq_length
+        actual_seqlen = args.seq_length
+        data['tokens'] = data['tokens'].long()
+        tokens = data['tokens'][..., :actual_seqlen]
+        labels = data['tokens'][..., actual_seqlen:]
+        loss_mask = (labels != -100).float()
+        
+        attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
+            tokens,
+            tokenizer.eod,
+            args.reset_position_ids,
+            args.reset_attention_mask,
+            False,
+            args.create_attention_mask_in_dataloader
+        )
+        # dtype: long, long, float, bool, long
+        batch = {
+            'tokens': tokens.cuda(non_blocking=True),
+            'labels': labels.cuda(non_blocking=True),
+            'loss_mask': loss_mask.cuda(non_blocking=True),
+            'attention_mask': attention_mask.cuda(non_blocking=True) if attention_mask is not None else None,
+            'position_ids': position_ids.cuda(non_blocking=True)
+        }
+
+        if args.pipeline_model_parallel_size == 1:
+            _broadcast(batch['tokens'])
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+            _broadcast(batch['attention_mask'])
+
+        elif mpu.is_pipeline_first_stage():
+            _broadcast(batch['tokens'])
+            _broadcast(batch['attention_mask'])
+
+        elif mpu.is_pipeline_last_stage():
+            _broadcast(batch['labels'])
+            _broadcast(batch['loss_mask'])
+            _broadcast(batch['attention_mask'])
+        
+        _broadcast(batch['position_ids'])
+
+    else:
+        # dtype: long, long, float, bool, long
+        tokens = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64,
+                             device=torch.cuda.current_device())
+        labels = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64,
+                             device=torch.cuda.current_device())
+        loss_mask = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.float32,
+                                device=torch.cuda.current_device())
+        
+        attention_mask = None
+        if args.create_attention_mask_in_dataloader:
+            attention_mask = torch.empty((args.micro_batch_size, 1, args.seq_length, args.seq_length), dtype=torch.bool,
+                                        device=torch.cuda.current_device())
+        position_ids = torch.empty((args.micro_batch_size, args.seq_length), dtype=torch.int64,
+                                   device=torch.cuda.current_device())
+
+        if args.pipeline_model_parallel_size == 1:
+            _broadcast(tokens)
+            _broadcast(labels)
+            _broadcast(loss_mask)
+            _broadcast(attention_mask)
+
+        elif mpu.is_pipeline_first_stage():
+            labels = None
+            loss_mask = None
+
+            _broadcast(tokens)
+            _broadcast(attention_mask)
+
+        elif mpu.is_pipeline_last_stage():
+            tokens = None
+
+            _broadcast(labels)
+            _broadcast(loss_mask)
+            _broadcast(attention_mask)
+
+        _broadcast(position_ids)
+        batch = {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids
+        }
+
+    return batch

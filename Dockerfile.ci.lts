@@ -37,7 +37,7 @@ RUN \
     --mount=type=bind,source=megatron/core/__init__.py,target=megatron/core/__init__.py <<"EOF" bash -ex
 
 pip install causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl
-PY_ENV=pytorch:24.07 pip install .
+PY_ENV=pytorch_24.07 pip install .
 EOF
 
 # Since megatron does not have any dependencies (and isn't a dependency to any other package), we can install it separately to make everything a bit quicker
@@ -64,7 +64,7 @@ git checkout $MCORE_BACKWARDS_REF
 rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
 EOF
 
-RUN PY_ENV=pytorch:24.01 pip install -e /opt/megatron-lm
+RUN PY_ENV=pytorch_24.01 pip install -e /opt/megatron-lm
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
 
 ##### For NVIDIANS only #####

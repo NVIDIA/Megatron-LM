@@ -177,6 +177,98 @@ def num_floating_point_operations(args, batch_size):
         )
     )
 
+def num_floating_point_operations_mla_moe(args, batch_size):
+    # MoE.
+    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
+    num_experts_routed_to = 1 if args.num_experts is None else args.moe_router_topk
+    ffn_hidden_size = args.moe_ffn_hidden_size if args.moe_ffn_hidden_size is not None else args.ffn_hidden_size
+    shared_expert_ffn_hidden_size = (
+        0
+        if args.moe_shared_expert_intermediate_size is None
+        else args.moe_shared_expert_intermediate_size
+    )
+
+    # The 12x term below comes from the following factors; for more details, see
+    # "APPENDIX: FLOATING-POINT OPERATIONS" in https://arxiv.org/abs/2104.04473.
+    # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
+    #       backward wgrad [weight gradient], backward dgrad [data gradient]).
+    # - 2x: GEMMs of a particular size are stacked twice in the standard Transformer model
+    #       architectures implemented in this codebase (e.g., h->ffn_h GEMM and ffn_h->h GEMM
+    #       in MLP layer).
+    # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
+    expansion_factor_fw_bw = 3
+    expansion_factor_gemm_stack = 2
+    expansion_factor_gemm_ops = 2
+
+    return (
+        expansion_factor_fw_bw
+        * expansion_factor_gemm_ops
+        * batch_size
+        * args.seq_length
+        * args.num_layers
+        * args.hidden_size
+        * args.hidden_size
+        * (
+            # Attention - q.
+            (
+                (
+                    # Attention - q_proj.
+                    args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / args.hidden_size
+                )
+                if not args.q_lora_rank else
+                (
+                    # Attention - q_down_proj.
+                    (
+                        args.q_lora_rank / args.hidden_size
+                    )
+                    # Attention - q_up_proj.
+                    + (
+                        (args.q_lora_rank / args.hidden_size)
+                        * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / args.hidden_size)
+                    )
+                )
+            )
+            # Attention - kv_down_proj.
+            + (
+                (args.kv_lora_rank + args.qk_pos_emb_head_dim) / args.hidden_size
+            )
+            # Attention - kv_up_proj.
+            + (
+                (args.kv_lora_rank / args.hidden_size)
+                * (args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) / args.hidden_size)
+            )
+            # Attention - Q*K.
+            + (
+                (args.seq_length / args.hidden_size)
+                * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / args.hidden_size)
+            )
+            # Attention - A(ttention Score)*V.
+            + (
+                (args.seq_length / args.hidden_size)
+                * (args.num_attention_heads * args.v_head_dim / args.hidden_size)
+            )
+            # Attention - output proj.
+            + (
+                args.num_attention_heads * args.v_head_dim / args.hidden_size
+            )
+            # MLP.
+            + (
+                (ffn_hidden_size / args.hidden_size)
+                * num_experts_routed_to
+                * gated_linear_multiplier
+                * expansion_factor_gemm_stack
+            )
+            # Shared Experts.
+            + (
+                (shared_expert_ffn_hidden_size / args.hidden_size)
+                * gated_linear_multiplier
+                * expansion_factor_gemm_stack
+            )
+            # Logit. (untie_embeddings_and_output_weights=True)
+            + (args.padded_vocab_size / (2 * args.num_layers * args.hidden_size)) * expansion_factor_gemm_stack
+        )
+    )
+
 
 def get_start_time_from_progress_log():
     """
@@ -1013,7 +1105,9 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        flops_calc = num_floating_point_operations if not args.multi_latent_attention else \
+            num_floating_point_operations_mla_moe
+        throughput = flops_calc(args, batch_size) / (
             elapsed_time_per_iteration * 10**12 * args.world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
@@ -1424,6 +1518,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     prof = None
     if args.profile and torch.distributed.get_rank() in args.profile_ranks and args.use_pytorch_profiler:
         prof = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(
             wait=max(args.profile_step_start-1, 0),
             warmup=1 if args.profile_step_start > 0 else 0,
@@ -1431,6 +1526,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
         record_shapes=True,
+        profile_memory=True,
         with_stack=True)
         prof.start()
 
