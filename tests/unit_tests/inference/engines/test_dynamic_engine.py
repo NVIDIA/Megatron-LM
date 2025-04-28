@@ -35,6 +35,13 @@ from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
+def set_rounder(value):
+    """Utility function to set the DynamicInferenceContext rounder."""
+    DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
+    DynamicInferenceContext.TOKEN_ROUNDER = value
+    DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
 class Request:
     """Simple class to hold prompt tokens and output tokens."""
 
@@ -56,8 +63,8 @@ class Request:
 class TestConfig:
     """Test configuration args."""
 
-    DynamicInferenceContext.ROUNDER = 4
-    num_requests: int = 2 * DynamicInferenceContext.round_up(1)
+    set_rounder(4)
+    num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1)
     max_prompt_length: int = 16
     max_output_length: int = 4
     num_gap_steps: int = 2
@@ -156,12 +163,12 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _build_test_env(cls, test_config):
-        DynamicInferenceContext.ROUNDER = 4
-
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
             pipeline_model_parallel_size=1,
         )
+
+        set_rounder(4)
 
         random_seed = 123
         vocab_size = 100
@@ -175,7 +182,7 @@ class TestDynamicInferenceEngine:
         transformer_config = TransformerConfig(
             params_dtype=torch.bfloat16,
             num_layers=4,
-            hidden_size=12,
+            hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
@@ -253,7 +260,7 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _run_step(cls, env):
-        DynamicInferenceContext.ROUNDER = 4
+        set_rounder(4)
         # Step inference engine (i.e., generate one token per request).
         result, step_time = env.engine.step(env.sampling_params, verbose=False)
 
@@ -315,7 +322,7 @@ class TestDynamicInferenceEngine:
         return env
 
     def teardown_method(self, method):
-        DynamicInferenceContext.ROUNDER = 64
+        set_rounder(64)
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(
@@ -334,11 +341,11 @@ class TestDynamicInferenceEngine:
         # Validate output tokens.
         expected_outputs = [
             [69, 85, 55, 74, 85, 78],
-            [29, 16, 33, 30, 45, 76, 41, 56, 28, 17, 17, 2, 61, 6, 20],
-            [35, 78, 64, 59, 33, 67, 15, 58, 6, 49],
+            [29, 54, 33, 30, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 20],
+            [35, 78, 64, 59, 55, 67, 15, 58, 6, 49],
             [54, 16, 79, 98, 22, 5, 60, 0, 1, 24],
             [57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0],
-            [85, 75, 30, 68, 23, 33, 20, 76, 69, 36, 37, 99],
+            [85, 75, 30, 68, 23, 33, 20, 76, 97, 36, 37, 99],
             [32, 49, 54, 47, 22, 1, 87, 30, 36, 97],
             [93, 24, 77, 11, 25, 7, 92, 97, 27, 56, 82],
         ]
@@ -360,8 +367,8 @@ class TestDynamicInferenceEngine:
         )
 
         # Validate max_requests, max_tokens.
-        assert env.engine.context.max_requests == 1120
-        assert env.engine.context.max_tokens == 1120
+        assert env.engine.context.max_requests == 420
+        assert env.engine.context.max_tokens == 420
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

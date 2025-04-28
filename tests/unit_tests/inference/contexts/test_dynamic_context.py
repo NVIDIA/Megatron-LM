@@ -10,6 +10,13 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
 
+def set_rounder(value):
+    """Utility function to set the DynamicInferenceContext rounder."""
+    DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
+    DynamicInferenceContext.TOKEN_ROUNDER = value
+    DynamicInferenceContext.REQUEST_ROUNDER = value
+
+
 class TestDynamicContext:
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
@@ -34,7 +41,7 @@ class TestDynamicContext:
         max_requests_override,
         max_tokens_override,
     ):
-        DynamicInferenceContext.ROUNDER = 64
+        set_rounder(64)
         dynamic_context = DynamicInferenceContext(
             params_dtype=params_dtype,
             num_layers=num_layers,
@@ -51,7 +58,7 @@ class TestDynamicContext:
         return dynamic_context
 
     def teardown_method(self, method):
-        DynamicInferenceContext.ROUNDER = 64
+        set_rounder(64)
         Utils.destroy_model_parallel()
 
     def test_initialize_dynamic_context(self):
@@ -136,7 +143,7 @@ class TestDynamicContext:
 
     def test_request_overflow(self):
         self._setup_model_parallel_group(1, 1)
-        DynamicInferenceContext.ROUNDER = 1
+        set_rounder(1)
         dynamic_context = DynamicInferenceContext(
             params_dtype=torch.float32,
             num_layers=2,
@@ -155,7 +162,7 @@ class TestDynamicContext:
 
     def test_token_overflow_error(self):
         self._setup_model_parallel_group(1, 1)
-        DynamicInferenceContext.ROUNDER = 1
+        set_rounder(1)
         dynamic_context = DynamicInferenceContext(
             params_dtype=torch.float32,
             num_layers=2,
