@@ -482,7 +482,7 @@ def validate_args(args, defaults={}):
                 num_layers = args.num_layers
             else:
                 num_layers = args.decoder_num_layers
-            
+
             if args.account_for_embedding_in_pipeline_split:
                 num_layers += 1
 
@@ -984,6 +984,11 @@ def validate_args(args, defaults={}):
             "as the hybrid device optimizer reuses the code path of this flag."
         )
 
+    if args.fp8_recipe != "delayed":
+        assert not (args.fp8_param_gather and args.use_precision_aware_optimizer), (
+            "Currently only delayed scaling is supported to use precision-aware optimizer and fp8 "
+            "params at the same time."
+        )
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
