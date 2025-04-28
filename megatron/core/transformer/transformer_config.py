@@ -776,6 +776,10 @@ class TransformerConfig(ModelParallelConfig):
                     "Please check that the core_attn recompute is really needed."
                 )
 
+            if self.fp8:
+                if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
+                    raise ValueError("moe_act and layernorm recompute cannot work with fp8.")
+
         if self.moe_layer_recompute:
             warnings.warn(
                 "--moe-layer-recompute is deprecated. "

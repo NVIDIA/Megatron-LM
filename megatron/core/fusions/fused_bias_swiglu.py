@@ -50,9 +50,12 @@ def bias_swiglu_back(g, y, bias):
 @jit_fuser
 def weighted_swiglu_back(g, y, weights):
     input_dtype = y.dtype
+    w_dtype = weights.dtype
     input_grad = swiglu_back(g * weights, y)
-    weights_grad = torch.bmm(swiglu(y).unsqueeze(-2), g.unsqueeze(-1)).squeeze(-1)
-    return input_grad.to(input_dtype), weights_grad
+    # precison of w may be higher than y and g, so we need to cast g to w_dtype
+    weights_grad = swiglu(y) * g.to(w_dtype)
+    weights_grad = torch.sum(weights_grad, dim=-1, keepdim=True)
+    return input_grad.to(input_dtype), weights_grad.to(w_dtype)
 
 
 class BiasSwiGLUFunction(torch.autograd.Function):
