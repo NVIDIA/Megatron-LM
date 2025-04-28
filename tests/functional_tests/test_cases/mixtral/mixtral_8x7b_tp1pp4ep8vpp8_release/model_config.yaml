@@ -9,8 +9,9 @@ TEST_TYPE: "release"
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
-  --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 4
+  --tensor-model-parallel-size: 2
+  --expert-tensor-parallel-size: 1
   --num-layers-per-virtual-pipeline-stage: 1
   --use-distributed-optimizer: true
   --overlap-grad-reduce: true
@@ -77,8 +78,8 @@ MODEL_ARGS:
   # Add checkpointing args
   --finetune: true
   --auto-detect-ckpt-format: true
-  --load: ${LOAD_PATH}
-  --save: ${OUTPUT_PATH}/checkpoints
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
   --no-ckpt-fully-parallel-save: true
   --save-interval: 500
   # Add initialization args
@@ -91,7 +92,7 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-throughput: true
   --log-interval: 1
-  --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
+  --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
