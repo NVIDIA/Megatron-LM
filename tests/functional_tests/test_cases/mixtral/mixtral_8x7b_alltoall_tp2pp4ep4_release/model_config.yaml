@@ -95,3 +95,9 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
   --bf16: true
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
