@@ -1,5 +1,3 @@
-from typing import Dict, List, Union
-
 import pytest
 
 from tests.functional_tests.python_test_utils import common
