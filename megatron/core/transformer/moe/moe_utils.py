@@ -251,6 +251,7 @@ def permute(
     Args:
         tokens (torch.Tensor): The input token tensor, [num_tokens, hidden].
         routing_map (torch.Tensor): The sparse token to expert mapping, [num_tokens, num_experts].
+        probs (torch.Tensor, optional): The probs tensor, [num_tokens, num_experts].
         num_out_tokens (int, optional): The number of output tokens. If None, it's set to
                                         the number of input tokens.
         fused (bool, optional): Whether use the fused permute function.
@@ -276,6 +277,7 @@ def permute(
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]
+    permuted_probs = None
     if drop_and_pad and not (num_out_tokens is None):
         capacity = num_out_tokens // num_experts
         assert not routing_map.requires_grad
@@ -288,8 +290,16 @@ def permute(
         ].contiguous()
         # flatten from [num_experts, capacity] to 1D
         sorted_indices = sorted_indices.view(-1)
+
         if probs is not None:
-            routing_map = routing_map.bool()
+            # [num_tokens, num_experts] -> num_experts * num_tokens
+            probs_T_1D = probs.T.contiguous().view(-1)
+            # get 1D indices of the probs selected by routing_map
+            indices_dim0 = torch.arange(num_experts, device=routing_map.device).unsqueeze(-1)
+            indices_dim1 = sorted_indices.view(num_experts, capacity)
+            indices_1D = (indices_dim0 * num_tokens + indices_dim1).view(-1)
+            # get probs from indices
+            permuted_probs = probs_T_1D.index_select(0, indices_1D)
     else:
         # mask [num_tokens, num_experts] -> [num_experts, num_tokens]
         routing_map = routing_map.bool().T.contiguous()
@@ -300,13 +310,11 @@ def permute(
         )
         sorted_indices = token_indices.masked_select(routing_map)
 
+        if probs is not None:
+            permuted_probs = probs.T.contiguous().masked_select(routing_map)
+
     # use the mapping to permute the tokens
     permuted_input = tokens.index_select(0, sorted_indices)
-
-    if probs is not None:
-        permuted_probs = probs.T.contiguous().masked_select(routing_map)
-    else:
-        permuted_probs = None
 
     return permuted_input, permuted_probs, sorted_indices
 
