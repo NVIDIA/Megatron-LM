@@ -555,6 +555,13 @@ class Attention(MegatronModule, ABC):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
+        # Check if we need to skip RoPE
+        # no_rope is 0-indexed array and self.layer_number is 1-indexed
+        no_rope = (
+            self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
+        )
+        if no_rope:
+            rotary_pos_emb = None
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 

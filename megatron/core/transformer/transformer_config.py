@@ -142,6 +142,13 @@ class TransformerConfig(ModelParallelConfig):
     multi_latent_attention: bool = False
     """Whether to use multi-latent attention."""
 
+    no_rope_freq: Optional[Union[int, List[int]]] = None
+    """Controls which layers perform Rotary Position Embedding (RoPE). Accepts either:
+    An integer N: Creates a pattern where RoPE is skipped every N-1 layers. For example,
+    no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
+    A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
+    For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
+
     ####################
     # initialization
     ####################
@@ -1084,6 +1091,23 @@ class TransformerConfig(ModelParallelConfig):
                 "Using a large number of experts (e.g. >=32) without fp32 routing. "
                 "Consider enabling moe_router_dtype for better numerical stability."
             )
+
+        if self.no_rope_freq:
+            assert not self.flash_decode, 'flash_decode cannot be used with no_rope.'
+            if isinstance(self.no_rope_freq, int):
+                assert self.num_layers % self.no_rope_freq == 0, (
+                    f"no_rope_freq={self.no_rope_freq} should be "
+                    f"divisible by num_layers={self.num_layers}."
+                )
+                # Convert integer pattern to list pattern
+                # e.g. no_rope=4 with num_layers=8 becomes [0,0,0,1,0,0,0,1]
+                pattern = [0] * (self.no_rope_freq - 1) + [1]
+                self.no_rope_freq = pattern * (self.num_layers // self.no_rope_freq)
+            else:
+                assert len(self.no_rope_freq) == self.num_layers, (
+                    f"Length of no_rope list ({len(self.no_rope_freq)}) must match "
+                    f"the number of layers ({self.num_layers})"
+                )
 
 
 @dataclass
