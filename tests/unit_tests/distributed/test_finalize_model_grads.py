@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import _allreduce_layernorm_grads
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -46,13 +47,13 @@ class TestAllReduceLNGrads:
     @pytest.mark.parametrize("freeze_model,tp_size", [(True, 2), (False, 2)])
     @pytest.mark.internal
     def test_allreduce_layernorm_grads(self, freeze_model, tp_size):
-
         self.tp_size = tp_size
         Utils.initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         model_parallel_cuda_manual_seed(123)
 
         self.init_model()
         self.model.cuda()
+        self.model.ddp_config = DistributedDataParallelConfig()
 
         for param in self.model.parameters():
             if freeze_model:
