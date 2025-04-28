@@ -143,9 +143,6 @@ class MLP(MegatronModule):
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
             if self.config.gated_linear_unit and name == 'linear_fc1':
-                # NOTE: In custom FSDP, we can have no weight in local.
-                if not self.config.use_custom_fsdp:
-                    assert f'{prefix}{name}.weight' in sub_sd, sub_sd.keys()
                 for k, v in sub_sd.items():
                     if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)

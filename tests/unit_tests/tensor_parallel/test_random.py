@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
+    CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
     get_cuda_rng_tracker,
@@ -51,4 +52,34 @@ def test_checkpoint():
     input1 = torch.ones((4, 4))
     checkpoint(test_forward, True, input1, torch.ones((4, 4)) * 2)
     assert torch.equal(torch.ones(input1.numel()).cuda(), input1)
+    Utils.destroy_model_parallel()
+
+
+def test_checkpoint_without_output():
+    def normal_forward(input):
+        x = torch.nn.functional.gelu(input)
+        y = x * input
+        return y
+
+    def checkpoint_forward(input):
+        checkpoint = CheckpointWithoutOutput()
+        x = checkpoint.checkpoint(torch.nn.functional.gelu, input)
+        y = x * input
+        checkpoint.discard_output_and_register_recompute(y)
+        return y
+
+    Utils.initialize_model_parallel()
+
+    input1 = torch.ones((4, 4))
+    input1.requires_grad_(True)
+    output1 = normal_forward(input1)
+    input2 = torch.ones((4, 4))
+    input2.requires_grad_(True)
+    output2 = checkpoint_forward(input2)
+    assert torch.equal(output1, output2)
+
+    output1.backward(torch.ones((4, 4)), retain_graph=True)
+    output2.backward(torch.ones((4, 4)), retain_graph=True)
+    assert torch.equal(input1.grad, input2.grad)
+
     Utils.destroy_model_parallel()

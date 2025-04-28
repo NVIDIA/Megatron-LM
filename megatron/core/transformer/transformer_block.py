@@ -238,7 +238,10 @@ class TransformerBlock(MegatronModule):
         # required for pipeline parallel schedules
         self.input_tensor = None
 
-        self.checkpoint_core_attention = self.config.recompute_granularity == 'selective'
+        self.checkpoint_core_attention = (
+            self.config.recompute_granularity == 'selective'
+            and "core_attn" in self.config.recompute_modules
+        )
 
         if get_cpu_offload_context is not None:
             (self.offload_context, self.group_prefetch_offload_commit_async) = (
