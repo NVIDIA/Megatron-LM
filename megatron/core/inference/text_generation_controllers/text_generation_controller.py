@@ -449,13 +449,10 @@ class TextGenerationController:
             self.inference_wrapped_model.inference_wrapper_config.inference_max_seq_length
         )
         padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
-        padded_sequence_length = (
-            inference_max_sequence_length if enable_cuda_graph else max_sequence_length
-        )
         padded_batch_prompt_tokens = self.pad_input_prompt_tokens(
             batch_prompt_tokens_list,
             padded_batch_size=padded_batch_size,
-            padded_sequence_length=padded_sequence_length,
+            padded_sequence_length=max_sequence_length,
         )
 
         # Verify that output sequence length is within configured limit
