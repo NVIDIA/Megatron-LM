@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 import contextlib
 import weakref
 from typing import Optional
@@ -17,9 +18,10 @@ from megatron.core.pipeline_parallel.combined_1f1b import (
     get_comp_stream,
     make_viewless,
 )
+from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer import transformer_layer
 from megatron.core.transformer.module import float16_to_fp32
-
+from megatron.core.fp8_utils import get_fp8_context
 
 def weak_method(method):
     """Creates a weak reference to a method to prevent circular references.
@@ -331,6 +333,7 @@ class TransformerLayerSchedulePlan:
             com_stream (torch.cuda.Stream): CUDA stream for communication.
         """
         self.common_state = TransformerLayerState()
+        self.layer = layer
         # get submodules for transformer layer
         attn_module, dispatch_module, mlp_module, combine_module = layer.get_submodule_callables(
             chunk_state
@@ -354,6 +357,13 @@ class TransformerLayerSchedulePlan:
         else:
             self.dispatch = FakeScheduleNode()
             self.combine = FakeScheduleNode()
+
+    def get_fp8_context(self):
+        """
+        Get the fp8 context for the transformer layer.
+        """
+        use_inner_fp8_context = self.layer.config.fp8 and self.layer.config.fp8_recipe != Fp8Recipe.delayed
+        return get_fp8_context(self.layer.config, self.layer.layer_number - 1) if use_inner_fp8_context else nullcontext()
 
 
 class ModelChunkSchedulePlan(AbstractSchedulePlan):
@@ -397,7 +407,6 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
             pre_backward (Callable): Callback for preprocessing in backward pass.
             post_forward (Callable): Callback for postprocessing in forward pass.
             post_backward (Callable): Callback for postprocessing in backward pass.
-
         Returns:
             The output of the forward pass.
         """
@@ -521,7 +530,7 @@ def schedule_layer_1f1b(
         del pre_backward_dw
 
     if f_layer is not None:
-        with f_context:
+        with f_context and f_layer.get_fp8_context():
             f_input = f_layer.attn.forward(f_input)
 
     if b_layer is not None:
@@ -529,7 +538,7 @@ def schedule_layer_1f1b(
             b_grad = b_layer.mlp.backward(b_grad)
 
     if f_layer is not None:
-        with f_context:
+        with f_context and f_layer.get_fp8_context():
             f_input = f_layer.dispatch.forward(f_input)
 
     if b_layer is not None:
@@ -538,12 +547,12 @@ def schedule_layer_1f1b(
             b_grad = b_layer.dispatch.backward(b_grad)
 
     if f_layer is not None:
-        with f_context:
+        with f_context and f_layer.get_fp8_context():
             f_input = f_layer.mlp.forward(f_input)
 
     def next_iter_pre_forward():
         if f_layer is not None:
-            with f_context:
+            with f_context and f_layer.get_fp8_context():
                 output = f_layer.combine.forward(f_input)
                 return output
 
@@ -590,7 +599,6 @@ def schedule_chunk_1f1b(
         pre_backward: Callback for preprocessing in backward pass.
         post_forward: Callback for postprocessing in forward pass.
         post_backward: Callback for postprocessing in backward pass.
-
     Returns:
         The output of the forward pass.
     """

@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from contextlib import nullcontext
 import contextlib
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -10,6 +11,8 @@ from torch import Tensor
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
@@ -425,8 +428,16 @@ def forward_backward_step(
             torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
             b_output_tensor_grad[0] = loss_node.get_grad()
 
+    # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
+    # otherwise do nothing extra at the outer level
+    # if we are using other fp8 recipes, then the context manager enter&exit are free
+    # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
+    # control which layer will be fp8 or bf16
+    use_outer_fp8_context = config.fp8 and config.fp8_recipe == Fp8Recipe.delayed
+    outer_fp8_context = get_fp8_context(config) if use_outer_fp8_context else nullcontext()
+
     grad = b_output_tensor_grad[0] if b_model else None
-    with context_manager:  # autocast context
+    with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
         # schedule forward and backward
         output_tensor = schedule_chunk_1f1b(
             f_schedule_plan,
