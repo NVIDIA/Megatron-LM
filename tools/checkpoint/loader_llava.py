@@ -167,11 +167,11 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         vp_size = self.margs.virtual_pipeline_model_parallel_size or 1
         encoder_tp_size = self.md.previous_encoder_tensor_parallel_size
 
-        if self.md.vision_model_type not in ("internvit", "clip", "siglip", "radio", "radio-g"):
+        if self.md.vision_model_type not in ("internvit", "siglip", "radio", "radio-g"):
             raise Exception(f'unrecognized vision model type: {md.vision_model_type}')
 
         message = {}
-        if self.md.vision_model_type in ("internvit", "clip", "siglip"):
+        if self.md.vision_model_type in ("internvit", "siglip"):
             message["conv1 weight"] = self.all_models[0][0][0].vision_model.conv1.weight.data
             if self.md.vision_model_type in ("internvit", "siglip"):
                 message["conv1 bias"] = self.all_models[0][0][0].vision_model.conv1.bias.data
@@ -186,15 +186,11 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
                 message["embedder bias"] = torch.cat([self.all_models[0][0][tp_rank].vision_model.embedder.bias.data for tp_rank in range(encoder_tp_size)], dim=0)
             message["position embeddings"] = self.all_models[0][0][0].vision_model.position_embeddings.data
 
-        if self.md.vision_model_type in ("clip"):
-            message["ln pre weight"] = self.all_models[0][0][0].vision_model.ln_pre.weight.data
-            message["ln pre bias"] = self.all_models[0][0][0].vision_model.ln_pre.bias.data
-
         if self.md.vision_model_type in ("siglip", "radio-g"):
             message["ln post weight"] = self.all_models[0][0][0].vision_model.ln_post.weight.data
             message["ln post bias"] = self.all_models[0][0][0].vision_model.ln_post.bias.data
 
-        if self.md.vision_model_type in ("internvit", "clip", "radio", "radio-g"):
+        if self.md.vision_model_type in ("internvit", "radio", "radio-g"):
             message["class token"] = self.all_models[0][0][0].vision_model.class_token.data
 
         self.queue_put("vit embeddings", message)
