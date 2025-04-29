@@ -1,0 +1,5 @@
+timestamp,gpu_name,driver_version,temperature,power_draw,gpu_utilization,memory_utilization,memory_used,memory_total
+2025/03/25 10:03:58.362,Tesla P100-PCIE-16GB,560.35.03,36,40.85 W,93 %,61 %,3469 MiB,"16384 MiB
+2025/03/25 10:03:58.365",Tesla P100-PCIE-16GB,560.35.03,25,25.26 W,0 %,0 %,3 MiB,16384 MiB
+2025/03/25 10:05:52.533,Tesla P100-PCIE-16GB,560.35.03,37,40.85 W,99 %,63 %,3469 MiB,"16384 MiB
+2025/03/25 10:05:52.536",Tesla P100-PCIE-16GB,560.35.03,24,25.04 W,0 %,0 %,3 MiB,16384 MiB
