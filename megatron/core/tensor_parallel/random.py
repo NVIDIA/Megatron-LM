@@ -151,15 +151,18 @@ def initialize_rng_tracker(
     use_te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
+    force_reset: bool = False,
 ):
     """Create the RNG tracker. 'use_te_rng_tracker' determines whether to use
     Megatron or TransformerEngine's implementation.
     In particular, TransformerEngine's implementation is cudagraphable and supports FP8.
     """
-
-
     global _DEVICE_RNG_STATE_TRACKER
     global _DEVICE_RNG_STATE_TRACKER_INITIALIZED
+    if force_reset:
+        _DEVICE_RNG_STATE_TRACKER = None
+        _DEVICE_RNG_STATE_TRACKER_INITIALIZED = False
+
     if _DEVICE_RNG_STATE_TRACKER_INITIALIZED:
         return
 

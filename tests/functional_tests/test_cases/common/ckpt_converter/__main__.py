@@ -22,7 +22,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import all_reduce, gather_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_attr_wrapped_model
@@ -284,7 +284,7 @@ class Pipeline:
             attention_mask = attention_mask.unsqueeze(0)
 
         # Other TP ranks on PP rank 0.
-        elif parallel_state.is_pipeline_first_stage():
+        elif parallel_state.is_pipeline_first_stage(ignore_virtual=False):
             input_ids = torch.empty(
                 (args.micro_batch_size, args.seq_length),
                 dtype=torch.int64,
@@ -312,7 +312,7 @@ class Pipeline:
             attention_mask = None
 
         # Broadcast.
-        if parallel_state.is_pipeline_first_stage():
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
             broadcast(input_ids)
             broadcast(attention_mask)
             broadcast(position_ids)
@@ -367,13 +367,13 @@ class Pipeline:
             forward_only=True,
             collect_non_loss_data=True,
         )
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor = data[0]["output_tensor"]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
         else:
             output_tensor_gathered = None
@@ -393,14 +393,14 @@ class Pipeline:
                     p.normal_(0, 0.1)
 
             # Synchronize embeddings.
-            if meta.mp.pp != 1 and parallel_state.is_rank_in_embedding_group():
-                if parallel_state.is_pipeline_first_stage():
+            if meta.mp.pp != 1 and parallel_state.is_rank_in_embedding_group(ignore_virtual=False):
+                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
                     emb = models[0].module.module.shared_embedding_or_output_weight()
-                elif parallel_state.is_pipeline_last_stage():
+                elif parallel_state.is_pipeline_last_stage(ignore_virtual=False):
                     emb = models[-1].module.module.shared_embedding_or_output_weight()
                 else:
                     raise Exception("should be either first/last pipeline rank.")
-                torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
+                all_reduce(emb, group=parallel_state.get_embedding_group(wrapped=True))
 
     def save_checkpoint(self):
         """Initialize params, forward pass data, and save checkpoint."""
@@ -732,13 +732,13 @@ class LLaVAPipeline(Pipeline):
             collect_non_loss_data=True,
         )
 
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor = data[0]["output_tensor"][0]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage():
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
             output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
         else:
             output_tensor_gathered = None

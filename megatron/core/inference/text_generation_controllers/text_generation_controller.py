@@ -14,7 +14,7 @@ from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
-from megatron.core.inference.contexts import TokenOverflowError
+from megatron.core.inference.contexts.dynamic_context import TokenOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,

@@ -137,7 +137,7 @@ def test_expert_model_parallel_rank():
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_first_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_first_stage(ignore_virtual=True) == (rank == 0)
+    assert ps.is_pipeline_first_stage(ignore_virtual=False) == (rank == 0)
     assert ps.is_pipeline_first_stage() == (rank == 0)
     Utils.destroy_model_parallel()
 
@@ -145,7 +145,7 @@ def test_is_pipeline_first_stage(order):
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_is_pipeline_last_stage(order):
     Utils.initialize_model_parallel(pipeline_model_parallel_size=world_size, order=order)
-    assert ps.is_pipeline_last_stage(ignore_virtual=True) == (rank == world_size - 1)
+    assert ps.is_pipeline_last_stage(ignore_virtual=False) == (rank == world_size - 1)
     assert ps.is_pipeline_last_stage() == (rank == world_size - 1)
     Utils.destroy_model_parallel()
 

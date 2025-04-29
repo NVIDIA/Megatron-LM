@@ -1,13 +1,14 @@
 import os
 
 import torch.distributed
-from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count
+from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count, get_xla_runtime
 from megatron.core.device_utils import get_distributed_init_method
 import torch
 
 from megatron.core.dist_checkpointing.strategies.base import deinit_async_calls, init_async_calls
 import megatron.core.parallel_state as ps
 
+xr = get_xla_runtime()
 
 class TestModel(torch.nn.Module):
     def __init__(
@@ -38,7 +39,7 @@ class Utils:
             print(f'Initializing torch.distributed with rank: {Utils.rank}, world_size: {Utils.world_size}')
             
             init_method = get_distributed_init_method()
-            backend = get_distributed_backend()  
+            backend = get_distributed_backend()  if not xr or not xr.is_spmd() else "gloo"
  
             torch.distributed.init_process_group(backend=backend, 
                                                  world_size=Utils.world_size, 

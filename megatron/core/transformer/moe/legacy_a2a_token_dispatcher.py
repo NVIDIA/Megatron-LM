@@ -61,7 +61,7 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
             ), "local_expert_indices must be continous"
         # Super class MoETokenDispatcher use model_comm_pgs.expt_tp_group as tensor parallel group.
         # But should use model_comm_pgs.tp_group as tensor parallel group for this module.
-        self.tp_group = model_comm_pgs.tp_group
+        self.tp_group = model_comm_pgs.tp
         self.ep_size = self.ep_group.size()
         self.tp_size = self.tp_group.size()
         self.input_splits = None

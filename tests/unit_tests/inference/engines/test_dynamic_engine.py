@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device
-from megatron.core.inference.contexts import (
+from megatron.core.inference.contexts.dynamic_context import (
     ChunkOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,

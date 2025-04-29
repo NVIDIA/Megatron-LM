@@ -431,7 +431,13 @@ def main(
                 n_nondeterminism_attemps += 1
                 continue
 
-            sys.exit(1)
+            telemetrics_and_exit(
+                success=False,
+                test_case=test_case,
+                environment=environment,
+                pipeline_id=int(os.getenv("PARENT_PIPELINE_ID", 0)),
+                is_integration_test=enable_lightweight_mode,
+            )
 
         if parse_failed_job(logs=logs):
             n_attempts += 1

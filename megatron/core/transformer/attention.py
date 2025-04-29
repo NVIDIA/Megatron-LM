@@ -164,6 +164,7 @@ class Attention(MegatronModule, ABC):
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='proj',
+            tp_group=self.model_comm_pgs.tp,
         )
 
     def _checkpointed_attention_forward(
@@ -725,6 +726,7 @@ class SelfAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='qkv',
+            tp_group=self.model_comm_pgs.tp,
         )
 
         if submodules.q_layernorm is not None:

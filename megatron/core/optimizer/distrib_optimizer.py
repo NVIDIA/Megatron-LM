@@ -589,9 +589,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """
         With the distributed optimizer, gradient statistics (num_zeros & norm) are reduced over
-        all ranks (versus only the model-parallel ranks with the non-distributed optimizer).
+        all ranks in the distributed optimizer instance (versus only the model-parallel ranks
+        with the non-distributed optimizer).
         """
-        return None
+        return getattr(self, 'grad_stats_parallel_group', None)
 
     def state_dict(self):
         """

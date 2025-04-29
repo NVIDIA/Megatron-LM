@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.device_utils import get_current_device
-from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (

@@ -423,6 +423,14 @@ def _get_megatron_optimizer_based_on_param_groups(
                 data_parallel_group_idx=data_parallel_group_idx,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
+            # This is needed for case where num_distributed_optimizer_instances > 1. In this case,
+            # weight gradients are all-reduced across optimizer instances, so each instance has
+            # the duplicated weight gradients, need to reduce gradient stats inside each instance.
+            setattr(
+                optimizer,
+                'grad_stats_parallel_group',
+                mpu.get_intra_distributed_optimizer_instance_group(),
+            )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
@@ -480,7 +488,7 @@ def get_megatron_optimizer(
         mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
     ):
         distributed_optimizer_instance_id = torch.distributed.get_rank(
-            mpu.get_inter_partial_data_parallel_group()
+            mpu.get_inter_distributed_optimizer_instance_group()
         )
     else:
         distributed_optimizer_instance_id = 0
@@ -581,7 +589,9 @@ def get_megatron_optimizer(
         )
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
-            data_parallel_group_gloo = mpu.get_expert_data_parallel_group_gloo()
+            data_parallel_group_gloo = mpu.get_expert_data_parallel_group_gloo(
+                partial_expert_data_parallel=True
+            )
         else:
             data_parallel_group_gloo = None
         optimizers.append(
@@ -591,9 +601,12 @@ def get_megatron_optimizer(
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
                 model_parallel_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
-                data_parallel_group=mpu.get_expert_data_parallel_group(),
+                data_parallel_group=mpu.get_expert_data_parallel_group(
+                    partial_expert_data_parallel=True
+                ),
                 data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )
 

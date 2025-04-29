@@ -94,8 +94,7 @@ def test_fsdp2_constructor_with_process_group(init_model_parallel):
     model = Float16Module(config, model)
 
     # Create a custom process group (using the default world for testing)
-    custom_process_group = parallel_state.get_data_parallel_group(with_context_parallel=True, wrapped=True) \
-        if xm is None else parallel_state.get_data_parallel_group_gloo(with_context_parallel=True, wrapped=True)
+    custom_process_group = parallel_state.get_data_parallel_group(with_context_parallel=True, wrapped=True)
         
     # Create the sharded model with explicit process group
     fsdp_model = TorchFullyShardedDataParallel(

@@ -5,6 +5,7 @@ import os
 import sys
 
 from megatron.core.device_utils import get_current_device_type
+from megatron.core.tensor_parallel.mappings import all_reduce
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -133,8 +134,8 @@ def calibrate(data_loader, model):
 
                 # Reduce across processes.
                 if parallel_state.is_pipeline_last_stage():
-                    torch.distributed.all_reduce(
-                        output, group=parallel_state.get_data_parallel_group()
+                    all_reduce(
+                        output, group=parallel_state.get_data_parallel_group(wrapped=True)
                     )
 
                     total_output += output
@@ -147,7 +148,7 @@ def calibrate(data_loader, model):
             forward_step(batch, model, config)
 
             if parallel_state.is_pipeline_last_stage():
-                torch.distributed.all_reduce(output, group=parallel_state.get_data_parallel_group())
+                all_reduce(output, group=parallel_state.get_data_parallel_group(wrapped=True))
 
                 total_output += output
 

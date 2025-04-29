@@ -50,7 +50,7 @@ class TestMoEModel(torch.nn.Module):
             expert_tensor_parallel_size=etp_size,
             bf16=True,
             params_dtype=torch.bfloat16,
-            add_bias_linear=False
+            add_bias_linear=False,
         )
 
         if HAVE_TE:
@@ -83,6 +83,7 @@ def get_moe_model_and_buffers(
     use_distributed_optimizer: bool,
     overlap_grad_reduce: bool,
     average_in_collective: bool,
+    num_distributed_optimizer_instances: int,
 ):
     model_parallel_device_manual_seed(123)
     ddp_config = DistributedDataParallelConfig(
@@ -91,6 +92,7 @@ def get_moe_model_and_buffers(
         overlap_grad_reduce=overlap_grad_reduce,
         bucket_size=bucket_size,
         average_in_collective=average_in_collective,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
     model = TestMoEModel(
         hidden_size=hidden_size,
@@ -125,6 +127,7 @@ def get_moe_model_and_buffers(
 @pytest.mark.parametrize("average_in_collective", [False, True])
 @pytest.mark.parametrize("ep_size", [1, 2])
 @pytest.mark.parametrize("etp_size", [1, 2])
+@pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
 @pytest.mark.flaky
 @pytest.mark.flaky_in_dev
 def test_grad_sync(
@@ -133,14 +136,21 @@ def test_grad_sync(
     average_in_collective: bool,
     ep_size: int,
     etp_size: int,
+    num_distributed_optimizer_instances: int,
 ):
     use_distributed_optimizer = use_distributed_optimizer and xm is None
     average_in_collective = average_in_collective and xm is None
     
-    Utils.fake_initialize_model_parallel(expert_model_parallel_size=ep_size)
     Utils.initialize_model_parallel(
-        expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
+        expert_model_parallel_size=ep_size,
+        expert_tensor_parallel_size=etp_size,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
+
+    if num_distributed_optimizer_instances > 1 and not use_distributed_optimizer:
+        pytest.skip(
+            "Multiple distributed optimizer instances requires distributed optimizer to be enabled"
+        )
 
     (
         model,
@@ -159,6 +169,7 @@ def test_grad_sync(
         use_distributed_optimizer=use_distributed_optimizer,
         overlap_grad_reduce=overlap_grad_reduce,
         average_in_collective=average_in_collective,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
     )
 
     param_to_bucket_group = {}
@@ -176,7 +187,10 @@ def test_grad_sync(
     if (
         use_distributed_optimizer
         and (not average_in_collective)
-        and parallel_state.get_data_parallel_rank() != 0
+        and parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, partial_data_parallel=True
+        )
+        != 0
     ):
         # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/data_parallel_word_size
         # When average_in_collective=False, the grad data is always first scaled by 1/data_parallel_word_size and then summed by AR/RS
@@ -186,14 +200,14 @@ def test_grad_sync(
             parallel_state.get_data_parallel_world_size()
         )
     if ep_size > 1:
-        # For MoE models with exper parallelism, each expert will receive tokens from EPxETP times batches, such that the expert gradient will be EPxETP times after backward,
+        # For MoE models with expert parallelism, each expert will receive tokens from EPxETP times batches, such that the expert gradient will be EPxETP times after backward,
         # and the expected gradient after collective should be 1.0 as same as dense params.
         ep_param_and_grad_buffer.grad_data.data.fill_(float(ep_size * etp_size))
         ep_expected_grad_data_value_after_collective = 1
         if (
             use_distributed_optimizer
             and (not average_in_collective)
-            and parallel_state.get_expert_data_parallel_rank() != 0
+            and parallel_state.get_expert_data_parallel_rank(partial_expert_data_parallel=True) != 0
         ):
             # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/EDP
             # When average_in_collective=False, the grad data is always first scaled by expert_data_parallel_size and then summed by AR/RS
@@ -219,7 +233,11 @@ def test_grad_sync(
             contextlib.nullcontext() if overlap_grad_reduce else pytest.raises(AssertionError)
         )
         finish_grad_sync_context = contextlib.nullcontext()
-        if param_idx < (len(bucket_group.params) - 1) and overlap_grad_reduce:
+        if (
+            param_idx < (len(bucket_group.params) - 1)
+            and overlap_grad_reduce
+            and num_distributed_optimizer_instances == 1
+        ):
             # Can't finish grad sync until all params have been registered ready.
             finish_grad_sync_context = pytest.raises(AssertionError)
 

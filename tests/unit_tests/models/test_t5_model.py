@@ -12,6 +12,14 @@ from pytest_mock import mocker
 import megatron.core.parallel_state as ps
 from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.models.T5.t5_model import T5Model
+from megatron.core.models.T5.t5_spec import (
+    get_t5_decoder_with_local_block_spec,
+    get_t5_decoder_with_transformer_engine_block_spec,
+    get_t5_encoder_with_local_block_spec,
+    get_t5_encoder_with_transformer_engine_block_spec,
+)
+from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
@@ -69,6 +77,9 @@ class TestT5Model:
             post_process=post_process,
             add_encoder=add_encoder,
             add_decoder=add_decoder,
+            model_comm_pgs=ModelCommProcessGroups.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            ),
         )
 
     def teardown_method(self, method):
