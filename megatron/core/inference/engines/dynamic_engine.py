@@ -69,7 +69,7 @@ class DynamicInferenceEngine(AbstractEngine):
             position_ids = context.current_position_ids()
 
             # Forward pass -> logits.
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits = controller.inference_wrapped_model.run_one_forward_step(
                     {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
                 )
@@ -179,4 +179,5 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, step_time
 
     def generate(self) -> dict:
+        """Batch generation function included for API compatibility with static engine."""
         raise Exception("Dynamic engine does not support batch generation.")
