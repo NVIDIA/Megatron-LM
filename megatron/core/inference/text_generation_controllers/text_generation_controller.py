@@ -304,6 +304,7 @@ class TextGenerationController:
 
         return tokens
 
+    @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
         self, sampling_params: SamplingParams, termination_id: int
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
@@ -330,7 +331,7 @@ class TextGenerationController:
         position_ids = context.current_position_ids()
 
         # Forward pass -> logits.
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
@@ -400,6 +401,7 @@ class TextGenerationController:
                     logit_dict[key] = logprob.item()
             top_n_logprobs_dict[batch_idx].append(logit_dict)
 
+    @torch.inference_mode()
     def generate_all_output_tokens_static_batch(
         self,
         active_requests: OrderedDict[str, InferenceRequest],
@@ -504,7 +506,7 @@ class TextGenerationController:
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
-        with torch.no_grad():
+        with torch.inference_mode():
 
             self.inference_wrapped_model.prep_model_for_inference()
 

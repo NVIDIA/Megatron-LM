@@ -346,6 +346,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         # NOTE: Only returns the logits on the last pipeline stage
         return logits
 
+    @torch.inference_mode()
     def run_one_forward_step(
         self, inference_input: Dict[str, Any], recv_buffer_seq_len: Optional[int] = None
     ) -> torch.Tensor:
