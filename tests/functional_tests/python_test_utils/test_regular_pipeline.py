@@ -24,6 +24,14 @@ CHECK_THRESHOLDS = {
         common.DeterministicTest(),
         common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.20), rtol=0),
     ],
+    "generated_tokens": [
+        common.DeterministicTest(),
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
+    ],
+    "logprobs": [
+        common.DeterministicTest(),
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
+    ],
 }
 
 
