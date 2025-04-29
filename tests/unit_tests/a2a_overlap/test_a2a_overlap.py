@@ -7,8 +7,6 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from megatron.core.enums import Fp8Recipe
-from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.fine_grained_schedule import (
     TransformerLayerSchedulePlan,
     schedule_layer_1f1b,
@@ -109,11 +107,9 @@ def run_model_ref_with_capture(model, input_tensors, iterations):
         if hasattr(module, 'fuse_wgrad_accumulation'):
             module.fuse_wgrad_accumulation = False
 
-    fp8_context = get_fp8_context(model.config) if model.config.fp8 else nullcontext()
     output_tensors = []
     for i in range(iterations):
-        with get_fp8_context(model.config):
-            output = model(input_tensors[i].clone())[0]
+        output = model(input_tensors[i].clone())[0]
         output_tensors.append(output)
         output.backward(torch.ones_like(output))
 
@@ -280,9 +276,7 @@ class TestA2AOverlap:
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     # TODO: Add flex dispatcher test back in when CI image installs DeepEP.
     @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
-    # @pytest.mark.parametrize("fp8", [False, True])
-    # @pytest.mark.parametrize("fp8_recipe", ['tensorwise', 'blockwise'])
-    def test_1f1b_overlap(self, dispatcher_type, fp8, fp8_recipe):
+    def test_1f1b_overlap(self, dispatcher_type):
         """
         Tests the 1-forward-1-backward overlap optimization.
 
@@ -300,9 +294,6 @@ class TestA2AOverlap:
         if dispatcher_type == "flex":
             extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
-        if fp8:
-            extra_kwargs["fp8"] = 'hybrid'
-            extra_kwargs["fp8_recipe"] = fp8_recipe
         config = MLATransformerConfig(
             pipeline_model_parallel_size=4,
             expert_model_parallel_size=2,
