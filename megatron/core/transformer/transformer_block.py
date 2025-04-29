@@ -338,6 +338,7 @@ class TransformerBlock(MegatronModule):
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
+        use_inner_fp8_context: bool,
     ):
         """Forward method with activation checkpointing."""
 
@@ -347,16 +348,22 @@ class TransformerBlock(MegatronModule):
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
-                    hidden_states, context = layer(
-                        hidden_states=hidden_states,
-                        attention_mask=attention_mask,
-                        context=context,
-                        context_mask=context_mask,
-                        rotary_pos_emb=rotary_pos_emb,
-                        attention_bias=attention_bias,
-                        inference_context=None,
-                        packed_seq_params=packed_seq_params,
+                    inner_fp8_context = (
+                        get_fp8_context(self.config, layer.layer_number - 1)
+                        if use_inner_fp8_context
+                        else nullcontext()
                     )
+                    with inner_fp8_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            attention_bias=attention_bias,
+                            inference_context=None,
+                            packed_seq_params=packed_seq_params,
+                        )
                 return hidden_states, context
 
             return custom_forward
@@ -534,6 +541,7 @@ class TransformerBlock(MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
+                    use_inner_fp8_context=use_inner_fp8_context,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):

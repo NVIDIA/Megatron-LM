@@ -6,7 +6,7 @@ from typing import Optional, Union
 
 import torch
 
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import (  # type: ignore
@@ -22,6 +22,13 @@ from megatron.core.transformer.moe.token_dispatcher import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 @dataclass
@@ -186,7 +193,16 @@ class MoELayer(BaseMoELayer):
             return output, mlp_bias
 
         if self.moe_layer_recompute:
-            output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
+            if self.config.fp8:
+                output, mlp_bias = te_checkpoint(
+                    custom_forward,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    hidden_states,
+                )
+            else:
+                output, mlp_bias = tensor_parallel.checkpoint(custom_forward, False, hidden_states)
         else:
             output, mlp_bias = custom_forward(hidden_states)
 

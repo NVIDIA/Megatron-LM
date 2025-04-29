@@ -90,7 +90,7 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-throughput: true
   --log-interval: 1
-  --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
+  --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args

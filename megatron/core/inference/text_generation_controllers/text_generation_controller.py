@@ -338,8 +338,11 @@ class TextGenerationController:
         last_token_logits = logits.squeeze(0)
 
         # Sample.
+        # Use padded vocab size because tokenizer vocab size might not include padding
+        # to nearest power of 2.
+        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
         new_sample = self.sample_from_logits(
-            last_token_logits, sampling_params, vocab_size=self.tokenizer.vocab_size
+            last_token_logits, sampling_params, vocab_size=vocab_size
         )
 
         # Active sequence lengths.

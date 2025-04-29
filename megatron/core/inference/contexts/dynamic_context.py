@@ -1,13 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import warnings
 from typing import Optional, Tuple
 
 import torch
+from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
@@ -146,14 +149,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
 
         if buffer_overflow_factor is not None:
-            self.max_requests = self.round_up(int(self.max_requests * buffer_overflow_factor))
-            self.max_tokens = self.round_up(int(self.max_tokens * buffer_overflow_factor / 50.0))
+            self.max_requests = self.round_up_requests(
+                int(self.max_requests * buffer_overflow_factor)
+            )
+            self.max_tokens = self.round_up_tokens(
+                int(self.max_tokens * buffer_overflow_factor / 50.0)
+            )
 
         if max_requests_override is not None:
-            self.max_requests = self.round_up(max_requests_override)
+            self.max_requests = self.round_up_requests(max_requests_override)
 
         if max_tokens_override is not None:
-            self.max_tokens = self.round_up(max_tokens_override)
+            self.max_tokens = self.round_up_tokens(max_tokens_override)
 
         self.max_requests = min(self.max_requests, self.max_tokens)  # e.g., decode only.
 
@@ -268,8 +275,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
         gtd_byte_count = buffer_guaranteed_fraction * buffer_size_bytes
         gtd_request_count, _ = bytes_to_max_requests_and_tokens(gtd_byte_count)
-        gtd_request_count = max(1, gtd_request_count)
-        gtd_request_count = self.round_up(min(gtd_request_count, self.max_requests))
+        if buffer_guaranteed_fraction > 0:
+            gtd_request_count = max(1, gtd_request_count)
+        gtd_request_count = self.round_up_requests(min(gtd_request_count, self.max_requests))
         gtd_chunk_count = gtd_request_count * self.max_kv_chunk_count
         assert (
             gtd_request_count <= self.max_requests
@@ -287,12 +295,32 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Reset attention state.
         self.reset_attention_state()
 
-    ROUNDER = 64
+    TOKEN_ROUNDER = 64
+    REQUEST_ROUNDER = 4
+
+    @classmethod
+    def round_up_tokens(cls, value):
+        """Round up to nearest multiple of `TOKEN_ROUNDER` (above)."""
+        if PkgVersion(mcore_version) < PkgVersion("0.13"):
+            return cls.round_up(value)
+        return cls.TOKEN_ROUNDER * int(math.ceil(int(value) / cls.TOKEN_ROUNDER))
+
+    @classmethod
+    def round_up_requests(cls, value):
+        """Round up to nearest multiple of `REQUEST_ROUNDER` (above)."""
+        if PkgVersion(mcore_version) < PkgVersion("0.13"):
+            return cls.round_up(value)
+        return cls.REQUEST_ROUNDER * int(math.ceil(int(value) / cls.REQUEST_ROUNDER))
 
     @classmethod
     def round_up(cls, value):
-        """Round up to nearest multiple of `ROUNDER` (above)."""
-        return cls.ROUNDER * int(math.ceil(int(value) / cls.ROUNDER))
+        """Deprecated in favor of round_up_tokens and round_up_requests."""
+        warnings.warn(
+            "`round_up` is deprecated in favor of `round_up_tokens` or `round_up_requests` "
+            "and will be removed in `megatron-core` 0.14."
+        )
+        ROUNDER = getattr(cls, "ROUNDER", 64)
+        return ROUNDER * int(math.ceil(int(value) / ROUNDER))
 
     def is_static_batching(self) -> bool:
         """Is static batching? False."""
@@ -317,7 +345,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def cu_kv_lengths(self) -> Tensor:
         """Cumulative key/value sequence lengths."""
-        return self.cu_kv_seq_lengths, self.kv_seq_lengths_decode_only, self.max_seqlen_k
+        return (
+            self.cu_kv_seq_lengths,
+            self.kv_seq_lengths,
+            self.kv_seq_lengths_decode_only,
+            self.max_seqlen_k,
+        )
 
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
@@ -392,7 +425,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         n = self.padded_active_token_count
         query_seq_idx = self.token_to_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
-        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q, cp_group)
+        query[:n] = apply_rotary_pos_emb(
+            t=query[:n],
+            freqs=query_emb[:n],
+            config=config,
+            cu_seqlens=cu_seqlens_q,
+            cp_group=cp_group,
+        )
         return query
 
     def apply_rotary_emb_key(
@@ -418,9 +457,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
             assert key.shape[0] == n == self.max_requests
-            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
+            key = apply_rotary_pos_emb(
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+            )
         else:
-            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
+            key[:n] = apply_rotary_pos_emb(
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+            )
         return key
 
     def reset_attention_state(self) -> None:
@@ -440,7 +483,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Initialize attention state so that every layer can use it"""
 
         self.padded_active_token_count = (
-            self.max_requests if self.is_decode_only() else self.round_up(self.active_token_count)
+            self.max_requests
+            if self.is_decode_only()
+            else self.round_up_tokens(self.active_token_count)
         )
         self.padded_active_sample_count = (
             self.max_requests
@@ -479,12 +524,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cu_query_seq_lengths[1:] = cu_query_lengths
             self.max_seqlen_q = query_lengths.max().item()
 
-        kv_lengths = self.request_kv_length_offsets + self.request_query_lengths
-        kv_lengths = kv_lengths[self.paused_request_count : self.total_request_count]
+        kv_seq_lengths = self.request_kv_length_offsets + self.request_query_lengths
+        self.kv_seq_lengths = kv_seq_lengths[self.paused_request_count : self.total_request_count]
         if self.is_decode_only():
             self.kv_seq_lengths_decode_only[
                 0 : self.total_request_count - self.paused_request_count
-            ] = kv_lengths
+            ] = self.kv_seq_lengths
             cu_kv_lengths_decode_only = torch.cumsum(self.kv_seq_lengths_decode_only, dim=0)
             self.cu_kv_seq_lengths_decode_only[1:] = cu_kv_lengths_decode_only
             self.cu_kv_seq_lengths = self.cu_kv_seq_lengths_decode_only
@@ -496,8 +541,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
-            self.cu_kv_seq_lengths[1:] = torch.cumsum(kv_lengths, dim=0)
-            self.max_seqlen_k = kv_lengths.max().item()
+            self.cu_kv_seq_lengths[1:] = torch.cumsum(self.kv_seq_lengths, dim=0)
+            self.max_seqlen_k = self.kv_seq_lengths.max().item()
 
         kv_memory = self.request_to_kv_chunk_ids[
             self.paused_request_count : self.total_request_count

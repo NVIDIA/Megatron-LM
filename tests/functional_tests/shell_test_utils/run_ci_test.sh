@@ -152,7 +152,7 @@ for i in $(seq 1 $N_REPEAT); do
     fi
 
     if [[ "$TEST_TYPE" == "release" ]]; then
-        SKIP_PYTEST=0
+        SKIP_PYTEST=1
         TRAIN_ITERS=10000000
     fi
 
@@ -161,8 +161,7 @@ for i in $(seq 1 $N_REPEAT); do
         SKIP_PYTEST=1
     fi
 
-    # Maybe run tests
-    if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
+    if [[ ${SKIP_PYTEST:-0} != 1 || "$TEST_TYPE" == "release" ]]; then
         # Save run results
         export PYTHONPATH=$ROOT_DIR
         if [[ "$TEST_TYPE" == "release" ]]; then
@@ -176,6 +175,10 @@ for i in $(seq 1 $N_REPEAT); do
             --train-iters $TRAIN_ITERS \
             --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
             "${EXTRACT_ARGS[@]}"
+    fi
+
+    # Maybe run tests
+    if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
 
         export NVTE_ALLOW_NONDETERMINISTIC_ALGO
         if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" ]]; then

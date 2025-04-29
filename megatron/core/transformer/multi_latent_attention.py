@@ -537,7 +537,7 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = k_pos_emb.squeeze(1)
 
         if self.recompute_up_proj:
-            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
             query, key, value = self.qkv_up_checkpoint.checkpoint(
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )

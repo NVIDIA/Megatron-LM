@@ -128,7 +128,11 @@ def get_days_in_stage(mr, stage):
     for event in sorted(
         mr.resourcelabelevents.list(get_all=True), key=lambda x: x.created_at, reverse=True
     ):
-        if event.label.get('name') == stage and event.action == 'add':
+        if (
+            event.label.get('name') == stage
+            and event.action == 'add'
+            and '_bot_' not in event.user.get('username')
+        ):
             return get_days_since(event.created_at)
 
 
@@ -184,6 +188,8 @@ def get_required_reviewers(mr):
 
     if review_group is None or len(review_group) == 0:
         review_group = ["okoenig@nvidia.com"]
+
+    print(f"Reviewer: {review_group}")
 
     return ", ".join(get_slack_user_id(reviewer) for reviewer in review_group)
 

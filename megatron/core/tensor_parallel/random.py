@@ -5,7 +5,7 @@
 
 import contextlib
 import logging
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from torch import _C
@@ -24,6 +24,8 @@ from .utils import gather_split_1d_tensor, split_tensor_into_1d_equal_chunks
 
 try:
     import transformer_engine  # pylint: disable=unused-import
+    from transformer_engine.pytorch.distributed import activation_recompute_forward
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
 
     HAVE_TE = True
 except ModuleNotFoundError:
@@ -326,9 +328,9 @@ def model_parallel_cuda_manual_seed(
     te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
-    tp_rank: int = None,
-    ep_rank: int = None,
-    etp_rank: int = None,
+    tp_rank: Optional[int] = None,
+    ep_rank: Optional[int] = None,
+    etp_rank: Optional[int] = None,
 ):
     """Initialize model parallel cuda seed.
 
@@ -484,7 +486,17 @@ class CheckpointWithoutOutputFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, checkpoint_without_output_obj, *args):
         """Forward pass."""
-        with torch.no_grad():
+        if checkpoint_without_output_obj.fp8:
+            fp8 = FP8GlobalStateManager.is_fp8_enabled()
+            ctx.fp8 = fp8
+            ctx.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe() if fp8 else None
+            fwd_ctx = activation_recompute_forward(activation_recompute=True, recompute_phase=False)
+        else:
+            ctx.fp8 = False
+            ctx.fp8_recipe = None
+            fwd_ctx = contextlib.nullcontext()
+
+        with torch.no_grad(), fwd_ctx:
             outputs = run_function(*args)
         ctx.save_for_backward(*detach_variable(args))
         # the CheckpointWithoutOutput object is passed in, then it can access the saved input
@@ -514,7 +526,8 @@ class CheckpointWithoutOutput(object):
     backward pass to reduce the memory usage.
     """
 
-    def __init__(self):
+    def __init__(self, fp8=False):
+        self.fp8 = fp8 is not None
         self.run_function = None
         self.fwd_cpu_rng_state = None
         self.fwd_cuda_rng_state = None
@@ -545,7 +558,16 @@ class CheckpointWithoutOutput(object):
         with _fork_rng():
             _set_all_rng_states(*self.rng_states)
 
-            with torch.enable_grad():
+            if self.fp8:
+                recompute_ctx = activation_recompute_forward(
+                    activation_recompute=True, recompute_phase=True
+                )
+                fp8_ctx = fp8_autocast(enabled=self.ctx.fp8, fp8_recipe=self.ctx.fp8_recipe)
+            else:
+                recompute_ctx = contextlib.nullcontext()
+                fp8_ctx = contextlib.nullcontext()
+
+            with torch.enable_grad(), fp8_ctx, recompute_ctx:
                 outputs = self.run_function(*self.ctx.saved_tensors)
 
         self.run_function = None

@@ -257,6 +257,30 @@ def load_retro_args(args):
     args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
     args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
 
+def no_rope_freq_type(x):
+    """ Controls which layers to skip performing Rotary Position Embedding.
+    - An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers.
+    - A string "N": Same as above, but provided as a string
+    - A string containing a Python list expression that defines a custom pattern, e.g.:
+      "([0]*3+[1]*1)*3" evaluates to [0,0,0,1,0,0,0,1,0,0,0,1]
+      where 1 indicates rope is skipped on the layer.
+      This allows defining arbitrary patterns of rope skipping.
+      The pattern length must match the total number of transformer layers.
+      Examples:
+          "([1]+[0]*23)": Only first layer has rope skipped for a 24-layer network.
+          "([0]*3+[1]*1)*2": Every 4 layers the rope is skipped on the last layer. Repeat twice.
+    """
+    if x is None or isinstance(x, int):
+        return x
+    assert isinstance(x, str)
+    if '[' in x:
+        # it's a custom pattern
+        pattern = eval(x)
+        return pattern
+    else:
+        # it's a single int but in str
+        return int(x)
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -458,7 +482,7 @@ def validate_args(args, defaults={}):
                 num_layers = args.num_layers
             else:
                 num_layers = args.decoder_num_layers
-            
+
             if args.account_for_embedding_in_pipeline_split:
                 num_layers += 1
 
@@ -1009,6 +1033,12 @@ def validate_args(args, defaults={}):
             'delay_wgrad_compute is only supported with transformer_engine implementation'
         assert not args.overlap_grad_reduce, \
             'delay_wgrad_compute is not supported with overlap_grad_reduce'
+    
+    if args.fp8_recipe != "delayed":
+        assert not (args.fp8_param_gather and args.use_precision_aware_optimizer), (
+            "Currently only delayed scaling is supported to use precision-aware optimizer and fp8 "
+            "params at the same time."
+        )
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -1337,6 +1367,15 @@ def _add_network_size_args(parser):
                        help='Apply rope scaling as used in llama3.x')
     group.add_argument('--rope-scaling-factor', type=float, default=8.0,
                        help='Rope scaling factor in llama3.x models')
+    group.add_argument('--no-rope-freq', type=no_rope_freq_type, default=None,
+                       help='Controls which layers to skip performing Rotary Position Embedding. Accepts either: '
+                            '- An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers. '
+                            '- A string containing a Python list expression that defines a custom pattern, e.g.: '
+                            '"([0]*3+[1]*1)*3" evaluates to [0,0,0,1,0,0,0,1,0,0,0,1] '
+                            'where 1 indicates no-rope layer. This patten is equivalent to --no-rope-freq=4.'
+                            'By default this is disabled and set to None, indicating RoPE will be performed'
+                            'on every layer.'
+                       )
     group.add_argument('--no-position-embedding',
                        action='store_false',
                        help='Disable position embedding. Deprecated: use --position-embedding-type',
