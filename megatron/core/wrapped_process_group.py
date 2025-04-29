@@ -27,21 +27,31 @@ class WrappedProcessGroup(object):
         
         try:
             if isinstance(self.__process_group, list):
-                self.__rank_groups = self.__process_group
-                return
+                self.__rank_groups = None
+                return None
             
             world_size = torch.distributed.get_world_size()
-            if self.__process_group is None or self.__process_group == torch.distributed.group.WORLD:
-                return [range(world_size)]
+            world_ranks = [ r  for r in range(world_size)]
+            if self.process_group is None or self.__process_group == torch.distributed.group.WORLD:
+                return [world_ranks]
 
-            ranks = torch.distributed.get_process_group_ranks(self.__process_group)
-            num_sub_groups = world_size // len(ranks)
-            all_ranks = [ [ int(lr + len(ranks)*sg) for lr in range(len(ranks)) ] for sg in range(num_sub_groups)]
-            assert ranks in all_ranks, f"{ranks} not in {all_ranks}"
-            logger.info(f"process_group: {self.__process_group}, all_ranks: {all_ranks}")
+            group_ranks = torch.distributed.get_process_group_ranks(self.__process_group)
+            group_ranks = [ r - group_ranks[0] for r in group_ranks]
+            group_size = len(group_ranks)
+            num_rank_groups = world_size // group_size
+            strides = [ group_ranks[i+1] - group_ranks[i] for i in range(len(group_ranks) - 1)]
+            all_ranks = []
+            for _ in range(num_rank_groups):
+                _ranks = [world_ranks[0]]
+                for j in range(1,group_size,1):
+                    _ranks.append(world_ranks[j-1]+ strides[j-1])
+                all_ranks.append(_ranks)
+                world_ranks = [ r for r in world_ranks if r not in _ranks]
+
+            assert group_ranks in all_ranks
             return all_ranks
         except Exception as e:
-            logger.warning(f"process_group: {self.__process_group}")
+            traceback.print_exc()
             return None
 
     @property
