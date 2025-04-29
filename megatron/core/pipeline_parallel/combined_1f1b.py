@@ -1,9 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
 import contextlib
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import List, Union
 
 import torch
@@ -11,9 +10,9 @@ from torch import Tensor
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallel
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.distributed import DistributedDataParallel
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler

@@ -1,13 +1,15 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
 import contextlib
 import weakref
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 from torch import Tensor
 
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.combined_1f1b import (
     AbstractSchedulePlan,
     FakeScheduleNode,
@@ -18,10 +20,9 @@ from megatron.core.pipeline_parallel.combined_1f1b import (
     get_comp_stream,
     make_viewless,
 )
-from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer import transformer_layer
 from megatron.core.transformer.module import float16_to_fp32
-from megatron.core.fp8_utils import get_fp8_context
+
 
 def weak_method(method):
     """Creates a weak reference to a method to prevent circular references.
@@ -362,8 +363,14 @@ class TransformerLayerSchedulePlan:
         """
         Get the fp8 context for the transformer layer.
         """
-        use_inner_fp8_context = self.layer.config.fp8 and self.layer.config.fp8_recipe != Fp8Recipe.delayed
-        return get_fp8_context(self.layer.config, self.layer.layer_number - 1) if use_inner_fp8_context else nullcontext()
+        use_inner_fp8_context = (
+            self.layer.config.fp8 and self.layer.config.fp8_recipe != Fp8Recipe.delayed
+        )
+        return (
+            get_fp8_context(self.layer.config, self.layer.layer_number - 1)
+            if use_inner_fp8_context
+            else nullcontext()
+        )
 
 
 class ModelChunkSchedulePlan(AbstractSchedulePlan):

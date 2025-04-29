@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.fine_grained_schedule import (
     TransformerLayerSchedulePlan,
     schedule_layer_1f1b,
@@ -16,8 +18,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import get_te_version, is_te_min_version
-from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.enums import Fp8Recipe
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
