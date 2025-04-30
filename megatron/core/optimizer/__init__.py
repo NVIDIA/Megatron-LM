@@ -343,9 +343,11 @@ def _get_megatron_optimizer_based_on_param_groups(
                         "master_weight_dtype": config.main_params_dtype,
                         "exp_avg_dtype": config.exp_avg_dtype,
                         "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
-                        "store_param_remainders": config.store_param_remainders,
                     }
                 )
+
+                if is_te_min_version("2.1.0.dev0"):
+                    kwargs.update({"store_param_remainders": config.store_param_remainders})
 
             optimizer = Adam(**kwargs)
 
