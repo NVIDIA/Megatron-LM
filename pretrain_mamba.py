@@ -124,26 +124,22 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """
     args = get_args()
 
-    losses = output_tensor.float()
+    losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
-    total_tokens = loss_mask.sum()
-    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
-
-    if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
+    loss = torch.sum(losses * loss_mask)
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=True,
         )
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
             tolerance=0.0,        # forward pass calculations are determinisic
@@ -152,7 +148,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=partial(
                 rerun_state_machine.is_unexpectedly_large,
                 threshold=SPIKY_LOSS_FACTOR,
@@ -163,19 +159,11 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             fatal=False,
         )
 
-    # Reduce loss for logging.
-    reporting_loss = loss.clone().detach()
-    torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
 
-    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
-    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
-    # on loss[0] fixes this
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-    return (
-        loss[0].clone(),
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
-    )
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
+
+    return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def forward_step(data_iterator, model: MambaModel):

@@ -1426,21 +1426,22 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Average loss across microbatches.
         loss_reduced = {}
         for key in losses_reduced[0].keys():
-            numerator = 0
-            denominator = 0
-            for x in losses_reduced:
-                val = x[key]
+            val = [x[key].view(-1) for x in losses_reduced]
+            if val[0].numel() == 2:
                 # there is one dict per microbatch. in new reporting, we average
                 # over the total number of tokens across the global batch.
-                if isinstance(val, tuple) or isinstance(val, list):
-                    numerator += val[0]
-                    denominator += val[1]
-                else:
-                    # legacy behavior. we average over the number of microbatches,
-                    # and so the denominator is 1.
-                    numerator += val
-                    denominator += 1
-            loss_reduced[key] = numerator / denominator
+                val = torch.vstack(val).sum(dim=0)
+                torch.distributed.all_reduce(
+                    val,
+                    group=mpu.get_data_parallel_group(with_context_parallel=True)
+                )
+                loss_reduced[key] = val[0] / val[1]
+            elif val[0].numel() == 1:
+                # legacy behavior, we average over the number of microbatches
+                val = torch.cat(val).mean()
+                loss_reduced[key] = val
+            else:
+                raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
         return (
             loss_reduced,
             skipped_iter,
@@ -2447,19 +2448,25 @@ def evaluate(
 
             if mpu.is_pipeline_last_stage(ignore_virtual=True):
                 # Reduce across processes.
-                for loss_dict in loss_dicts:
-                    for key in loss_dict:
-                        if key not in total_loss_dict:
-                            total_loss_dict[key] = torch.tensor(
-                                [0.0, 0.0], dtype=torch.float
-                            ).cuda()
-                        val = loss_dict[key]
-                        if isinstance(val, tuple) or isinstance(val, list):
-                            total_loss_dict[key][0] += val[0]
-                            total_loss_dict[key][1] += val[1]
-                        else:
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
+                for key in loss_dicts[0].keys():
+                    if key not in total_loss_dict:
+                        total_loss_dict[key] = torch.tensor(
+                            [0.0, 0.0], dtype=torch.float
+                        ).cuda()
+                    val = [x[key].view(-1) for x in loss_dicts]
+                    if val[0].numel() == 2:
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(
+                            val,
+                            group=mpu.get_data_parallel_group(with_context_parallel=True)
+                        )
+                        total_loss_dict[key] += val
+                    elif val[0].numel() == 1:
+                        val = torch.cat(val).sum()
+                        total_loss_dict[key][0] += val
+                        total_loss_dict[key][1] += len(loss_dicts)
+                    else:
+                        raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
 
             args.consumed_valid_samples += eval_batch_size
 
