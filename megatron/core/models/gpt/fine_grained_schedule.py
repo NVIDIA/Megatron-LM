@@ -615,8 +615,8 @@ def schedule_chunk_1f1b(
     if f_schedule_plan:
         # pp output send/receive sync
         if pre_forward is not None:
-            with f_context:  # virtual pipeline parallel context
-                pre_forward()
+            with f_context as ctx:  # virtual pipeline parallel context
+                pre_forward(ctx.vpp_rank)
         f_schedule_plan.record_current_stream()
 
     if b_schedule_plan:
@@ -642,8 +642,8 @@ def schedule_chunk_1f1b(
                 # pp grad send receive sync here, safe for now, maybe not safe in the future
                 with torch.cuda.stream(get_com_stream()):
                     b_schedule_plan.wait_current_stream()
-                    with b_context:  # virtual pipeline parallel context
-                        pre_backward()
+                    with b_context as ctx:  # virtual pipeline parallel context
+                        pre_backward(ctx.vpp_rank)
                     b_schedule_plan.record_current_stream()
 
         return tmp
@@ -691,24 +691,24 @@ def schedule_chunk_1f1b(
             torch.cuda.nvtx.range_pop()
 
     if f_schedule_plan is not None and post_forward is not None:
-        with f_context:
+        with f_context as ctx:
             if overlaped_layers < f_num_layers:
                 # The last submodule is running in the current stream
                 f_schedule_plan.wait_current_stream()
-                post_forward(f_input)
+                post_forward(f_input, ctx.vpp_rank)
             else:
                 # The last submodule is running in the communication stream,
                 # so the p2p comm could be overlapped with the attn backward
                 with torch.cuda.stream(get_com_stream()):
                     f_schedule_plan.wait_current_stream()
-                    post_forward(f_input)
+                    post_forward(f_input, ctx.vpp_rank)
 
     # pp grad send / receive, overlapped with attn dw of cur micro-batch
     # and forward attn of next micro-batch
     if b_schedule_plan is not None and post_backward is not None:
-        with b_context:
+        with b_context as ctx:
             b_schedule_plan.wait_current_stream()
-            post_backward(grad)
+            post_backward(grad, ctx.vpp_rank)
 
     # The last wgrad of attention
     layer_pre_backward_dw()

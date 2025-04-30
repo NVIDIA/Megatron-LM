@@ -1164,7 +1164,9 @@ def forward_backward_pipelining_with_interleaving(
                             config.param_sync_func[param_sync_chunk_id](
                                 model[param_sync_chunk_id].parameters()
                             )
-                if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=model_chunk_id):
+                if parallel_state.is_pipeline_first_stage(
+                    ignore_virtual=False, vp_stage=model_chunk_id
+                ):
                     if len(input_tensors[model_chunk_id]) == len(output_tensors[model_chunk_id]):
                         input_tensors[model_chunk_id].append(None)
                 offset = num_released_microbatches(f_virtual_microbatch_id, model_chunk_id)
@@ -1189,7 +1191,9 @@ def forward_backward_pipelining_with_interleaving(
                     synchronized_model_chunks.add(model_chunk_id)
 
                 # pylint: disable=E0606
-                if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=model_chunk_id):
+                if parallel_state.is_pipeline_last_stage(
+                    ignore_virtual=False, vp_stage=model_chunk_id
+                ):
                     if len(output_tensor_grads[model_chunk_id]) == 0:
                         output_tensor_grads[model_chunk_id].append(None)
                 b_input_tensor = input_tensors[model_chunk_id].pop(0)
@@ -1529,8 +1533,10 @@ def forward_backward_pipelining_with_interleaving(
             backward_k = k
 
             # output send / receive sync
-            def pp_pre_forward():
-                if not is_vp_first_stage(vp_stage=cur_model_chunk_id):
+            def pp_pre_forward(vp_stage=None):
+                if vp_stage is None:
+                    vp_stage = get_model_chunk_id(forward_k, forward=True)
+                if not is_vp_first_stage(vp_stage=vp_stage):
                     if config.overlap_p2p_comm_warmup_flush:
                         assert recv_prev_wait_handles, (
                             f'pp rank {pipeline_parallel_rank}, fwd iteration {forward_k}, '
@@ -1546,13 +1552,15 @@ def forward_backward_pipelining_with_interleaving(
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
             # output async send / receive
-            def pp_post_forward(output_tensor):
+            def pp_post_forward(output_tensor, vp_stage=None):
                 nonlocal send_next_wait_handle
                 nonlocal fwd_recv_buffer
                 nonlocal fwd_wait_handles
                 nonlocal recv_prev_wait_handles
+                if vp_stage is None:
+                    vp_stage = get_model_chunk_id(forward_k, forward=True)
                 # Last virtual stage no activation tensor to send.
-                if is_vp_last_stage(vp_stage=cur_model_chunk_id):
+                if is_vp_last_stage(vp_stage=vp_stage):
                     output_tensor = None
 
                 recv_prev, next_forward_model_chunk_id = recv_tensor_from_previous_stage(
@@ -1598,9 +1606,11 @@ def forward_backward_pipelining_with_interleaving(
                 return output_tensor
 
             # grad send receive sync
-            def pp_pre_backward():
+            def pp_pre_backward(vp_stage=None):
                 nonlocal recv_next_wait_handles
-                if not is_vp_last_stage(vp_stage=cur_model_chunk_id):
+                if vp_stage is None:
+                    vp_stage = get_model_chunk_id(backward_k, forward=False)
+                if not is_vp_last_stage(vp_stage=vp_stage):
                     if config.overlap_p2p_comm_warmup_flush:
                         assert recv_next_wait_handles, (
                             f'pp rank {pipeline_parallel_rank}, bwd iteration {backward_k}, '
@@ -1614,12 +1624,14 @@ def forward_backward_pipelining_with_interleaving(
                             recv_next_wait_handle.wait()
 
             # async grad send receive
-            def pp_post_backward(input_tensor_grad):
+            def pp_post_backward(input_tensor_grad, vp_stage=None):
                 nonlocal send_prev_wait_handle
                 nonlocal bwd_wait_handles
                 nonlocal recv_next_wait_handles
+                if vp_stage is None:
+                    vp_stage = get_model_chunk_id(backward_k, forward=False)
                 # First virtual stage no activation gradient tensor to send.
-                if is_vp_first_stage(vp_stage=cur_model_chunk_id):
+                if is_vp_first_stage(vp_stage=vp_stage):
                     input_tensor_grad = None
 
                 recv_next, next_backward_model_chunk_id = recv_tensor_from_previous_stage(

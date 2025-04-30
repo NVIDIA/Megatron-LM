@@ -180,8 +180,6 @@ class AbstractSchedulePlan(ABC):
         f_schedule_plan,
         b_schedule_plan,
         grad=None,
-        f_context=None,
-        b_context=None,
         pre_forward=None,
         pre_backward=None,
         post_forward=None,
