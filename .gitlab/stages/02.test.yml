@@ -1,6 +1,6 @@
 .test_rules:
   rules:
-    - if: $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
+    - if: $PUBLISH == "yes"
       when: never
     - when: on_success
   stage: test
