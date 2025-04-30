@@ -1794,7 +1794,7 @@ def forward_backward_pipelining_with_interleaving(
                 input_tensor_grad = None
 
             if config.overlap_p2p_comm_warmup_flush:
-                if not is_vp_last_stage(vp_stage=backward_model_chunk_id):
+                if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     _, bwd_wait_handles = p2p_communication.send_backward_recv_backward(
                         input_tensor_grad,
                         recv_next=False,
