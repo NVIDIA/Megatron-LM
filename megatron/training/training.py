@@ -980,6 +980,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 post_process = mpu.is_pipeline_last_stage(ignore_virtual=False)
                 this_model = model_provider_func(pre_process=pre_process, post_process=post_process)
                 this_model.model_type = model_type
+                this_model.vp_stage = i
                 model.append(this_model)
         else:
             pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False)

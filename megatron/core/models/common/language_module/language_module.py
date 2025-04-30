@@ -30,6 +30,7 @@ class LanguageModule(MegatronModule):
     def __init__(self, config: TransformerConfig) -> None:
         super().__init__(config=config)
         self._set_attention_backend()
+        self.vp_stage = None
 
     # pylint: disable=line-too-long
     def _set_attention_backend(self):

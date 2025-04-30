@@ -1554,7 +1554,7 @@ def get_pipeline_model_parallel_split_rank():
     return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
 
 
-def is_pipeline_first_stage(ignore_virtual=True):
+def is_pipeline_first_stage(ignore_virtual=True, vp_stage=None):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
     if not ignore_virtual:
         if (
@@ -1562,10 +1562,18 @@ def is_pipeline_first_stage(ignore_virtual=True):
             and get_virtual_pipeline_model_parallel_rank() != 0
         ):
             return False
+
+        # Note: This is a temporary check to ensure that vp_stage is passed correctly,
+        # after which we'll remove virtual pipeline rank in global scope and make
+        # passing vp_stage mandatory.
+        if vp_stage is not None:
+            assert (
+                get_virtual_pipeline_model_parallel_rank() == vp_stage
+            ), "get_virtual_pipeline_model_parallel_rank() is not equal to vp_stage"
     return get_pipeline_model_parallel_rank() == 0
 
 
-def is_pipeline_last_stage(ignore_virtual=True):
+def is_pipeline_last_stage(ignore_virtual=True, vp_stage=None):
     """Return True if in the last pipeline-model-parallel stage, False otherwise."""
     if not ignore_virtual:
         virtual_pipeline_model_parallel_world_size = (
@@ -1577,10 +1585,17 @@ def is_pipeline_last_stage(ignore_virtual=True):
             != (virtual_pipeline_model_parallel_world_size - 1)
         ):
             return False
+        # Note: This is a temporary check to ensure that vp_stage is passed correctly,
+        # after which we'll remove virtual pipeline rank in global scope and make
+        # passing vp_stage mandatory.
+        if vp_stage is not None:
+            assert (
+                get_virtual_pipeline_model_parallel_rank() == vp_stage
+            ), "get_virtual_pipeline_model_parallel_rank() is not equal to vp_stage"
     return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
 
 
-def is_rank_in_embedding_group(ignore_virtual=True):
+def is_rank_in_embedding_group(ignore_virtual=True, vp_stage=None):
     """Return true if current rank is in embedding group, False otherwise."""
     rank = torch.distributed.get_rank()
     global _EMBEDDING_GLOBAL_RANKS
@@ -1590,9 +1605,9 @@ def is_rank_in_embedding_group(ignore_virtual=True):
         return rank in _EMBEDDING_GLOBAL_RANKS
     if rank in _EMBEDDING_GLOBAL_RANKS:
         if rank == _EMBEDDING_GLOBAL_RANKS[0]:
-            return is_pipeline_first_stage(ignore_virtual=False)
+            return is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
         elif rank == _EMBEDDING_GLOBAL_RANKS[-1]:
-            return is_pipeline_last_stage(ignore_virtual=False)
+            return is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
         else:
             return True
     return False
