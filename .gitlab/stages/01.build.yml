@@ -1,5 +1,10 @@
+.build_rules:
+  rules:
+    - when: on_success
+  stage: test
+
 .build_image:
-  extends: [.test_rules, .dind_rules]
+  extends: [.build_rules, .dind_rules]
   stage: build
   tags:
     - arch/amd64
