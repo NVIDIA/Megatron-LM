@@ -1,10 +1,15 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 
 import torch
 from torch.autograd import Variable
 
-from megatron.core.parallel_state import parallel_state
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallel
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -110,7 +115,9 @@ class ScheduleNode:
                 if not isinstance(data, tuple):
                     data = make_viewless(data)
                 else:
-                    data = tuple([make_viewless(e) if isinstance(e, Tensor) else e for e in data])
+                    data = tuple(
+                        [make_viewless(e) if isinstance(e, torch.Tensor) else e for e in data]
+                    )
 
                 self.output = data
             torch.cuda.nvtx.range_pop()
@@ -245,15 +252,6 @@ class MemoryManagementStrategy:
 
         Args:
             inputs (tuple): Input tensors that have been used
-            stream (torch.cuda.Stream): Current CUDA stream
-        """
-        pass
-
-    def handle_outputs(self, outputs, stream):
-        """Process output tensors after computation.
-
-        Args:
-            outputs (tuple): Output tensors produced by the computation
             stream (torch.cuda.Stream): Current CUDA stream
         """
         pass

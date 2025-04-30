@@ -10,7 +10,7 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.combined_1f1b import (
+from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     FakeScheduleNode,
     FreeInputsMemoryStrategy,

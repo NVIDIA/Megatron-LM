@@ -9,6 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -291,4 +292,3 @@ def forward_backward_step(
             input_tensor_grad = input_tensor_grad[0]
 
     return output_tensor, num_tokens, input_tensor_grad
-

@@ -20,7 +20,8 @@ from megatron.core.utils import (
     get_model_xattn,
 )
 
-from .combined_1f1b import VppContextManager, forward_backward_step, set_streams, wrap_forward_func
+from .combined_1f1b import forward_backward_step
+from .utils import VppContextManager, set_streams, wrap_forward_func
 
 # Types
 Shape = Union[List[int], torch.Size]
