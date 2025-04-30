@@ -1,16 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 import os
-import random
-from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
+from contextlib import contextmanager
 
 import pytest
 import torch
 
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -22,6 +20,7 @@ class DummyState:
     This class is used to simulate the state object that would normally be passed
     to transformer callables in a real model.
     """
+
     attention_mask = None
     attention_bias = None
     inference_params = None
@@ -30,7 +29,6 @@ class DummyState:
     rotary_pos_emb = None
     rotary_pos_cos = None
     rotary_pos_sin = None
-
 
 
 def build_data():
@@ -138,19 +136,22 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
 
     for i in range(microbatches):
         state = DummyState()
-        local_tokens, probs, residual, pre_mlp_layernorm_output = model._submodule_attn_router_forward(input_tensors[i])
+        local_tokens, probs, residual, pre_mlp_layernorm_output = (
+            model._submodule_attn_router_forward(input_tensors[i])
+        )
         state.residual = residual
         if model.mlp.use_shared_expert:
             state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
         dispatched_tokens, probs = model._submodule_dispatch_forward(local_tokens, probs)
         if model.is_deepep:
             state.dispatched_probs = probs
-        expert_output, shared_expert_output, mlp_bias = model._submodule_moe_forward(dispatched_tokens, probs, state)
+        expert_output, shared_expert_output, mlp_bias = model._submodule_moe_forward(
+            dispatched_tokens, probs, state
+        )
         assert mlp_bias is None
         hidden_states = model._submodule_combine_forward(expert_output, shared_expert_output, state)
         output_tensors.append(hidden_states)
         hidden_states.backward(torch.ones_like(hidden_states))
-
 
     capture = {"outputs": output_tensors}
     for name, param in model.named_parameters():
