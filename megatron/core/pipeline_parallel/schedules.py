@@ -612,6 +612,8 @@ def get_pp_rank_microbatches(
             # immediately start with 1F1B).
             num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
             num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+            # When enabling combined_1f1b, we need to add one more microbatch
+            # before 1f1b stages for a2a overlap.
             if combined_1f1b:
                 num_warmup_microbatches = num_warmup_microbatches + 1
     else:
