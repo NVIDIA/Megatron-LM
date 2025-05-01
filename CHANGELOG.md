@@ -16,6 +16,9 @@
     - Qwen Model support
 - Known Issues
   - When using sequence parallel, during the transformer block forward pass, dropout is not using the appropriate rng context.
+- NVRx / Fault tolerance
+  - fault and hang detection in addition to existing straggler detection
+  - graceful exit and auto restart
 
 
 ## NVIDIA Megatron Core 0.8.0
