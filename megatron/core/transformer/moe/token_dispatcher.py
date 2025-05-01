@@ -50,8 +50,8 @@ class MoETokenDispatcher:
         self.config = config
         self.shared_experts: Optional[SharedExpertMLP] = None
 
-        self.tp_size = config.expert_tensor_parallel_size
-        self.ep_size = config.expert_model_parallel_size
+        self.tp_size = config.expert_tensor_parallel_size or 1
+        self.ep_size = config.expert_model_parallel_size or 1
 
     @property
     def ep_group(self):
