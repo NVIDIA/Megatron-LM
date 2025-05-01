@@ -826,18 +826,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
-                logger.info(
-                    '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
-                )
+                if torch.distributed.get_rank() == 0:
+                    logger.info(
+                        '***WARNING*** found an old checkpoint, will not ' 'load grad scaler ...'
+                    )
         else:
             if self.grad_scaler:
                 self.grad_scaler.load_state_dict(state_dict['grad_scaler'])
             else:
-                logger.info(
-                    '***WARNING*** fould the grad scaler in the '
-                    'checkpoint but it is None in the class. '
-                    'Skipping loading grad scaler ...'
-                )
+                if torch.distributed.get_rank() == 0:
+                    logger.info(
+                        '***WARNING*** fould the grad scaler in the '
+                        'checkpoint but it is None in the class. '
+                        'Skipping loading grad scaler ...'
+                    )
 
         if 'param_state' in state_dict:
             assert 'param_state_sharding_type' in state_dict, state_dict.keys()
@@ -847,7 +849,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 assert (
                     sharding_type == "fully_sharded_model_space"
                 ), "Only fully sharded model space is supported"
-            logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
+            if torch.distributed.get_rank() == 0:
+                logger.info(f'Loading distributed optimizer sharded state of type {sharding_type}')
             if sharding_type == 'dp_zero_gather_scatter':
                 self.load_parameter_state_from_dp_zero(param_state)
             elif sharding_type == 'fully_sharded_bucket_space':
