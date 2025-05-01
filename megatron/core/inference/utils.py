@@ -14,4 +14,5 @@ class Counter:
         return i
 
     def reset(self) -> None:
+        """Reset counter"""
         self.counter = 0

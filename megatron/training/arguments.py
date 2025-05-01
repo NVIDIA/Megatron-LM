@@ -1211,6 +1211,12 @@ def _add_inference_args(parser):
                        type=int, default=None,
                        help='If set, this overrides the max tokens as computed '
                        'from `--inference-dynamic-batching-buffer-overflow-factor`.')
+    group.add_argument('--symmetric-ar-type', type=str, default=None,
+                       choices=['two_shot', "one_shot", "multimem_all_reduce", None],
+                       help='What type of symmetric all reduce to use. The default is none which is no use of symetric memory')
+    group.add_argument('--nccl-all-reduce-for-prefill',
+                       action='store_true', default=False,
+                       help='When using symmeric all reduce kernels this will use regular nccl kernels for prefill. This can be more effecient when prefill is large as the nccl kernels can be more bandwith optimized')
     group.add_argument('--mlp-chunks-for-prefill', type=int, default=1,
                        help='Number of chunks along sequence dimension for MLP '
                        'computation during prefill')

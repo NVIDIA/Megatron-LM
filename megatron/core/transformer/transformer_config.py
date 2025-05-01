@@ -6,12 +6,19 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from packaging.version import Version as PkgVersion
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.enums import AttnBackend
 
 from ..model_parallel_config import ModelParallelConfig
-from ..utils import get_te_version, init_method_normal, is_te_min_version, scaled_init_method_normal
+from ..utils import (
+    get_te_version,
+    init_method_normal,
+    is_te_min_version,
+    is_torch_min_version,
+    scaled_init_method_normal,
+)
 
 
 @dataclass
@@ -529,6 +536,9 @@ class TransformerConfig(ModelParallelConfig):
 
     inference_rng_tracker: bool = False
     """ Whether we should instantiate a separate RNG tracker for inference. """
+
+    symmetric_ar_type: Optional[str] = None
+    """Type of symmetric all reduce to use"""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1095,6 +1105,11 @@ class TransformerConfig(ModelParallelConfig):
                 "Using a large number of experts (e.g. >=32) without fp32 routing. "
                 "Consider enabling moe_router_dtype for better numerical stability."
             )
+        if self.symmetric_ar_type is not None:
+            assert is_torch_min_version("2.7.0a0"), "Must have at least torch version 2.7 or higher"
+            assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
+                "2.3.0.dev0+39c0e70"
+            ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
 
         if self.no_rope_freq:
             assert not self.flash_decode, 'flash_decode cannot be used with no_rope.'

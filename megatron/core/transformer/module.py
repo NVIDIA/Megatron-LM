@@ -100,6 +100,39 @@ class MegatronModule(torch.nn.Module):
             for m in self.modules_with_is_first_microbatch:
                 m.is_first_microbatch = True
 
+    def set_symmetric_ar(self, set_to: Optional[str] = None) -> None:
+        """
+        Set symmetric all-reduce functionality across all eligible modules.
+
+        This method traverses the model's module hierarchy to find all modules
+        with the 'symmetric_ar_type' attribute, caches them, and then sets their
+        '_symmetric_ar_cache' attribute to the specified value to enable or
+        disable symmetric all-reduce operations.
+
+        Args:
+            set_to (Any, optional): Value to set for the 'symmetric_ar_type' to.
+            Allowed choices ['two_shot', "one_shot", "multimem_all_reduce", None]
+        """
+        assert set_to in ['two_shot', "one_shot", "multimem_all_reduce", None]
+
+        # Recursive function to find all modules with our target attributes
+        def create_ar_cache(module):
+            # Check if this module has any of our target attributes
+            if hasattr(module, "symmetric_ar_type"):
+                self._symmetric_ar_cache.append(module)
+
+            # Check all children modules recursively
+            for child in module._modules.values():
+                if child is not None:
+                    create_ar_cache(child)
+
+        if not hasattr(self, "_symmetric_ar_cache"):
+            self._symmetric_ar_cache = []
+            create_ar_cache(self)
+
+        for module in self._symmetric_ar_cache:
+            module._symmetric_ar_cache = set_to
+
 
 def conversion_helper(val, conversion):
     """Recursively applies a conversion function to values in nested data structures.

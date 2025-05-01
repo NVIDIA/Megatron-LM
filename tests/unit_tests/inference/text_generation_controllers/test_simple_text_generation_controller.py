@@ -30,12 +30,13 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestTextGenerationController:
 
-    def setup_model(self, dtype):
+    def setup_model(self, dtype, symmetric_ar_type=None):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=2, pipeline_model_parallel_size=2
         )
@@ -51,6 +52,7 @@ class TestTextGenerationController:
             use_cpu_initialization=True,
             attention_backend=AttnBackend.local,
             params_dtype=dtype,
+            symmetric_ar_type=symmetric_ar_type,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
@@ -183,9 +185,21 @@ class TestTextGenerationController:
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_generate_all_output_tokens_static_batch(self, dtype):
-        self.setup_model(dtype)
-
+    @pytest.mark.parametrize(
+        "symmetric_ar_type",
+        [
+            None,
+            pytest.param(
+                "multimem_all_reduce",
+                marks=pytest.mark.skipif(
+                    not is_te_min_version("2.3"),
+                    reason="multimem_all_reduce requires Transformer Engine >= 2.3",
+                ),
+            ),
+        ],
+    )
+    def test_generate_all_output_tokens_static_batch(self, dtype, symmetric_ar_type):
+        self.setup_model(dtype, symmetric_ar_type)
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
         self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
