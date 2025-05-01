@@ -461,7 +461,7 @@ def topk_softmax_with_capacity(
         drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
                            If "prob", the tokens with the lowest probabilities will be dropped.
                            If "position", tokens at the end of each batch will be dropped.
-        use_pre_softmax (bool): Whether to apply softmax before top-k selection.
+        use_pre_softmax (bool): Whether to apply softmax or sigmoid before top-k selection.
         num_groups (int): Number of groups for routed experts.
         group_topk (int): Number of selected groups for each token.
         scaling_factor (float): Scaling factor of routing score in top-k selection.
@@ -503,7 +503,7 @@ def topk_softmax_with_capacity(
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
-        scores = torch.sigmoid(logits)
+        scores = torch.sigmoid(logits.float()).type_as(logits)
         if expert_bias is not None:
             scores_for_routing = scores + expert_bias
             _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
@@ -642,6 +642,7 @@ def track_moe_metrics(
     if moe_layer_freq is None:
         num_moe_layers = num_layers
     elif isinstance(moe_layer_freq, int):
+        assert isinstance(num_layers, int)
         moe_layer_pattern = [1 if (i % moe_layer_freq == 0) else 0 for i in range(num_layers)]
         num_moe_layers = sum(moe_layer_pattern)
     elif isinstance(moe_layer_freq, list):

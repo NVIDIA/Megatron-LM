@@ -367,7 +367,8 @@ class TransformerConfig(ModelParallelConfig):
     """Number of selected groups for group-limited routing."""
 
     moe_router_pre_softmax: bool = False
-    """Enable pre-softmax routing for MoE, which means softmax is before the top-k selection.
+    """Enable pre-softmax(pre-sigmoid) routing for MoE, which means softmax is before the 
+    top-k selection.
     By default, softmax is done after top-k."""
 
     moe_router_topk_scaling_factor: Optional[float] = None
@@ -447,6 +448,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
+
+    moe_apply_probs_on_input: bool = False
+    """Apply probs on input of experts instead of applying after activation and glu."""
 
     ##################
     # Context Parallel
