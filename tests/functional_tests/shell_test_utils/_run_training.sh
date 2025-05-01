@@ -167,7 +167,11 @@ DISTRIBUTED_ARGS=(
 )
 
 # Start training
-torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+if [[ "$IS_NEMO_TEST" == "true" ]]; then
+    torchrun ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+else
+    torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+fi
 
 # Run after script
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.AFTER_SCRIPT')
