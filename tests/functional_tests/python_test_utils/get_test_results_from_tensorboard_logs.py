@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
     help="Tensorboard index to extract",
     default=False,
 )
-@click.option("--step-size", required=False, default=1, type=int, help="Step size of sampling")
+@click.option("--step-size", required=False, default=5, type=int, help="Step size of sampling")
 def collect_train_test_metrics(
     logs_dir: str, train_iters: str, output_path: str, is_convergence_test: bool, step_size: int
 ):
