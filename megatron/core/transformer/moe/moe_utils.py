@@ -555,18 +555,14 @@ def topk_softmax_with_capacity(
             scores, top_indices = compute_topk(logits, topk, num_groups, group_topk)
             probs = torch.softmax(scores, dim=-1, dtype=torch.float32).type_as(logits)
     elif score_function == "sigmoid":
-        logits_fp32 = logits.float()  # use fp32 for stability
-        if use_pre_softmax:
-            logits_fp32 = torch.sigmoid(logits_fp32)
+        scores = torch.sigmoid(logits.float()).type_as(logits)
         if expert_bias is not None:
-            logits_fp32 = logits_fp32 + expert_bias
-        logits_fp32, top_indices = compute_topk(logits_fp32, topk, num_groups, group_topk)
-        if use_pre_softmax:
-            scores = logits_fp32.type_as(logits)
+            scores_for_routing = scores + expert_bias
+            _, top_indices = compute_topk(scores_for_routing, topk, num_groups, group_topk)
+            scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
-            scores = torch.sigmoid(logits_fp32).type_as(logits)
+            scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
         probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
-
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
