@@ -141,6 +141,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         padded_vocab_size=args.padded_vocab_size,
         inference_max_seq_length=args.inference_max_seq_length,
         inference_max_requests=args.inference_max_batch_size,
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
     )
 
     inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)

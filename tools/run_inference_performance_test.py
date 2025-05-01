@@ -103,6 +103,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         padded_vocab_size=args.padded_vocab_size,
         inference_max_requests=args.inference_max_requests,
         inference_max_seq_length=args.inference_max_seq_length,
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
     )
 
     inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
