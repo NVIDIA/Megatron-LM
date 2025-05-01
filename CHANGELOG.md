@@ -17,6 +17,15 @@
     - Fix TEGroupedMLP distckpt compatibility issue with FP8 padding/unpadding.
   - Known Issues:
     - When training the Dense+MoE hybrid model, the process will hang if any PP rank does not have expert params.
+- Add MX-FP16 support for optimizer and master weights
+- CUDA Graph memory optimizations
+- Enable UCC backend for PP communication
+- Optimizer CPU offload support for memory savings
+- Models
+  - Initial RADIO/CRADIO implementation
+  - llama3.2 support
+- Hybrid Model
+  - Support quantization via TensorRT Model Optimizer
 
 ## NVIDIA Megatron Core 0.10.0
 
@@ -45,6 +54,9 @@
     - Qwen Model support
 - Known Issues
   - When using sequence parallel, during the transformer block forward pass, dropout is not using the appropriate rng context.
+- NVRx / Fault tolerance
+  - fault and hang detection in addition to existing straggler detection
+  - graceful exit and auto restart
 
 ## NVIDIA Megatron Core 0.8.0
 
