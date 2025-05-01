@@ -113,7 +113,7 @@ class Linear(torch.nn.Linear):
         is_expert: bool = False,
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
-        tp_group: Optional[WrappedProcessGroup] = None,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.config = config
 
@@ -131,7 +131,7 @@ class Linear(torch.nn.Linear):
         if grad_output_buffer is not None:
             raise ValueError('torch.nn.Linear does not support grad_output_buffer != None')
 
-        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert, wrapped=True)
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         assert tp_group.size() == 1, "Not supported for TP size > 1"
 
         super().__init__(

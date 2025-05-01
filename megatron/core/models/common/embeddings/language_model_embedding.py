@@ -44,7 +44,7 @@ class LanguageModelEmbedding(MegatronModule):
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
         self.num_tokentypes = num_tokentypes
         self.scatter_to_sequence_parallel = scatter_to_sequence_parallel
-        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
+        self.tp_group = get_tensor_model_parallel_group_if_none(tp_group)
         self.reduce_scatter_embeddings = (
             (not self.add_position_embedding)
             and self.num_tokentypes <= 0

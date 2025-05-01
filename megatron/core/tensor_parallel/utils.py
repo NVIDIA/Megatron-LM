@@ -60,7 +60,7 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False, tp_group=None):
                            Default is False
 
     """
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     partition_size = torch.numel(tensor) // tp_group.size()
     start_index = partition_size * tp_group.rank()
     end_index = start_index + partition_size
@@ -87,15 +87,16 @@ def gather_split_1d_tensor(tensor, tp_group=None):
         tensor: A Tensor or view of this rank's portion of the data.
     """
     
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     numel_gathered = torch.numel(tensor) * tp_group.size()
     xm = get_xla_model()
     if xm:
-        gathered = xm.all_gather(tensor, groups=tp_group.rank_groups, pin_layout=False).view(numel_gathered)
+        wpg = WrappedProcessGroup(tp_group)
+        gathered = xm.all_gather(tensor, groups=wpg.rank_groups, pin_layout=False).view(numel_gathered)
     else:
         gathered = torch.empty(numel_gathered, dtype=tensor.dtype, device=get_current_device(), 
                                requires_grad=False)
-        dist_all_gather_func(gathered, tensor, group=tp_group.process_group)
+        dist_all_gather_func(gathered, tensor, group=tp_group)
     
     
     return gathered

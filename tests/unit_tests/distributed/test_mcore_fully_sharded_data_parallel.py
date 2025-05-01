@@ -4,7 +4,7 @@ import torch
 from packaging import version
 from torch import testing
 
-from megatron.core.wrapped_process_group import WrappedProcessGroup
+
 from megatron.core.device_utils import get_current_device, get_current_device_type
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.custom_fsdp.fully_sharded_data_parallel import (

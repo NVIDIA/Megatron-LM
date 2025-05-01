@@ -18,6 +18,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 xm = get_xla_model()
 
@@ -217,8 +218,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
         if not parallel_state.is_pipeline_first_stage():
             recv_buffer = self._allocate_recv_buffer(batch_size, seq_len)
             if xm:
+                wpg = WrappedProcessGroup(parallel_state.get_pipeline_model_parallel_group())
                 xm.mark_step()
-                recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                recv_buffer = xm.collective_permute(recv_buffer, wpg.rank_groups)
                 xm.mark_step()
             else:
                 recv_from_prev_pipeline_rank_(recv_buffer)
@@ -229,9 +231,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         if not parallel_state.is_pipeline_last_stage():
             if xm:
+                wpg = WrappedProcessGroup(parallel_state.get_pipeline_model_parallel_group())
                 xm.mark_step()
                 recv_buffer = output_tensor
-                recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                recv_buffer = xm.collective_permute(recv_buffer, wpg.rank_groups)
                 xm.mark_step()
             else:
                 send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))
@@ -306,8 +309,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
             if not parallel_state.is_pipeline_first_stage():
                 if xm:
+                    wpg = WrappedProcessGroup(parallel_state.get_pipeline_model_parallel_group())
                     xm.mark_step()
-                    recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                    recv_buffer = xm.collective_permute(recv_buffer, wpg.rank_groups)
                     xm.mark_step()
                 else:
                     recv_from_prev_pipeline_rank_(recv_buffer)
@@ -325,9 +329,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
             if not parallel_state.is_pipeline_last_stage():
                 if xm:
+                    wpg = WrappedProcessGroup(parallel_state.get_pipeline_model_parallel_group())
                     xm.mark_step()
                     recv_buffer = output_tensor
-                    recv_buffer = xm.collective_permute(recv_buffer, parallel_state.get_pipeline_model_parallel_groups())
+                    recv_buffer = xm.collective_permute(recv_buffer, wpg.rank_groups)
                     xm.mark_step()
                 else:
                     send_to_next_pipeline_rank(output_tensor.type(dtype=self.pipeline_communication_dtype))

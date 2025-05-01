@@ -341,7 +341,7 @@ def deprecate_inference_params(inference_context, inference_params):
     return inference_context
 
 
-def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True, wrapped=False):
+def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
     if tp_group is None:
@@ -354,11 +354,11 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
             )
         if is_expert:
             tp_group = parallel_state.get_expert_tensor_parallel_group(
-                check_initialized=check_initialized, wrapped=wrapped
+                check_initialized=check_initialized
             )
         else:
             tp_group = parallel_state.get_tensor_model_parallel_group(
-                check_initialized=check_initialized, wrapped=wrapped
+                check_initialized=check_initialized
             )
     return tp_group
 
@@ -891,13 +891,15 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     dim_size[0] = dim_size[0] * world_size
 
     all_gathered_input = [None, None]
+    tp_group=get_tensor_model_parallel_group()
+    tp_wpg = WrappedProcessGroup(process_group=tp_group)
     if config.sequence_parallel:
         if xm:
-            all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False)
+            all_gather_buffer = xm.all_gather(input, groups=tp_wpg.rank_groups, pin_layout=False)
         else:
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
             handle = dist_all_gather_func(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), 
+                all_gather_buffer, input, group=tp_group,
                 async_op=False
             )
 
@@ -936,11 +938,11 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
             name = "mpu_" + str((i + 1) % 2)
             handle = None
             if xm:
-                all_gather_buffer = xm.all_gather(input, groups=parallel_state.get_tensor_model_parallel_groups(), pin_layout=False)
+                all_gather_buffer = xm.all_gather(input, groups=tp_wpg.rank_groups, pin_layout=False)
             else:
                 all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
                 handle = dist_all_gather_func(
-                    all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
+                    all_gather_buffer, input, group=tp_group, async_op=True
                 )
 
             all_gathered_input[(i + 1) % 2] = all_gather_buffer

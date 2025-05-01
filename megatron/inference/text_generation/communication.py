@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core import mpu
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 xm = get_xla_model()
 
@@ -97,10 +98,10 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     
     xm = get_xla_model()
     if xm:
-        groups = mpu.get_pipeline_model_parallel_groups()
+        wpg = WrappedProcessGroup(mpu.get_pipeline_model_parallel_group())
         xm.collective_broadcast([tensor],
                          src,
-                         groups=groups, pin_layout=False)
+                         groups=wpg.rank_groups, pin_layout=False)
     else:
         group = mpu.get_pipeline_model_parallel_group()
         torch.distributed.broadcast(tensor, src, group)
@@ -157,10 +158,10 @@ def broadcast_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
         # Broadcast from last stage into the first stage.
         xm = get_xla_model()
         if xm:
-            groups = mpu.get_embedding_groups()
+            wpg = WrappedProcessGroup( mpu.get_embedding_group())
             xm.collective_broadcast([tensor],
                             src,
-                            groups=groups, pin_layout=False)
+                            groups=wpg.rank_groups, pin_layout=False)
         else:
             group = mpu.get_embedding_group()
             torch.distributed.broadcast(tensor, src, group)
@@ -199,10 +200,10 @@ def copy_from_last_to_first_pipeline_stage(size, dtype, tensor=None):
         # Broadcast from last stage into the first stage.
         xm = get_xla_model()
         if xm:
-            groups = mpu.get_embedding_groups()
+            wpg = WrappedProcessGroup( mpu.get_embedding_group())
             xm.collective_broadcast([tensor_],
                             src,
-                            groups=groups, pin_layout=False)
+                            groups=wpg.rank_groups, pin_layout=False)
         else:
             group = mpu.get_embedding_group()
             torch.distributed.broadcast(tensor_, src, group)

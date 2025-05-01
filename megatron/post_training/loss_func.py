@@ -35,12 +35,12 @@ def _mask_loss(output_tensor, loss_mask):
 
     loss = torch.cat([torch.sum(losses * loss_mask).view(1), num_tokens.view(1)])
     if args.context_parallel_size > 1:
-        all_reduce(loss, group=parallel_state.get_context_parallel_group(wrapped=True))
+        all_reduce(loss, group=parallel_state.get_context_parallel_group())
     loss = loss[0] / loss[1]
 
     if tp_reduce or is_sequence_parallel:
         # Losses on parallel tensors require extra all-reduce to sync across MP ranks.
-        all_reduce(loss, group=parallel_state.get_tensor_model_parallel_group(wrapped=True))
+        all_reduce(loss, group=parallel_state.get_tensor_model_parallel_group())
 
     return loss
 

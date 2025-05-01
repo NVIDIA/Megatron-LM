@@ -684,7 +684,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc1',
-            tp_group=parallel_state.get_expert_tensor_parallel_group(wrapped=True),
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
 
         self.activation_func = self.config.activation_func
@@ -705,7 +705,7 @@ class TEGroupedMLP(MegatronModule):
             skip_bias_add=True,
             is_expert=True,
             tp_comm_buffer_name='fc2',
-            tp_group=parallel_state.get_expert_tensor_parallel_group(wrapped=True),
+            tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
 
         if self.config.fp8:
@@ -873,7 +873,7 @@ class SequentialMLP(MegatronModule):
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
-                tp_group=parallel_state.get_expert_tensor_parallel_group(wrapped=True),
+                tp_group=parallel_state.get_expert_tensor_parallel_group(),
             )
             self.local_experts.append(expert)
 

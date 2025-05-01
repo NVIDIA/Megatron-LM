@@ -8,6 +8,7 @@ import torch.distributed
 
 from megatron.core.device_utils import get_xla_model
 from megatron.core.tensor_parallel.mappings import all_reduce
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 try:
     from torch.distributed._tensor import DTensor, distribute_tensor
@@ -108,10 +109,11 @@ def _allreduce_conditional_embedding_grads(model: List[torch.nn.Module], config:
         if grads_dict:
             # All-reduce the gradient on the first VPP rank.
             grads = [param_grad[0] for _, param_grad in grads_dict.items()]
-            coalesced = _flatten_dense_tensors(grads)
+            coalesced = _flatten_dense_tensors(grads) 
             if xm:
+                wpg = WrappedProcessGroup(process_group=parallel_state.get_pipeline_model_parallel_group())
                 coalesced=xm.all_reduce(xm.REDUCE_SUM, coalesced, 
-                                        groups=parallel_state.get_pipeline_model_parallel_groups(), 
+                                        groups=wpg.rank_groups, 
                                         pin_layout=False)
             else:
                 torch.distributed.all_reduce(
@@ -157,7 +159,7 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
             grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
             orig_grad = getattr(weight, grad_attr)
             grad = _unshard_if_dtensor(orig_grad)
-            all_reduce(tensor=grad, group=parallel_state.get_embedding_group(wrapped=True))
+            all_reduce(tensor=grad, group=parallel_state.get_embedding_group)
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
@@ -184,7 +186,7 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
         grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
         orig_grad = getattr(weight, grad_attr)
         grad = _unshard_if_dtensor(orig_grad)
-        all_reduce(tensor=grad, group=parallel_state.get_position_embedding_group(wrapped=True))
+        all_reduce(tensor=grad, group=parallel_state.get_position_embedding_group)
         setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
@@ -223,7 +225,7 @@ def _allreduce_layernorm_grads(model: List[torch.nn.Module], config: Transformer
                     grads.append(grad.data)
         if grads:
             coalesced = _flatten_dense_tensors(grads)
-            all_reduce(tensor=coalesced, group=parallel_state.get_tensor_model_parallel_group(wrapped=True))
+            all_reduce(tensor=coalesced, group=parallel_state.get_tensor_model_parallel_group())
             for param, buf, synced in zip(
                 params, grads, _unflatten_dense_tensors(coalesced, grads)
             ):
@@ -332,7 +334,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
 
         # all-reduce across DP ranks.
-        all_reduce(tensor=num_tokens, group=parallel_state.get_data_parallel_group(wrapped=True))
+        all_reduce(tensor=num_tokens, group=parallel_state.get_data_parallel_group())
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens

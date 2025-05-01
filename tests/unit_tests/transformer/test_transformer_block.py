@@ -20,7 +20,7 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock, get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.wrapped_process_group import WrappedProcessGroup
+
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
@@ -279,8 +279,8 @@ class TestProcessGroupTransformerBlock:
                 get_current_device_type(), (dp_size, tp_size, cp_size), mesh_dim_names=("dp", "tp", "cp")
             )
             # Get process groups from device mesh
-            tp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="tp"))
-            cp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="cp"))
+            tp_group = device_mesh.get_group(mesh_dim="tp")
+            cp_group = device_mesh.get_group(mesh_dim="cp")
             # Create ModelCommProcessGroups with custom process groups
             model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
         else:
@@ -358,9 +358,7 @@ class TestMixedProcessGroups:
             self.local_attn_config = copy.deepcopy(self.config)
             self.local_pgs = ModelCommProcessGroups.use_mpu_process_groups()
             self.local_attn_config.context_parallel_size = 1
-            self.local_pgs.cp = WrappedProcessGroup(
-                process_group=torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
-            )
+            self.local_pgs.cp = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
 
             # offset is implicit in TransformerLayer
             self.layers = torch.nn.ModuleList(

@@ -245,14 +245,14 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
                 )
             else:
                 xm = get_xla_model()
-                group = WrappedProcessGroup(process_group=self.data_parallel_group)
                 if xm:
+                    wpg = WrappedProcessGroup(process_group=self.data_parallel_group)
                     xm.collective_broadcast([exchange_tensor],
                             src_rank,
-                            groups=group.rank_groups, pin_layout=False)
+                            groups=wpg.rank_groups, pin_layout=False)
                 else:
                     torch.distributed.broadcast(
-                        exchange_tensor, group=group, src=src_rank
+                        exchange_tensor, group=self.data_parallel_group, src=src_rank
                     )
             self._distribute_data_to_state_dict(ten_meta, exchange_tensor, sharded_state_dict)
             logger.debug(f'exchange {ten_meta.sharded_tensor_no_data.key} done')

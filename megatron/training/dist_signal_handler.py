@@ -58,7 +58,6 @@ def all_gather_item(item, dtype, group:Optional[WrappedProcessGroup]=None, async
         groups = group.rank_groups if group else None
         output_tensors = list(xm.all_gather(tensor, groups=groups).split(tensor.size()[0]), pin_layout=False)
     else:
-        group = group.process_group if group else None
         output_tensors = [
             torch.zeros(1, dtype=tensor.dtype, device=tensor.device)
             for _ in range(group_size)

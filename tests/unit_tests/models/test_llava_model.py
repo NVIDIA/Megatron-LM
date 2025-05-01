@@ -16,7 +16,7 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_reduce
-from megatron.core.wrapped_process_group import WrappedProcessGroup
+
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -981,7 +981,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
                 if not hasattr(p, 'tensor_model_parallel')
             ]
         )
-        group = ps.get_tensor_model_parallel_group(wrapped=True)
+        group = ps.get_tensor_model_parallel_group()
         test_vit_params_tensor = torch.tensor([test_vit_tp_params], dtype=torch.int32).to(device=get_current_device())
         all_reduce(tensor=test_vit_params_tensor, group=group)
         total_test_vit_tp_params = test_vit_params_tensor.item()

@@ -16,7 +16,7 @@ class WrappedProcessGroup(object):
     def __init__(self, process_group: torch.distributed.ProcessGroup=torch.distributed.group.WORLD,
                  rank_groups: Optional[List[List[int]]]=None):
         self.__process_group = process_group 
-        self.__rank_groups = rank_groups if rank_groups else self.__all_rank_groups() if xm else None
+        self.__rank_groups = self.__all_rank_groups() if xm else None
 
     def __all_rank_groups(self) -> List[List[int]]:
         """Gets all the ranks of all processes in the group.
@@ -44,11 +44,11 @@ class WrappedProcessGroup(object):
             for _ in range(num_rank_groups):
                 _ranks = [world_ranks[0]]
                 for j in range(1,group_size,1):
-                    _ranks.append(world_ranks[j-1]+ strides[j-1])
+                    _ranks.append(_ranks[j-1]+ strides[j-1])
                 all_ranks.append(_ranks)
                 world_ranks = [ r for r in world_ranks if r not in _ranks]
 
-            assert group_ranks in all_ranks
+            assert group_ranks in all_ranks, f"{group_ranks} not in {all_ranks}"
             return all_ranks
         except Exception as e:
             traceback.print_exc()

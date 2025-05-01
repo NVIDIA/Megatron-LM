@@ -7,7 +7,6 @@ import torch
 
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -131,7 +130,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             vocab_parallel_logits
         )
         xm = get_xla_model()
-        all_reduce(tensor=logits_max, group=get_tensor_model_parallel_group(wrapped=True), 
+        all_reduce(tensor=logits_max, group=get_tensor_model_parallel_group(), 
                    op=torch.distributed.ReduceOp.MAX)
 
         # Get the partition's vocab indices
@@ -148,8 +147,8 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         )
 
         # All reduce is needed to get the chunks from other GPUs.
-        all_reduce(tensor=predicted_logits, group=get_tensor_model_parallel_group(wrapped=True))
-        all_reduce(tensor=sum_exp_logits, group=get_tensor_model_parallel_group(wrapped=True))
+        all_reduce(tensor=predicted_logits, group=get_tensor_model_parallel_group())
+        all_reduce(tensor=sum_exp_logits, group=get_tensor_model_parallel_group())
     
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
             exp_logits, predicted_logits, sum_exp_logits

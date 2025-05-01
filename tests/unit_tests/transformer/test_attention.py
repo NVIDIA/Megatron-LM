@@ -13,7 +13,7 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.wrapped_process_group import WrappedProcessGroup
+
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.device_utils import get_current_device, get_current_device_type
 
@@ -188,8 +188,8 @@ class TestSelfAttention:
         model_parallel_device_manual_seed(123)
 
         # Get TP and CP process groups from device mesh
-        tp_group = parallel_state.get_tensor_model_parallel_group(wrapped=True)
-        cp_group = parallel_state.get_context_parallel_group(wrapped=True)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
 
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
 
@@ -216,8 +216,8 @@ class TestSelfAttention:
             get_current_device_type(), (tp_size, cp_size), mesh_dim_names=("tp", "cp")
         )
         # Get TP and CP process groups from device mesh
-        tp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="tp"))
-        cp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="cp"))
+        tp_group = device_mesh.get_group(mesh_dim="tp")
+        cp_group = device_mesh.get_group(mesh_dim="cp")
 
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
 

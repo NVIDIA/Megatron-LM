@@ -7,7 +7,6 @@ from typing import List, Optional
 
 import torch
 
-from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.core import parallel_state
 
 
@@ -42,47 +41,47 @@ class ModelCommProcessGroups:
     """
 
     # _TENSOR_MODEL_PARALLEL_GROUP
-    tp: WrappedProcessGroup = field(init=False)
+    tp: torch.distributed.ProcessGroup = field(init=False)
 
     # _PIPELINE_MODEL_PARALLEL_GROUP
-    pp: WrappedProcessGroup = field(init=False)
+    pp: torch.distributed.ProcessGroup = field(init=False)
 
     # _MODEL_PARALLEL_GROUP
-    mp: WrappedProcessGroup = field(init=False)
+    mp: torch.distributed.ProcessGroup = field(init=False)
 
     # _EMBEDDING_GROUP
-    embd: WrappedProcessGroup = field(init=False)
+    embd: torch.distributed.ProcessGroup = field(init=False)
 
     # _POSITION_EMBEDDING_GROUP
-    pos_embd: WrappedProcessGroup = field(init=False)
+    pos_embd: torch.distributed.ProcessGroup = field(init=False)
 
     # _CONTEXT_PARALLEL_GROUP
-    cp: WrappedProcessGroup = field(init=False)
+    cp: torch.distributed.ProcessGroup = field(init=False)
 
     # _TENSOR_AND_CONTEXT_PARALLEL_GROUP
-    tp_cp: WrappedProcessGroup = field(init=False)
+    tp_cp: torch.distributed.ProcessGroup = field(init=False)
 
     # _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
-    hcp: List[WrappedProcessGroup] = field(init=False)
+    hcp: List[torch.distributed.ProcessGroup] = field(init=False)
 
     # _EXPERT_MODEL_PARALLEL_GROUP
-    ep: WrappedProcessGroup = field(init=False)
+    ep: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_PARALLEL_GROUP
-    expt_tp: WrappedProcessGroup = field(init=False)
+    expt_tp: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
-    tp_ep: WrappedProcessGroup = field(init=False)
+    tp_ep: torch.distributed.ProcessGroup = field(init=False)
 
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
-    tp_ep_pp: WrappedProcessGroup = field(init=False)
+    tp_ep_pp: torch.distributed.ProcessGroup = field(init=False)
 
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
     # TODO (Hepteract): remove this once distributed checkpoint is refactored
     # _EXPERT_DATA_PARALLEL_GROUP
-    expt_dp: WrappedProcessGroup = field(init=False)
+    expt_dp: torch.distributed.ProcessGroup = field(init=False)
 
     def __init__(self, **kwargs):
         for key in kwargs:
@@ -132,7 +131,7 @@ class ModelCommProcessGroups:
         }
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group
-        init_dict = {pg: pg_to_func[pg](check_initialized=False, wrapped=True) for pg in required_pgs}
+        init_dict = {pg: pg_to_func[pg](check_initialized=False) for pg in required_pgs}
 
         return cls(**init_dict)
 

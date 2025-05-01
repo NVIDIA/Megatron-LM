@@ -1,6 +1,7 @@
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch.nn.functional as F
 import torch
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.training import print_rank_0, get_args
 from megatron.core import mpu
 from megatron.legacy.data.vit_dataset import ClassificationTransform
@@ -70,7 +71,8 @@ def compute_feature_bank(model):
 
     xm = get_xla_model()
     if xm:
-        feature_banks = list(xm.all_gather(feature_bank, groups=mpu.get_data_parallel_groups(), pin_layout=False).split(feature_bank.size()[0]))
+        wpg = WrappedProcessGroup(mpu.get_data_parallel_group())
+        feature_banks = list(xm.all_gather(feature_bank, groups=wpg.rank_groups, pin_layout=False).split(feature_bank.size()[0]))
     else:
         feature_banks = [torch.zeros_like(feature_bank)
                         for i in range(mpu.get_data_parallel_world_size())]
@@ -82,7 +84,8 @@ def compute_feature_bank(model):
                               feature_bank))
 
     if xm:
-        feature_labels = list(xm.all_gather(feature_label, groups=mpu.get_data_parallel_groups(), pin_layout=False).split(feature_label.size()[0]))
+        wpg = WrappedProcessGroup(mpu.get_data_parallel_group())
+        feature_labels = list(xm.all_gather(feature_label, groups=wpg.rank_groups, pin_layout=False).split(feature_label.size()[0]))
     else:
         feature_labels = [torch.zeros_like(feature_label)
                         for i in range(mpu.get_data_parallel_world_size())]

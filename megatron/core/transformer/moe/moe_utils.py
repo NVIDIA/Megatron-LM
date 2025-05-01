@@ -3,7 +3,6 @@
 import math
 from typing import List, Optional, Union
 
-from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
@@ -649,15 +648,15 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
         values = tracker[name]["values"]
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Collect aux losses across PP.
-        all_reduce(tensor=values, group=parallel_state.get_pipeline_model_parallel_group(wrapped=True))
+        all_reduce(tensor=values, group=parallel_state.get_pipeline_model_parallel_group())
 
         # Reduce aux losses across ranks.
         if tracker[name].get('reduce_group') is not None:
-            group = WrappedProcessGroup(tracker[name].get('reduce_group'))
+            group = tracker[name].get('reduce_group')
             all_reduce(tensor=values, group=group)
             
         if tracker[name].get('avg_group') is not None:
-            group = WrappedProcessGroup(tracker[name].get('avg_group'))
+            group = tracker[name].get('avg_group')
             all_reduce(tensor=values, group=group)
             values = values / group.size()
 
@@ -744,7 +743,7 @@ def get_updated_expert_bias(tokens_per_expert, expert_bias, expert_bias_update_r
         # All Reduce Across TPxCPxDP group
         all_reduce(
             tensor=tokens_per_expert, 
-            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True, wrapped=True)
+            group=parallel_state.get_tensor_and_data_parallel_group(with_context_parallel=True)
         )
         average_tokens = tokens_per_expert.sum(dim=-1, keepdim=True) / tokens_per_expert.shape[-1]
         offset = average_tokens - tokens_per_expert
@@ -785,11 +784,11 @@ def get_default_model_comm_pgs():
         ModelCommProcessGroups: The default process groups for MoE.
     """
     model_comm_pgs = ModelCommProcessGroups()
-    model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group(wrapped=True)
-    model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group(wrapped=True)
-    model_comm_pgs.cp = parallel_state.get_context_parallel_group(wrapped=True)
-    model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group(wrapped=True)
-    model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group(wrapped=True)
-    model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group(wrapped=True)
-    model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group(wrapped=True)
+    model_comm_pgs.ep = parallel_state.get_expert_model_parallel_group()
+    model_comm_pgs.tp = parallel_state.get_tensor_model_parallel_group()
+    model_comm_pgs.cp = parallel_state.get_context_parallel_group()
+    model_comm_pgs.expt_tp = parallel_state.get_expert_tensor_parallel_group()
+    model_comm_pgs.expt_dp = parallel_state.get_expert_data_parallel_group()
+    model_comm_pgs.tp_ep = parallel_state.get_expert_tensor_and_model_parallel_group()
+    model_comm_pgs.tp_cp = parallel_state.get_tensor_and_context_parallel_group()
     return model_comm_pgs

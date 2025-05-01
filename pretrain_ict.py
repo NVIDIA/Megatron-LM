@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
@@ -51,11 +52,12 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
     def forward(ctx, input_):
         assert input_.dim() == 2
         
+        group = mpu.get_data_parallel_group()
         if xm:
             xm.mark_step()
-            output = xm.all_gather(input_, groups=mpu.get_data_parallel_groups(), pin_layout=False)
+            wpg = WrappedProcessGroup(process_group=group)
+            output = xm.all_gather(input_, groups=wpg.rank_groups, pin_layout=False)
         else:
-            group = mpu.get_data_parallel_group()
             tensor_list = [torch.empty_like(input_) for _ in range(group.size())]
             tensor_list[group.rank()] = input_
             torch.distributed.all_gather(tensor_list, input_, group=group)

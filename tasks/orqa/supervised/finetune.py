@@ -10,6 +10,7 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 import torch.nn.functional as F
 
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.training import get_args, get_timers, get_tokenizer, print_rank_0
 from megatron.core import mpu
 from megatron.legacy.indexer import IndexBuilder
@@ -22,7 +23,7 @@ from tasks.orqa.supervised.eval_utils import process_batch, task_collate_fn
 from tasks.orqa.evaluate_utils import ORQAEvaluator
 
 # input_ is a 2D tensor
-def check_and_append_tensor_for_gather(group, rank, world_size, input_, groups=None):
+def check_and_append_tensor_for_gather(group, rank, world_size, input_):
 
     # gather the size of the first dimension of the tensor from all ranks
     current_length = input_.size()[0]
@@ -30,7 +31,8 @@ def check_and_append_tensor_for_gather(group, rank, world_size, input_, groups=N
         device=get_current_device())
     xm = get_xla_model()
     if xm:
-        input_list = list(xm.all_gather(first_dim, groups=groups, pin_layout=False).split(first_dim.size()[0]), pin_layout=False)
+        wpg = WrappedProcessGroup(process_group=group)
+        input_list = list(xm.all_gather(first_dim, groups=wpg.rank_groups, pin_layout=False).split(first_dim.size()[0]), pin_layout=False)
     else:
         input_list = [torch.empty_like(first_dim) for _ in range(world_size)]
         input_list[rank].copy_(first_dim)
@@ -78,12 +80,9 @@ def orqa(Dataset):
             context_list.append(tokenizer.decode(context_tokens[i].tolist()))
 
         if neg_context_tokens is not None:
-            neg_context_tokens = check_and_append_tensor_for_gather(group,
-                rank, world_size, neg_context_tokens, groups=mpu.get_data_parallel_groups())
-            neg_context_mask = check_and_append_tensor_for_gather(group,
-                rank, world_size, neg_context_mask, groups=mpu.get_data_parallel_groups())
-            neg_context_types = check_and_append_tensor_for_gather(group,
-                rank, world_size, neg_context_types, groups=mpu.get_data_parallel_groups())
+            neg_context_tokens = check_and_append_tensor_for_gather(group, rank, world_size, neg_context_tokens)
+            neg_context_mask = check_and_append_tensor_for_gather(group, rank, world_size, neg_context_mask)
+            neg_context_types = check_and_append_tensor_for_gather(group, rank, world_size, neg_context_types)
 
         if neg_context_tokens is not None:
             context_tokens = torch.cat([context_tokens, neg_context_tokens])
@@ -109,12 +108,12 @@ def orqa(Dataset):
 
         if world_size > 1:
             xm = get_xla_model()
-            groups = mpu.get_data_parallel_groups()
+            wpg = WrappedProcessGroup(group)
             input_ = torch.empty_like(context_logits).copy_(\
                 context_logits).detach_()
            
             if xm:
-                tensor_list = list(xm.all_gather(input_, groups=groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
+                tensor_list = list(xm.all_gather(input_, groups=wpg.rank_groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
             else:
                 tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
                 tensor_list[rank].copy_(input_)
@@ -132,7 +131,7 @@ def orqa(Dataset):
             input_ = torch.empty_like(query_logits).copy_(\
                 query_logits).detach_()
             if xm:
-                tensor_list = list(xm.all_gather(input_, groups=groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
+                tensor_list = list(xm.all_gather(input_, groups=wpg.rank_groups, pin_layout=False).split(input_.size()[0]), pin_layout=False)
             else:
                 tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
                 tensor_list[rank].copy_(input_)

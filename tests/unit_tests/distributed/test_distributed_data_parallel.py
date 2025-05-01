@@ -10,7 +10,7 @@ from megatron.core.device_utils import get_current_device, get_current_device_ty
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from megatron.core.transformer import TransformerConfig
-from megatron.core.wrapped_process_group import WrappedProcessGroup
+
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -85,8 +85,8 @@ class TestDistributedDataParallel:
         model_comm_pgs = ModelCommProcessGroups()
 
         grad_comm_pgs.dp = device_mesh.get_group(mesh_dim="dp")
-        model_comm_pgs.pp = WrappedProcessGroup(device_mesh.get_group(mesh_dim="pp"))
-        model_comm_pgs.ep = WrappedProcessGroup(device_mesh.get_group(mesh_dim="ep"))
+        model_comm_pgs.pp = device_mesh.get_group(mesh_dim="pp")
+        model_comm_pgs.ep = device_mesh.get_group(mesh_dim="ep")
 
         # Wrap second model with minimal process groups (only dp)
         ddp_model2 = DistributedDataParallel(

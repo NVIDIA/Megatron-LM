@@ -17,11 +17,9 @@ from megatron.core.models.common.embeddings.rope_utils import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_data_parallel_group,
-    get_data_parallel_groups,
     get_data_parallel_rank,
     get_data_parallel_world_size,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -29,6 +27,7 @@ from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import deprecate_inference_params, divide, is_fa_min_version
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -777,7 +776,8 @@ class SelfAttention(Attention):
         )
    
         if xm:
-            dp_list = list(xm.all_gather(inputs, groups=get_data_parallel_groups(), pin_layout=False).split(inputs.size()[0]))
+            wpg = WrappedProcessGroup(get_data_parallel_group())
+            dp_list = list(xm.all_gather(inputs, groups=wpg.rank_groups, pin_layout=False).split(inputs.size()[0]))
         else:
             dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
             dp_list[rank] = inputs
@@ -806,7 +806,8 @@ class SelfAttention(Attention):
             )
 
         if xm:
-            tp_list = list(xm.all_gather(inputs, groups=get_tensor_model_parallel_groups(), pin_layout=False).split(inputs.size()[0]))
+            wpg = WrappedProcessGroup(get_tensor_model_parallel_group())
+            tp_list = list(xm.all_gather(inputs, groups=wpg.rank_groups, pin_layout=False).split(inputs.size()[0]))
         else:
             rank = get_tensor_model_parallel_rank()
             tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]

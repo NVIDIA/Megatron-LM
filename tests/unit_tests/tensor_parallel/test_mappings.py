@@ -12,7 +12,7 @@ def test_CopyToModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.ones((1)).to(get_current_device()) * Utils.rank
 
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
 
     class Ctx:
         group = tp_group
@@ -33,7 +33,7 @@ def test_ReduceFromModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.ones((1)).to(get_current_device()) * Utils.rank
 
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
     output_data = mappings._ReduceFromModelParallelRegion.symbolic(None, input_data, tp_group)
 
     result = torch.ones(1).to(get_current_device())
@@ -56,7 +56,7 @@ def test_ScatterToModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).to(get_current_device())
 
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
     output_data = mappings.scatter_to_tensor_model_parallel_region(input_data)
 
     req_dim = int(Utils.rank % (Utils.world_size / 2))
@@ -84,7 +84,7 @@ def test_GatherFromModelParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).to(get_current_device())
 
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
     req_dim = int(Utils.rank % (Utils.world_size / 2))
 
     class Ctx:
@@ -115,7 +115,7 @@ def test_ScatterToSequenceParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.rand((8, 4)).to(get_current_device())
 
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
     req_dim = int(Utils.rank % (Utils.world_size / 2)) * 2
     output_data = mappings._ScatterToSequenceParallelRegion.symbolic(None, input_data, tp_group)
     assert torch.equal(output_data, input_data[req_dim : req_dim + 2, :])
@@ -142,7 +142,7 @@ def test_GatherFromSequenceParallelRegion():
     Utils.initialize_model_parallel(4, 2)
     input_data = torch.ones(4).to(get_current_device()) * Utils.rank
 
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
     output_data = mappings.gather_from_sequence_parallel_region(input_data)
     expected_output = torch.concat((
         torch.ones(4)*0,
@@ -179,7 +179,7 @@ def test_ReduceScatterToSequenceParallelRegion():
         (torch.ones(4) * 0, torch.ones(4) * 1, torch.ones(4) * 2, torch.ones(4) * 3)
     ).to(get_current_device())
 
-    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None, wrapped=True)
+    tp_group = get_tensor_model_parallel_group_if_none(tp_group=None)
     output_data = mappings.reduce_scatter_to_sequence_parallel_region(input_data)
     expected_output = torch.ones(4).to(get_current_device()) * 4 * int(Utils.rank % 4)
     assert torch.equal(output_data[0], expected_output)

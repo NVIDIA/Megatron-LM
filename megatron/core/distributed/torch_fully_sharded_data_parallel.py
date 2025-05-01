@@ -79,7 +79,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
         },
-        group: Optional[WrappedProcessGroup] = None,
+        group: Optional[torch.distributed.ProcessGroup] = None,
     ):
 
         assert (
@@ -89,21 +89,22 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
         super().__init__(config=config, module=module)
 
         if group is None:
-            self.group = parallel_state.get_data_parallel_group(with_context_parallel=True, wrapped=True)
+            self.group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         else:
             self.group = group
 
         if xm:
             # Define the mesh following common SPMD practice
+            wpg = WrappedProcessGroup(self.group)
             num_devices = xr.global_runtime_device_count()
             device_ids = np.array(range(num_devices))
-            mesh_shape = (len(self.group.rank_groups[0]), len(self.group.rank_groups))
+            mesh_shape = (len(wpg.rank_groups[0]), len(wpg.rank_groups))
             # To be noted, the mesh must have an axis named 'fsdp', 
             # # which the weights and activations will be sharded on.
             self.mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'model'))
             kwargs = {"mesh": self.mesh}
         else:
-            self.mesh = DeviceMesh.from_group(self.group.process_group, get_current_device_type())
+            self.mesh = DeviceMesh.from_group(self.group, get_current_device_type())
             kwargs = {"mesh": self.mesh}
 
         def save_custom_attrs(module):

@@ -150,13 +150,13 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         sharded_norm_2 = sharded_norm * sharded_norm
         # Sum over all DP groups.
         all_reduce(
-            sharded_norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group(wrapped=True)
+            sharded_norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group
         )
         norm_2 += sharded_norm_2
 
     if custom_fsdp_all_param_is_shared:
         all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group(wrapped=True)
+            norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group
         )
 
     # Add norm contribution from expert layers in MoEs.
@@ -173,7 +173,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             all_reduce(
                 moe_norm_2,
                 op=torch.distributed.ReduceOp.SUM,
-                group=mpu.get_expert_data_parallel_group(wrapped=True),
+                group=mpu.get_expert_data_parallel_group(),
             )
     # Account for MoE norm even if current rank doesn't have any expert params to prevent
     # hang in models with un-even numbers of MoE layers.
@@ -211,7 +211,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
-    all_reduce(averaged_losses, group=mpu.get_data_parallel_group(wrapped=True))
+    all_reduce(averaged_losses, group=mpu.get_data_parallel_group())
     averaged_losses = averaged_losses / torch.distributed.get_world_size(
         group=mpu.get_data_parallel_group()
     )
@@ -230,7 +230,7 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float:
     if stat is None:
         stat = -1.0
     stat = torch.tensor([stat], dtype=torch.float32, device=get_current_device())
-    all_reduce(tensor=stat, group=mpu.get_model_parallel_group(wrapped=True), op=torch.distributed.ReduceOp.MAX)
+    all_reduce(tensor=stat, group=mpu.get_model_parallel_group(), op=torch.distributed.ReduceOp.MAX)
     if stat.item() == -1.0:
         return None
     else:
@@ -246,7 +246,7 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
     else:
         input = 0
     input = torch.tensor([input], dtype=torch.int, device=get_current_device())
-    all_reduce(tensor=input, group=mpu.get_model_parallel_group(wrapped=True), op=torch.distributed.ReduceOp.MIN)
+    all_reduce(tensor=input, group=mpu.get_model_parallel_group(), op=torch.distributed.ReduceOp.MIN)
     return bool(input.item())
 
 
@@ -466,9 +466,10 @@ def get_batch_on_this_tp_rank(data_iterator):
        if item is not None:
             xm = get_xla_model()
             if xm:
+                wpg = WrappedProcessGroup(process_group=mpu.get_tensor_model_parallel_group())
                 xm.collective_broadcast([item],
                                 mpu.get_tensor_model_parallel_src_rank(),
-                                groups=mpu.get_tensor_model_parallel_groups(), 
+                                groups=wpg.rank_groups, 
                                 pin_layout=False)
             else:
                 torch.distributed.broadcast(item, mpu.get_tensor_model_parallel_src_rank(), 

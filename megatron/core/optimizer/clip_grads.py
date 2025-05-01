@@ -84,9 +84,6 @@ def get_grad_norm_fp32(
     for grad in grads_for_norm:
         data_parallel_group = get_data_parallel_group_if_dtensor(grad, data_parallel_group)
 
-    if data_parallel_group:
-        data_parallel_group = WrappedProcessGroup(process_group=data_parallel_group)
-
     grads_for_norm = [to_local_if_dtensor(grad) for grad in grads_for_norm]
 
     # Norm parameters.

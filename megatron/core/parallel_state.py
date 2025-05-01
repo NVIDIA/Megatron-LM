@@ -8,9 +8,7 @@ from datetime import timedelta
 from functools import partial
 from typing import Callable, List, Optional
 
-from megatron.core.wrapped_process_group import WrappedProcessGroup
-
-from .device_utils import get_current_device, get_xla_model, get_xla_runtime
+from .device_utils import get_xla_model, get_xla_runtime
 import einops
 import numpy as np
 import torch
@@ -19,6 +17,9 @@ from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 xm = get_xla_model()
 xr = get_xla_runtime()
+
+#  None for CUDA, and 'gloo' backend group with all ranks for XLA
+_DEFAULT_PROCESS_GROUP = None
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -131,35 +132,6 @@ _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
 # Memory buffers to avoid dynamic memory allocation
 _GLOBAL_MEMORY_BUFFER = None
 
-# MOE logging
-_MOE_LAYER_WISE_LOGGING_TRACKER = {}
-
-#  None for CUDA, and 'gloo' backend group with all ranks for XLA
-_DEFAULT_PROCESS_GROUP = None
-
-# Groups: list of lists of ranks: Only used with XLA
-_MODEL_PARALLEL_GROUPS = []
-_TENSOR_AND_DATA_PARALLEL_GROUPS= []
-_MODEL_AND_EXPERT_PARALLEL_GROUPS = []
-_EMBEDDING_GROUPS = []
-_POSITION_EMBEDDING_GROUPS = []
-_PIPELINE_MODEL_PARALLEL_GROUPS = []
-_DATA_PARALLEL_GROUPS = []
-_TENSOR_MODEL_PARALLEL_GROUPS = []
-_CONTEXT_PARALLEL_GROUPS = []
-_DATA_PARALLEL_WITH_CP_GROUPS = []
-_INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
-_INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
-_TENSOR_AND_CONTEXT_PARALLEL_GROUPS = []
-_TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS = []
-
-# Begin expert related
-_EXPERT_MODEL_PARALLEL_GROUPS = []
-_EXPERT_TENSOR_PARALLEL_GROUPS = []
-_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUPS = []
-_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS = []
-_EXPERT_DATA_PARALLEL_GROUPS = []
-# End expert related
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
@@ -849,15 +821,11 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP
     global _DATA_PARALLEL_GROUP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS
-    global _DATA_PARALLEL_GROUPS
     global _DATA_PARALLEL_GROUP_WITH_CP
-    global _DATA_PARALLEL_WITH_CP_GROUPS
     global _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
-    global _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
-    global _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
     for ranks in generator_wrapper('dp'):
@@ -873,7 +841,6 @@ def initialize_model_parallel(
             )
         else:
             group_gloo = None
-        _DATA_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _DATA_PARALLEL_GROUP = group
             _DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -895,7 +862,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs),
             group_desc='DATA_PARALLEL_GROUP_WITH_CP',
         )
-        _DATA_PARALLEL_WITH_CP_GROUPS.append(ranks_with_cp)
         if create_gloo_process_groups:
             group_with_cp_gloo = create_group(
                 ranks_with_cp,
@@ -918,7 +884,6 @@ def initialize_model_parallel(
                         (i + 1) * intra_partial_data_parallel_size
                     )
                 ]
-                _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS.append(intra_partial_dp_ranks_with_cp)
                 intra_partial_dp_group_with_cp = create_group(
                     intra_partial_dp_ranks_with_cp,
                     timeout=timeout,
@@ -942,7 +907,6 @@ def initialize_model_parallel(
         else:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
-            _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = _DATA_PARALLEL_WITH_CP_GROUPS
 
     # Apply SHARP to DP process groups
     if use_sharp and torch.cuda.is_available():
@@ -959,7 +923,7 @@ def initialize_model_parallel(
             )
         torch.distributed.barrier(
             group=get_data_parallel_group(with_context_parallel=True),
-            device_ids=[get_current_device()],
+            device_ids=[torch.cuda.current_device()],
         )
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
         os.environ["NCCL_COLLNET_ENABLE"] = "0"
@@ -967,7 +931,6 @@ def initialize_model_parallel(
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
-    global _CONTEXT_PARALLEL_GROUPS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
     for ranks in generator_wrapper('cp'):
         group = create_group(
@@ -976,7 +939,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('cp', nccl_comm_cfgs),
             group_desc='CONTEXT_PARALLEL_GROUP',
         )
-        _CONTEXT_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _CONTEXT_PARALLEL_GROUP = group
             _CONTEXT_PARALLEL_GLOBAL_RANKS = ranks
@@ -997,7 +959,6 @@ def initialize_model_parallel(
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
-    global _MODEL_PARALLEL_GROUPS
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
     for ranks in generator_wrapper('tp-pp'):
@@ -1007,7 +968,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('mp', nccl_comm_cfgs),
             group_desc='MODEL_PARALLEL_GROUP',
         )
-        _MODEL_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _MODEL_PARALLEL_GROUP = group
             _MODEL_PARALLEL_GLOBAL_RANKS = ranks
@@ -1015,7 +975,6 @@ def initialize_model_parallel(
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
     global _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS
-    global _TENSOR_MODEL_PARALLEL_GROUPS
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
@@ -1026,7 +985,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('tp', nccl_comm_cfgs),
             group_desc='TENSOR_MODEL_PARALLEL_GROUP',
         )
-        _TENSOR_MODEL_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _TENSOR_MODEL_PARALLEL_GROUP = group
             _TENSOR_MODEL_PARALLEL_GLOBAL_RANKS = ranks
@@ -1035,17 +993,14 @@ def initialize_model_parallel(
     # (first and last rank in each pipeline model-parallel group).
     global _PIPELINE_MODEL_PARALLEL_GROUP
     global _PIPELINE_GLOBAL_RANKS
-    global _PIPELINE_MODEL_PARALLEL_GROUPS
     assert (
         _PIPELINE_MODEL_PARALLEL_GROUP is None
     ), 'pipeline model parallel group is already initialized'
     global _EMBEDDING_GROUP
     global _EMBEDDING_GLOBAL_RANKS
-    global _EMBEDDING_GROUPS
     assert _EMBEDDING_GROUP is None, 'embedding group is already initialized'
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
-    global _POSITION_EMBEDDING_GROUPS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
     if pipeline_model_parallel_comm_backend == 'ucc':
         # The UCC backend provides two key benefits:
@@ -1111,7 +1066,6 @@ def initialize_model_parallel(
             ),
             group_desc='PIPELINE_MODEL_PARALLEL_GROUP',
         )
-        _PIPELINE_MODEL_PARALLEL_GROUPS.append(ranks)
         assert (
             pipeline_model_parallel_comm_backend == None
             or pipeline_model_parallel_comm_backend == 'nccl'
@@ -1136,7 +1090,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('embd', nccl_comm_cfgs),
             group_desc='EMBEDDING_GROUP',
         )
-        _EMBEDDING_GROUPS.append(embedding_ranks)
         if rank in embedding_ranks:
             _EMBEDDING_GROUP = group
             _EMBEDDING_GLOBAL_RANKS = embedding_ranks
@@ -1148,7 +1101,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('pos_embd', nccl_comm_cfgs),
             group_desc='POSITION_EMBEDDING_GROUP',
         )
-        _POSITION_EMBEDDING_GROUPS.append(position_embedding_ranks)
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
@@ -1156,8 +1108,6 @@ def initialize_model_parallel(
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     global _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
-    global _TENSOR_AND_DATA_PARALLEL_GROUPS
-    global _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS
     assert (
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
@@ -1168,7 +1118,6 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('tp_dp_cp', nccl_comm_cfgs),
             group_desc='TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP',
         )
-        _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS.append(ranks)
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
     for ranks in generator_wrapper('tp-dp'):
@@ -1178,12 +1127,10 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('tp_dp', nccl_comm_cfgs),
             group_desc='TENSOR_AND_DATA_PARALLEL_GROUP',
         )
-        _TENSOR_AND_DATA_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP = group
 
     global _TENSOR_AND_CONTEXT_PARALLEL_GROUP
-    global _TENSOR_AND_CONTEXT_PARALLEL_GROUPS
     assert (
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
@@ -1194,14 +1141,12 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('tp_cp', nccl_comm_cfgs),
             group_desc='TENSOR_AND_CONTEXT_PARALLEL_GROUP',
         )
-        _TENSOR_AND_CONTEXT_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP = group
 
     ### Expert-related parallel groups initialization
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP
-    global _EXPERT_MODEL_PARALLEL_GROUPS
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
     for ranks in generator_wrapper('ep', is_expert=True):
         group = create_group(
@@ -1209,13 +1154,11 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('ep', nccl_comm_cfgs),
             group_desc='EXPERT_MODEL_PARALLEL_GROUP',
         )
-        _EXPERT_MODEL_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _EXPERT_MODEL_PARALLEL_GROUP = group
 
     # Build the expert tensor parallel group
     global _EXPERT_TENSOR_PARALLEL_GROUP
-    global _EXPERT_TENSOR_PARALLEL_GROUPS
     assert (
         _EXPERT_TENSOR_PARALLEL_GROUP is None
     ), 'Expert tensor model parallel group is already initialized'
@@ -1226,13 +1169,11 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('ep_tp', nccl_comm_cfgs),
             group_desc='EXPERT_TENSOR_PARALLEL_GROUP',
         )
-        _EXPERT_TENSOR_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _EXPERT_TENSOR_PARALLEL_GROUP = group
 
     # Build the tensor + expert parallel groups
     global _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
-    global _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUPS
     assert (
         _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is None
     ), 'Expert tensor + model parallel group is already initialized'
@@ -1243,13 +1184,11 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('tp_ep_mp', nccl_comm_cfgs),
             group_desc='EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP',
         )
-        _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = group
 
     # Build the expert+tensor+pipeline parallel groups
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
-    global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS
     assert (
         _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is None
     ), 'The expert_tensor_model_pipeline parallel group is already initialized'
@@ -1260,13 +1199,11 @@ def initialize_model_parallel(
             pg_options=get_nccl_options('tp_ep_pp', nccl_comm_cfgs),
             group_desc='EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP',
         )
-        _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = group
 
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
-    global _EXPERT_DATA_PARALLEL_GROUPS
     assert _EXPERT_DATA_PARALLEL_GROUP is None, 'Expert data group is already initialized'
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, 'Expert data group-gloo is already initialized'
@@ -1303,7 +1240,6 @@ def initialize_model_parallel(
             )
         else:
             group_gloo = None
-        _EXPERT_DATA_PARALLEL_GROUPS.append(ranks)
         if rank in ranks:
             _EXPERT_DATA_PARALLEL_GROUP = group
             _EXPERT_DATA_PARALLEL_GROUP_GLOO = group_gloo
@@ -1389,141 +1325,82 @@ def model_parallel_is_initialized():
         return False
     return True
 
+def get_default_process_group():
+    global _DEFAULT_PROCESS_GROUP
+    assert xm is None or _DEFAULT_PROCESS_GROUP is not None, \
+        "_DEFAULT_PROCESS_GROUP is None for XLA" 
+    return _DEFAULT_PROCESS_GROUP
 
-def get_model_parallel_group(check_initialized=True, wrapped=False):
+def get_model_parallel_group(check_initialized=True):
     """Get the model-parallel group the caller rank belongs to."""
     if check_initialized:
         assert _MODEL_PARALLEL_GROUP is not None, 'model parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_MODEL_PARALLEL_GROUP,
-        rank_groups=get_model_parallel_groups() if xm else None
-    ) if wrapped else _MODEL_PARALLEL_GROUP
-
-def get_model_parallel_groups() -> List[List[int]]:
-    assert _MODEL_PARALLEL_GROUPS, 'model parallel groups is not initialized'
-    return _MODEL_PARALLEL_GROUPS
+    return _MODEL_PARALLEL_GROUP
 
 
-def get_tensor_model_parallel_group(check_initialized=True, wrapped=False):
-    """Get the tensor model parallel group the caller rank belongs to."""
+def get_tensor_model_parallel_group(check_initialized=True):
+    """Get the tensor-model-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
             _TENSOR_MODEL_PARALLEL_GROUP is not None
         ), 'tensor model parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_TENSOR_MODEL_PARALLEL_GROUP,
-        rank_groups=get_tensor_model_parallel_groups(check_initialized=check_initialized) if xm else None
-    ) if wrapped else _TENSOR_MODEL_PARALLEL_GROUP
+    return _TENSOR_MODEL_PARALLEL_GROUP
 
-def get_tensor_model_parallel_groups(check_initialized=True) -> List[List[int]]:
-    if check_initialized:
-        assert (
-            _TENSOR_MODEL_PARALLEL_GROUPS
-        ), 'tensor model parallel group is not initialized'
-    return _TENSOR_MODEL_PARALLEL_GROUPS
 
-def get_pipeline_model_parallel_group(check_initialized=True, wrapped=False):
-    """Get the pipeline model parallel group the caller rank belongs to."""
+def get_pipeline_model_parallel_group(check_initialized=True):
+    """Get the pipeline-model-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
             _PIPELINE_MODEL_PARALLEL_GROUP is not None
         ), 'pipeline_model parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_PIPELINE_MODEL_PARALLEL_GROUP,
-        rank_groups=get_pipeline_model_parallel_groups() if xm else None
-    ) if wrapped else _PIPELINE_MODEL_PARALLEL_GROUP
+    return _PIPELINE_MODEL_PARALLEL_GROUP
 
-def get_pipeline_model_parallel_groups() -> List[List[int]]:
-    assert (
-        _PIPELINE_MODEL_PARALLEL_GROUPS
-    ), 'pipeline_model parallel groups is not initialized'
-    return _PIPELINE_MODEL_PARALLEL_GROUPS
 
-def get_data_parallel_group(with_context_parallel=False, 
-                            partial_data_parallel=False,
-                            wrapped=False):
+def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=False):
     """Get the data-parallel group the caller rank belongs to."""
-
-    data_parallel_group = _DATA_PARALLEL_GROUP
     if with_context_parallel:
         if partial_data_parallel:
             assert (
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
             ), 'Intra partial data parallel group is not initialized'
-            data_parallel_group = _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-        else:
-            assert (
-                _DATA_PARALLEL_GROUP_WITH_CP is not None
-            ), 'data parallel group with context parallel combined is not initialized'
-            data_parallel_group = _DATA_PARALLEL_GROUP_WITH_CP
+            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
+        assert (
+            _DATA_PARALLEL_GROUP_WITH_CP is not None
+        ), 'data parallel group with context parallel combined is not initialized'
+        return _DATA_PARALLEL_GROUP_WITH_CP
     else:
         assert _DATA_PARALLEL_GROUP is not None, 'data parallel group is not initialized'
         assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
-    
-    return WrappedProcessGroup(
-                process_group=data_parallel_group,
-                rank_groups=get_data_parallel_groups(
-                    with_context_parallel=with_context_parallel,
-                    partial_data_parallel=partial_data_parallel
-                ) if xm else None
-            ) if wrapped else data_parallel_group
+        return _DATA_PARALLEL_GROUP
 
-def get_data_parallel_groups(with_context_parallel=False, 
-                             partial_data_parallel=False) -> List[List[int]]:
-    """Get the data-parallel group the caller rank belongs to."""
 
-    if with_context_parallel:
-        if partial_data_parallel:
-            assert (
-                _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS is not None
-            ), 'Intra partial data parallel group is not initialized'
-            return _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
-        assert (
-            _DATA_PARALLEL_WITH_CP_GROUPS is not None
-        ), 'data parallel group with context parallel combined is not initialized'
-        return _DATA_PARALLEL_WITH_CP_GROUPS
-    else:
-        assert _DATA_PARALLEL_GROUPS is not None, 'data parallel group is not initialized'
-        assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
-        return _DATA_PARALLEL_GROUPS
-
-def get_data_parallel_group_gloo(with_context_parallel=False, 
-                                 partial_data_parallel=False):
+def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_parallel=False):
     """Get the Gloo data-parallel group the caller rank belongs to."""
-
-    data_parallel_group_gloo = _DATA_PARALLEL_GROUP_GLOO
     if with_context_parallel:
         if partial_data_parallel:
             assert (
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
             ), 'Intra partial data parallel group is not initialized'
-            data_parallel_group_gloo = _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
-        else:
-            assert (
-                _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-            ), 'data parallel group-gloo with context parallel combined is not initialized'
-            data_parallel_group_gloo = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
+        assert (
+            _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
+        ), 'data parallel group-gloo with context parallel combined is not initialized'
+        return _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     else:
         assert _DATA_PARALLEL_GROUP_GLOO is not None, 'data parallel group-gloo is not initialized'
         assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
-    return data_parallel_group_gloo
+        return _DATA_PARALLEL_GROUP_GLOO
 
-def get_context_parallel_group(check_initialized=True, wrapped=False):
+
+def get_context_parallel_group(check_initialized=True):
     """Get the context-parallel group the caller rank belongs to."""
     if check_initialized:
         assert _CONTEXT_PARALLEL_GROUP is not None, 'context parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_CONTEXT_PARALLEL_GROUP,
-        rank_groups=get_context_parallel_groups(check_initialized=check_initialized) if xm else None
-    ) if wrapped else _CONTEXT_PARALLEL_GROUP
+    return _CONTEXT_PARALLEL_GROUP
 
-def get_context_parallel_groups(check_initialized=True) -> List[List[int]]:
-    if check_initialized:
-        assert _CONTEXT_PARALLEL_GROUPS, 'context parallel groups is not initialized'
-    return _CONTEXT_PARALLEL_GROUPS
 
-def get_context_parallel_global_ranks(check_initialized=True) -> List[int]:
-    """Get all global ranks of the context parallel group that the caller rank belongs to."""
+def get_context_parallel_global_ranks(check_initialized=True):
+    """Get all global ranks of the context-parallel group that the caller rank belongs to."""
     if check_initialized:
         assert (
             _CONTEXT_PARALLEL_GLOBAL_RANKS is not None
@@ -1531,149 +1408,75 @@ def get_context_parallel_global_ranks(check_initialized=True) -> List[int]:
     return _CONTEXT_PARALLEL_GLOBAL_RANKS
 
 
-def get_hierarchical_context_parallel_groups(check_initialized=True, wrapped=False):
+def get_hierarchical_context_parallel_groups(check_initialized=True):
     """Get the inner ring of context parallel group the caller rank belongs to."""
     if check_initialized:
         assert _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS is not None
-    return WrappedProcessGroup(
-        process_group=_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
-    ) if wrapped else _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
+    return _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS
 
 
-def get_embedding_group(check_initialized=True, wrapped=False):
+def get_embedding_group(check_initialized=True):
     """Get the embedding group the caller rank belongs to."""
     if check_initialized:
         assert _EMBEDDING_GROUP is not None, 'embedding group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_EMBEDDING_GROUP,
-        rank_groups=get_embedding_groups() if xm else None
-    ) if wrapped else _EMBEDDING_GROUP 
+    return _EMBEDDING_GROUP
 
-def get_embedding_groups() -> List[List[int]]:
-    assert _EMBEDDING_GROUPS, 'embedding groups is not initialized'
-    return _EMBEDDING_GROUPS
 
-def get_position_embedding_group(check_initialized=True, wrapped=False):
+def get_position_embedding_group(check_initialized=True):
     """Get the position embedding group the caller rank belongs to."""
     if check_initialized:
         assert _POSITION_EMBEDDING_GROUP is not None, 'position embedding group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_POSITION_EMBEDDING_GROUP,
-        rank_groups=get_position_embedding_groups() if xm else None
-    ) if wrapped else _POSITION_EMBEDDING_GROUP
+    return _POSITION_EMBEDDING_GROUP
 
-def get_position_embedding_groups() -> List[List[int]]:
-    assert _POSITION_EMBEDDING_GROUPS, 'position embedding groups is not initialized'
-    return _POSITION_EMBEDDING_GROUPS
 
-def get_amax_reduction_group(with_context_parallel=False, 
-                             tp_only_amax_red=False,
-                             wrapped=False):
+def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False):
     """Get the FP8 amax reduction group the caller rank belongs to."""
-
-    amax_reduction_group = _TENSOR_MODEL_PARALLEL_GROUP
     if with_context_parallel:
         if not tp_only_amax_red:
             assert (
                 _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
             ), 'FP8 amax reduction group is not initialized'
-            amax_reduction_group = _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP 
+            return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
         else:
             assert (
                 _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
             ), 'FP8 amax reduction group is not initialized'
-            amax_reduction_group = _TENSOR_AND_CONTEXT_PARALLEL_GROUP 
+            return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     else:
         if not tp_only_amax_red:
             assert (
                 _TENSOR_AND_DATA_PARALLEL_GROUP is not None
             ), 'FP8 amax reduction group is not initialized'
-            amax_reduction_group = _TENSOR_AND_DATA_PARALLEL_GROUP 
+            return _TENSOR_AND_DATA_PARALLEL_GROUP
         else:
             assert (
                 _TENSOR_MODEL_PARALLEL_GROUP is not None
             ), 'FP8 amax reduction group is not initialized'
+            return _TENSOR_MODEL_PARALLEL_GROUP
 
-    return WrappedProcessGroup(
-                process_group=amax_reduction_group,
-                rank_groups=get_amax_reduction_groups(
-                    with_context_parallel=with_context_parallel, 
-                    tp_only_amax_red=tp_only_amax_red
-                ) if xm else None
-            ) if wrapped else amax_reduction_group
 
-def get_amax_reduction_groups(with_context_parallel=False, tp_only_amax_red=False) -> List[List[int]]:
-    if with_context_parallel:
-        if not tp_only_amax_red:
-            assert (
-                _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS is not None
-            ), 'FP8 amax reduction group is not initialized'
-            return _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS
-        else:
-            assert (
-                _TENSOR_AND_CONTEXT_PARALLEL_GROUPS is not None
-            ), 'FP8 amax reduction group is not initialized'
-            return _TENSOR_AND_CONTEXT_PARALLEL_GROUPS
-    else:
-        if not tp_only_amax_red:
-            assert (
-                _TENSOR_AND_DATA_PARALLEL_GROUPS is not None
-            ), 'FP8 amax reduction group is not initialized'
-            return _TENSOR_AND_DATA_PARALLEL_GROUPS
-        else:
-            assert (
-                _TENSOR_MODEL_PARALLEL_GROUPS is not None
-            ), 'FP8 amax reduction group is not initialized'
-            return _TENSOR_MODEL_PARALLEL_GROUPS
-
-def get_tensor_and_data_parallel_group(with_context_parallel=False, wrapped=False):
+def get_tensor_and_data_parallel_group(with_context_parallel=False):
     """Get the tensor- and data-parallel group the caller rank belongs to."""
-
-    tensor_and_data_parallel_group = _TENSOR_AND_DATA_PARALLEL_GROUP
     if with_context_parallel:
         assert (
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
         ), 'tensor and data parallel group is not initialized'
-        tensor_and_data_parallel_group = _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+        return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     else:
         assert (
             _TENSOR_AND_DATA_PARALLEL_GROUP is not None
         ), 'tensor and data parallel group is not initialized'
-    
-    return WrappedProcessGroup(
-        process_group=tensor_and_data_parallel_group,
-        rank_groups=get_tensor_and_data_parallel_groups(with_context_parallel=with_context_parallel) if xm else None
-    ) if wrapped else tensor_and_data_parallel_group
+        return _TENSOR_AND_DATA_PARALLEL_GROUP
 
-def get_tensor_and_data_parallel_groups(with_context_parallel=False) -> List[List[int]]:
-    """Get the tensor and data parallel group the caller rank belongs to."""
-    if with_context_parallel:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS
-        ), 'tensor and data parallel groups is not initialized'
-        return _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS
-    else:
-        assert (
-            _TENSOR_AND_DATA_PARALLEL_GROUPS
-        ), 'tensor and data parallel groups is not initialized'
-        return _TENSOR_AND_DATA_PARALLEL_GROUPS
 
-def get_tensor_and_context_parallel_group(check_initialized=True, wrapped=False):
-    """Get the tensor and context parallel group the caller rank belongs to."""
+def get_tensor_and_context_parallel_group(check_initialized=True):
+    """Get the tensor- and context-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
         ), 'tensor and context parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_TENSOR_AND_CONTEXT_PARALLEL_GROUP,
-        rank_groups=get_tensor_and_context_parallel_groups() if xm else None
-    ) if wrapped else _TENSOR_AND_CONTEXT_PARALLEL_GROUP
+    return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
 
-def get_tensor_and_context_parallel_groups() -> List[List[int]]:
-    assert (
-        _TENSOR_AND_CONTEXT_PARALLEL_GROUPS
-    ), 'tensor and context parallel groups is not initialized'
-    return _TENSOR_AND_CONTEXT_PARALLEL_GROUPS
 
 def set_tensor_model_parallel_world_size(world_size):
     """Set the tensor-model-parallel size"""
@@ -2080,25 +1883,14 @@ def get_tensor_and_context_parallel_rank():
 
 
 ### Expert-related parallel states functions
-def get_expert_model_parallel_group(check_initialized=True, wrapped=False):
+def get_expert_model_parallel_group(check_initialized=True):
     """Get the expert-model-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
             _EXPERT_MODEL_PARALLEL_GROUP is not None
         ), 'expert model parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_EXPERT_MODEL_PARALLEL_GROUP,
-        rank_groups=get_expert_model_parallel_groups(check_initialized=check_initialized) if xm else None
-    ) if wrapped else _EXPERT_MODEL_PARALLEL_GROUP
+    return _EXPERT_MODEL_PARALLEL_GROUP
 
-
-def get_expert_model_parallel_groups(check_initialized=True) -> List[List[int]]:
-    """Get the expert-model-parallel global ranks"""
-    if check_initialized:
-        assert (
-            _EXPERT_MODEL_PARALLEL_GROUPS is not None
-        ), 'expert model parallel group is not initialized'
-    return _EXPERT_MODEL_PARALLEL_GROUPS
 
 def get_expert_model_parallel_world_size():
     """Return world size for the expert-model-parallel group."""
@@ -2132,23 +1924,13 @@ def set_expert_model_parallel_rank(rank):
     _MPU_EXPERT_MODEL_PARALLEL_RANK = rank
 
 
-def get_expert_tensor_parallel_group(check_initialized=True, wrapped=False):
+def get_expert_tensor_parallel_group(check_initialized=True):
     """Get the expert-tensor-parallel group the caller rank belongs to."""
     if check_initialized:
         assert (
             _EXPERT_TENSOR_PARALLEL_GROUP is not None
         ), 'Expert tensor parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_EXPERT_TENSOR_PARALLEL_GROUP,
-        rank_groups=get_expert_tensor_parallel_groups(check_initialized=check_initialized) if xm else None
-    ) if wrapped else _EXPERT_TENSOR_PARALLEL_GROUP
-
-def get_expert_tensor_parallel_groups(check_initialized=True) -> List[List[int]]:
-    if check_initialized:
-        assert (
-            _EXPERT_TENSOR_PARALLEL_GROUPS is not None
-        ), 'Expert tensor parallel group is not initialized'
-    return _EXPERT_TENSOR_PARALLEL_GROUPS
+    return _EXPERT_TENSOR_PARALLEL_GROUP
 
 
 def get_expert_tensor_parallel_world_size():
@@ -2187,24 +1969,14 @@ def set_expert_tensor_parallel_rank(rank):
     _MPU_EXPERT_TENSOR_PARALLEL_RANK = rank
 
 
-def get_expert_tensor_and_model_parallel_group(check_initialized=True, wrapped=False):
-    """Get the tensor- and expert-parallel group the caller rank belongs to."""
+def get_expert_tensor_and_model_parallel_group(check_initialized=True):
+    """Get the expert-tensor and expert-model group the caller rank belongs to."""
     if check_initialized:
         assert (
             _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is not None
         ), 'Expert tensor and model parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP,
-        rank_groups=get_expert_tensor_and_model_parallel_groups(check_initialized=check_initialized) if xm else None
-    ) if wrapped else _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
+    return _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
 
-def get_expert_tensor_and_model_parallel_groups(check_initialized=True) -> List[List[int]]:
-    """Get the tensor- and expert-parallel global ranks"""
-    if check_initialized:
-        assert (
-            _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUPS is not None
-        ), 'Expert tensor and model parallel group is not initialized'
-    return _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUPS
 
 def get_expert_tensor_and_model_parallel_world_size():
     """Return world size for the expert model parallel group times expert tensor parallel group."""
@@ -2225,41 +1997,30 @@ def get_expert_tensor_and_model_parallel_rank():
         return 0
 
 
-def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True, wrapped=False):
+def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     """Get expert tensor-model-pipeline parallel group."""
     if check_initialized:
         assert (
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
         ), 'Expert tensor-model-pipeline parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP,
-        rank_groups=get_expert_tensor_model_pipeline_parallel_groups() if xm else None
-    ) if wrapped else _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
+    return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
-def get_expert_tensor_model_pipeline_parallel_groups() -> List[List[int]]:
-    assert (
-        _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS is not None
-    ), 'Expert tensor-model-pipeline parallel group is not initialized'
-    return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS
 
-def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_parallel=False, wrapped=False):
+def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_parallel=False):
     """Get expert data parallel group."""
-    expert_data_parallel_group = _EXPERT_DATA_PARALLEL_GROUP
     if partial_expert_data_parallel:
         if check_initialized:
             assert (
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None
             ), 'Intra partial expert data parallel group is not initialized'
-        expert_data_parallel_group = _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
+        return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     else:
         if check_initialized:
             assert (
                 _EXPERT_DATA_PARALLEL_GROUP is not None
             ), 'Expert data parallel group is not initialized'
-    return WrappedProcessGroup(
-        process_group=expert_data_parallel_group,
-        rank_groups=None
-    ) if wrapped else expert_data_parallel_group
+        return _EXPERT_DATA_PARALLEL_GROUP
+
 
 def get_data_modulo_expert_parallel_group(partial_expert_data_parallel=False):
     """[Deprecated] Get expert data parallel group."""
@@ -2364,17 +2125,6 @@ def get_all_ranks():
     return '_'.join(map(lambda x: str(x or 0), ranks))
 
 
-def get_moe_layer_wise_logging_tracker():
-    """Return the moe layer wise tracker."""
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    return _MOE_LAYER_WISE_LOGGING_TRACKER
-
-def get_default_process_group():
-    global _DEFAULT_PROCESS_GROUP
-    assert xm is None or _DEFAULT_PROCESS_GROUP is not None, \
-        "_DEFAULT_PROCESS_GROUP is None for XLA" 
-    return _DEFAULT_PROCESS_GROUP
-
 def destroy_model_parallel():
     """Set the groups to none."""
     global _MODEL_PARALLEL_GROUP
@@ -2460,43 +2210,7 @@ def destroy_model_parallel():
         torch.distributed.destroy_process_group(_DATA_PARALLEL_GROUP_WITH_CP_GLOO)
     _DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 
-    global _DEFAULT_PROCESS_GROUP
-    if _DEFAULT_PROCESS_GROUP is not None:
-        torch.distributed.barrier(group=_DEFAULT_PROCESS_GROUP)
-        torch.distributed.destroy_process_group(_DEFAULT_PROCESS_GROUP)
-    _DEFAULT_PROCESS_GROUP = None
-    
-    global _MODEL_PARALLEL_GROUPS
-    _MODEL_PARALLEL_GROUPS = []
-    global _TENSOR_AND_DATA_PARALLEL_GROUPS
-    _TENSOR_AND_DATA_PARALLEL_GROUPS= []
-    global _MODEL_AND_EXPERT_PARALLEL_GROUPS
-    _MODEL_AND_EXPERT_PARALLEL_GROUPS = []
-    global _EMBEDDING_GROUPS
-    _EMBEDDING_GROUPS = []
-    global _POSITION_EMBEDDING_GROUPS
-    _POSITION_EMBEDDING_GROUPS = []
-    global _PIPELINE_MODEL_PARALLEL_GROUPS
-    _PIPELINE_MODEL_PARALLEL_GROUPS = []
-    global _DATA_PARALLEL_GROUPS
-    _DATA_PARALLEL_GROUPS = []
-    global _TENSOR_MODEL_PARALLEL_GROUPS
-    _TENSOR_MODEL_PARALLEL_GROUPS = []
-    global _CONTEXT_PARALLEL_GROUPS
-    _CONTEXT_PARALLEL_GROUPS = []
-    global _DATA_PARALLEL_WITH_CP_GROUPS 
-    _DATA_PARALLEL_WITH_CP_GROUPS = []
-    global _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
-    _INTRA_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
-    global _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS
-    _INTER_PARTIAL_DATA_PARALLEL_WITH_CP_GROUPS = []
-    global _TENSOR_AND_CONTEXT_PARALLEL_GROUPS
-    _TENSOR_AND_CONTEXT_PARALLEL_GROUPS = []
-    global _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS
-    _TENSOR_AND_DATA_PARALLEL_WITH_CP_GROUPS = []
-
-
-    ### Expert-related parallel states destory
+    # Destroy parallel state related to expert parallelism.
     global _EXPERT_MODEL_PARALLEL_GROUP
     _EXPERT_MODEL_PARALLEL_GROUP = None
 
@@ -2535,24 +2249,6 @@ def destroy_model_parallel():
         torch.distributed.destroy_process_group(_EXPERT_DATA_PARALLEL_GROUP_GLOO)
     _EXPERT_DATA_PARALLEL_GROUP_GLOO = None
 
-    global _EXPERT_MODEL_PARALLEL_GROUPS
-    _EXPERT_MODEL_PARALLEL_GROUPS = []
-
-    global _EXPERT_TENSOR_PARALLEL_GROUPS
-    _EXPERT_TENSOR_PARALLEL_GROUPS = []
-
-    global _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUPS
-    _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUPS = []
-
-    global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS
-    _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUPS = []
-
-    global _EXPERT_DATA_PARALLEL_GROUPS
-    _EXPERT_DATA_PARALLEL_GROUPS = []
-    ### End of expert-related parallel states destory
-
-    global _MOE_LAYER_WISE_LOGGING_TRACKER
-    _MOE_LAYER_WISE_LOGGING_TRACKER = {}
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 
@@ -2573,3 +2269,9 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _DEFAULT_PROCESS_GROUP
+    if _DEFAULT_PROCESS_GROUP is not None:
+        torch.distributed.barrier(group=_DEFAULT_PROCESS_GROUP)
+        torch.distributed.destroy_process_group(_DEFAULT_PROCESS_GROUP)
+    _DEFAULT_PROCESS_GROUP = None

@@ -400,7 +400,7 @@ class Pipeline:
                     emb = models[-1].module.module.shared_embedding_or_output_weight()
                 else:
                     raise Exception("should be either first/last pipeline rank.")
-                all_reduce(emb, group=parallel_state.get_embedding_group(wrapped=True))
+                all_reduce(emb, group=parallel_state.get_embedding_group)
 
     def save_checkpoint(self):
         """Initialize params, forward pass data, and save checkpoint."""

@@ -75,7 +75,7 @@ class TestSpecCustomization:
 
         # Create model process groups for test.
         self.model_comm_pgs = ModelCommProcessGroups(
-            tp=get_tensor_model_parallel_group(wrapped=True), cp=get_context_parallel_group(wrapped=True)
+            tp=get_tensor_model_parallel_group(), cp=get_context_parallel_group
         )
 
     def teardown_method(self, method):

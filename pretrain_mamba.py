@@ -132,7 +132,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
     
     if args.context_parallel_size > 1:
-        all_reduce(tensor=loss, group=mpu.get_context_parallel_group(wrapped=True))
+        all_reduce(tensor=loss, group=mpu.get_context_parallel_group())
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -167,7 +167,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
 
     # Reduce loss for logging.
     reporting_loss = loss.clone().detach()
-    all_reduce(tensor=reporting_loss, group=mpu.get_data_parallel_group(wrapped=True))
+    all_reduce(tensor=reporting_loss, group=mpu.get_data_parallel_group())
     
     # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
     # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()

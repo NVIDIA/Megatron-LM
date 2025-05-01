@@ -36,7 +36,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from megatron.core.wrapped_process_group import WrappedProcessGroup
+
 from tests.unit_tests.test_utilities import Utils
 
 class HeterogenousTransformerLayer(TransformerLayer):
@@ -271,10 +271,10 @@ class TestTransformerBlockWithProcessGroups:
             get_current_device_type(), (1, 1, dp_size, cp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "cp", "tp")
         )
 
-        tp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="tp"))
-        cp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="cp"))
-        pp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="pp"))
-        ep_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="ep"))
+        tp_group = device_mesh.get_group(mesh_dim="tp")
+        cp_group = device_mesh.get_group(mesh_dim="cp")
+        pp_group = device_mesh.get_group(mesh_dim="pp")
+        ep_group = device_mesh.get_group(mesh_dim="ep")
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group)
 
         dp_group = device_mesh.get_group(mesh_dim="dp")
@@ -420,9 +420,9 @@ class TestTransformerBlockWithProcessGroups:
             (attn_tp_size, attn_cp_size, mlp_tp_size),
             mesh_dim_names=("attn_tp", "attn_cp", "mlp_tp"),
         )
-        attn_tp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="attn_tp"))
-        attn_cp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="attn_cp"))
-        mlp_tp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="mlp_tp"))
+        attn_tp_group = device_mesh.get_group(mesh_dim="attn_tp")
+        attn_cp_group = device_mesh.get_group(mesh_dim="attn_cp")
+        mlp_tp_group = device_mesh.get_group(mesh_dim="mlp_tp")
 
         attn_model_comm_pgs = ModelCommProcessGroups(tp=attn_tp_group, cp=attn_cp_group)
         mlp_model_comm_pgs = ModelCommProcessGroups(tp=mlp_tp_group)
@@ -483,8 +483,8 @@ class TestTransformerBlockWithProcessGroups:
             get_current_device_type(), (2, 4), mesh_dim_names=("cp", "tp")
         )
 
-        tp_group = WrappedProcessGroup(grid_cp_2_tp_4.get_group(mesh_dim="tp"))
-        cp_group = WrappedProcessGroup(grid_cp_2_tp_4.get_group(mesh_dim="cp"))
+        tp_group = grid_cp_2_tp_4.get_group(mesh_dim="tp")
+        cp_group = grid_cp_2_tp_4.get_group(mesh_dim="cp")
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
 
         transformer_config = TransformerConfig(
@@ -520,11 +520,11 @@ class TestTransformerBlockWithProcessGroups:
         grid_cp_2_tp_2_dp_2 = torch.distributed.init_device_mesh(
             get_current_device_type(), (2, 2, 2, 1, 1), mesh_dim_names=("cp", "tp", "dp", "pp", "ep")
         )
-        tp_group = WrappedProcessGroup(grid_cp_2_tp_2_dp_2.get_group(mesh_dim="tp"))
-        cp_group = WrappedProcessGroup(grid_cp_2_tp_2_dp_2.get_group(mesh_dim="cp"))
-        dp_group = WrappedProcessGroup(grid_cp_2_tp_2_dp_2.get_group(mesh_dim="dp"))
-        pp_group = WrappedProcessGroup(grid_cp_2_tp_2_dp_2.get_group(mesh_dim="pp"))
-        ep_group = WrappedProcessGroup(grid_cp_2_tp_2_dp_2.get_group(mesh_dim="ep"))
+        tp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="tp")
+        cp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="cp")
+        dp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="dp")
+        pp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="pp")
+        ep_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="ep")
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group)
         grad_comm_pgs = GradCommProcessGroups()
 
@@ -624,10 +624,10 @@ class TestTransformerBlockWithProcessGroups:
             device_mesh = torch.distributed.init_device_mesh(
                 get_current_device_type(), (1, 1, dp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "tp")
             )
-        pp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="pp"))
-        ep_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="ep"))
-        dp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="dp"))
-        tp_group = WrappedProcessGroup(device_mesh.get_group(mesh_dim="tp"))
+        pp_group = device_mesh.get_group(mesh_dim="pp")
+        ep_group = device_mesh.get_group(mesh_dim="ep")
+        dp_group = device_mesh.get_group(mesh_dim="dp")
+        tp_group = device_mesh.get_group(mesh_dim="tp")
         mlp_model_comm_pgs = ModelCommProcessGroups(tp=tp_group, pp=pp_group, ep=ep_group)
 
         grad_comm_pgs = GradCommProcessGroups()

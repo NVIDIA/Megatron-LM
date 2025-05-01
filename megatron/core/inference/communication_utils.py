@@ -3,6 +3,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 
 xm = get_xla_model()
@@ -28,8 +29,8 @@ def broadcast_from_last_pipeline_stage(size, dtype, tensor=None):
     # Get the group and corresponding source rank.
     src = parallel_state.get_pipeline_model_parallel_last_rank()
     if xm:
-        groups = parallel_state.get_pipeline_model_parallel_groups()
-        xm.collective_broadcast([tensor], src, groups=groups, pin_layout=False)
+        wpg = WrappedProcessGroup(process_group=parallel_state.get_pipeline_model_parallel_group())
+        xm.collective_broadcast([tensor], src, groups=wpg.rank_groups, pin_layout=False)
     else:
         group = parallel_state.get_pipeline_model_parallel_group()
         torch.distributed.broadcast(tensor, src, group)

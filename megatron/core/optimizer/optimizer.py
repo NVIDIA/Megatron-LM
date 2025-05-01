@@ -15,7 +15,6 @@ import torch.distributed
 
 from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.tensor_parallel.mappings import all_reduce
-from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 HAVE_APEX_OR_TE = True
 try:
@@ -197,7 +196,7 @@ class MegatronOptimizer(ABC):
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
             grads_for_norm, 
-            grad_stats_parallel_group=WrappedProcessGroup(self.get_grad_stats_parallel_group())
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
         return total_norm
 
@@ -210,7 +209,7 @@ class MegatronOptimizer(ABC):
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, 
-            grad_stats_parallel_group=WrappedProcessGroup(self.get_grad_stats_parallel_group())
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
 
         if params:
@@ -405,7 +404,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
 
         # Update across all model parallel instances.
-        all_reduce(tensor=self.found_inf, group=WrappedProcessGroup(self.get_grad_stats_parallel_group()), 
+        all_reduce(tensor=self.found_inf, group=self.get_grad_stats_parallel_group(), 
                    op=torch.distributed.ReduceOp.MAX)
         # Check for nan.
         found_inf_flag = self.found_inf.item() > 0
