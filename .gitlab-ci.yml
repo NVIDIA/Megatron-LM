@@ -69,7 +69,9 @@ workflow:
     # For MRs with nightly
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run nightly/
       variables:
-        UNIT_TEST: "no"
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 15
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
@@ -83,7 +85,9 @@ workflow:
     # For MRs with weekly
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_LABELS =~ /Run weekly/
       variables:
-        UNIT_TEST: "no"
+        UNIT_TEST: "yes"
+        UNIT_TEST_REPEAT: 1
+        UNIT_TEST_TIMEOUT: 15
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
