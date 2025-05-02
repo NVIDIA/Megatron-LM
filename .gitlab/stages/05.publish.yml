@@ -518,7 +518,7 @@ public:review_reminder:
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   script:
     - export GITLAB_ENDPOINT
-    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export RO_API_TOKEN=${PAT}
     - export SLACK_WEBHOOK_URL=${SLACK_REMINDER_HOOK}
     - export SLACK_API_TOKEN=${SLACK_API_TOKEN}
     - python tests/test_utils/python_scripts/auto_reminder.py
@@ -530,6 +530,5 @@ public:review_reminder:
     - purpose/utility
     - team/megatron
   rules:
-    - if: $CI_COMMIT_BRANCH == "ko3n1g/ci/auto-reminder"
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
+    - if: $CI_COMMIT_BRANCH == "ci-review-reminder" && $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
     - when: never
