@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+import logging
 from copy import deepcopy
 from functools import partial, wraps
 from math import ceil
@@ -224,13 +225,10 @@ class GroupedMLP(MegatronModule):
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = (
-                permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
+            logging.getLogger(__name__).warning(
+                "Llama4 functionality is broken in this branch but fixed in the latest megatron-lm branch. "
+                "Please be aware that using the current branch will cause slight accuracy degradation for Llama4 runs."
             )
-            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
 
         if permuted_local_hidden_states.nelement() != 0:
             # Reshape the weights for the grouped GEMMs.
@@ -724,11 +722,10 @@ class TEGroupedMLP(MegatronModule):
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
-            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
+            logging.getLogger(__name__).warning(
+                "Llama4 functionality is broken in this branch but fixed in the latest megatron-lm branch. "
+                "Please be aware that using the current branch will cause slight accuracy degradation for Llama4 runs."
+            )
 
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
@@ -871,13 +868,9 @@ class SequentialMLP(MegatronModule):
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = (
-                permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
+            logging.getLogger(__name__).warning(
+                "Llama4 is functional broken but fixed in megatron-lm branch. Please be warn the current branch you are using will cause slight accuracy off for llama4 runs."
             )
-            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
 
         if self.num_local_experts == 1:
             if self.config.fp8:
