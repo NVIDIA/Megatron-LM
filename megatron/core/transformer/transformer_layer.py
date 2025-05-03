@@ -317,7 +317,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.self_attention = build_module(
             submodules.self_attention,
             config=self.config,
-            layer_number=layer_number,
+            layer_number=self.layer_number,
             **attention_optional_kwargs,
         )
 
@@ -336,7 +336,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.cross_attention = build_module(
             submodules.cross_attention,
             config=self.config,
-            layer_number=layer_number,
+            layer_number=self.layer_number,
             **attention_optional_kwargs,
         )
 
