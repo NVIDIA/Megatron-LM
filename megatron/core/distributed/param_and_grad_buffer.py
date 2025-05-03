@@ -587,6 +587,7 @@ class _ParamAndGradBuffer:
                         param_start_index = _pad_end_of_bucket_if_needed(param_start_index)
                 if len(bucket_params) > 0:
                     bucket_end_index = _update_bucket_metadata(param_start_index)
+                    param_start_index = bucket_end_index
 
             param_end_index = param_start_index + this_numel
             self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
