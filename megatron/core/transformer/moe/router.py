@@ -247,7 +247,6 @@ class TopKRouter(Router):
             aux_loss / moe_aux_loss_coeff,
             self.layer_number,
             self.config.num_layers,
-            reduce_group=sequence_partition_group,
         )
         activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
