@@ -578,15 +578,10 @@ class _ParamAndGradBuffer:
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
             # Create bucket with collected parameters if current param needs its own bucket.
-            if _does_param_require_new_bucket(param):
-                # We are creating a bucket for the already accumulated parameters, whose params
-                # end at the current param_start_index.
-                if self.ddp_config.use_distributed_optimizer:
-                    # Make sure new bucket is appropriately padded.
-                    if param_start_index % self.data_parallel_world_size != 0:
-                        param_start_index = _pad_end_of_bucket_if_needed(param_start_index)
-                if len(bucket_params) > 0:
-                    bucket_end_index = _update_bucket_metadata(param_start_index)
+            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                # Ensure this param accounts for the new padding introduced at end of
+                # previous bucket.
+                param_start_index = _update_bucket_metadata(param_start_index)
 
             param_end_index = param_start_index + this_numel
             self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
