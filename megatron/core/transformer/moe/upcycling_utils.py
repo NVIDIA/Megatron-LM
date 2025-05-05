@@ -1,6 +1,5 @@
 # Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
 """ Helpers for converting a dense model to a MoE model in runtime """
-from megatron.core import mpu
 
 
 def _get_keys_endswith(model, suffix):
@@ -156,7 +155,6 @@ def upcycle_state_dict(moe_model, dense_model):
     else:
         assert len(moe_model) == len(dense_model)
         for i in range(len(moe_model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
             state_dict['model%d' % i] = _covert_to_moe_state_dict(
                 dense_model[i].state_dict(), moe_model[i]
             )
@@ -190,7 +188,6 @@ def load_and_upcycle_model(
         moe_model[0].load_state_dict(state_dict['model'], strict=strict)
     else:
         for i in range(len(moe_model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
             moe_model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     return iteration, num_floating_point_operations_so_far

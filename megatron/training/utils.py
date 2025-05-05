@@ -491,12 +491,12 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
 
-        elif mpu.is_pipeline_first_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
 
-        elif mpu.is_pipeline_last_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
@@ -545,7 +545,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(attention_mask)
             _broadcast(position_ids)
 
-        elif mpu.is_pipeline_first_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_first_stage():
             labels = None
             loss_mask = None
 
@@ -553,7 +553,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(attention_mask)
             _broadcast(position_ids)
 
-        elif mpu.is_pipeline_last_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.

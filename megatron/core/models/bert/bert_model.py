@@ -53,6 +53,7 @@ class BertModel(LanguageModule):
             Options ['learned_absolute', 'rope']. Defaults is 'learned_absolute'.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
             Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
+        vp_stage (int): Virtual pipeline stage.
     """
 
     def __init__(
@@ -72,6 +73,7 @@ class BertModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
         add_binary_head=True,
         return_embeddings=False,
+        vp_stage: Optional[int] = None,
     ):
         super(BertModel, self).__init__(config=config)
 
@@ -124,6 +126,7 @@ class BertModel(LanguageModule):
             spec=self.transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            vp_stage=vp_stage,
         )
 
         # Output
