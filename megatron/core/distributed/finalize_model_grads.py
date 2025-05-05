@@ -147,6 +147,9 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
             grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
             orig_grad = getattr(weight, grad_attr)
             grad = _unshard_if_dtensor(orig_grad)
+            # When the embedding is frozen, the grad is None.
+            if grad is None:
+                return
             torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
