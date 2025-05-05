@@ -466,10 +466,17 @@ publish:docs:
     - owner/jet-core
     - purpose/utility
     - team/megatron
+  before_script:
+    - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
+    - git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    - git fetch origin $PUBLISH_COMMIT
+    - git checkout $PUBLISH_COMMIT
   script:
     - cd ..
-    - rm -rf documentation && git clone --recursive https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
+    - rm -rf documentation && git clone --recursive https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
     - cd documentation/megatron-lm
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
     - git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
     - git fetch origin $PUBLISH_COMMIT
     - git checkout $PUBLISH_COMMIT
@@ -479,6 +486,10 @@ publish:docs:
       git commit -m 'feat: Bump mcore'
 
     - git push
+  rules:
+    - if: '$CI_COMMIT_REF_PROTECTED == "true" && $CI_PIPELINE_SOURCE == "push"'
+      allow_failure: true
+    - when: never
 
 publish:upload_statistics:
   stage: publish
