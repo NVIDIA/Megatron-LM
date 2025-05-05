@@ -978,7 +978,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 # Set pre_process and post_process only after virtual rank is set.
                 pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False)
                 post_process = mpu.is_pipeline_last_stage(ignore_virtual=False)
-                this_model = model_provider_func(pre_process=pre_process, post_process=post_process)
+                this_model = model_provider_func(
+                    pre_process=pre_process, post_process=post_process, vp_stage=i)
                 this_model.model_type = model_type
                 this_model.vp_stage = i
                 model.append(this_model)

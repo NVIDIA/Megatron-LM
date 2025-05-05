@@ -92,6 +92,7 @@ class GPTModel(LanguageModule):
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         mtp_block_spec: Optional[ModuleSpec] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=config)
 
@@ -171,6 +172,7 @@ class GPTModel(LanguageModule):
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            vp_stage=vp_stage,
         )
 
         if self.mtp_process:

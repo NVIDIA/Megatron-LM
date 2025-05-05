@@ -208,6 +208,7 @@ class Float16Module(MegatronModule):
         self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
+        self.vp_stage = getattr(module, 'vp_stage', None)
 
         if self.fp16:
             self.add_module('module', module.half())
@@ -230,10 +231,10 @@ class Float16Module(MegatronModule):
         return self.module.set_input_tensor(input_tensor)
 
     def forward(self, *inputs, **kwargs):  # pylint: disable=missing-function-docstring
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage):
             outputs = float16_to_fp32(outputs)
         return outputs
 
