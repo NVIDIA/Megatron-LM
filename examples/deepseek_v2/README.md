@@ -40,7 +40,7 @@ You can use either mock data or real data for training.
   Update the `DATA_DIR` to the location where your dataset is stored:
   ```bash
   MOCK_DATA=0
-  DATA_DIR="/root/deepseek-datasets"  # Change to where your dataset is stored
+  DATA_DIR="/path/to/deepseek-datasets"  # Change to where your dataset is stored
   ```
 ### 3.2 Tokenizer
 DeepSeek-V2 uses `DeepSeekV2Tokenizer`

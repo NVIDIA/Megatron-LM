@@ -10,22 +10,23 @@ TOKENIZER_MODEL="deepseek-ai/DeepSeek-V2-Lite"
 
 CURRENT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 MEGATRON_PATH=$( dirname $( dirname ${CURRENT_DIR}))
-export PYTHONPATH=${MEGATRON_PATH}:${MEGATRON_PATH}/PAI-Megatron-LM-240718:$PYTHONPATH
+export PYTHONPATH=${MEGATRON_PATH}:$PYTHONPATH
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 echo $CURRENT_DIR
 
-export TORCH_NCCL_HIGH_PRIORITY=1
 
-# specify which RDMA interfaces to use for communication
-export NCCL_IB_HCA=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
+# network envs
+export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-2}
+export TORCH_NCCL_HIGH_PRIORITY=${TORCH_NCCL_HIGH_PRIORITY:-1}
+export NCCL_CHECKS_DISABLE=${NCCL_CHECKS_DISABLE:-1}
+NCCL_IB_HCA_LIST=$(rdma link -j | python3 -c "import sys, json; links=json.load(sys.stdin);names=[links[i]['ifname'] for i in range(8)]; print(*names,sep=',')")
+export NCCL_IB_HCA=${NCCL_IB_HCA:-$NCCL_IB_HCA_LIST}
+export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}
+export NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-0}
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1} # Reducing to 1 ensures no PCIE traffic (even on single node)
+export NCCL_PROTO=${NCCL_PROTO:-Simple}
+export RCCL_MSCCL_ENABLE=${RCCL_MSCCL_ENABLE:-0}
 
-# define the Global ID index used in RoCE mode
-export NCCL_IB_GID_INDEX=3
-
-# avoid data corruption/mismatch issue that existed in past releases
-export RCCL_MSCCL_ENABLE=0
-
-export NCCL_PROTO=Simple
 
 ENV=dsw
 
@@ -44,7 +45,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 MODEL_NAME=DeepSeek-V2-Lite
 
-DATA_DIR="/root/deepseek-datasets"
+DATA_DIR=${DATA_DIR:-"/root/deepseek-datasets"}
 MODEL=deepseek-ai/${MODEL_NAME}
 
 MODEL_SIZE=16B
@@ -77,7 +78,7 @@ TRAIN_LOG=${EXPERIMENT_DIR}/MI300X-$MODEL_NAME-${PR}-seq${SEQ_LEN}-tp${TP}pp${PP
 MOCK_DATA="${MOCK_DATA:-1}"
 
 # For multi-node runs DATA_CACHE_PATH should point to a common path accessible by all the nodes (for eg, an NFS directory)
-DATA_CACHE_PATH="/root/cache"
+DATA_CACHE_PATH=${DATA_CACHE_PATH:-"/root/cache"}
 
 if [ "$MOCK_DATA" -eq 1 ]; then
     echo Using mock data.
@@ -118,6 +119,15 @@ GPUS_PER_NODE=${KUBERNETES_CONTAINER_RESOURCE_GPU}
 
 fi
 
+
+if [ "${NNODES:-1}" -gt 1 ]; then
+    export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens51np0}"
+    export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-ens51np0}"
+    echo "NCCL and GLOO socket interfaces set."
+else
+    echo "Single node setup, skipping NCCL and GLOO socket interface settings."
+fi
+
 if [ -z ${MP_VP} ]; then
     vp_options=""
 else
@@ -151,6 +161,8 @@ NUM_SHARED_EXPERTS=2
 MOE_LAYER_FREQ=1
 
 moe_options=" \
+    --multi-latent-attention \
+    --qk-layernorm \
     --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
     --enable-shared-expert \
     --moe-layer-freq ${MOE_LAYER_FREQ} \
@@ -188,6 +200,8 @@ NUM_SHARED_EXPERTS=2
 MOE_LAYER_FREQ=1
 
 moe_options=" \
+    --multi-latent-attention \
+    --qk-layernorm \
     --moe-ffn-hidden-size ${MOE_INTERMEDIATE_SIZE} \
     --enable-shared-expert \
     --moe-layer-freq ${MOE_LAYER_FREQ} \
@@ -356,9 +370,8 @@ megatron_options="  \
         --no-load-rng \
         --num-workers 8 \
         --extra-vocab-size ${EXTRA_VOCAB_SIZE} \
-        --patch-tokenizer-type DeepSeekV2Tokenizer \
         --tokenizer-type DeepSeekV2Tokenizer \
-        --load ${TOKENIZER_MODEL}\
+        --tokenizer-model ${TOKENIZER_MODEL}\
         --dataset LLama-Pretrain-Idxmap \
         --swiglu \
         --normalization RMSNorm \
@@ -370,7 +383,8 @@ megatron_options="  \
         --untie-embeddings-and-output-weights \
         --disable-bias-linear \
         --use-mcore-models \
-        --use-legacy-models \
+        --moe-grouped-gemm \
+        --moe-use-legacy-grouped-gemm \
         --ckpt-format torch \
         --rotary-base ${ROPE_THETA} \
         --rotary-scaling-factor ${SCALE_FACTOR} \
