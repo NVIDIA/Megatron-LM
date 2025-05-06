@@ -457,6 +457,7 @@ def _load_checkpoint(queue, args):
                 '--no-save-rng',
                 '--mock-data', # To pass the "blend data checks" in arguments.py
                 '--no-initialization',
+                '--no-gradient-accumulation-fusion', # Gradient accumulation fusion requires NVIDIA/apex. TODO: remove this line when we have apex working on ROCm platform.
                 '--load', args.load_dir,
                 '--no-one-logger',
                 ]

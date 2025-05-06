@@ -13,32 +13,18 @@ import gzip
 import glob
 import torch
 import numpy as np
+#import ftfy
 import multiprocessing
 try:
     import nltk
-    from nltk.tokenize.punkt import PunktLanguageVars
     nltk_available = True
 except ImportError:
-    PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
-from megatron.training.tokenizer import build_tokenizer
-from megatron.training.arguments import _add_tokenizer_args
 from megatron.core.datasets import indexed_dataset
-
-
-# https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
-class CustomLanguageVars(PunktLanguageVars):
-
-    _period_context_fmt = r"""
-        \S*                          # some word material
-        %(SentEndChars)s             # a potential sentence ending
-        \s*                       #  <-- THIS is what I changed
-        (?=(?P<after_tok>
-            %(NonWord)s              # either other punctuation
-            |
-            (?P<next_tok>\S+)     #  <-- Normally you would have \s+ here
-        ))"""
+from megatron_patch import build_tokenizer
+manager = multiprocessing.Manager()
+token_count_queue = multiprocessing.Queue()
 
 class IdentitySplitter(object):
     def tokenize(self, *text):
@@ -48,6 +34,7 @@ class IdentitySplitter(object):
 class Encoder(object):
     def __init__(self, args):
         self.args = args
+        self.total_token_count = 0  # add total_token_count
 
     def initializer(self):
         # Use Encoder class as a container for global data
@@ -63,13 +50,7 @@ class Encoder(object):
                 library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
                 url = f"nltk:{library}"
             splitter = nltk.load(url)
-            if self.args.keep_newlines:
-                # this prevents punkt from eating newlines after sentences
-                Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text = splitter._params,
-                    lang_vars = CustomLanguageVars())
-            else:
-                Encoder.splitter = splitter
+            Encoder.splitter = splitter
 
         else:
             Encoder.splitter = IdentitySplitter()
@@ -77,12 +58,14 @@ class Encoder(object):
     def split(self, json_line):
         data = json.loads(json_line)
         output = {}
+        total_token_count = 0
         for key in self.args.json_keys:
             text = data[key]
             max_len = 1000000
             tokens_list = [Encoder.splitter.tokenize(text[i:i+max_len]) for i in range(0, len(text), max_len)]
             output[key] = [tokens for partial in tokens_list for tokens in partial]
-        return json.dumps(output), len(json_line)
+            total_token_count += sum(len(tokens) for partial in tokens_list for tokens in partial)
+        return json.dumps(output), len(json_line), total_token_count
 
     def encode(self, json_line):
         data = json.loads(json_line)
@@ -90,6 +73,7 @@ class Encoder(object):
         lens = {}
         for key in self.args.json_keys:
             text = data[key]
+            #text = ftfy.fix_text(text)
             if isinstance(text, list):
                 sentences = text
             else:
@@ -97,8 +81,20 @@ class Encoder(object):
             doc_ids = []
             sentence_lens = []
             for sentence in sentences:
-                sentence_ids = Encoder.tokenizer.tokenize(sentence)
+                if self.args.patch_tokenizer_type in ["DeepSeekV2Tokenizer", "DeepSeekV3Tokenizer","Qwen2Tokenizer", "LLama3Tokenizer", "LLama2Tokenizer"]:
+                    sentence_ids = Encoder.tokenizer.tokenizer(sentence, add_special_tokens=False)['input_ids']
+                else:
+                    sentence_ids = Encoder.tokenizer(sentence, add_special_tokens=False)['input_ids']
+                if not sentence_ids:
+                    print(f"tokenizer error sentence_ids is empty :\n {text} \n")
+                    continue
+
+                if max(sentence_ids) >= Encoder.tokenizer.vocab_size:
+                    print(f"tokenizer error max(sentence_ids) >= Encoder.tokenizer.vocab_size :\n {text}\n {max(sentence_ids)}")
+                    continue
+                
                 if len(sentence_ids) > 0:
+                    self.total_token_count += len(sentence_ids)  # increase total token
                     doc_ids.extend(sentence_ids)
                     sentence_lens.append(len(sentence_ids))
             if len(doc_ids) > 0 and self.args.append_eod:
@@ -106,7 +102,7 @@ class Encoder(object):
                 sentence_lens[-1] += 1
             ids[key] = doc_ids
             lens[key] = sentence_lens
-        return ids, lens, len(json_line)
+        return ids, lens, len(json_line), self.total_token_count
 
 
 class Partition(object):
@@ -114,13 +110,13 @@ class Partition(object):
         self.args = args
         self.workers = workers
 
-    def print_processing_stats(self, count, proc_start, total_bytes_processed):
+    def print_processing_stats(self, count, proc_start, total_bytes_processed, total_token_count):
         if count % self.args.log_interval == 0:
             current = time.time()
             elapsed = current - proc_start
             mbs = total_bytes_processed/elapsed/1024/1024
             print(f"Processed {count} documents",
-                  f"({count/elapsed} docs/s, {mbs} MB/s).",
+                  f"({count/elapsed} docs/s, {mbs} MB/s). Total tokens: {total_token_count}.",
                   file=sys.stderr)
 
     def split_sentences(self, file_name):
@@ -135,10 +131,12 @@ class Partition(object):
 
         proc_start = time.time()
         total_bytes_processed = 0
-        for i, (doc, bytes_processed) in enumerate(split_docs, start=1):
+        total_token_count = 0
+        for i, (doc, bytes_processed, current_token_count) in enumerate(split_docs, start=1):
             total_bytes_processed += bytes_processed
+            total_token_count += current_token_count
             fout.write(doc + "\n")
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
+            self.print_processing_stats(i, proc_start, total_bytes_processed, total_token_count)
 
         fin.close()
         fout.close()
@@ -147,10 +145,7 @@ class Partition(object):
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
-        if input_file_name.endswith(".gz"):
-            fin = gzip.open(input_file_name, 'rt')
-        else:
-            fin = open(input_file_name, 'r', encoding='utf-8')
+        fin = open(input_file_name, 'r', encoding='utf-8')
 
         startup_start = time.time()
         encoder = Encoder(self.args)
@@ -179,12 +174,17 @@ class Partition(object):
         startup_end = time.time()
         proc_start = time.time()
         total_bytes_processed = 0
+        total_token_count = 0  # add token count for process json file
         print("Time to startup:", startup_end - startup_start)
-        for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
+        for i, (doc, sentence_lens, bytes_processed, current_token_count) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
+            total_token_count += current_token_count  # update token count
             for key in doc.keys():
                 builders[key].add_document(doc[key], sentence_lens[key])
-            self.print_processing_stats(i, proc_start, total_bytes_processed)
+            self.print_processing_stats(i, proc_start, total_bytes_processed, total_token_count)
+
+        print(f"Total token count: {total_token_count}")  #print total token 
+        token_count_queue.put(total_token_count) 
 
         fin.close()
         builders[key].finalize(output_idx_files[key])
@@ -192,7 +192,6 @@ class Partition(object):
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser = _add_tokenizer_args(parser)
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
                        help='Path to input JSON')
@@ -202,7 +201,22 @@ def get_args():
                        help='Split documents into sentences.')
     group.add_argument('--keep-newlines', action='store_true',
                        help='Keep newlines between sentences when splitting.')
-    group = parser.add_argument_group(title='tokenization process')
+
+    group = parser.add_argument_group(title='tokenizer')
+    group.add_argument('--tokenizer-type', type=str, required=False, default='GPT2BPETokenizer',
+                       choices=['BertWordPieceLowerCase','BertWordPieceCase',
+                                'GPT2BPETokenizer', 'SentencePieceTokenizer',
+                                'GPTSentencePieceTokenizer', 'LLama2Tokenizer',
+                                'NullTokenizer'],
+                       help='What type of tokenizer to use.')
+    group.add_argument('--tokenizer-model', type=str, default=None,
+                       help='YTTM tokenizer model.')
+    group.add_argument('--vocab-file', type=str, default=None,
+                       help='Path to the vocab file')
+    group.add_argument('--vocab-size', default=786,
+                       help='size of vocab for use with NullTokenizer')
+    group.add_argument('--merge-file', type=str, default=None,
+                       help='Path to the BPE merge file (if necessary).')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',
@@ -210,6 +224,7 @@ def get_args():
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
+
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, required=True,
                        help=('Number of worker processes to launch.'
@@ -222,6 +237,29 @@ def get_args():
     group.add_argument('--keep-sequential-samples', action='store_true',
                        help='Ensure ordering of samples in .jsonl files is '
                             'preserved when using partitions>1.')
+    group.add_argument(
+        '--patch-tokenizer-type',
+        type=str,
+        required=True,
+        choices=['Qwen2Tokenizer', 'LLamaTokenizer', 'DeepSeekV2Tokenizer',
+                  'DeepSeekV3Tokenizer', 'LLama3Tokenizer', 'LLama2Tokenizer'],
+        help='What type of tokenizer to use.',
+    )
+    group.add_argument('--load',
+                       type=str,
+                       default=None,
+                       help='path to tokenizer config file')
+
+    group.add_argument('--seq-length',
+                       type=int,
+                       default=2048,
+                       help='sequence length')
+
+    group.add_argument('--extra-vocab-size',
+                       type=int,
+                       default=0,
+                       help='extra_vocab_size')
+
     args = parser.parse_args()
     args.keep_empty = False
 
@@ -276,7 +314,8 @@ def main():
             'output_prefix': args.output_prefix}
         in_ss_out_names.append(file_names)
     else:
-        in_file_names = glob.glob(args.input)
+        file_list = os.listdir(args.input)
+        in_file_names = [os.path.join(args.input, file) for file in file_list]
 
         # Count total number of lines across .jsonl files
         if args.keep_sequential_samples:
@@ -392,9 +431,13 @@ def main():
                                                              key, level)
             builders[key].add_index(full_partition_output_prefix)
         builders[key].finalize(output_idx_files[key])
+    # count all process token num
+    total_token_count = 0
+    while not token_count_queue.empty():
+        total_token_count += token_count_queue.get()
 
+    print(f"Total tokens processed: {total_token_count}")
 
 if __name__ == '__main__':
 
     main()
-

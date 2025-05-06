@@ -634,6 +634,10 @@ def validate_args(args, defaults={}):
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
+    if args.multi_latent_attention:
+        if args.tensor_model_parallel_size > 1:
+            assert args.sequence_parallel == True, 'Sequence parallelism should be enabled when MLA is used with tensor parallel'
+
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if args.sequence_parallel:
@@ -821,8 +825,8 @@ def core_transformer_config_from_args(args, config_class=None):
     # Config class.
     config_class = config_class or TransformerConfig
 
-    if args.multi_latent_attention:
-        config_class = MLATransformerConfig
+    # if args.multi_latent_attention:
+    #     config_class = MLATransformerConfig
 
     # Translate args to core transformer configuration
     kw_args = {}
@@ -1059,8 +1063,16 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
+
+    # MLA
     group.add_argument('--multi-latent-attention', action='store_true',
                        help='Use multi-latent attention for model.')
+    group.add_argument('--fused-padded-mla-attention', action='store_true',
+                       help='Pad value head dim to the size of qk head dim, and run ck fused attention.')
+    group.add_argument('--attention-sink-k', type=int, default=0,
+                       help='k attention sink tokens.')
+    parser.add_argument("--window-size", type=int, nargs=2, help="sliding window size")
+
     return parser
 
 
@@ -1366,6 +1378,7 @@ def _add_training_args(parser):
     group.add_argument('--train-sync-interval', type=int, default=None,
                        help='Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU.')
 
+
     # deprecated
     group.add_argument('--checkpoint-activations', action='store_true',
                        help='Checkpoint activation to allow for training '
@@ -1448,6 +1461,8 @@ def _add_training_args(parser):
                        help='DEPRECATED. Use the implementation from megatron core.'
                        'Now ignored and mcore models are the default, use '
                        '--use-legacy-models to not use core models.')
+    
+        
     group.add_argument('--use-legacy-models', action='store_true',
                        help='Use the legacy Megatron models, not Megatron-Core models.')
     group.add_argument('--manual-gc', action='store_true',
@@ -1878,7 +1893,8 @@ def _add_tokenizer_args(parser):
                                 'TikTokenizer',
                                 'MultimodalTokenizer',
                                 'NullTokenizer',
-                                'DeepSeekV2Tokenizer'],
+                                'DeepSeekV2Tokenizer',
+                                'DeepSeekV3Tokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
@@ -2065,7 +2081,6 @@ def get_patch_args(parser):
         "--valid-data", nargs="+", default=None, help="path(s) to the validation data."
     )
 
-    group.add_argument("--patch-tokenizer-type", type=str, help="patch-tokenizer-type")
 
     group.add_argument(
         "--use-alibi-mask",
@@ -2548,6 +2563,7 @@ def _add_vision_args(parser):
 
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
+    # General arguments
     group.add_argument('--expert-model-parallel-size', type=int, default=1,
                        help='Degree of expert model parallelism.')
     group.add_argument('--expert-tensor-parallel-size', type=int, default=None,
@@ -2573,16 +2589,37 @@ def _add_moe_args(parser):
                        help='Enable overlapping between shared expert computations and dispatcher communications. '
                        'Without this, the shared epxerts execute after the routed experts. '
                        'Only effective when moe-shared-expert-intermediate-size is set.')
+    group.add_argument('--moe-grouped-gemm', action='store_true',
+                       help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+    # Router arguments
     group.add_argument('--moe-router-load-balancing-type', type=str,
-                       choices=['aux_loss', 'sinkhorn', 'none'],
+                       choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
-                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+                       help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
+    group.add_argument('--moe-router-score-function', type=str,
+                       choices=['softmax', 'sigmoid'],
+                       default='softmax',
+                       help='Score function for MoE TopK routing. Can be "softmax" or "sigmoid".')
     group.add_argument('--moe-router-topk', type=int, default=2,
                        help='Number of experts to route to for each token. The default is 2.')
     group.add_argument('--moe-router-pre-softmax', action='store_true',
                        help='Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k.')
-    group.add_argument('--moe-grouped-gemm', action='store_true',
-                       help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
+    group.add_argument('--moe-router-num-groups', type=int, default=None,
+                       help='Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.'
+                       'Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)')
+    group.add_argument('--moe-router-group-topk', type=int, default=None,
+                        help='Number of selected groups for group-limited routing.')
+    group.add_argument('--moe-router-topk-scaling-factor', type=float, default=None,
+                       help='Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling.')
+    group.add_argument('--moe-router-enable-expert-bias', action='store_true',
+                       help='TopK routing with dynamic expert bias in the aux-loss-free load balancing strategy. '
+                       'The routing decision is based on the sum of the routing scores and the expert bias. '
+                       'See https://arxiv.org/abs/2408.15664 for details.')
+    group.add_argument('--moe-router-bias-update-rate', type=float, default=1e-3,
+                       help='Expert bias update rate in the aux-loss-free load balancing strategy. '
+                       'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
+                       'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
+                       'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
                        help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
@@ -2611,6 +2648,8 @@ def _add_moe_args(parser):
     group.add_argument('--moe-use-upcycling', action='store_true',
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
+    group.add_argument('--moe-permute-fusion', action='store_true',
+                       help='Fuse token rearrangement ops during token dispatching.')
 
     return parser
 
@@ -2657,4 +2696,6 @@ def _add_experimental_args(parser):
                        'the overidden pattern')
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
+    group.add_argument('--moe-router-force-load-balancing',action='store_true',
+                       help = 'Enforce token dispatch balancing to MoE routing')
     return parser
