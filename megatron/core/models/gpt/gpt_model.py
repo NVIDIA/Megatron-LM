@@ -411,6 +411,27 @@ class GPTModel(LanguageModule):
 
         return loss
 
+    def shared_embedding_or_output_weight(self) -> Tensor:
+        """Gets the embedding weight or output logit weights when share input embedding and
+        output weights set to True or when use Multi-Token Prediction (MTP) feature.
+
+        Returns:
+            Tensor: During pre processing or MTP process it returns the input embeddings weight.
+            Otherwise, during post processing it returns the final output layers weight.
+        """
+        if self.pre_process or self.mtp_process:
+            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
+            # So there will be both embedding layer and output layer in the mtp process stage.
+            # In this case, if share_embeddings_and_output_weights is True, the shared weights
+            # will be stored in embedding layer, and output layer will not have any weight.
+            assert hasattr(
+                self, 'embedding'
+            ), f"embedding is needed in this pipeline stage, but it is not initialized."
+            return self.embedding.word_embeddings.weight
+        elif self.post_process:
+            return self.output_layer.weight
+        return None
+
     def get_transformer_callables_by_layer(self, layer_number: int):
         """
         Get the callables for the layer at the given transformer layer number.
