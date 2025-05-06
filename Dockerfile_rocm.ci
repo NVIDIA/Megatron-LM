@@ -61,7 +61,7 @@ ENV NVTE_USE_HIPBLASLT=1
 RUN git clone --recursive -b ${TE_BRANCH} https://github.com/ROCm/TransformerEngine.git && \
     cd TransformerEngine && \
     echo "TransformerEngine at commit:" $(git rev-parse HEAD) && \
-    pip install .
+    pip install -v .
 
 RUN git clone https://github.com/caaatch22/grouped_gemm.git &&\
     cd grouped_gemm &&\
