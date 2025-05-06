@@ -63,7 +63,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN \
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL) && \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS) && \
-    pip install --no-cache-dir jet-api==$JET_API_VERSION --upgrade $JET_INDEX_URLS  && \
+    pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS  && \
     pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL && \
     pip install --no-cache-dir --no-build-isolation ./experimental_flash_attention/*flash_attn*.whl
 

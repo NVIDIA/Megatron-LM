@@ -25,6 +25,7 @@ MANDATORY_VARS=(
     "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
     "DATA_CACHE_PATH"
+    "ENABLE_LIGHTWEIGHT_MODE"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then

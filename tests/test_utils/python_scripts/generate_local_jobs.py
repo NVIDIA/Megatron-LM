@@ -42,12 +42,22 @@ def load_script(config_path: str) -> str:
     help="Directory where the functional test will write its artifacts to (Tensorboard logs)",
     default="/opt/megatron-lm",
 )
+@click.option(
+    "--enable-lightweight-mode",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Run 2-step smoke tests instead of full training",
+)
 def main(
     model: Optional[str],
     scope: Optional[str],
     test_case: Optional[str],
     environment: str,
     output_path: str,
+    enable_lightweight_mode: bool = False,
 ):
     workloads = common.load_workloads(
         container_image='none',
@@ -62,8 +72,8 @@ def main(
         if workload.type == "build":
             continue
         magic_values = dict(workload.spec)
-        magic_values["assets_dir"] = output_path
-        magic_values["artifacts_dir"] = output_path
+        magic_values["assets_dir"] = "$OUTPUT_PATH"
+        magic_values["artifacts_dir"] = "$OUTPUT_PATH"
         magic_values["environment"] = environment
         magic_values["test_case"] = workload.spec.test_case
         magic_values["name"] = workload.spec.name.format(**magic_values)
@@ -76,6 +86,10 @@ def main(
         )
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as fh:
+            fh.write(f"export ENABLE_LIGHTWEIGHT_MODE={str(enable_lightweight_mode).lower()}\n")
+            fh.write(
+                f'export OUTPUT_PATH={output_path}/runs/$(python3 -c "import uuid; print(uuid.uuid4())")\n'
+            )
             fh.write(workload.spec.script.format(**magic_values))
 
 
