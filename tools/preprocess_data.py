@@ -147,7 +147,10 @@ class Partition(object):
     def process_json_file(self, file_name):
         input_file_name, output_prefix = file_name
         print("Opening", input_file_name)
-        fin = open(input_file_name, 'r', encoding='utf-8')
+        if input_file_name.endswith(".gz"):
+            fin = gzip.open(input_file_name, 'rt')
+        else:
+            fin = open(input_file_name, 'r', encoding='utf-8')
 
         startup_start = time.time()
         encoder = Encoder(self.args)
