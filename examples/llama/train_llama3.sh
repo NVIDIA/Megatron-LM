@@ -6,18 +6,19 @@
 #################################################################################
 #set -x
 
-# set envs
-export GPU_MAX_HW_QUEUES=2
-export TORCH_NCCL_HIGH_PRIORITY=1
-export NCCL_CHECKS_DISABLE=1
-export NCCL_IB_HCA=rdma0,rdma1,rdma2,rdma3,rdma4,rdma5,rdma6,rdma7
-export NCCL_IB_GID_INDEX=3
-export NCCL_CROSS_NIC=0
-export CUDA_DEVICE_MAX_CONNECTIONS=1
-export NCCL_PROTO=Simple
-export RCCL_MSCCL_ENABLE=0
-export TOKENIZERS_PARALLELISM=false
-export HSA_NO_SCRATCH_RECLAIM=1
+# set envs 
+export GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-2}
+export TORCH_NCCL_HIGH_PRIORITY=${TORCH_NCCL_HIGH_PRIORITY:-1}
+export NCCL_CHECKS_DISABLE=${NCCL_CHECKS_DISABLE:-1}
+NCCL_IB_HCA_LIST=$(rdma link -j | python3 -c "import sys, json; links=json.load(sys.stdin);names=[links[i]['ifname'] for i in range(8)]; print(*names,sep=',')")
+export NCCL_IB_HCA=${NCCL_IB_HCA:-$NCCL_IB_HCA_LIST}
+export NCCL_IB_GID_INDEX=${NCCL_IB_GID_INDEX:-3}
+export NCCL_CROSS_NIC=${NCCL_CROSS_NIC:-0}
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+export NCCL_PROTO=${NCCL_PROTO:-Simple}
+export RCCL_MSCCL_ENABLE=${RCCL_MSCCL_ENABLE:-0}
+export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
+export HSA_NO_SCRATCH_RECLAIM=${HSA_NO_SCRATCH_RECLAIM:-1}
 
 # parsing input arguments
 for ARGUMENT in "$@"
@@ -147,8 +148,8 @@ GPT_ARGS="
     --untie-embeddings-and-output-weights \
     --position-embedding-type rope \
     --no-position-embedding \
-    --disable-bias-linear \
     --swiglu \
+    --disable-bias-linear \
     --init-method-std 0.02 \
     --attention-dropout 0.0 \
     --hidden-dropout 0.0 \
@@ -299,6 +300,15 @@ if [ "$TE_FP8" -eq 1 ]; then
 "
 fi
 
+if [ -n "${WANDB_API_KEY}" ]; then
+    LOGGING_ARGS="--wandb-project=LLama \
+        --wandb-exp-name=LLama_${MODEL_SIZE}B \
+        --wandb-save-dir logs/wandb \
+    "
+else
+   LOGGING_ARGS=""
+fi
+
 run_cmd="
     torchrun $DISTRIBUTED_ARGS pretrain_gpt.py \
         $GPT_ARGS \
@@ -306,6 +316,7 @@ run_cmd="
         $OUTPUT_ARGS \
         $EXTRA_ARGS \
         $TRAIN_ARGS \
+        $LOGGING_ARGS \
         $CKPT_LOAD_ARGS
 "
 
@@ -351,7 +362,6 @@ echo "elapsed time per iteration: $ETPI" |& tee -a $TRAIN_LOG
 TIME_PER_ITER=$(python3 mean_log_value.py tmp.txt 2>/dev/null | awk '{printf "%.6f", $0}')
 TGS=$(awk -v bs="$BS" -v sl="$SEQ_LENGTH" -v tpi="$TIME_PER_ITER" -v ws="$WORLD_SIZE" 'BEGIN {printf "%.6f", bs * sl * 1000/ (tpi * ws)}')
 echo "tokens/GPU/s: $TGS" |& tee -a $TRAIN_LOG
-rm tmp.txt
 
 # Extract memory usage
 grep -Eo 'mem usages: [^|]*' "$TRAIN_LOG" | sed -E 's/.*mem usages: ([0-9\.]+).*/\1/' > tmp.txt

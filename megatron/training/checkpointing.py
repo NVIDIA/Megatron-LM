@@ -390,6 +390,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
+    ckpt_save_start = time()
     # Collect args, model, RNG.
     if not torch.distributed.is_initialized() \
             or mpu.get_expert_data_parallel_rank() == 0 \
@@ -483,9 +484,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             def iter_finalize_fn():
                 with open(tracker_filename, 'w') as f:
                     f.write(str(iteration))
-                print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
+                print_rank_0(f'  [Time: {time() - ckpt_save_start:.3f} s] successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
                              f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
-                             f'p {(pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1}/{mpu.get_pipeline_model_parallel_world_size()} ]')
+                             f'p {(pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1}/{mpu.get_pipeline_model_parallel_world_size()}, '
+                             f'e {(expert_rank if expert_rank is not None else mpu.get_expert_model_parallel_rank()) + 1}/{mpu.get_expert_model_parallel_world_size()} ]')
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)

@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Union
 
 import torch
+import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import (
@@ -25,6 +26,7 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -45,6 +47,40 @@ class MLASelfAttentionSubmodules:
     q_layernorm: Union[ModuleSpec, type] = None
     kv_layernorm: Union[ModuleSpec, type] = None
 
+def get_attention_sink_bias(batch_size, num_heads, seq_len, window_size=None, sink_k=1, dtype=torch.bfloat16):
+    """
+    Generate attention bias with shape [batch, num_heads, seq, seq].
+
+    Args:
+    - batch_size (int): Number of sequences in a batch.
+    - num_heads (int): Number of attention heads.
+    - seq_len (int): Sequence length.
+    - window_size tupe(int): Sliding window size (each token attends to its local window).
+    - sink_k (int): Number of initial tokens that act as attention sinks.
+
+    Returns:
+    - attention_bias (Tensor): Shape [batch, num_heads, seq, seq], used to mask attention scores.
+    """
+    # Initialize bias with -inf (default masked)
+    attention_bias = torch.full((seq_len, seq_len), float('-inf'), dtype=dtype, device="cuda")
+
+    # Allow each token to attend to its sliding window neighbors
+    if window_size is not None:
+        for i in range(seq_len):
+            left = max(0, i - window_size[0])
+            right = min(seq_len, i + window_size[1] + 1)  # Exclusive upper bound
+            attention_bias[i, left:right] = 0  # Allow attention
+
+    # Allow all tokens to attend to the first `sink_k` tokens
+    attention_bias[:, :sink_k] = 0  # Enable global attention to sink tokens
+
+    # Shape [1, 1, seq, seq]
+    attention_bias = attention_bias.unsqueeze(0).unsqueeze(0)
+    # Expand to [batch, num_heads, seq, seq]
+    attention_bias = attention_bias.expand(batch_size, num_heads, seq_len, seq_len)
+
+    # incontiguous attention bias will led core dump of fused attention
+    return attention_bias.contiguous()
 
 class MultiLatentAttention(Attention):
     """Multi-Latent Attention layer abstract class.
@@ -62,11 +98,7 @@ class MultiLatentAttention(Attention):
         attention_type: str,
         cp_comm_type: str = None,
     ) -> None:
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
-        assert (
-            world_size == 1
-        ), "MLA is not supported with Tensor Parallelism yet, \
-        use Expert Parallelism and Pipeline Parallelism for better performance."
+
 
         super().__init__(
             config=config,
@@ -94,8 +126,13 @@ class MultiLatentAttention(Attention):
             mscale_all_dim=self.config.mscale_all_dim,
         )
         # Add kv channels as kwargs for DotProductAttention 
-        kwargs = {"k_channels": self.q_head_dim,
-                  "v_channels": self.config.v_head_dim}
+        if self.config.fused_padded_mla_attention:
+            assert self.q_head_dim > self.config.v_head_dim
+            kwargs = {"k_channels": self.q_head_dim,
+                    "v_channels": self.q_head_dim}
+        else:
+            kwargs = {"k_channels": self.q_head_dim,
+                    "v_channels": self.config.v_head_dim}
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -107,6 +144,9 @@ class MultiLatentAttention(Attention):
             **kwargs
             
         )
+
+        self.attention_bias_seq_length = None
+        self.attention_bias = None
 
         # Output.
         self.linear_proj = build_module(
@@ -165,14 +205,29 @@ class MultiLatentAttention(Attention):
         query, key, value, _, attn_mask_type = self._adjust_key_value_for_inference(
             inference_params, query, key, value, rotary_pos_emb=None
         )
+        
+        seq_length = query.shape[0]
+        batch_size = query.shape[1]
+        num_heads = query.shape[2]
 
         # ==================================
         # core attention computation
         # ==================================
         # Need corresponding TE change
+        if self.config.fused_padded_mla_attention:
+            padded_dim = self.q_head_dim - self.config.v_head_dim
+            # pad value to q_head_dim
+            value = F.pad(value, (0, padded_dim))
+        
+        if self.attention_bias_seq_length != seq_length and self.config.attention_sink_k > 0:
+            with torch.no_grad():
+                self.attention_bias = get_attention_sink_bias(batch_size, num_heads, seq_length,
+                    self.config.window_size, self.config.attention_sink_k, query.dtype)
+            self.attention_bias_seq_length = seq_length
+        
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query, key, value, attention_mask, attention_bias=self.attention_bias, packed_seq_params=packed_seq_params
             )
         else:
             core_attn_out = self.core_attention(
@@ -182,7 +237,12 @@ class MultiLatentAttention(Attention):
                 attention_mask,
                 packed_seq_params=packed_seq_params,
                 attn_mask_type=attn_mask_type,
+                attention_bias=self.attention_bias,
             )
+        if self.config.fused_padded_mla_attention:
+            # [s, b, n * dim] -> [s, b, n, dim=192] -> [s, b, n, dim=128] -> [s, b, n*dim]
+            core_attn_out = core_attn_out.reshape(seq_length, batch_size, num_heads, self.q_head_dim)[..., :self.config.v_head_dim]
+            core_attn_out = core_attn_out.reshape(seq_length, batch_size, num_heads * self.config.v_head_dim)
 
         if packed_seq_params is not None:
             # reshape to same output shape as unpacked case
@@ -223,7 +283,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is None:
-            # Not projectiing query
+            # Not projectiing query (not MLA)
             self.linear_q_proj = build_module(
                 submodules.linear_q_proj,
                 self.config.hidden_size,
@@ -237,23 +297,23 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
         else:
-
+            # W_DQ, [HiddenSize, q_lora_rank] for down projection 
             self.linear_q_down_proj = build_module(
                 submodules.linear_q_down_proj,
                 self.config.hidden_size,
                 self.config.q_lora_rank,
+                parallel_mode="duplicated",
                 config=self.config,
                 init_method=self.config.init_method,
-                gather_output=False,
                 bias=False,
                 skip_bias_add=False,
-                is_expert=False,
+                skip_weight_param_allocation=False,
             )
-
+            # W_UQ [q_lora_rank, NumAttentionHeads * q_head_dim] for up projection
             self.linear_q_up_proj = build_module(
                 submodules.linear_q_up_proj,
                 self.config.q_lora_rank,
-                self.config.num_attention_heads * self.q_head_dim,
+                self.config.num_attention_heads * self.q_head_dim, # TODO use num_head and num_kv_head instead of num_attention_heads
                 config=self.config,
                 init_method=self.config.init_method,
                 gather_output=False,
@@ -261,19 +321,19 @@ class MLASelfAttention(MultiLatentAttention):
                 skip_bias_add=False,
                 is_expert=False,
             )
-
+        # W_DKV [HiddenSize, kv_lora_rank + qk_pos_emb_head_dim] for down projection
         self.linear_kv_down_proj = build_module(
             submodules.linear_kv_down_proj,
             self.config.hidden_size,
             self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
+            parallel_mode="duplicated",
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
             bias=False,
             skip_bias_add=False,
-            is_expert=False,
+            skip_weight_param_allocation=False,
         )
-
+        # W_UKV [kv_lora_rank, NumAttentionHeads * (qk_head_dim + v_head_dim)] for up projection
         self.linear_kv_up_proj = build_module(
             submodules.linear_kv_up_proj,
             self.config.kv_lora_rank,
@@ -313,22 +373,24 @@ class MLASelfAttention(MultiLatentAttention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # s = sequence length, b = batch size, h = hidden size, n = num attention heads
-        # Attention heads [s, b, n*h]
+        # Attention heads [s, b, n * head_dim], 
+        # Note hidden_size != n * head_dim for MLA 
         assert (
             hidden_states.ndim == 3
-        ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        q_len, bsz, _ = hidden_states.size()
+        ), f"hidden_states should be 3D, [s, b, hidden_size], got {hidden_states.ndim}D"
 
         if self.config.q_lora_rank is not None:
-            q_compressed, _ = self.linear_q_down_proj(hidden_states)
-            q_compressed = self.q_layernorm(q_compressed)
-            q, _ = self.linear_q_up_proj(q_compressed)
+            q_compressed, _ = self.linear_q_down_proj(hidden_states) # [s, b, hidden_size] * [hidden_size, q_lora_rank] -> [s, b, q_lora_rank]
+            q_compressed = self.q_layernorm(q_compressed) # [s, b, q_lora_rank]
+            q, _ = self.linear_q_up_proj(q_compressed) # [s, b, q_lora_rank] * [q_lora_rank, n * q_head_dim] -> [s, b, n * q_head_dim]
+            # Note that self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
         else:
             # hidden_states:[s, b, 2048], q: [s, b, n * 192]
             q, _ = self.linear_q_proj(hidden_states)
-
+        
+        q_len, bsz, _ = q.size()
         # q: [s, b, n, 192]
-        q = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim)
+        q = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim) 
 
         # q: [s, b, n, 128], q_pos_emb: [s, b, n, 64]
         q_no_pe, q_pos_emb = torch.split(
@@ -336,15 +398,19 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         # kv_combined: [s, b, 576]
-        kv_combined, _ = self.linear_kv_down_proj(hidden_states)
+        kv_combined, _ = self.linear_kv_down_proj(hidden_states) # [s, b, hidden_size] * [hidden_size, kv_lora_rank + qk_head_dim] -> [s, b, 576]
 
         # kv_compressed:[s, b, 512], k_pos_emb: [s, b, 64]
         kv_compressed, k_pos_emb = torch.split(
             kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
         )
 
+        # Gather the input from sequence parallel region
+        if parallel_state.get_tensor_model_parallel_world_size() > 1:
+            k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
+
         # kv: [s, b, 2048]
-        kv, _ = self.linear_kv_up_proj(self.kv_layernorm(kv_compressed))
+        kv, _ = self.linear_kv_up_proj(self.kv_layernorm(kv_compressed)) # [s, b, kv_lora_rank] * [kv_lora_rank, n * (qk_head_dim + v_head_dim)] -> [s, b, n * (qk_head_dim + v_head_dim)]
 
         # kv: [s, b, n, 256]
         kv = kv.view(
@@ -363,6 +429,8 @@ class MLASelfAttention(MultiLatentAttention):
         if len(rotary_pos_emb) == 2:
             mscale = rotary_pos_emb[1]
             rotary_pos_emb = rotary_pos_emb[0]
+        else:
+            mscale = 1.0
 
         if inference_params is not None:
             # add offset to the sequence start for inference
@@ -391,7 +459,7 @@ class MLASelfAttention(MultiLatentAttention):
         query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
 
         # key: [s, b, n, 192]
-        k_pos_emb = k_pos_emb.expand(-1, -1, self.config.num_attention_heads, -1)
+        k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
         key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
         query = query.contiguous()
