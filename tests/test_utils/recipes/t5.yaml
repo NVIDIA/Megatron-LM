@@ -54,6 +54,10 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
+  - test_case: [t5_11b_mr_mcore_tp4_pp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
   - test_case: [t5_220m_mr_mcore_te_tp2_pp2_dgx_a100_1N8G]
     products:
       - environment: [dev]
