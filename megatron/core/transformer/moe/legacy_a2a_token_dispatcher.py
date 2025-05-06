@@ -1,5 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+# type: ignore
+# This file will be deprecated soon. We won't fix the mypy type checks.
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -60,13 +63,13 @@ class MoEAlltoAllSEQTokenDispatcher(MoETokenDispatcher):
         self.num_global_tokens_per_local_expert_cpu = None
         input_chunk_idxs = torch.arange(self.num_experts)
         # [num_local_experts, ep_size]. Sort the input chunks by local experts.
-        self.sort_input_by_local_experts = (
-            input_chunk_idxs.reshape(-1, self.num_local_experts).T.ravel().tolist()
-        )
+        self.sort_input_by_local_experts = input_chunk_idxs.reshape(
+            -1, self.num_local_experts
+        ).T.ravel()
         # [ep_size, num_local_experts]. Restore the output chunks by local experts.
-        self.restore_output_by_local_experts = (
-            input_chunk_idxs.reshape(self.num_local_experts, -1).T.ravel().tolist()
-        )
+        self.restore_output_by_local_experts = input_chunk_idxs.reshape(
+            self.num_local_experts, -1
+        ).T.ravel()
 
         # Token drop and padding.
         # We need to keep track of the token num if we drop tokens without padding them.

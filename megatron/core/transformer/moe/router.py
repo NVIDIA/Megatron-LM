@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 from abc import ABC, abstractmethod
+from functools import partial
+from typing import Callable
 
 import torch
 
@@ -10,6 +12,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     MoEAuxLossAutoScaler,
     save_to_aux_losses_tracker,
+    sequence_load_balancing_loss_func,
     sinkhorn,
     switch_load_balancing_loss_func,
     topk_softmax_with_capacity,
@@ -99,7 +102,22 @@ class TopKRouter(Router):
         super().__init__(config=config)
         self.topk = self.config.moe_router_topk
         self.routing_type = self.config.moe_router_load_balancing_type
+        self.score_function = self.config.moe_router_score_function
         self.input_jitter = None
+
+        self.enable_expert_bias = self.config.moe_router_enable_expert_bias
+        if self.enable_expert_bias:
+            self.register_buffer(
+                'local_tokens_per_expert',
+                torch.zeros(self.config.num_moe_experts, dtype=torch.float32),
+                persistent=False,
+            )
+            self.register_buffer(
+                'expert_bias', torch.zeros(self.config.num_moe_experts, dtype=torch.float32)
+            )
+        else:
+            self.local_tokens_per_expert = None
+            self.expert_bias = None
 
     def sinkhorn_load_balancing(self, logits: torch.Tensor):
         """Apply sinkhorn routing to the logits tensor.
@@ -142,7 +160,7 @@ class TopKRouter(Router):
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
-            indices (torch.Tensor): The mask of token to experts assignment.
+            routing_map (torch.Tensor): The mask of token to experts assignment.
         """
         probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
             logits,
@@ -151,47 +169,78 @@ class TopKRouter(Router):
             pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             drop_policy=self.config.moe_token_drop_policy,
             use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
             deterministic_mode=self.config.deterministic_mode,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias,
         )
 
         if self.training:
             # Apply load balancing loss
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
-            probs = self.apply_load_balancing_loss(scores, tokens_per_expert, activation=probs)
+            aux_loss_func = partial(
+                switch_load_balancing_loss_func,
+                probs=scores,
+                tokens_per_expert=tokens_per_expert,
+                topk=self.topk,
+            )
+            probs = self.apply_load_balancing_loss(
+                activation=probs, load_balancing_loss_func=aux_loss_func
+            )
+        return probs, routing_map
+
+    def seq_aux_loss_load_balancing(self, logits: torch.Tensor, bsz: int, seq_length: int):
+        """Apply loss-based load balancing to the logits tensor."""
+
+        probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
+            logits,
+            self.topk,
+            capacity_factor=self.config.moe_expert_capacity_factor,
+            pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+            drop_policy=self.config.moe_token_drop_policy,
+            use_pre_softmax=self.config.moe_router_pre_softmax,
+            num_groups=self.config.moe_router_num_groups,
+            group_topk=self.config.moe_router_group_topk,
+            scaling_factor=self.config.moe_router_topk_scaling_factor,
+            deterministic_mode=self.config.deterministic_mode,
+            score_function=self.score_function,
+            expert_bias=self.expert_bias,
+        )
+
+        if self.training:
+            scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+            aux_loss_func = partial(
+                sequence_load_balancing_loss_func,
+                probs=scores,
+                routing_map=routing_map,
+                batch_size=bsz,
+                seq_length=seq_length,
+                topk=self.topk,
+            )
+            probs = self.apply_load_balancing_loss(
+                activation=probs, load_balancing_loss_func=aux_loss_func
+            )
+
         return probs, routing_map
 
     def apply_load_balancing_loss(
-        self,
-        probs: torch.Tensor,
-        num_local_tokens_per_expert: torch.Tensor,
-        activation: torch.Tensor,
+        self, activation: torch.Tensor, load_balancing_loss_func: Callable
     ):
-        """Applies auxiliary loss to the MoE layer.
-
-        Args:
-            probs (torch.Tensor): The probs output by the router for each token.
-                [num_tokens, num_experts]
-            num_local_tokens_per_expert (torch.Tensor): The number of tokens per expert.
-                [num_experts]
-            activation (torch.Tensor): The activation tensor to attach the gradient function to.
-
-        Returns:
-            torch.Tensor: The activation tensor with the attached gradient function.
-        """
+        """Calculate auxiliary loss, attach gradient function to activation and add to logging."""
         moe_aux_loss_coeff = self.config.moe_aux_loss_coeff
+        if moe_aux_loss_coeff == 0:
+            return activation
         sequence_partition_group = None
         if self.config.moe_token_dispatcher_type == "alltoall_seq":
             sequence_partition_group = parallel_state.get_context_parallel_group()
             moe_aux_loss_coeff /= parallel_state.get_tensor_model_parallel_world_size()
-        else:
+        elif parallel_state.get_tensor_and_context_parallel_world_size() > 1:
             sequence_partition_group = parallel_state.get_tensor_and_context_parallel_group()
 
-        aux_loss = switch_load_balancing_loss_func(
-            probs,
-            num_local_tokens_per_expert,
-            self.topk,
-            moe_aux_loss_coeff,
-            sequence_partition_group=sequence_partition_group,
+        aux_loss = load_balancing_loss_func(
+            moe_aux_loss_coeff=moe_aux_loss_coeff, sequence_partition_group=sequence_partition_group
         )
         save_to_aux_losses_tracker(
             "load_balancing_loss",
@@ -257,6 +306,7 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mapping of token to experts assignment,
                 with shape [num_tokens, num_experts].
         """
+        seq_length, bsz = logits.shape[:2]
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Apply Z-Loss
@@ -270,6 +320,8 @@ class TopKRouter(Router):
             scores, routing_map = self.sinkhorn_load_balancing(logits)
         elif self.routing_type == "aux_loss":
             scores, routing_map = self.aux_loss_load_balancing(logits)
+        elif self.routing_type == "seq_aux_loss":
+            scores, routing_map = self.seq_aux_loss_load_balancing(logits, bsz, seq_length)
         elif self.routing_type == "none":
             # A naive top-k routing without load balancing
             scores, routing_map, _ = topk_softmax_with_capacity(
@@ -279,10 +331,26 @@ class TopKRouter(Router):
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
                 drop_policy=self.config.moe_token_drop_policy,
                 use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
                 deterministic_mode=self.config.deterministic_mode,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
             )
         else:
             raise ValueError(f"Unsupported MoE routing type: {self.routing_type}")
+        # Prevent extra local tokens accumulation on evaluation or activation recomputation
+        if self.enable_expert_bias and torch.is_grad_enabled():
+            with torch.no_grad():
+                self.local_tokens_per_expert += routing_map.sum(dim=0)
+
+        # profile for moe
+        if self.config.moe_router_force_load_balancing:
+            indices = torch.arange(routing_map.sum(),device=routing_map.device).view(routing_map.size(0),self.topk) % self.num_experts
+            row = torch.arange(routing_map.size(0),device=routing_map.device).repeat_interleave(self.topk)
+            col = indices.view(-1)
+            routing_map = torch.zeros_like(routing_map,dtype=torch.bool).index_put_((row,col),torch.ones(1,device=routing_map.device,dtype=torch.bool))
 
         return scores, routing_map
 
@@ -293,12 +361,10 @@ class TopKRouter(Router):
         Args:
             input (torch.Tensor): Input tensor.
         """
-        self.hidden = input.shape[-1]
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
-        logits = logits.view(-1, self.config.num_moe_experts)
 
         scores, routing_map = self.routing(logits)
 

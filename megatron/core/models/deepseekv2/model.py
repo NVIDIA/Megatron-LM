@@ -192,7 +192,6 @@ class GPTModel(LanguageModule):
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
-            position_ids=position_ids,
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=None,

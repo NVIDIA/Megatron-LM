@@ -189,10 +189,26 @@ follow these steps for 2 Node run with Node0 as master node :
   ```bash
   TEE_OUTPUT=1 MBS=2 BS=256 TP=1 TE_FP8=1 SEQ_LENGTH=8192 MODEL_SIZE=8 MASTER_ADDR=IP_NODE0 NNODES=2 NODE_RANK=1 bash examples/llama/train_llama3.sh
   ```
+  where `MASTER_ADDR=IP_NODE0` tells the script that the master node ip address is `IP_NODE0`.
 
-where `MASTER_ADDR=IP_NODE0` tells the script that the master node ip address is
-`IP_NODE0`.
-
+### 3.3 Multi-node Training with Slurm 
+In the slurm environment, launch the multinode training in the following way.   
+  ```
+  export HF_TOKEN=YourHuggingFaceToken
+  export MODEL_NAME=llama3
+  sbatch examples/llama/train_llama_slurm.sh <MODEL_SIZE> <MBS> <BATCH_SIZE_PER_NODE> <SEQ_LENTH> <TOTAL_ITERS> <FSDP> <RECOMPUTE>
+  ```
+For example, train llama 2 with multinodes: 
+```
+  export HF_TOKEN=YourHuggingFaceToken
+  export MODEL_NAME=llama2
+  sbatch examples/llama/train_llama_slurm.sh 13 6 48 4096 10 1 0
+```
+Train llama3 with multinodes:
+```
+  export HF_TOKEN=YourHuggingFaceToken
+  export MODEL_NAME=llama3
+  sbatch examples/llama/train_llama_slurm.sh 70 7 56 8192 10 1 1
 ---
 
 ## 4. Key Variables to Pay Attention To

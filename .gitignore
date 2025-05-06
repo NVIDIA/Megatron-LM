@@ -9,3 +9,5 @@ logs
 .vscode
 local/
 .gitmodules
+output
+experiment

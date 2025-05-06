@@ -19,6 +19,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 - Load Balancing algorithms:
     - Sinkhorn (S-BASE)
     - Aux loss / Load balancing loss
+    - Aux-loss-free load balancing strategy
 
 ### Performance Optimizations
 - GroupedGEMM when num local experts > 1
@@ -57,8 +58,15 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --expert-tensor-parallel-size | Degree of tensor model parallelism of expert layer. Default is same to --tensor-model-parallel-size. |
 | --moe-layer-freq | Frequency between MoE layers and Dense layers. Accepts either: 1) An integer N for 1:N ratio (one expert layer for every N-1 dense layers), 2) A string "N" for the same ratio, or 3) A string with Python list expression for custom patterns like `([1]*3+[0]*1)*3` which gives [1,1,1,0,1,1,1,0,1,1,1,0] where 1=expert layer and 0=dense layer. Examples: `([0]+[1]*23)` for 1 dense layer followed by 23 experts layers, `([1]*3+[0]*2)*2` for three expert layers followed by two dense layers, repeated twice. Default is 1. |
 | --moe-grouped-gemm | When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine. |
-| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer, "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
+| --moe-router-load-balancing-type | Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss". |
 | --moe-router-topk | Number of experts to route to for each token. The default is 2. |  
+| --moe-router-score-function | Score function for MoE routing. Can be "softmax" or "sigmoid". Default is "softmax". |
+| --moe-router-pre-softmax | Enable pre-softmax routing for MoE, which means softmax is before the top-k selection. By default, softmax is done after top-k. |
+| --moe-router-num-groups | Number of groups to divide experts into for group-limited routing. When using group-limited routing: 1) Experts are divided into equal-sized groups, 2) For each token, a subset of groups are selected based on routing scores (sum of top-2 expert scores within each group), 3) From these selected groups, moe_router_topk experts are chosen.  Two common use cases: 1) Device-limited routing: Set equal to expert parallel size (EP) to limit each token to experts on a subset of devices (See DeepSeek-V2: https://arxiv.org/pdf/2405.04434) 2) Node-limited routing: Set equal to number of nodes in EP group to limit each token to experts on a subset of nodes (See DeepSeek-V3: https://arxiv.org/pdf/2412.19437)) |
+| --moe-router-group-topk | Number of selected groups for group-limited routing. |
+| --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
+| --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
+| --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
 | --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
 | --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
 | --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |
@@ -68,6 +76,7 @@ Megatron-Core offers rich parallelism mappings, combining Expert Parallelism wit
 | --moe-pad-expert-input-to-capacity | Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set. |
 | --moe-token-drop-policy | The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped. |
 | --moe-layer-recompute | Enable activation checkpointing for moe_layer, should be used when memory is not sufficient. |
+| --moe-permute-fusion | Fuse token rearrangement ops during token dispatching. |
 | --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
 | --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
 | --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
@@ -82,6 +91,7 @@ To train a top-2 MoE model with 8 experts and auxiliary loss, include the follow
 --num-experts 8
 --expert-model-parallel-size 8
 --moe-grouped-gemm
+--moe-permute-fusion
 --moe-router-load-balancing-type aux_loss # options: aux_loss, sinkhorn, none. Default is aux_loss.
 --moe-router-topk 2
 --moe-aux-loss-coeff 1e-2
@@ -233,6 +243,7 @@ MOE_ARGS=(
     --moe-router-topk 2
     --moe-aux-loss-coeff 1e-2
     --moe-grouped-gemm
+    --moe-permute-fusion
 )
 
 DATA_ARGS=(
@@ -328,13 +339,13 @@ Here we provide some general rules to get better performance:
     - In practice, EP8TP1 is better than EP4TP2 for 8x7B.
 5. Enable Context Parallelism for long context training.
     - The efficiency of CP largely depends on whether its communication can be overlapped with computation. 
-    - Emperically, use CP when sequence length >= 8K.
+    - Empirically, use CP when sequence length >= 8K.
 
 ### MoE Parallel Folding
 
 MoE Parallel Folding separates the MoE related parallel groups from Dense groups.
 1. Traditional MoE parallel groups are entangled with dense by using a 5-dimension parallel group generator with default order `tp-cp-ep-dp-pp`. The EP group in MoE is a sub-group of DP in Attention.
-2. With MoE Parallel Fodling, we use a parallel group generator with `tp-cp-dp-pp` for Attention, and another with `tp-ep-dp-pp` for MoE. The EPxTP group in MoE is a sub-group of DPxCPxTP in Attention.
+2. With MoE Parallel Folding, we use a parallel group generator with `tp-cp-dp-pp` for Attention, and another with `tp-ep-dp-pp` for MoE. The EPxTP group in MoE is a sub-group of DPxCPxTP in Attention.
 
 By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 
