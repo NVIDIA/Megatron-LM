@@ -81,30 +81,6 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [bert_mr_tp1_pp4_vp2_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [bert_mr_tp1_pp4_vp2_resume_torch_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [bert_mr_tp2_pp2_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
-  - test_case: [bert_mr_tp2_pp2_resume_torch_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
     products:
       - environment: [dev, lts]
