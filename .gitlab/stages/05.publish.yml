@@ -149,7 +149,9 @@ publish:test_release_pypi_push_wheel:
     - owner/jet-core
     - purpose/utility
     - team/megatron
-  needs: [publish:test_release_pypi_test_wheel]
+  needs:
+    - job: publish:test_release_pypi_test_wheel
+      optional: true
   variables:
     GIT_STRATEGY: none
     PUBLISH_DRYRUN: "yes"
@@ -175,15 +177,6 @@ publish:test_release_pypi_push_wheel:
       if [[ "$PUBLISH_DRYRUN" != "yes" ]]; then
         twine upload --verbose -u $TWINE_USERNAME -p $TWINE_PASSWORT --repository   $REPOSITORY wheelhouse/* dist/*
       fi
-
-  rules:
-    - if: $PUBLISH == "yes" && $PUBLISH_SCOPE == "review-reminder"
-      when: never
-    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
-      allow_failure: true
-      when: on_success
-    - when: on_success
-      allow_failure: true
 
 publish:test_release_github:
   extends: [.test_rules]
@@ -218,7 +211,7 @@ publish:test_release_github:
 
     - |
       PAYLOAD=$(jq -nc \
-                  --arg TAG_NAME "v${RELEASE_NUMBER}" \
+                  --arg TAG_NAME "core_v${RELEASE_NUMBER}" \
                   --arg CI_COMMIT_SHA "$PUBLISH_COMMIT" \
                   --arg NAME "$NAME" \
                   --arg BODY "$CHANGELOG" \
@@ -269,7 +262,7 @@ publish:test_release_notify:
     PUBLISH_DRYRUN: "yes"
   script:
     - echo $PUBLISH_DRYRUN
-    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_r$RELEASE_NUMBER"
+    - URL="https://github.com/NVIDIA/Megatron-LM/releases/tag/core_v$RELEASE_NUMBER"
     - |
       cat << EOF > message.json
       {
@@ -278,7 +271,7 @@ publish:test_release_notify:
               "type": "section",
               "text": {
                 "type": "mrkdwn",
-                "text": "Releasebot 🤖: Megatron-Core released <${URL}|core_r${RELEASE_NUMBER}> 🚀"
+                "text": "Releasebot 🤖: Megatron-Core released <${URL}|core_v${RELEASE_NUMBER}> 🚀"
               }
             }
           ]

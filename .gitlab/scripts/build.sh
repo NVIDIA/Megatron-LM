@@ -13,10 +13,9 @@ if [[ "$CI_COMMIT_BRANCH" == "ci-rebuild-mcore-nemo-image" || "$CI_COMMIT_BRANCH
     ADDITIONAL_PARAMS+=("--pull")
     ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:main,mode=max")
     ADDITIONAL_PARAMS+=("-t ${IMAGE}:main")
-else
-    ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID:-$CI_COMMIT_REF_SLUG},mode=max")
+elif [[ -n "$CI_MERGE_REQUEST_IID" ]]; then
+    ADDITIONAL_PARAMS+=("--cache-to type=registry,ref=${IMAGE}-buildcache:${CI_MERGE_REQUEST_IID},mode=max")
     ADDITIONAL_PARAMS+=("-t ${IMAGE}:${CI_MERGE_REQUEST_IID}")
-
 fi
 
 if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
