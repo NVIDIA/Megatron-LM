@@ -978,6 +978,11 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    # Goldfish loss
+    if args.goldfish_loss:
+        assert args.goldfish_k > 0, f"goldfish_k (frequency) must be a positive integer. ({args.goldfish_k})"
+        assert args.goldfish_h > 0, f"goldfish_h (context width) must be a positive integer. ({args.goldfish_h})"
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -1502,6 +1507,14 @@ def _add_regularization_args(parser):
     group.add_argument('--adam-beta2', type=float, default=0.999,
                        help='Second coefficient for computing running averages '
                        'of gradient and its square')
+    group.add_argument('--ademamix-beta3', type=float, default=0.999,
+                       help='AdEMAMix beta_3 parameter')
+    group.add_argument('--ademamix-alpha', type=float, default=5,
+                       help='AdEMAMix alpha parameter')
+    group.add_argument('--ademamix-beta3-warmup', type=int, default=-1,
+                       help='AdEMAMix warmup period for beta_3')
+    group.add_argument('--ademamix-alpha-warmup', type=int, default=-1,
+                       help='AdEMAMix warmup period for aplha')
     group.add_argument('--adam-eps', type=float, default=1e-08,
                        help='Term added to the denominator to improve'
                        'numerical stability')
@@ -1729,7 +1742,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'ademamix'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
@@ -2330,6 +2343,12 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--goldfish-loss', action='store_true',
+                       help='Enable goldfish loss during pretraining.')
+    group.add_argument('--goldfish-k', type=int, default=50,
+                       help='Dropout factor k for goldfish loss masking, where dropout probability is 1/k.')
+    group.add_argument('--goldfish-h', type=int, default=50,                        
+                        help='Context width for hashing in goldfish loss masking. Controls how many preceding tokens determine masking.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
