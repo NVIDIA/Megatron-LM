@@ -42,9 +42,9 @@ spec:
         "DATA_CACHE_PATH='-'"
         "OUTPUT_PATH={assets_dir}"
         "TENSORBOARD_PATH={assets_dir}/tensorboard"
-       "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
         "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/{name}"
-        "TRAINING_SCRIPT_PATH=/opt/NeMo/examples/nlp/language_modeling/megatron_gpt_pretraining.py"
+        "TRAINING_SCRIPT_PATH=\"nemo llm pretrain -y --factory llama3_8b\""
         "TRAINING_PARAMS_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
         "N_REPEAT={n_repeat}"
@@ -53,17 +53,11 @@ spec:
     bash /opt/megatron-lm/tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_tp2_pp4_vp3_seq_par_overlap_p2p_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [deprecated]
-  - test_case: [gpt3-nemo_126m_mr_mbs4_gbs64_mcore_te_tp1_pp1_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [deprecated]
-  # TODO(Hepteract): Late init of parallel_state was broken after parallel states refactor,
-  # So skip this test case until NeMo is adapted to the refactored MCore.
-  # - test_case: [gpt3-nemo_126m_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp1_dgx_a100_1N8G]
+  # - test_case: [llama3-nemo_8b_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp2_dgx_a100_1N8G] # needs a fix
   #   products:
   #     - environment: [dev]
-  #       scope: [deprecated]
+  #       scope: [mr]
+  - test_case: [llama3-nemo_8b_mr_mbs4_gbs64_mcore_te_tp1_pp1_cp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]

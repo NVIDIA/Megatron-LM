@@ -3,12 +3,20 @@
 set -exo pipefail
 
 echo "------ARGUMENTS LIST --------"
+# Use eval to properly handle quoted arguments
+eval "set -- $@"
 for ARGUMENT in "$@"; do
-    echo $ARGUMENT
-    KEY=$(echo $ARGUMENT | cut -f1 -d=)
+    # Split on first = only, preserving any subsequent = signs in the value
+    KEY="${ARGUMENT%%=*}"
+    VALUE="${ARGUMENT#*=}"
 
-    KEY_LENGTH=${#KEY}
-    VALUE=$(eval echo ${ARGUMENT:$KEY_LENGTH+1})
+    # Remove any surrounding quotes from the value if they exist
+    VALUE="${VALUE%\"}"
+    VALUE="${VALUE#\"}"
+    VALUE="${VALUE%\'}"
+    VALUE="${VALUE#\'}"
+
+    # Properly quote the value to preserve spaces and special characters
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
