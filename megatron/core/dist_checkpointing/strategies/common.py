@@ -14,6 +14,7 @@ from megatron.core.dist_checkpointing.strategies.base import (
     StrategyAction,
     register_default_strategy,
 )
+from megatron.core.msc_utils import MultiStorageClientFeature
 
 from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import CheckpointingException, ShardedObject, is_main_replica
@@ -38,7 +39,12 @@ class TorchCommonSaveStrategy(SaveCommonStrategy):
     def save_common(self, common_state_dict: StateDict, checkpoint_dir: Path):
         """Save common part of the state dict."""
         if torch.distributed.get_rank() == 0:
-            torch.save(common_state_dict, checkpoint_dir / COMMON_STATE_FNAME)
+            path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
+            if MultiStorageClientFeature.is_enabled():
+                msc = MultiStorageClientFeature.import_package()
+                msc.torch.save(common_state_dict, path)
+            else:
+                torch.save(common_state_dict, path)
 
     def save_sharded_objects(
         self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
@@ -46,9 +52,15 @@ class TorchCommonSaveStrategy(SaveCommonStrategy):
         """Save sharded objects from the state dict."""
         for sh_obj in nested_values(sharded_objects_state_dict):
             if is_main_replica(sh_obj.replica_id):
-                save_path = checkpoint_dir / f'{sh_obj.unique_key}.pt'
-                os.makedirs(save_path.parent, exist_ok=True)
-                torch.save(sh_obj.data, save_path)
+                save_path = os.path.join(checkpoint_dir, f"{sh_obj.unique_key}.pt")
+                parent_dir = os.path.dirname(save_path)
+                if MultiStorageClientFeature.is_enabled():
+                    msc = MultiStorageClientFeature.import_package()
+                    msc.os.makedirs(parent_dir, exist_ok=True)
+                    msc.torch.save(sh_obj.data, save_path)
+                else:
+                    os.makedirs(parent_dir, exist_ok=True)
+                    torch.save(sh_obj.data, save_path)
 
     def can_handle_sharded_objects(self):
         """This strategy can handle ShardedObjects."""
@@ -67,12 +79,20 @@ class TorchCommonLoadStrategy(LoadCommonStrategy):
         Returns:
             StateDict: state dict with non-sharded objects from the checkpoint
         """
-        load_path = Path(checkpoint_dir) / COMMON_STATE_FNAME
+        load_path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
         try:
-            return torch.load(load_path, map_location='cpu', weights_only=False)
+            if MultiStorageClientFeature.is_enabled():
+                msc = MultiStorageClientFeature.import_package()
+                return msc.torch.load(load_path, map_location='cpu', weights_only=False)
+            else:
+                return torch.load(load_path, map_location='cpu', weights_only=False)
         except FileNotFoundError as e:
             err_msg = f'Common file {load_path} does not exist'
-            ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
+            if MultiStorageClientFeature.is_enabled():
+                msc = MultiStorageClientFeature.import_package()
+                ckpt_files = [f.name for f in msc.Path(checkpoint_dir).iterdir()]
+            else:
+                ckpt_files = [f.name for f in checkpoint_dir.iterdir()]
             logger.debug(f'{err_msg}. Checkpoint directory content: {ckpt_files}')
             raise CheckpointingException(err_msg) from e
 

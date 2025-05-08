@@ -1,8 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import logging
+import os
 from collections import Counter, defaultdict
 from enum import Enum
-from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
@@ -31,6 +31,7 @@ from megatron.core.dist_checkpointing.strategies.base import (
     StrategyAction,
     get_default_strategy,
 )
+from megatron.core.msc_utils import MultiStorageClientFeature
 
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
@@ -161,7 +162,7 @@ def validate_integrity_and_strict_load(
             on all ranks, unexpected keys might differ across ranks. Additionally,
             missing keys might be erroneously empty (depending on `strict` value).
     """
-    missing_keys, unexpected_keys = [], []
+    missing_keys, unexpected_keys = set(), set()
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
         if ckpt_sharded_metadata is None:
             raise CheckpointingException(
@@ -185,7 +186,7 @@ def validate_integrity_and_strict_load(
         sharded_state_dict = adjust_non_strict_load(sharded_state_dict, unexpected_keys)
 
         if strict == StrictHandling.IGNORE_ALL:
-            missing_keys, unexpected_keys = [], []
+            missing_keys, unexpected_keys = set(), set()
         elif strict in (StrictHandling.RAISE_UNEXPECTED, StrictHandling.RAISE_ALL):
             maybe_report_missing_and_unexpected_keys(missing_keys, unexpected_keys, True)
         elif strict in (StrictHandling.LOG_UNEXPECTED, StrictHandling.LOG_ALL):
@@ -219,7 +220,13 @@ def verify_checkpoint_and_load_strategy(
             if compatible with the checkpoint content. If None, the default common load strategy
             for the checkpoint backend will be returned.
     """
-    if not Path(checkpoint_dir).exists():
+    isdir = True
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        isdir = msc.os.path.isdir(str(checkpoint_dir), strict=False)
+    else:
+        isdir = os.path.isdir(checkpoint_dir)
+    if not isdir:
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
     saved_config = maybe_load_config(checkpoint_dir)
@@ -379,6 +386,7 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
     torch.distributed.gather_object(common_state_dict, other_rank_state_dicts)
     common_state_dict_diff = {}
     if rank == 0:
+        assert other_rank_state_dicts
         main_rank_state_dict = common_state_dict
         for rank, rank_state_dict in enumerate(other_rank_state_dicts[1:], 1):
             only_left, only_right, mismatch = diff(main_rank_state_dict, rank_state_dict)
@@ -531,7 +539,7 @@ def determine_global_metadata(
     local_metadata = [ten.without_data() for ten in nested_values(sharded_state_dict)]
     global_metadata = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(global_metadata, local_metadata)
-    return local_metadata, global_metadata
+    return local_metadata, global_metadata  # type: ignore[return-value]
 
 
 def validate_sharded_objects_handling(
