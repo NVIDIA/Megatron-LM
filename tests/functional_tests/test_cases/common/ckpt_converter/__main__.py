@@ -92,7 +92,7 @@ class ModelMeta:
     """Basic information about a model.
 
     Args:
-        format (str): 'core', 'legacy', 'meta', 'hf', or 'llava'.
+        format (str): 'core', 'meta', 'hf', or 'llava'.
         mp (ModelParallelState): Defines TP, PP, EP.
         transformer_impl (str): 'transformer_engine' or 'local'.
     """
@@ -104,7 +104,7 @@ class ModelMeta:
         if transformer_impl is None:
             transformer_impl = "transformer_engine" if format in ("core", "llava") else "local"
 
-        assert format in ("core", "legacy", "meta", "hf", "llava")
+        assert format in ("core", "meta", "hf", "llava")
         assert isinstance(mp, ModelParallelState)
         assert transformer_impl in ("transformer_engine", "local")
 
@@ -205,10 +205,6 @@ class Pipeline:
         # Fail on missing checkpoint.
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
-
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
 
         # Parse args.
         args = parse_args()
@@ -810,10 +806,6 @@ class LLaVAPipeline(Pipeline):
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
 
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
-
         # Parse args.
         from examples.multimodal.multimodal_args import add_multimodal_extra_args
 
@@ -844,9 +836,6 @@ def get_gpt_pipelines():
         GPTPipeline(("core", (4, 2)), ("core", (2, 4), "local")),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4), "local")),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4))),
-        # GPTPipeline(("legacy", (4, 2)), ("core", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2)), ("legacy", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2), "te"), ("legacy", (2, 4), "te")),
         # [todo] GPTPipeline("meta", "core", None, (8, 1)),
         # [todo] GPTPipeline("hf", "core", None, (8, 1)),
     ]

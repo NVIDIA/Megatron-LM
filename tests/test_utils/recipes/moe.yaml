@@ -87,10 +87,6 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_4experts]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts]
   #   products:
   #     - environment: [dev, lts]
