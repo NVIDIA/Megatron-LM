@@ -74,6 +74,7 @@ RUN \
 pip install -U pip
 pip install --no-cache-dir causal_conv1d-*.whl mamba_ssm-*.whl grouped_gemm-*.whl transformer_engine*.whl
 pip install "nvidia-modelopt[torch]==0.27.1"
+pip install "multi-storage-client==0.20.2"
 PY_ENV=pytorch_25.03 pip install --no-cache-dir . -r requirements_mlm.txt -r requirements_ci.txt
 EOF
 
