@@ -58,8 +58,9 @@ ARG TE_BRANCH=release_v1.13_rocm
 ENV NVTE_FRAMEWORK=pytorch
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH_OVERRIDE}
 ENV NVTE_USE_HIPBLASLT=1
-RUN git clone --single-branch --depth 1 --shallow-submodule -b ${TE_BRANCH} https://github.com/ROCm/TransformerEngine.git && \
+RUN git clone --single-branch --depth 1 -b ${TE_BRANCH} https://github.com/ROCm/TransformerEngine.git && \
     cd TransformerEngine && \
+    git submodule update --init --recursive && \
     echo "TransformerEngine at commit:" $(git rev-parse HEAD) && \
     pip install -v .
 
