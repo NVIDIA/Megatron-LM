@@ -32,6 +32,7 @@ class TestMambaMixer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.parametrize("use_mem_eff_path", [True, False])
     def test_gpu_forward(self, use_mem_eff_path):
         if use_mem_eff_path:

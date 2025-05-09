@@ -57,6 +57,7 @@ def get_pp_offsets():
 
 
 class TestMambaReconfiguration:
+    @pytest.mark.internal
     @pytest.mark.parametrize(
         "use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu",
         [
