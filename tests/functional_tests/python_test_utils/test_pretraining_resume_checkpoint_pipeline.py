@@ -2,7 +2,7 @@ import logging
 
 import yaml
 
-from tests.functional_tests.python_test_utils import common, test_regular_pipeline
+from tests.functional_tests.python_test_utils import common, test_pretraining_regular_pipeline
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ def test_resume_checkpoint_pipeline(
     logger.info(first_run_values)
     logger.info(second_run_values)
 
-    test_regular_pipeline.test_regular_pipeline(
+    test_pretraining_regular_pipeline.test_regular_pipeline(
         compare_approximate_results=compare_approximate_results,
         golden_values=first_run_values,
         tensorboard_logs=second_run_values,
