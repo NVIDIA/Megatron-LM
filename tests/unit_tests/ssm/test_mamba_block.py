@@ -38,6 +38,7 @@ class TestMambaBlock:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_gpu_forward(self):
         hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         block = self.get_mamba_block(hybrid_override_pattern)
@@ -56,6 +57,7 @@ class TestMambaBlock:
         assert output.shape[2] == block.config.hidden_size
         assert output.dtype == torch.float32
 
+    @pytest.mark.internal
     def test_layer_types(self):
         """
         Make sure that the layer types specified with hybrid_override_pattern
@@ -71,6 +73,7 @@ class TestMambaBlock:
         assert isinstance(layers[2], TransformerLayer)
         assert isinstance(layers[2].mlp, MLP)
 
+    @pytest.mark.internal
     def test_invalid_layer_types_cause_failure(self):
         invalid_symbol = '+'
         assert invalid_symbol not in Symbols.VALID  # sanity check.
