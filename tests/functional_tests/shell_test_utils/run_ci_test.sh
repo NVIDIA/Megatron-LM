@@ -45,10 +45,6 @@ done
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     yq '.TEST_TYPE')
-MODE=$(cat $TRAINING_PARAMS_PATH |
-    yq '.MODE // "pretraining"')
-
-MODES=("pretraining" "inference")
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "release")
 
 if [[ "$TEST_TYPE" == "release" ]]; then
@@ -69,34 +65,33 @@ IS_NEMO_TEST=$([[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') =
 export IS_NEMO_TEST
 
 # Adjust model_config for lightweight mode
-if [[ "$MODE" == "pretraining" ]]; then
-    if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "true" ]]; then
-        yq -i '.MODEL_ARGS."trainer.max_steps" = 2' $TRAINING_PARAMS_PATH
-        TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
-            yq '.MODEL_ARGS."trainer.max_steps // "100"')
+if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "true" ]]; then
+    yq -i '.MODEL_ARGS."trainer.max_steps" = 2' $TRAINING_PARAMS_PATH
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."trainer.max_steps // "100"')
 
-        N_REPEAT=1
+    N_REPEAT=1
 
-    elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
-        yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
-        yq -i '.MODEL_ARGS."--exit-interval" = 4' $TRAINING_PARAMS_PATH
-        TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
-            yq '.MODEL_ARGS."--exit-interval" // "100"')
-        N_REPEAT=1
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "false" ]]; then
+    yq -i '.ENV_VARS."SKIP_PYTEST" = 1' $TRAINING_PARAMS_PATH
+    yq -i '.MODEL_ARGS."--exit-interval" = 4' $TRAINING_PARAMS_PATH
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."--exit-interval" // "100"')
+    N_REPEAT=1
 
-        if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
-            yq -i '.MODEL_ARGS."--save-interval" = 2' $TRAINING_PARAMS_PATH
-        fi
-
-    elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "false" && "$IS_NEMO_TEST" == "true" ]]; then
-        TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
-            yq '.MODEL_ARGS."trainer.max_steps" // "100"')
-
-    elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "false" && "$IS_NEMO_TEST" == "false" ]]; then
-        yq -i '.MODEL_ARGS."--exit-interval" = .MODEL_ARGS."--train-iters"' $TRAINING_PARAMS_PATH
-        TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
-            yq '.MODEL_ARGS."--exit-interval" // "100"')
+    if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+        yq -i '.MODEL_ARGS."--save-interval" = 2' $TRAINING_PARAMS_PATH
     fi
+
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "false" && "$IS_NEMO_TEST" == "true" ]]; then
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."trainer.max_steps" // "100"')
+
+elif [[ "$ENABLE_LIGHTWEIGHT_MODE" == "false" && "$IS_NEMO_TEST" == "false" ]]; then
+    yq -i '.MODEL_ARGS."--exit-interval" = .MODEL_ARGS."--train-iters"' $TRAINING_PARAMS_PATH
+    TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
+        yq '.MODEL_ARGS."--exit-interval" // "100"')
+
 fi
 
 # Extract settings from params file
@@ -184,41 +179,24 @@ for i in $(seq 1 $N_REPEAT); do
             EXTRACT_ARGS=("--is-normal-test")
         fi
 
-        # Read test values from Tensorboard for non-inference tests.
-        # Inference tests will load from JSON instead.
-        if [[ "$MODE" == "pretraining" ]]; then
-            python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-                --logs-dir $TENSORBOARD_PATH \
-                --train-iters $TRAIN_ITERS \
-                --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
-                "${EXTRACT_ARGS[@]}"
-        fi
+        python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+            --logs-dir $TENSORBOARD_PATH \
+            --train-iters $TRAIN_ITERS \
+            --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
+            "${EXTRACT_ARGS[@]}"
     fi
 
     # Maybe run tests
-    if [[ ${SKIP_PYTEST:-0} == 1 ]]; then
-        echo Skipping Pytest checks.
-        exit 0
-    fi
+    if [[ ${SKIP_PYTEST:-0} != 1 ]]; then
 
-    if [[ ! " ${TEST_TYPES[*]} " =~ " ${TEST_TYPE} " ]]; then
-        echo "Test type $TEST_TYPE not yet implemented."
-    fi
+        export NVTE_ALLOW_NONDETERMINISTIC_ALGO
+        if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" ]]; then
+            ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"
+        fi
 
-    if [[ ! " ${MODES[*]} " =~ " ${MODE} " ]]; then
-        echo "Mode $MODE not yet implemented."
-    fi
+        echo "Running pytest checks against golden values"
 
-    export NVTE_ALLOW_NONDETERMINISTIC_ALGO
-    if [[ "${NVTE_ALLOW_NONDETERMINISTIC_ALGO}" == "1" ]]; then
-        ALLOW_NONDETERMINISTIC_ALGO_ARG="--allow-nondeterministic-algo"
-    fi
-
-    echo "Running pytest checks against golden values"
-
-    # For pretraining jobs
-    if [[ "$MODE" == "pretraining" ]]; then
-        pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
+        pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_regular_pipeline.py \
             --golden-values-path $GOLDEN_VALUES_PATH \
             --tensorboard-path $TENSORBOARD_PATH \
             --model-config-path ${TRAINING_PARAMS_PATH} \
@@ -226,23 +204,15 @@ for i in $(seq 1 $N_REPEAT); do
 
         if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
             echo "Running pytest 1st vs 2nd run comparison"
-            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
+            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py \
                 --tensorboard-path $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --model-config-path ${TRAINING_PARAMS_PATH} \
                 $ALLOW_NONDETERMINISTIC_ALGO_ARG
         fi
-    fi
 
-    # For inference jobs
-    if [[ "$MODE" == "inference" ]]; then
-        if [[ "$TEST_TYPE" == "frozen-start" ]]; then
-            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
-                --golden-values-path $GOLDEN_VALUES_PATH \
-                --test-values-path $TENSORBOARD_PATH \
-                --model-config-path ${TRAINING_PARAMS_PATH} \
-                $ALLOW_NONDETERMINISTIC_ALGO_ARG
+        if [[ ! " ${TEST_TYPES[*]} " =~ " ${TEST_TYPE} " ]]; then
+            echo "Test type $TEST_TYPE not yet implemented."
         fi
     fi
-
 done
