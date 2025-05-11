@@ -1,8 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import os
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import torch.nn as nn
 
@@ -20,14 +19,20 @@ except ImportError as e:
 NEMO_WEIGHT_DIR_NAMES = {"model_weights": "model.", "weights": "module."}
 
 
-def get_sharded_load_dir(load_dir: str) -> Tuple[str, str]:
-    """ """
-    sharded_prefix = ""
+def get_sharded_load_dir(load_dir: str) -> Tuple[Union[str, None], str]:
+    """Helper to retrieve the sharded load directory and its prefix, if any."""
+    load_dir = Path(load_dir)
+
+    # Skip if load_dir is nonexistent or empty
+    if not load_dir.is_dir() or not any(load_dir.iterdir()):
+        return None, ""
+
     sharded_load_dir = None
+    sharded_prefix = ""
     # Read the tracker file and set the iteration if this is a MLM sharded checkpoint.
-    tracker_filename = os.path.join(load_dir, 'latest_checkpointed_iteration.txt')
-    # If no tracker file, assuming that it is a NeMo sharded checkpoint.
-    if os.path.isfile(tracker_filename):
+    # If no tracker file, assume it is a NeMo sharded checkpoint.
+    tracker_filename = load_dir / 'latest_checkpointed_iteration.txt'
+    if tracker_filename.is_file():
         with open(tracker_filename, 'r') as f:
             metastring = f.read().strip()
             try:
@@ -38,13 +43,15 @@ def get_sharded_load_dir(load_dir: str) -> Tuple[str, str]:
     else:
         for nemo_dir_name, prefix in NEMO_WEIGHT_DIR_NAMES.items():
             nemo_weight_dir = Path(load_dir) / nemo_dir_name
-            if os.path.isdir(nemo_weight_dir):
-                sharded_prefix = prefix
+            if nemo_weight_dir.is_dir():
                 sharded_load_dir = nemo_weight_dir
+                sharded_prefix = prefix
                 break
 
     if sharded_load_dir is None:
-        raise ValueError("{} is not a MLM or NeMo sharded checkpoint!".format(load_dir))
+        raise ValueError(f"{load_dir} is not a MLM or NeMo sharded checkpoint!")
+    if not sharded_load_dir.exists():
+        return None, ""
 
     return sharded_load_dir, sharded_prefix
 
@@ -68,15 +75,19 @@ def load_modelopt_state(load_dir: Optional[str] = None, model: Optional[nn.Modul
     if args.use_dist_ckpt:
         assert model is not None, "`model` argument required when `args.use_dist_ckpt is True`"
         sharded_load_dir, _ = get_sharded_load_dir(load_dir)
+        if sharded_load_dir is None:
+            print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
+            return {}
         return restore_sharded_modelopt_state([model], sharded_load_dir)
     else:
-        print_rank_0("Loading modelopt_state from base checkpoint ({})".format(load_dir))
+        print_rank_0(f"Loading ModelOpt state from base checkpoint ({load_dir})")
         try:
             state_dict, _, _ = _load_base_checkpoint(args.load, rank0=False)
         except Exception:
             print_rank_0("Failed to load base checkpoint via megatron _load_base_checkpoint!")
             return {}
         if state_dict is None:
+            print_rank_0("No checkpoint state_dict found. Skipping loading ModelOpt state.")
             return {}
         return state_dict.get("modelopt_state", {})
 
@@ -132,7 +143,7 @@ def load_modelopt_checkpoint(
         )
         model_state_dict = state_dict["model"]
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
-    elif sharded_load_dir.exists() and optimizer is None and opt_param_scheduler is None:
+    elif sharded_load_dir is not None and optimizer is None and opt_param_scheduler is None:
         sharded_state_dict = unwrapped_model[0].sharded_state_dict(prefix=additional_sharded_prefix)
         if additional_sharded_prefix:
             unwrapped_model[0]._register_load_state_dict_pre_hook(

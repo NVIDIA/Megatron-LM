@@ -334,7 +334,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
 
         # all-reduce across DP ranks.
-        all_reduce(tensor=num_tokens, group=parallel_state.get_data_parallel_group())
+        all_reduce(tensor=num_tokens, group=parallel_state.get_data_parallel_group(with_context_parallel=True))
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens

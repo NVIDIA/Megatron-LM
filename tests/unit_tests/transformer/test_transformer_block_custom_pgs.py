@@ -210,7 +210,7 @@ class TestTransformerBlockWithProcessGroups:
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
-    @pytest.mark.skip("OOM error")
+    @pytest.mark.skipif(int(os.getenv('ACCEL_MEMORY_GB', 40)) < 40, reason="Insufficient GPU memory")
     @pytest.mark.skipif(not HAVE_TE, reason="Transformer Enginer not available")
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),

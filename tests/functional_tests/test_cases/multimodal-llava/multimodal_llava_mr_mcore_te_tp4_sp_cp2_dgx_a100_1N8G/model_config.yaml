@@ -55,4 +55,5 @@ MODEL_ARGS:
   --mock-data: true
   --use-packed-sequence: true
   --log-memory-to-tensorboard: true
+  --calculate-per-token-loss: true
 TEST_TYPE: regular

@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+import random
 
 import pytest
 import torch
@@ -33,54 +34,57 @@ class PytorchIndicesToMultihot:
         return multihot_routing_map.bool(), multihot_probs
 
 
-# Unit test
-@pytest.mark.experimental
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_indices_to_multihot():
-    Utils.initialize_model_parallel()
-    config.ENABLE_EXPERIMENTAL = True
-    indices = torch.tensor(
-        [
-            [-1, -1, -1, -1, -1, 18, -1, -1],
-            [7, -1, -1, -1, -1, -1, 3, -1],
-            [-1, -1, -1, -1, -1, 3, 12, -1],
-            [-1, -1, 25, -1, -1, -1, -1, -1],
-        ],
-        dtype=torch.int32,
-        device=get_current_device(),
-    )
-    probs_indices = torch.tensor(
-        [
-            [0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0654, 0.0000, 0.0000],
-            [0.1621, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0884, 0.0000],
-            [0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.0640, 0.0449, 0.0000],
-            [0.0000, 0.0000, 0.1309, 0.0000, 0.0000, 0.0000, 0.0000, 0.0000],
-        ],
-        dtype=torch.float32,
-        device=get_current_device(),
-        requires_grad=True,
-    )
-    indices_pytorch = copy.deepcopy(indices)
-    probs_indices_pytorch = copy.deepcopy(probs_indices)
-    num_of_local_experts = 32
+class TestIndicesToMultihot:
 
-    # test forward
-    multihot_indices, probs_in_multihot = fused_indices_to_multihot(
-        indices, probs_indices, num_of_local_experts
-    )
-    pytorch_class = PytorchIndicesToMultihot(num_of_local_experts)
-    multihot_indices_pytorch, probs_in_multihot_pytorch = pytorch_class._indices_to_multihot(
-        indices_pytorch, probs_indices_pytorch
-    )
-    assert torch.allclose(multihot_indices, multihot_indices_pytorch)
-    assert torch.allclose(probs_in_multihot, probs_in_multihot_pytorch)
+    def setup_method(self, method):
+        # enable experimental feature
+        if config.ENABLE_EXPERIMENTAL is False:
+            config.ENABLE_EXPERIMENTAL = True
 
-    # test backward
-    loss = (probs_in_multihot @ torch.transpose(probs_in_multihot, 0, 1)).sum() / 2
-    loss.backward()
-    loss_pytorch = (
-        probs_in_multihot_pytorch @ torch.transpose(probs_in_multihot_pytorch, 0, 1)
-    ).sum() / 2
-    loss_pytorch.backward()
-    assert torch.allclose(probs_indices.grad, probs_indices_pytorch.grad)
-    Utils.destroy_model_parallel()
+    def teardown_method(self, method):
+        # disable experimental feature
+        if config.ENABLE_EXPERIMENTAL is True:
+            config.ENABLE_EXPERIMENTAL = False
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.experimental
+    @pytest.mark.parametrize("num_of_token", [3, 5, 8, 128, 512])
+    @pytest.mark.parametrize("topk", [2, 4, 6, 7, 8])
+    @pytest.mark.parametrize("num_of_local_experts", [4, 7, 8, 12, 20, 30, 31, 32])
+    def test_indices_to_multihot(self, num_of_token, topk, num_of_local_experts):
+        # construct the indices and probs_indices
+        indices = torch.full((num_of_token, topk), -1, dtype=torch.int32, device=get_current_device())
+        probs_indices = torch.full((num_of_token, topk), 0, dtype=torch.float32, device=get_current_device())
+        # Fill the indices with random values
+        # There are 2 non-ordinary values in each row
+        for i in range(num_of_token):
+            positions = random.sample(range(indices.shape[1]), 2)
+            values = random.sample(range(num_of_local_experts), 2)
+            indices[i, positions[0]] = values[0]
+            indices[i, positions[1]] = values[1]
+        mask = indices != -1
+        probs_indices[mask] = torch.rand(mask.sum(), device=indices.device)
+        probs_indices.requires_grad = True
+
+        indices_pytorch = copy.deepcopy(indices)
+        probs_indices_pytorch = copy.deepcopy(probs_indices)
+
+        # test forward
+        multihot_indices, probs_in_multihot = fused_indices_to_multihot(
+            indices, probs_indices, num_of_local_experts
+        )
+        pytorch_class = PytorchIndicesToMultihot(num_of_local_experts)
+        multihot_indices_pytorch, probs_in_multihot_pytorch = pytorch_class._indices_to_multihot(
+            indices_pytorch, probs_indices_pytorch
+        )
+        assert torch.allclose(multihot_indices, multihot_indices_pytorch)
+        assert torch.allclose(probs_in_multihot, probs_in_multihot_pytorch)
+
+        # test backward
+        loss = (probs_in_multihot @ torch.transpose(probs_in_multihot, 0, 1)).sum() / 2
+        loss.backward()
+        loss_pytorch = (
+            probs_in_multihot_pytorch @ torch.transpose(probs_in_multihot_pytorch, 0, 1)
+        ).sum() / 2
+        loss_pytorch.backward()
+        assert torch.allclose(probs_indices.grad, probs_indices_pytorch.grad)

@@ -50,7 +50,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
     Args:
         config: Transformer config object.
-        ddp_config: DistributedDataParallel config object.
+        ddp_config: TorchDistributedDataParallel config object.
         module: Underlying model.
         sub_modules_to_wrap: Set of sub_modules to shard with FSDP.
             Parameters within each sub_module will be all-gathered just-in-time.
@@ -79,7 +79,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             RotaryEmbedding,
             tensor_parallel.ColumnParallelLinear,
         },
-        group: Optional[torch.distributed.ProcessGroup] = None,
+        process_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
 
         assert (
@@ -88,24 +88,31 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
 
         super().__init__(config=config, module=module)
 
-        if group is None:
-            self.group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        if process_group is None:
+            self.process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
         else:
-            self.group = group
+            self.process_group = process_group
 
         if xm:
             # Define the mesh following common SPMD practice
-            wpg = WrappedProcessGroup(self.group)
+            wpg = WrappedProcessGroup(self.process_group)
             num_devices = xr.global_runtime_device_count()
             device_ids = np.array(range(num_devices))
             mesh_shape = (len(wpg.rank_groups[0]), len(wpg.rank_groups))
             # To be noted, the mesh must have an axis named 'fsdp', 
             # # which the weights and activations will be sharded on.
-            self.mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'model'))
-            kwargs = {"mesh": self.mesh}
+            self.device_mesh = xs.Mesh(device_ids, mesh_shape, ('fsdp', 'model'))
+            kwargs = {
+                "mesh": self.device_mesh,
+            }
         else:
-            self.mesh = DeviceMesh.from_group(self.group, get_current_device_type())
-            kwargs = {"mesh": self.mesh}
+            self.device_mesh = DeviceMesh.from_group(self.process_group, get_current_device_type())
+            kwargs = {
+                "mesh": self.device_mesh,
+                "reshard_after_forward": getattr(ddp_config, "reshard_after_forward", True),
+            }
+
+        self.ddp_config = ddp_config
 
         def save_custom_attrs(module):
             custom_attrs = {}

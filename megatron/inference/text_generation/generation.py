@@ -226,8 +226,12 @@ def generate_tokens_probs_and_return_on_first_stage(
             positions2use = position_ids[:, prev_context_length:context_length]
 
             # Do not pass a variable-shape attention mask in the decode phase.
-            attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length] if prefill else None
+            if torch.is_inference_mode_enabled():
+                attention_mask2use = attention_mask.clone()[
+                    ..., prev_context_length:context_length, :context_length] if prefill else None
+            else:
+                attention_mask2use = attention_mask[
+                    ..., prev_context_length:context_length, :context_length] if prefill else None
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
@@ -373,8 +377,12 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
             positions2use = position_ids[:, prev_context_length:context_length]
 
             # Do not pass a variable-shape attention mask in the decode phase.
-            attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length] if not prefill else None
+            if torch.is_inference_mode_enabled():
+                attention_mask2use = attention_mask.clone()[
+                    ..., prev_context_length:context_length, :context_length] if not prefill else None
+            else:
+                attention_mask2use = attention_mask[
+                    ..., prev_context_length:context_length, :context_length] if not prefill else None
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)

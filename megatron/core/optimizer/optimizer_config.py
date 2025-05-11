@@ -5,6 +5,8 @@ from typing import Callable, Optional
 
 import torch
 
+from ..utils import is_te_min_version
+
 
 @dataclass
 class OptimizerConfig:
@@ -50,6 +52,11 @@ class OptimizerConfig:
     use_precision_aware_optimizer: bool = False
     """If true, allows optimizer-related tensors (master_param, gradients and optimizer states)
     to be set to lower precision. Defaults to False.
+    """
+
+    store_param_remainders: bool = True
+    """If true, store the 16-bit FP32 parameter remainders in the optimizer state, excluding the
+        16 bits shared with the BF16 parameters. This lowers GPU memory usage. Defaults to True.
     """
 
     main_grads_dtype: torch.dtype = torch.float32
@@ -169,6 +176,9 @@ class OptimizerConfig:
             assert (
                 self.use_distributed_optimizer
             ), '--use-precision-aware-optimizer only supported with distributed optimizer'
+
+            if not is_te_min_version("2.1.0"):
+                self.store_param_remainders = False
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
             # --use-precision-aware-optimizer.

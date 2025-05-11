@@ -13,7 +13,7 @@ class ModelType(enum.Enum):
 
 
 class Fp8Recipe(str, enum.Enum):
-    """FP8 recipe names: delayed, tensorwise, mxfp8."""
+    """FP8 recipe names: delayed, tensorwise, mxfp8, blockwise."""
 
     delayed = "delayed"
     tensorwise = "tensorwise"

@@ -5,7 +5,6 @@ from typing import List, Optional, Tuple, Union
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
-from megatron import core
 from megatron.core import ModelParallelConfig
 from megatron.core.parallel_state import (
     get_default_process_group,
@@ -488,13 +487,14 @@ def _communicate(
     return tensor_recv_prev, tensor_recv_next, reqs
 
 
-def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
+def recv_forward(
+    tensor_shape: Shape, config: ModelParallelConfig, is_first_stage: bool
+) -> torch.Tensor:
     """Receive tensor from previous rank in pipeline (forward receive).
 
     See _communicate for argument details.
     """
-
-    if core.parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+    if is_first_stage:
         input_tensor = None
     else:
         if config.timers is not None:
@@ -512,12 +512,14 @@ def recv_forward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tens
     return input_tensor
 
 
-def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Tensor:
+def recv_backward(
+    tensor_shape: Shape, config: ModelParallelConfig, is_last_stage: bool
+) -> torch.Tensor:
     """Receive tensor from next rank in pipeline (backward receive).
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+    if is_last_stage:
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -535,13 +537,15 @@ def recv_backward(tensor_shape: Shape, config: ModelParallelConfig) -> torch.Ten
     return output_tensor_grad
 
 
-def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> None:
+def send_forward(
+    output_tensor: torch.Tensor, config: ModelParallelConfig, is_last_stage: bool
+) -> None:
     """Send tensor to next rank in pipeline (forward send).
 
     See _communicate for argument details.
     """
 
-    if not core.parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+    if not is_last_stage:
         if config.timers is not None:
             config.timers('forward-send', log_level=2).start()
         _communicate(
@@ -556,12 +560,14 @@ def send_forward(output_tensor: torch.Tensor, config: ModelParallelConfig) -> No
             config.timers('forward-send').stop()
 
 
-def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) -> None:
+def send_backward(
+    input_tensor_grad: torch.Tensor, config: ModelParallelConfig, is_first_stage: bool
+) -> None:
     """Send tensor to previous rank in pipeline (backward send).
 
     See _communicate for argument details.
     """
-    if not core.parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+    if not is_first_stage:
         if config.timers is not None:
             config.timers('backward-send', log_level=2).start()
         _communicate(
@@ -577,13 +583,16 @@ def send_backward(input_tensor_grad: torch.Tensor, config: ModelParallelConfig) 
 
 
 def send_forward_recv_backward(
-    output_tensor: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    output_tensor: torch.Tensor,
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    is_last_stage: bool,
 ) -> torch.Tensor:
     """Batched send and recv with next rank in pipeline.
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+    if is_last_stage:
         output_tensor_grad = None
     else:
         if config.timers is not None:
@@ -602,13 +611,16 @@ def send_forward_recv_backward(
 
 
 def send_backward_recv_forward(
-    input_tensor_grad: torch.Tensor, tensor_shape: Shape, config: ModelParallelConfig
+    input_tensor_grad: torch.Tensor,
+    tensor_shape: Shape,
+    config: ModelParallelConfig,
+    is_first_stage: bool,
 ) -> torch.Tensor:
     """Batched send and recv with previous rank in pipeline.
 
     See _communicate for argument details.
     """
-    if core.parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+    if is_first_stage:
         input_tensor = None
     else:
         if config.timers is not None:

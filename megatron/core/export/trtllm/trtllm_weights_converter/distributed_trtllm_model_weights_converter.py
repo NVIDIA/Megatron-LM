@@ -68,7 +68,7 @@ class DistributedTRTLLMModelWeightsConverter:
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        vp_size = self.transformer_config.virtual_pipeline_model_parallel_size
 
         assert (
             vp_size is None or vp_size == 1

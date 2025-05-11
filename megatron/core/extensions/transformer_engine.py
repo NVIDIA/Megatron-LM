@@ -147,6 +147,14 @@ class TELinear(te.pytorch.Linear):
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
+        if tp_comm_buffer_name and tp_comm_buffer_name not in ['qkv', 'proj', 'fc1', 'fc2']:
+            self.config.tp_comm_overlap = False
+            warnings.warn(
+                f"The user buffer name {tp_comm_buffer_name} is not supported in"
+                "Transformer Engine. Disabling TP communication overlap "
+                "for this layer."
+            )
+
         if is_te_min_version("0.8.0"):
             if self.config.tp_comm_overlap:
                 if is_te_min_version("1.5.0"):
@@ -271,7 +279,7 @@ class TELinear(te.pytorch.Linear):
         # Provide the dist-ckpt support when TELinear is directly used
         # It can only happen with duplicated parallel mode
         assert (
-            self.parallel_mode == None
+            self.parallel_mode is None
         ), "TELinear sharded_state_dict can only be used with duplicated parallel mode"
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
@@ -566,7 +574,8 @@ class TERowParallelLinear(TELinear):
             ),
             bias=bias,
             skip_bias_add=skip_bias_add,
-            skip_weight_param_allocation=False,  # We don't currently use this for row parallel layers # pylint: disable=line-too-long
+            skip_weight_param_allocation=False,
+            # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
@@ -1299,15 +1308,7 @@ class TECudaRNGStatesTracker(te.pytorch.distributed.CudaRNGStatesTracker):
 
 
 def te_checkpoint(
-    forward_func,
-    distribute_saved_activations,
-    get_rng_state_tracker,
-    tp_group,
-    hidden_states,
-    attention_mask,
-    context,
-    context_mask,
-    rotary_pos_emb,
+    forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
 ):
     """Checkpointing with Transformer-Engine."""
     from transformer_engine.pytorch.distributed import checkpoint
@@ -1315,26 +1316,15 @@ def te_checkpoint(
     if is_te_min_version("1.5.0"):
         return checkpoint(
             forward_func,
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            rotary_pos_emb,
+            *args,
             distribute_saved_activations=distribute_saved_activations,
             get_rng_state_tracker=get_rng_state_tracker,
             tp_group=tp_group,
+            **kwargs,
         )
     else:
         return checkpoint(
-            forward_func,
-            distribute_saved_activations,
-            get_rng_state_tracker,
-            tp_group,
-            hidden_states,
-            attention_mask,
-            context,
-            context_mask,
-            rotary_pos_emb,
+            forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args
         )
 
 

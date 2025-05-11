@@ -36,7 +36,7 @@ from ..dist_checkpointing.mapping import (
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
-from ..fp8_utils import is_float8tensor, quantize_param_shard
+from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
@@ -338,14 +338,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if model_param_type in ['HalfTensor', 'BFloat16Tensor']:
 
                     # Generate sharded model param.
-                    shard_model_param = model_param.detach().view(-1)[
-                        param_range.start : param_range.end
-                    ]
-                    tensor_parallel.copy_tensor_model_parallel_attributes(
-                        shard_model_param, model_param
-                    )
-                    if hasattr(model_param, 'shared'):
-                        shard_model_param.shared = model_param.shared
+                    if is_float8tensor(model_param):
+                        # MXFP8Tensor and BlockwiseQTensor don't support view(-1)
+                        shard_model_param = None
+                    else:
+                        shard_model_param = model_param.detach().view(-1)[
+                            param_range.start : param_range.end
+                        ]
+                        tensor_parallel.copy_tensor_model_parallel_attributes(
+                            shard_model_param, model_param
+                        )
+                        if hasattr(model_param, 'shared'):
+                            shard_model_param.shared = model_param.shared
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer:
@@ -354,17 +358,20 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # precision at the beginning of training (this problem will not occur if the
                         # training is long enough or if the main params are loaded from a
                         # checkpoint).
-                        if is_float8tensor(model_param) and hasattr(
-                            model_param, 'get_high_precision_init_val'
-                        ):
-                            shard_main_param = (
-                                model_param.get_high_precision_init_val()
-                                .view(-1)[param_range.start : param_range.end]
-                                .clone()
-                                .to(shard_model_param.device)
-                                .float()
-                            )
-                            model_param.clear_high_precision_init_val()
+                        if is_float8tensor(model_param):
+                            if hasattr(model_param, 'get_high_precision_init_val'):
+                                shard_main_param = (
+                                    model_param.get_high_precision_init_val()
+                                    .view(-1)[param_range.start : param_range.end]
+                                    .clone()
+                                    .to(model_param.device)
+                                    .float()
+                                )
+                                model_param.clear_high_precision_init_val()
+                            else:
+                                shard_main_param = model_param.float().view(-1)[
+                                    param_range.start : param_range.end
+                                ]
                         else:
                             shard_main_param = shard_model_param.clone().float()
 
@@ -726,13 +733,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                             # Allocate dummy tensors.
                             numel = len(param_range_map["gbuf_world"])
-                            init_shard = lambda: torch.empty(
-                                (numel,), dtype=torch.float32, device=get_current_device()
+                            init_shard = lambda dtype=torch.float32: torch.empty(
+                                (numel,), dtype=dtype, device=get_current_device()
                             )
 
-                            tensors = {"exp_avg": init_shard(), "exp_avg_sq": init_shard()}
+                            # For precision_aware_optimizer, the empty tensors should also be
+                            #  initialized with the correct dtype.
+                            tensors = {
+                                "exp_avg": init_shard(self.config.exp_avg_dtype),
+                                "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
+                            }
                             if self.config.use_precision_aware_optimizer:
-                                tensors["master_param"] = init_shard()
+                                if self.config.store_param_remainders and self.config.bf16:
+                                    tensors["master_param"] = init_shard(torch.int16)
+                                else:
+                                    tensors["master_param"] = init_shard(
+                                        self.config.main_params_dtype
+                                    )
                             state_dict_state.append((state_order, tensors))
 
             # Sort by state order (see method docstring for details).
@@ -1781,7 +1798,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             assert max(param_indices) == len(param_indices) - 1
             fp8_flags = []
             for i in range(len(param_indices)):
-                fp8_flag.append(index_to_fp8_map[i])
+                fp8_flags.append(index_to_fp8_map[i])
 
             fp8_buffer = self.buffers[fp8_gbuf_idx]
             non_fp8_buffer = self.buffers[non_fp8_gbuf_idx]
@@ -2006,7 +2023,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
                     else:
-                        shard_main_param.grad = shard_model_grad.float().to(device=shard_main_param.grad.device)
+                        shard_main_param.grad = shard_model_grad.float().to(device=shard_main_param.device)
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer:
@@ -2099,7 +2116,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
 
-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+                    if is_float8tensor(model_param):
+                        shard_model_param = dequantize_fp8_tensor(model_param).view(-1)[
+                            param_range.start : param_range.end
+                        ]
+                    else:
+                        shard_model_param = model_param.view(-1)[
+                            param_range.start : param_range.end
+                        ]
                     shard_main_param.data.copy_(shard_model_param)
 
         # Copy model groups to shard groups.

@@ -28,11 +28,9 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import transformer_engine
-    HAVE_TE=True
-
     from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
     fp8_available, reason_for_no_fp8 = check_fp8_support()
+    HAVE_TE=True
 except ImportError:
     HAVE_TE=False
     fp8_available = False

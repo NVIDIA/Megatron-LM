@@ -9,11 +9,16 @@ from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributed import ProcessGroup
 
 from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
+from megatron.core.inference.communication_utils import (
+    broadcast_from_last_pipeline_stage,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
+)
 from megatron.core.inference.contexts.dynamic_context import TokenOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -34,15 +39,23 @@ class TextGenerationController:
         inference_wrapped_model (AbstractModelInferenceWrapper): A model that
             is wrapped using the specs given in the abstract_model_inference_wrapper.py
         tokenizer (_type_): Tokenizer used for tokenizing and detokenizing the prompts
+        pp_group (ProcessGroup): Process group for pipeline parallelism
     """
 
-    def __init__(self, inference_wrapped_model: AbstractModelInferenceWrapper, tokenizer):
+    def __init__(
+        self,
+        inference_wrapped_model: AbstractModelInferenceWrapper,
+        tokenizer,
+        pp_group: ProcessGroup = None,
+    ):
         self.inference_wrapped_model = inference_wrapped_model
         self.tokenizer = tokenizer
 
+        self.pp_group = pp_group
+
         # For models without pipeline parallelism, is_first_stage and is_last_stage returns True
         self.model_is_pipeline_parallel = not (
-            parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
+            is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
     def tokenize_prompt(
@@ -294,6 +307,7 @@ class TextGenerationController:
 
         return tokens
 
+    @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
         self, sampling_params: SamplingParams, termination_id: int
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
@@ -320,7 +334,7 @@ class TextGenerationController:
         position_ids = context.current_position_ids()
 
         # Forward pass -> logits.
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
             )
@@ -328,8 +342,11 @@ class TextGenerationController:
         last_token_logits = logits.squeeze(0)
 
         # Sample.
+        # Use padded vocab size because tokenizer vocab size might not include padding
+        # to nearest power of 2.
+        vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
         new_sample = self.sample_from_logits(
-            last_token_logits, sampling_params, vocab_size=self.tokenizer.vocab_size
+            last_token_logits, sampling_params, vocab_size=vocab_size
         )
 
         # Active sequence lengths.
@@ -387,6 +404,7 @@ class TextGenerationController:
                     logit_dict[key] = logprob.item()
             top_n_logprobs_dict[batch_idx].append(logit_dict)
 
+    @torch.inference_mode()
     def generate_all_output_tokens_static_batch(
         self,
         active_requests: OrderedDict[str, InferenceRequest],
@@ -435,13 +453,10 @@ class TextGenerationController:
             self.inference_wrapped_model.inference_wrapper_config.inference_max_seq_length
         )
         padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
-        padded_sequence_length = (
-            inference_max_sequence_length if enable_cuda_graph else max_sequence_length
-        )
         padded_batch_prompt_tokens = self.pad_input_prompt_tokens(
             batch_prompt_tokens_list,
             padded_batch_size=padded_batch_size,
-            padded_sequence_length=padded_sequence_length,
+            padded_sequence_length=max_sequence_length,
         )
 
         # Verify that output sequence length is within configured limit
@@ -487,7 +502,7 @@ class TextGenerationController:
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
-        with torch.no_grad():
+        with torch.inference_mode():
 
             self.inference_wrapped_model.prep_model_for_inference()
 
@@ -536,7 +551,7 @@ class TextGenerationController:
                 if enable_cuda_graph:
                     # Undo padding up to maximum batch size if necessary
                     batch_prompt_tokens = padded_batch_prompt_tokens[:batch_size]
-                    if parallel_state.is_pipeline_last_stage():
+                    if is_pipeline_last_stage(self.pp_group):
                         logits = logits[:batch_size]
 
                     create_cudagraphs()
@@ -551,12 +566,13 @@ class TextGenerationController:
                     context_length = context_end_position - context_start_position
                     logits_seq_len = 1 if materialize_only_last_token_logits else context_length
                     logits_shape = [batch_size, logits_seq_len, vocab_size]
-                    if parallel_state.is_pipeline_last_stage():
+                    if is_pipeline_last_stage(self.pp_group):
                         assert logits is not None and torch.Size(logits_shape) == logits.shape
                     logits = broadcast_from_last_pipeline_stage(
                         [batch_size, logits_seq_len, vocab_size],
                         dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
                         tensor=logits,
+                        pp_group=self.pp_group,
                     )
                 
                     if xm:
@@ -694,7 +710,9 @@ class TextGenerationController:
             request.status = Status.COMPLETED
 
             text, segments = self.detokenize_generations(
-                batch_prompt_tokens_with_generations[idx],
+                batch_prompt_tokens_with_generations[
+                    idx, : (input_prompt_length + required_sequence_length)
+                ],
                 input_prompt_length + generated_sequence_lengths,
                 sampling_params.return_segments,
             )

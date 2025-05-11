@@ -216,7 +216,7 @@ class MambaStack(MegatronModule):
             self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
         )
 
-        assert parallel_state.get_virtual_pipeline_model_parallel_world_size() is None, (
+        assert self.config.virtual_pipeline_model_parallel_size is None, (
             "The Mamba hybrid model does not currently support "
             "virtual/interleaved pipeline parallelism"
         )

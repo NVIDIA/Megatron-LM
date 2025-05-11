@@ -121,7 +121,6 @@ def get_moe_model_and_buffers(
         ep_bucket_groups,
     )
 
-
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])

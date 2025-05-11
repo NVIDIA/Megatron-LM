@@ -42,9 +42,9 @@ MODEL_ARGS=" \
     --moe-token-dispatcher-type alltoall \
     --moe-token-drop-policy probs \
     --seq-length 4096 \
-    --max-position-embeddings 32768 \
+    --max-position-embeddings 163840 \
     --tokenizer-type HuggingFaceTokenizer \
-    --make-vocab-size-divisible-by 160 \
+    --make-vocab-size-divisible-by 40 \
     --use-mcore-models \
     --rotary-base 10000 \
     --rotary-percent 1.0 \

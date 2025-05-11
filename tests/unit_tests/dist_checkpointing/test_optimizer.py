@@ -268,15 +268,10 @@ class TestDistributedOptimizer:
                             parallel_state.get_default_process_group(),
                             True,
                         )
-                    sharded_state_dict = optimizer_A.sharded_state_dict(
+                    optim_state_dict = optimizer_A.sharded_state_dict(
                         model[0].sharded_state_dict(), sharding_type=sharding_type
                     )
-                    save(
-                        sharded_state_dict,
-                        ckpt_dir,
-                        save_strategy,
-                        process_group=parallel_state.get_default_process_group()
-                    )
+                    save(optim_state_dict, ckpt_dir, save_strategy)
                     optim_param_state_A = optimizer_A.chained_optimizers[0].get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
                 else:

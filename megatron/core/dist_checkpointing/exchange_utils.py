@@ -123,23 +123,30 @@ T = TypeVar('T')
 
 
 def distribute_shards_to_ranks(
-    shard_to_ranks: Dict[T, List[int]], shard_to_size: Dict[T, int], num_ranks: int
+    shard_to_ranks: Dict[T, List[int]],
+    shard_to_size: Dict[T, int],
+    num_ranks: int,
+    cross_parallelization_group_loads: Set[T],
 ) -> Dict[T, int]:
     """Computes uniform distribution of workload across ranks, based on sizes.
 
     Currently, the assignment is greedy, based on:
-    1. Firstly, the coverage of each shard
+    1. Cross-parallelization group dependencies (shards with main rank in another group
+       are assigned at the end to make sure the distribution for load and save
+       is as similar as possible).
+    2. Secondly, the coverage of each shard
         (how many ranks the shard is available on; lower coverage is assigned first)
-    2. Secondly, the size of each shard (larger size is assigned first)
-    3. Finally, shard id for differentiation.
+    3. Then, the size of each shard (larger size is assigned first)
+    4. Finally, shard id for differentiation.
 
-    Third step is added because we rely on the fact that
+    Last step is added because we rely on the fact that
     the assignment is deterministic on all ranks.
 
     Args:
         shard_to_ranks (Dict[T, List[int]]): mapping of rank access to shards
         shard_to_size (Dict[T, int]): sizes of each shard
         num_ranks (int): number of ranks in the parallelization group
+        cross_parallelization_group_loads (Set[T]): Shards to load that are not in the main replica
 
     Returns (Dict[T, int]): assignment of shard to rank (which rank should do the work
         to achieve maximal uniformity)
@@ -152,6 +159,9 @@ def distribute_shards_to_ranks(
     for shard_id, shard_ranks in sorted(
         shard_to_ranks.items(),
         key=lambda sh_id_ranks: (
+            # 0 if rank is not in cross_parallelization_group_loads
+            # which means it has higher priority
+            int(sh_id_ranks[0] in cross_parallelization_group_loads),
             len(sh_id_ranks[1]),
             -shard_to_size[sh_id_ranks[0]],
             sh_id_ranks[0],
@@ -212,7 +222,9 @@ def determine_main_replica_uniform_distribution(
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
     shard_to_metadata = {}
-    shards_in_this_parallelization_group: Set[_ShardId] = set()
+    group_has_main_replica: Set[_ShardId] = set()
+    group_has_non_main_replica: Set[_ShardId] = set()
+
     for rank, rank_shards in enumerate(all_shards):
         for sh_ten in rank_shards:
             shard_id = _sharded_tensor_shard_id(sh_ten)
@@ -220,22 +232,28 @@ def determine_main_replica_uniform_distribution(
             if shard_id not in shard_to_size:
                 shard_to_size[shard_id] = _shard_size(sh_ten)
                 shard_to_metadata[shard_id] = sh_ten
-            if is_main_replica(sh_ten.replica_id) or ignore_groups:
-                shards_in_this_parallelization_group.add(shard_id)
+            if is_main_replica(sh_ten.replica_id):
+                group_has_main_replica.add(shard_id)
+            else:
+                group_has_non_main_replica.add(shard_id)
 
-    shard_to_ranks = {
-        k: v for k, v in shard_to_ranks.items() if k in shards_in_this_parallelization_group
-    }
+    # we always include all main replicas, and non-main only if `ignore_groups`
+    shards_in_this_group: Set[_ShardId] = group_has_main_replica
+    if ignore_groups:
+        shards_in_this_group = shards_in_this_group | group_has_non_main_replica
+    # cross-parallel-group references are empty if `not ignore_groups`,
+    # otherwise it's `group_has_non_main_replica - group_has_main_replica`
+    cross_parallelization_group_loads = shards_in_this_group - group_has_main_replica
+
+    # Filter out shards that don't belong to this group
+    shard_to_ranks = {k: v for k, v in shard_to_ranks.items() if k in shards_in_this_group}
 
     shard_to_saving_rank = distribute_shards_to_ranks(
-        shard_to_ranks, shard_to_size, len(all_shards)
+        shard_to_ranks, shard_to_size, len(all_shards), cross_parallelization_group_loads
     )
 
     return ShardDistribution(
-        shard_to_saving_rank,
-        shards_in_this_parallelization_group,
-        shard_to_metadata,
-        shard_to_ranks,
+        shard_to_saving_rank, shards_in_this_group, shard_to_metadata, shard_to_ranks
     )
 
 

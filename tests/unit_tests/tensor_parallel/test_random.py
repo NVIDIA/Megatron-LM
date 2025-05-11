@@ -15,6 +15,12 @@ from megatron.core.tensor_parallel.random import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def test_device_rng_states_tracker():
     rng_tracker = DeviceRNGStatesTracker()
@@ -63,6 +69,7 @@ def test_checkpoint():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer engine required" )
 def test_checkpoint_without_output():
     def normal_forward(input):
         x = torch.nn.functional.gelu(input)

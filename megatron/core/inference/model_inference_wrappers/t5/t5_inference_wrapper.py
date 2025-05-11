@@ -225,6 +225,6 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
             encoder_decoder_mask,
             inference_context=None,
         )
-        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits, self.tp_group)
 
         return logits

@@ -20,6 +20,7 @@ from megatron.core.distributed.custom_fsdp.param_and_grad_buffer import (
     GradReducePipeline,
     ParamAndGradBuffer,
     PrefetchOrder,
+    override_sharded_param_methods_with_safety_checks,
 )
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
@@ -260,6 +261,11 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.suggested_RS_queue_capacity = suggested_communication_unit_size
         self.suggested_AG_prefetch_size = suggested_communication_unit_size
+
+        if self.data_parallel_sharding_strategy == "optim_grads_params":
+            override_sharded_param_methods_with_safety_checks(
+                self.module.parameters(), self.all_gather_pipeline
+            )
 
     def _register_fsdp_hooks(self, root_module):
         """Register necessary hooks for Fully Sharded Data Parallel (FSDP) execution on the model.

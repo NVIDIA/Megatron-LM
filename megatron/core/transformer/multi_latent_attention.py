@@ -287,6 +287,7 @@ class MLASelfAttention(MultiLatentAttention):
                 bias=False,
                 skip_bias_add=False,
                 is_expert=False,
+                tp_comm_buffer_name='q_proj',
             )
 
         else:
@@ -301,6 +302,7 @@ class MLASelfAttention(MultiLatentAttention):
                 skip_bias_add=False,
                 gather_output=False,
                 is_expert=False,
+                tp_comm_buffer_name='q_down_proj',
             )
 
             self.linear_q_up_proj = build_module(
@@ -313,6 +315,7 @@ class MLASelfAttention(MultiLatentAttention):
                 bias=False,
                 skip_bias_add=False,
                 is_expert=False,
+                tp_comm_buffer_name='q_up_proj',
             )
 
         self.linear_kv_down_proj = build_module(
@@ -325,6 +328,7 @@ class MLASelfAttention(MultiLatentAttention):
             skip_bias_add=False,
             gather_output=False,
             is_expert=False,
+            tp_comm_buffer_name='kv_down_proj',
         )
 
         self.linear_kv_up_proj = build_module(
@@ -337,6 +341,7 @@ class MLASelfAttention(MultiLatentAttention):
             bias=False,
             skip_bias_add=False,
             is_expert=False,
+            tp_comm_buffer_name='kv_up_proj',
         )
 
         if self.config.q_lora_rank is not None:
@@ -550,7 +555,7 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = k_pos_emb.squeeze(1)
 
         if self.recompute_up_proj:
-            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
             query, key, value = self.qkv_up_checkpoint.checkpoint(
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )

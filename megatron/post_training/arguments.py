@@ -90,15 +90,58 @@ def add_modelopt_args(parser):
         help='Number of Medusa heads for speculative decoding.',
     )
     group.add_argument(
+        '--export-eagle-algorithm',
+        type=str,
+        choices=['eagle1', 'eagle3', 'eagle-mtp'],
+        default="eagle-mtp",
+        help='Chosing the between different flavors of EAGLE algorithms.',
+    )
+    group.add_argument(
         '--export-num-eagle-layers',
         type=int,
         default=0,
         help='Number of EAGLE layers for speculative decoding.',
     )
+    group.add_argument(
+        '--export-draft-vocab-size',
+        type=int,
+        default=0,
+        help='The reduced vocabulary size of the draft model.',
+    )
+    group.add_argument(
+        '--export-num-mtp',
+        type=int,
+        default=0,
+        help='Number of MTP modules for speculative decoding.',
+    )
+    group.add_argument(
+        '--export-freeze-mtp',
+        type=int,
+        nargs="*",
+        default=[],
+        help='Index of MTP that will be frozen in training.',
+    )
+
+
 
     # Finetuning
     group.add_argument(
         "--finetune-hf-dataset", type=str, default=None, help="HF dataset used for finetuning."
+    )
+    group.add_argument(
+        "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
+    )
+
+    # Special model architecture option
+    group.add_argument(
+        '--export-qk-l2-norm',
+        action="store_true",
+        help='Use Llama-4 L2Norm instead of normal LayerNorm/RMSNorm for QK normalization.',
+    )
+    group.add_argument(
+        '--export-moe-apply-probs-on-input',
+        action="store_true",
+        help='Use Llama-4 expert scaling on input instead of output.',
     )
 
     return parser

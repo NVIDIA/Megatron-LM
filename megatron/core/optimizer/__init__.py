@@ -354,7 +354,7 @@ def _get_megatron_optimizer_based_on_param_groups(
                 )
 
                 if is_te_min_version("2.1.0.dev0"):
-                    kwargs.update({"store_param_remainders": True})
+                    kwargs.update({"store_param_remainders": config.store_param_remainders})
 
             optimizer = Adam(**kwargs)
 

@@ -1,16 +1,21 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import warnings
 from typing import Optional, Tuple
 
 import torch
+from packaging.version import Version as PkgVersion
 from torch import Tensor
 from megatron.core.device_utils import get_current_device
 from megatron.core import parallel_state
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
 from .base_context import BaseInferenceContext
+from .dynamic_chunk_allocator import ChunkAllocator
 
 class ContextOverflowError(Exception):
     '''Base exception for when a new request would not fit.'''
@@ -104,14 +109,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_overflow_factor: Optional[float] = None,
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
+        tensor_model_parallel_size: Optional[int] = None,
     ):
 
         super().__init__()
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
-        world_size = parallel_state.get_tensor_model_parallel_world_size()
+        if tensor_model_parallel_size is None:
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            tp_size = tensor_model_parallel_size
         hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, world_size)
+        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
@@ -139,14 +148,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
 
         if buffer_overflow_factor is not None:
-            self.max_requests = self.round_up(int(self.max_requests * buffer_overflow_factor))
-            self.max_tokens = self.round_up(int(self.max_tokens * buffer_overflow_factor / 50.0))
+            self.max_requests = self.round_up_requests(
+                int(self.max_requests * buffer_overflow_factor)
+            )
+            self.max_tokens = self.round_up_tokens(
+                int(self.max_tokens * buffer_overflow_factor / 50.0)
+            )
 
         if max_requests_override is not None:
-            self.max_requests = self.round_up(max_requests_override)
+            self.max_requests = self.round_up_requests(max_requests_override)
 
         if max_tokens_override is not None:
-            self.max_tokens = self.round_up(max_tokens_override)
+            self.max_tokens = self.round_up_tokens(max_tokens_override)
 
         self.max_requests = min(self.max_requests, self.max_tokens)  # e.g., decode only.
 
@@ -190,30 +203,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
         self.token_to_local_position_within_kv_chunk = torch.empty_like(self.token_to_input_ids)
 
-        # Simulate a stack, by decrementing chunk_count_avail during allocations.
-        # *Note: The last chunk idx (`dummy_chunk_idx`) is reserved for
-        # decode-only inference steps. For these teps, `input_ids` and
-        # `position_ids` are padded to length `max_requests`, regardless of the
-        # number of valid active requests. This padding is to maintain a
-        # consistent input shape when using cuda graphs for the decode-only steps.
-        # All requests between the active request count and `max_requests` are
-        # 'garbage', but must still point to valid memory within the flash
-        # attention kernel. These garbage requests point to chunk
-        # `dummy_chunk_idx`.
-        # TODO: @lmcafee, abstract chunk allocation into separate class.
-        self.chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
-        self.chunk_count_avail = self.chunk_count_total - 1
-        self.dummy_chunk_idx = self.chunk_count_total - 1
-        self.chunk_bag = torch.arange(
-            self.chunk_count_total, dtype=torch.int32, device=get_current_device()
-        )
+        # Calculate the total number of chunks available in the buffer
+        chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
 
         # Memory buffer.
         self.memory_buffer = torch.full(
             (
                 2,  # key and value
                 self.num_layers,
-                self.chunk_count_total,
+                chunk_count_total,
                 self.chunk_size_tokens,
                 num_attention_heads_per_partition,
                 hidden_size_per_attention_head,
@@ -272,10 +270,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         #   exact multiple of `max_sequence_length`. This is then converted into
         #   the number of reserved chunks (`gtd_chunk_count`) and bytes
         #   (`gtd_byte_count`).
+        # Chunk ids.
+        self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
         gtd_byte_count = buffer_guaranteed_fraction * buffer_size_bytes
         gtd_request_count, _ = bytes_to_max_requests_and_tokens(gtd_byte_count)
-        gtd_request_count = max(1, gtd_request_count)
-        gtd_request_count = self.round_up(min(gtd_request_count, self.max_requests))
+        if buffer_guaranteed_fraction > 0:
+            gtd_request_count = max(1, gtd_request_count)
+        gtd_request_count = self.round_up_requests(min(gtd_request_count, self.max_requests))
         gtd_chunk_count = gtd_request_count * self.max_kv_chunk_count
         assert (
             gtd_request_count <= self.max_requests
@@ -283,15 +284,42 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.gtd_request_count = gtd_request_count
         self.gtd_chunk_count = gtd_chunk_count
 
+        # Initialize chunk allocator
+        self.chunk_allocator = ChunkAllocator(
+            chunk_count_total=chunk_count_total, gtd_chunk_count=self.gtd_chunk_count
+        )
+
+        # Store the dummy chunk idx reference for convenience
+        self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
         # Reset attention state.
         self.reset_attention_state()
 
-    ROUNDER = 64
+    TOKEN_ROUNDER = 64
+    REQUEST_ROUNDER = 4
+
+    @classmethod
+    def round_up_tokens(cls, value):
+        """Round up to nearest multiple of `TOKEN_ROUNDER` (above)."""
+        if PkgVersion(mcore_version) < PkgVersion("0.13"):
+            return cls.round_up(value)
+        return cls.TOKEN_ROUNDER * int(math.ceil(int(value) / cls.TOKEN_ROUNDER))
+
+    @classmethod
+    def round_up_requests(cls, value):
+        """Round up to nearest multiple of `REQUEST_ROUNDER` (above)."""
+        if PkgVersion(mcore_version) < PkgVersion("0.13"):
+            return cls.round_up(value)
+        return cls.REQUEST_ROUNDER * int(math.ceil(int(value) / cls.REQUEST_ROUNDER))
 
     @classmethod
     def round_up(cls, value):
-        """Round up to nearest multiple of `ROUNDER` (above)."""
-        return cls.ROUNDER * int(math.ceil(int(value) / cls.ROUNDER))
+        """Deprecated in favor of round_up_tokens and round_up_requests."""
+        warnings.warn(
+            "`round_up` is deprecated in favor of `round_up_tokens` or `round_up_requests` "
+            "and will be removed in `megatron-core` 0.14."
+        )
+        ROUNDER = getattr(cls, "ROUNDER", 64)
+        return ROUNDER * int(math.ceil(int(value) / ROUNDER))
 
     def is_static_batching(self) -> bool:
         """Is static batching? False."""
@@ -316,7 +344,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def cu_kv_lengths(self) -> Tensor:
         """Cumulative key/value sequence lengths."""
-        return self.cu_kv_seq_lengths, self.kv_seq_lengths_decode_only, self.max_seqlen_k
+        return (
+            self.cu_kv_seq_lengths,
+            self.kv_seq_lengths,
+            self.kv_seq_lengths_decode_only,
+            self.max_seqlen_k,
+        )
 
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
@@ -393,7 +426,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         n = self.padded_active_token_count
         query_seq_idx = self.token_to_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
-        query[:n] = apply_rotary_pos_emb(query[:n], query_emb[:n], config, cu_seqlens_q, cp_group)
+        query[:n] = apply_rotary_pos_emb(
+            t=query[:n],
+            freqs=query_emb[:n],
+            config=config,
+            cu_seqlens=cu_seqlens_q,
+            cp_group=cp_group,
+        )
         return query
 
     def apply_rotary_emb_key(
@@ -421,72 +460,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_emb = key_emb[key_seq_idx]
         if self.is_decode_only():
             assert key.shape[0] == n == self.max_requests
-            key = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
+            key = apply_rotary_pos_emb(
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+            )
         else:
-            key[:n] = apply_rotary_pos_emb(key[:n], key_emb[:n], config, cp_group)
+            key[:n] = apply_rotary_pos_emb(
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+            )
         return key
-
-    def is_memory_available(self, num_chunks: int, safe: bool = False) -> bool:
-        """Check if memory chunks are available.
-
-        Use 'safe' to avoid all requests being blocked. As detailed in the class
-        docstring above, a fraction of the KV cache memory buffer is reserved to
-        guarantee that a minimum number of active requests can run on any given
-        step. This is handled by not allocating the final `gtd_request_fraction`
-        of the memory buffer to either newly-added or currently-paused requests.
-
-        `gtd_chunk_count` is the total number of chunks reserved for this purpose,
-        and it is calculated as `gtd_request_count` (number of guaranteed active
-        requests) * `max_kv_chunk_count` (max number of chunks necessary to run a
-        request to `max_sequence_length`).
-
-        Args:
-            num_chunks (int): Number of chunks to check.
-            safe (bool): Include extra space for guaranteeing ability to run
-                `gtd_request_count` to completion.
-
-        Return:
-            (bool) Is memory available?
-        """
-        if safe:
-            return self.chunk_count_avail >= num_chunks + self.gtd_chunk_count
-        else:
-            return self.chunk_count_avail >= num_chunks
-
-    def allocate_memory_chunks(self, num_chunks: int = 1, safe: bool = False) -> Optional[Tensor]:
-        """Allocate memory chunks if available, else return None.
-
-        TODO: @lmcafee, abstract chunk allocation into separate class.
-
-        Args:
-            num_chunks (int): Number of chunks to allocate.
-            safe (bool): Include extra space for guaranteeing ability to run
-                `gtd_request_count` to completion. See `is_memory_available()`
-                for more details.
-
-        Return:
-            (Optional[Tensor]) Allocated chunk IDs.
-        """
-        if self.is_memory_available(num_chunks, safe):
-            self.chunk_count_avail -= num_chunks
-            return self.chunk_bag[self.chunk_count_avail : (self.chunk_count_avail + num_chunks)]
-        else:
-            return None
-
-    def release_memory_chunks(self, chunks: Tensor) -> None:
-        """Release memory chunks.
-
-        TODO: @lmcafee, abstract chunk allocation into separate class.
-
-        Args:
-            chunks (Tensor): Chunk IDs to release.
-
-        Return:
-            None
-        """
-        num_chunks = chunks.size(dim=0)
-        self.chunk_bag[self.chunk_count_avail : (self.chunk_count_avail + num_chunks)] = chunks
-        self.chunk_count_avail += num_chunks
 
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
@@ -505,7 +486,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Initialize attention state so that every layer can use it"""
 
         self.padded_active_token_count = (
-            self.max_requests if self.is_decode_only() else self.round_up(self.active_token_count)
+            self.max_requests
+            if self.is_decode_only()
+            else self.round_up_tokens(self.active_token_count)
         )
         self.padded_active_sample_count = (
             self.max_requests
@@ -544,12 +527,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cu_query_seq_lengths[1:] = cu_query_lengths
             self.max_seqlen_q = query_lengths.max().item()
 
-        kv_lengths = self.request_kv_length_offsets + self.request_query_lengths
-        kv_lengths = kv_lengths[self.paused_request_count : self.total_request_count]
+        kv_seq_lengths = self.request_kv_length_offsets + self.request_query_lengths
+        self.kv_seq_lengths = kv_seq_lengths[self.paused_request_count : self.total_request_count]
         if self.is_decode_only():
             self.kv_seq_lengths_decode_only[
                 0 : self.total_request_count - self.paused_request_count
-            ] = kv_lengths
+            ] = self.kv_seq_lengths
             cu_kv_lengths_decode_only = torch.cumsum(self.kv_seq_lengths_decode_only, dim=0)
             self.cu_kv_seq_lengths_decode_only[1:] = cu_kv_lengths_decode_only
             self.cu_kv_seq_lengths = self.cu_kv_seq_lengths_decode_only
@@ -561,8 +544,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 dtype=torch.int32,
                 device=get_current_device(),
             )
-            self.cu_kv_seq_lengths[1:] = torch.cumsum(kv_lengths, dim=0)
-            self.max_seqlen_k = kv_lengths.max().item()
+            self.cu_kv_seq_lengths[1:] = torch.cumsum(self.kv_seq_lengths, dim=0)
+            self.max_seqlen_k = self.kv_seq_lengths.max().item()
 
         kv_memory = self.request_to_kv_chunk_ids[
             self.paused_request_count : self.total_request_count
@@ -606,6 +589,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_kv_chunk_counts.fill_(0)
         self.request_last_kv_chunk_id.fill_(-1)
         self.request_last_kv_chunk_offset.fill_(0)
+        self.request_to_kv_chunk_ids.fill_(-1)
 
         # Reset token indexes.
         self.token_to_input_ids.fill_(0)
@@ -617,7 +601,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset available chunk count.
         self.reset_attention_state()
-        self.chunk_count_avail = self.chunk_count_total - 1
+        self.chunk_allocator.reset()
         self.request_to_kv_chunk_ids.fill_(-1)
 
     def current_input_ids(self) -> Tensor:
@@ -704,7 +688,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Preallocate chunks.
         num_chunks_needed = math.ceil(context_length / self.chunk_size_tokens)
-        new_chunk_ids = self.allocate_memory_chunks(num_chunks_needed, safe=True)
+        new_chunk_ids = self.chunk_allocator.allocate_memory_chunks(num_chunks_needed, safe=True)
         if new_chunk_ids is None:
             raise ChunkOverflowError()
 
@@ -832,7 +816,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 kv_chunks_assigned = self.request_to_kv_chunk_ids[finished_idxs]
                 non_zero_values_in_kv_memory = kv_chunks_assigned[kv_chunks_assigned != -1]
-                self.release_memory_chunks(non_zero_values_in_kv_memory)
+                self.chunk_allocator.release_memory_chunks(non_zero_values_in_kv_memory)
 
             # Reset request/token counts.
             self.request_to_kv_chunk_ids.fill_(-1)
@@ -857,7 +841,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             kv_chunks_asigned = self.request_to_kv_chunk_ids[finished_idxs]
             non_zero_values_in_kv_memory = kv_chunks_asigned[kv_chunks_asigned != -1]
-            self.release_memory_chunks(non_zero_values_in_kv_memory)
+            self.chunk_allocator.release_memory_chunks(non_zero_values_in_kv_memory)
 
             if active_request_count > 0:
                 finished_idxs_on_left = (
@@ -929,20 +913,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count += active_requests_requiring_new_chunk_count
             active_request_count -= active_requests_requiring_new_chunk_count
 
-        # Now that we have the requests in following order [Paused, Active, Finished]
-        # 6. We determine how many requests we can resume and resume them
+        # 6. Now that we have the requests in following order [Paused, Active, Finished]
+        # We determine how many requests we can resume and resume them
         # Assign released chunks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-        if self.chunk_count_avail <= self.paused_request_count + self.gtd_chunk_count:
+        if (
+            self.chunk_allocator.chunk_count_avail
+            <= self.paused_request_count + self.gtd_chunk_count
+        ):
             if active_request_count < self.gtd_request_count:
                 resume_request_count = min(
                     self.paused_request_count, self.gtd_request_count - active_request_count
                 )
             else:
-                # If there are more active requests than gtd requests and not enough chunks available, no requests can be resumed
+                # If there are more active requests than gtd requests and not enough
+                # chunks available, no requests can be resumed
                 resume_request_count = 0
         else:
-            # If there are more available chunks than (paused requests + gtd requests), resume all paused requests
+            # If there are more available chunks than (paused + gtd requests), resume all paused requests
             resume_request_count = self.paused_request_count
 
         self.paused_request_count -= resume_request_count
@@ -983,11 +971,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 == 0
             ), 'The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. '
 
-            chunk_ids = self.allocate_memory_chunks(resume_request_count)
+            chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
             row_idx = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + resume_request_count,
                 device=get_current_device(),
+                dtype=torch.int
             )
             col_idx = self.request_kv_chunk_counts[
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
@@ -1002,7 +991,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 9. We make relevant changes to the token bookkeeping tensors
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
-            self.paused_request_count, self.total_request_count, device=get_current_device()
+            self.paused_request_count, self.total_request_count, device=get_current_device(), dtype=torch.int
         )
         self.token_to_position_in_request[: self.active_token_count] = (
             self.request_kv_length_offsets[self.paused_request_count : self.total_request_count]

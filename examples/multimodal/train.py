@@ -235,52 +235,23 @@ def scaled_loss_func(loss_mask, output_tensor):
     else:
         raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
 
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = total_tokens.clone().detach().to(torch.int)
+    reporting_loss = torch.cat([total_loss.clone().detach().view(1), num_tokens.view(1)])
 
-    if args.context_parallel_size > 1:
-        all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    reporting_loss = loss.clone().detach()
-    all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
-    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
-    # on loss[0] fixes this
-    return (
-        loss[0].clone(),
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
-    )
+    return (total_loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def loss_func(loss_mask, output_tensor):
     args = get_args()
 
-    losses = output_tensor.float()
-
+    losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.contiguous().view(-1).float()
+    loss = torch.sum(losses * loss_mask)
 
-    total_tokens = loss_mask.sum()
-    total_loss = torch.sum(losses.view(-1) * loss_mask)
-    loss = torch.cat([total_loss.view(1), total_tokens.view(1)])
+    num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])
 
-    if args.context_parallel_size > 1:
-        all_reduce(loss, group=mpu.get_context_parallel_group())
-
-    reporting_loss = loss.clone().detach()
-    all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
-
-    # loss[0] is a view of loss, so it has ._base not None, which triggers assert error
-    # in core/pipeline_parallel/schedule.py::deallocate_output_tensor, calling .clone()
-    # on loss[0] fixes this
-    return (
-        loss[0].clone(),
-        local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])}
-    )
+    return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
 def forward_step(data_iterator, model: LLaVAModel):

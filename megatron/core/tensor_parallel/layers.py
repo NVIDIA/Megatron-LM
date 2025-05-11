@@ -464,7 +464,11 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         else:
             total_input = input
 
-        output = torch.matmul(total_input, weight.t())
+        if torch.is_inference_mode_enabled():
+            output = torch.matmul(total_input, weight.clone().t())
+        else:
+            output = torch.matmul(total_input, weight.t())
+            
         if bias is not None:
             output = output + bias
         return output

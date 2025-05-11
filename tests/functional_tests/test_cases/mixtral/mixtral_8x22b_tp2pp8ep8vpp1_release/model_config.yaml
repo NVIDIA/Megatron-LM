@@ -76,8 +76,8 @@ MODEL_ARGS:
   # Add checkpointing args
   --finetune: true
   --auto-detect-ckpt-format: true
-  --load: ${LOAD_PATH}
-  --save: ${OUTPUT_PATH}/checkpoints
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
   --no-ckpt-fully-parallel-save: true
   --save-interval: 500
   # Add initialization args
@@ -95,3 +95,9 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
   --bf16: true
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

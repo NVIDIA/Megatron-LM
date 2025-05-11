@@ -165,9 +165,14 @@ class CLIPViTModel(VisionModule):
         x = x.permute(0, 2, 1)  # [batch, grid ** 2, hidden_size]
 
         if self.add_class_token:
-            class_token = self.class_token.expand(
-                x.shape[0], -1, -1
-            )  # [batch, class_token_len, hidden_size]
+            if torch.is_inference_mode_enabled():
+                class_token = self.class_token.clone().expand(
+                    x.shape[0], -1, -1
+                )  # [batch, class_token_len, hidden_size]
+            else:
+                class_token = self.class_token.expand(
+                    x.shape[0], -1, -1
+                )  # [batch, class_token_len, hidden_size]
             x = torch.cat(
                 [class_token, x], dim=1
             )  # [batch, grid ** 2 + class_token_len, hidden_size]
