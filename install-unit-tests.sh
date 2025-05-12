@@ -29,7 +29,8 @@ pip3 install git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0
 
 pip3 install git+https://github.com/Dao-AILab/flash-attention@v2.5.8
 pip3 install git+https://github.com/NVIDIA/TransformerEngine.git@v1.13
-pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git@e4b22cfb45d9e078b77242b68a35d9df4947dc91
+pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git@87a2c60e494498525a163af598dacbd57c8528b0
 pip3 install multi-storage-client==0.20.3
+pip3 install pybind11==2.13.6
 
 
