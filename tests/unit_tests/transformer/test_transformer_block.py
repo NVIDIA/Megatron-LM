@@ -162,7 +162,7 @@ class TestPipelineParallelTransformerBlock:
             # Include embedding and loss in pipeline split without virtual PP
             (62, 4, None, True, True, None, None, False),
             # Include embedding and loss with virtual PP
-            (62, 4, 2, True, True, None, None, False),
+            pytest.param(62, 4, 2, True, True, None, None, False, marks=pytest.mark.internal),
             # num_layers not divisible by pipeline size without embedding/loss
             (65, 4, None, False, False, None, None, True),
             # num_layers not divisible by pipeline size with embedding/loss
