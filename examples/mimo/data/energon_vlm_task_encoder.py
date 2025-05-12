@@ -6,8 +6,8 @@ import os
 import sys
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Protocol, Union
-
+from typing import Dict, List, Protocol, Union, Iterable, Tuple, Optional
+import heapq
 import torch
 import torch.nn.utils.rnn as rnn_utils
 
@@ -27,6 +27,7 @@ sys.path.append(
 from dataloader_provider import train_valid_test_dataloaders_provider
 from transformers import AutoProcessor
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.energon import (
     DefaultTaskEncoder,
     VQASample,
@@ -36,6 +37,8 @@ from megatron.energon import (
 )
 from megatron.energon.task_encoder.base import stateless
 from megatron.training import get_args
+from megatron.training.tokenizer.multimodal_tokenizer import mistral_custom_template
+from megatron.core.models.multimodal import context_parallel
 
 
 @dataclass
@@ -52,6 +55,61 @@ class LlavaConversationTemplateConfig(ConversationTemplateConfig):
     system: str = None
     chat_template: str = None
 
+@dataclass
+class MeshConfig:
+    """Configuration for parallel training dimensions."""
+    cp_size: int = 1
+    tensor_model_parallel_size: int = 1
+    sequence_parallel: bool = False
+
+def predict_seq_len_with_padding(instance_tokens: torch.Tensor, pad_to_multiple_of: int = 64) -> int:
+    """Get seqlen with padding.
+    Args:
+        instance_tokens (torch.Tensor): Tensor of instance tokens.
+        pad_to_multiple_of (int): Pad to multiple of this value.
+    Returns:
+        int: Padded sequence length.
+    """
+    seqlen = len(instance_tokens)
+    seqlen_padded = (seqlen + pad_to_multiple_of - 1) // pad_to_multiple_of * pad_to_multiple_of
+    return seqlen_padded
+
+def group_samples(samples: List[Dict[str, torch.Tensor]], 
+                  group_size: int, 
+                  lengths: List[int],
+                  ) -> List[List[Dict[str, torch.Tensor]]]:
+    """Group samples into groups of size group_size.
+
+    Args:
+        samples (List[Dict[str, torch.Tensor]]): List of samples to group.
+        group_size (int): Maximum size of each group.
+        lengths (List[int]): List of lengths of each sample.
+
+    Returns:
+        List[List[Dict[str, torch.Tensor]]]: List of groups, where each group is a list of samples
+                that should be packed together. Each group's total length will not exceed group_size.
+    """
+    # create a max heap of the lengths
+    max_heap: List[Tuple[int, int]] = [(-length, i) for i, length in enumerate(lengths)]
+    heapq.heapify(max_heap)
+
+    groups: List[List[Dict[str, torch.Tensor]]] = []
+    current_group: List[Dict[str, torch.Tensor]] = []
+    current_length: int = 0
+    while max_heap:
+        neg_length, i = heapq.heappop(max_heap)
+        length = -neg_length
+        if current_length + length <= group_size:
+            current_group.append(samples[i])
+            current_length += length
+        else:
+            groups.append(current_group)
+            current_group = [samples[i]]
+            current_length = length
+    # If we're at the end of the samples, add the last group
+    if current_group:
+        groups.append(current_group)
+    return groups
 
 class ModelType(Enum):
     LLAVA_VLM = "llava_vlm"
@@ -69,12 +127,16 @@ class VLMTaskEncoder(
         self,
         model_type: ModelType,
         processor,
-        conversation_template_config=None,
+        conversation_template_config: Optional[ConversationTemplateConfig] = None,
+        max_seq_length: Optional[int] = None,
+        mesh_config: Optional[MeshConfig] = None,
     ):
         self.model_type = model_type
-
+        # Use max_seq_length if provided, otherwise default to 4096
+        self.group_size = max_seq_length if max_seq_length is not None else 4096
         self.processor = processor
         self.conversation_template_config = conversation_template_config
+        self.parallel_config = mesh_config
 
     def apply_prompt_template(self, input_text: VQASample):
         """Create conversation prompt string using HF chat template.
@@ -132,6 +194,22 @@ class VLMTaskEncoder(
             tokenize=False,
             add_generation_prompt=False,
         )
+    
+    def _pad_and_stack(self, tensors: List[torch.Tensor], max_len: int, pad_val: int) -> torch.Tensor:
+        """Pad or truncate a list of 1D tensors to a fixed length and stack them."""
+        padded_tensors = []
+        for t in tensors:
+            current_len = t.size(0)
+            if current_len > max_len:
+                # Truncate
+                padded_tensors.append(t[:max_len])
+            else:
+                # Pad
+                pad_amount = max_len - current_len
+                padding = torch.full((pad_amount,), pad_val, dtype=t.dtype, device=t.device)
+                padded_tensors.append(torch.cat([t, padding]))
+        return torch.stack(padded_tensors, dim=0)
+
 
     def _find_pattern_indices(
         self, template, pattern, start_idx=0, allow_first_mismatch=False
@@ -143,6 +221,127 @@ class VLMTaskEncoder(
             if torch.all(match) or (allow_first_mismatch and torch.all(match[1:])):
                 return i, i + pat_len
         return -1, -1
+
+    def select_samples_to_pack(self, samples: List[Dict[str, torch.Tensor]]) -> List[List[Dict[str, torch.Tensor]]]:
+        """Selects which samples will be packed together.
+        
+        This function receives a list of samples (size according to the selected packing_buffer_size), 
+        and partitions those samples into groups that shall be packed together.
+
+        Args:
+            samples (List[Dict[str, torch.Tensor]]): List of samples from the buffer, each containing
+                tokenized data with keys like 'input_ids', 'labels', 'loss_mask', etc.
+
+        Returns:
+            List[List[Dict[str, torch.Tensor]]]: List of groups, where each group is a list of samples
+                that should be packed together. Each group's total length will not exceed group_size.
+
+        NOTE: Energon dataloader calls this method internally if packing is used.
+        Please see https://nvidia.github.io/Megatron-Energon/advanced/packing.html
+        """
+        # Group samples into groups of size group_size
+        lengths = [predict_seq_len_with_padding(sample["input_ids"]) for sample in samples]
+        # lengths = [sample["input_ids"].size(0) for sample in samples]
+        packed_samples = group_samples(samples, group_size=self.group_size, lengths=lengths)
+        return packed_samples
+    
+    @stateless
+    def pack_selected_samples(self, samples: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Implements how a group of samples will be mapped to a single sample.
+        
+        Args:
+            samples (List[Dict[str, torch.Tensor]]): List of samples to pack together.
+
+        Returns:
+            Dict[str, torch.Tensor]: Packed sample with keys like 'input_ids', 'labels', 'loss_mask', etc.
+        """
+        # Pad each sample to a multiple of 64, then concatenate
+        padded_input_ids = []
+        padded_labels = []
+        padded_loss_masks = []
+        padded_lens = []
+
+        has_labels = "labels" in samples[0] and samples[0]["labels"] is not None
+        has_loss_mask = "loss_mask" in samples[0] and samples[0]["loss_mask"] is not None
+
+        for sample in samples:
+            original_len = sample["input_ids"].size(0)
+            padded_len = predict_seq_len_with_padding(sample["input_ids"])
+            padded_lens.append(padded_len)
+            pad_amount = padded_len - original_len
+
+            padded_input_ids.append(torch.cat([
+                sample["input_ids"],
+                torch.zeros(pad_amount, dtype=sample["input_ids"].dtype)
+            ]))
+            
+            if has_labels:
+                padded_labels.append(torch.cat([
+                    sample["labels"],
+                    torch.full((pad_amount,), -100, dtype=sample["labels"].dtype)
+                ]))
+
+            if has_loss_mask:
+                padded_loss_masks.append(torch.cat([
+                    sample["loss_mask"],
+                    torch.zeros(pad_amount, dtype=sample["loss_mask"].dtype)
+                ]))
+
+        # Concatenate sequences
+        input_ids = torch.cat(padded_input_ids)
+        labels = torch.cat(padded_labels) if has_labels else None
+        loss_mask = torch.cat(padded_loss_masks) if has_loss_mask else None
+        
+        batched_images = torch.stack([s["images"] for s in samples], dim=0)   # (B , C , H , W)
+        
+        # Calculate padding if context parallel or sequence parallel is enabled
+        pad_len = 0
+        if self.parallel_config.cp_size > 1 or self.parallel_config.sequence_parallel:
+            pad_len = context_parallel.get_padding(
+                len(input_ids),
+                self.parallel_config.cp_size,
+                self.parallel_config.tensor_model_parallel_size,
+                self.parallel_config.sequence_parallel,
+            )
+        
+        # Pad sequences
+        if pad_len > 0:
+            input_ids = torch.cat([input_ids, torch.zeros(pad_len, dtype=input_ids.dtype)])
+            if labels is not None:
+                labels = torch.cat([labels, torch.full((pad_len,), -100, dtype=labels.dtype)])
+            if loss_mask is not None:
+                loss_mask = torch.cat([loss_mask, torch.zeros(pad_len, dtype=loss_mask.dtype)])
+        
+        # Generate position_ids after padding
+        position_ids = torch.arange(len(input_ids))
+        
+        # Calculate cu_seqlens using padded lengths
+        lens = torch.tensor(padded_lens, dtype=torch.int32)
+        cu_seqlens = torch.cat([torch.tensor([0], dtype=torch.int32), torch.cumsum(lens, dim=0)])
+        
+        # Calculate padded sequence lengths and cu_seqlens
+        seqlens_padded = [l.item() + pad_len for l in lens]
+        cu_seqlens_padded = torch.cat([torch.tensor([0], dtype=torch.int32), torch.cumsum(torch.tensor(seqlens_padded, dtype=torch.int32), dim=0)])
+        
+        packing_kwargs = {
+            "cu_seqlens_q": cu_seqlens,
+            "cu_seqlens_kv": cu_seqlens,
+            "cu_seqlens_q_padded": cu_seqlens_padded,
+            "cu_seqlens_kv_padded": cu_seqlens_padded,
+            "max_seqlen_q": torch.tensor(max(seqlens_padded), dtype=torch.int32),
+            "max_seqlen_kv": torch.tensor(max(seqlens_padded), dtype=torch.int32),
+        }
+        
+        packed_result = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "images": batched_images,
+            "position_ids": position_ids,
+            "packing_kwargs": packing_kwargs,
+        }
+            
+        return packed_result
 
     @stateless
     def encode_sample(self, sample: VQASample):
@@ -191,23 +390,23 @@ class VLMTaskEncoder(
         else:
             inputs["labels"] = None
             inputs["loss_mask"] = None
+        
         return inputs
 
     def batch(self, samples: List[Dict]) -> Dict:
         """Pad/stack individual samples into a single batch dict."""
-
         if not samples:
             return {}
 
         batched: Dict[str, torch.Tensor] = {}
         keys = samples[0].keys()
-
+        is_packed_sample = "packing_kwargs" in samples[0]
         for key in keys:
             values = [s[key] for s in samples if key in s and s[key] is not None]
 
             processor = KEY_PROCESSORS.get(key)
             if processor is not None:
-                batched[key] = processor(values)
+                batched[key] = processor(values, is_packed_sample, self.group_size)
                 continue
 
             # Fallback behaviours if no specific processor is registered.
@@ -216,12 +415,49 @@ class VLMTaskEncoder(
             else:
                 batched[key] = values
 
+
+        # Add context parallel padding if enabled
+        if self.parallel_config and self.parallel_config.cp_size > 1:
+            seq_len = batched["input_ids"].size(1)
+            pad_len = context_parallel.get_padding(
+                seq_len,
+                self.parallel_config.cp_size,
+                self.parallel_config.tensor_model_parallel_size,
+                self.parallel_config.sequence_parallel,
+            )
+            if pad_len > 0:
+                # Pad input_ids
+                batched["input_ids"] = torch.cat([
+                    batched["input_ids"],
+                    torch.zeros(batched["input_ids"].size(0), pad_len, dtype=batched["input_ids"].dtype)
+                ], dim=1)
+                # Pad labels
+                if "labels" in batched:
+                    batched["labels"] = torch.cat([
+                        batched["labels"],
+                        torch.full((batched["labels"].size(0), pad_len), -100, dtype=batched["labels"].dtype)
+                    ], dim=1)
+                # Pad loss_mask
+                if "loss_mask" in batched:
+                    batched["loss_mask"] = torch.cat([
+                        batched["loss_mask"],
+                        torch.zeros(batched["loss_mask"].size(0), pad_len, dtype=batched["loss_mask"].dtype)
+                    ], dim=1)
+        
         return batched
 
     def encode_batch_vlm_clip_llava(self, batch_data: Dict) -> Dict:
         input_ids = batch_data["input_ids"]
         labels = batch_data.get("labels")
         loss_mask = batch_data.get("loss_mask")
+
+        # Handle packed-sample case where input_ids is 1-D
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)  # add batch dimension
+            if labels is not None and labels.dim() == 1:
+                labels = labels.unsqueeze(0)
+            if loss_mask is not None and loss_mask.dim() == 1:
+                loss_mask = loss_mask.unsqueeze(0)
 
         seq_len = input_ids.size(1)
         position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
@@ -277,7 +513,10 @@ class VLMTaskEncoder(
             raise ValueError(f"Model type {self.model_type} not supported")
 
 
-def llava_vlm_dataloader_provider(train_val_test_num_samples, is_video_input=False):
+def llava_vlm_dataloader_provider(train_val_test_num_samples, 
+                                  mesh_config: Optional[MeshConfig] = None, 
+                                  max_seq_length: Optional[int] = None,
+                                  is_video_input=False):
     args = get_args()
     tokenizer_model_id = args.tokenizer_model
     processor = AutoProcessor.from_pretrained(tokenizer_model_id)
@@ -291,7 +530,9 @@ def llava_vlm_dataloader_provider(train_val_test_num_samples, is_video_input=Fal
             model_type=model_type,
             processor=processor,
             conversation_template_config=LlavaConversationTemplateConfig(),
-        ),
+            max_seq_length=max_seq_length,
+            mesh_config=mesh_config,
+        )
     )
 
 
@@ -304,7 +545,14 @@ if __name__ == "__main__":
         required=True,
         help="path to the dataset directory in energon format",
     )
+    parser.add_argument('--total-seq-length', type=int, default=512, help='Maximum text length')
+    parser.add_argument('--image-seq-length', type=int, default=197, help='Number of image tokens')
+    parser.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
     args = parser.parse_args()
+    
+    # Calculate max_seq_length as sum of text and image sequence lengths
+    max_seq_length = args.max_text_length + args.image_seq_length
+    
     model_name = "llava-hf/llava-1.5-7b-hf"
 
     processor = AutoProcessor.from_pretrained(model_name)
@@ -319,6 +567,7 @@ if __name__ == "__main__":
                 model_type=ModelType.LLAVA_VLM,
                 processor=processor,
                 conversation_template_config=LlavaConversationTemplateConfig(),
+                max_seq_length=max_seq_length,  # Use calculated max_seq_length
             ),
             worker_config=worker_config,
         ),
@@ -341,7 +590,7 @@ if __name__ == "__main__":
 class KeyProcessor(Protocol):
     """Callable that aggregates a list of tensors into a single batched tensor."""
 
-    def __call__(self, values: List[torch.Tensor]) -> torch.Tensor:  # pragma: no cover
+    def __call__(self, values: List[torch.Tensor], is_packed_sample: bool, group_size: int) -> torch.Tensor:  # pragma: no cover
         ...
 
 
@@ -351,8 +600,11 @@ class StackProcessor:
     def __init__(self, dim: int = 0):
         self.dim = dim
 
-    def __call__(self, values: List[torch.Tensor]) -> torch.Tensor:
-        return torch.stack(values, dim=self.dim)
+    def __call__(self, values: List[torch.Tensor], is_packed_sample: bool, group_size: int) -> torch.Tensor:
+        if values[0].dim() == 3:
+            return torch.stack(values, dim=self.dim) # (B , C , H , W)
+        # Concatenate already-batched image tensors along the batch dimension.
+        return torch.cat(values, dim=self.dim)  # (B , C , H , W)
 
 
 class PaddingProcessor:
@@ -362,10 +614,12 @@ class PaddingProcessor:
         self.pad_value = pad_value
         self.batch_first = batch_first
 
-    def __call__(self, values: List[torch.Tensor]) -> torch.Tensor:
-        return rnn_utils.pad_sequence(
-            values, batch_first=self.batch_first, padding_value=self.pad_value
-        )
+    def __call__(self, values: List[torch.Tensor], is_packed_sample: bool, group_size: int) -> torch.Tensor:
+        if is_packed_sample:
+            return rnn_utils.pad_sequence(values, batch_first=self.batch_first, padding_value=self.pad_value)
+        
+        return self._pad_and_stack(values, group_size, self.pad_value)
+        
 
 
 # Registry mapping sample keys to their corresponding processor.
