@@ -35,6 +35,9 @@ from . import wandb_utils
 
 from . import ft_integration
 
+from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
+
 # [ModelOpt]: Import
 try:
     from modelopt.torch.opt.plugins import (
@@ -105,10 +108,22 @@ def check_checkpoint_args(checkpoint_args):
         _compare('pipeline_model_parallel_size')
 
 
+def isfile(filename) -> bool:
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.os.path.isfile(filename)
+    else:
+        return os.path.isfile(filename)
+
+
 def ensure_directory_exists(filename, check_parent=True):
     """Build filename's path if it does not already exists."""
     dirname = os.path.dirname(filename) if check_parent else filename
-    os.makedirs(dirname, exist_ok=True)
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        msc.os.makedirs(dirname, exist_ok=True)
+    else:
+        os.makedirs(dirname, exist_ok=True)
 
 
 def get_checkpoint_name(checkpoints_path, iteration, release=False,
@@ -172,7 +187,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=False, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for checkpoint with no pipelining and expert parallelism
@@ -180,7 +195,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=False,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=True, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and no expert parallelism
@@ -188,7 +203,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=False, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for checkpoint with pipelining and expert parallelism
@@ -196,7 +211,7 @@ def find_checkpoint_rank_0(checkpoints_path, iteration, release=False):
                                    pipeline_parallel=True,
                                    tensor_rank=0, pipeline_rank=0,
                                    expert_parallel=True, expert_rank=0)
-    if os.path.isfile(filename):
+    if isfile(filename):
         return filename
 
     # Look for a distributed checkpoint
@@ -219,8 +234,8 @@ def get_checkpoint_tracker_filename(checkpoints_path):
 def checkpoint_exists(checkpoints_path):
     if checkpoints_path is None:
         return False
-    load_step = 'latest_checkpointed_iteration.txt'
-    return os.path.exists(os.path.join(checkpoints_path, load_step))
+    path = get_checkpoint_tracker_filename(checkpoints_path)
+    return isfile(path)
 
 
 def read_metadata(tracker_filename):
@@ -228,7 +243,8 @@ def read_metadata(tracker_filename):
     # mark it as a release checkpoint.
     iteration = 0
     release = False
-    with open(tracker_filename, 'r') as f:
+
+    with open_file(tracker_filename, 'r') as f:
         metastring = f.read().strip()
         try:
             iteration = int(metastring)
@@ -523,7 +539,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                            barrier=False)
         else:
             def iter_finalize_fn():
-                with open(tracker_filename, 'w') as f:
+                with open_file(tracker_filename, 'w') as f:
                     f.write(str(iteration))
                 print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
                              f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
@@ -774,7 +790,7 @@ def _get_non_persistent_iteration(non_persistent_global_dir, args, checkpointing
         return -1
     elif args.non_persistent_ckpt_type == "global":
         tracker_filename = get_checkpoint_tracker_filename(non_persistent_global_dir)
-        if os.path.isfile(tracker_filename):
+        if isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
             if release:
                 raise RuntimeError('Non-persistent checkpoint can\'t be a release checkpoint')
@@ -858,8 +874,14 @@ def _load_global_dist_base_checkpoint(
 
 def _get_checkpoint_format(checkpoint_name):
     """Get the format of an existing checkpoint."""
-    is_torch_ckpt = any([f.startswith("mp_rank_0") for f in os.listdir(checkpoint_name)])
-    is_torch_dcp = os.path.exists(os.path.join(checkpoint_name, ".metadata"))
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        checkpoint_dir = msc.Path(checkpoint_name)
+        is_torch_ckpt = any([f.name.startswith("mp_rank_0") for f in checkpoint_dir.iterdir()])
+        is_torch_dcp = checkpoint_dir.joinpath(".metadata").exists()
+    else:
+        is_torch_ckpt = any([f.startswith("mp_rank_0") for f in os.listdir(checkpoint_name)])
+        is_torch_dcp = os.path.exists(os.path.join(checkpoint_name, ".metadata"))
 
     ckpt_format = None
     if dist_checkpointing.check_is_distributed_checkpoint(checkpoint_name):
@@ -898,7 +920,7 @@ def _load_base_checkpoint(
     tracker_filename = 'because load directory is not defined'
     if load_dir is not None:
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
-        if os.path.isfile(tracker_filename):
+        if isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
 
     # Allow user to specify the loaded iteration.
@@ -1521,7 +1543,8 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     load_path = custom_load_path if custom_load_path is not None else args.load
 
     tracker_filename = get_checkpoint_tracker_filename(load_path)
-    with open(tracker_filename, 'r') as f:
+
+    with open_file(tracker_filename, 'r') as f:
         iteration = int(f.read().strip())
 
     checkpoint_name = get_checkpoint_name(load_path, iteration,

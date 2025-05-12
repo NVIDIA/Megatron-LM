@@ -1,5 +1,10 @@
+.build_rules:
+  rules:
+    - when: on_success
+  stage: test
+
 .build_image:
-  extends: [.test_rules, .dind_rules]
+  extends: [.build_rules, .dind_rules]
   stage: build
   tags:
     - arch/amd64
@@ -60,3 +65,6 @@ test:build_nemo_image:
     IMAGE: CI_NEMO_IMAGE
     FILE: Dockerfile.ci.dev
     BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes" || $INTEGRATION_TEST == "yes"
+      when: on_success

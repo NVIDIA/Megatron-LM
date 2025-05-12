@@ -44,8 +44,6 @@ class TestParallelAttention:
         # we can't currently do this because the global memory buffer is on GPU
         pass
 
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_gpu_forward(self):
 
         config = self.parallel_attention.config
@@ -60,7 +58,7 @@ class TestParallelAttention:
         )
         hidden_states = hidden_states.cuda()
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
 
         output, bias = self.parallel_attention(hidden_states, attention_mask)
 
@@ -70,7 +68,6 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
-    @pytest.mark.flaky_in_dev
     def test_fused_rope_gpu_forward(self):
         self.parallel_attention.config.apply_rope_fusion = True
         config = self.parallel_attention.config
@@ -85,7 +82,7 @@ class TestParallelAttention:
         )
         hidden_states = hidden_states.cuda()
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
         rotary_pos_emb = torch.ones(
             sequence_length, 1, 1, self.parallel_attention.config.kv_channels
         ).cuda()
@@ -100,7 +97,6 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
 
-    @pytest.mark.flaky_in_dev
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity = 'selective'
@@ -122,7 +118,7 @@ class TestParallelAttention:
         )
         hidden_states = hidden_states.cuda()
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
 
         output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
 

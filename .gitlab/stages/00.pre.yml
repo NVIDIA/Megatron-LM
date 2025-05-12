@@ -59,6 +59,7 @@ pre:create_ci_branches:
       - branch: ci-nightly
       - branch: ci-weekly
       - branch: ci-pre-release
+      - branch: ci-review-reminder
   tags:
     - arch/amd64
     - env/prod

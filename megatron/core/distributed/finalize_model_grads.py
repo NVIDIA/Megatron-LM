@@ -147,6 +147,9 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
             grad_attr = _get_main_grad_attr(weight, ddp_config.use_custom_fsdp)
             orig_grad = getattr(weight, grad_attr)
             grad = _unshard_if_dtensor(orig_grad)
+            # When the embedding is frozen, the grad is None.
+            if grad is None:
+                return
             torch.distributed.all_reduce(grad, group=parallel_state.get_embedding_group())
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
@@ -324,7 +327,9 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
 
         # all-reduce across DP ranks.
-        torch.distributed.all_reduce(num_tokens, group=parallel_state.get_data_parallel_group())
+        torch.distributed.all_reduce(
+            num_tokens, group=parallel_state.get_data_parallel_group(with_context_parallel=True)
+        )
         for model_chunk in model:
             if num_tokens > 0:
                 scaling = 1.0 / num_tokens

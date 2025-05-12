@@ -295,7 +295,9 @@ def forward_step(
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
-        assert vp_stage == model_vp_stage, "vp_stage mismatch"
+        assert (
+            vp_stage == model_vp_stage
+        ), f"vp_stage {vp_stage} doesn't match model_vp_stage {model_vp_stage}"
     num_tokens = torch.tensor(0, dtype=torch.int)
     if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
         if not collect_non_loss_data:
@@ -304,7 +306,6 @@ def forward_step(
                 output_tensor, num_tokens, loss_reduced = outputs
                 if not config.calculate_per_token_loss:
                     output_tensor /= num_tokens
-                    output_tensor *= parallel_state.get_context_parallel_world_size()
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)

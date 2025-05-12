@@ -34,6 +34,10 @@ class InferenceWrapperConfig:
     fp32_residual_connection: bool = False
     """Move residual connections to fp32. Obtained from arguments.py"""
 
+    nccl_all_reduce_for_prefill: bool = False
+    """When using symmetric all reduce kernels we keep the default all reduces for nccl. 
+    This can be more effecient for large prefill sizes"""
+
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to inference params
 

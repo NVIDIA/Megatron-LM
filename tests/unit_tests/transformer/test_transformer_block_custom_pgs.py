@@ -52,6 +52,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         layer_number (int, optional): Index of this layer. Defaults to 1.
         hidden_dropout (float, optional): Override dropout rate. Defaults to None.
         model_comm_pgs (ModelCommProcessGroups, optional): Default process groups. Defaults to None.
+        vp_stage (int, optional): Virtual pipeline stage. Defaults to None.
     """
 
     def __init__(
@@ -61,6 +62,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
         model_comm_pgs: ModelCommProcessGroups = None,
+        vp_stage: Optional[int] = None,
     ):
         # Temporarily replace attention and MLP with IdentityOp,
         # This is a temporary workaround for the test until we have a better interface
@@ -80,6 +82,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
             layer_number=layer_number,
             hidden_dropout=hidden_dropout,
             model_comm_pgs=model_comm_pgs,
+            vp_stage=vp_stage,
         )
 
         assert (

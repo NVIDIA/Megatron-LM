@@ -330,6 +330,21 @@ class TextGenerationController:
         input_ids = context.current_input_ids()
         position_ids = context.current_position_ids()
 
+        # If using symmetric kernels and we are using using nccl
+        # for prefill turn off symmetric kernels
+        symmetric_ar_type = get_model_config(self.inference_wrapped_model.model).symmetric_ar_type
+        nccl_all_reduce_for_prefill = (
+            self.inference_wrapped_model.inference_wrapper_config.nccl_all_reduce_for_prefill
+        )
+
+        if nccl_all_reduce_for_prefill and symmetric_ar_type is not None:
+            if context.is_decode_only():
+                # Turn on symmetric all reduce when in decode mode
+                self.inference_wrapped_model.model.module.set_symmetric_ar(symmetric_ar_type)
+            else:
+                # Turn off symmetric all reduces for prefill
+                self.inference_wrapped_model.model.module.set_symmetric_ar(None)
+
         # Forward pass -> logits.
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
@@ -518,6 +533,17 @@ class TextGenerationController:
                 not self.inference_wrapped_model.inference_context.is_decode_only()
             ), f"Generation must start in prefill mode"
 
+            # If using symmetric kernels and we are using using nccl
+            # for prefill turn off symmetric kernels
+            symmetric_ar_type = get_model_config(
+                self.inference_wrapped_model.model
+            ).symmetric_ar_type
+            nccl_all_reduce_for_prefill = (
+                self.inference_wrapped_model.inference_wrapper_config.nccl_all_reduce_for_prefill
+            )
+            if symmetric_ar_type is not None and nccl_all_reduce_for_prefill:
+                self.inference_wrapped_model.model.module.set_symmetric_ar(None)
+
             context_start_position = 0
             # Pick the context window that we need to pass through the network.
             for context_end_position in range(min_prompt_length_in_batch, max_sequence_length):
@@ -574,6 +600,19 @@ class TextGenerationController:
                         tensor=logits,
                         pp_group=self.pp_group,
                     )
+
+                # Turn on symmetric all reduce kernels for decode stage
+                # if we turned it off for prefill
+                if (
+                    context_end_position == min_prompt_length_in_batch
+                    and symmetric_ar_type is not None
+                    and nccl_all_reduce_for_prefill
+                ):
+                    if symmetric_ar_type is not None and nccl_all_reduce_for_prefill:
+                        self.inference_wrapped_model.model.module.set_symmetric_ar(
+                            symmetric_ar_type
+                        )
+
                 # Indicates which of the input prompts have started generating tokens.
                 # A 1D boolean tensor with [batch_size] elements (i.e) The shortest
                 # prompts will start generating first and so on

@@ -50,6 +50,7 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
         "N_REPEAT={n_repeat}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -86,10 +87,6 @@ products:
     products:
       - environment: [dev, lts]
         scope: [nightly]
-  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_tp2_pp2_resume_torch_4experts]
-    products:
-      - environment: [dev, lts]
-        scope: [nightly]
   # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts]
   #   products:
   #     - environment: [dev, lts]
@@ -109,20 +106,14 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-      # - environment: [lts]
-      #   scope: [nightly] # non-determinism
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      # - environment: [lts]
-      #   scope: [nightly] # non-determinism
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      # - environment: [lts]
-      #   scope: [nightly] # non-determinism
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G]
     products:
       - environment: [dev]

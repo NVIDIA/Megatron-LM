@@ -111,11 +111,11 @@ def get_mcore_reviewers():
 
     def get_group_members(group):
         # Get direct members of the group
-        for member in group.members.list(all=True):
+        for member in group.members.list(get_all=True):
             reviewers.add(f"{member.username}@nvidia.com")
 
         # Recursively get members of subgroups
-        for subgroup in group.subgroups.list(all=True):
+        for subgroup in group.subgroups.list(get_all=True):
             subgroup_obj = get_gitlab_handle().groups.get(subgroup.id)
             get_group_members(subgroup_obj)
 
