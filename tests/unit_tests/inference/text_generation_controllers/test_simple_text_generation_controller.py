@@ -292,6 +292,7 @@ class TestTextGenerationController:
             assert request.generated_text is not None, "Generated text should not be None"
             assert len(request.generated_log_probs) == request.generated_length
 
+    @pytest.mark.experimental
     def test_token_overflow(self):
         self.setup_model(torch.float32)
 
