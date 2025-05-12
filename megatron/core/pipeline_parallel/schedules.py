@@ -495,44 +495,120 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-    with no_sync_func():
-        for i in range(num_microbatches - 1):
-            output_tensor, num_tokens = forward_step(
-                forward_step_func,
-                data_iterator,
-                model,
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                collect_non_loss_data,
-                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                current_microbatch=i,
-            )
-            total_num_tokens += num_tokens
-            if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
-    # Run computation for last microbatch out of context handler (want to
-    # synchronize gradients).
-    output_tensor, num_tokens = forward_step(
-        forward_step_func,
-        data_iterator,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        config,
-        collect_non_loss_data,
-        is_first_microbatch=check_first_val_step(
-            first_val_step, forward_only, num_microbatches == 1
-        ),
-        current_microbatch=num_microbatches - 1,
-    )
-    total_num_tokens += num_tokens
+    if config.combined_1f1b and not forward_only:
+        assert config.combined_1f1b_recipe == "ep_a2a", "only ep_a2a recipe is supported for combined_1f1b"
+        f_context = contextlib.nullcontext()
+        b_context = contextlib.nullcontext()
+        # in combined_1f1b, we need to wrap the forward_step_func
+        # to return a schedule plan instead of the forward output tensor
+        forward_step_func = wrap_forward_func(forward_step_func)
+        set_streams()
+        # The forward step for the first microbatch is executed alone, no a2a overlapping
+        output_tensor, num_tokens, _ = forward_backward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            None,
+            input_tensor,
+            None,
+            None,
+            config,
+            f_context=f_context,
+            b_context=b_context,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=None,
+            is_first_microbatch=check_first_val_step(first_val_step, forward_only, True),
+            current_microbatch=0,
+        )
+        # The forward step is executed in parallel with the backward step of another microbatch
+        # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
+        # Vice versa.
+        with no_sync_func():
+            for i in range(num_microbatches - 1):
+                total_num_tokens += num_tokens
+                output_tensor, num_tokens, _ = forward_backward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    model,
+                    input_tensor,
+                    output_tensor,
+                    output_tensor_grad,
+                    config,
+                    f_context=f_context,
+                    b_context=b_context,
+                    collect_non_loss_data=collect_non_loss_data,
+                    checkpoint_activations_microbatch=None,
+                    is_first_microbatch=check_first_val_step(
+                        first_val_step,
+                        forward_only,
+                        (i+1) == 0
+                        ),
+                    current_microbatch=(i+1),
+                )
+        total_num_tokens += num_tokens
+        # The backward step for the last microbatch is executed alone, no a2a overlapping
+        output_tensor, num_tokens, _ = forward_backward_step(
+            forward_step_func,
+            data_iterator,
+            None,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            model,
+            input_tensor,
+            output_tensor,
+            output_tensor_grad,
+            config,
+            f_context=f_context,
+            b_context=b_context,
+        )
+    else:
+        with no_sync_func():
+            for i in range(num_microbatches - 1):
+                output_tensor, num_tokens = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                    current_microbatch=i,
+                )
+                total_num_tokens += num_tokens
+                if not forward_only:
+                    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        # Run computation for last microbatch out of context handler (want to
+        # synchronize gradients).
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, num_microbatches == 1
+            ),
+            current_microbatch=num_microbatches - 1,
+        )
 
-    if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        total_num_tokens += num_tokens
+
+        if not forward_only:
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for

@@ -994,10 +994,10 @@ def validate_args(args, defaults={}):
         # Basic requirements for combined 1F1B
         assert args.distributed_backend == 'nccl', \
             'combined 1F1B is only supported with NCCL backend'
-        assert args.pipeline_model_parallel_size > 1, \
-            'combined 1F1B is only supported with pipeline model parallelism'
-        assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
-            'virtual pipeline parallel should be enabled for combined 1F1B'
+        # assert args.pipeline_model_parallel_size > 1, \
+        #     'combined 1F1B is only supported with pipeline model parallelism'
+        # assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
+        #     'virtual pipeline parallel should be enabled for combined 1F1B'
 
         # Additional requirements for ep_a2a recipe
         if args.combined_1f1b_recipe == 'ep_a2a':
