@@ -23,5 +23,5 @@ pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-
     triton==3.1.0
 
 pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git@e4b22cfb45d9e078b77242b68a35d9df4947dc91
-pip3 install multi-storage-client
+pip3 install multi-storage-client==0.20.3
 

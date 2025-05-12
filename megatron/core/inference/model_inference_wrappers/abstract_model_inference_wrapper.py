@@ -406,6 +406,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if (
                 current_batch_size * seq_len
                 > self.inference_wrapper_config.inference_batch_times_seqlen_threshold
+                and self.inference_wrapper_config.inference_batch_times_seqlen_threshold != -1
             ):
                 output =  self.forward_pass_with_pipeline_parallel_large_input_batch(
                     inference_input, recv_buffer_seq_len

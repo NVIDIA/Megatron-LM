@@ -3,6 +3,7 @@ from unittest import mock
 import pytest
 
 from megatron.core.dist_checkpointing.strategies.base import StrategyAction, get_default_strategy
+from megatron.core.msc_utils import MultiStorageClientFeature
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -17,6 +18,9 @@ def tmp_dir_per_class(tmp_path_factory):
 
 @pytest.fixture(scope='session', autouse=True)
 def set_default_dist_ckpt_strategy():
+    # Disable MSC for tests
+    MultiStorageClientFeature.disable()
+
     def get_pyt_dist_save_sharded_strategy():
         return get_default_strategy(StrategyAction.SAVE_SHARDED, 'torch_dist', 1)
 

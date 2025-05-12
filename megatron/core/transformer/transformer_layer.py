@@ -32,7 +32,7 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
-def get_transformer_layer_offset(config: TransformerConfig):
+def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
     pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
     if not parallel_state.is_inside_encoder():
@@ -80,9 +80,10 @@ def get_transformer_layer_offset(config: TransformerConfig):
                 - num_layers_in_last_pipeline_stage
             )
 
-            if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-                vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-                vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+            if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
+                assert (
+                    vp_stage is not None
+                ), "vp_stage must be provided if virtual pipeline model parallel size is set"
 
                 # Calculate number of layers in each virtual model chunk
                 # If the num_layers_in_first_pipeline_stage and
@@ -113,10 +114,10 @@ def get_transformer_layer_offset(config: TransformerConfig):
 
                 # Calculate the layer offset with interleaved uneven pipeline parallelism
                 if pipeline_rank == 0:
-                    offset = vp_rank * total_virtual_chunks
+                    offset = vp_stage * total_virtual_chunks
                 else:
                     offset = (
-                        vp_rank * total_virtual_chunks
+                        vp_stage * total_virtual_chunks
                         + num_layers_per_virtual_model_chunk_in_first_pipeline_stage
                         + (pipeline_rank - 1)
                         * (
@@ -155,20 +156,23 @@ def get_transformer_layer_offset(config: TransformerConfig):
 
             num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
-            if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
-                vp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
-                vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+            if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
+                assert (
+                    vp_stage is not None
+                ), "vp_stage must be provided if virtual pipeline model parallel size is set"
 
                 num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
                 total_virtual_chunks = num_layers // vp_size
-                offset = vp_rank * total_virtual_chunks + (
+                offset = vp_stage * total_virtual_chunks + (
                     pipeline_rank * num_layers_per_virtual_rank
                 )
 
                 # Reduce the offset of embedding layer from the total layer number
                 if (
                     config.account_for_embedding_in_pipeline_split
-                    and not parallel_state.is_pipeline_first_stage(ignore_virtual=False)
+                    and not parallel_state.is_pipeline_first_stage(
+                        ignore_virtual=False, vp_stage=vp_stage
+                    )
                 ):
                     offset -= 1
             else:
@@ -177,7 +181,9 @@ def get_transformer_layer_offset(config: TransformerConfig):
                 # Reduce the offset of embedding layer from the total layer number
                 if (
                     config.account_for_embedding_in_pipeline_split
-                    and not parallel_state.is_pipeline_first_stage(ignore_virtual=False)
+                    and not parallel_state.is_pipeline_first_stage(
+                        ignore_virtual=False, vp_stage=vp_stage
+                    )
                 ):
                     offset -= 1
     else:
@@ -259,6 +265,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
 
@@ -292,7 +299,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         if model_comm_pgs is None:
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
         self.submodules_config = submodules
-        self.layer_number = layer_number + get_transformer_layer_offset(self.config)
+        self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage)
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
@@ -317,7 +324,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.self_attention = build_module(
             submodules.self_attention,
             config=self.config,
-            layer_number=layer_number,
+            layer_number=self.layer_number,
             **attention_optional_kwargs,
         )
 
@@ -336,7 +343,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.cross_attention = build_module(
             submodules.cross_attention,
             config=self.config,
-            layer_number=layer_number,
+            layer_number=self.layer_number,
             **attention_optional_kwargs,
         )
 
@@ -470,7 +477,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-
+        if hasattr(self.input_layernorm, "weight"):
+            hidden_states = hidden_states.to(dtype=self.input_layernorm.weight.dtype)
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Residual connection.

@@ -51,7 +51,7 @@ stimer = StragglerDetector()
 
 
 def model_provider(
-    pre_process=True, post_process=True
+    pre_process=True, post_process=True, vp_stage: Optional[int] = None
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
@@ -159,6 +159,7 @@ def model_provider(
             rotary_base=args.rotary_base,
             rope_scaling=args.use_rope_scaling,
             mtp_block_spec=mtp_block_spec,
+            vp_stage=vp_stage,
         )
 
     return model

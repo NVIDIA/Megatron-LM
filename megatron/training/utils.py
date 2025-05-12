@@ -9,6 +9,8 @@ from datetime import datetime
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
+from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
 except ImportError:
@@ -401,7 +403,7 @@ def append_to_progress_log(string, barrier=True):
     if barrier:
         torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
-        with open(progress_log_filename, 'a') as f:
+        with open_file(progress_log_filename, 'a') as f:
             job_id = os.getenv('SLURM_JOB_ID', '')
             num_gpus = args.world_size
             f.write(
@@ -426,14 +428,14 @@ def get_blend_and_blend_per_split(args):
     if use_data_path:
         if args.data_args_path is not None:
             assert args.data_path is None
-            with open(args.data_args_path, 'r') as f:
+            with open_file(args.data_args_path, 'r') as f:
                 blend = get_blend_from_list(f.read().split())
         else:
             assert args.data_path is not None
             blend = get_blend_from_list(args.data_path)
     elif use_per_split_data_path:
         if args.per_split_data_args_path is not None:
-            with open(args.per_split_data_args_path, 'r') as f:
+            with open_file(args.per_split_data_args_path, 'r') as f:
                 per_split_data_args = json.load(f)
                 # Each element in blend_per_split should be a list of files (and optional
                 # weights), so split string if needed.
@@ -497,12 +499,12 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
 
-        elif mpu.is_pipeline_first_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
 
-        elif mpu.is_pipeline_last_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
@@ -551,7 +553,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(attention_mask)
             _broadcast(position_ids)
 
-        elif mpu.is_pipeline_first_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_first_stage():
             labels = None
             loss_mask = None
 
@@ -559,7 +561,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(attention_mask)
             _broadcast(position_ids)
 
-        elif mpu.is_pipeline_last_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.

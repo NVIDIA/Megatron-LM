@@ -65,3 +65,6 @@ test:build_nemo_image:
     IMAGE: CI_NEMO_IMAGE
     FILE: Dockerfile.ci.dev
     BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes" || $INTEGRATION_TEST == "yes"
+      when: on_success

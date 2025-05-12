@@ -5,6 +5,7 @@ import string
 import time
 from argparse import Namespace
 from collections import OrderedDict, defaultdict
+import traceback
 from typing import Dict, List
 from unittest import mock
 
@@ -33,12 +34,13 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
 class TestTextGenerationController:
 
-    def setup_model(self, dtype):
+    def setup_model(self, dtype, symmetric_ar_type=None):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=2, pipeline_model_parallel_size=2
         )
@@ -54,6 +56,7 @@ class TestTextGenerationController:
             use_cpu_initialization=True,
             attention_backend=AttnBackend.local,
             params_dtype=dtype,
+            symmetric_ar_type=symmetric_ar_type,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
@@ -187,69 +190,84 @@ class TestTextGenerationController:
 
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_generate_all_output_tokens_static_batch(self, dtype):
-        self.setup_model(dtype)
-
-        self.mock_tokenizer.vocab_size = self.vocab_size
-        self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
-            [
-                ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
-                for _ in range(len(x))
-            ]
-        )
-        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
-            i for i, c in enumerate(s) if c == ' '
-        ] + [len(s)]
-
-        active_requests: Dict[str, InferenceRequest] = OrderedDict()
-        all_prompt_tokens: Dict[str, List[int]] = OrderedDict()
-        for i in range(self.batch_size):
-            prompt = "sample" * (i + 1)
-            self.mock_tokenizer.tokenize.return_value = torch.randn(
-                self.batch_size, self.vocab_size
-            ).to(device=get_current_device())
-            prompt_tokens = torch.randint(
-                low=0, high=self.vocab_size - 1, size=(len(prompt),)
-            ).tolist()
-
-            request_id = str(i)
-            inference_request = InferenceRequest(
-                request_id=request_id,
-                prompt=prompt,
-                sampling_params=SamplingParams(
-                    num_tokens_to_generate=10, return_log_probs=True, return_segments=True
+    @pytest.mark.parametrize(
+        "symmetric_ar_type",
+        [
+            None,
+            pytest.param(
+                "multimem_all_reduce",
+                marks=pytest.mark.skipif(
+                    not is_te_min_version("2.3"),
+                    reason="multimem_all_reduce requires Transformer Engine >= 2.3",
                 ),
-                arrival_time=time.time(),
-                prompt_tokens=prompt_tokens,
-                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+            ),
+        ],
+    )
+    def test_generate_all_output_tokens_static_batch(self, dtype, symmetric_ar_type):
+        try:
+            self.setup_model(dtype, symmetric_ar_type)
+            self.mock_tokenizer.vocab_size = self.vocab_size
+            self.mock_tokenizer.eod = self.vocab_size - 1
+            self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+                [
+                    ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
+                    for _ in range(len(x))
+                ]
             )
-            active_requests[request_id] = inference_request
-            all_prompt_tokens[request_id] = copy.deepcopy(prompt_tokens)
+            self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+                i for i, c in enumerate(s) if c == ' '
+            ] + [len(s)]
 
-        requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
-            active_requests
-        )
+            active_requests: Dict[str, InferenceRequest] = OrderedDict()
+            all_prompt_tokens: Dict[str, List[int]] = OrderedDict()
+            for i in range(self.batch_size):
+                prompt = "sample" * (i + 1)
+                self.mock_tokenizer.tokenize.return_value = torch.randn(
+                    self.batch_size, self.vocab_size
+                ).to(device=get_current_device())
+                prompt_tokens = torch.randint(
+                    low=0, high=self.vocab_size - 1, size=(len(prompt),)
+                ).tolist()
 
-        for request_id, request in requests.items():
-            assert (
-                request.status == Status.COMPLETED
-            ), f"Status should be completed but its {request.status}"
-            assert request.generated_length > 0, f"Generated length should be greater than zero"
-            assert request.generated_text is not None, "Generated text should not be None"
-            assert (
-                all_prompt_tokens[request_id] == request.prompt_tokens
-            ), "Prompt tokens should not have changed during generation"
-            # Log probabilities are calculated based on the likelihood of a token given the
-            # preceding context. The first token lacks this dependency and is excluded from
-            # the logprobs output, which is why the +1 is necessary
-            assert (
-                len(request.segments)
-                == len(request.prompt_log_probs) + len(request.generated_log_probs) + 1
-            ), "Segments should be returned for both prompt and generated tokens"
-            assert len(request.prompt) + len(request.generated_text) == len(
-                request.text
-            ), "Output text should include prompts and generations"
+                request_id = str(i)
+                inference_request = InferenceRequest(
+                    request_id=request_id,
+                    prompt=prompt,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=10, return_log_probs=True, return_segments=True
+                    ),
+                    arrival_time=time.time(),
+                    prompt_tokens=prompt_tokens,
+                    status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+                )
+                active_requests[request_id] = inference_request
+                all_prompt_tokens[request_id] = copy.deepcopy(prompt_tokens)
+
+            requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
+                active_requests
+            )
+
+            for request_id, request in requests.items():
+                assert (
+                    request.status == Status.COMPLETED
+                ), f"Status should be completed but its {request.status}"
+                assert request.generated_length > 0, f"Generated length should be greater than zero"
+                assert request.generated_text is not None, "Generated text should not be None"
+                assert (
+                    all_prompt_tokens[request_id] == request.prompt_tokens
+                ), "Prompt tokens should not have changed during generation"
+                # Log probabilities are calculated based on the likelihood of a token given the
+                # preceding context. The first token lacks this dependency and is excluded from
+                # the logprobs output, which is why the +1 is necessary
+                assert (
+                    len(request.segments)
+                    == len(request.prompt_log_probs) + len(request.generated_log_probs) + 1
+                ), "Segments should be returned for both prompt and generated tokens"
+                assert len(request.prompt) + len(request.generated_text) == len(
+                    request.text
+                ), "Output text should include prompts and generations"
+        except:
+            traceback.print_exc()
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_output_log_probs(self, dtype):

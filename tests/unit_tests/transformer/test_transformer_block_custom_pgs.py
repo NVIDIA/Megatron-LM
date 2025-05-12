@@ -10,7 +10,7 @@ import torch
 from packaging import version
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_current_device, get_current_device_type
+from megatron.core.device_utils import get_current_device, get_current_device_type, get_local_device_count
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -57,6 +57,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         layer_number (int, optional): Index of this layer. Defaults to 1.
         hidden_dropout (float, optional): Override dropout rate. Defaults to None.
         model_comm_pgs (ModelCommProcessGroups, optional): Default process groups. Defaults to None.
+        vp_stage (int, optional): Virtual pipeline stage. Defaults to None.
     """
 
     def __init__(
@@ -66,6 +67,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
         layer_number: int = 1,
         hidden_dropout: Optional[float] = None,
         model_comm_pgs: ModelCommProcessGroups = None,
+        vp_stage: Optional[int] = None,
     ):
         # Temporarily replace attention and MLP with IdentityOp,
         # This is a temporary workaround for the test until we have a better interface
@@ -85,6 +87,7 @@ class HeterogenousTransformerLayer(TransformerLayer):
             layer_number=layer_number,
             hidden_dropout=hidden_dropout,
             model_comm_pgs=model_comm_pgs,
+            vp_stage=vp_stage,
         )
 
         assert (
@@ -236,7 +239,7 @@ class TestTransformerBlockWithProcessGroups:
         between transformer blocks using default and custom process groups.
         """
         # Skip if world size doesn't match
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
         Utils.initialize_model_parallel(
@@ -395,7 +398,7 @@ class TestTransformerBlockWithProcessGroups:
         with different process groups for attention and mlp.
         """
 
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
         Utils.initialize_model_parallel()
@@ -472,7 +475,7 @@ class TestTransformerBlockWithProcessGroups:
     )
     def test_fwd_bwd_pass_mix_and_match_transformer_blocks(self):
         world_size = 8
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
@@ -606,7 +609,7 @@ class TestTransformerBlockWithProcessGroups:
     )
     def test_mlp_with_custom_pgs(self, world_size, tp_size, dp_size, reverse_tp_dp_order):
 
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 

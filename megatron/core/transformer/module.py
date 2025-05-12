@@ -100,6 +100,39 @@ class MegatronModule(torch.nn.Module):
             for m in self.modules_with_is_first_microbatch:
                 m.is_first_microbatch = True
 
+    def set_symmetric_ar(self, set_to: Optional[str] = None) -> None:
+        """
+        Set symmetric all-reduce functionality across all eligible modules.
+
+        This method traverses the model's module hierarchy to find all modules
+        with the 'symmetric_ar_type' attribute, caches them, and then sets their
+        '_symmetric_ar_cache' attribute to the specified value to enable or
+        disable symmetric all-reduce operations.
+
+        Args:
+            set_to (Any, optional): Value to set for the 'symmetric_ar_type' to.
+            Allowed choices ['two_shot', "one_shot", "multimem_all_reduce", None]
+        """
+        assert set_to in ['two_shot', "one_shot", "multimem_all_reduce", None]
+
+        # Recursive function to find all modules with our target attributes
+        def create_ar_cache(module):
+            # Check if this module has any of our target attributes
+            if hasattr(module, "symmetric_ar_type"):
+                self._symmetric_ar_cache.append(module)
+
+            # Check all children modules recursively
+            for child in module._modules.values():
+                if child is not None:
+                    create_ar_cache(child)
+
+        if not hasattr(self, "_symmetric_ar_cache"):
+            self._symmetric_ar_cache = []
+            create_ar_cache(self)
+
+        for module in self._symmetric_ar_cache:
+            module._symmetric_ar_cache = set_to
+
 
 def conversion_helper(val, conversion):
     """Recursively applies a conversion function to values in nested data structures.
@@ -175,6 +208,7 @@ class Float16Module(MegatronModule):
         self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
+        self.vp_stage = getattr(module, 'vp_stage', None)
 
         if self.fp16:
             self.add_module('module', module.half())
@@ -197,10 +231,10 @@ class Float16Module(MegatronModule):
         return self.module.set_input_tensor(input_tensor)
 
     def forward(self, *inputs, **kwargs):  # pylint: disable=missing-function-docstring
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage):
             outputs = float16_to_fp32(outputs)
         return outputs
 

@@ -133,6 +133,8 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 stimer = StragglerDetector()
 
 xm = get_xla_model()
+from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+
 
 def destroy_global_state():
     destroy_global_vars()
@@ -454,7 +456,7 @@ def get_start_time_from_progress_log():
     def _get_field(string, type):
         return type(string.split(': ')[1])
 
-    with open(progress_log_filename, 'r') as f:
+    with open_file(progress_log_filename, 'r') as f:
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
@@ -990,7 +992,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 # Set pre_process and post_process only after virtual rank is set.
                 pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False)
                 post_process = mpu.is_pipeline_last_stage(ignore_virtual=False)
-                this_model = model_provider_func(pre_process=pre_process, post_process=post_process)
+                this_model = model_provider_func(
+                    pre_process=pre_process, post_process=post_process, vp_stage=i)
                 this_model.model_type = model_type
                 this_model.vp_stage = i
                 model.append(this_model)

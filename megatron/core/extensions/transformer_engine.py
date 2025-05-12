@@ -44,6 +44,7 @@ from megatron.core.utils import (
     get_te_version,
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
+    is_torch_min_version,
 )
 from megatron.core.wrapped_process_group import WrappedProcessGroup
 
@@ -128,6 +129,7 @@ class TELinear(te.pytorch.Linear):
         skip_weight_param_allocation: bool,
         tp_comm_buffer_name: Optional[str] = None,
         is_expert: bool = False,
+        symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.config = config
@@ -140,6 +142,7 @@ class TELinear(te.pytorch.Linear):
         self.te_return_bias = skip_bias_add and bias
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
+        self.symmetric_ar_type = symmetric_ar_type
         if skip_weight_param_allocation:
             raise ValueError(
                 'Transformer Engine linear layers do not support skip_weight_param_allocation'
@@ -190,6 +193,12 @@ class TELinear(te.pytorch.Linear):
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
+        if symmetric_ar_type is not None:
+            assert is_torch_min_version("2.7.0a0"), "Must have at least torch version 2.7 or higher"
+            assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
+                "2.3.0.dev0+39c0e70"
+            ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
+            extra_kwargs["symmetric_ar_type"] = symmetric_ar_type
         if parallel_mode == "duplicated":
             assert tp_group is None, "duplicated linear should not have tp_group set"
             tp_size = 1
@@ -376,6 +385,13 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
 
+        if self.config.symmetric_ar_type is not None:
+            assert is_torch_min_version("2.7.0a0"), "Must have at least torch version 2.7 or higher"
+            assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
+                "2.3.0.dev0+39c0e70"
+            ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
+            extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -495,6 +511,7 @@ class TEColumnParallelLinear(TELinear):
             is_expert=is_expert,
             skip_weight_param_allocation=skip_weight_param_allocation,
             tp_comm_buffer_name=tp_comm_buffer_name,
+            symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
         )
 
@@ -578,6 +595,7 @@ class TERowParallelLinear(TELinear):
             # We don't currently use this for row parallel layers # pylint: disable=line-too-long
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
+            symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
         )
 

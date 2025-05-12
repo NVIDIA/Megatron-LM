@@ -51,8 +51,6 @@ class TestParallelAttention:
         # we can't currently do this because the global memory buffer is on GPU
         pass
 
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
     def test_gpu_forward(self):
 
         config = self.parallel_attention.config
@@ -65,7 +63,7 @@ class TestParallelAttention:
         hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
         hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).to(get_current_device())
 
         output, bias = self.parallel_attention(hidden_states, attention_mask)
 
@@ -75,7 +73,6 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
-    @pytest.mark.flaky_in_dev
     def test_fused_rope_gpu_forward(self):
         self.parallel_attention.config.apply_rope_fusion = True
         config = self.parallel_attention.config
@@ -88,9 +85,13 @@ class TestParallelAttention:
         hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
         hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
-        rotary_pos_emb = torch.ones(sequence_length, 1, 1, self.parallel_attention.config.kv_channels).to(device=get_current_device())
-        output, bias = self.parallel_attention(hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb)
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).to(get_current_device())
+        rotary_pos_emb = torch.ones(
+            sequence_length, 1, 1, self.parallel_attention.config.kv_channels
+        ).to(get_current_device())
+        output, bias = self.parallel_attention(
+            hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb
+        )
 
         assert config.recompute_granularity is None
         assert output.shape[0] == sequence_length
@@ -99,7 +100,6 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
 
-    @pytest.mark.flaky_in_dev
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity = 'selective'
@@ -122,7 +122,7 @@ class TestParallelAttention:
         )
         hidden_states = hidden_states.to(device=get_current_device())
 
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(device=get_current_device())
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).to(get_current_device())
 
         output, bias = checkpointed_parallel_attention(hidden_states, attention_mask)
 
