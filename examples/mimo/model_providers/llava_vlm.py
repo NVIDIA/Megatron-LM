@@ -62,8 +62,20 @@ def model_provider_llava_vlm(
         if getattr(_args, "fp16", False):
             language_config.fp16 = True
             projection_config.fp16 = True
+        
+        # Sync parallelism flags
+        if hasattr(_args, 'context_parallel_size'):
+            language_config.context_parallel_size = _args.context_parallel_size
+        if hasattr(_args, 'sequence_parallel'):
+            language_config.sequence_parallel = _args.sequence_parallel
+
+        # Determine kv_format based on sequence packing
+        current_kv_format = "sbhd"
+        if getattr(_args, "pack_sequence", False):
+            current_kv_format = "thd"
+
     except (ModuleNotFoundError, AssertionError):
-        pass
+        _args = None # Args not available (e.g. not in Megatron training context)
 
     # HF encoder
     vision_encoder = ModuleSpec(
