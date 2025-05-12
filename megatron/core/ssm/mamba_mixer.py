@@ -145,6 +145,7 @@ class MambaMixer(MegatronModule):
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.layer_number = layer_number
+        self.cached_batch_size = None
 
         # Check for deprecated arguments and raise warnings
         if use_mem_eff_path is not None:
@@ -616,7 +617,10 @@ class MambaMixer(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         assert self.layer_number is not None
-        if self.layer_number not in inference_context.key_value_memory_dict:
+        if (
+            self.layer_number not in inference_context.key_value_memory_dict
+            or batch_size != self.cached_batch_size
+        ):
             conv_state = torch.zeros(
                 batch_size,
                 self.conv1d.weight.shape[0],
@@ -633,9 +637,9 @@ class MambaMixer(MegatronModule):
                 dtype=self.in_proj.weight.dtype,
             )
             inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
+            self.cached_batch_size = batch_size
         else:
             conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
-            # TODO: What if batch size changes between generation, and we reuse the same states?
             if initialize_states:
                 conv_state.zero_()
                 ssm_state.zero_()
