@@ -10,11 +10,11 @@ export NCCL_IB_SL=1
 DRY_RUN=false
 GPUS_PER_NODE=2
 NUM_NODES=1
-DEBUG_MODE=false     # Set to true to enable debugging with debugpy-run
-DEBUG_PORT=5678      # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
+DEBUG_MODE=false    # Set to true to enable debugging with debugpy-run
+DEBUG_PORT=5678     # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
 
 DATASET_PATH=$1
-PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH=${2:-"None"}
+PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH=${2:-""}
 
 # Conditionally build the language-model-checkpoint CLI flag. If the caller
 # did not supply a second positional argument, `$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH`
@@ -31,11 +31,11 @@ if [ "$1" = "-d" ]; then
   echo "Debug mode enabled"
 fi
 
-mbs=8
+mbs=4
 gbs=128
 
 WANDB_PROJECT='mimo-llava-train'
-EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs''
+EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs
 
 # for storing checkpoints
 ROOT_DIR='./local/'
@@ -51,8 +51,8 @@ DISTRIBUTED_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-	--tensor-model-parallel-size 1
-	--pipeline-model-parallel-size 1
+    --tensor-model-parallel-size 1
+    --pipeline-model-parallel-size 1
 )
 
 TRAINING_ARGS=(
@@ -61,14 +61,15 @@ TRAINING_ARGS=(
     --train-iters 2200
     --adam-beta1 0.9 
     --adam-beta2 0.95 
-    --lr 0.001
+    --lr 1e-2
     --lr-decay-style cosine 
-    --min-lr 2.0e-5
-    --lr-warmup-iters 150
-    --lr-decay-iters 2200 
+    --min-lr 2e-4
+    --lr-warmup-iters 100
+    --lr-decay-iters 1000 
     --auto-detect-ckpt-format
     --accumulate-allreduce-grads-in-fp32
     --model-provider llava_vlm
+    --bf16
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -84,6 +85,11 @@ EVAL_AND_LOGGING_ARGS=(
     ${LANGUAGE_MODEL_CKPT_ARG[@]}
 )
 
+# Add checkpoint argument only if provided
+if [ -n "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH" ]; then
+    EVAL_AND_LOGGING_ARGS+=(--language-model-checkpoint "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH")
+fi
+
 # Tokenizer args
 TOKENIZER_ARGS=(
     --tokenizer-type HuggingFaceTokenizer
@@ -95,6 +101,7 @@ DATASET_ARGS=(
     --dataloader-type external
     --dataset-provider llava_vlm
     --data-path $DATASET_PATH
+    --total-seq-length 1536
 )
 
 # GPT Model args
@@ -139,3 +146,4 @@ else
     ${DATASET_ARGS[@]}
   fi
 fi
+
