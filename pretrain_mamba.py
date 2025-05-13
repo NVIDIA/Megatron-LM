@@ -7,7 +7,6 @@ from functools import partial
 from typing import List, Optional, Tuple, Union
 
 from megatron.training import get_args
-from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.training import get_tokenizer
@@ -259,12 +258,8 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    # Optionally enable inprocess restart on pretrain
-    pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
-
     pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-             store=store)
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
