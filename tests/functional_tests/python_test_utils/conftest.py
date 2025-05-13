@@ -17,6 +17,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--train-iters", action="store", default=100, help="Number of train iters", type=int
     )
+    parser.addoption("--test-values-path", action="store", help="Path to tensorboard records")
     parser.addoption("--tensorboard-path", action="store", help="Path to tensorboard records")
     parser.addoption("--model-config-path", action="store", help="Path to model_config.yaml")
 
@@ -25,6 +26,12 @@ def pytest_addoption(parser):
 def compare_approximate_results(request) -> bool:
     """Simple fixture returning whether to check against results approximately."""
     return request.config.getoption("--allow-nondeterministic-algo") is True
+
+
+@pytest.fixture
+def golden_values_path(request):
+    """Simple fixture returning golden values."""
+    return request.config.getoption("--golden-values-path")
 
 
 @pytest.fixture
@@ -45,6 +52,11 @@ def tensorboard_logs(request, train_iters):
     return common.read_tb_logs_as_list(
         request.config.getoption("--tensorboard-path"), train_iters=train_iters
     )
+
+
+@pytest.fixture
+def test_values_path(request):
+    return request.config.getoption("--test-values-path")
 
 
 @pytest.fixture
