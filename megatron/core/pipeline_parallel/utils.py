@@ -59,7 +59,7 @@ class ScheduleNode:
         stream,
         event,
         backward_func=None,
-        memory_strategy=None,
+        free_input=False,
         name="schedule_node",
     ):
         """Initialize a schedule node.
@@ -77,7 +77,7 @@ class ScheduleNode:
         self.backward_func = backward_func if backward_func else self.default_backward_func
         self.stream = stream
         self.event = event
-        self.memory_strategy = memory_strategy or NoOpMemoryStrategy()
+        self.free_input = free_input
         self.inputs = None
         self.outputs = None
 
@@ -122,8 +122,13 @@ class ScheduleNode:
                 self.output = data
             torch.cuda.nvtx.range_pop()
 
-        # Handle inputs using the memory strategy
-        self.memory_strategy.handle_inputs(inputs, self.stream)
+        # Immediately frees input tensors after they are used for nodes 
+        # where inputs are no longer needed after computation.
+        if self.free_input:
+            for input in inputs:
+                if input is not None:
+                    input.record_stream(self.stream)
+                    input.untyped_storage().resize_(0)
 
         return self.output
 
@@ -238,75 +243,8 @@ class VppContextManager:
         parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)
 
 
-class MemoryManagementStrategy:
-    """Base class for memory management strategies.
 
-    Different memory management strategies can be implemented by subclassing this class.
-    These strategies control how tensors are handled in memory during the computation.
-    """
-
-    def handle_inputs(self, inputs, stream):
-        """Process input tensors after computation.
-
-        Args:
-            inputs (tuple): Input tensors that have been used
-            stream (torch.cuda.Stream): Current CUDA stream
-        """
-        pass
-
-
-class NoOpMemoryStrategy(MemoryManagementStrategy):
-    """Strategy that performs no memory management operations.
-
-    This is the default strategy - it doesn't free any memory.
-    """
-
-    pass
-
-
-class FreeInputsMemoryStrategy(MemoryManagementStrategy):
-    """Strategy that immediately frees input tensors after they are used.
-
-    This strategy is useful for nodes where inputs are no longer needed
-    after computation, helping to reduce memory usage.
-    """
-
-    def handle_inputs(self, inputs, stream):
-        """Free input tensors by resizing their storage to zero.
-
-        Args:
-            inputs (tuple): Input tensors to be freed
-            stream (torch.cuda.Stream): Current CUDA stream
-        """
-        for input in inputs:
-            if input is not None:
-                input.record_stream(stream)
-                input.untyped_storage().resize_(0)
-
-
-def get_default_cls_for_unwrap():
-    """Returns the default classes to unwrap from a model.
-
-    This function provides a tuple of classes that should be unwrapped from a model
-    to access the underlying GPTModel instance. It includes DistributedDataParallel
-    and Float16Module by default, and also attempts to include LegacyFloat16Module
-    if available for backward compatibility.
-
-    Returns:
-        tuple: A tuple of classes to unwrap from a model.
-    """
-    cls = (DistributedDataParallel, Float16Module)
-    try:
-        # legacy should not be used in core, but for backward compatibility, we support it here
-        from megatron.legacy.model import Float16Module as LegacyFloat16Module
-
-        cls = cls + (LegacyFloat16Module,)
-    except:
-        pass
-    return cls
-
-
-def unwrap_model(model, module_instances=get_default_cls_for_unwrap()):
+def unwrap_model(model):
     """Unwrap_model DistributedDataParallel and Float16Module wrapped model
     to return GPTModel instance
     """
@@ -316,7 +254,7 @@ def unwrap_model(model, module_instances=get_default_cls_for_unwrap()):
         return_list = False
     unwrapped_model = []
     for model_module in model:
-        while isinstance(model_module, module_instances):
+        while isinstance(model_module, (DistributedDataParallel, Float16Module)):
             model_module = model_module.module
         assert isinstance(
             model_module, GPTModel

@@ -13,8 +13,6 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     FakeScheduleNode,
-    FreeInputsMemoryStrategy,
-    NoOpMemoryStrategy,
     ScheduleNode,
     get_com_stream,
     get_comp_stream,
@@ -41,38 +39,28 @@ def weak_method(method):
     return wrapped_func
 
 
-class MemoryStrategyRegistry:
-    """Registry for memory management strategies based on node names.
+def should_free_input(name, is_moe, is_deepep):
+    """Determine if the node should free its input memory.
 
-    This class centralizes the definition of which memory strategy
-    should be used for each type of node in the computation graph.
+    Args:
+        name: Node name
+        is_moe: Whether it's a MoE model
+        is_deepep: Whether it's a DeepEP model
+
+    Returns:
+        bool: Whether to free input memory
     """
+    # For dense layers [attn, fake, mlp, fake], mlp input is needed during backward pass
+    if not is_moe:
+        return False
+    # Define which nodes should free input memory
+    free_input_nodes = {
+        "mlp": True,  # Free input after MLP node usage
+        "combine": True,  # Free input after Combine node usage
+        "dispatch": not is_deepep,  # Free input after dispatch node usage in non-deepep mode
+    }
 
-    @classmethod
-    def get_strategy_by_name(cls, name, is_moe, is_deepep):
-        """Gets the appropriate memory strategy for a node based on its name and MoE status.
-
-        Args:
-            name: The name of the node, which determines which strategy to use.
-            is_moe: Whether the node is part of a Mixture of Experts model.
-
-        Returns:
-            The memory strategy to use for the node.
-        """
-        strategies = {
-            "default": NoOpMemoryStrategy(),
-            "attn": NoOpMemoryStrategy(),  # Attention nodes keep their inputs
-            "dispatch": (
-                FreeInputsMemoryStrategy() if not is_deepep else NoOpMemoryStrategy()
-            ),  # deepep dispatch inputs share same storage with moe inputs
-            "mlp": FreeInputsMemoryStrategy(),  # MLP nodes free inputs after use
-            "combine": FreeInputsMemoryStrategy(),  # Combine nodes free inputs after use
-        }
-
-        if is_moe:
-            return strategies.get(name, strategies["default"])
-        # For dense layers [attn, fake, mlp, fake], the inputs of mlp are required for backward
-        return NoOpMemoryStrategy()
+    return free_input_nodes.get(name, False)
 
 
 class PreProcessNode(ScheduleNode):
@@ -250,17 +238,15 @@ class TransformerLayerNode(ScheduleNode):
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
         """
-        # Get memory strategy based on node name
-        memory_strategy = MemoryStrategyRegistry.get_strategy_by_name(
-            name, submodule.is_moe, submodule.is_deepep
-        )
+        # 获取是否需要释放输入内存的标志
+        free_input = should_free_input(name, submodule.is_moe, submodule.is_deepep)
 
         super().__init__(
             weak_method(self.forward_impl),
             stream,
             event,
             weak_method(self.backward_impl),
-            memory_strategy=memory_strategy,
+            free_input=free_input,
             name=name,
         )
         self.common_state = state
