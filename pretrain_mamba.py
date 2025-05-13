@@ -46,7 +46,7 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
-        post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
+        post_process (bool, optional): Set to true if you want to compute output logits/loss. Defaults to True.
 
 
     Returns:
