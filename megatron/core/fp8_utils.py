@@ -36,12 +36,25 @@ except (ImportError, ModuleNotFoundError):
     # Float8Tensor not found
     pass
 
+# Check if Transformer Engine has MXFP8Tensor class
+HAVE_TE_MXFP8TENSOR = False
+try:
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    HAVE_TE_MXFP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # MXFP8Tensor not found
+    pass
+
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor"""
     return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
 
-
+def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine MXFP8Tensor"""
+    return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
+    
 """
 The code below abstracts the functionalities needed for implementing "--fp8-param-gather" into
 several functions. It provides different implementations for each function based on different

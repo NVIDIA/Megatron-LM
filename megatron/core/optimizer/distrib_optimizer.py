@@ -35,7 +35,7 @@ from ..dist_checkpointing.mapping import (
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
-from ..fp8_utils import is_float8tensor, quantize_param_shard
+from ..fp8_utils import is_float8tensor, quantize_param_shard, is_mxfp8tensor
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
@@ -333,7 +333,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
-
+                    print("is_bf16tensor")
                     # Generate sharded model param.
                     shard_model_param = model_param.detach().view(-1)[
                         param_range.start : param_range.end
@@ -382,7 +382,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     model_float16_params_this_group.append(model_param)
                     shard_float16_params_this_group.append(shard_model_param)
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
+                elif is_mxfp8tensor(model_param):
+                    print("is_mxfp8tensor")
+                    main_param = model_param.clone().float()
+                    shard_main_param = main_param.view(-1)[
+                        param_range.start : param_range.end
+                    ]
+                    # Store handle to main_param.
+                    model_param.main_param = shard_main_param
+                    model_param.main_param_sharded = True
 
+                    # Add to group.
+                    model_float16_params_this_group.append(model_param)
+                    shard_fp32_from_float16_params_this_group.append(shard_main_param)                    
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
@@ -2047,6 +2059,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 
+    def _copy_main_params_to_param_buffer(self):
+        """
+        Copy FP32 main params to param buffer for later all-gather.
+        Flow:
+        FP32 main params -> bf16 param buffer -> all-gather -> convert to FP8
+        """
+        for shard_main_group, model_group in zip(self.shard_fp32_from_float16_groups, 
+                                            self.model_float16_groups):
+            for shard_main_param, model_param in zip(shard_main_group, model_group):
+                # Get position in param buffer
+                param_range_map = self._get_model_param_range_map(model_param)
+                world_range = param_range_map["gbuf_world_in_bucket"]
+                
+                # Get param buffer
+                gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+                
+                # Get the correct slice of param buffer
+                param_buffer_slice = param_buffer.view(-1)[
+                    world_range.start : world_range.end
+                ]
+                
+                # Copy FP32 -> BF16 buffer (for all-gather)
+                param_buffer_slice.copy_(shard_main_param)
+                
     def _copy_model_params_to_main_params(self):
         """
         Copy model params to main params.

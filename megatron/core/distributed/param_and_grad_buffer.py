@@ -13,7 +13,7 @@ from torch.distributed import _coalescing_manager
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor, modify_underlying_storage
+from ..fp8_utils import is_float8tensor, modify_underlying_storage, is_mxfp8tensor
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
@@ -87,7 +87,11 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
-
+        self.param_to_index = {}
+        offset = 0
+        for param in params:
+            self.param_to_index[param] = (offset, offset + param.numel())
+            offset += param.numel()
 
 class _ParamAndGradBucketGroup:
     """
@@ -617,20 +621,39 @@ class _ParamAndGradBuffer:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
-        # Only re-map param tensors if using distributed optimizer.
-        if self.ddp_config.use_distributed_optimizer:
-            self.param_data = torch.zeros(
+        self.mxfp8_param = None
+        # Check if any param is MXFP8Tensor
+        for param in params[::-1]:
+            if is_mxfp8tensor(param):
+                self.mxfp8_param = True
+                break
+        # Partial support for MXFP8 param: AG in bfloat16 buffer which will be reused for grad RS.
+        if self.mxfp8_param and self.ddp_config.use_distributed_optimizer:
+            print("create shared buffer in bfloat16")
+            self.shared_buffer = torch.zeros(
                 self.numel,
                 dtype=self.param_dtype,
+                dtype=torch.bfloat16,
                 device=torch.cuda.current_device(),
                 requires_grad=False,
             )
-        self.grad_data = torch.zeros(
-            self.numel,
-            dtype=self.grad_dtype,
-            device=torch.cuda.current_device(),
-            requires_grad=False,
-        )
+            self.param_data = self.shared_buffer  
+            self.grad_data = self.shared_buffer   
+        else:
+            # Only re-map param tensors if using distributed optimizer.
+            if self.ddp_config.use_distributed_optimizer:
+                self.param_data = torch.zeros(
+                    self.numel,
+                    dtype=torch.bfloat16,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+            self.grad_data = torch.zeros(
+                self.numel,
+                dtype=self.grad_dtype,
+                device=torch.cuda.current_device(),
+                requires_grad=False,
+            )
 
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []
