@@ -494,9 +494,13 @@ publish:upload_statistics:
       optional: true
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
     - job: test:unit_tests_pyt(LTS)_mcore(latest)
-    - job: functional:run_lts
+    - job: functional:run_lts_a100
       optional: true
-    - job: functional:run_dev
+    - job: functional:run_lts_h100
+      optional: true
+    - job: functional:run_dev_a100
+      optional: true
+    - job: functional:run_dev_h100
       optional: true
   tags:
     - arch/amd64
