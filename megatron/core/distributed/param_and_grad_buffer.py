@@ -660,21 +660,22 @@ class _ParamAndGradBuffer:
         cur_bucket_id = 0
         for param in params[::-1]:
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-
-            # Assign param.data to appropriate segment of self.param_data.
-            if self.param_data is not None:
-                new_param_data = self._get(
-                    param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                )
-                if is_float8tensor(param):
-                    modify_underlying_storage(param, new_param_data)
-                else:
-                    old_param_data = param.data
-                    param.data = new_param_data
-                    assert old_param_data._base is None
-                    # Copy tensor values (from initialization or checkpoint).
-                    param.data.detach().copy_(old_param_data)
-                    del old_param_data
+            if not self.mxfp8_param:
+                print("assign param.data to bf16 buffer")
+                # Assign param.data to appropriate segment of self.param_data.
+                if self.param_data is not None:
+                    new_param_data = self._get(
+                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                    )
+                    if is_float8tensor(param):
+                        modify_underlying_storage(param, new_param_data)
+                    else:
+                        old_param_data = param.data
+                        param.data = new_param_data
+                        assert old_param_data._base is None
+                        # Copy tensor values (from initialization or checkpoint).
+                        param.data.detach().copy_(old_param_data)
+                        del old_param_data
 
             param.main_grad = self._get(
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
