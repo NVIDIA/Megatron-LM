@@ -632,7 +632,6 @@ class _ParamAndGradBuffer:
             print("create shared buffer in bfloat16")
             self.shared_buffer = torch.zeros(
                 self.numel,
-                dtype=self.param_dtype,
                 dtype=torch.bfloat16,
                 device=torch.cuda.current_device(),
                 requires_grad=False,
