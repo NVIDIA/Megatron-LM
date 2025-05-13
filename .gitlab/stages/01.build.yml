@@ -31,6 +31,7 @@
   script:
     - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
     - apk add bash curl git
+    - export TE_GIT_REF=$TE_GIT_REF
     - bash .gitlab/scripts/build.sh
 
     - git fetch origin $MCORE_BACKWARDS_REF
