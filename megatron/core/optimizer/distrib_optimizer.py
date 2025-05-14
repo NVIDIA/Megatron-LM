@@ -397,25 +397,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # Add to group.
                 model_float16_params_this_group.append(model_param)
                 shard_fp32_from_float16_params_this_group.append(shard_main_param)                    
-                # fp32 params.
-                elif model_param.type() == 'torch.cuda.FloatTensor':
-                    shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
-                    model_fp32_params_this_group.append(model_param)
-                    shard_fp32_params_this_group.append(shard_model_param)
-                    tensor_parallel.copy_tensor_model_parallel_attributes(
-                        shard_model_param, model_param
-                    )
-                    if hasattr(model_param, 'shared'):
-                        shard_model_param.shared = model_param.shared
+                # # fp32 params.
+                # elif model_param.type() == 'torch.cuda.FloatTensor':
+                #     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
+                #     model_fp32_params_this_group.append(model_param)
+                #     shard_fp32_params_this_group.append(shard_model_param)
+                #     tensor_parallel.copy_tensor_model_parallel_attributes(
+                #         shard_model_param, model_param
+                #     )
+                #     if hasattr(model_param, 'shared'):
+                #         shard_model_param.shared = model_param.shared
 
-                else:
-                    raise TypeError(
-                        'Wrapped parameters must be one of '
-                        'torch.cuda.FloatTensor,  '
-                        'torch.cuda.HalfTensor, or '
-                        'torch.cuda.BFloat16Tensor. '
-                        'Received {}'.format(model_param.type())
-                    )
+                # else:
+                #     raise TypeError(
+                #         'Wrapped parameters must be one of '
+                #         'torch.cuda.FloatTensor,  '
+                #         'torch.cuda.HalfTensor, or '
+                #         'torch.cuda.BFloat16Tensor. '
+                #         'Received {}'.format(model_param.type())
+                #     )
 
             # Update optimizer's params.
             if not config.use_precision_aware_optimizer:
