@@ -22,6 +22,10 @@ if [[ "$CI_COMMIT_BRANCH" == "ci-nightly" ]]; then
     ADDITIONAL_PARAMS+=("-t ${IMAGE}:nightly")
 fi
 
+if [[ -n "$TE_GIT_REF" ]]; then
+    ADDITIONAL_PARAMS+=("--build-arg TE_COMMIT=${TE_GIT_REF}")
+fi
+
 echo $(git rev-parse HEAD)
 
 JET_API_VERSION=$(curl -s -u "$ARTIFACTORY_USER:$ARTIFACTORY_TOKEN" "https://sc-hw-artf.nvidia.com/artifactory/api/pypi/hw-joc-pypi/simple/jet-api/" | grep -o 'href="../../jet-api/[0-9.]*/' | sed 's|href="../../jet-api/||;s|/||' | sort -V -r | head -n1)

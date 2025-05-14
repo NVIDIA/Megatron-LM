@@ -3,7 +3,7 @@ set -euxo pipefail
 
 # Parse command line arguments
 usage() {
-    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--unit-test-repeat N] [--unit-test-timeout N]"
+    echo "Usage: $0 --tag {latest|legacy} --environment {lts|dev} --bucket BUCKET [--unit-test-repeat N] [--unit-test-timeout N] --log-dir LOG_DIR"
     exit 1
 }
 
@@ -14,6 +14,7 @@ cd $SCRIPT_PATH/../../
 # Default values
 UNIT_TEST_REPEAT=1
 UNIT_TEST_TIMEOUT=10
+LOG_DIR=$(pwd)/logs
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -41,6 +42,10 @@ while [[ $# -gt 0 ]]; do
         UNIT_TEST_TIMEOUT="$2"
         shift 2
         ;;
+    --log-dir)
+        LOG_DIR="$2"
+        shift 2
+        ;;
     *)
         echo "Unknown option: $1"
         usage
@@ -64,6 +69,14 @@ fi
 if [[ "$ENVIRONMENT" != "lts" && "$ENVIRONMENT" != "dev" ]]; then
     echo "Error: ENVIRONMENT must be either 'dev' or 'dev'"
     usage
+fi
+
+# Validate LOG_DIR
+if [[ -z "${LOG_DIR:-}" ]]; then
+    echo "Error: LOG_DIR is required"
+    usage
+else
+    mkdir -p $LOG_DIR
 fi
 
 # Set default timeout if not specified
@@ -135,7 +148,7 @@ DISTRIBUTED_ARGS=(
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
     --node_rank $SLURM_NODEID
-    --log-dir {assets_dir}
+    --log-dir $LOG_DIR
     --tee "0:3"
     --redirects "3"
 )
