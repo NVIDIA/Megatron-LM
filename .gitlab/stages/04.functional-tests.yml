@@ -158,7 +158,7 @@ functional:run_lts_h100:
 functional:run_dev_a100:
   extends: [.functional_run]
   variables:
-    ENVIRONMENT: lts
+    ENVIRONMENT: dev
     CLUSTER: A100
 
 functional:run_dev_h100:

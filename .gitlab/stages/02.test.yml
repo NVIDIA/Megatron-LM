@@ -35,7 +35,7 @@ test:unit_tests_configure:
         "--n-repeat ${UNIT_TEST_REPEAT}"
         "--time-limit $(( UNIT_TEST_TIMEOUT * 60 ))"
         "--test-cases all"
-        "--cluster $H100_CLUSTER"
+        "--cluster dgxh100_coreweave"
         "--platform dgx_h100"
         "--partition batch_short,batch"
         "--container-image ${UTILITY_IMAGE}"
