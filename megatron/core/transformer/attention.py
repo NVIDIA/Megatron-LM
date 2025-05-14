@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from torch import Tensor
 
@@ -26,6 +27,7 @@ from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import deprecate_inference_params, divide, is_fa_min_version
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -59,6 +61,9 @@ try:
 except ImportError:
     HAVE_TE = False
     SplitAlongDim = None
+
+
+xm = get_xla_model()
 
 
 @dataclass
@@ -220,7 +225,7 @@ class Attention(MegatronModule, ABC):
             self.num_query_groups_per_partition,
             dim,
             dtype=dtype,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
     def _adjust_key_value_for_inference(
@@ -835,9 +840,14 @@ class SelfAttention(Attention):
                 self.k_layernorm.bias.data,
             ]
         )
-        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
-        dp_list[rank] = inputs
-        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+   
+        if xm:
+            wpg = WrappedProcessGroup(get_data_parallel_group())
+            dp_list = list(xm.all_gather(inputs, groups=wpg.rank_groups, pin_layout=False).split(inputs.size()[0]))
+        else:
+            dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+            dp_list[rank] = inputs
+            torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
 
         def _compare(srcs, tgts, names, parallelism):
             assert len(srcs) == len(tgts) == len(names)
@@ -861,10 +871,14 @@ class SelfAttention(Attention):
                 "DP",
             )
 
-        rank = get_tensor_model_parallel_rank()
-        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
-        tp_list[rank] = inputs
-        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+        if xm:
+            wpg = WrappedProcessGroup(get_tensor_model_parallel_group())
+            tp_list = list(xm.all_gather(inputs, groups=wpg.rank_groups, pin_layout=False).split(inputs.size()[0]))
+        else:
+            rank = get_tensor_model_parallel_rank()
+            tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+            tp_list[rank] = inputs
+            torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
 
         for i, tp in enumerate(tp_list):
             q_w, q_b, k_w, k_b = torch.unbind(tp)

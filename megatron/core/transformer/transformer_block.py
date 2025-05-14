@@ -42,8 +42,8 @@ except ImportError:
     try:
         import apex  # pylint: disable=unused-import
 
+        from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
         LayerNormImpl = FusedLayerNorm
-
     except ImportError:
         from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
@@ -115,7 +115,7 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
 
         assert (
             num_layers % config.pipeline_model_parallel_size == 0
-        ), "num_layers should be divisible by pipeline_model_parallel_size"
+        ), f"num_layers: actual: {num_layers} config: {config.num_layers} is not divisible by pipeline_model_parallel_size: {config.pipeline_model_parallel_size}"
         num_layers_per_pipeline_rank = num_layers // config.pipeline_model_parallel_size
 
     if (
@@ -381,7 +381,7 @@ class TransformerBlock(MegatronModule):
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
-                    tensor_parallel.random.get_cuda_rng_tracker,
+                    tensor_parallel.random.get_device_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
                     attention_mask,
@@ -524,7 +524,7 @@ class TransformerBlock(MegatronModule):
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         if self.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_device_rng_tracker().fork()
         else:
             rng_context = nullcontext()
 

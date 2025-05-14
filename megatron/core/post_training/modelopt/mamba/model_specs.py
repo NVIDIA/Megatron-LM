@@ -1,8 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
+try:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    from megatron.core.post_training.modelopt.layers import Norm
+except ModuleNotFoundError:
+    TEDotProductAttention = None
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm as Norm
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.post_training.modelopt.layers import Norm
+
 from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules

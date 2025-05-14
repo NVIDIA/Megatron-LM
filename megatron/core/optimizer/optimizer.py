@@ -11,7 +11,12 @@ from logging import getLogger
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed
 
+from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.tensor_parallel.mappings import all_reduce
+
+HAVE_APEX_OR_TE = True
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_scale
 
@@ -35,6 +40,7 @@ except ImportError:
 
         multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
+        HAVE_APEX_OR_TE = False
 
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
@@ -52,6 +58,7 @@ from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
 
+xm = get_xla_model()
 
 def _zero_grad_group_helper(
     group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
@@ -188,7 +195,8 @@ class MegatronOptimizer(ABC):
         """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm, 
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
         return total_norm
 
@@ -200,7 +208,8 @@ class MegatronOptimizer(ABC):
         else:
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
-            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            grads_for_norm, 
+            grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
 
         if params:
@@ -354,7 +363,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         # Note that we keep this for the cases that grad scaler is none.
         # We still record nan/inf if we have a bfloat16 with a grad scaler.
         if self.grad_scaler:
-            self.found_inf = torch.tensor([0.0], dtype=torch.float, device='cuda')
+            self.found_inf = torch.tensor([0.0], dtype=torch.float, device=get_current_device())
 
         # Dummy tensor needed for apex multi-apply tensor.
         # For bfloat, we don't have multi-tensor apply and for now
@@ -362,11 +371,13 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
         if self.config.bf16:
             self._dummy_overflow_buf = None
         else:
-            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+            self._dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device=get_current_device())
+        #else:
+            #self._dummy_overflow_buf = None
 
         # In case grad scaler is not passed, define the unity scale.
         if self.grad_scaler is None:
-            self._scale_one = torch.tensor([1.0], dtype=torch.float, device='cuda')
+            self._scale_one = torch.tensor([1.0], dtype=torch.float, device=get_current_device())
 
     def get_loss_scale(self):
         if self.grad_scaler is None:
@@ -393,12 +404,8 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             )
 
         # Update across all model parallel instances.
-        torch.distributed.all_reduce(
-            self.found_inf,
-            op=torch.distributed.ReduceOp.MAX,
-            group=self.get_grad_stats_parallel_group(),
-        )
-
+        all_reduce(tensor=self.found_inf, group=self.get_grad_stats_parallel_group(), 
+                   op=torch.distributed.ReduceOp.MAX)
         # Check for nan.
         found_inf_flag = self.found_inf.item() > 0
 
@@ -545,7 +552,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     if param.requires_grad:
 
                         # float16 params:
-                        if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                        param_type = param.type().split('.')[-1]
+                        if param_type in ['HalfTensor', 'BFloat16Tensor']:
                             float16_params_this_group.append(param)
                             # Create a copy
                             main_param = param.detach().clone().float()
@@ -564,17 +572,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             if param in self.optimizer.state:
                                 self.optimizer.state[main_param] = self.optimizer.state.pop(param)
                         # fp32 params.
-                        elif param.type() == 'torch.cuda.FloatTensor':
+                        elif param_type == 'FloatTensor':
                             fp32_params_this_group.append(param)
                             param_group['params'][i] = param
 
                         else:
                             raise TypeError(
                                 'Wrapped parameters must be one of '
-                                'torch.cuda.FloatTensor,  '
-                                'torch.cuda.HalfTensor, or '
-                                'torch.cuda.BFloat16Tensor. '
-                                'Received {}'.format(param.type())
+                                'FloatTensor,  '
+                                'HalfTensor, or '
+                                'BFloat16Tensor. '
+                                'Received {}'.format(param_type)
                             )
 
                 self.float16_groups.append(float16_params_this_group)
@@ -632,11 +640,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # This only needs to be done for the float16 group.
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
+                assert main_param.device is not None, f"{main_param.device}"
                 if hasattr(model_param, 'main_grad'):
-                    main_param.grad = model_param.main_grad.float()
+                    main_param.grad = model_param.main_grad.float().to(device=main_param.device)
                 else:
                     if model_param.grad is not None:
-                        main_param.grad = model_param.grad.float()
+                        main_param.grad = model_param.grad.float().to(device=main_param.device)
 
                 # Safe to deallocate model's grad/main_grad after copying.
                 # (If using contiguous buffers, main_grad's memory should
@@ -646,7 +655,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # For fp32 grads, we need to reset the grads to main grad.
         for model_group in self.fp32_from_fp32_groups:
             for model_param in model_group:
-                model_param.grad = model_param.main_grad
+                model_param.grad = model_param.main_grad.to(device=model_param.grad.device, 
+                                                            dtype=model_param.grad.dtype)
 
     def _copy_main_params_to_model_params(self):
         # Only needed for the float16 params.
@@ -728,9 +738,15 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             logger.info('***WARNING*** loading optimizer from an old checkpoint ...')
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
+            assert common_step is not None
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
-        self.optimizer.load_state_dict(state_dict[optimizer_key])
+        elif not HAVE_APEX_OR_TE:
+            # Native PyTorch state dict requires step (i.e., iteration).
+            self._restore_common_per_param_step(state_dict[optimizer_key], 0.0)
+     
 
+        self.optimizer.load_state_dict(state_dict[optimizer_key])
+        
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
             if self.config.fp16:
@@ -773,7 +789,7 @@ class FP32Optimizer(MegatronOptimizer):
 
         super(FP32Optimizer, self).__init__(optimizer, config, init_state_fn)
 
-        self._scale = torch.tensor([1.0], dtype=torch.float, device='cuda')
+        self._scale = torch.tensor([1.0], dtype=torch.float, device=get_current_device())
         self.is_stub_optimizer = True if optimizer is None else False
 
     def zero_grad(self, set_to_none=True):
@@ -799,10 +815,11 @@ class FP32Optimizer(MegatronOptimizer):
             timers('optimizer-copy-to-main-grad', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
                 if hasattr(param, 'main_grad'):
-                    param.grad = param.main_grad
+                    param.grad = param.main_grad.to(device=param.grad.device, dtype=param.grad.dtype)
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
@@ -871,7 +888,13 @@ class FP32Optimizer(MegatronOptimizer):
         pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
+            if not HAVE_APEX_OR_TE:
+                common_step = 0 if common_step is None else common_step
             self._restore_common_per_param_step(state_dict, common_step)
+        elif not HAVE_APEX_OR_TE:
+            # Native PyTorch state dict requires step (i.e., iteration).
+            self._restore_common_per_param_step(state_dict, 0.0)
+
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
@@ -1000,7 +1023,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if self.chained_optimizers:
             return self.chained_optimizers[0].get_loss_scale()
         else:
-            return torch.tensor([1.0], dtype=torch.float32, device=torch.cuda.current_device())
+            return torch.tensor([1.0], dtype=torch.float32, device=get_current_device())
 
     def reload_model_params(self):
         for optimizer in self.chained_optimizers:

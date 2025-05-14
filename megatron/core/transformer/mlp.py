@@ -21,6 +21,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 
 # pylint: disable=missing-class-docstring

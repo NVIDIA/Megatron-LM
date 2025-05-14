@@ -89,7 +89,7 @@ class ModelCommProcessGroups:
                 setattr(self, key, kwargs[key])
             else:
                 raise ValueError(f"Unknown attribute: {key}")
-
+      
     @classmethod
     def use_mpu_process_groups(cls, required_pgs: Optional[List[str]] = None):
         """
@@ -111,7 +111,7 @@ class ModelCommProcessGroups:
         invalid_pgs = [pg for pg in required_pgs if pg not in all_pgs]
         if invalid_pgs:
             raise ValueError(f"Invalid process groups requested: {invalid_pgs}")
-
+  
         # Mapping of attribute names to their initialization functions
         pg_to_func = {
             'tp': parallel_state.get_tensor_model_parallel_group,
@@ -131,7 +131,7 @@ class ModelCommProcessGroups:
         }
 
         # Build initialization dict by calling appropriate parallel_state get_foo_group
-        init_dict = {pg: pg_to_func[pg](False) for pg in required_pgs}
+        init_dict = {pg: pg_to_func[pg](check_initialized=False) for pg in required_pgs}
 
         return cls(**init_dict)
 

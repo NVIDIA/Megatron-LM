@@ -1,11 +1,14 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
 def test_weighted_bias_swiglu(input_dtype):
+    Utils.initialize_model_parallel()
     if input_dtype == torch.float32:
         tols = dict(rtol=1.0e-6, atol=1.0e-6)
     elif input_dtype == torch.bfloat16:
@@ -13,11 +16,11 @@ def test_weighted_bias_swiglu(input_dtype):
     else:
         raise ValueError(f"Invalid input dtype: {input_dtype}")
 
-    x = torch.randn(16, 64, dtype=input_dtype, device="cuda")
+    x = torch.randn(16, 64, dtype=input_dtype, device=get_current_device())
     x.requires_grad = True
-    weights = torch.randn(16, 1, dtype=torch.float32, device="cuda")
+    weights = torch.randn(16, 1, dtype=torch.float32, device=get_current_device())
     weights.requires_grad = True
-    bwd_input = torch.randn(16, 32, dtype=input_dtype, device="cuda")
+    bwd_input = torch.randn(16, 32, dtype=input_dtype, device=get_current_device())
 
     y = bias_swiglu_impl(x, None) * weights
     y = y.to(input_dtype)
@@ -39,3 +42,4 @@ def test_weighted_bias_swiglu(input_dtype):
     assert weights_2.grad.dtype == weights.grad.dtype
     if input_dtype == torch.float32:
         assert torch.allclose(weights.grad, weights_2.grad, **tols)
+    Utils.destroy_model_parallel()

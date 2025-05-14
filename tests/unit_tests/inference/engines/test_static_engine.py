@@ -22,10 +22,13 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.parallel_state import is_pipeline_first_stage, is_pipeline_last_stage
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.device_utils import get_current_device, get_xla_model
 
+xm=get_xla_model()
 
 class TestStaticInferenceEngine:
     def setup_engine(self, engine_max_batch_size=None):
@@ -33,7 +36,7 @@ class TestStaticInferenceEngine:
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
 
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 12
         self.vocab_size = 100
@@ -46,12 +49,13 @@ class TestStaticInferenceEngine:
         )
 
         gpt_model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(),
-            vocab_size=self.vocab_size,
-            max_sequence_length=self.sequence_length,
-            parallel_output=True,
-        ).cuda()
+            config=transformer_config, 
+            transformer_layer_spec=get_gpt_layer_local_spec(), 
+            vocab_size=self.vocab_size, 
+            max_sequence_length=self.sequence_length, 
+            pre_process=is_pipeline_first_stage(),
+            post_process=is_pipeline_last_stage(),
+            parallel_output = True).to(device=get_current_device())
 
         inference_wrapper_config = InferenceWrapperConfig(
             hidden_size=self.hidden_size,
@@ -124,6 +128,7 @@ class TestStaticInferenceEngine:
                 assert result.generated_text is not None, f'Generated text should not be None'
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(xm, reason="Not suported for XLA")
     async def test_streaming(self):
         self.setup_engine()
 

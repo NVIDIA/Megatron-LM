@@ -1,6 +1,7 @@
 import torch
 from pytest_mock import mocker
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.model_to_trllm_mapping.default_conversion_dict import (
     DEFAULT_CONVERSION_DICT,
@@ -12,7 +13,7 @@ from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_mod
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -30,7 +31,7 @@ class TestTRTLLMDistributedGPUConverter:
         Setup method
         """
         Utils.initialize_model_parallel(2, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         transformer_config = TransformerConfig(
             num_layers=2,
@@ -58,7 +59,7 @@ class TestTRTLLMDistributedGPUConverter:
         """
         test model weights onverter
         """
-        device = torch.device("cuda")
+        device = get_current_device()
         self.gpt_model.to(device)
 
         transformer_config = self.gpt_model.config

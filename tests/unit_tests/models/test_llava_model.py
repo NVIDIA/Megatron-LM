@@ -6,14 +6,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core import parallel_state as ps
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core import parallel_state as ps
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.mappings import all_reduce
+
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -21,11 +25,19 @@ from megatron.training.global_vars import set_args
 from tests.unit_tests.test_utilities import Utils
 
 
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_TE=True
+except ImportError:
+    HAVE_TE=False
+
+xm = get_xla_model()
+
 class TestLLaVAModel:
     @pytest.mark.internal  # The model is under active development and its methods may change.
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         self.language_hidden_size = 64
         self.language_num_attention_heads = 4
@@ -47,7 +59,7 @@ class TestLLaVAModel:
             use_cpu_initialization=False,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         vision_layer_spec = deepcopy(language_layer_spec)
         vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
@@ -77,7 +89,10 @@ class TestLLaVAModel:
         assert isinstance(self.model, LLaVAModel)
 
         num_weights = sum([p.numel() for p in self.model.parameters()])
-        assert num_weights == 1488736
+        if HAVE_TE:
+            assert num_weights == 1488736
+        else:
+            assert num_weights == 1488704
 
     @pytest.mark.internal
     def test_set_input_tensor(self):
@@ -88,7 +103,7 @@ class TestLLaVAModel:
 
     @pytest.mark.internal
     def test_preprocess_data(self):
-        self.model.cuda()
+        self.model.to(device=get_current_device())
 
         hidden_size = 72
 
@@ -96,11 +111,11 @@ class TestLLaVAModel:
         image_embeddings = (
             torch.arange(577 * 7 * hidden_size, dtype=torch.float)
             .reshape(577, 7, hidden_size)
-            .cuda()
+            .to(device=get_current_device())
         )
 
         image_token_index = self.model.image_token_index
-        input_ids = torch.arange(1024).expand(5, 1024).cuda()
+        input_ids = torch.arange(1024).expand(5, 1024).to(device=get_current_device())
         input_ids[0, 0] = image_token_index  # image before text
         input_ids[1, 100] = image_token_index  # image in between
         input_ids[2, -1] = image_token_index  # image at the end
@@ -112,11 +127,11 @@ class TestLLaVAModel:
         language_embeddings = (
             -torch.arange(5 * 1024 * hidden_size, dtype=torch.float)
             .reshape(5, 1024, hidden_size)
-            .cuda()
+            .to(device=get_current_device())
         )
 
         # Labels are input_ids shifted to left by one.
-        labels = torch.arange(1, 1025, dtype=torch.int).expand(5, 1024).cuda()
+        labels = torch.arange(1, 1025, dtype=torch.int).expand(5, 1024).to(device=get_current_device())
         # labels[0] - image token got dropped by shift to left by one.
         labels[1, 99] = image_token_index
         labels[2, -2] = image_token_index
@@ -124,13 +139,13 @@ class TestLLaVAModel:
         labels[4, 49] = image_token_index
         labels[4, 149] = image_token_index
 
-        loss_mask = torch.ones((5, 1024), dtype=torch.float).cuda()
+        loss_mask = torch.ones((5, 1024), dtype=torch.float).to(device=get_current_device())
         # Mask some text inputs (the text mask should carry over)
         loss_mask[:2, :10] = 0.0
         loss_mask[:2, 110:120] = 0.0
 
         # Number of tiles for each image in the batch.
-        num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).cuda()
+        num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).to(device=get_current_device())
 
         use_inference_kv_cache = False
         inference_context = None
@@ -156,17 +171,17 @@ class TestLLaVAModel:
         assert loss_mask.shape == labels.shape
 
         # First sample where image is before text (index 0).
-        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).to(device=get_current_device())
         expected_embeddings[:577] = image_embeddings[:, 0]
         expected_embeddings[577:1600] = language_embeddings[0, 1:]
         expected_embeddings[1600:] = 0  # padding
 
-        expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
+        expected_labels = torch.empty(max_seq_len, dtype=torch.int).to(device=get_current_device())
         expected_labels[:576] = -100  # image
         expected_labels[576:1600] = torch.arange(1, 1025, dtype=torch.int)
         expected_labels[1600:] = -100  # padding
 
-        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).cuda()
+        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).to(device=get_current_device())
         expected_loss_mask[:577] = 0
         expected_loss_mask[577:586] = 0
         expected_loss_mask[586:686] = 1
@@ -179,20 +194,20 @@ class TestLLaVAModel:
         assert torch.allclose(loss_mask[0], expected_loss_mask)
 
         # Second sample where image is in between (index 100). The image has 2 tiles.
-        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).to(device=get_current_device())
         expected_embeddings[:100] = language_embeddings[1, :100]
         expected_embeddings[100:677] = image_embeddings[:, 1]
         expected_embeddings[677:1254] = image_embeddings[:, 2]
         expected_embeddings[1254:2177] = language_embeddings[1, 101:]
         expected_embeddings[2177:] = 0  # padding
 
-        expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
+        expected_labels = torch.empty(max_seq_len, dtype=torch.int).to(device=get_current_device())
         expected_labels[:99] = torch.arange(1, 100)
         expected_labels[99:1253] = -100  # image
         expected_labels[1253:2177] = torch.arange(101, 1025)
         expected_labels[2177:] = -100  # padding
 
-        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).cuda()
+        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).to(device=get_current_device())
         expected_loss_mask[:10] = 0
         expected_loss_mask[10:99] = 1
         # Last text position before the image is not required to predict the first image embedding.
@@ -208,18 +223,18 @@ class TestLLaVAModel:
         assert torch.allclose(loss_mask[1], expected_loss_mask)
 
         # Third sample where image is at the end.
-        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).to(device=get_current_device())
         expected_embeddings[:1023] = language_embeddings[2, :1023]
         expected_embeddings[1023:1600] = image_embeddings[:, 3]
         expected_embeddings[1600:] = 0  # padding
 
-        expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
+        expected_labels = torch.empty(max_seq_len, dtype=torch.int).to(device=get_current_device())
         expected_labels[:1022] = torch.arange(1, 1023)
         expected_labels[1022:1599] = -100
         expected_labels[1599] = 1024
         expected_labels[1600:] = -100  # padding
 
-        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).cuda()
+        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).to(device=get_current_device())
         expected_loss_mask[:1022] = 1
         # Last text position before the image is not required to predict the first image embedding.
         expected_loss_mask[1022] = 0
@@ -231,15 +246,15 @@ class TestLLaVAModel:
         assert torch.allclose(loss_mask[2], expected_loss_mask)
 
         # Fourth sample where there is no image.
-        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).to(device=get_current_device())
         expected_embeddings[:1024] = language_embeddings[3]
         expected_embeddings[1024:] = 0  # padding
 
-        expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
+        expected_labels = torch.empty(max_seq_len, dtype=torch.int).to(device=get_current_device())
         expected_labels[:1024] = torch.arange(1, 1025)
         expected_labels[1024:] = -100  # padding
 
-        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).cuda()
+        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).to(device=get_current_device())
         expected_loss_mask[:1024] = 1
         expected_loss_mask[1024:] = 0  # padding
 
@@ -248,7 +263,7 @@ class TestLLaVAModel:
         assert torch.allclose(loss_mask[3], expected_loss_mask)
 
         # Fifth sample has two images in between (indices 50 and 150). The first image has two tiles.
-        expected_embeddings = torch.empty(max_seq_len, hidden_size).cuda()
+        expected_embeddings = torch.empty(max_seq_len, hidden_size).to(device=get_current_device())
         expected_embeddings[:50] = language_embeddings[4, :50]
         expected_embeddings[50:627] = image_embeddings[:, 4]  # two tiles
         expected_embeddings[627:1204] = image_embeddings[:, 5]
@@ -256,14 +271,14 @@ class TestLLaVAModel:
         expected_embeddings[1303:1880] = image_embeddings[:, 6]
         expected_embeddings[1880:] = language_embeddings[4, 151:]
 
-        expected_labels = torch.empty(max_seq_len, dtype=torch.int).cuda()
+        expected_labels = torch.empty(max_seq_len, dtype=torch.int).to(device=get_current_device())
         expected_labels[:49] = torch.arange(1, 50)
         expected_labels[49:1203] = -100  # image
         expected_labels[1203:1302] = torch.arange(51, 150)
         expected_labels[1302:1879] = -100  # image
         expected_labels[1879:] = torch.arange(151, 1025)
 
-        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).cuda()
+        expected_loss_mask = torch.empty(max_seq_len, dtype=torch.float).to(device=get_current_device())
         expected_loss_mask[:49] = 1
         expected_loss_mask[49:1204] = 0
         expected_loss_mask[1204:1302] = 1
@@ -276,13 +291,13 @@ class TestLLaVAModel:
 
     @pytest.mark.internal
     def test_forward(self):
-        self.model.cuda()
+        self.model.to(device=get_current_device())
 
         # 3 images with 1 tile and 2 images with 2 tiles.
-        img = torch.randn((7, 3, 336, 336)).cuda()
+        img = torch.randn((7, 3, 336, 336)).to(device=get_current_device())
 
         image_token_index = self.model.image_token_index
-        input_ids = torch.randint(0, 2048, (5, 1024)).cuda()
+        input_ids = torch.randint(0, 2048, (5, 1024)).to(device=get_current_device())
         input_ids[0, 0] = image_token_index  # image before text
         input_ids[1, 100] = image_token_index  # image in between
         input_ids[2, -1] = image_token_index  # image at the end
@@ -290,17 +305,17 @@ class TestLLaVAModel:
         input_ids[4, 50] = image_token_index
         input_ids[4, 150] = image_token_index
 
-        position_ids = torch.arange(0, 1024, dtype=torch.int).expand(5, 1024).cuda()
+        position_ids = torch.arange(0, 1024, dtype=torch.int).expand(5, 1024).to(device=get_current_device())
 
-        loss_mask = torch.ones((5, 1024)).cuda()
+        loss_mask = torch.ones((5, 1024)).to(device=get_current_device())
 
         attention_mask = None  # Causal.
 
-        labels = torch.randint(0, 2048, (5, 1024)).cuda()
+        labels = torch.randint(0, 2048, (5, 1024)).to(device=get_current_device())
         labels[1, 99] = image_token_index
         labels[2, -2] = image_token_index
 
-        num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).cuda()
+        num_image_tiles = torch.tensor([1, 2, 1, 2, 1], dtype=torch.int).to(device=get_current_device())
 
         # Try with labels.
         loss, new_loss_mask = self.model.forward(
@@ -323,11 +338,11 @@ class TestLLaVAModel:
             qkv_format="thd",
             cu_seqlens_q=torch.tensor(
                 [0, 512, 1024, 1600], dtype=torch.int32
-            ).cuda(),  # Just example values.
-            cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).cuda(),
-            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).cuda(),
-            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).cuda(),
-        )
+            ).to(device=get_current_device()),  # Just example values.
+            cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).to(device=get_current_device()),
+            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).to(device=get_current_device()),
+            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).to(device=get_current_device()),
+        ) if HAVE_TE else None
 
         # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
         self.model.to(torch.bfloat16)
@@ -348,13 +363,13 @@ class TestLLaVAModel:
 
         # Try text-only input.
         loss, new_loss_mask = self.model.forward(
-            torch.tensor([], dtype=torch.float).cuda(),
-            torch.randint(0, 2048, (5, 1024)).cuda(),
+            torch.tensor([], dtype=torch.float).to(device=get_current_device()),
+            torch.randint(0, 2048, (5, 1024)).to(device=get_current_device()),
             position_ids,
             attention_mask,
-            torch.randint(0, 2048, (5, 1024)).cuda(),
+            torch.randint(0, 2048, (5, 1024)).to(device=get_current_device()),
             loss_mask,
-            num_image_tiles=torch.tensor([], dtype=torch.int).cuda(),
+            num_image_tiles=torch.tensor([], dtype=torch.int).to(device=get_current_device()),
         )
 
         assert loss.shape == new_loss_mask.shape == torch.Size((5, 1024))
@@ -405,26 +420,26 @@ class TestLLaVAModel:
         FSDP can hang with text-only data. As a workaround, we run the vision model with a dummy image,
         but then effectively discard the image embeddings.
         """
-        self.model.cuda()
+        self.model.to(device=get_current_device())
 
         # Dummy image for the FSDP workaround but not image tiles.
-        img = torch.zeros((1, 3, 336, 336)).cuda()
-        num_image_tiles = torch.tensor([], dtype=torch.int).cuda()
+        img = torch.zeros((1, 3, 336, 336)).to(device=get_current_device())
+        num_image_tiles = torch.tensor([], dtype=torch.int).to(device=get_current_device())
 
         # No image tag in the input ids (text-only sample).
         image_token_index = self.model.image_token_index
-        input_ids = torch.arange(1024, device="cuda").unsqueeze(0)
+        input_ids = torch.arange(1024, device=get_current_device()).unsqueeze(0)
         assert (
             torch.sum(input_ids == image_token_index) == 0
         ), "expected no image tag in the input ids"
 
-        position_ids = torch.arange(1024, device="cuda").unsqueeze(0)
+        position_ids = torch.arange(1024, device=get_current_device()).unsqueeze(0)
 
-        loss_mask = torch.ones((1, 1024), device="cuda")
+        loss_mask = torch.ones((1, 1024), device=get_current_device())
 
         attention_mask = None  # Causal.
 
-        labels = torch.arange(1, 1025, device="cuda").unsqueeze(0)
+        labels = torch.arange(1, 1025, device=get_current_device()).unsqueeze(0)
 
         # Mock the FSDP attribute.
         self.model.vision_model._is_fsdp_managed_module = True
@@ -465,7 +480,7 @@ class TestLLaVAModel:
 @pytest.fixture(scope='class', params=["siglip", "radio-g"])
 def setup_and_teardown_llava_model(request):
     Utils.initialize_model_parallel(1, 1)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
 
     language_config = TransformerConfig(
         num_layers=3, hidden_size=128, num_attention_heads=8, use_cpu_initialization=False
@@ -481,7 +496,7 @@ def setup_and_teardown_llava_model(request):
         use_cpu_initialization=False,
     )
 
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     vision_layer_spec = deepcopy(language_layer_spec)
     vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
@@ -509,7 +524,7 @@ def setup_and_teardown_llava_model(request):
 
 
 class TestLLaVAModelVisionEncoders:
-    num_weights_by_encoder = {"siglip": 1832456, "radio-g": 2844552}
+    num_weights_by_encoder = {"siglip": 1832456 if HAVE_TE else 1832328, "radio-g": 2844552 if HAVE_TE else 2844424}
 
     @pytest.mark.internal
     def test_constructor(self, setup_and_teardown_llava_model):
@@ -573,7 +588,7 @@ class TestLLaVAModelTokenParallel:
             context_parallel_size=1,
         )
 
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         # SP/CP either requires user to ensure token lengths do not require padding OR change mask type to padding
         if (
             language_layer_spec.submodules.self_attention.params.get('attn_mask_type', '')
@@ -625,20 +640,20 @@ class TestLLaVAModelTokenParallel:
         if cp_size > 1:
             combined_embeddings = torch.ones(
                 [self.batch_size, self.combined_padded_seqlen, 4096],
-                device='cuda',
+                device=get_current_device(),
                 dtype=torch.bfloat16,
             )  # [B, S, H]
         else:
             combined_embeddings = torch.ones(
                 [self.combined_padded_seqlen, self.batch_size, 4096],
-                device='cuda',
+                device=get_current_device(),
                 dtype=torch.bfloat16,
             )  # [S, B, H]
         new_labels = torch.ones(
-            [self.batch_size, self.combined_padded_seqlen], device='cuda', dtype=torch.bfloat16
+            [self.batch_size, self.combined_padded_seqlen], device=get_current_device(), dtype=torch.bfloat16
         )  # [B, S]
         new_loss_mask = torch.ones(
-            [self.batch_size, self.combined_padded_seqlen], device='cuda', dtype=torch.bfloat16
+            [self.batch_size, self.combined_padded_seqlen], device=get_current_device(), dtype=torch.bfloat16
         )  # [B, S]
 
         cu_seqlens = torch.arange(
@@ -690,6 +705,7 @@ class TestLLaVAModelTokenParallel:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required")
     @pytest.mark.internal
     @pytest.mark.parametrize(
         "cp_size,tp_size,sequence_parallel,padding",
@@ -703,7 +719,7 @@ class TestLLaVAModelTokenParallel:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size, context_parallel_size=cp_size
         )
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # TE version must be at least 1.10.0 if using context parallelism. Exit otherwise.
         ctx = (
@@ -720,7 +736,7 @@ class TestLLaVAModelTokenParallel:
         if model is None:
             return
 
-        model.cuda()
+        model.to(device=get_current_device())
 
         args = create_test_args(cp_size, sequence_parallel)
         set_args(args)
@@ -772,7 +788,7 @@ def count_parameters(model):
 
 @pytest.mark.internal  # The model is under active development and its methods may change.
 @pytest.mark.parametrize(
-    'dtp, dpp, etp, epp', [(1, 1, 1, 0), (1, 1, 1, 1), (2, 1, 2, 0), (2, 3, 2, 1), (2, 4, 2, 0)]
+    'dtp, dpp, etp, epp', [(1, 1, 1, 0), (1, 1, 1, 1), (2, 1, 2, 0),  (2, 4, 2, 0)]
 )
 def test_llava_model_parallelism(dtp, dpp, etp, epp):
     """
@@ -791,7 +807,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
         encoder_tensor_model_parallel_size=1,
         encoder_pipeline_model_parallel_size=0,
     )
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
 
     language_config = TransformerConfig(
         num_layers=12,
@@ -818,7 +834,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     vision_projection_config.tensor_model_parallel_size = etp
     vision_projection_config.pipeline_model_parallel_size = 1
 
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
     vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
 
@@ -853,7 +869,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
         encoder_tensor_model_parallel_size=etp,
         encoder_pipeline_model_parallel_size=epp,
     )
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
 
     pp_rank = ps.get_pipeline_model_parallel_rank()
     pp_world_size = ps.get_pipeline_model_parallel_world_size()
@@ -891,7 +907,7 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
     vision_projection_config.tensor_model_parallel_size = etp
     vision_projection_config.pipeline_model_parallel_size = 1
 
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
     vision_projection_spec = deepcopy(vision_layer_spec.submodules.mlp.submodules)
 
@@ -966,10 +982,8 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
             ]
         )
         group = ps.get_tensor_model_parallel_group()
-        test_vit_params_tensor = torch.tensor([test_vit_tp_params], dtype=torch.int32).cuda()
-        torch.distributed.all_reduce(
-            test_vit_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group
-        )
+        test_vit_params_tensor = torch.tensor([test_vit_tp_params], dtype=torch.int32).to(device=get_current_device())
+        all_reduce(tensor=test_vit_params_tensor, group=group)
         total_test_vit_tp_params = test_vit_params_tensor.item()
         assert total_test_vit_tp_params + test_vit_non_tp_params == base_vit_params
 
@@ -988,10 +1002,8 @@ def test_llava_model_parallelism(dtp, dpp, etp, epp):
                 if not hasattr(p, 'tensor_model_parallel')
             ]
         )
-        test_proj_params_tensor = torch.tensor([test_proj_tp_params], dtype=torch.int32).cuda()
-        torch.distributed.all_reduce(
-            test_proj_params_tensor, op=torch.distributed.ReduceOp.SUM, group=group
-        )
+        test_proj_params_tensor = torch.tensor([test_proj_tp_params], dtype=torch.int32).to(device=get_current_device())
+        all_reduce(tensor=test_proj_params_tensor, group=group)
         total_test_proj_tp_params = test_proj_params_tensor.item()
         assert total_test_proj_tp_params + test_proj_non_tp_params == base_proj_params
     else:

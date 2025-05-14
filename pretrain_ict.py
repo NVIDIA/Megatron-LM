@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
@@ -19,6 +21,8 @@ from megatron.legacy.data.dataset_utils import build_train_valid_test_datasets
 from megatron.legacy.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
+
+xm = get_xla_model()
 
 
 def pretrain_ict_model_provider(pre_process=True, post_process=True):
@@ -47,20 +51,24 @@ class AllgatherFromDataParallelRegion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_):
         assert input_.dim() == 2
-        group, rank, world_size = get_group_world_size_rank()
-
-        tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
-        tensor_list[rank] = input_
-        torch.distributed.all_gather(tensor_list, input_, group=group)
-
-        output = torch.cat(tensor_list, dim=0).contiguous()
+        
+        group = mpu.get_data_parallel_group()
+        if xm:
+            xm.mark_step()
+            wpg = WrappedProcessGroup(process_group=group)
+            output = xm.all_gather(input_, groups=wpg.rank_groups, pin_layout=False)
+        else:
+            tensor_list = [torch.empty_like(input_) for _ in range(group.size())]
+            tensor_list[group.rank()] = input_
+            torch.distributed.all_gather(tensor_list, input_, group=group)
+            output = torch.cat(tensor_list, dim=0).contiguous()
 
         return output
 
 
     @staticmethod
     def backward(ctx, grad_output):
-        group, rank, world_size = get_group_world_size_rank()
+        _, rank, world_size = get_group_world_size_rank()
 
         assert grad_output.shape[0] % world_size == 0
         dim_size = grad_output.shape[0] // world_size
@@ -95,12 +103,13 @@ def loss_func(output_tensor):
                                     k=softmax_scores.shape[1], sorted=True)
 
     def topk_accuracy(k):
-        return torch.cuda.FloatTensor([sum([int(i in sorted_indices[i, :k]) \
-            for i in range(global_batch_size)]) / global_batch_size])
+        return torch.tensor([sum([int(i in sorted_indices[i, :k]) \
+            for i in range(global_batch_size)]) / global_batch_size], 
+            dtype=torch.float, device=get_current_device())
 
     topk_accs = [topk_accuracy(int(k)) for k in args.retriever_report_topk_accuracies]
 
-    labels = torch.arange(global_batch_size).long().cuda()
+    labels = torch.arange(global_batch_size).long().to(device=get_current_device())
     loss = F.nll_loss(softmax_scores, labels, reduction='mean')
     reduced_losses = average_losses_across_data_parallel_group([loss, *topk_accs])
 
@@ -127,8 +136,9 @@ def forward_step(data_iterator, model):
     timers('batch-generator').stop()
 
     # Query and Context Types
-    query_types = torch.cuda.LongTensor(*query_tokens.shape).fill_(0)
-    context_types = torch.cuda.LongTensor(*context_tokens.shape).fill_(0)
+    query_types = torch.zeros(*query_tokens.shape).long().to(device=get_current_device())
+    context_types = torch.zeros(*context_tokens.shape).long().to(device=get_current_device())
+
 
     # Forward model.
     output_tensor = model(query_tokens, query_mask, query_types, context_tokens,

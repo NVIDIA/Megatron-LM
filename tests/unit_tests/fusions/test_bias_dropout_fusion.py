@@ -1,14 +1,15 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("training", [True, False])
 def test_bias_dropout_add(dtype, training):
     torch.manual_seed(42)
-    device = "cuda"
+    device = get_current_device()
     B, H = 16, 64
 
     # Initialize inputs

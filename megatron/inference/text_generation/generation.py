@@ -2,6 +2,7 @@
 
 """Generation utilities."""
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 
@@ -68,15 +69,15 @@ def score_and_return_on_first_stage(model, tokens: torch.Tensor, lengths: torch.
 
     if mpu.is_pipeline_last_stage():
         output_log_probs = torch.empty(
-            output_log_probs_size, dtype=torch.float32, device=torch.cuda.current_device()
+            output_log_probs_size, dtype=torch.float32, device=get_current_device()
         )
 
         output_topk_log_probs = torch.empty(
-            output_topk_log_probs_size, dtype=torch.float32, device=torch.cuda.current_device()
+            output_topk_log_probs_size, dtype=torch.float32, device=get_current_device()
         )
 
         output_topk_log_indices = torch.empty(
-            output_topk_log_probs_size, dtype=torch.int64, device=torch.cuda.current_device()
+            output_topk_log_probs_size, dtype=torch.int64, device=get_current_device()
         )
     # =============
     # Run infernece
@@ -197,14 +198,14 @@ def generate_tokens_probs_and_return_on_first_stage(
         if return_output_log_probs:
             output_log_probs = torch.empty(output_log_probs_size,
                                            dtype=torch.float32,
-                                           device=torch.cuda.current_device())
+                                           device=get_current_device())
         generated_sequence_lengths = torch.ones(
                 batch_size, dtype=torch.int64,
-                device=torch.cuda.current_device()) * max_sequence_length
+                device=get_current_device()) * max_sequence_length
 
     # Whether we have reached a termination id.
     is_generation_done = torch.zeros(batch_size, dtype=torch.uint8,
-                                     device=torch.cuda.current_device())
+                                     device=get_current_device())
 
     # =============
     # Run inference
@@ -225,8 +226,12 @@ def generate_tokens_probs_and_return_on_first_stage(
             positions2use = position_ids[:, prev_context_length:context_length]
 
             # Do not pass a variable-shape attention mask in the decode phase.
-            attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length] if prefill else None
+            if torch.is_inference_mode_enabled():
+                attention_mask2use = attention_mask.clone()[
+                    ..., prev_context_length:context_length, :context_length] if prefill else None
+            else:
+                attention_mask2use = attention_mask[
+                    ..., prev_context_length:context_length, :context_length] if prefill else None
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
@@ -351,10 +356,10 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
 
     beam_hyp = BeamHypotheses(beam_size, length_penalty)
     best_batches = None
-    done = torch.zeros(1, dtype=torch.uint8, device=torch.cuda.current_device())
+    done = torch.zeros(1, dtype=torch.uint8, device=get_current_device())
     scores = torch.zeros(beam_size,
                          dtype=torch.float32,
-                         device=torch.cuda.current_device()).unsqueeze(1)
+                         device=get_current_device()).unsqueeze(1)
     scores_size_tensor, tokens_size_tensor = None, None
     # =============
     # Run inference
@@ -372,8 +377,12 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
             positions2use = position_ids[:, prev_context_length:context_length]
 
             # Do not pass a variable-shape attention mask in the decode phase.
-            attention_mask2use = attention_mask[
-                ..., prev_context_length:context_length, :context_length] if not prefill else None
+            if torch.is_inference_mode_enabled():
+                attention_mask2use = attention_mask.clone()[
+                    ..., prev_context_length:context_length, :context_length] if not prefill else None
+            else:
+                attention_mask2use = attention_mask[
+                    ..., prev_context_length:context_length, :context_length] if not prefill else None
 
             # logits will be meanigful only in the last pipeline stage.
             logits = forward_step(tokens2use, positions2use, attention_mask2use)
@@ -416,7 +425,7 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
                         break
 
                 if beam_hyp.is_done(best_scores.max().item(), context_length + 1 - prompt_length):
-                    done = torch.ones(1, dtype=torch.uint8, device=torch.cuda.current_device())
+                    done = torch.ones(1, dtype=torch.uint8, device=get_current_device())
 
                 best_batches = tokens.new([item[2] for item in next_beams])
                 tokens = tokens[best_batches,:]
@@ -453,8 +462,8 @@ def beam_search_and_return_on_first_stage(model, forward_step, tokens, lengths, 
             tokens = [sorted_hyps[i][1] for i in range(num_return_gen)]
             scores = torch.stack(scores, dim=0)
             tokens = torch.stack(tokens, dim=0)
-            scores_size_tensor = torch.tensor(scores.shape, dtype=torch.int64, device=torch.cuda.current_device())
-            tokens_size_tensor = torch.tensor(tokens.shape, dtype=torch.int64, device=torch.cuda.current_device())
+            scores_size_tensor = torch.tensor(scores.shape, dtype=torch.int64, device=get_current_device())
+            tokens_size_tensor = torch.tensor(tokens.shape, dtype=torch.int64, device=get_current_device())
 
         scores_size_tensor = broadcast_from_last_pipeline_stage(1, torch.int64, scores_size_tensor)
         tokens_size_tensor = broadcast_from_last_pipeline_stage(2, torch.int64, tokens_size_tensor)

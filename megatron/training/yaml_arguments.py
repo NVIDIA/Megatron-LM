@@ -263,8 +263,9 @@ def validate_yaml(args, defaults={}):
 
     if args.language_model.moe_grouped_gemm:
         assert args.model_parallel.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
-        dc = torch.cuda.get_device_capability()
-        assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
+        if torch.cuda.is_available():
+            dc = torch.cuda.get_device_capability()
+            assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
     if args.weight_decay_incr_style == 'constant':
         assert args.start_weight_decay is None

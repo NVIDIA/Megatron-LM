@@ -2,6 +2,11 @@
 
 """Transformer."""
 import math
+from megatron.core.device_utils import get_current_device, get_xla_model
+import numpy as np
+import torch
+import torch.nn.functional as F
+from typing import Optional
 import os
 from contextlib import nullcontext
 from typing import Optional
@@ -22,14 +27,17 @@ from megatron.core.jit import jit_fuser
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.parallel_state import (
     get_expert_tensor_and_model_parallel_group,
-    get_tensor_model_parallel_group,
 )
 from megatron.core.tensor_parallel import (
+    get_device_rng_tracker,
+    get_data_parallel_rng_tracker_name,
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
-    get_cuda_rng_tracker,
+    get_device_rng_tracker,
     get_data_parallel_rng_tracker_name,
 )
+from megatron.core.jit import jit_fuser
+
 from megatron.legacy.model.enums import AttnMaskType, AttnType, LayerType
 from megatron.legacy.model.fused_bias_gelu import bias_gelu_impl
 from megatron.legacy.model.fused_softmax import FusedScaleMaskSoftmax
@@ -57,6 +65,8 @@ except ImportError:
         )
     except ImportError:
         flash_attn_unpadded_func = None
+
+xm = get_xla_model()
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -195,7 +205,7 @@ def sinkhorn(cost, tol=0.0001):
 def get_router_linear_layer(config):
     args = get_args()
     router = torch.nn.Linear(args.hidden_size, args.num_experts, bias=False)
-    with get_cuda_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
+    with get_device_rng_tracker().fork(get_data_parallel_rng_tracker_name()):
         config.init_method(router.weight)
     setattr(router.weight, 'sequence_parallel',config.sequence_parallel)
     return router
@@ -236,7 +246,7 @@ class SwitchMLP(MegatronModule):
 
         # TODO pre allocate memory
         output = torch.empty(dim_size, dtype=local_indices.dtype,
-                             device=torch.cuda.current_device())
+                             device=get_current_device())
         torch.distributed._all_gather_base(
             output, local_indices.contiguous(), group=self.tp_ep_group
         )
@@ -381,9 +391,15 @@ class CoreAttention(MegatronModule):
                                    output_size[0] * output_size[1], -1)
 
         # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
-            (output_size[0]*output_size[1], output_size[2], output_size[3]),
-            query_layer.dtype, "mpu")
+        if xm:
+            matmul_input_buffer = torch.empty(
+                (output_size[0]*output_size[1], output_size[2], output_size[3]), 
+                dtype=query_layer.dtype, device=get_current_device(), requires_grad=False
+            )
+        else:
+            matmul_input_buffer = mpu.get_global_memory_buffer().get_tensor(
+                (output_size[0]*output_size[1], output_size[2], output_size[3]),
+                query_layer.dtype, "mpu")
 
         # Raw attention scores. [b * np, sq, sk]
         matmul_result = torch.baddbmm(
@@ -406,7 +422,7 @@ class CoreAttention(MegatronModule):
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
         if not self.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
+            with tensor_parallel.get_device_rng_tracker().fork():
                 attention_probs = self.attention_dropout(attention_probs)
         else:
             attention_probs = self.attention_dropout(attention_probs)
@@ -477,7 +493,7 @@ class FlashSelfAttention(torch.nn.Module):
         """
 
         assert all((i.dtype in [torch.float16, torch.bfloat16] for i in (q,k,v)))
-        assert all((i.is_cuda for i in (q,k,v)))
+        assert all((i.is_cuda or i.is_xla for i in (q,k,v)))
 
         batch_size, seqlen_q = q.shape[0], q.shape[1]
         seqlen_k = k.shape[1]
@@ -652,7 +668,7 @@ class ParallelAttention(MegatronModule):
             num_attention_heads,
             self.hidden_size_per_attention_head,
             dtype=self.params_dtype,
-            device=torch.cuda.current_device())
+            device=get_current_device())
 
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, inference_context=None,
@@ -826,7 +842,7 @@ class ParallelAttention(MegatronModule):
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
             if not self.sequence_parallel:
-                with tensor_parallel.get_cuda_rng_tracker().fork():
+                with tensor_parallel.get_device_rng_tracker().fork():
                     context_layer = self.core_attention_flash(q, k, v)
             else:
                 context_layer = self.core_attention_flash(q, k, v)
@@ -1381,7 +1397,6 @@ def _get_layer_type(model_type, default_layer_type, retro_layer_numbers,
     else:
         return default_layer_type
 
-
 class ParallelTransformer(MegatronModule):
     """Transformer class."""
 
@@ -1404,7 +1419,7 @@ class ParallelTransformer(MegatronModule):
         self.post_process = post_process
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
-        self.transformer_impl = args.transformer_impl
+        self.transformer_impl = args.transformer_impl if not xm else "local"
         self.retro_add_retriever = args.retro_add_retriever
 
         # Store activation checkpoiting flag.
@@ -1420,6 +1435,7 @@ class ParallelTransformer(MegatronModule):
         self.transformer_engine_v_0_10 = False
         self.transformer_engine_v_0_11 = False
         self.transformer_engine_v_0_8 = False
+
         if self.transformer_impl == 'transformer_engine':
             global transformer_engine
             import transformer_engine
@@ -1434,7 +1450,7 @@ class ParallelTransformer(MegatronModule):
             assert not args.squared_relu, ("TransformerEngine does not support squared "
                                            "relu activation.")
 
-        self.use_fp8 = args.fp8 is not None
+        self.use_fp8 = args.fp8 is not None and xm is None
         self.fp8_recipe = None
         self.fp8_group = None
         if self.use_fp8:
@@ -1524,8 +1540,8 @@ class ParallelTransformer(MegatronModule):
                     self_attn_mask_type=self_attn_mask_type.name,
                     tp_group=mpu.get_tensor_model_parallel_group() if mpu.is_initialized() else None,
                     tp_size=mpu.get_tensor_model_parallel_world_size(),
-                    get_rng_state_tracker=get_cuda_rng_tracker
-                    if get_cuda_rng_tracker().is_initialized()
+                    get_rng_state_tracker=get_device_rng_tracker
+                    if get_device_rng_tracker().is_initialized()
                     else None,
                     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
                     seq_length=args.seq_length,
@@ -1634,7 +1650,7 @@ class ParallelTransformer(MegatronModule):
                     hidden_states = transformer_engine.pytorch.checkpoint(
                         custom(l, l + self.recompute_num_layers),
                         self.distribute_saved_activations,
-                        tensor_parallel.get_cuda_rng_tracker,
+                        tensor_parallel.get_device_rng_tracker,
                         mpu.get_tensor_model_parallel_group(),
                         hidden_states, attention_mask, encoder_output,
                         enc_dec_attn_mask, **te_forward_kwargs)
@@ -1658,7 +1674,7 @@ class ParallelTransformer(MegatronModule):
                         hidden_states = transformer_engine.pytorch.checkpoint(
                             custom(l, l + 1),
                             self.distribute_saved_activations,
-                            tensor_parallel.get_cuda_rng_tracker,
+                            tensor_parallel.get_device_rng_tracker,
                             mpu.get_tensor_model_parallel_group(),
                             hidden_states, attention_mask, encoder_output,
                             enc_dec_attn_mask, **te_forward_kwargs)
@@ -1739,7 +1755,7 @@ class ParallelTransformer(MegatronModule):
 
         # RNG context.
         if self.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_device_rng_tracker().fork()
         else:
             rng_context = nullcontext()
 

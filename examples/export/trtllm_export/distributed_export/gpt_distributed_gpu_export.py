@@ -2,10 +2,11 @@ import os
 import torch
 from megatron.core import parallel_state
 from megatron.core import dist_checkpointing
+from megatron.core.device_utils import get_current_device
 from megatron.core.export.model_type import ModelType
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.trtllm_helper import TRTLLMHelper
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -54,10 +55,10 @@ def load_distributed_checkpoint(checkpoint_path, gpt_model):
 
 if __name__ == "__main__":
     initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
 
     gpt_model = model_provider()
-    device = torch.device("cuda")
+    device = get_current_device()
     gpt_model.to(device) 
     
     # Optionally you can also load a gpt model from ckpt_path using this code below

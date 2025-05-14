@@ -10,19 +10,24 @@ import torch
 from packaging import version
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_current_device_type, get_local_device_count
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.extensions.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TERowParallelLinear,
-)
+try:
+    from megatron.core.extensions.transformer_engine import (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    HAVE_TE=True
+except ImportError:
+    HAVE_TE = False
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -31,8 +36,8 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
-from tests.unit_tests.test_utilities import Utils
 
+from tests.unit_tests.test_utilities import Utils
 
 class HeterogenousTransformerLayer(TransformerLayer):
     """A transformer layer that supports different process groups for attention and MLP.
@@ -208,6 +213,8 @@ class TestTransformerBlockWithProcessGroups:
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
+    @pytest.mark.skipif(int(os.getenv('ACCEL_MEMORY_GB', 40)) < 40, reason="Insufficient GPU memory")
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Enginer not available")
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
@@ -232,7 +239,7 @@ class TestTransformerBlockWithProcessGroups:
         between transformer blocks using default and custom process groups.
         """
         # Skip if world size doesn't match
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
         Utils.initialize_model_parallel(
@@ -241,7 +248,7 @@ class TestTransformerBlockWithProcessGroups:
         os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "1"
 
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # Create transformer configuration
         transformer_config = TransformerConfig(
@@ -258,13 +265,13 @@ class TestTransformerBlockWithProcessGroups:
         # Create a transformer block with default process groups
         default_block = (
             TransformerBlock(transformer_config, get_gpt_layer_with_transformer_engine_spec())
-            .cuda()
+            .to(get_current_device())
             .bfloat16()
         )
 
         # Create custom process groups
         device_mesh = torch.distributed.init_device_mesh(
-            "cuda", (1, 1, dp_size, cp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "cp", "tp")
+            get_current_device_type(), (1, 1, dp_size, cp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "cp", "tp")
         )
 
         tp_group = device_mesh.get_group(mesh_dim="tp")
@@ -288,7 +295,7 @@ class TestTransformerBlockWithProcessGroups:
                 get_gpt_layer_with_transformer_engine_spec(),
                 model_comm_pgs=model_comm_pgs,
             )
-            .cuda()
+            .to(get_current_device())
             .bfloat16()
         )
 
@@ -322,7 +329,7 @@ class TestTransformerBlockWithProcessGroups:
         hidden_states = (
             torch.randn(
                 (sequence_length, micro_batch_size, transformer_config.hidden_size),
-                device="cuda",
+                device=get_current_device(),
                 requires_grad=True,
             )
             .bfloat16()
@@ -365,6 +372,7 @@ class TestTransformerBlockWithProcessGroups:
                     default_param.main_grad is not None and custom_param.main_grad is not None
                 ), f"Gradient is None for parameter '{param_name}' at index {i}"
 
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Enginer not available")
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
@@ -390,12 +398,12 @@ class TestTransformerBlockWithProcessGroups:
         with different process groups for attention and mlp.
         """
 
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
         Utils.initialize_model_parallel()
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # Create transformer configuration
         transformer_config = TransformerConfig(
@@ -411,7 +419,7 @@ class TestTransformerBlockWithProcessGroups:
 
         # Create custom process groups
         device_mesh = torch.distributed.init_device_mesh(
-            "cuda",
+            get_current_device_type(),
             (attn_tp_size, attn_cp_size, mlp_tp_size),
             mesh_dim_names=("attn_tp", "attn_cp", "mlp_tp"),
         )
@@ -426,7 +434,7 @@ class TestTransformerBlockWithProcessGroups:
         hetro_layer_spec = _gpt_te_layer_spec_with_hetro_pgs(
             attn_model_comm_pgs, mlp_model_comm_pgs
         )
-        custom_block = TransformerBlock(transformer_config, hetro_layer_spec).cuda().bfloat16()
+        custom_block = TransformerBlock(transformer_config, hetro_layer_spec).to(get_current_device()).bfloat16()
 
         sequence_length = 4096
         micro_batch_size = 2
@@ -435,7 +443,7 @@ class TestTransformerBlockWithProcessGroups:
         hidden_states = (
             torch.randn(
                 (sequence_length, micro_batch_size, transformer_config.hidden_size),
-                device="cuda",
+                device=get_current_device(),
                 requires_grad=True,
             )
             .bfloat16()
@@ -460,21 +468,22 @@ class TestTransformerBlockWithProcessGroups:
 
         assert hidden_states.grad is not None, "Hidden states gradient is None"
 
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Enginer not available")
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
     def test_fwd_bwd_pass_mix_and_match_transformer_blocks(self):
         world_size = 8
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
         Utils.initialize_model_parallel()
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         grid_cp_2_tp_4 = torch.distributed.init_device_mesh(
-            "cuda", (2, 4), mesh_dim_names=("cp", "tp")
+            get_current_device_type(), (2, 4), mesh_dim_names=("cp", "tp")
         )
 
         tp_group = grid_cp_2_tp_4.get_group(mesh_dim="tp")
@@ -496,7 +505,7 @@ class TestTransformerBlockWithProcessGroups:
                 get_gpt_layer_with_transformer_engine_spec(),
                 model_comm_pgs=model_comm_pgs,
             )
-            .cuda()
+            .to(get_current_device())
             .bfloat16()
         )
 
@@ -504,7 +513,7 @@ class TestTransformerBlockWithProcessGroups:
         micro_batch_size = 4
         hidden_states = (
             torch.randn(
-                (sequence_length, micro_batch_size, transformer_config.hidden_size), device="cuda"
+                (sequence_length, micro_batch_size, transformer_config.hidden_size), device=get_current_device()
             )
             .bfloat16()
             .requires_grad_(True)
@@ -512,7 +521,7 @@ class TestTransformerBlockWithProcessGroups:
         hidden_states.retain_grad()
 
         grid_cp_2_tp_2_dp_2 = torch.distributed.init_device_mesh(
-            "cuda", (2, 2, 2, 1, 1), mesh_dim_names=("cp", "tp", "dp", "pp", "ep")
+            get_current_device_type(), (2, 2, 2, 1, 1), mesh_dim_names=("cp", "tp", "dp", "pp", "ep")
         )
         tp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="tp")
         cp_group = grid_cp_2_tp_2_dp_2.get_group(mesh_dim="cp")
@@ -533,7 +542,7 @@ class TestTransformerBlockWithProcessGroups:
                 get_gpt_layer_with_transformer_engine_spec(),
                 model_comm_pgs=model_comm_pgs,
             )
-            .cuda()
+            .to(get_current_device())
             .bfloat16()
         )
 
@@ -579,6 +588,7 @@ class TestTransformerBlockWithProcessGroups:
 
         assert hidden_states.grad is not None, "Hidden states gradient is None"
 
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Enginer not available")
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
@@ -599,7 +609,7 @@ class TestTransformerBlockWithProcessGroups:
     )
     def test_mlp_with_custom_pgs(self, world_size, tp_size, dp_size, reverse_tp_dp_order):
 
-        actual_world_size = torch.cuda.device_count()
+        actual_world_size = get_local_device_count()
         if actual_world_size != world_size:
             pytest.skip(f"Test requires world_size={world_size}, but got {actual_world_size}")
 
@@ -607,15 +617,15 @@ class TestTransformerBlockWithProcessGroups:
 
         # Set PyTorch random seed explicitly for reproducible input
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         if reverse_tp_dp_order:
             device_mesh = torch.distributed.init_device_mesh(
-                "cuda", (1, 1, tp_size, dp_size), mesh_dim_names=("pp", "ep", "tp", "dp")
+                get_current_device_type(), (1, 1, tp_size, dp_size), mesh_dim_names=("pp", "ep", "tp", "dp")
             )
         else:
             device_mesh = torch.distributed.init_device_mesh(
-                "cuda", (1, 1, dp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "tp")
+                get_current_device_type(), (1, 1, dp_size, tp_size), mesh_dim_names=("pp", "ep", "dp", "tp")
             )
         pp_group = device_mesh.get_group(mesh_dim="pp")
         ep_group = device_mesh.get_group(mesh_dim="ep")
@@ -656,8 +666,8 @@ class TestTransformerBlockWithProcessGroups:
         reference_mlp = create_reference_mlp(
             transformer_config.hidden_size, transformer_config.ffn_hidden_size
         )
-        default_mlp = build_module(default_mlp_spec, config=transformer_config).cuda()
-        custom_mlp = build_module(custom_mlp_spec, config=transformer_config).cuda()
+        default_mlp = build_module(default_mlp_spec, config=transformer_config).to(get_current_device())
+        custom_mlp = build_module(custom_mlp_spec, config=transformer_config).to(get_current_device())
 
         copy_weights_to_tp_mlp(
             reference_mlp, default_mlp, parallel_state.get_tensor_model_parallel_group()
@@ -681,7 +691,7 @@ class TestTransformerBlockWithProcessGroups:
         sequence_length = 4096
         micro_batch_size = 1
         hidden_states = torch.randn(
-            (sequence_length, micro_batch_size, transformer_config.hidden_size), device="cuda"
+            (sequence_length, micro_batch_size, transformer_config.hidden_size), device=get_current_device()
         ).requires_grad_(True)
 
         torch.distributed.all_reduce(hidden_states, op=torch.distributed.ReduceOp.SUM)
@@ -701,7 +711,7 @@ class TestTransformerBlockWithProcessGroups:
 
         # Set PyTorch random seed explicitly for reproducible inputs
         torch.manual_seed(12345)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # Create transformer configuration
         transformer_config = TransformerConfig(
@@ -721,8 +731,8 @@ class TestTransformerBlockWithProcessGroups:
         block = TransformerBlock(transformer_config, get_gpt_layer_local_spec())
         block_2 = TransformerBlock(transformer_config_2, get_gpt_layer_local_spec())
         # Move block to GPU
-        block.cuda()
-        block_2.cuda()
+        block.to(get_current_device())
+        block_2.to(get_current_device())
 
         # Create test input
         sequence_length = 37
@@ -740,7 +750,7 @@ class TestTransformerBlockWithProcessGroups:
             -10,
             10,
             (sequence_length, micro_batch_size, transformer_config.hidden_size),
-            device="cuda",
+            device=get_current_device(),
         )
         hidden_states = hidden_states_int.float()
 

@@ -5,7 +5,7 @@ from typing import Dict, Optional, Tuple, Union
 
 import torch.nn as nn
 
-from megatron.core import dist_checkpointing
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -150,7 +150,8 @@ def load_modelopt_checkpoint(
                 _remove_prefix_state_dict_pre_hook
             )
         model_state_dict = dist_checkpointing.load(
-            sharded_state_dict, sharded_load_dir, strict=args.dist_ckpt_strictness
+            sharded_state_dict, sharded_load_dir, strict=args.dist_ckpt_strictness,
+            process_group=parallel_state.get_default_process_group()
         )
         unwrapped_model[0].load_state_dict(model_state_dict, strict=False)
     else:

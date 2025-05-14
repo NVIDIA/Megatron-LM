@@ -154,16 +154,16 @@ class FusedLayerNorm(torch.nn.Module):
                 in inspect.getfullargspec(FusedLayerNormAffineFunction.forward).args
             ):
                 return FusedLayerNormAffineFunction.apply(
-                    input,
-                    weight,
-                    self.bias,
+                    input.float(),
+                    weight.float(),
+                    self.bias.float(),
                     self.hidden_size,
                     self.eps,
                     self.config.memory_efficient_layer_norm,
-                )
+                ).to(dtype=input.dtype)
             else:
                 return FusedLayerNormAffineFunction.apply(
-                    input, weight, self.bias, self.hidden_size, self.eps
-                )
+                    input.float(), weight.float(), self.bias.float(), self.hidden_size, self.eps
+                ).to(dtype=input.dtype)
 
         return output

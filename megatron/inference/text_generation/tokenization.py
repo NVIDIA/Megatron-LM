@@ -6,6 +6,7 @@
 import torch
 
 
+from megatron.core.device_utils import get_current_device
 from megatron.core import parallel_state
 from megatron.training import get_args, get_tokenizer
 from .communication import broadcast_int_list, broadcast_tensor
@@ -58,8 +59,8 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None,
 
     # On all ranks set to None so we can pass them to functions
     sizes_list = None
-    prompts_tokens_cuda_long_tensor = None
-    prompts_length_cuda_long_tensor = None
+    prompts_tokens_device_long_tensor = None
+    prompts_length_device_long_tensor = None
 
     # On the specified rank, build the above.
     src_rank = torch.distributed.get_rank()
@@ -70,11 +71,11 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None,
         assert prompts is not None
         assert tokens_to_generate is not None
         # Tensor of tokens padded and their unpadded length.
-        prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor = \
+        prompts_tokens_device_long_tensor, prompts_length_device_long_tensor = \
             _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS)
         # We need the sizes of these tensors for the boradcast
-        sizes_list = [prompts_tokens_cuda_long_tensor.size(0), # Batch size
-                      prompts_tokens_cuda_long_tensor.size(1)] # Sequence lenght
+        sizes_list = [prompts_tokens_device_long_tensor.size(0), # Batch size
+                      prompts_tokens_device_long_tensor.size(1)] # Sequence lenght
 
     # First, broadcast the sizes.
     sizes_tensor = broadcast_int_list(2, int_list=sizes_list, rank=rank, data_parallel=data_parallel)
@@ -82,13 +83,13 @@ def tokenize_prompts(prompts=None, tokens_to_generate=None,
     # Now that we have the sizes, we can boradcast the tokens
     # and length tensors.
     sizes = sizes_tensor.tolist()
-    prompts_tokens_cuda_long_tensor = broadcast_tensor(
-        sizes, torch.int64, tensor=prompts_tokens_cuda_long_tensor, rank=rank, data_parallel=data_parallel)
-    prompts_length_cuda_long_tensor = broadcast_tensor(
-        sizes[0], torch.int64, tensor=prompts_length_cuda_long_tensor,
+    prompts_tokens_device_long_tensor = broadcast_tensor(
+        sizes, torch.int64, tensor=prompts_tokens_device_long_tensor, rank=rank, data_parallel=data_parallel)
+    prompts_length_device_long_tensor = broadcast_tensor(
+        sizes[0], torch.int64, tensor=prompts_length_device_long_tensor,
         rank=rank, data_parallel=data_parallel)
 
-    return prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor
+    return prompts_tokens_device_long_tensor, prompts_length_device_long_tensor
 
 
 def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
@@ -130,7 +131,7 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
         prompt_tokens.extend([eod_token] * padding_size)
 
     # Now we are in a structured format, we can convert to tensors.
-    prompts_tokens_tensor = torch.tensor(prompts_tokens, dtype=torch.long, device='cuda')
-    prompts_length_tensor = torch.tensor(prompts_length, dtype=torch.long, device='cuda')
+    prompts_tokens_tensor = torch.tensor(prompts_tokens, dtype=torch.long, device=get_current_device())
+    prompts_length_tensor = torch.tensor(prompts_length, dtype=torch.long, device=get_current_device())
 
     return prompts_tokens_tensor, prompts_length_tensor

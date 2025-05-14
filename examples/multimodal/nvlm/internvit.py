@@ -14,6 +14,7 @@ from functools import partial
 
 import torch
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.utils import divide
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -22,6 +23,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
+    get_tensor_model_parallel_groups,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -39,6 +41,7 @@ from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from examples.multimodal.layer_scaling import LayerScalingTransformerLayer, get_bias_dropout_add_layer_scaling
 
 
+xm = get_xla_model()
 try:
     import apex
 
@@ -133,11 +136,13 @@ class InternViTRMSNorm(MegatronModule):
         else:
             var = input_.sum(-1, keepdim=True) * 0.0  # All heads in these ranks are dummy heads: Zero-out.
 
-        tensor_list = [torch.empty_like(var) for _ in range(world_size)]
-        tensor_list[rank] = var
-        torch.distributed.all_gather(tensor_list, var, group=get_tensor_model_parallel_group())
-
-        output = torch.cat(tensor_list, dim=last_dim).contiguous()
+        if xm:
+            output = xm.all_gather(var, groups=get_tensor_model_parallel_groups(), pin_layout=False)
+        else:
+            tensor_list = [torch.empty_like(var) for _ in range(world_size)]
+            tensor_list[rank] = var
+            torch.distributed.all_gather(tensor_list, var, group=get_tensor_model_parallel_group())
+            output = torch.cat(tensor_list, dim=last_dim).contiguous()
 
         return output.sum(-1, keepdim=True)
 

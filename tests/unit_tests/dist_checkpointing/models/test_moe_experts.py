@@ -2,9 +2,9 @@
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import (
@@ -19,7 +19,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -27,12 +27,19 @@ from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-fp8_available, reason_for_no_fp8 = check_fp8_support()
+try:
+    from transformer_engine.pytorch.fp8 import check_fp8_support, fp8_autocast
+    fp8_available, reason_for_no_fp8 = check_fp8_support()
+    HAVE_TE=True
+except ImportError:
+    HAVE_TE=False
+    fp8_available = False
+    reason_for_no_fp8 = "Transformer Engine not available"
 
 
 def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
     model_comm_pgs = get_default_model_comm_pgs()
 
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -54,6 +61,8 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         model = GroupedMLP(num_local_experts, transformer_config, model_comm_pgs)
     elif expert_type == 'te_grouped':
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_moe_experts, moe_grouped_gemm=True
+        )  if HAVE_TE else get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=True
         )
         model = TEGroupedMLP(
@@ -98,15 +107,14 @@ def get_pp_offsets():
 
 expert_type = ['sequential', 'grouped']
 src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
-if is_te_min_version("1.7.0.dev0"):
+if HAVE_TE and is_te_min_version("1.7.0.dev0"):
     expert_type.append('te_sequential')
     src_dest_expert_type.append(('sequential', 'te_sequential'))
     src_dest_expert_type.append(('te_sequential', 'sequential'))
-if is_te_min_version("1.9.0.dev0"):
+if HAVE_TE and is_te_min_version("1.9.0.dev0"):
     expert_type.append('te_grouped')
     src_dest_expert_type.append(('te_sequential', 'te_grouped'))
     src_dest_expert_type.append(('te_grouped', 'te_sequential'))
-
 
 class TestExpertLayerReconfiguration:
     def setup_method(self, method):
@@ -180,12 +188,16 @@ class TestExpertLayerReconfiguration:
 
             save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
+                xm = get_xla_model()
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                        parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                    parallel_state.get_default_process_group(),
                     True,
                 )
-            save(sharded_state_dict, ckpt_dir_A, save_strategy)
+            save(sharded_state_dict, ckpt_dir_A, save_strategy,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP/EP and save as checkpoint B
@@ -200,9 +212,11 @@ class TestExpertLayerReconfiguration:
             model_B = initialize_expert_layer(1, use_glu, expert_type)
             if use_fpsl:
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
+                xm = get_xla_model()
                 load_strategy = FullyParallelLoadStrategyWrapper(
                     load_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                    parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                        parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
                 )
             else:
                 load_strategy = None
@@ -210,15 +224,17 @@ class TestExpertLayerReconfiguration:
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_B.load_state_dict(state_dict)
-            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
+            state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+            state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
 
@@ -258,7 +274,8 @@ class TestExpertLayerReconfiguration:
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
-            save(sharded_state_dict, ckpt_dir_A, save_strategy)
+            save(sharded_state_dict, ckpt_dir_A, save_strategy,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
@@ -268,15 +285,17 @@ class TestExpertLayerReconfiguration:
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_B.load_state_dict(state_dict)
-            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
+            state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+            state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs
             Utils.destroy_model_parallel()
@@ -311,18 +330,18 @@ class TestExpertLayerReconfiguration:
             tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_B'
         ) as ckpt_dir_B, fp8_autocast():
             tokens_per_expert = torch.tensor([16] * (8 // src_exp))
-            input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
-            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device="cuda")
+            input_tensor = torch.randn(tokens_per_expert.sum(), 16, device=get_current_device())
+            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device=get_current_device())
 
             # Save checkpoint A
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
-            model_A = model_A.cuda()
+            model_A = model_A.to(device=get_current_device())
             # fp8 meta is initialized at the first step
             model_A(input_tensor, tokens_per_expert, probs)
             sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
 
             save_strategy = get_default_save_sharded_strategy()
-            save(sharded_state_dict, ckpt_dir_A, save_strategy)
+            save(sharded_state_dict, ckpt_dir_A, save_strategy, process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
@@ -330,21 +349,23 @@ class TestExpertLayerReconfiguration:
 
             # model_A load checkpoint A
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
-            model_A = model_A.cuda()
+            model_A = model_A.to(device=get_current_device())
             state_dict = load(
                 model_A.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_A.load_state_dict(state_dict)
 
             # model_B load checkpoint A
             model_B = initialize_expert_layer(1, use_glu, expert_type=dst_module, fp8=True)
-            model_B = model_B.cuda()
+            model_B = model_B.to(device=get_current_device())
             state_dict = load(
                 model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
                 ckpt_dir_A,
                 load_strategy,
+                process_group=parallel_state.get_default_process_group()
             )
             model_B.load_state_dict(state_dict)
 
@@ -396,12 +417,12 @@ class TestExpertLayerReconfiguration:
         Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
         with TempNamedDir(tmp_path_dist_ckpt / 'test_te_grouped_linear_torch_native') as ckpt_dir:
             tokens_per_expert = torch.tensor([16] * (8 // ep_size))
-            input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
-            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device="cuda")
+            input_tensor = torch.randn(tokens_per_expert.sum(), 16, device=get_current_device())
+            probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device=get_current_device())
 
             # Save checkpoint
             model = initialize_expert_layer(1, use_glu, expert_type="te_grouped")
-            model = model.cuda()
+            model = model.to(device=get_current_device())
             model(input_tensor, tokens_per_expert, probs)
             torch.save(model.state_dict(), ckpt_dir / f"model_ep{torch.distributed.get_rank()}.pt")
 

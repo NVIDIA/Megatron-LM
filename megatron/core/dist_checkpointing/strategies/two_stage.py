@@ -11,7 +11,10 @@ from operator import attrgetter, itemgetter
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
+
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 from ..dict_utils import dict_list_map_inplace, map_reduce, nested_values
 from ..mapping import ShardedStateDict, ShardedTensor
@@ -95,12 +98,13 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
     2.c) broadcast
     """
 
-    def __init__(self, data_parallel_group, cpu_transfer=True):
+    def __init__(self, data_parallel_group, cpu_transfer=True, data_parallel_group_gloo=None):
         super().__init__()
 
         self.cpu_transfer = cpu_transfer
         self.data_parallel_group_orig = data_parallel_group
         self.data_parallel_group = None if cpu_transfer else data_parallel_group
+        self.data_parallel_group_gloo = None if cpu_transfer else data_parallel_group_gloo
         self.dp_group_ranks = tuple(
             sorted(torch.distributed.get_process_group_ranks(data_parallel_group))
         )
@@ -123,8 +127,8 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         # TODO: `timers` keys are not guaranteed to be the same across ranks which causes hangs
         for key, times in sorted(timers.items()):
             times_sum = sum(times)
-            max_times = torch.tensor([times_sum], device='cuda')
-            avg_times = torch.tensor([times_sum], device='cuda')
+            max_times = torch.tensor([times_sum], device=get_current_device())
+            avg_times = torch.tensor([times_sum], device=get_current_device())
             torch.distributed.all_reduce(max_times, op=torch.distributed.ReduceOp.MAX)
             torch.distributed.all_reduce(avg_times, op=torch.distributed.ReduceOp.SUM)
             avg_times /= torch.distributed.get_world_size()
@@ -179,8 +183,15 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             )
             for sharded_ten in nested_values(sharded_state_dict)
         ]
-        all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group)
-        torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group)
+        
+        xm = get_xla_model()
+        if xm:
+            assert self.data_parallel_group_gloo is not None
+            all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group_gloo)
+            torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group_gloo)
+        else:
+            all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group)
+            torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group)
         all_meta = list(chain.from_iterable(all_meta))
         all_tensors_sorted = self.deduplicate_chunks(all_meta)
         return all_tensors_sorted
@@ -214,22 +225,35 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             if self.dp_group_rank == ten_meta.dist_group_rank:
                 exchange_tensor = self.load_tensor_from_storage(checkpoint_dir, ten_meta)
                 if not self.cpu_transfer:
-                    exchange_tensor = exchange_tensor.cuda()
+                    exchange_tensor = exchange_tensor.to(device=get_current_device())
             else:
                 # TODO: for non-flattened ranges we could reuse the buffer from the start here
                 exchange_tensor = torch.empty(
                     ten_meta.sharded_tensor_no_data.local_shape,
-                    device='cpu' if self.cpu_transfer else 'cuda',
+                    device='cpu' if self.cpu_transfer else get_current_device(),
                     dtype=ten_meta.sharded_tensor_no_data.dtype,
                 )
 
             logger.debug(
                 f'exchange {ten_meta.sharded_tensor_no_data.key}, {exchange_tensor.shape}\
-({exchange_tensor.numel()}), broadcast({src_rank} -> {self.dp_group_ranks})'
+                ({exchange_tensor.numel()}), broadcast({src_rank} -> {self.dp_group_ranks})'
             )
-            torch.distributed.broadcast(
-                exchange_tensor, group=self.data_parallel_group, src=src_rank
-            )
+            if self.cpu_transfer:
+                 assert self.data_parallel_group_gloo, "Data Parallel Gloo group required for cpu transfer"
+                 torch.distributed.broadcast(
+                    exchange_tensor, group=self.data_parallel_group_gloo, src=src_rank
+                )
+            else:
+                xm = get_xla_model()
+                if xm:
+                    wpg = WrappedProcessGroup(process_group=self.data_parallel_group)
+                    xm.collective_broadcast([exchange_tensor],
+                            src_rank,
+                            groups=wpg.rank_groups, pin_layout=False)
+                else:
+                    torch.distributed.broadcast(
+                        exchange_tensor, group=self.data_parallel_group, src=src_rank
+                    )
             self._distribute_data_to_state_dict(ten_meta, exchange_tensor, sharded_state_dict)
             logger.debug(f'exchange {ten_meta.sharded_tensor_no_data.key} done')
 

@@ -3,17 +3,25 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.device_utils import get_current_device
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
+from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
 
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+    
 def make_test_packed_seq_params(sequence_length):
-    cu_seqlens = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
+    cu_seqlens = torch.IntTensor([0, 6, 19, 22, sequence_length]).to(device=get_current_device())
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
     max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
     packed_seq_params = PackedSeqParams(
@@ -27,8 +35,8 @@ def make_test_packed_seq_params(sequence_length):
 
 
 def make_test_packed_padded_seq_params(sequence_length):
-    cu_seqlens = torch.IntTensor([0, 18, 44, 52, 96, 118]).cuda()
-    cu_seqlens_padded = torch.IntTensor([0, 20, 48, 56, 100, sequence_length]).cuda()
+    cu_seqlens = torch.IntTensor([0, 18, 44, 52, 96, 118]).to(device=get_current_device())
+    cu_seqlens_padded = torch.IntTensor([0, 20, 48, 56, 100, sequence_length]).to(device=get_current_device())
     seqlens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
     max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
     packed_seq_params = PackedSeqParams(
@@ -42,12 +50,12 @@ def make_test_packed_padded_seq_params(sequence_length):
     )
     return packed_seq_params
 
-
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer not available")
 class TestParallelAttentionWithPackedSequence:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         # use BF16 and a large enough hidden size to enable FlashAttention for thd format.
         self.transformer_config = TransformerConfig(
             num_layers=2,
@@ -59,9 +67,10 @@ class TestParallelAttentionWithPackedSequence:
             pipeline_dtype=torch.bfloat16,
             autocast_dtype=torch.bfloat16,
         )
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         self.parallel_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            transformer_layer_spec.submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -79,13 +88,13 @@ class TestParallelAttentionWithPackedSequence:
         sequence_length = 32
         micro_batch_size = 1
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+        hidden_states = hidden_states.to(get_current_device()).to(torch.bfloat16)
 
         attention_mask = None
 
@@ -106,18 +115,18 @@ class TestParallelAttentionWithPackedSequence:
         sequence_length = 32
         micro_batch_size = 1
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+        hidden_states = hidden_states.to(get_current_device()).to(torch.bfloat16)
 
         attention_mask = None
         rotary_pos_emb = torch.ones(
             sequence_length, 1, 1, self.parallel_attention.config.kv_channels
-        ).cuda()
+        ).to(get_current_device())
 
         packed_seq_params = make_test_packed_seq_params(sequence_length)
         output, bias = self.parallel_attention(
@@ -134,9 +143,10 @@ class TestParallelAttentionWithPackedSequence:
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config
         transformer_config.recompute_granularity = 'selective'
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            transformer_layer_spec.submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -145,13 +155,13 @@ class TestParallelAttentionWithPackedSequence:
         sequence_length = 32
         micro_batch_size = 1
 
-        checkpointed_parallel_attention.cuda()
+        checkpointed_parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+        hidden_states = hidden_states.to(device=get_current_device()).to(torch.bfloat16)
 
         attention_mask = None
 
@@ -168,6 +178,7 @@ class TestParallelAttentionWithPackedSequence:
 
 
 # Note: this test requires TE >= 1.8 as well as cuDNN FusedAttention to run
+@pytest.mark.skip("Required attention unavailable")
 class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPackedSequence):
 
     def test_gpu_forward(self):
@@ -176,13 +187,13 @@ class TestParallelAttentionWithPackedPaddedSequence(TestParallelAttentionWithPac
         sequence_length = 128
         micro_batch_size = 1
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+        hidden_states = hidden_states.to(get_current_device()).to(torch.bfloat16)
 
         attention_mask = None
 

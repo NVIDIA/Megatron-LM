@@ -437,7 +437,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         if self.config.sequence_parallel:
-            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            rng_context = tensor_parallel.get_device_rng_tracker().fork()
         else:
             rng_context = nullcontext()
 

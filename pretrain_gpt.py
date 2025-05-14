@@ -4,6 +4,7 @@
 
 from functools import partial
 from typing import List, Optional, Tuple, Union
+from megatron.core.tensor_parallel.mappings import all_reduce
 
 import torch
 
@@ -71,9 +72,8 @@ def model_provider(
 
     use_te = args.transformer_impl == "transformer_engine"
 
-    if args.record_memory_history:
-        torch.cuda.memory._record_memory_history(
-            True,
+    if args.record_memory_history and torch.cuda.is_available():
+        torch.cuda.memory._record_memory_history(True,
             # keep 100,000 alloc/free events from before the snapshot
             trace_alloc_max_entries=100000,
             # record stack information for the trace events

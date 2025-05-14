@@ -10,7 +10,9 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.distributed.param_and_grad_buffer import partition_buckets
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
+from megatron.core.device_utils import get_current_device, get_xla_model
 
+xm = get_xla_model()
 
 def get_model_and_buffers(
     input_dim: int,
@@ -39,6 +41,7 @@ def get_model_and_buffers(
         bias=bias,
         shared_embedding=shared_embedding,
     ).bfloat16()
+    model.to(device=get_current_device())
 
     # Wrap with DistributedDataParallel, and get underlying buffer.
     # Use dummy TransformerConfig with mostly default values. Avoid divide-by-zero
@@ -52,7 +55,6 @@ def get_model_and_buffers(
 
     return model, param_and_grad_buffer, bucket_groups
 
-
 @pytest.mark.parametrize("bucket_size", [None, 9000, 9025, 9050, 18000, 18050, 20000])
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
@@ -60,6 +62,8 @@ def get_model_and_buffers(
 def test_bucket_sizes(
     bucket_size: Optional[int], use_distributed_optimizer: bool, bias: bool, shared_embedding: bool
 ):
+    use_distributed_optimizer = use_distributed_optimizer and xm is None
+    
     Utils.initialize_model_parallel()
 
     if shared_embedding and bias:
@@ -158,8 +162,7 @@ def test_bucket_sizes(
         )
 
     Utils.destroy_model_parallel()
-
-
+    
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
@@ -171,13 +174,16 @@ def test_grad_sync(
     average_in_collective: bool,
     num_distributed_optimizer_instances: int,
 ):
+    use_distributed_optimizer = use_distributed_optimizer and xm is None
+    average_in_collective = average_in_collective and xm is None
+
     Utils.initialize_model_parallel(
         num_distributed_optimizer_instances=num_distributed_optimizer_instances
     )
     # Skip test if num_distributed_optimizer_instances > 1 and not using distributed optimizer
     if num_distributed_optimizer_instances > 1 and not use_distributed_optimizer:
         pytest.skip("Multiple optimizer instances require distributed optimizer to be enabled")
-
+    
     input_dim = 100
     output_dim = 100
     num_layers = 10

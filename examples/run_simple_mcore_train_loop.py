@@ -1,4 +1,6 @@
 import os
+from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count
+from megatron.core.device_utils import get_distributed_init_method
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
@@ -8,7 +10,7 @@ from pathlib import Path
 from megatron.core import parallel_state
 from megatron.core import dist_checkpointing
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -25,10 +27,11 @@ def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel
     parallel_state.destroy_model_parallel()
 
     # Torch setup for distributed training
-    rank = int(os.environ['LOCAL_RANK'])
-    world_size = torch.cuda.device_count()
-    torch.cuda.set_device(rank)
-    torch.distributed.init_process_group(world_size=world_size, rank=rank)
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    torch.distributed.init_process_group(backend=get_distributed_backend(), 
+                                         init_nmethod=get_distributed_init_method(), 
+                                         world_size=world_size, rank=rank)
 
     # Megatron core distributed training initialization
     parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
@@ -107,20 +110,22 @@ def forward_step_func(data_iterator, model):
 
 def save_distributed_checkpoint(checkpoint_path, gpt_model):
     sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
-    dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path,
+                            process_group=parallel_state.get_default_process_group())
 
 def load_distributed_checkpoint(checkpoint_path, gpt_model):
     sharded_state_dict=gpt_model.sharded_state_dict(prefix='')
-    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path,
+                                         process_group=parallel_state.get_default_process_group())
     gpt_model.load_state_dict(checkpoint)
     return gpt_model
 
 if __name__ == "__main__":
     initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
 
     gpt_model = model_provider()
-    device = torch.device("cuda")
+    device = get_current_device()
     gpt_model.to(device)
 
     optim = Adam(gpt_model.parameters())

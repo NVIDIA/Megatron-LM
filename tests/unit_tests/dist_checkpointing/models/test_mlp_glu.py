@@ -1,26 +1,31 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import pytest
-import torch
-from torch.optim import Adam
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
-from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
-from megatron.core.dist_checkpointing.optimizer import (
-    get_param_id_to_sharded_param_map,
-    optim_state_to_sharding_state,
+from megatron.core.dist_checkpointing import load, load_plain_tensors, save
+from megatron.core.dist_checkpointing.dict_utils import diff
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec
 )
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def initialize_mlp(glu=True):
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     transformer_config = TransformerConfig(
         num_layers=pp_size,
@@ -29,8 +34,9 @@ def initialize_mlp(glu=True):
         use_cpu_initialization=True,
         gated_linear_unit=glu,
     )
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     return MLP(
-        transformer_config, get_gpt_layer_with_transformer_engine_spec().submodules.mlp.submodules
+        transformer_config, transformer_layer_spec.submodules.mlp.submodules
     )
 
 
@@ -68,22 +74,25 @@ class TestParallelMLPWithGLU:
         ) as ckpt_dir_B:
             # Save checkpoint A
             mlp_A = initialize_mlp()
-            save(mlp_A.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A)
+            save(mlp_A.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
             Utils.initialize_model_parallel(*dest_tp_pp)
             mlp_B = initialize_mlp()
             state_dict = load(
-                mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A
+                mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A,
+                process_group=parallel_state.get_default_process_group()
             )
             mlp_B.load_state_dict(state_dict)
-            save(mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            save(mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B,
+                 process_group=parallel_state.get_default_process_group())
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal
             Utils.initialize_model_parallel(1, 1)
-            state_dict_A = load_plain_tensors(ckpt_dir_A)
-            state_dict_B = load_plain_tensors(ckpt_dir_B)
+            state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+            state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
             diffs = diff(state_dict_A, state_dict_B)
             assert not any(map(bool, diffs)), diffs

@@ -7,7 +7,8 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_mod
 import torch
 import torch.nn as nn
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.device_utils import get_current_device
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
@@ -16,6 +17,13 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 class TestMimoModel:
@@ -54,8 +62,9 @@ class TestMimoModel:
         )
 
         # Create layer specs
-        self.vision_layer_spec = get_gpt_layer_with_transformer_engine_spec()
-        self.language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
+        self.vision_layer_spec = transformer_layer_spec
+        self.language_layer_spec = transformer_layer_spec
 
         # Create language model spec
         self.language_model_spec = ModuleSpec(
@@ -114,7 +123,7 @@ class TestMimoModel:
         self.mimo_model = MimoModel(self.mimo_config)
 
         # Move to device
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = get_current_device()
         self.mimo_model = self.mimo_model.to(self.device)
 
     def teardown_method(self, method):

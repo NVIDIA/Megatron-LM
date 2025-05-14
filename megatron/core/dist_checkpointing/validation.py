@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed
 
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
@@ -131,6 +132,7 @@ def validate_integrity_and_strict_load(
     local_metadata: Optional[_LocalMetadata] = None,
     global_metadata: Optional[_GlobalMetadata] = None,
     ckpt_sharded_metadata: Optional['CkptShardedMetadata'] = None,
+    process_group: torch.distributed.ProcessGroup = None
 ) -> Tuple[ShardedStateDict, Set[str], Set[str]]:
     """Validates sharding integrity and potential mismatches with the checkpoint.
 
@@ -197,7 +199,7 @@ def validate_integrity_and_strict_load(
             raise CheckpointingException(
                 'Cannot check sharding intergrity without global_metadata (None).'
             )
-        validate_sharding_integrity(global_metadata)
+        validate_sharding_integrity(global_metadata, process_group=process_group)
 
     return sharded_state_dict, missing_keys, unexpected_keys
 
@@ -371,7 +373,8 @@ def maybe_report_missing_and_unexpected_keys(
         logger.warning(error_msg)
 
 
-def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
+def _validate_common_state_dict(common_state_dict: CommonStateDict,
+                                 process_group: torch.distributed.ProcessGroup = None):
     """Validate consistancy across ranks for the common state dict
 
     We save the common state dict only on rank 0. We validate to make sure that the common dict is consistant across ranks before saving.
@@ -381,9 +384,9 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
     """
 
     # Gather the common state dict across ranks onto rank 0 for comparison
-    rank = torch.distributed.get_rank()
-    other_rank_state_dicts = [None] * torch.distributed.get_world_size() if rank == 0 else None
-    torch.distributed.gather_object(common_state_dict, other_rank_state_dicts)
+    rank = torch.distributed.get_rank(group=process_group)
+    other_rank_state_dicts = [None] * torch.distributed.get_world_size(group=process_group) if rank == 0 else None
+    torch.distributed.gather_object(common_state_dict, other_rank_state_dicts, group=process_group)
     common_state_dict_diff = {}
     if rank == 0:
         assert other_rank_state_dicts
@@ -400,7 +403,8 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
 
 
 def validate_sharding_integrity(
-    global_metadata: _GlobalMetadata, common_state_dict: CommonStateDict = None
+    global_metadata: _GlobalMetadata, common_state_dict: CommonStateDict = None,
+     process_group: torch.distributed.ProcessGroup = None
 ) -> None:
     """Validate if the ShardedTensors and ShardedObjects from multiple processes define correct sharding.
 
@@ -420,8 +424,8 @@ def validate_sharding_integrity(
         CheckpointingException for invalid access pattern
     """
 
-    if common_state_dict is not None:
-        _validate_common_state_dict(common_state_dict)
+    if common_state_dict:
+        _validate_common_state_dict(common_state_dict, process_group=process_group)
 
     if torch.distributed.get_rank() != 0:
         return
@@ -502,7 +506,7 @@ def _validate_sharding_for_key_flattened(tensors_by_shard):
         all_slices.append((sharding.flattened_range.start, sharding.flattened_range.stop))
 
     starts, stops = map(np.asarray, zip(*sorted(all_slices)))
-    expected_size = np.product(local_shape)
+    expected_size = np.prod(local_shape)
     if starts[0] != 0 or stops[-1] != expected_size or not np.all(starts[1:] == stops[:-1]):
         raise CheckpointingException(
             f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]} of size {expected_size}. Ranges: {(starts, stops)}'
@@ -527,6 +531,7 @@ def _validate_objects_for_key(sharded_objects: List[ShardedObject]):
 
 def determine_global_metadata(
     sharded_state_dict: ShardedStateDict,
+    process_group: torch.distributed.ProcessGroup = None
 ) -> Tuple[_LocalMetadata, _GlobalMetadata]:
     """Exchanges local metadata with `all_gather_object` to determine global metadata.
 
@@ -537,10 +542,9 @@ def determine_global_metadata(
         Tuple[_LocalMetadata, _GlobalMetadata]: local and global ShardedBase objects with stripped data
     """
     local_metadata = [ten.without_data() for ten in nested_values(sharded_state_dict)]
-    global_metadata = [None] * torch.distributed.get_world_size()
-    torch.distributed.all_gather_object(global_metadata, local_metadata)
+    global_metadata = [None] * torch.distributed.get_world_size(group=process_group)
+    torch.distributed.all_gather_object(global_metadata, local_metadata, group=process_group)
     return local_metadata, global_metadata  # type: ignore[return-value]
-
 
 def validate_sharded_objects_handling(
     sharded_strategy: Union[SaveShardedStrategy, LoadShardedStrategy],

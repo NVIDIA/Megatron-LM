@@ -10,6 +10,7 @@ import torch
 import torch.distributed
 from torch import Tensor
 
+from megatron.core.device_utils import get_current_device
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -297,7 +298,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         if model_comm_pgs is None:
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-
         self.submodules_config = submodules
         self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage)
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
@@ -477,7 +477,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 context (Tensor): Updated context tensor if cross-attention is used,
                 otherwise None.
         """
-
+        if hasattr(self.input_layernorm, "weight"):
+            hidden_states = hidden_states.to(dtype=self.input_layernorm.weight.dtype)
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Residual connection.
@@ -679,11 +680,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             (slen_per_cptp, micro_batch_size, self.config.hidden_size),
             dtype=torch.bfloat16,
             requires_grad=True,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
         static_inputs["attention_mask"] = (
             ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-            .to(torch.cuda.current_device())
+            .to(get_current_device())
             .reshape(1, 1, slen_per_cp, seq_length)
             .tile(micro_batch_size, 1, 1, 1)
         )
@@ -780,7 +781,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     return torch.zeros(
                         (micro_batch_size, 1, slen_per_cp, slen),
                         dtype=torch.bool,
-                        device=torch.cuda.current_device(),
+                        device=get_current_device(),
                     )
 
                 if not is_te_min_version("1.10.0", check_equality=False):
