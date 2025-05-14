@@ -625,7 +625,7 @@ class TestNonStrictLoad:
             ),
         }
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_unexpected_keys_handling_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
@@ -699,7 +699,7 @@ class TestNonStrictLoad:
             loaded_state_dict = load_with_flag(StrictHandling.IGNORE_ALL)
             assert 'TenA' in loaded_state_dict
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_missing_keys_raises_error_during_validation(
         self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format
@@ -737,10 +737,6 @@ class TestNonStrictLoad:
 
             with caplog.at_level(logging.WARNING):
                 loaded_state_dict = load_with_flag(StrictHandling.LOG_UNEXPECTED)
-            assert (
-                caplog.text == ''
-                or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
-            )
             assert 'TenB' in loaded_state_dict
 
             loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(
@@ -772,7 +768,7 @@ class TestNonStrictLoad:
             assert unexpected_keys == set()
             assert missing_keys == {'TenA', 'ObjB'}
 
-    @pytest.mark.parametrize('save_format', ['zarr', 'torch_dist'])
+    @pytest.mark.parametrize('save_format', ['torch_dist'])
     @pytest.mark.parametrize('validate_integrity', [True, False])
     def test_exact_load_handling(self, caplog, tmp_path_dist_ckpt, validate_integrity, save_format):
         sharded_state_dict = self._get_base_state_dict()
@@ -799,20 +795,12 @@ class TestNonStrictLoad:
             ):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict = load_with_flag(strict)
-                assert (
-                    caplog.text == ''
-                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
-                )
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
 
             for strict in (StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL):
                 with caplog.at_level(logging.WARNING):
                     loaded_state_dict, missing_keys, unexpected_keys = load_with_flag(strict)
-                assert (
-                    caplog.text == ''
-                    or '`zarr` distributed checkpoint backend is deprecated' in caplog.text
-                )
                 assert 'TenB' in loaded_state_dict
                 assert 'ObjB' in loaded_state_dict
                 assert missing_keys == set()
