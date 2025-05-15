@@ -580,8 +580,8 @@ class TransformerConfig(ModelParallelConfig):
                         f"({max_bf16_layers_per_pipeline_stage})."
                     )
 
-            if self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param:
-                raise ValueError("MXFP8 currently does not support fp8_param.")
+            #if self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param:
+            #   raise ValueError("MXFP8 currently does not support fp8_param.")
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
