@@ -12,7 +12,7 @@ spec:
   platforms: dgx_a100
   artifacts:
     /workspace/data/gpt3_data: text/the_pile/shard00
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/22410107
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/28359448
   script_setup: |
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -51,6 +51,7 @@ spec:
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -88,7 +89,7 @@ products:
       - environment: [dev, lts]
         scope: [nightly]
   # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts]
-  #   products:
+  #   products: # non-determinism: #478
   #     - environment: [dev, lts]
   #       scope: [nightly]
   #######################################################################
@@ -126,32 +127,23 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_fsdp2_resume_torch_dist_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
   #######################################################################
   # Super important MR tests that run for both DEV and LTS per MR       #
   #######################################################################
-
-  # Temporarily skipping these tests as both !2719 and !2668 require checkpoint updates. Will update all checkpoints together later.
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
   ###########################
   # Merge train tests       #
   ###########################
