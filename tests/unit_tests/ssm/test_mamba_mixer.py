@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.ssm.mamba_mixer import MambaMixer
@@ -26,10 +27,18 @@ class TestMambaMixer:
         )
         modules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
         self.mixer = MambaMixer(
-            transformer_config, modules, transformer_config.hidden_size, layer_number=1
+            transformer_config,
+            modules,
+            transformer_config.hidden_size,
+            layer_number=1,
+            tp_group=parallel_state.get_tensor_model_parallel_group(),
         )
         self.mixer_no_mem_eff_path = MambaMixer(
-            transformer_config, modules, transformer_config.hidden_size, use_mem_eff_path=False
+            transformer_config,
+            modules,
+            transformer_config.hidden_size,
+            use_mem_eff_path=False,
+            tp_group=parallel_state.get_tensor_model_parallel_group(),
         )
 
     def teardown_method(self, method):
