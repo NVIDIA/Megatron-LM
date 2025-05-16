@@ -46,7 +46,13 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     submodules = MambaMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
     )
-    model = MambaMixer(transformer_config, submodules, transformer_config.hidden_size, rmsnorm=True)
+    model = MambaMixer(
+        transformer_config,
+        submodules,
+        transformer_config.hidden_size,
+        rmsnorm=True,
+        tp_group=parallel_state.get_tensor_model_parallel_group(),
+    )
     return model
 
 

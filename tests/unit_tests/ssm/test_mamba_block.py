@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -21,6 +22,9 @@ class TestMambaBlock:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
 
+    def get_model_comm_pgs(self):
+        return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
     def get_mamba_block(self, hybrid_override_pattern):
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
@@ -32,13 +36,17 @@ class TestMambaBlock:
         )
         modules = mamba_stack_spec.submodules
         return MambaStack(
-            transformer_config, modules, hybrid_override_pattern=hybrid_override_pattern
+            transformer_config,
+            modules,
+            hybrid_override_pattern=hybrid_override_pattern,
+            model_comm_pgs=self.get_model_comm_pgs(),
         )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     def test_gpu_forward(self):
+        """Test GPU forward pass."""
         hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         block = self.get_mamba_block(hybrid_override_pattern)
         block.cuda()
