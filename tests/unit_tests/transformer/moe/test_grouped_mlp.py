@@ -210,7 +210,11 @@ class TestParallelGroupedMLP:
         tokens_per_expert = torch.zeros(self.num_experts)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
         hidden_states = hidden_states.cuda()
-        output_gmm, _ = self.grouped_mlp.experts(hidden_states, tokens_per_expert=tokens_per_expert)
+        probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
+        probs = probs.cuda()
+        output_gmm, _ = self.grouped_mlp.experts(
+            hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
+        )
         output_gmm.mean().backward()
         assert self.grouped_mlp.experts.weight1.grad is not None
 
@@ -312,7 +316,6 @@ class TestTEGroupedMLP:
                 self.fc2_ffn_hidden_size,
             )
 
-    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_gpu_forward_backward(self):
@@ -356,7 +359,6 @@ class TestTEGroupedMLP:
         for smm_result, gmm_result in zip(smm_results, gmm_results):
             torch.testing.assert_close(smm_result, gmm_result)
 
-    @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
@@ -366,7 +368,11 @@ class TestTEGroupedMLP:
         tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.int32)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
         hidden_states = hidden_states.cuda()
-        output, _ = self.grouped_mlp.experts(hidden_states, tokens_per_expert=tokens_per_expert)
+        probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
+        probs = probs.cuda()
+        output, _ = self.grouped_mlp.experts(
+            hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
+        )
         assert torch.equal(output, torch.zeros_like(output))
         assert output.shape == (num_allocated_tokens, self.hidden_size)
 

@@ -29,6 +29,7 @@ class TestTop2Router:
             moe_aux_loss_coeff=0,
             bf16=True,
             params_dtype=torch.bfloat16,
+            add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False
@@ -154,6 +155,7 @@ class TestGroupLimitedRouter:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            add_bias_linear=False,
         )
 
         # init MoE layer
@@ -232,6 +234,7 @@ class TestAuxLossFreeTop2Router:
             moe_router_enable_expert_bias=True,  # Enable expert bias
             moe_router_bias_update_rate=0.1,  # Set bias update rate
             moe_router_topk=2,
+            add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=num_moe_experts, moe_grouped_gemm=False

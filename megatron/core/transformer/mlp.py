@@ -15,7 +15,7 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -50,7 +50,7 @@ class MLP(MegatronModule):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         is_expert: bool = False,
-        input_size: int = None,
+        input_size: Optional[int] = None,
     ):
         super().__init__(config=config)
 
@@ -97,26 +97,40 @@ class MLP(MegatronModule):
             tp_comm_buffer_name='fc2',
         )
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
 
         if self.config.bias_activation_fusion:
-            if self.activation_func == F.gelu:
-                if self.config.gated_linear_unit:
-                    intermediate_parallel = bias_geglu_impl(intermediate_parallel, bias_parallel)
+            if per_token_scale is not None:
+                if self.activation_func == F.silu and self.config.gated_linear_unit:
+                    # dtype is handled inside the fused kernel
+                    intermediate_parallel = weighted_bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        per_token_scale.unsqueeze(-1),
+                        self.config.activation_func_fp8_input_store,
+                    )
                 else:
-                    assert self.config.add_bias_linear is True
-                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            elif self.activation_func == F.silu and self.config.gated_linear_unit:
-                intermediate_parallel = bias_swiglu_impl(
-                    intermediate_parallel,
-                    bias_parallel,
-                    self.config.activation_func_fp8_input_store,
-                )
+                    raise ValueError("Only support fusion of swiglu with per_token_scale in MLP.")
             else:
-                raise ValueError("Only support fusion of gelu and swiglu")
+                if self.activation_func == F.gelu:
+                    if self.config.gated_linear_unit:
+                        intermediate_parallel = bias_geglu_impl(
+                            intermediate_parallel, bias_parallel
+                        )
+                    else:
+                        assert self.config.add_bias_linear is True
+                        intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                elif self.activation_func == F.silu and self.config.gated_linear_unit:
+                    intermediate_parallel = bias_swiglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        self.config.activation_func_fp8_input_store,
+                    )
+                else:
+                    raise ValueError("Only support fusion of gelu and swiglu")
         else:
             if bias_parallel is not None:
                 intermediate_parallel = intermediate_parallel + bias_parallel
@@ -130,8 +144,16 @@ class MLP(MegatronModule):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
+            if per_token_scale is not None:
+                original_dtype = intermediate_parallel.dtype
+                intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
+                intermediate_parallel = intermediate_parallel.to(original_dtype)
+
         # [s, b, h]
         output, output_bias = self.linear_fc2(intermediate_parallel)
+
+        if per_token_scale is not None:
+            assert output_bias is None, "Bias is not supported with per_token_scale"
 
         return output, output_bias
 
