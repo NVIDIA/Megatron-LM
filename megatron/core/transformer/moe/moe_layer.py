@@ -8,7 +8,9 @@ import torch
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import MoEAlltoAllSEQTokenDispatcher
+from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import (  # type: ignore
+    MoEAlltoAllSEQTokenDispatcher,
+)
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -138,10 +140,12 @@ class MoELayer(BaseMoELayer):
         # process MoE
         def custom_forward(hidden_states):
             probs, routing_map = self.router(hidden_states)
-            (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
-                hidden_states, probs, routing_map
+            (dispatched_input, tokens_per_expert, permuted_probs) = (
+                self.token_dispatcher.token_permutation(hidden_states, probs, routing_map)
             )
-            expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert)
+            expert_output, mlp_bias = self.experts(
+                dispatched_input, tokens_per_expert, permuted_probs
+            )
             output, mlp_bias = self.token_dispatcher.token_unpermutation(expert_output, mlp_bias)
             if self.use_shared_expert and not self.shared_expert_overlap:
                 # if shared_expert_overlap is True, the expert calculation happens in

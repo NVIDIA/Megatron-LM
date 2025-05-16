@@ -56,5 +56,7 @@ MODEL_ARGS:
   --ckpt-assume-constant-structure: true
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
+  --disable-bias-linear: true
+  --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume
