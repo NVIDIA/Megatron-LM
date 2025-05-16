@@ -4,6 +4,7 @@
 import array
 import functools
 import hashlib
+import inspect
 import logging
 import math
 import operator
@@ -16,7 +17,7 @@ import traceback
 import warnings
 from dataclasses import dataclass
 from datetime import datetime
-from functools import reduce, wraps
+from functools import lru_cache, reduce, wraps
 from importlib.metadata import version
 from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
@@ -37,6 +38,13 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+
+try:
+    import nvtx
+
+    HAVE_NVTX = True
+except ImportError:
+    HAVE_NVTX = False
 
 logger = logging.getLogger(__name__)
 
@@ -1753,3 +1761,154 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
                 batch[key] = val
 
     return batch
+
+
+######################
+### NVTX profiling ###
+######################
+
+_nvtx_enabled: bool = False  # Whether NVTX range profiling is enabled
+_nvtx_range_messages: list[str] = []  # Messages associated with active NVTX ranges
+
+
+def configure_nvtx_profiling(enabled: bool) -> None:
+    """Configure NVTX range profiling to be enabled or disabled.
+
+    Args:
+        enabled (bool): Whether to enable NVTX range profiling
+    """
+    global _nvtx_enabled
+    _nvtx_enabled = enabled
+
+
+def _nvtx_range_push(msg: str) -> None:
+    """Push NVTX range onto stack, if NVTX range profiling is enabled.
+
+    Args:
+        msg (str): Message to associate with range
+
+    Note:
+        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
+    """
+    if not _nvtx_enabled:
+        return
+    _nvtx_range_messages.append(msg)
+    torch.cuda.nvtx.range_push(msg)
+
+
+def _nvtx_range_pop(msg: Optional[str] = None) -> None:
+    """Pop NVTX range from stack, if NVTX range profiling is enabled.
+
+    Args:
+        msg (str, optional): Message associated with range
+
+    Note:
+        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
+    """
+    # Return immediately if NVTX range profiling is not enabled
+    if not _nvtx_enabled:
+        return
+
+    # Update list of NVTX range messages and check for consistency
+    if not _nvtx_range_messages:
+        raise RuntimeError("Attempted to pop NVTX range from empty stack")
+    last_msg = _nvtx_range_messages.pop()
+    if msg is not None and msg != last_msg:
+        raise ValueError(
+            f"Attempted to pop NVTX range from stack with msg={msg}, "
+            f"but last range has msg={last_msg}"
+        )
+
+    # Pop NVTX range
+    torch.cuda.nvtx.range_pop()
+
+
+def _nvtx_range_get_func_path():
+    """Get the path of a function. Assumes being called from nvtx_range_push/pop.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    # Get the caller's caller frame (go back 2 frames)
+    frame = inspect.currentframe().f_back.f_back
+    caller_func = inspect.getframeinfo(frame).function
+    module = inspect.getmodule(frame)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_range_push(msg=None, suffix=None) -> None:
+    """Push NVTX range onto stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    _nvtx_range_push(msg)
+
+
+def nvtx_range_pop(msg=None, suffix=None) -> None:
+    """Pop NVTX range from stack. If msg is not provided, use the calling function's path.
+
+    Args:
+        msg (str, optional): Message to associate with range
+        suffix (str, optional): Suffix to append to the message
+    """
+    if msg is None:
+        msg = _nvtx_range_get_func_path()
+    if suffix is not None:
+        msg = f"{msg}.{suffix}"
+
+    _nvtx_range_pop(msg)
+
+
+@lru_cache(maxsize=None)
+def _nvtx_decorator_get_func_path(func):
+    """Get the path of a function.
+
+    Args:
+        func (Callable): Function to get path for.
+
+    Returns:
+        str: Module path and function name joined by a dot
+    """
+    caller_func = func.__name__
+    module = inspect.getmodule(func)
+
+    return f"{module.__name__}.{caller_func}"
+
+
+def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
+    """Decorator to add NVTX range to a function.
+
+    Args:
+        message (str, optional): Custom message for the NVTX range. If None, uses function path
+        color (str, optional): Color for the NVTX range. Defaults to None
+
+    Returns:
+        Callable: Decorated function with NVTX profiling if enabled
+
+    Example:
+        @nvtx_decorator()
+        def my_function():
+            pass
+
+        @nvtx_decorator(message="Custom Range", color="blue")
+        def another_function():
+            pass
+    """
+    assert HAVE_NVTX, "NVTX module is required to use nvtx_decorator"
+
+    def decorator(func: Callable) -> Callable:
+        if _nvtx_enabled:
+            return nvtx.annotate(
+                message=message or _nvtx_decorator_get_func_path(func), color=color
+            )(func)
+        return func
+
+    return decorator

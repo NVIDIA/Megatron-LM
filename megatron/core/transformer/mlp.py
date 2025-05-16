@@ -20,7 +20,11 @@ from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_b
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.utils import (
+    get_tensor_model_parallel_group_if_none,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 # pylint: disable=missing-class-docstring
@@ -112,8 +116,11 @@ class MLP(MegatronModule):
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
+        nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        nvtx_range_pop(suffix="linear_fc1")
 
+        nvtx_range_push(suffix="activation")
         if self.config.bias_activation_fusion:
             if per_token_scale is not None:
                 if self.activation_func == F.silu and self.config.gated_linear_unit:
@@ -160,9 +167,12 @@ class MLP(MegatronModule):
                 original_dtype = intermediate_parallel.dtype
                 intermediate_parallel = intermediate_parallel * per_token_scale.unsqueeze(-1)
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
+        nvtx_range_pop(suffix="activation")
 
         # [s, b, h]
+        nvtx_range_push(suffix="linear_fc2")
         output, output_bias = self.linear_fc2(intermediate_parallel)
+        nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None:
             assert output_bias is None, "Bias is not supported with per_token_scale"
