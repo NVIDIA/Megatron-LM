@@ -13,9 +13,9 @@ spec:
   artifacts:
     /workspace/data/gpt3_data: text/the_pile/shard00
     /workspace/checkpoints/gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G_dev/24475828
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G_dev/22629512
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G_dev/22629512
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G_dev/22629512
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G_dev/28359448
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G_dev/28359448
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G_dev/28359448
     /workspace/checkpoints/gpt_teacher: model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher
   script_setup: |
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
@@ -55,6 +55,7 @@ spec:
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -65,8 +66,8 @@ products:
   #######################################################################
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
-      # - environment: [dev]
-      #   scope: [nightly] # Broken due to memory issue
+      - environment: [dev]
+        scope: [nightly]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
@@ -74,7 +75,7 @@ products:
       - environment: [dev, lts]
         scope: [nightly]
   # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist]
-  #   products:
+  #   products: # non-determinism: #419
   #     - environment: [dev, lts]
   #       scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4]
@@ -82,7 +83,7 @@ products:
       - environment: [dev, lts]
         scope: [nightly]
   # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist]
-  #   products:
+  #   products: # non-determinism: #420
   #     - environment: [dev, lts]
   #       scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch]
@@ -95,43 +96,10 @@ products:
         scope: [nightly]
   - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
     products:
-      - environment: [dev, lts]
+      # - environment: [dev]
+      #   scope: [nightly] # Broken: #480
+      - environment: [lts]
         scope: [nightly]
-  #######################################################################
-  # Weekly tests: Run both DEV and LTS unless something is flaky        #
-  #######################################################################
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_nondet_tp1_pp1_fp8_no_model_parallel]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_bf16_baseline]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp1_fp8_no_model_parallel]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp1_pp2_fp8_pp]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_fp8_tp_pp_sp]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_native_fp8_tp_pp_sp]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
-  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_pp2_fp8_tp_pp]
-    products:
-      - environment: [dev, lts]
-        scope: [weekly]
   #######################################################################
   # MR tests: Mostly DEV on MR, and LTS on nightly cadence, except for  #
   #             some very important tests.                              #
@@ -156,8 +124,8 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_cp4_a2a_p2p_nondeterministic_dgx_a100_1N8G]
     products:
-      #     # - environment: [dev] Until TE is at 1.12
-      #     #   scope: [mr]
+      - environment: [dev]
+        scope: [mr]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_dgx_a100_1N8G]
@@ -170,26 +138,26 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-      # - environment: [lts]
-      #   scope: [nightly]
+      - environment: [lts]
+        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
       # - environment: [lts]
-      #   scope: [nightly]
+      #   scope: [nightly] # non-determinism: #436
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  # - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_swiglu_dgx_a100_1N8G]
-  #   products:
-  #     # - environment: [dev] # memory issue after loading from checkpoint
-  #     #   scope: [mr]
-  #     # - environment: [lts]
-  #     #   scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_swiglu_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      # - environment: [lts]
+      #   scope: [nightly] # non-determinism: #437
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -228,8 +196,8 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
     products:
-      # - environment: [dev]
-      #   scope: [mr] # memory issue after loading from checkpoint
+      - environment: [dev]
+        scope: [mr]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G]
@@ -264,8 +232,8 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
     products:
-      # - environment: [dev] # memory issue after loading from checkpoints
-      #   scope: [mr]
+      - environment: [dev]
+        scope: [mr]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances_dgx_a100_1N8G]
@@ -314,25 +282,25 @@ products:
         scope: [mr]
       - environment: [lts]
         scope: [nightly]
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G]  Failing on max-memory
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_cross_entropy_loss_fusion_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
 
-  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
-  # - test_case:  # Failing on max-memory[gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G]
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      - environment: [lts]
+        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_mla_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -390,13 +358,13 @@ products:
       - environment: [dev]
         scope: [mr]
       # - environment: [lts]
-      #   scope: [nightly]
+      #   scope: [nightly] # OOM: #434
   - test_case: [gpt3_7b_mr_dgx_a100_1N8G_tp4_pp1_memory_speed]
     products:
       - environment: [dev]
         scope: [mr]
       # - environment: [lts]
-      #   scope: [nightly]
+      #   scope: [nightly] # OOM: #434
   - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -405,10 +373,10 @@ products:
         scope: [nightly]
   # - test_case: [gpt3_mr_mcore_te_tp2_pp1_fsdp2_resume_torch_dist_dgx_a100_1N8G]
   #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
-  #     - environment: [lts]
-  #       scope: [nightly]
+  # - environment: [dev]
+  #   scope: [mr] # Broken: #484
+  # - environment: [lts]
+  #   scope: [nightly] # Requires PyT 2.4: #481
   #######################################################################
   # Super important MR tests that run for both DEV and LTS per MR       #
   #######################################################################
@@ -449,8 +417,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-
   # - test_case: [gpt3_mr_mcore_tp2_pp2_resume_torch_dist_uninstall_te_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev, lts]
-  #       scope: [mr]
+  #       scope: [mr] # Non-deterministic: #483

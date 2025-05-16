@@ -51,6 +51,15 @@ def load_script(config_path: str) -> str:
     default=False,
     help="Run 2-step smoke tests instead of full training",
 )
+@click.option(
+    "--record-checkpoints",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Save checkpoints, do not run pytest",
+)
 def main(
     model: Optional[str],
     scope: Optional[str],
@@ -58,6 +67,7 @@ def main(
     environment: str,
     output_path: str,
     enable_lightweight_mode: bool = False,
+    record_checkpoints: bool = False,
 ):
     workloads = common.load_workloads(
         container_image='none',
@@ -87,6 +97,7 @@ def main(
         file_path.parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, "w", encoding="utf-8") as fh:
             fh.write(f"export ENABLE_LIGHTWEIGHT_MODE={str(enable_lightweight_mode).lower()}\n")
+            fh.write(f"export RECORD_CHECKPOINTS={str(record_checkpoints).lower()}\n")
             fh.write(
                 f'export OUTPUT_PATH={output_path}/runs/$(python3 -c "import uuid; print(uuid.uuid4())")\n'
             )
