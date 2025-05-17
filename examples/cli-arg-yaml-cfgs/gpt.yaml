@@ -1,0 +1,6 @@
+bf16: True
+num_layers: 4
+hidden_size: 12288
+num_attention_heads: 96
+seq_length: 2048
+max_position_embeddings: 2048

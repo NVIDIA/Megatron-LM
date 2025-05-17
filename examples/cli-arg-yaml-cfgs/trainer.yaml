@@ -1,0 +1,20 @@
+# trainer
+seq_length: 4096
+micro_batch_size: 1
+global_batch_size: 96
+train_iters: 500000
+weight_decay: 0.1
+adam_beta1: 0.9
+adam_beta2: 0.95
+init_method_std: 0.006
+clip_grad: 1.0
+lr: 6.0e-5
+lr_decay_style: cosine
+min_lr: 6.0e-6
+lr_warmup_fraction: .001
+lr_decay_iters: 430000
+save_interval: 10000 
+
+# logging
+log_interval: 1
+eval_iters: -1
