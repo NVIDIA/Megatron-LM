@@ -612,6 +612,7 @@ def save_to_aux_losses_tracker(
     num_layers: int,
     reduce_group: torch.distributed.ProcessGroup = None,
     avg_group: torch.distributed.ProcessGroup = None,
+    is_full_recompute: bool = False,
 ):
     """Save the auxiliary loss for logging.
     Args:
@@ -621,6 +622,7 @@ def save_to_aux_losses_tracker(
         num_layers (int): The number of total layers.
         reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
         mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+        is_full_recompute (bool): Whether the loss is from full recompute. If that is true, then it means same values will tracked twice.
     """
     # Skip aux loss logging if layer_number is None.
     if layer_number is None:
@@ -630,7 +632,10 @@ def save_to_aux_losses_tracker(
     if name not in tracker:
         tracker[name] = {}
         tracker[name]["values"] = torch.zeros(num_layers, device=loss.device)
-    tracker[name]["values"][layer_number - 1] += loss.detach()  # Aggregate the loss for the layer.
+    loss_detached = loss.detach()
+    if is_full_recompute: # if it is full recompute, to avoid it to be tracked twice, we need to divide the loss by 2.
+        loss_detached = loss_detached / 2
+    tracker[name]["values"][layer_number - 1] += loss_detached  # Aggregate the loss for the layer
     tracker[name]["reduce_group"] = reduce_group
     tracker[name]["avg_group"] = avg_group
 

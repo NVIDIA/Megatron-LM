@@ -132,6 +132,7 @@ class MTPLossLoggingHelper:
         num_layers: int,
         reduce_group: torch.distributed.ProcessGroup = None,
         avg_group: torch.distributed.ProcessGroup = None,
+        is_full_recompute: bool = False,
     ):
         """Save the mtp loss for logging.
         Args:
@@ -140,6 +141,7 @@ class MTPLossLoggingHelper:
             num_layers (int): The number of total layers.
             reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
             mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            is_full_recompute (bool): Whether the loss is from full recompute. If that is true, then it means same values will tracked twice.
         """
         # Skip mtp loss logging if layer_number is None.
         if layer_number is None:
@@ -148,7 +150,10 @@ class MTPLossLoggingHelper:
         tracker = MTPLossLoggingHelper.tracker
         if "values" not in tracker:
             tracker["values"] = torch.zeros(num_layers, device=loss.device)
-        tracker["values"][layer_number] += loss.detach()
+        loss_detached = loss.detach()
+        if is_full_recompute: # if it is full recompute, to avoid it to be tracked twice, we need to divide the loss by 2.
+            loss_detached = loss_detached / 2
+        tracker["values"][layer_number] += loss_detached  # Aggregate the loss for the layer
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -672,6 +677,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_number,
                     self.config.mtp_num_layers,
                     avg_group=parallel_state.get_tensor_and_context_parallel_group(),
+                    is_full_recompute=(self.config.recompute_granularity == "full")
                 )
             mtp_loss_scale = self.mtp_loss_scaling_factor / self.config.mtp_num_layers
             if self.config.calculate_per_token_loss:
