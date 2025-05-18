@@ -36,6 +36,12 @@ class TokenOverflowError(ContextOverflowError):
     pass
 
 
+class MaxSequenceLengthOverflowError(ContextOverflowError):
+    '''Adding request would overflow max sequence length.'''
+
+    pass
+
+
 class ChunkOverflowError(ContextOverflowError):
     '''Adding request would overflow available memory chunks.'''
 
@@ -692,7 +698,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_tokens_to_generate is None:
             num_tokens_to_generate = self.max_sequence_length - context_length
         elif context_length + num_tokens_to_generate > self.max_sequence_length:
-            raise TokenOverflowError()
+            raise MaxSequenceLengthOverflowError()
 
         # Update request state.
         self.request_ids[self.total_request_count] = request_id
