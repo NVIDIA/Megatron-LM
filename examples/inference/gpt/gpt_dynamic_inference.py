@@ -186,30 +186,25 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         is_decode_only = engine.context.is_decode_only()
-        result, step_time = engine.step(sampling_params, verbose=True)
+        finished_requests, step_time = engine.step(sampling_params, verbose=True)
         step_id += 1
 
-        # Append output tokens.
-        if result is not None:
-
+        if len(finished_requests) > 0:
             output_start = get_curr_time()
-
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
                 step_times["prefill"].append(step_time)
 
-            request_ids, finished_request_ids, sample = result
-            request_ids = request_ids.tolist()
-            sample = sample.tolist()
-            for request_id, token in zip(request_ids, sample):
-                request = requests[request_id]
-                request.output_tokens.append(token)
-                if request_id in finished_request_ids:
-                    request.time_end = get_curr_time()
-                    request.state = "finished"
-                    num_requests_finished += 1
-
+            # Append output tokens.
+            for finished_request in finished_requests:
+                request = requests[finished_request.request_id]
+                request.output_tokens = finished_request.generated_tokens
+                request.time_end = get_curr_time()
+                request.output_text = finished_request.generated_text
+                request.state = "finished"
+                num_requests_finished += 1
+            
             output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
@@ -287,10 +282,6 @@ if __name__ == "__main__":
     # Validate all requests finished.
     for request in requests:
         assert request.state == "finished"
-
-    # Detokenize outputs.
-    for request in requests:
-        request.output_text = tokenizer.detokenize(request.output_tokens)
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:
