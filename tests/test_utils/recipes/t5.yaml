@@ -64,71 +64,57 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [t5_220m_mr_mcore_te_tp2_pp2_resume_torch_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [t5_220m_mr_mcore_te_tp4_pp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [t5_220m_mr_mcore_te_tp4_pp1_resume_torch_dist_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G]
     products:
-      - environment: [lts]
+      - environment: [dev]
         scope: [nightly]
   - test_case: [t5_220m_mr_mcore_tp2_pp2_resume_torch_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [t5_220m_mr_mcore_tp4_pp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [t5_220m_mr_mcore_tp4_pp1_resume_torch_dist_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp1_pp1_vp1_resume_torch]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
         scope: [nightly]
   - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
         scope: [nightly]
   - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1_sequence_parallel]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
         scope: [nightly]
   - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_vp1]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
         scope: [nightly]
   - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_vp1_resume_torch]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
         scope: [nightly]
   - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_tp2_pp1_vp1]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
         scope: [nightly]
   - test_case: [t5_220m_mr_mcore_te_tp2_pp2_frozen_resume_torch_dgx_a100_1N8G]
     products:
