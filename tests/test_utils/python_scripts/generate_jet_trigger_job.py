@@ -161,6 +161,7 @@ def main(
                 f"--test-case '{test_case.spec.test_case}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
+                f"--platform {platform}",
                 f"--record-checkpoints {record_checkpoints}",
                 f"--account {slurm_account}",
             ]

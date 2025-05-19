@@ -215,7 +215,7 @@ variables:
       - "dgxa100_dracooci-ord"
     description: "Cluster for A100 workloads"
   CLUSTER_H100:
-    value: "dgxh100_eos"
+    value: "dgxh100_coreweave"
     options:
       - "dgxh100_coreweave"
       - "dgxh100_eos"
