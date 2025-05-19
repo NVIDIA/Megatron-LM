@@ -31,11 +31,11 @@ def main(pipeline_id: int, only_failing: bool):
 
     project = gl.projects.get(PROJECT_ID)
     pipeline = project.pipelines.get(pipeline_id)
-    print(pipeline.bridges.list())
+    print(pipeline.bridges.list(get_all=True))
 
     pipeline_bridges = [
         pipeline_bridge
-        for pipeline_bridge in pipeline.bridges.list()
+        for pipeline_bridge in pipeline.bridges.list(get_all=True)
         if pipeline_bridge.name.startswith("functional")
         and pipeline_bridge.downstream_pipeline is not None
     ]
@@ -70,7 +70,7 @@ def main(pipeline_id: int, only_failing: bool):
                 / f"{restart_dir}"
                 / "assets"
                 / "basic"
-                / f"{job.name.replace('_', '-').lower()}-{environment}"
+                / f"{job.name.replace('_', '-').lower()}-{environment.replace('_', '-')}"
                 / f"golden_values_{environment}.json"
             )
             golden_values_target = (
@@ -90,9 +90,7 @@ def main(pipeline_id: int, only_failing: bool):
 
                 shutil.move(golden_values_source, golden_values_target)
             else:
-                logger.info(
-                    "Golden values for %s does not exist. Skip.", str(f"{job.stage} / {job.name}")
-                )
+                logger.info("Golden values for %s does not exist. Skip.", str(golden_values_source))
 
             shutil.rmtree("tmp")
 
