@@ -67,5 +67,5 @@ test:build_nemo_image:
     FILE: Dockerfile.ci.dev
     BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
   rules:
-    - if: $FUNCTIONAL_TEST == "yes" || $INTEGRATION_TEST == "yes"
+    - if: $FUNCTIONAL_TEST == "yes" || $INTEGRATION_TEST == "yes" || $CI_COMMIT_BRANCH == "ci-rebuild-mcore-nemo-image"
       when: on_success

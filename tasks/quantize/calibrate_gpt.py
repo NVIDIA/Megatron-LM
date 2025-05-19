@@ -135,7 +135,7 @@ def calibrate(data_loader, model):
                 # Reduce across processes.
                 if parallel_state.is_pipeline_last_stage():
                     all_reduce(
-                        output, group=parallel_state.get_data_parallel_group
+                        output, group=parallel_state.get_data_parallel_group()
                     )
 
                     total_output += output

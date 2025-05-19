@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_xla_model, set_manual_seed
+from megatron.core.device_utils import set_manual_seed
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.serialization import (
@@ -15,8 +15,15 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
-from megatron.core.ssm.mamba_mixer import MambaMixer
+try: 
+    from megatron.core.extensions.transformer_engine import (
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    HAVE_TE=True
+except ImportError:
+    HAVE_TE = False
+from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer import TransformerConfig
@@ -42,8 +49,16 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
-    submodules = mamba_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
-    model = MambaMixer(transformer_config, submodules, transformer_config.hidden_size, rmsnorm=True)
+    submodules = MambaMixerSubmodules(
+        in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
+    )
+    model = MambaMixer(
+        transformer_config,
+        submodules,
+        transformer_config.hidden_size,
+        rmsnorm=True,
+        tp_group=parallel_state.get_tensor_model_parallel_group(),
+    )
     return model
 
 
@@ -52,7 +67,7 @@ def get_pp_offsets():
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     return ((0, pp_rank, pp_size),)
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mamba model requires CUDA at this time.")
+@pytest.mark.skipif(not HAVE_TE, reason="Tansformer engine is not available")
 class TestMambaReconfiguration:
     @pytest.mark.parametrize(
         "use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu",
@@ -99,11 +114,9 @@ class TestMambaReconfiguration:
 
             save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
-                xm = get_xla_model()
                 save_strategy = FullyParallelSaveStrategyWrapper(
                     save_strategy,
-                    parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
-                        parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                    parallel_state.get_data_parallel_group(with_context_parallel=True),
                     parallel_state.get_default_process_group(),
                     True,
                 )
@@ -123,8 +136,7 @@ class TestMambaReconfiguration:
                 sequence_parallel=(dest_exp > 1 and dest_pp > 1),
             )
             if use_fpsl:
-                parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
-                    parallel_state.get_data_parallel_group_gloo(with_context_parallel=True)
+                parallelization_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
                 load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)
                 load_strategy = FullyParallelLoadStrategyWrapper(load_strategy,
                                                                 parallelization_group=parallelization_group)

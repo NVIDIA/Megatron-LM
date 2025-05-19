@@ -20,6 +20,8 @@ from megatron.core.utils import (
     get_model_config,
     get_model_type,
     get_model_xattn,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 # Types
@@ -1106,6 +1108,7 @@ def forward_backward_pipelining_with_interleaving(
     is_vp_last_stage = partial(parallel_state.is_pipeline_last_stage, ignore_virtual=False)
 
     # Run warmup forward passes.
+    nvtx_range_push(suffix="warmup")
     parallel_state.set_virtual_pipeline_model_parallel_rank(0)
     input_tensors[0].append(
         p2p_communication.recv_forward(tensor_shape, config, is_vp_first_stage())
@@ -1287,8 +1290,10 @@ def forward_backward_pipelining_with_interleaving(
 
                 if recv_next:
                     output_tensor_grads[num_model_chunks - 1].append(bwd_recv_buffer[-1])
+    nvtx_range_pop(suffix="warmup")
 
     # Run 1F1B in steady state.
+    nvtx_range_push(suffix="steady")
     for k in range(num_microbatches_remaining):
         # Forward pass.
         forward_k = k + num_warmup_microbatches
@@ -1479,8 +1484,10 @@ def forward_backward_pipelining_with_interleaving(
                 output_tensor_grads[next_backward_model_chunk_id].append(output_tensor_grad)
 
     deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
+    nvtx_range_pop(suffix="steady")
 
     # Run cooldown backward passes (flush out pipeline).
+    nvtx_range_push(suffix="cooldown")
     if not forward_only:
         if bwd_wait_handles is not None:
             for bwd_wait_handle in bwd_wait_handles.values():
@@ -1592,7 +1599,9 @@ def forward_backward_pipelining_with_interleaving(
                 if model_chunk_id not in synchronized_model_chunks:
                     config.grad_sync_func[model_chunk_id](model[model_chunk_id].parameters())
                     synchronized_model_chunks.add(model_chunk_id)
+    nvtx_range_pop(suffix="cooldown")
 
+    nvtx_range_push(suffix="misc")
     assert (
         not recv_prev_wait_handles
     ), 'recv_prev_wait_handles should be cleared at the end of a step'
@@ -1622,6 +1631,7 @@ def forward_backward_pipelining_with_interleaving(
 
     if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
         create_cudagraphs()
+    nvtx_range_pop(suffix="misc")
 
     return forward_data_store
 

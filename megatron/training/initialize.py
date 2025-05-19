@@ -8,8 +8,13 @@ import time
 import warnings
 from datetime import timedelta
 
-from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count, get_xla_model, set_manual_seed
-from megatron.core.device_utils import get_distributed_init_method
+from megatron.core.device_utils import (
+    get_current_device, get_distributed_backend, 
+    get_local_device_count, 
+    get_xla_model, 
+    set_manual_seed,
+    get_distributed_init_method
+)
 import numpy as np
 import torch
 
@@ -27,6 +32,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.utils import get_te_version, is_te_min_version, is_torch_min_version
 from megatron.legacy import fused_kernels
 from megatron.training import get_adlr_autoresume, get_args, get_tensorboard_writer
+from megatron.training import inprocess_restart
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.checkpointing import load_args_from_checkpoint
@@ -46,6 +52,7 @@ def initialize_megatron(
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
     parsed_args=None,
+    store=None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -121,7 +128,7 @@ def initialize_megatron(
     def finish_mpu_init():
         args = get_args()
         # Pytorch distributed.
-        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks)
+        _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store)
 
         # Random seeds for reproducibility.
         if args.rank == 0:
@@ -298,7 +305,7 @@ def _initialize_tp_communicators():
         )
 
 
-def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
+def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
@@ -330,6 +337,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
         }
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
+        if torch.distributed.get_backend() == torch.distributed.Backend.NCCL:
+            inprocess_restart.maybe_force_nccl_backend_init(get_current_device())
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.

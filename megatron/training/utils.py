@@ -152,13 +152,13 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         sharded_norm_2 = sharded_norm * sharded_norm
         # Sum over all DP groups.
         all_reduce(
-            sharded_norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group
+            sharded_norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group()
         )
         norm_2 += sharded_norm_2
 
     if custom_fsdp_all_param_is_shared:
         all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group
+            norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group()
         )
 
     # Add norm contribution from expert layers in MoEs.

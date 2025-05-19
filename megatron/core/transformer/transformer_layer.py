@@ -27,6 +27,8 @@ from megatron.core.utils import (
     is_te_min_version,
     log_single_rank,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 logger = logging.getLogger(__name__)
@@ -494,6 +496,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             input_layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
+        nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -505,6 +508,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
+        nvtx_range_pop(suffix="self_attention")
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
@@ -515,10 +519,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
+        nvtx_range_push(suffix="self_attn_bda")
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                 attention_output_with_bias, residual, self.hidden_dropout
             )
+        nvtx_range_pop(suffix="self_attn_bda")
 
         # Residual connection.
         residual = hidden_states
@@ -570,6 +576,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
 
+        nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
         should_chunk_mlp_for_prefill = (
             self.config.mlp_chunks_for_prefill > 1
@@ -585,7 +592,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias = te_checkpoint(
                     self.mlp,
                     False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
+                    tensor_parallel.random.get_device_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     pre_mlp_layernorm_output,
                 )
@@ -616,13 +623,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
                 mlp_output_with_bias[0]
             )
+        nvtx_range_pop(suffix="mlp")
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
+        nvtx_range_push(suffix="mlp_bda")
         with self.bias_dropout_add_exec_handler():
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
+        nvtx_range_pop(suffix="mlp_bda")
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

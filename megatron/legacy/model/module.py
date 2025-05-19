@@ -122,7 +122,7 @@ class MegatronModule(torch.nn.Module):
                 self.shared_embedding_or_output_weight().data.to(get_current_device())
             )
             all_reduce(
-                self.shared_embedding_or_output_weight().data, group=mpu.get_embedding_group
+                self.shared_embedding_or_output_weight().data, group=mpu.get_embedding_group()
             )
 
         # Ensure that encoder(first stage) and decoder(split stage) position
@@ -136,7 +136,7 @@ class MegatronModule(torch.nn.Module):
             self.language_model.embedding.to(device=get_current_device())
             position_embeddings = self.language_model.embedding.position_embeddings
             all_reduce(
-                position_embeddings.weight.data, group=mpu.get_position_embedding_group
+                position_embeddings.weight.data, group=mpu.get_position_embedding_group()
             )
 
 

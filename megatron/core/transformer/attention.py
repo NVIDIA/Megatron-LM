@@ -26,8 +26,14 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.utils import deprecate_inference_params, divide, is_fa_min_version
 from megatron.core.wrapped_process_group import WrappedProcessGroup
+from megatron.core.utils import (
+    deprecate_inference_params,
+    divide,
+    is_fa_min_version,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -590,7 +596,9 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
+        nvtx_range_push(suffix="qkv")
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        nvtx_range_pop(suffix="qkv")
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -598,6 +606,7 @@ class Attention(MegatronModule, ABC):
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear
         # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
+        nvtx_range_push(suffix="adjust_key_value")
         if (
             self.config.flash_decode
             and inference_context is not None
@@ -642,10 +651,12 @@ class Attention(MegatronModule, ABC):
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
+        nvtx_range_pop(suffix="adjust_key_value")
 
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
+        nvtx_range_push(suffix="rotary_pos_emb")
         if rotary_pos_emb is not None and not self.config.flash_decode:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
@@ -688,11 +699,13 @@ class Attention(MegatronModule, ABC):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+        nvtx_range_pop(suffix="rotary_pos_emb")
 
         # ==================================
         # core attention computation
         # ==================================
 
+        nvtx_range_push(suffix="core_attention")
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -744,12 +757,15 @@ class Attention(MegatronModule, ABC):
             # t is the pack size = sum (sq_i)
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        nvtx_range_pop(suffix="core_attention")
 
         # =================
         # Output. [sq, b, h]
         # =================
 
+        nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(core_attn_out)
+        nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
 

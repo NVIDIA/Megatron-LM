@@ -60,9 +60,11 @@ class MambaLayer(MegatronModule):
         submodules: MambaLayerSubmodules,
         layer_number: int = 1,
         residual_in_fp32=False,
+        tp_group: torch.distributed.ProcessGroup = None,
     ):
         """Initialize Mamba Layer."""
         super().__init__(config)
+        assert tp_group is not None, "tp_group must be provided for MambaLayer"
 
         if config.enable_cuda_graph:
             self.cudagraph_manager = CudaGraphManager(config)
@@ -77,6 +79,7 @@ class MambaLayer(MegatronModule):
             self.config,
             d_model=self.config.hidden_size,
             layer_number=layer_number,
+            tp_group=tp_group,
         )
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)

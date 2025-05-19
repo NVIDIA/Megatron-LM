@@ -18,7 +18,6 @@ import torch.nn.functional as F
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel import get_device_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -107,6 +106,7 @@ class MambaMixer(MegatronModule):
         chunk_size: The chunk size for the fused kernel.
         use_mem_eff_path: Whether to use the memory-efficient path for the Mamba model.
         layer_number: The layer number of this Mamba layer.
+        tp_group: The required process group to use for tensor model parallel.
     """
 
     def __init__(
@@ -135,6 +135,7 @@ class MambaMixer(MegatronModule):
         d_state=None,
         headdim=None,
         ngroups=None,
+        tp_group: torch.distributed.ProcessGroup = None,
     ):
         super().__init__(config)
         self.config = config
@@ -149,6 +150,7 @@ class MambaMixer(MegatronModule):
         self.chunk_size = chunk_size
         self.layer_number = layer_number
         self.cached_batch_size = None
+        self.tp_group = tp_group
 
         # Check for deprecated arguments and raise warnings
         if use_mem_eff_path is not None:
@@ -199,16 +201,15 @@ class MambaMixer(MegatronModule):
                 "input projection output tensor must be a multiple of 16."
             )
 
-        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
-        assert self.d_inner % self.tensor_model_parallel_size == 0
-        assert self.ngroups % self.tensor_model_parallel_size == 0
-        assert self.nheads % self.tensor_model_parallel_size == 0
+        assert self.d_inner % self.tp_group.size() == 0
+        assert self.ngroups % self.tp_group.size() == 0
+        assert self.nheads % self.tp_group.size() == 0
         assert not bias
         assert not self.norm_before_gate
 
-        self.d_inner_local = self.d_inner // self.tensor_model_parallel_size
-        self.ngroups_local = self.ngroups // self.tensor_model_parallel_size
-        self.nheads_local = self.nheads // self.tensor_model_parallel_size
+        self.d_inner_local = self.d_inner // self.tp_group.size()
+        self.ngroups_local = self.ngroups // self.tp_group.size()
+        self.nheads_local = self.nheads // self.tp_group.size()
 
         assert self.d_inner_local % self.ngroups_local == 0
 
@@ -225,6 +226,7 @@ class MambaMixer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='fc1',
+            tp_group=self.tp_group,
         )
 
         conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state
@@ -313,6 +315,7 @@ class MambaMixer(MegatronModule):
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='fc2',
+            tp_group=self.tp_group,
         )
 
     def forward(

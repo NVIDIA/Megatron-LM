@@ -50,6 +50,7 @@ spec:
         "TENSORBOARD_PATH={assets_dir}/generations.json"
         "N_REPEAT={n_repeat}"
         "ENABLE_LIGHTWEIGHT_MODE=false"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}

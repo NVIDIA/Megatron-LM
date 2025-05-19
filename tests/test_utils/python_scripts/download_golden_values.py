@@ -15,13 +15,19 @@ logger = logging.getLogger(__name__)
 
 @click.command()
 @click.option("--pipeline-id", required=True, type=int, help="Pipeline ID")
-def main(pipeline_id: int):
+@click.option(
+    "--only-failing/--no-only-failing",
+    default=False,
+    help="Only download artifacts from failing jobs",
+)
+def main(pipeline_id: int, only_failing: bool):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
 
     gl = gitlab.Gitlab(
         f"https://{os.getenv('GITLAB_ENDPOINT')}", private_token=os.getenv("RO_API_TOKEN")
     )
+    logger.info("Setting only_failing to %s", only_failing)
 
     project = gl.projects.get(PROJECT_ID)
     pipeline = project.pipelines.get(pipeline_id)
@@ -43,6 +49,9 @@ def main(pipeline_id: int):
         for functional_pipeline_job in functional_pipeline_jobs:
             job = project.jobs.get(functional_pipeline_job.id)
             logger.info("Starting with job %s", job.name)
+            if only_failing and job.status != "failed":
+                logger.info("Job %s is not failing. Skipping.", job.name)
+                continue
 
             try:
                 file_name = '__artifacts.zip'

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.device_utils import get_current_device
+from megatron.core import parallel_state
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
@@ -25,7 +26,9 @@ class TestMambaLayer:
             use_cpu_initialization=True,
         )
         modules = mamba_stack_spec.submodules.mamba_layer.submodules
-        self.layer = MambaLayer(transformer_config, modules)
+        self.layer = MambaLayer(
+            transformer_config, modules, tp_group=parallel_state.get_tensor_model_parallel_group()
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
