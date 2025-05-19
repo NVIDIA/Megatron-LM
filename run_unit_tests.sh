@@ -9,4 +9,4 @@ if [[ "$HIP_ARCHITECTURES" == "gfx90a" ]]; then
     PYTEST_MARKERS="$PYTEST_MARKERS and not failing_on_rocm_mi250"
 fi
 
-torchrun --nproc_per_node=8 -m pytest --color=yes -m "$PYTEST_MARKERS" --csv output/test_report.csv tests/unit_tests/
+torchrun --nproc_per_node=8 -m pytest --color=yes -m "$PYTEST_MARKERS" --csv output/test_report.csv tests/unit_tests/ --dist=loadscope
