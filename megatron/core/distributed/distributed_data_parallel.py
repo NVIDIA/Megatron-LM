@@ -454,6 +454,13 @@ class DistributedDataParallel(_BaseDataParallel):
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_param_sync(force_sync=force_sync)
+            for bucket in bucket_group.buckets:
+                for param in bucket.params:
+                    param_start, param_end = bucket.param_to_index[param]
+                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                    # The copy_ operation on MXFP8Tensor will handle the casting internally
+                    param.data.copy_(param_slice.view(param.data.shape))
+                bucket.param_data.zero_()
 
     def start_grad_sync(self, *unused):
         """

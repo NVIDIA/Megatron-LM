@@ -35,7 +35,7 @@ from ..dist_checkpointing.mapping import (
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
-from ..fp8_utils import is_float8tensor, quantize_param_shard
+from ..fp8_utils import is_float8tensor, quantize_param_shard, is_mxfp8tensor
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
@@ -331,58 +331,74 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
                 param_range = gbuf_range["param_map"][model_param]["param"]
 
-                # fp16, bf16 params.
+                # # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                    if not is_mxfp8tensor(model_param):
+                        print("is_bf16tensor")
+                        # Generate sharded model param.
+                        shard_model_param = model_param.detach().view(-1)[
+                            param_range.start : param_range.end
+                        ]
+                        tensor_parallel.copy_tensor_model_parallel_attributes(
+                            shard_model_param, model_param
+                        )
+                        if hasattr(model_param, 'shared'):
+                            shard_model_param.shared = model_param.shared
 
-                    # Generate sharded model param.
-                    shard_model_param = model_param.detach().view(-1)[
-                        param_range.start : param_range.end
-                    ]
-                    tensor_parallel.copy_tensor_model_parallel_attributes(
-                        shard_model_param, model_param
-                    )
-                    if hasattr(model_param, 'shared'):
-                        shard_model_param.shared = model_param.shared
+                        # Generate main param.
+                        if not config.use_precision_aware_optimizer:
+                            # If we use FP8 params to initialize FP32 main params (compared to using the
+                            # bf16/fp16 params to initialize the main params), there will be a loss of
+                            # precision at the beginning of training (this problem will not occur if the
+                            # training is long enough or if the main params are loaded from a
+                            # checkpoint).
+                            if is_float8tensor(model_param) and hasattr(
+                                model_param, 'get_high_precision_init_val'
+                            ):
+                                shard_main_param = (
+                                    model_param.get_high_precision_init_val()
+                                    .view(-1)[param_range.start : param_range.end]
+                                    .clone()
+                                    .to(shard_model_param.device)
+                                    .float()
+                                )
+                                model_param.clear_high_precision_init_val()
+                            else:
+                                shard_main_param = shard_model_param.clone().float()
 
-                    # Generate main param.
-                    if not config.use_precision_aware_optimizer:
-                        # If we use FP8 params to initialize FP32 main params (compared to using the
-                        # bf16/fp16 params to initialize the main params), there will be a loss of
-                        # precision at the beginning of training (this problem will not occur if the
-                        # training is long enough or if the main params are loaded from a
-                        # checkpoint).
-                        if is_float8tensor(model_param) and hasattr(
-                            model_param, 'get_high_precision_init_val'
-                        ):
-                            shard_main_param = (
-                                model_param.get_high_precision_init_val()
-                                .view(-1)[param_range.start : param_range.end]
-                                .clone()
-                                .to(shard_model_param.device)
-                                .float()
+                            tensor_parallel.copy_tensor_model_parallel_attributes(
+                                shard_main_param, model_param
                             )
-                            model_param.clear_high_precision_init_val()
+                            if hasattr(model_param, 'shared'):
+                                shard_main_param.shared = model_param.shared
                         else:
-                            shard_main_param = shard_model_param.clone().float()
+                            # When using precision-aware optimizer, main params are held by FusedAdam.
+                            shard_main_param = None
 
+                        # Store handle to main_param.
+                        model_param.main_param = shard_main_param
+                        model_param.main_param_sharded = True
+
+                        # Add to group.
+                        model_float16_params_this_group.append(model_param)
+                        shard_float16_params_this_group.append(shard_model_param)
+                        shard_fp32_from_float16_params_this_group.append(shard_main_param)
+                    else:
+                        print("is_mxfp8tensor")
+                        main_param = model_param.detach().clone().float()
+                        shard_main_param = main_param.view(-1)[
+                            param_range.start : param_range.end
+                        ]
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
-                        if hasattr(model_param, 'shared'):
-                            shard_main_param.shared = model_param.shared
-                    else:
-                        # When using precision-aware optimizer, main params are held by FusedAdam.
-                        shard_main_param = None
+                        # Store handle to main_param.
+                        model_param.main_param = shard_main_param
+                        model_param.main_param_sharded = True
 
-                    # Store handle to main_param.
-                    model_param.main_param = shard_main_param
-                    model_param.main_param_sharded = True
-
-                    # Add to group.
-                    model_float16_params_this_group.append(model_param)
-                    shard_float16_params_this_group.append(shard_model_param)
-                    shard_fp32_from_float16_params_this_group.append(shard_main_param)
-
+                        # Add to group.
+                        model_float16_params_this_group.append(model_param)
+                        shard_fp32_from_float16_params_this_group.append(shard_main_param)                  
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
@@ -2046,6 +2062,31 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
+
+    def _copy_main_params_to_param_buffer(self):
+        """
+        Copy FP32 main params to param buffer for later all-gather.
+        Flow:
+        FP32 main params -> bf16 param buffer -> all-gather -> convert to FP8
+        """
+        for shard_main_group, model_group in zip(self.shard_fp32_from_float16_groups, 
+                                            self.model_float16_groups):
+            for shard_main_param, model_param in zip(shard_main_group, model_group):
+                # Get position in param buffer
+                param_range_map = self._get_model_param_range_map(model_param)
+                world_range = param_range_map["gbuf_world_in_bucket"]
+                
+                # Get param buffer
+                gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+                
+                # Get the correct slice of param buffer
+                param_buffer_slice = param_buffer.view(-1)[
+                    world_range.start : world_range.end
+                ]
+                
+                # Copy FP32 -> BF16 buffer (for all-gather)
+                param_buffer_slice.copy_(shard_main_param)
 
     def _copy_model_params_to_main_params(self):
         """
