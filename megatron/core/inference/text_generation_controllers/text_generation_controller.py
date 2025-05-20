@@ -19,7 +19,7 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.contexts.dynamic_context import TokenOverflowError
+from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -476,7 +476,7 @@ class TextGenerationController:
 
         # Verify that output sequence length is within configured limit
         if max_sequence_length > inference_max_sequence_length:
-            raise TokenOverflowError(
+            raise MaxSequenceLengthOverflowError(
                 f"Maximum allowed sequence length was set to {inference_max_sequence_length} "
                 f"tokens but requested generation of {max_sequence_length} tokens"
             )

@@ -1960,9 +1960,7 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
         def another_function():
             pass
     """
-    if not HAVE_NVTX:
-        logger.warning("NVTX module is not available; nvtx_decorator is noop")
-
+    
     def decorator(func: Callable) -> Callable:
         if HAVE_NVTX and _nvtx_enabled:
             return nvtx.annotate(

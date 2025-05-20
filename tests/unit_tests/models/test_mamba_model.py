@@ -190,14 +190,14 @@ class TestMambaModel:
         micro_batch_size = 2
         sequence_length = model.max_sequence_length
 
-        model.cuda()
+        model.to(get_current_device())
 
         data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+        ).to(get_current_device())
 
         logits = model.forward(
             input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
