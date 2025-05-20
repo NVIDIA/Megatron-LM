@@ -385,10 +385,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_fp32_from_float16_params_this_group.append(shard_main_param)
                     else:
                         print("is_mxfp8tensor")
-                        main_param = model_param.clone().float()
+                        main_param = model_param.detach().clone().float()
                         shard_main_param = main_param.view(-1)[
                             param_range.start : param_range.end
                         ]
+                        tensor_parallel.copy_tensor_model_parallel_attributes(
+                            shard_main_param, model_param
+                        )
                         # Store handle to main_param.
                         model_param.main_param = shard_main_param
                         model_param.main_param_sharded = True
