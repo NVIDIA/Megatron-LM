@@ -211,7 +211,7 @@ def apply_rotary_pos_emb(
                     except ImportError:
                         raise ImportError(
                             "TE interleaved fused RoPE is not available."
-                            "Please install TE >= 2.3.0.dev0."
+                            "Please install TE >= 2.2.0.dev0."
                         )
                 else:
                     assert (

@@ -1355,13 +1355,13 @@ try:
             warnings.warn(
                 "transpose_output_memory is not supported by TE's fused RoPE and will be ignored."
             )
-        if is_te_min_version("2.3.0.dev0"):
+        if is_te_min_version("2.2.0.dev0"):
             return apply_rotary_pos_emb(
                 t, freqs, tensor_format="sbhd", interleaved=interleaved, fused=True
             )
         else:
             if interleaved:
-                raise ValueError("Only TE >= 2.3.0.dev0 supports interleaved fused RoPE.")
+                raise ValueError("Only TE >= 2.2.0.dev0 supports interleaved fused RoPE.")
             return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
 
     def fused_apply_rotary_pos_emb_thd(
