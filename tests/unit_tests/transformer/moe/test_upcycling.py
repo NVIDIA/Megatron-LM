@@ -182,7 +182,6 @@ class TestGPTModel:
             moe_model[0].load_state_dict(state_dict['model'], strict=True)
         else:
             for i in range(len(moe_model)):
-                mpu.set_virtual_pipeline_model_parallel_rank(i)
                 moe_model[i].load_state_dict(state_dict['model%d' % i], strict=True)
 
         moe_logits = moe_model[0].forward(

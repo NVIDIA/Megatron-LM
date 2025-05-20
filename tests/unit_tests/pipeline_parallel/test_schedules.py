@@ -201,7 +201,10 @@ def test_forward_backward_func_with_interleaving(mocker):
     hidden_size = 256
 
     config = ModelParallelConfig(
-        pipeline_model_parallel_size=4, sequence_parallel=False, pipeline_dtype=torch.float
+        pipeline_model_parallel_size=4,
+        sequence_parallel=False,
+        pipeline_dtype=torch.float,
+        virtual_pipeline_model_parallel_size=2,
     )
     config.hidden_size = hidden_size
     model.config = config
@@ -302,6 +305,8 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
 
     model_a = torch.nn.Linear(4, 1)
     model_b = torch.nn.Linear(8, 1)
+    model_a.vp_stage = 0
+    model_b.vp_stage = 1
 
     def set_input_tensor(input_tensor):
         return None
@@ -320,7 +325,10 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
     hidden_size = 256
 
     config = ModelParallelConfig(
-        pipeline_model_parallel_size=4, sequence_parallel=False, pipeline_dtype=torch.float
+        pipeline_model_parallel_size=4,
+        sequence_parallel=False,
+        pipeline_dtype=torch.float,
+        virtual_pipeline_model_parallel_size=2,
     )
     config.hidden_size = hidden_size
     model_a.config = config

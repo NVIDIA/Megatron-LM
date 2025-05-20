@@ -20,9 +20,7 @@ class TestParallelTransformerBlockCudagraphs:
         # initialize parallel state
         initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=2,
-            pipeline_model_parallel_size=2,
-            virtual_pipeline_model_parallel_size=2,
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
         )
         model_parallel_cuda_manual_seed(123)
 
