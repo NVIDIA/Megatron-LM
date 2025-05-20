@@ -1556,42 +1556,20 @@ def get_pipeline_model_parallel_split_rank():
 
 def is_pipeline_first_stage(ignore_virtual=True, vp_stage=None):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
-    if not ignore_virtual:
-        # Note: This is a temporary check to ensure that vp_stage is passed correctly,
-        # after which we'll remove virtual pipeline rank in global scope and make
-        # passing vp_stage mandatory.
-        if vp_stage is not None:
-            assert (
-                get_virtual_pipeline_model_parallel_rank() == vp_stage
-            ), "get_virtual_pipeline_model_parallel_rank() is not equal to vp_stage"
+    if not ignore_virtual and get_virtual_pipeline_model_parallel_world_size() is not None:
+        assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
 
-        if (
-            get_virtual_pipeline_model_parallel_world_size() is not None
-            and get_virtual_pipeline_model_parallel_rank() != 0
-        ):
+        if vp_stage != 0:
             return False
     return get_pipeline_model_parallel_rank() == 0
 
 
 def is_pipeline_last_stage(ignore_virtual=True, vp_stage=None):
     """Return True if in the last pipeline-model-parallel stage, False otherwise."""
-    if not ignore_virtual:
-        # Note: This is a temporary check to ensure that vp_stage is passed correctly,
-        # after which we'll remove virtual pipeline rank in global scope and make
-        # passing vp_stage mandatory.
-        if vp_stage is not None:
-            assert (
-                get_virtual_pipeline_model_parallel_rank() == vp_stage
-            ), "get_virtual_pipeline_model_parallel_rank() is not equal to vp_stage"
+    if not ignore_virtual and get_virtual_pipeline_model_parallel_world_size() is not None:
+        assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
 
-        virtual_pipeline_model_parallel_world_size = (
-            get_virtual_pipeline_model_parallel_world_size()
-        )
-        if (
-            virtual_pipeline_model_parallel_world_size is not None
-            and get_virtual_pipeline_model_parallel_rank()
-            != (virtual_pipeline_model_parallel_world_size - 1)
-        ):
+        if vp_stage != (get_virtual_pipeline_model_parallel_world_size() - 1):
             return False
     return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
 
@@ -1711,6 +1689,11 @@ def get_virtual_pipeline_model_parallel_rank():
 
 def set_virtual_pipeline_model_parallel_rank(rank):
     """Set the virtual pipeline-parallel rank."""
+    warnings.warn(
+        "set_virtual_pipeline_model_parallel_rank in global scope is deprecated. "
+        "Pass vp_stage explicitly to is_pipeline_first_stage, is_pipeline_last_stage, etc.",
+        DeprecationWarning,
+    )
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = rank
 
