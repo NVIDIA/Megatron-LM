@@ -1902,7 +1902,6 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
         def another_function():
             pass
     """
-    assert HAVE_NVTX, "NVTX module is required to use nvtx_decorator"
 
     def decorator(func: Callable) -> Callable:
         if _nvtx_enabled:
