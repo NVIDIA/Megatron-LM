@@ -25,6 +25,7 @@ from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
@@ -210,7 +211,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         if not args.use_mcore_inference:
             forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
 
-
+        inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
         if is_first_rank():
 
             if args.use_mcore_inference:
@@ -234,7 +235,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 ]
             else:
                 resp_sentences, _, _, _ = generate_and_post_process(
-                    model,
+                    model, inference_context,
                     forward_step=forward_step,
                     prompts=[conv],
                     tokens_to_generate=config.out_seq_length,
@@ -344,7 +345,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 )
             else:
                 generate_and_post_process(
-                    model, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+                    model, inference_context, forward_step=forward_step, detokenize_segments=False, data_parallel=True
                 )
 
             idx += 1
@@ -567,7 +568,7 @@ def get_conversation(task, question, metadata=None):
     elif task == "MMMU":
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": question},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
     elif task == "VideoMME":
         q = (
@@ -790,7 +791,6 @@ def run_eval(config, iteration=None):
 
 def eval_single_task():
     """Vision language model text generation for one task."""
-    initialize_megatron(extra_args_provider=add_text_generation_args)
 
     args = get_args()
 
@@ -862,4 +862,4 @@ def eval_batch_tasks():
 
 
 if __name__ == "__main__":
-    eval_single_task()
+    eval_batch_tasks()
