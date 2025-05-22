@@ -2245,6 +2245,12 @@ def _add_distributed_args(parser):
                        'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub', 
+                       help='Use the userbuffer registration for DP/FSDP communication buffers.'
+                       'This option will reduce GPU SM usage for the DP/FSDP communication,'
+                       'which is improving the performance of the overlapped computation.')
+    group.add_argument('--use-sharp', action='store_true', 
+                       help='Required to enable SHARP communication.')
     group.add_argument('--use-custom-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
@@ -2253,6 +2259,11 @@ def _add_distributed_args(parser):
                        help='Sharding strategy of data parallelism.')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
+    group.add_argument('--fsdp-double-buffer', action='store_true',
+                       help="Enable double buffering for temporary memory needed for custom FSDP communications. "
+                        "Double-buffering the communication memory improves memory management efficiency by "
+                        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
+                        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
