@@ -25,4 +25,5 @@ pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-
 pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git@87a2c60e494498525a163af598dacbd57c8528b0
 pip3 install multi-storage-client==0.20.3
 pip3 install pybind11==2.13.6
+pip3 install transformers==4.47.1
 

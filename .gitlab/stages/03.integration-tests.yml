@@ -141,25 +141,25 @@ integration:configure:
   inherit:
     variables: true
 
-integration:run_lts_a100:
+integration:run_lts_dgx_a100:
   extends: [.integration_run]
   variables:
     ENVIRONMENT: lts
     CLUSTER: A100
 
-integration:run_lts_h100:
+integration:run_lts_dgx_h100:
   extends: [.integration_run]
   variables:
     ENVIRONMENT: lts
     CLUSTER: H100
 
-integration:run_dev_a100:
+integration:run_dev_dgx_a100:
   extends: [.integration_run]
   variables:
     ENVIRONMENT: dev
     CLUSTER: A100
 
-integration:run_dev_h100:
+integration:run_dev_dgx_h100:
   extends: [.integration_run]
   variables:
     ENVIRONMENT: dev

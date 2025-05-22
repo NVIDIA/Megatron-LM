@@ -1,6 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import pytest
+
 import torch
 
 from megatron.core.device_utils import get_current_device

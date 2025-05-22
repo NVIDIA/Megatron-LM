@@ -50,6 +50,7 @@ def launch_and_wait_for_completion(
     container_image: Optional[str],
     container_tag: str,
     cluster: str,
+    platform: str,
     account: str,
     record_checkpoints: str,
     partition: Optional[str],
@@ -76,6 +77,7 @@ def launch_and_wait_for_completion(
                     scope=scope,
                     container_image=container_image,
                     container_tag=container_tag,
+                    platform=platform,
                     environment=environment,
                     record_checkpoints=record_checkpoints,
                 ),
@@ -214,6 +216,10 @@ def telemetrics_and_exit(
     )
     logger.info(payload)
 
+    if DASHBOARD_ENDPOINT is None:
+        logger.info("No dashboard endpoint found, skipping telemetrics")
+        return
+
     res = requests.post(
         DASHBOARD_ENDPOINT,
         data=payload,
@@ -245,6 +251,7 @@ def telemetrics_and_exit(
 )
 @click.option("--partition", required=False, type=str, help="Slurm partition to use", default=None)
 @click.option("--cluster", required=True, type=str, help="Cluster to run on")
+@click.option("--platform", required=True, type=str, help="Platform to select")
 @click.option("--container-tag", required=True, type=str, help="Base image of Mcore image")
 @click.option("--container-image", required=False, type=str, help="Base image of Mcore image")
 @click.option("--tag", required=False, type=str, help="Tag (only relevant for unit tests)")
@@ -277,6 +284,7 @@ def main(
     account: str,
     partition: Optional[str],
     cluster: str,
+    platform: str,
     container_tag: str,
     record_checkpoints: str,
     tag: Optional[str] = None,
@@ -329,6 +337,7 @@ def main(
             container_image=container_image,
             container_tag=container_tag,
             cluster=cluster,
+            platform=platform,
             account=account,
             partition=partition,
             tag=tag,

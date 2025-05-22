@@ -6,8 +6,7 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m torch.distributed.run \
     tests/unit_tests/models/test_mimo_submodules.py -v
 '''
 
-import traceback
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
@@ -49,7 +48,7 @@ class MockModalitySubmodule(ModalitySubmodules):
     ) -> Optional[torch.Tensor]:
         return None
 
-    def forward(self, data_batch: Dict) -> Optional[torch.Tensor]:
+    def forward(self, encoder_inputs: Dict[str, Any], seq_lengths: Optional[torch.Tensor] = None):
         return None
 
 
@@ -103,7 +102,7 @@ class TestBaseSubmodule:
         self.module_spec = ModuleSpec(
             module=MockModalitySubmodule,
             submodules={
-                "encoders": [self.encoder_spec],
+                "encoders": {"clip_encoder": self.encoder_spec},
                 "input_projections": [self.projection_spec],
             },
         )
@@ -131,7 +130,9 @@ class TestBaseSubmodule:
         )
 
         # Create submodule with modules
-        submodule = MockModalitySubmodule(encoders=[encoder], input_projections=[projection])
+        submodule = MockModalitySubmodule(
+            encoders={"clip_encoder": encoder}, input_projections=[projection]
+        )
 
         # Check modules are set correctly
         assert len(submodule.encoders) == 1
@@ -140,7 +141,7 @@ class TestBaseSubmodule:
         assert len(submodule.output_projections) == 0
 
         # Check the encoder module is of the right type
-        assert isinstance(submodule.encoders[0], CLIPViTModel)
+        assert isinstance(submodule.encoders['clip_encoder'], CLIPViTModel)
 
         # Check the projection module is of the right type
         assert isinstance(submodule.input_projections[0], nn.Linear)
@@ -157,13 +158,13 @@ class TestBaseSubmodule:
         assert len(submodule_from_spec.output_projections) == 0
 
         # Check the encoder modules are of the right type
-        assert isinstance(submodule_from_spec.encoders[0], CLIPViTModel)
+        assert isinstance(submodule_from_spec.encoders['clip_encoder'], CLIPViTModel)
 
         # Check the projection module is of the right type
         assert isinstance(submodule_from_spec.input_projections[0], nn.Linear)
 
         # Check parameters of the encoder
-        encoder = submodule_from_spec.encoders[0]
+        encoder = submodule_from_spec.encoders['clip_encoder']
         assert encoder.img_h == self.img_h
         assert encoder.img_w == self.img_w
         assert encoder.patch_dim == self.patch_dim
@@ -221,7 +222,8 @@ class TestVisionSubmodule:
 
         # Create VisionModalitySubmodules with encoder and projection
         self.vision_submodule = VisionModalitySubmodules(
-            encoders=[self.vision_encoder], input_projections=[self.input_projection]
+            encoders={"clip_encoder": self.vision_encoder},
+            input_projections=[self.input_projection],
         )
 
         self.device = get_current_device()
@@ -245,23 +247,21 @@ class TestVisionSubmodule:
         # Create random batch of images
         num_images = 2
         images = torch.rand(num_images, 3, self.img_h, self.img_w, device=self.device)
-        data_batch = {"images": images}
+        data_batch = {"clip_encoder": {"x": images}}
 
         # Test encode method
         embeddings = self.vision_submodule.encode(data_batch)
 
         # Verify embeddings shape and content
         assert len(embeddings) == 1  # One encoder
-
         embedding = embeddings[0]
-        assert embedding.shape[0] == num_images
-        assert embedding.shape[2] == self.hidden_size
 
         # Number of tokens depends on image size and patch size
         expected_seq_len = (self.img_h // self.patch_dim) * (
             self.img_w // self.patch_dim
         ) + 1  # +1 for cls token
-        assert embedding.shape[1] == expected_seq_len
+        assert embedding.shape[0] == num_images * expected_seq_len
+        assert embedding.shape[1] == self.hidden_size
 
     def test_combine_embeddings(self):
         """Test combining embeddings functionality."""
@@ -271,17 +271,17 @@ class TestVisionSubmodule:
         seq_len2 = 15
 
         # Create test embeddings
-        embedding1 = torch.rand(num_images, seq_len1, self.hidden_size, device=self.device)
-        embedding2 = torch.rand(num_images, seq_len2, self.hidden_size, device=self.device)
+        embedding1 = torch.rand(num_images * seq_len1, self.hidden_size, device=self.device)
+        embedding2 = torch.rand(num_images * seq_len2, self.hidden_size, device=self.device)
         embeddings = [embedding1, embedding2]
 
         # Test combining embeddings
         combined = self.vision_submodule.combine_embeddings(embeddings)
-        assert combined.shape == (num_images, seq_len1 + seq_len2, self.hidden_size)
+        assert combined.shape == (num_images * (seq_len1 + seq_len2), self.hidden_size)
 
         # Test combining a single embedding
         single_combined = self.vision_submodule.combine_embeddings([embedding1])
-        assert single_combined.shape == (num_images, seq_len1, self.hidden_size)
+        assert single_combined.shape == (num_images * seq_len1, self.hidden_size)
         assert torch.all(single_combined == embedding1)
 
         # Test combining empty embeddings raises error
@@ -293,7 +293,7 @@ class TestVisionSubmodule:
         # Create random batch of images
         num_images = 2
         images = torch.rand(num_images, 3, self.img_h, self.img_w, device=self.device)
-        data_batch = {"images": images}
+        data_batch = {"clip_encoder": {"x": images}}
 
         # Test forward pass
         output = self.vision_submodule(data_batch)
@@ -307,40 +307,8 @@ class TestVisionSubmodule:
     def test_empty_data_batch(self):
         """Test forward pass with empty data batch."""
         # Create a data batch without images
-        data_batch = {"other_data": torch.rand(2, 10, device=self.device)}
+        data_batch = {}
 
         # Test forward pass
         output = self.vision_submodule(data_batch)
         assert output is None
-
-    def test_embedding_flattening(self):
-        """
-        This test verifies that the flattening process preserves the correct ordering
-        of embeddings when flattening from [num_images, seq_len, hidden_size] to
-        [num_images*seq_len, hidden_size].
-        """
-        num_images = 5
-        images = torch.rand(num_images, 3, self.img_h, self.img_w, device=self.device)
-        data_batch = {"images": images}
-
-        with torch.no_grad():
-            encoded_outputs = self.vision_submodule.encode(data_batch)
-            projected = self.vision_submodule.project_embeddings(encoded_outputs, is_input=True)
-            patch_count = (self.img_h // self.patch_dim) * (self.img_w // self.patch_dim)
-            seq_len = patch_count + 1  # +1 for CLS token
-
-            # Get output from forward method
-            output = self.vision_submodule(data_batch)
-
-            if xm:
-                xm.mark_step()
-                output = output.cpu()
-                projected = projected.cpu()
-
-            # Comprehensive check for all positions
-            for img_idx in range(num_images):
-                for pos_idx in range(seq_len):
-                    flattened_idx = img_idx * seq_len + pos_idx
-                    assert torch.allclose(
-                        projected[img_idx, pos_idx], output[flattened_idx], rtol=1e-5, atol=1e-5
-                    ), f"Mismatch at image {img_idx}, position {pos_idx} (flattened index {flattened_idx})"
