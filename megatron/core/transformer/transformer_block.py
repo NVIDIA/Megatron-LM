@@ -346,6 +346,8 @@ class TransformerBlock(MegatronModule):
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
         use_inner_fp8_context: bool,
+        packed_seq_params_full: PackedSeqParams,
+        fullatt_block_indexes: List[int],
     ):
         """Forward method with activation checkpointing."""
 
@@ -354,6 +356,10 @@ class TransformerBlock(MegatronModule):
                 hidden_states, attention_mask, context, context_mask, rotary_pos_emb
             ):
                 for index in range(start, end):
+                    if fullatt_block_indexes is not None and index in fullatt_block_indexes:
+                        packed_seq_params_now = packed_seq_params_full
+                    else:
+                        packed_seq_params_now = packed_seq_params
                     layer = self._get_layer(index)
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
@@ -369,7 +375,7 @@ class TransformerBlock(MegatronModule):
                             rotary_pos_emb=rotary_pos_emb,
                             attention_bias=attention_bias,
                             inference_context=None,
-                            packed_seq_params=packed_seq_params,
+                            packed_seq_params=packed_seq_params_now,
                         )
                 return hidden_states, context
 
@@ -460,6 +466,8 @@ class TransformerBlock(MegatronModule):
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        packed_seq_params_full: Optional[PackedSeqParams] = None,
+        fullatt_block_indexes: Optional[list[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
@@ -486,6 +494,9 @@ class TransformerBlock(MegatronModule):
                 optimizations.
             packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
                 processing.
+            packed_seq_params_full (PackedSeqParams, optional): Parameters for packed sequence
+                processing for full attention.
+            fullatt_block_indexes (List, optional): Layer index for full attention.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -549,9 +560,15 @@ class TransformerBlock(MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_fp8_context=use_inner_fp8_context,
+                    packed_seq_params_full=packed_seq_params_full,
+                    fullatt_block_indexes=fullatt_block_indexes,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
+                    if fullatt_block_indexes is not None and l_no in fullatt_block_indexes:
+                        packed_seq_params_now = packed_seq_params_full
+                    else:
+                        packed_seq_params_now = packed_seq_params
                     inner_fp8_context = (
                         get_fp8_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
@@ -568,7 +585,7 @@ class TransformerBlock(MegatronModule):
                             rotary_pos_sin=rotary_pos_sin,
                             attention_bias=attention_bias,
                             inference_context=inference_context,
-                            packed_seq_params=packed_seq_params,
+                            packed_seq_params=packed_seq_params_now,
                             sequence_len_offset=sequence_len_offset,
                         )
 
