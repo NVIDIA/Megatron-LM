@@ -75,9 +75,9 @@ def validate_yaml(args, defaults={}):
     args.data_parallel_size = args.world_size // (model_parallel_size * args.model_parallel.context_parallel_size)
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
-              'context-parallel size: {} '
+              'context-parallel size: {}, '
               'tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {} '.format(
+              'pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.model_parallel.context_parallel_size,
                   args.model_parallel.tensor_model_parallel_size,
