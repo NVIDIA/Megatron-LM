@@ -122,7 +122,7 @@ class ScheduleNode:
                 self.output = data
             torch.cuda.nvtx.range_pop()
 
-        # Immediately frees input tensors after they are used for nodes 
+        # Immediately frees input tensors after they are used for nodes
         # where inputs are no longer needed after computation.
         if self.free_input:
             for input in inputs:
@@ -241,7 +241,6 @@ class VppContextManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)
-
 
 
 def unwrap_model(model):

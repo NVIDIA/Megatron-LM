@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import contextlib
-import weakref
 from contextlib import nullcontext
 from typing import Optional
 
@@ -10,286 +9,19 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.gpt.fine_grained_callables import (
+    PostProcessNode,
+    PreProcessNode,
+    TransformerLayerNode,
+    TransformerLayerState,
+    build_layer_callables,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     FakeScheduleNode,
-    ScheduleNode,
     get_com_stream,
     get_comp_stream,
-    make_viewless,
 )
-from megatron.core.transformer import transformer_layer
-from megatron.core.transformer.module import float16_to_fp32
-
-
-def weak_method(method):
-    """Creates a weak reference to a method to prevent circular references.
-
-    This function creates a weak reference to a method and returns a wrapper function
-    that calls the method when invoked. This helps prevent memory leaks from circular
-    references.
-    """
-    method_ref = weakref.WeakMethod(method)
-    del method
-
-    def wrapped_func(*args, **kwarg):
-        # nonlocal object_ref
-        return method_ref()(*args, **kwarg)
-
-    return wrapped_func
-
-
-def should_free_input(name, is_moe, is_deepep):
-    """Determine if the node should free its input memory.
-
-    Args:
-        name: Node name
-        is_moe: Whether it's a MoE model
-        is_deepep: Whether it's a DeepEP model
-
-    Returns:
-        bool: Whether to free input memory
-    """
-    # For dense layers [attn, fake, mlp, fake], mlp input is needed during backward pass
-    if not is_moe:
-        return False
-    # Define which nodes should free input memory
-    free_input_nodes = {
-        "mlp": True,  # Free input after MLP node usage
-        "combine": True,  # Free input after Combine node usage
-        "dispatch": not is_deepep,  # Free input after dispatch node usage in non-deepep mode
-    }
-
-    return free_input_nodes.get(name, False)
-
-
-class PreProcessNode(ScheduleNode):
-    """Node responsible for preprocessing operations in the model.
-
-    This node handles embedding and rotary positional embedding computations
-    before the main transformer layers.
-    """
-
-    def __init__(self, gpt_model, model_chunk_state, event, stream):
-        """Initializes a preprocessing node.
-
-        Args:
-            gpt_model: The GPT model instance.
-            model_chunk_state: State shared across the model chunk.
-            event: CUDA event for synchronization.
-            stream: CUDA stream for execution.
-        """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="pre_process")
-        self.gpt_model = gpt_model
-        self.model_chunk_state = model_chunk_state
-
-    def forward_impl(self):
-        """Implements the forward pass for preprocessing.
-
-        This method handles:
-        1. Decoder embedding computation
-        2. Rotary positional embedding computation
-        3. Sequence length offset computation for flash decoding
-
-        Returns:
-            The processed decoder input tensor.
-        """
-        gpt_model = self.gpt_model
-        decoder_input = self.model_chunk_state.decoder_input
-        input_ids = self.model_chunk_state.input_ids
-        position_ids = self.model_chunk_state.position_ids
-        inference_params = self.model_chunk_state.inference_params
-        packed_seq_params = self.model_chunk_state.packed_seq_params
-
-        # Decoder embedding.
-        if decoder_input is not None:
-            pass
-        elif gpt_model.pre_process:
-            decoder_input = gpt_model.embedding(input_ids=input_ids, position_ids=position_ids)
-        else:
-            # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
-            decoder_input = gpt_model.decoder.input_tensor
-
-        # Rotary positional embeddings (embedding is None for PP intermediate devices)
-        rotary_pos_emb = None
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        if (
-            gpt_model.position_embedding_type == 'rope'
-            and not gpt_model.config.multi_latent_attention
-        ):
-            if not gpt_model.training and gpt_model.config.flash_decode and inference_params:
-                # Flash decoding uses precomputed cos and sin for RoPE
-                rotary_pos_cos, rotary_pos_sin = gpt_model.rotary_pos_emb_cache.setdefault(
-                    inference_params.max_sequence_length,
-                    gpt_model.rotary_pos_emb.get_cos_sin(inference_params.max_sequence_length),
-                )
-            else:
-                rotary_seq_len = gpt_model.rotary_pos_emb.get_rotary_seq_len(
-                    inference_params,
-                    gpt_model.decoder,
-                    decoder_input,
-                    gpt_model.config,
-                    packed_seq_params,
-                )
-                rotary_pos_emb = gpt_model.rotary_pos_emb(
-                    rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
-                )
-        if (
-            (gpt_model.config.enable_cuda_graph or gpt_model.config.flash_decode)
-            and rotary_pos_cos is not None
-            and inference_params
-        ):
-            sequence_len_offset = torch.tensor(
-                [inference_params.sequence_len_offset] * inference_params.current_batch_size,
-                dtype=torch.int32,
-                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
-            )
-        else:
-            sequence_len_offset = None
-
-        # saved for later use
-        self.model_chunk_state.rotary_pos_emb = rotary_pos_emb
-        self.model_chunk_state.rotary_pos_cos = rotary_pos_cos
-        self.model_chunk_state.rotary_pos_sin = rotary_pos_sin
-        self.model_chunk_state.sequence_len_offset = sequence_len_offset
-        return decoder_input
-
-
-class PostProcessNode(ScheduleNode):
-    """Node responsible for postprocessing operations in the model.
-
-    This node handles final layer normalization and output layer computation
-    after the main transformer layers.
-    """
-
-    def __init__(self, gpt_model, model_chunk_state, event, stream):
-        """Initializes a postprocessing node.
-
-        Args:
-            gpt_model: The GPT model instance.
-            model_chunk_state: State shared across the model chunk.
-            event: CUDA event for synchronization.
-            stream: CUDA stream for execution.
-        """
-        super().__init__(weak_method(self.forward_impl), stream, event, name="post_process")
-        self.gpt_model = gpt_model
-        self.model_chunk_state = model_chunk_state
-
-    def forward_impl(self, hidden_states):
-        """Implements the forward pass for postprocessing.
-
-        This method handles:
-        1. Final layer normalization
-        2. Output layer computation
-        3. Loss computation if labels are provided
-
-        Args:
-            hidden_states: The hidden states from the transformer layers.
-
-        Returns:
-            The logits or loss depending on whether labels are provided.
-        """
-        # Final layer norm.
-        if self.gpt_model.decoder.final_layernorm is not None:
-            hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
-            hidden_states = transformer_layer.make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-
-        gpt_model = self.gpt_model
-        runtime_gather_output = self.model_chunk_state.runtime_gather_output
-        labels = self.model_chunk_state.labels
-        output_weight = None
-        if gpt_model.share_embeddings_and_output_weights:
-            output_weight = gpt_model.shared_embedding_or_output_weight()
-        logits, _ = gpt_model.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-        )
-
-        if labels is None:
-            # [s b h] => [b s h]
-            return float16_to_fp32(logits.transpose(0, 1).contiguous())
-        loss = float16_to_fp32(gpt_model.compute_language_model_loss(labels, logits))
-        return loss
-
-
-class TransformerLayerNode(ScheduleNode):
-    """Base class for transformer layer computation nodes.
-
-    This class provides common functionality for different types of
-    transformer layer nodes (attention, MLP, etc.)
-    """
-
-    def __init__(self, stream, event, state, submodule, name="default"):
-        """Initialize a transformer layer node.
-
-        Args:
-            stream (torch.cuda.Stream): CUDA stream for execution
-            event (torch.cuda.Event): Synchronization event
-            common_state (TransformerLayerState): State shared within a transformer layer
-            submodule (SubmoduleCallables): The submodule contain forward and dw function
-            it's the per_batch_state_context, o.w. nullcontext
-            name (str): Node name, also used to determine memory strategy
-        """
-        # 获取是否需要释放输入内存的标志
-        free_input = should_free_input(name, submodule.is_moe, submodule.is_deepep)
-
-        super().__init__(
-            weak_method(self.forward_impl),
-            stream,
-            event,
-            weak_method(self.backward_impl),
-            free_input=free_input,
-            name=name,
-        )
-        self.common_state = state
-        self.submodule = submodule
-        self.detached = tuple()
-        self.before_detached = tuple()
-
-    def detach(self, t):
-        """Detaches a tensor and stores it for backward computation."""
-        detached = make_viewless(t).detach()
-        detached.requires_grad = t.requires_grad
-        self.before_detached = self.before_detached + (t,)
-        self.detached = self.detached + (detached,)
-        return detached
-
-    def forward_impl(self, *args):
-        """Implements the forward pass for the transformer layer node."""
-        return self.submodule.forward(self, *args)
-
-    def backward_impl(self, outputs, output_grad):
-        """Implements the backward pass for the transformer layer node."""
-        detached_grad = tuple([e.grad for e in self.detached])
-        grads = output_grad + detached_grad
-        self.default_backward_func(outputs + self.before_detached, grads)
-        self.before_detached = None
-        self.detached = None
-        # return grads for record stream
-        return grads
-
-    def dw(self):
-        """Computes the weight gradients for the transformer layer node."""
-        with torch.cuda.nvtx.range(f"{self.name} wgrad"):
-            self.submodule.dw()
-
-
-class TransformerLayerState:
-    """State shared within a transformer layer.
-
-    This class holds state that is shared between different nodes
-    within a transformer layer.
-    """
-
-    pass
 
 
 class ModelChunkSate:
@@ -302,48 +34,92 @@ class ModelChunkSate:
     pass
 
 
-class TransformerLayerSchedulePlan:
+class LayerSchedulePlan:
     """Schedule plan for a transformer layer.
 
     This class organizes the computation nodes for a transformer layer,
     including attention, MLP, dispatch, and combine nodes.
     """
 
-    def __init__(self, layer, event, chunk_state, comp_stream, com_stream):
+    attn = None
+    dispatch = None
+    mlp = None
+    combine = None
+    mtp_post_process = None
+
+    def __init__(self, layer, event, chunk_state, comp_stream, com_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
 
         Args:
-            layer (TransformerLayer): The transformer layer to schedule.
+            layer (TransformerLayer): The transformer/mtp layer to schedule.
             event (torch.cuda.Event): CUDA event for synchronization.
             chunk_state (ModelChunkState): State shared across the model chunk.
             comp_stream (torch.cuda.Stream): CUDA stream for computation.
             com_stream (torch.cuda.Stream): CUDA stream for communication.
         """
         self.common_state = TransformerLayerState()
+        self.chunk_state = chunk_state
         self.layer = layer
-        # get submodules for transformer layer
-        attn_module, dispatch_module, mlp_module, combine_module = layer.get_submodule_callables(
-            chunk_state
-        ).as_array()
+        self.event = event
+        self.comp_stream = comp_stream
+        self.com_stream = com_stream
+
+        # get callable nodes for transformer/mtp layer
+        self.build_callable_nodes(event, comp_stream, com_stream, extra_args)
+
+    def build_callable_nodes(self, event, comp_stream, com_stream, extra_args):
+        """
+        Builds the callable nodes for the transformer/mtp layer:
+            attn, post_attn, mlp, dispatch, combine, and post_process.
+        """
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        # build the forward and backward callables for the transformer/mtp layer
+        fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+
+        # get flags for latter use
+        is_moe = isinstance(self.layer.mlp, MoELayer)
+        enable_deepep = self.layer.config.moe_enable_deepep
+        extra_args["enable_deepep"] = enable_deepep
+        extra_args["is_moe"] = is_moe
+
+        # wrapper to help create TransformerLayerNode
+        def create_node(stream, module, name):
+            bwd_dw_callables = bwd_dw_callable_map.get(name, None)
+            return TransformerLayerNode(
+                stream,
+                event,
+                self.common_state,
+                self.chunk_state,
+                module,
+                name=name,
+                bwd_dw_callables=bwd_dw_callables,
+                extra_args=extra_args,
+            )
+
+        (
+            attn_module,
+            post_attn_module,
+            dispatch_module,
+            mlp_module,
+            combine_module,
+            post_process_module,
+        ) = fwd_callables
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
-        self.attn = TransformerLayerNode(
-            comp_stream, event, self.common_state, attn_module, name="attn"
-        )
-        self.mlp = TransformerLayerNode(
-            comp_stream, event, self.common_state, mlp_module, name="mlp"
-        )
-        if attn_module.is_moe:
-            self.dispatch = TransformerLayerNode(
-                com_stream, event, self.common_state, dispatch_module, name="dispatch"
-            )
-            self.combine = TransformerLayerNode(
-                com_stream, event, self.common_state, combine_module, name="combine"
-            )
+        self.attn = create_node(comp_stream, attn_module, "attn")
+        self.mlp = create_node(comp_stream, mlp_module, "mlp")
+        if is_moe:
+            self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
+            self.dispatch = create_node(com_stream, dispatch_module, "dispatch")
+            self.combine = create_node(com_stream, combine_module, "combine")
         else:
+            self.post_attn = FakeScheduleNode()
             self.dispatch = FakeScheduleNode()
             self.combine = FakeScheduleNode()
+
+        self.post_process = FakeScheduleNode()
 
     def get_fp8_context(self):
         """
@@ -373,6 +149,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         self._post_process = None
         self._model_chunk_state = ModelChunkSate()
         self._transformer_layers = []
+        self._mtp_layers = []
         self._event = torch.cuda.Event()
 
     @classmethod
@@ -502,20 +279,24 @@ def schedule_layer_1f1b(
     f_context = f_context if f_context is not None else contextlib.nullcontext()
     b_context = b_context if b_context is not None else contextlib.nullcontext()
 
-    if pre_forward is not None:
-        assert f_input is None
-        # combine from last iter
-        f_input = pre_forward()
-        del pre_forward
-
+    # TODO: Find a better way to handle pre_backward and pre_forward.
+    # Ideally pre_forward should launch before pre_backward only if
+    # pre_forward is communication.
     if pre_backward is not None:
         # attn backward from last iter
         assert b_grad is None
         b_grad = pre_backward()
         del pre_backward
 
+    if pre_forward is not None:
+        assert f_input is None
+        # combine/post_process from last iter
+        f_input = pre_forward()
+        del pre_forward
+
     if b_layer is not None:
         with b_context:
+            b_grad = b_layer.post_process.backward(b_grad)
             b_grad = b_layer.combine.backward(b_grad)
 
     if pre_backward_dw is not None:
@@ -525,6 +306,7 @@ def schedule_layer_1f1b(
     if f_layer is not None:
         with f_context and f_layer.get_fp8_context():
             f_input = f_layer.attn.forward(f_input)
+            f_input = f_layer.post_attn.forward(f_input)
 
     if b_layer is not None:
         with b_context:
@@ -536,7 +318,7 @@ def schedule_layer_1f1b(
 
     if b_layer is not None:
         with b_context:
-            b_layer.mlp.dw()
+            b_layer.mlp.backward_dw()
             b_grad = b_layer.dispatch.backward(b_grad)
 
     if f_layer is not None:
@@ -547,18 +329,20 @@ def schedule_layer_1f1b(
         if f_layer is not None:
             with f_context and f_layer.get_fp8_context():
                 output = f_layer.combine.forward(f_input)
+                output = f_layer.post_process.forward(output)
                 return output
 
     def next_iter_pre_backward():
         if b_layer is not None:
             with b_context:
-                grad = b_layer.attn.backward(b_grad)
+                grad = b_layer.post_attn.backward(b_grad)
+                grad = b_layer.attn.backward(grad)
                 return grad
 
     def next_iter_pre_backward_dw():
         if b_layer is not None:
             with b_context:
-                b_layer.attn.dw()
+                b_layer.attn.backward_dw()
 
     if f_layer and b_layer:
         return next_iter_pre_forward, next_iter_pre_backward, next_iter_pre_backward_dw
@@ -620,17 +404,23 @@ def schedule_chunk_1f1b(
         tmp = grad
         if b_schedule_plan is not None:
             assert grad is not None
-            if b_schedule_plan.post_process is not None:
-                with b_context:  # virtual pipeline parallel context
-                    tmp = b_schedule_plan.post_process.backward(grad)
 
             if pre_backward is not None:
                 # pp grad send receive sync here, safe for now, maybe not safe in the future
-                with torch.cuda.stream(get_com_stream()):
+                if isinstance(b_schedule_plan.post_process, FakeScheduleNode):
+                    stream = get_com_stream()
+                else:
+                    stream = get_comp_stream()
+                with torch.cuda.stream(stream):
                     b_schedule_plan.wait_current_stream()
                     with b_context as ctx:  # virtual pipeline parallel context
                         pre_backward(ctx.vpp_rank)
                     b_schedule_plan.record_current_stream()
+
+            if b_schedule_plan.post_process is not None:
+                with b_context:  # virtual pipeline parallel context
+                    tmp = b_schedule_plan.post_process.backward(grad)
+                    b_schedule_plan.post_process.backward_dw()
 
         return tmp
 
@@ -678,16 +468,11 @@ def schedule_chunk_1f1b(
 
     if f_schedule_plan is not None and post_forward is not None:
         with f_context as ctx:
-            if overlaped_layers < f_num_layers:
-                # The last submodule is running in the current stream
+            # The last submodule is running in the communication stream,
+            # so the p2p comm could be overlapped with the attn backward
+            with torch.cuda.stream(get_com_stream()):
                 f_schedule_plan.wait_current_stream()
                 post_forward(f_input, ctx.vpp_rank)
-            else:
-                # The last submodule is running in the communication stream,
-                # so the p2p comm could be overlapped with the attn backward
-                with torch.cuda.stream(get_com_stream()):
-                    f_schedule_plan.wait_current_stream()
-                    post_forward(f_input, ctx.vpp_rank)
 
     # pp grad send / receive, overlapped with attn dw of cur micro-batch
     # and forward attn of next micro-batch
@@ -726,6 +511,7 @@ def build_model_chunk_schedule_plan(
     packed_seq_params=None,
     extra_block_kwargs=None,
     runtime_gather_output: Optional[bool] = None,
+    loss_mask: Optional[Tensor] = None,
 ):
     """Builds a schedule plan for a model chunk.
 
@@ -739,7 +525,6 @@ def build_model_chunk_schedule_plan(
         attention_mask: Attention mask.
         decoder_input: Decoder input tensor.
         labels: Labels for loss computation.
-        inference_params: Parameters for inference.
         packed_seq_params: Parameters for packed sequences.
         extra_block_kwargs: Additional keyword arguments for blocks.
         runtime_gather_output: Whether to gather output at runtime.
@@ -752,13 +537,14 @@ def build_model_chunk_schedule_plan(
     model_chunk_schedule_plan = ModelChunkSchedulePlan()
     event = model_chunk_schedule_plan.event
     state = model_chunk_schedule_plan.state
+
     # save for later use
     state.input_ids = input_ids
     state.position_ids = position_ids
     state.attention_mask = attention_mask
     state.decoder_input = decoder_input
     state.labels = labels
-    state.inference_params = inference_params
+    state.loss_mask = loss_mask
     state.packed_seq_params = packed_seq_params
     state.extra_block_kwargs = extra_block_kwargs
     state.runtime_gather_output = runtime_gather_output
@@ -766,15 +552,15 @@ def build_model_chunk_schedule_plan(
     state.context_mask = None
     state.attention_bias = None
 
+    transformer_num_layers = model.decoder.num_layers_per_pipeline_rank
     # build preprocess
     model_chunk_schedule_plan.pre_process = PreProcessNode(model, state, event, comp_stream)
     # build for layers
-    for layer_idx in range(model.decoder.num_layers_per_pipeline_rank):
+    for layer_idx in range(transformer_num_layers):
         layer = model.decoder._get_layer(layer_idx)
-        layer_plan = TransformerLayerSchedulePlan(layer, event, state, comp_stream, com_stream)
+        layer_plan = LayerSchedulePlan(layer, event, state, comp_stream, com_stream)
         model_chunk_schedule_plan.add_layer(layer_plan)
     # build post process
     if model.post_process:
         model_chunk_schedule_plan.post_process = PostProcessNode(model, state, event, comp_stream)
-
     return model_chunk_schedule_plan

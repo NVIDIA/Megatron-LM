@@ -1,21 +1,17 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 import os
 import random
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import pytest
 import torch
 
-from megatron.core.models.gpt.fine_grained_schedule import (
-    TransformerLayerSchedulePlan,
-    schedule_layer_1f1b,
-)
+from megatron.core.models.gpt.fine_grained_schedule import LayerSchedulePlan, schedule_layer_1f1b
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
@@ -142,7 +138,14 @@ def run_model_a2a_overlap_with_capture(model, input_tensors, microbatches):
     comp_stream = torch.cuda.current_stream()
     com_stream = torch.cuda.Stream(device="cuda")
     layers = [
-        TransformerLayerSchedulePlan(model, event, DummyState(), comp_stream, com_stream)
+        LayerSchedulePlan(
+            model,
+            event,
+            DummyState(),
+            comp_stream,
+            com_stream,
+            extra_args={"is_moe": True, "enable_deepep": False},
+        )
         for _ in range(microbatches)
     ]
     output_tensors = []
