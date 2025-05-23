@@ -498,7 +498,9 @@ def forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if config.combined_1f1b and not forward_only:
-        assert config.combined_1f1b_recipe == "ep_a2a", "only ep_a2a recipe is supported for combined_1f1b"
+        assert (
+            config.combined_1f1b_recipe == "ep_a2a"
+        ), "only ep_a2a recipe is supported for combined_1f1b"
         f_context = contextlib.nullcontext()
         b_context = contextlib.nullcontext()
         # in combined_1f1b, we need to wrap the forward_step_func
@@ -548,11 +550,9 @@ def forward_backward_no_pipelining(
                     collect_non_loss_data=collect_non_loss_data,
                     checkpoint_activations_microbatch=None,
                     is_first_microbatch=check_first_val_step(
-                        first_val_step,
-                        forward_only,
-                        (i+1) == 0
-                        ),
-                    current_microbatch=(i+1),
+                        first_val_step, forward_only, (i + 1) == 0
+                    ),
+                    current_microbatch=(i + 1),
                 )
         total_num_tokens += num_tokens
         # The backward step for the last microbatch is executed alone, no a2a overlapping
@@ -588,7 +588,9 @@ def forward_backward_no_pipelining(
                 )
                 total_num_tokens += num_tokens
                 if not forward_only:
-                    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                    backward_step(
+                        input_tensor, output_tensor, output_tensor_grad, model_type, config
+                    )
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(

@@ -1023,7 +1023,9 @@ def validate_args(args, defaults={}):
             # Disable shared expert overlap as it conflicts with ep_a2a
             assert not args.moe_shared_expert_overlap, \
                 'moe_shared_expert_overlap is not supported when combined_1f1b_recipe is ep_a2a'
-
+            assert args.mtp_num_layers is None, \
+                'MTP is not supported when enabling 1f1b overlap.'
+            
     # Check delay_wgrad_compute compatibility
     if args.delay_wgrad_compute:
         assert args.combined_1f1b and args.combined_1f1b_recipe == 'ep_a2a', \

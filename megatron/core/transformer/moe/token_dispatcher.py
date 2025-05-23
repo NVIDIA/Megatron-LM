@@ -598,11 +598,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                     fused=self.config.moe_permute_fusion,
                 )
 
-        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+        tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_finish", self.tokens_per_expert
         )
-
-        return global_input_tokens, global_probs
+        self.tokens_per_expert = None
+        return global_input_tokens, tokens_per_expert, global_probs
 
     def token_permutation(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
@@ -635,11 +635,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         global_input_tokens, global_probs = self.dispatch_all_to_all(
             permutated_local_input_tokens, permuted_probs
         )
-        global_input_tokens, global_probs = self.dispatch_postprocess(
+        global_input_tokens, tokens_per_expert, global_probs = self.dispatch_postprocess(
             global_input_tokens, global_probs
         )
-        tokens_per_expert = self.tokens_per_expert
-        self.tokens_per_expert = None
+
         return global_input_tokens, tokens_per_expert, global_probs
 
     def combine_preprocess(self, hidden_states):
@@ -1157,7 +1156,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             self._comm_manager.dispatched_probs,
         )
 
-    def dispatch_postprocess(self, hidden_states: torch.Tensor):
+    def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """
         Post-processes the dispatched hidden states after all-to-all communication.
 
@@ -1186,7 +1185,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             hidden_states, async_finish=False, allocate_on_comm_stream=False
         )
         global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(
-            hidden_states
+            hidden_states, None
         )
 
         return global_input_tokens, tokens_per_expert, permuted_probs

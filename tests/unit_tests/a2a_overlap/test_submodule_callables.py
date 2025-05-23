@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
+from megatron.core.models.gpt.fine_grained_callables import build_layer_callables
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -124,6 +125,10 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
     Returns:
         dict: A dictionary containing model outputs and parameter gradients.
     """
+
+    def dummy_detach(t):
+        return t
+
     for i in range(len(input_tensors)):
         input_tensors[i] = input_tensors[i].clone()
     for module in model.modules():
@@ -131,25 +136,39 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
             module.fuse_wgrad_accumulation = False
 
     output_tensors = []
-    # init flags: is_moe, is_deepep
-    model.get_submodule_callables(DummyState())
-
+    # get callables
+    callables, dw = build_layer_callables(model)
+    attn, post_attn, dispatch, moe, combine, post_process = callables
+    assert post_process is None
     for i in range(microbatches):
+        # build mock func/state
         state = DummyState()
-        local_tokens, probs, residual, pre_mlp_layernorm_output = (
-            model._submodule_attn_router_forward(input_tensors[i])
-        )
-        state.residual = residual
+        node = DummyState()
+        node.common_state = DummyState()
+        node.chunk_state = DummyState()
+        node.detach = dummy_detach
+
+        # attn fwd
+        hidden_states = attn(node, input_tensors[i])
+
+        # post attn fwd
+        local_tokens, probs = post_attn(node, hidden_states)
+
+        # dispatch fwd
+        dispatched_tokens, probs = dispatch(node, local_tokens, probs)
+
+        # moe fwd
+        expert_outputs = moe(node, dispatched_tokens, probs)
         if model.mlp.use_shared_expert:
-            state.pre_mlp_layernorm_output = pre_mlp_layernorm_output
-        dispatched_tokens, probs = model._submodule_dispatch_forward(local_tokens, probs)
-        if model.is_deepep:
-            state.dispatched_probs = probs
-        expert_output, shared_expert_output, mlp_bias = model._submodule_moe_forward(
-            dispatched_tokens, probs, state
-        )
-        assert mlp_bias is None
-        hidden_states = model._submodule_combine_forward(expert_output, shared_expert_output, state)
+            expert_output, shared_expert_output = expert_outputs
+        else:
+            expert_output = expert_outputs
+            shared_expert_output = None
+
+        # combine fwd
+        hidden_states = combine(node, expert_output, shared_expert_output)
+
+        # loss
         output_tensors.append(hidden_states)
         hidden_states.backward(torch.ones_like(hidden_states))
 
