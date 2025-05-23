@@ -81,7 +81,12 @@ pre:label_merge_request:
   extends: [.pre_rules]
   image: golang:1.22
   tags:
-    - mcore-docker-node-small
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
   before_script:
     - git clone -b nv https://${GITLAB_ENDPOINT}/okoenig/gitlab-mr-labeler.git
     - cd gitlab-mr-labeler
