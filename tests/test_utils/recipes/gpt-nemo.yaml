@@ -53,10 +53,11 @@ spec:
     bash /opt/megatron-lm/tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  # - test_case: [llama3-nemo_8b_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp2_dgx_a100_1N8G] # needs a fix
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
+  - test_case: [llama3-nemo_8b_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [llama3-nemo_8b_mr_mbs4_gbs64_mcore_te_tp1_pp1_cp2_dgx_a100_1N8G]
     products:
       - environment: [dev]
