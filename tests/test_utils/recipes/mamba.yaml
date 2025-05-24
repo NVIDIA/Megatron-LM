@@ -60,6 +60,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
       # - environment: [lts] # until triton is bumped
       #   scope: [nightly]
 
@@ -67,6 +68,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
       # - environment: [lts] # until triton is bumped
       #   scope: [nightly]
 

@@ -61,3 +61,4 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_h100]
