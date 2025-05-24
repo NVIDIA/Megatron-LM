@@ -11,6 +11,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
+    apply_random_logits,
     save_to_aux_losses_tracker,
     sequence_load_balancing_loss_func,
     sinkhorn,
@@ -444,6 +445,10 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+
+        if self.config.moe_router_force_load_balancing:
+            # Apply force load balancing with random logits for benchmark
+            logits = apply_random_logits(logits)
 
         scores, routing_map = self.routing(logits)
 
