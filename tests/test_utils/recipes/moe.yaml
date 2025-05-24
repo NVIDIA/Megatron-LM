@@ -12,7 +12,8 @@ spec:
   platforms: dgx_a100
   artifacts:
     /workspace/data/gpt3_data: text/the_pile/shard00
-    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/28359448
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev_dgx_a100: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/28359448
+    /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev_dgx_h100: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G_dev/28359448
   script_setup: |
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -62,31 +63,48 @@ products:
   #######################################################################
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_te_4experts2parallel]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+      - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
     products:
       - environment: [dev]
         scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+      - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_ep2_etp2_te_4experts2parallel_dp_last]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+      - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel_dp_last]
     products:
       - environment: [dev]
         scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+      - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_cp2_pp2_ep2_te_4experts2parallel_nondeterministic_dp_last]
     products:
-      - environment: [dev, lts]
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+      - environment: [lts]
         scope: [nightly]
   # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp2_pp2_resume_torch_dist_te_2experts]
   #   products: # non-determinism: #478
@@ -103,34 +121,41 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]
   #######################################################################
@@ -140,10 +165,12 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100] #, dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100] #, dgx_h100]
   ###########################
   # Merge train tests       #
   ###########################
@@ -151,15 +178,15 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100] #, dgx_h100]
+        platforms: [dgx_a100, dgx_h100]
       - environment: [dev]
         scope: [mr-slim]
-        platforms: [dgx_a100] #, dgx_h100]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100] #, dgx_h100]
+        platforms: [dgx_a100, dgx_h100]
       - environment: [dev]
         scope: [mr-slim]
-        platforms: [dgx_a100] #, dgx_h100]
+        platforms: [dgx_a100, dgx_h100]

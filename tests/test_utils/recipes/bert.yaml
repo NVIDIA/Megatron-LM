@@ -13,7 +13,8 @@ spec:
   n_repeat:
   artifacts:
     /workspace/data/bert_data: text/the_pile/bert_shard00
-    /workspace/checkpoints/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev: model/mcore_bert/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev/28359448
+    /workspace/checkpoints/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev_dgx_a100: model/mcore_bert/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev/28359448
+    /workspace/checkpoints/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev_dgx_h100: model/mcore_bert/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev/28359448
   script_setup: |
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -62,31 +63,39 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
     products:
       - environment: [dev]
         scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp4_vp2]
     products:
       - environment: [dev]
         scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
     products:
       - environment: [dev]
         scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
   - test_case: [bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G]
     products:
       - environment: [dev] # Update checkpoint
         scope: [mr]
+        platforms: [dgx_a100] #, dgx_h100]
