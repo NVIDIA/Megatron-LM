@@ -108,20 +108,24 @@ else
             key="${line%%:*}"
             value="${line#*: }"
             value="$(echo "$value" | xargs)" # trim whitespace
-            # Case 1: true
+            # Case: true
             if [[ "$value" == "true" ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="${key} "
 
-            # Case 2: value is wrapped in [ ]
+            # Case: value is wrapped in ( )
+            elif echo "$value" | grep -Eq '^\([^)]+\)$'; then
+                TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
+
+            # Case: value is wrapped in [ ]
             elif echo "$value" | grep -Eq '^\[[^]]+\]$'; then
                 # Strip square brackets from value using sed
                 value=$(echo "$value" | sed 's/^\[//;s/\]$//')
                 TRAINING_PARAMS_FROM_CONFIG+="$key $value "
 
-            # Case 3: contains spaces
+            # Case: contains spaces
             elif [[ "$value" == *" "* ]]; then
                 TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
-            # Case 4: default
+            # Case: default
             else
                 TRAINING_PARAMS_FROM_CONFIG+="$key $value "
             fi
