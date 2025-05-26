@@ -220,16 +220,6 @@ def forward_backward_step(
             post_forward=post_forward,
             post_backward=post_backward,
         )
-    
-    # clear the model_chunk_state manually to release memory
-    if b_schedule_plan is not None:
-        b_schedule_plan.pre_process.model_chunk_state = None
-        b_schedule_plan.pre_process = None
-
-        if b_schedule_plan.post_process is not None:
-            b_schedule_plan.post_process.model_chunk_state = None
-            b_schedule_plan.post_process = None
-        b_schedule_plan = None
 
     # forward post process
     num_tokens = None
