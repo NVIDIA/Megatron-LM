@@ -17,14 +17,9 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
 @click.option(
     "--test-cases", required=True, type=str, help="Comma-separated list of test_cases, or 'all'"
 )
-@click.option("--a100-cluster", required=True, type=str, help="A100 Cluster to run on")
-@click.option("--h100-cluster", required=True, type=str, help="H100 Cluster to run on")
-@click.option(
-    "--a100-partition", required=False, type=str, help="Slurm partition to use", default=None
-)
-@click.option(
-    "--h100-partition", required=False, type=str, help="Slurm partition to use", default=None
-)
+@click.option("--platform", required=True, type=str, help="Platform to select")
+@click.option("--cluster", required=True, type=str, help="Cluster to run on")
+@click.option("--partition", required=False, type=str, help="Slurm partition to use", default=None)
 @click.option("--output-path", required=True, type=str, help="Path to write GitLab job to")
 @click.option("--container-image", required=True, type=str, help="LTS Container image to use")
 @click.option("--container-tag", required=True, type=str, help="Container tag to use")
@@ -69,10 +64,9 @@ def main(
     n_repeat: int,
     time_limit: int,
     test_cases: str,
-    a100_cluster: str,
-    h100_cluster: str,
-    a100_partition: Optional[str],
-    h100_partition: Optional[str],
+    platform: Optional[str],
+    cluster: Optional[str],
+    partition: Optional[str],
     output_path: str,
     container_image: str,
     container_tag: str,
@@ -92,6 +86,7 @@ def main(
             container_tag=container_tag,
             environment=environment,
             test_cases=test_cases,
+            platform=platform,
             tag=tag,
         )
         if test_case.type != "build"
@@ -152,15 +147,6 @@ def main(
         warmup_job = ""
 
         for test_idx, test_case in enumerate(list_of_test_cases):
-            if test_case.spec.platforms == "dgx_a100":
-                cluster = a100_cluster
-                partition = a100_partition
-            elif test_case.spec.platforms == "dgx_h100":
-                cluster = h100_cluster
-                partition = h100_partition
-            else:
-                raise ValueError(f"Platform {test_case.spec.platforms} unknown")
-
             job_tags = list(tags)
             job_tags.append(f"cluster/{common.resolve_cluster_config(cluster)}")
 
@@ -175,6 +161,7 @@ def main(
                 f"--test-case '{test_case.spec.test_case}'",
                 f"--container-tag {container_tag}",
                 f"--cluster {cluster}",
+                f"--platform {platform}",
                 f"--record-checkpoints {record_checkpoints}",
                 f"--account {slurm_account}",
             ]

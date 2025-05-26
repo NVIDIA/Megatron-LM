@@ -64,6 +64,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_one_logger_args(parser)
+    parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
@@ -800,7 +801,8 @@ def validate_args(args, defaults={}):
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
-    if args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1 and get_device_arch_version() < 10:
+    if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
+        and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.use_torch_fsdp2 or args.use_custom_fsdp:
             fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Custom-FSDP"
@@ -1453,6 +1455,55 @@ def _add_workload_inspector_server_args(parser):
     group = parser.add_argument_group(title='workload inspector')
     group.add_argument('--run-workload-inspector-server', action='store_true',
                        help='If set, enables workload inspector server for on-demand profiling.')
+    return parser
+
+def _add_inprocess_restart_args(parser):
+    group = parser.add_argument_group(title='In-process restart')
+
+    group.add_argument('--inprocess-restart', action='store_true',
+                       help='Enables in-process restart.')
+
+    group.add_argument('--inprocess-max-iterations', default=None, type=int,
+                       help='Maximum number of in-process restart iterations.')
+    group.add_argument('--inprocess-monitor-thread-interval', default=1.0, type=float,
+                       help='Monitoring interval (in seconds) for the monitoring thread.')
+    group.add_argument('--inprocess-monitor-process-interval', default=1.0, type=float,
+                       help='Monitoring interval (in seconds) for the monitoring process.')
+    group.add_argument('--inprocess-progress-watchdog-interval', default=1.0, type=float,
+                       help='Interval (in seconds) for automatic progress watchdog timestamp '
+                       'updates.')
+    group.add_argument('--inprocess-heartbeat-interval', default=30, type=float,
+                       help='Monitoring interval (in seconds) for detecting unresponsive ranks.')
+
+    group.add_argument('--inprocess-soft-timeout', default=60, type=float,
+                       help='Soft progress timeout (in seconds).')
+    group.add_argument('--inprocess-hard-timeout', default=90, type=float,
+                       help='Hard progress timeout (in seconds).')
+    group.add_argument('--inprocess-heartbeat-timeout', default=60, type=float,
+                       help='Timeout (in seconds) for a missing rank detection heartbeat.')
+
+    group.add_argument('--inprocess-barrier-timeout', default=120, type=float,
+                       help='Timeout (in seconds) for internal distributed barrier')
+    group.add_argument('--inprocess-completion-timeout', default=120, type=float,
+                       help='Timeout (in seconds) for barrier on completion on all ranks')
+
+    group.add_argument('--inprocess-last-call-wait', default=1, type=float,
+                       help='Time interval (in seconds) for other ranks to report concurrent '
+                       'terminal failures.')
+    group.add_argument('--inprocess-termination-grace-time', default=1, type=float,
+                       help='Interval (in seconds) between SIGTERM and SIGKILL issued on hard '
+                       'timeout')
+
+    group.add_argument('--inprocess-granularity', default='node', type=str,
+                       choices=['node', 'rank'],
+                       help='Granularity for in-process restart.')
+    group.add_argument('--inprocess-active-world-size',
+                       default=int(os.getenv('WORLD_SIZE', '1')), type=int,
+                       help='The number of ranks initially executing the workload. '
+                       'The remaining ranks from the allocation are set aside '
+                       'as warm reserve.')
+    group.add_argument('--inprocess-empty-cuda-cache', action='store_true',
+                       help='Release all unoccupied cached GPU memory on every in-process restart.')
     return parser
 
 def _add_one_logger_args(parser):
@@ -2246,6 +2297,12 @@ def _add_distributed_args(parser):
                        'layer in the context of partition and placement for pipeline parallelism.')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub', 
+                       help='Use the userbuffer registration for DP/FSDP communication buffers.'
+                       'This option will reduce GPU SM usage for the DP/FSDP communication,'
+                       'which is improving the performance of the overlapped computation.')
+    group.add_argument('--use-sharp', action='store_true', 
+                       help='Required to enable SHARP communication.')
     group.add_argument('--use-custom-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
@@ -2254,6 +2311,11 @@ def _add_distributed_args(parser):
                        help='Sharding strategy of data parallelism.')
     group.add_argument('--no-gradient-reduce-div-fusion', action='store_false', dest='gradient_reduce_div_fusion',
                        help='If not set, fuse the division in gradient reduce.')
+    group.add_argument('--fsdp-double-buffer', action='store_true',
+                       help="Enable double buffering for temporary memory needed for custom FSDP communications. "
+                        "Double-buffering the communication memory improves memory management efficiency by "
+                        "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
+                        "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '
@@ -2655,6 +2717,8 @@ def _add_moe_args(parser):
                        'The expert bias is updated based on the number of assigned tokens to each expert in a global batch, '
                        'where the bias is increased for the experts with less assigned tokens and decreased for the experts with more assigned tokens. '
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
+    group.add_argument('--moe-router-force-load-balancing', action='store_true',
+                       help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,

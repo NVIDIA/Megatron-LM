@@ -14,13 +14,13 @@ from typing import Optional, Union
 import torch
 from torch import Tensor, nn
 
-from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -111,6 +111,8 @@ class MambaStack(MegatronModule):
             Defaults to True.
         device (optional): the device to use. Defaults to None.
         dtype (optional): the data type to use. Defaults to None.
+        model_comm_pgs (ModelCommProcessGroups): the required model communication
+            process groups to use.
     """
 
     def __init__(
@@ -126,12 +128,17 @@ class MambaStack(MegatronModule):
         post_process: bool = True,
         device=None,
         dtype=None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+
+        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaStack"
+
+        self.pp_group = model_comm_pgs.pp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -148,7 +155,7 @@ class MambaStack(MegatronModule):
         )
 
         pp_layer_offset = 0
-        if parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        if self.pp_group.size() > 1:
             pp_layer_offset, layer_type_list = self._select_layers_for_pipeline_parallel(
                 layer_type_list
             )
@@ -163,16 +170,23 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
+                        tp_group=model_comm_pgs.tp,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
-                        submodules.attention_layer, config=self.config, layer_number=i + 1
+                        submodules.attention_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        model_comm_pgs=model_comm_pgs,
                     )
                 elif layer_type == LayerSymbols.MLP:
                     # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
-                        submodules.mlp_layer, config=self.config, layer_number=i + 1
+                        submodules.mlp_layer,
+                        config=self.config,
+                        layer_number=i + 1,
+                        model_comm_pgs=model_comm_pgs,
                     )
                 else:
                     assert False, "unexpected layer_type"
@@ -198,17 +212,14 @@ class MambaStack(MegatronModule):
         )
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
-        num_layers_per_pipeline_rank = (
-            self.config.num_layers // parallel_state.get_pipeline_model_parallel_world_size()
-        )
+        num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
 
         assert self.config.virtual_pipeline_model_parallel_size is None, (
             "The Mamba hybrid model does not currently support "
             "virtual/interleaved pipeline parallelism"
         )
 
-        offset = pipeline_rank * num_layers_per_pipeline_rank
+        offset = self.pp_group.rank() * num_layers_per_pipeline_rank
         selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
 
         return offset, selected_list
@@ -355,7 +366,10 @@ class MambaStack(MegatronModule):
         return hidden_states
 
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
+        self,
+        prefix: str = '',
+        sharded_offsets: Optional[tuple] = None,
+        metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """
         Returns a sharded state dictionary for the current object.

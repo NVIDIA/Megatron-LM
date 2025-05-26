@@ -159,7 +159,11 @@ class TELinear(te.pytorch.Linear):
                 raise RuntimeError(
                     f"Only TE with version 2.3.0.dev0+5f16c79 supports delay_wgrad_compute now."
                 )
-        if tp_comm_buffer_name and tp_comm_buffer_name not in ['qkv', 'proj', 'fc1', 'fc2']:
+        if (
+            self.config.tp_comm_overlap
+            and tp_comm_buffer_name
+            and tp_comm_buffer_name not in ['qkv', 'proj', 'fc1', 'fc2']
+        ):
             self.config.tp_comm_overlap = False
             warnings.warn(
                 f"The user buffer name {tp_comm_buffer_name} is not supported in"
@@ -1030,7 +1034,12 @@ if is_te_min_version("1.9.0.dev0"):
                 Merge multiple "_extra_state" into one.
                 """
                 self.init_fp8_metadata(num_gemms=self.num_gemms)
-                fp8_checkpoint = self.fp8_meta["fp8_checkpoint"] or self.fp8 or self.fp8_calibration
+                # When resume training, loading ckpt is out of fp8_autocast context.
+                # So we need to manually detect from the state_dict.
+                fp8_checkpoint = any("_extra_state" in str(key) for key in state_dict.keys())
+
+                if not fp8_checkpoint:
+                    return
 
                 try:
                     state_list = [
@@ -1040,8 +1049,19 @@ if is_te_min_version("1.9.0.dev0"):
                     # "_extra_state{i}" only exists for dist-ckpt. Return for torch native ckpt.
                     return
 
-                if not fp8_checkpoint:
+                # Early return conditions:
+                # 1. Empty state_dict
+                # 2. Empty state_list
+                # 3. _extra_state is None
+                # 4. _extra_state does not contain any information
+                if (
+                    not state_dict
+                    or not state_list
+                    or state_dict.get(f"{prefix}_extra_state") is None
+                    or self._decode_extra_state(state_dict[f"{prefix}_extra_state"]) is None
+                ):
                     return
+
                 state_list = [state_dict.pop(f"{prefix}_extra_state")] + state_list
                 state_list = [self._decode_extra_state(state) for state in state_list]
                 extra_fp8_variables = state_list[0]['extra_fp8_variables']
@@ -1049,6 +1069,7 @@ if is_te_min_version("1.9.0.dev0"):
                 extra_state = {"extra_fp8_variables": extra_fp8_variables}
                 # TE 2.0 adds recipe in extra_state
                 if is_te_min_version("2.0.0"):
+                    self.fp8_meta["recipe"] = state_list[0]['recipe']
                     extra_state['recipe'] = self.fp8_meta["recipe"]
                 # Only delayed scaling has global fp8 meta tensors. We're not using
                 # self.fp8_meta["recipe"].delayed() because it's available in TE 2.0 and later.

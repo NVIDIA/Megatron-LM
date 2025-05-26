@@ -124,6 +124,62 @@ def _deinit_distributed():
     torch.distributed.barrier()
 
 
+@pytest.mark.parametrize(
+    "msg,suffix",
+    [(None, None), ("test_message", None), (None, "test_suffix"), ("test_message", "test_suffix")],
+)
+def test_nvtx_range(msg, suffix):
+    # Track function execution
+    execution_tracker = {'ranges': False}
+
+    def _call_nvtx_range():
+        util.nvtx_range_push(msg, suffix)
+        execution_tracker['ranges'] = True
+        util.nvtx_range_pop(msg, suffix)
+
+    # Test with NVTX disabled
+    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '0'}):
+        _call_nvtx_range()
+        assert execution_tracker['ranges']
+
+    # Reset tracker
+    execution_tracker['ranges'] = False
+
+    # Test with NVTX enabled
+    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '1'}):
+        _call_nvtx_range()
+        assert execution_tracker['ranges']
+
+
+def test_nvtx_decorator():
+    # Track function execution
+    execution_tracker = {'decorated': False, 'decorated_with_message': False}
+
+    # Create decorated functions
+    @util.nvtx_decorator()
+    def nvtx_decorated_function():
+        execution_tracker['decorated'] = True
+
+    @util.nvtx_decorator(message="test_nvtx_decorator", color="red")
+    def nvtx_decorated_function_with_message():
+        execution_tracker['decorated_with_message'] = True
+
+    # Test with NVTX disabled
+    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '0'}):
+        nvtx_decorated_function()
+        nvtx_decorated_function_with_message()
+        assert all(execution_tracker.values())
+
+    # Reset tracker
+    execution_tracker = {'decorated': False, 'decorated_with_message': False}
+
+    # Test with NVTX enabled
+    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '1'}):
+        nvtx_decorated_function()
+        nvtx_decorated_function_with_message()
+        assert all(execution_tracker.values())
+
+
 @pytest.mark.flaky_in_dev
 def test_check_param_hashes_across_dp_replicas():
     world = int(os.getenv('WORLD_SIZE', '1'))

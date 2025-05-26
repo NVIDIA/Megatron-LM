@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}"
+  name: "{test_case}_{environment}_{platforms}"
   model: common
   build: mcore-pyt-{environment}
   nodes: 1
@@ -34,12 +34,19 @@ spec:
   script: |-
     ls
     cd /opt/megatron-lm
-    torchrun --nproc_per_node 8 -m tests.functional_tests.test_cases.common.{test_case}
+
+    torchrun \
+      --log-dir {assets_dir}/logs/1 \
+      --tee "0:3,7:3" \
+      --redirects "3" \
+      --nproc_per_node 8 \
+      -m tests.functional_tests.test_cases.common.{test_case}
 
 products:
   - test_case: [ckpt_converter]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
       - environment: [lts]
         scope: [nightly]

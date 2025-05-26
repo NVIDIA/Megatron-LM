@@ -215,7 +215,7 @@ variables:
       - "dgxa100_dracooci-ord"
     description: "Cluster for A100 workloads"
   CLUSTER_H100:
-    value: "dgxh100_eos"
+    value: "dgxh100_coreweave"
     options:
       - "dgxh100_coreweave"
       - "dgxh100_eos"
@@ -245,6 +245,7 @@ variables:
   CI_MCORE_DEV_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_dev
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
   UTILITY_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_utility
+  TE_GIT_REF: ""
 
 include:
   - .gitlab/stages/00.pre.yml

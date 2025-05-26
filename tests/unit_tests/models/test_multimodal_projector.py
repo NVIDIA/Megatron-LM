@@ -1,6 +1,6 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import pytest
+
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec

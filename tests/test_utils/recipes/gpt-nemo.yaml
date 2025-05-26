@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}"
+  name: "{test_case}_{environment}_{platforms}"
   model: gpt-nemo
   build: mcore-nemo
   nodes: 1
@@ -46,18 +46,20 @@ spec:
         "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/{name}"
         "TRAINING_SCRIPT_PATH=\"nemo llm pretrain -y --factory llama3_8b\""
         "TRAINING_PARAMS_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "GOLDEN_VALUES_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
     )
 
     bash /opt/megatron-lm/tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  # - test_case: [llama3-nemo_8b_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp2_dgx_a100_1N8G] # needs a fix
-  #   products:
-  #     - environment: [dev]
-  #       scope: [mr]
+  - test_case: [llama3-nemo_8b_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [llama3-nemo_8b_mr_mbs4_gbs64_mcore_te_tp1_pp1_cp2_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_h100]

@@ -71,8 +71,6 @@ integration:configure:
         "--n-repeat 1"
         "--time-limit $INTEGRATION_TEST_TIME_LIMIT"
         "--test-cases $INTEGRATION_TEST_CASES"
-        "--a100-cluster $A100_CLUSTER"
-        "--h100-cluster $H100_CLUSTER"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--slurm-account ${CI_SLURM_ACCOUNT}"
@@ -85,17 +83,39 @@ integration:configure:
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         ${ARGS[@]} \
         --environment dev \
-        --output-path "functional-test-job-dev.yaml"
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-dev-A100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment dev \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-dev-H100.yaml"
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         ${ARGS[@]} \
         --environment lts \
-        --output-path "functional-test-job-lts.yaml"
+        --platform dgx_a100 \
+        --cluster $A100_CLUSTER \
+        --output-path "functional-test-job-lts-A100.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment lts \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-test-job-lts-H100.yaml"
   artifacts:
     paths:
-      - functional-test-job-lts.yaml
-      - functional-test-job-dev.yaml
+      - functional-test-job-lts-A100.yaml
+      - functional-test-job-lts-H100.yaml
+      - functional-test-job-dev-H100.yaml
+      - functional-test-job-dev-A100.yaml
       - tests/test_utils/local_recipes
 
 .integration_run:
@@ -106,7 +126,7 @@ integration:configure:
   extends: [.integration_tests_rules]
   trigger:
     include:
-      - artifact: functional-test-job-$ENVIRONMENT.yaml
+      - artifact: functional-test-job-$ENVIRONMENT-$CLUSTER.yaml
         job: integration:configure
     strategy: depend
   variables:
@@ -121,12 +141,26 @@ integration:configure:
   inherit:
     variables: true
 
-integration:run_lts:
+integration:run_lts_dgx_a100:
   extends: [.integration_run]
   variables:
     ENVIRONMENT: lts
+    CLUSTER: A100
 
-integration:run_dev:
+integration:run_lts_dgx_h100:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: lts
+    CLUSTER: H100
+
+integration:run_dev_dgx_a100:
   extends: [.integration_run]
   variables:
     ENVIRONMENT: dev
+    CLUSTER: A100
+
+integration:run_dev_dgx_h100:
+  extends: [.integration_run]
+  variables:
+    ENVIRONMENT: dev
+    CLUSTER: H100

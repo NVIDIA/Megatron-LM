@@ -10,7 +10,7 @@ import logging
 import math
 import os
 import sys
-from typing import List
+from typing import List, Optional
 
 import torch.distributed
 from .log_handler import CustomHandler
@@ -32,6 +32,12 @@ try:
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
+
+try:
+    from nvidia_resiliency_ext.inprocess import CallWrapper
+except ImportError:
+    CallWrapper = type(None)
+
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
@@ -202,7 +208,7 @@ def num_floating_point_operations(args, batch_size):
                      num_attn_layers, num_mamba_layers, num_mlp_layers,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
-                     num_attn_heads=32,gqa=True, 
+                     num_attn_heads=32,gqa=True,
                      gqa_groups=8, kv_channels=None,
                      mlp_expansion=4.0, swiglu=False,
                      vocab_size=256000):
@@ -670,6 +676,8 @@ def pretrain(
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
     non_loss_data_func=None,
+    store=None,
+    inprocess_call_wrapper: Optional[CallWrapper] = None,
 ):
     """Main training program.
 
@@ -702,7 +710,15 @@ def pretrain(
         get_position_embedding_ranks (TODO):
         non_loss_data_func (callable): A custom function to call during evaluation.
             It can run e.g. benchmarks.
+        store: an optional instance of torch.distributed.Store, to be used by
+            torch.distributed.init_process_group
+        inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
+            it is automatically injected when in-process restart is in use
     """
+
+    if inprocess_call_wrapper is not None:
+        iteration = inprocess_call_wrapper.iteration
+        store = torch.distributed.PrefixStore(str(iteration), store)
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
@@ -710,6 +726,7 @@ def pretrain(
         args_defaults=args_defaults,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
+        store=store,
     )
 
     args = get_args()
@@ -802,7 +819,6 @@ def pretrain(
         valid_data_iterator = []
         test_data_iterator = []
         for i in range(len(model)):
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
             iterators = build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
             train_data_iterator.append(iterators[0])
             valid_data_iterator.append(iterators[1])
@@ -976,18 +992,17 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 ), "Interleaved schedule not supported for model with encoder on separate PP rank"
             model = []
             for i in range(args.virtual_pipeline_model_parallel_size):
-                mpu.set_virtual_pipeline_model_parallel_rank(i)
                 # Set pre_process and post_process only after virtual rank is set.
-                pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False)
-                post_process = mpu.is_pipeline_last_stage(ignore_virtual=False)
+                pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
+                post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
                 this_model = model_provider_func(
                     pre_process=pre_process, post_process=post_process, vp_stage=i)
                 this_model.model_type = model_type
                 this_model.vp_stage = i
                 model.append(this_model)
         else:
-            pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False)
-            post_process = mpu.is_pipeline_last_stage(ignore_virtual=False)
+            pre_process = mpu.is_pipeline_first_stage()
+            post_process = mpu.is_pipeline_last_stage()
             add_encoder = True
             add_decoder = True
             if model_type == ModelType.encoder_and_decoder:
@@ -1074,7 +1089,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             DP = DDP
 
         config = get_model_config(model[0])
- 
+
         if getattr(args, "use_torch_fsdp2", False):
             reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
             ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)

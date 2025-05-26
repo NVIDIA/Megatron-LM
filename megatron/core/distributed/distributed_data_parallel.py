@@ -292,6 +292,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         param_to_name,
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
+                        self.ddp_config.nccl_ub,
                     )
                 )
 

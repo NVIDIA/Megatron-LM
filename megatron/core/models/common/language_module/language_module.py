@@ -133,14 +133,16 @@ class LanguageModule(MegatronModule):
             return
 
         if (
-            parallel_state.is_pipeline_first_stage(ignore_virtual=False)
+            parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage)
             and self.pre_process
             and not self.post_process
         ):
             self.shared_embedding_or_output_weight().shared_embedding = True
 
         if (self.post_process or getattr(self, 'mtp_process', False)) and not self.pre_process:
-            assert not parallel_state.is_pipeline_first_stage(ignore_virtual=False)
+            assert not parallel_state.is_pipeline_first_stage(
+                ignore_virtual=False, vp_stage=self.vp_stage
+            )
             # set weights of the duplicated embedding to 0 here,
             # then copy weights from pre processing stage using all_reduce below.
             weight = self.shared_embedding_or_output_weight()
@@ -164,7 +166,9 @@ class LanguageModule(MegatronModule):
         # Ensure that first and last stages have the same initial parameter
         # values.
         if torch.distributed.is_initialized():
-            if parallel_state.is_rank_in_embedding_group(ignore_virtual=False):
+            if parallel_state.is_rank_in_embedding_group(
+                ignore_virtual=False, vp_stage=self.vp_stage
+            ):
                 weight = self.shared_embedding_or_output_weight()
                 weight.data = weight.data.cuda()
                 torch.distributed.all_reduce(

@@ -7,18 +7,36 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.jit import jit_fuser
+from megatron.core.utils import nvtx_decorator
 
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
 
 
 @jit_fuser
 def swiglu(y):
+    """Performs SwiGLU (Swish-Gated Linear Unit) activation function.
+
+    Args:
+        y (torch.Tensor): Input tensor to be split into two halves along the last dimension.
+
+    Returns:
+        torch.Tensor: Result of SwiGLU activation: SiLU(y1) * y2, where y1, y2 are the split halves.
+    """
     y_1, y_2 = torch.chunk(y, 2, -1)
     return F.silu(y_1) * y_2
 
 
 @jit_fuser
 def bias_swiglu(y, bias):
+    """Performs SwiGLU activation with bias addition.
+
+    Args:
+        y (torch.Tensor): Input tensor.
+        bias (torch.Tensor): Bias tensor to be added to input.
+
+    Returns:
+        torch.Tensor: Result of bias addition followed by SwiGLU activation.
+    """
     y = y + bias
     return swiglu(y)
 
@@ -35,6 +53,16 @@ def weighted_swiglu(y, weights):
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
 @jit_fuser
 def swiglu_back(g, y):
+    """Computes the gradient for the SwiGLU activation function.
+
+    Args:
+        g (torch.Tensor): Gradient tensor from the subsequent layer.
+        y (torch.Tensor): Input tensor that was used in the forward pass.
+
+    Returns:
+        torch.Tensor: Gradient with respect to the input tensor, computed using the
+            chain rule and the derivative of the SiLU activation function.
+    """
     y_1, y_2 = torch.chunk(y, 2, -1)
     return torch.cat(
         (g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2, g * F.silu(y_1)), -1
@@ -43,6 +71,17 @@ def swiglu_back(g, y):
 
 @jit_fuser
 def bias_swiglu_back(g, y, bias):
+    """Computes the gradient for the biased SwiGLU activation function.
+
+    Args:
+        g (torch.Tensor): Gradient tensor from the subsequent layer.
+        y (torch.Tensor): Input tensor that was used in the forward pass.
+        bias (torch.Tensor): Bias tensor that was added in the forward pass.
+
+    Returns:
+        torch.Tensor: Gradient with respect to the input tensor, computed after
+            applying the bias addition.
+    """
     y = y + bias
     return swiglu_back(g, y)
 
@@ -59,9 +98,22 @@ def weighted_swiglu_back(g, y, weights):
 
 
 class BiasSwiGLUFunction(torch.autograd.Function):
+    """Custom autograd function for SwiGLU activation with bias support."""
+
     @staticmethod
-    # bias is an optional argument
+    @nvtx_decorator()
     def forward(ctx, input, bias, fp8_input_store):
+        """Forward pass of biased SwiGLU activation.
+
+        Args:
+            ctx: Autograd context object for saving tensors for backward pass.
+            input (torch.Tensor): Input tensor to apply SwiGLU to.
+            bias (torch.Tensor): Bias tensor to be added to input before SwiGLU.
+            fp8_input_store (bool): If True, stores intermediate values in FP8 format.
+
+        Returns:
+            torch.Tensor: Result of applying bias addition followed by SwiGLU activation.
+        """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward, bias)
         ctx.ori_input_dtype = input.dtype
@@ -69,7 +121,20 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         return bias_swiglu(input, bias)
 
     @staticmethod
+    @nvtx_decorator()
     def backward(ctx, grad_output):
+        """Backward pass of biased SwiGLU activation.
+
+        Args:
+            ctx: Autograd context object containing saved tensors from forward pass.
+            grad_output (torch.Tensor): Gradient of the loss with respect to the output.
+
+        Returns:
+            tuple: Tuple containing:
+                - Gradient with respect to the input tensor
+                - Gradient with respect to the bias tensor
+                - None for fp8_input_store parameter
+        """
         input, bias = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = bias_swiglu_back(grad_output, input, bias)
@@ -77,9 +142,21 @@ class BiasSwiGLUFunction(torch.autograd.Function):
 
 
 class SwiGLUFunction(torch.autograd.Function):
+    """Custom autograd function for SwiGLU activation without bias."""
+
     @staticmethod
-    # bias is an optional argument
+    @nvtx_decorator()
     def forward(ctx, input, fp8_input_store):
+        """Forward pass of SwiGLU activation.
+
+        Args:
+            ctx: Autograd context object for saving tensors for backward pass.
+            input (torch.Tensor): Input tensor to apply SwiGLU to.
+            fp8_input_store (bool): If True, stores intermediate values in FP8 format.
+
+        Returns:
+            torch.Tensor: Result of applying SwiGLU activation.
+        """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward)
         ctx.ori_input_dtype = input.dtype
@@ -87,7 +164,19 @@ class SwiGLUFunction(torch.autograd.Function):
         return swiglu(input)
 
     @staticmethod
+    @nvtx_decorator()
     def backward(ctx, grad_output):
+        """Backward pass of SwiGLU activation.
+
+        Args:
+            ctx: Autograd context object containing saved tensors from forward pass.
+            grad_output (torch.Tensor): Gradient of the loss with respect to the output.
+
+        Returns:
+            tuple: Tuple containing:
+                - Gradient with respect to the input tensor
+                - None for fp8_input_store parameter
+        """
         input = ctx.saved_tensors[0]
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = swiglu_back(grad_output, input)
@@ -113,8 +202,23 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
 
 
 def bias_swiglu_impl(input, bias, fp8_input_store=False):
-    """
-    Bias swiglu fusion.
+    """Implementation of biased SwiGLU that handles different input shapes.
+
+    This function reshapes the input if necessary, applies the SwiGLU activation
+    (with or without bias), and restores the original shape.
+
+    Args:
+        input (torch.Tensor): Input tensor to apply SwiGLU activation.
+        bias (torch.Tensor, optional): Bias tensor to be added to input. If None,
+            uses the bias-free SwiGLU variant.
+        fp8_input_store (bool, optional): Whether to store intermediate values in FP8 format.
+            Defaults to False.
+
+    Returns:
+        torch.Tensor: Result of biased SwiGLU activation.
+
+    Raises:
+        AssertionError: If input tensor does not have 2 or 3 dimensions.
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]

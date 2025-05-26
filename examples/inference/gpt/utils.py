@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import random
-import simpy
 import time
 import torch
 from argparse import ArgumentParser, Namespace
@@ -118,6 +117,7 @@ def get_user_requests(args: Namespace, tokenizer: Any) -> List[Request]:
 def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
     """Get example requests."""
 
+    import simpy  # Guard against this import in test case
     random.seed(args.seed)
 
     # Generate random time offsets.

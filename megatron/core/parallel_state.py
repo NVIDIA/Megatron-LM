@@ -816,24 +816,6 @@ def initialize_model_parallel(
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
     assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
 
-    for ranks in generator_wrapper('dp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp', nccl_comm_cfgs),
-            group_desc='DATA_PARALLEL_GROUP',
-        )
-        if create_gloo_process_groups:
-            group_gloo = create_group(
-                ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
-            )
-        else:
-            group_gloo = None
-        if rank in ranks:
-            _DATA_PARALLEL_GROUP = group
-            _DATA_PARALLEL_GROUP_GLOO = group_gloo
-            _DATA_PARALLEL_GLOBAL_RANKS = ranks
-
     assert (
         data_parallel_size * context_parallel_size
     ) % num_distributed_optimizer_instances == 0, (
@@ -843,6 +825,11 @@ def initialize_model_parallel(
         data_parallel_size * context_parallel_size
     ) // num_distributed_optimizer_instances
 
+    # In case of using SHARP, the dp-cp group requires to use NCCL COLLNET feature.
+    # Due to the hardware limitation, only the initially created communication group
+    # is eligible for using the NCCL COLLNET feature.
+    # Therefore, dp-cp group, which potentially requires SHARP-enablement,
+    # need to be created before all the other groups
     for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = create_group(
             ranks_with_cp,
@@ -915,6 +902,24 @@ def initialize_model_parallel(
         )
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
         os.environ["NCCL_COLLNET_ENABLE"] = "0"
+
+    for ranks in generator_wrapper('dp'):
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options('dp', nccl_comm_cfgs),
+            group_desc='DATA_PARALLEL_GROUP',
+        )
+        if create_gloo_process_groups:
+            group_gloo = create_group(
+                ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
+            )
+        else:
+            group_gloo = None
+        if rank in ranks:
+            _DATA_PARALLEL_GROUP = group
+            _DATA_PARALLEL_GROUP_GLOO = group_gloo
+            _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
     # Build the context-parallel groups.
     global _CONTEXT_PARALLEL_GROUP
@@ -1556,42 +1561,20 @@ def get_pipeline_model_parallel_split_rank():
 
 def is_pipeline_first_stage(ignore_virtual=True, vp_stage=None):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
-    if not ignore_virtual:
-        # Note: This is a temporary check to ensure that vp_stage is passed correctly,
-        # after which we'll remove virtual pipeline rank in global scope and make
-        # passing vp_stage mandatory.
-        if vp_stage is not None:
-            assert (
-                get_virtual_pipeline_model_parallel_rank() == vp_stage
-            ), "get_virtual_pipeline_model_parallel_rank() is not equal to vp_stage"
+    if not ignore_virtual and get_virtual_pipeline_model_parallel_world_size() is not None:
+        assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
 
-        if (
-            get_virtual_pipeline_model_parallel_world_size() is not None
-            and get_virtual_pipeline_model_parallel_rank() != 0
-        ):
+        if vp_stage != 0:
             return False
     return get_pipeline_model_parallel_rank() == 0
 
 
 def is_pipeline_last_stage(ignore_virtual=True, vp_stage=None):
     """Return True if in the last pipeline-model-parallel stage, False otherwise."""
-    if not ignore_virtual:
-        # Note: This is a temporary check to ensure that vp_stage is passed correctly,
-        # after which we'll remove virtual pipeline rank in global scope and make
-        # passing vp_stage mandatory.
-        if vp_stage is not None:
-            assert (
-                get_virtual_pipeline_model_parallel_rank() == vp_stage
-            ), "get_virtual_pipeline_model_parallel_rank() is not equal to vp_stage"
+    if not ignore_virtual and get_virtual_pipeline_model_parallel_world_size() is not None:
+        assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
 
-        virtual_pipeline_model_parallel_world_size = (
-            get_virtual_pipeline_model_parallel_world_size()
-        )
-        if (
-            virtual_pipeline_model_parallel_world_size is not None
-            and get_virtual_pipeline_model_parallel_rank()
-            != (virtual_pipeline_model_parallel_world_size - 1)
-        ):
+        if vp_stage != (get_virtual_pipeline_model_parallel_world_size() - 1):
             return False
     return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
 
@@ -1711,6 +1694,11 @@ def get_virtual_pipeline_model_parallel_rank():
 
 def set_virtual_pipeline_model_parallel_rank(rank):
     """Set the virtual pipeline-parallel rank."""
+    warnings.warn(
+        "set_virtual_pipeline_model_parallel_rank in global scope is deprecated. "
+        "Pass vp_stage explicitly to is_pipeline_first_stage, is_pipeline_last_stage, etc.",
+        DeprecationWarning,
+    )
     global _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK
     _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = rank
 
