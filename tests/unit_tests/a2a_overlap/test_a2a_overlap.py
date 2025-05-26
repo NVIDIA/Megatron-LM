@@ -151,18 +151,16 @@ def run_model_a2a_overlap_with_capture(model, input_tensors, microbatches):
     output_tensors = []
 
     # forward for 1st microbatch
-    output, _, _ = schedule_layer_1f1b(layers[0], None, f_input=input_tensors[0], b_grad=None)
+    output, _ = schedule_layer_1f1b(layers[0], None, f_input=input_tensors[0], b_grad=None)
     output_tensors.append(output)
     torch.cuda.synchronize()
     # overlapped forward and backward
     pre_backward_dw = None
     for i in range(1, microbatches):
-        pre_forward, pre_backward, pre_backward_dw = schedule_layer_1f1b(
+        output, _ = schedule_layer_1f1b(
             layers[i], layers[i - 1], f_input=input_tensors[i], b_grad=torch.ones_like(output)
         )
-        output_tensors.append(pre_forward())
-        pre_backward()
-        pre_backward_dw()
+        output_tensors.append(output)
         torch.cuda.synchronize()
     # backward for last microbatch
     schedule_layer_1f1b(None, layers[-1], f_input=None, b_grad=torch.ones_like(output))
