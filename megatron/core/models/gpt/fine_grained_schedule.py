@@ -157,7 +157,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         cls,
         f_schedule_plan,
         b_schedule_plan,
-        grad=None,
+        b_grad=None,
         f_context=None,
         b_context=None,
         pre_forward=None,
@@ -183,7 +183,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         return schedule_chunk_1f1b(
             f_schedule_plan,
             b_schedule_plan,
-            grad=grad,
+            b_grad=b_grad,
             f_context=f_context,
             b_context=b_context,
             pre_forward=pre_forward,
@@ -251,9 +251,6 @@ def schedule_layer_1f1b(
     b_layer,
     f_input=None,
     b_grad=None,
-    pre_forward=None,
-    pre_backward=None,
-    pre_backward_dw=None,
     f_context=None,
     b_context=None,
 ):
@@ -279,29 +276,10 @@ def schedule_layer_1f1b(
     f_context = f_context if f_context is not None else contextlib.nullcontext()
     b_context = b_context if b_context is not None else contextlib.nullcontext()
 
-    # TODO: Find a better way to handle pre_backward and pre_forward.
-    # Ideally pre_forward should launch before pre_backward only if
-    # pre_forward is communication.
-    if pre_backward is not None:
-        # attn backward from last iter
-        assert b_grad is None
-        b_grad = pre_backward()
-        del pre_backward
-
-    if pre_forward is not None:
-        assert f_input is None
-        # combine/post_process from last iter
-        f_input = pre_forward()
-        del pre_forward
-
     if b_layer is not None:
         with b_context:
             b_grad = b_layer.post_process.backward(b_grad)
             b_grad = b_layer.combine.backward(b_grad)
-
-    if pre_backward_dw is not None:
-        pre_backward_dw()
-        del pre_backward_dw
 
     if f_layer is not None:
         with f_context and f_layer.get_fp8_context():
@@ -325,35 +303,30 @@ def schedule_layer_1f1b(
         with f_context and f_layer.get_fp8_context():
             f_input = f_layer.mlp.forward(f_input)
 
-    def next_iter_pre_forward():
-        if f_layer is not None:
-            with f_context and f_layer.get_fp8_context():
-                output = f_layer.combine.forward(f_input)
-                output = f_layer.post_process.forward(output)
-                return output
+    # TODO: Find a better way to handle pre_backward and pre_forward.
+    # Ideally pre_forward should launch before pre_backward only if
+    # pre_forward is communication.
+    if f_layer is not None:
+        with f_context and f_layer.get_fp8_context():
+            f_input = f_layer.combine.forward(f_input)
+            f_input = f_layer.post_process.forward(f_input)
 
-    def next_iter_pre_backward():
-        if b_layer is not None:
-            with b_context:
-                grad = b_layer.post_attn.backward(b_grad)
-                grad = b_layer.attn.backward(grad)
-                return grad
+    if b_layer is not None:
+        with b_context:
+            b_grad = b_layer.post_attn.backward(b_grad)
+            b_grad = b_layer.attn.backward(b_grad)
 
-    def next_iter_pre_backward_dw():
-        if b_layer is not None:
-            with b_context:
-                b_layer.attn.backward_dw()
+    if b_layer is not None:
+        with b_context:
+            b_layer.attn.backward_dw()
 
-    if f_layer and b_layer:
-        return next_iter_pre_forward, next_iter_pre_backward, next_iter_pre_backward_dw
-    else:
-        return next_iter_pre_forward(), next_iter_pre_backward(), next_iter_pre_backward_dw()
+    return f_input, b_grad
 
 
 def schedule_chunk_1f1b(
     f_schedule_plan,
     b_schedule_plan,
-    grad=None,
+    b_grad=None,
     f_context=None,
     b_context=None,
     pre_forward=None,
@@ -369,7 +342,7 @@ def schedule_chunk_1f1b(
     Args:
         f_schedule_plan: Forward schedule plan.
         b_schedule_plan: Backward schedule plan.
-        grad: Gradient for backward computation.
+        b_grad: Gradient for backward computation.
         f_context: Context for forward computation.
         b_context: Context for backward computation.
         pre_forward: Callback for preprocessing in forward pass.
@@ -382,50 +355,35 @@ def schedule_chunk_1f1b(
     f_context = f_context if f_context is not None else contextlib.nullcontext()
     b_context = b_context if b_context is not None else contextlib.nullcontext()
 
+    f_input = None
     if f_schedule_plan:
         # pp output send/receive sync
         if pre_forward is not None:
             with f_context as ctx:  # virtual pipeline parallel context
                 pre_forward(ctx.vpp_rank)
         f_schedule_plan.record_current_stream()
+        f_input = f_schedule_plan.pre_process.forward()
 
     if b_schedule_plan:
         b_schedule_plan.record_current_stream()
+        assert b_grad is not None
 
-    f_input = None
+        if pre_backward is not None:
+            # If post_process is FakeScheduleNode, it means the last node is running in the communication stream,
+            if isinstance(b_schedule_plan.post_process, FakeScheduleNode):
+                stream = get_com_stream()
+            else:
+                stream = get_comp_stream()
+            with torch.cuda.stream(stream):
+                b_schedule_plan.wait_current_stream()
+                with b_context as ctx:  # virtual pipeline parallel context
+                    pre_backward(ctx.vpp_rank)
+                b_schedule_plan.record_current_stream()
 
-    def layer_pre_forward():
-        tmp = f_input
-        if f_schedule_plan is not None:
-            tmp = f_schedule_plan.pre_process.forward()
-        return tmp
-
-    def layer_pre_backward():
-        tmp = grad
-        if b_schedule_plan is not None:
-            assert grad is not None
-
-            if pre_backward is not None:
-                # pp grad send receive sync here, safe for now, maybe not safe in the future
-                if isinstance(b_schedule_plan.post_process, FakeScheduleNode):
-                    stream = get_com_stream()
-                else:
-                    stream = get_comp_stream()
-                with torch.cuda.stream(stream):
-                    b_schedule_plan.wait_current_stream()
-                    with b_context as ctx:  # virtual pipeline parallel context
-                        pre_backward(ctx.vpp_rank)
-                    b_schedule_plan.record_current_stream()
-
-            if b_schedule_plan.post_process is not None:
-                with b_context:  # virtual pipeline parallel context
-                    tmp = b_schedule_plan.post_process.backward(grad)
-                    # b_schedule_plan.post_process.backward_dw()
-
-        return tmp
-
-    def layer_pre_backward_dw():
-        pass
+        if b_schedule_plan.post_process is not None:
+            with b_context:  # virtual pipeline parallel context
+                b_grad = b_schedule_plan.post_process.backward(b_grad)
+                # b_schedule_plan.post_process.backward_dw()
 
     f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
     b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
@@ -435,35 +393,28 @@ def schedule_chunk_1f1b(
         f_layer = f_schedule_plan.get_layer(i)
         b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
         torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_num_layers - 1 - i}b")
-        layer_pre_forward, layer_pre_backward, layer_pre_backward_dw = schedule_layer_1f1b(
+        f_input, b_grad = schedule_layer_1f1b(
             f_layer,
             b_layer,
-            pre_forward=layer_pre_forward,
-            pre_backward=layer_pre_backward,
-            pre_backward_dw=layer_pre_backward_dw,
+            f_input=f_input,
+            b_grad=b_grad,
             f_context=f_context,
             b_context=b_context,
         )
         torch.cuda.nvtx.range_pop()
 
-    # tail forward
-    f_input = layer_pre_forward()
-    del layer_pre_forward
-    # tail backward
-    grad = layer_pre_backward()
-    del layer_pre_backward
     with b_context:
         for i in range(overlaped_layers, b_num_layers):
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
-            tmp, grad, _ = schedule_layer_1f1b(None, b_layer, b_grad=grad)
+            _, b_grad = schedule_layer_1f1b(None, b_layer, b_grad=b_grad)
             torch.cuda.nvtx.range_pop()
 
     with f_context:
         for i in range(overlaped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
             torch.cuda.nvtx.range_push(f"layer_{i}f")
-            f_input, tmp, _ = schedule_layer_1f1b(f_layer, None, f_input=f_input)
+            f_input, _ = schedule_layer_1f1b(f_layer, None, f_input=f_input)
             torch.cuda.nvtx.range_pop()
 
     if f_schedule_plan is not None and post_forward is not None:
@@ -479,18 +430,14 @@ def schedule_chunk_1f1b(
     if b_schedule_plan is not None and post_backward is not None:
         with b_context as ctx:
             b_schedule_plan.wait_current_stream()
-            post_backward(grad, ctx.vpp_rank)
-
-    # The last wgrad of attention
-    layer_pre_backward_dw()
-    del layer_pre_backward_dw
+            post_backward(b_grad, ctx.vpp_rank)
 
     with f_context:
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
             f_input = f_schedule_plan.post_process.forward(f_input)
     with b_context:
         if b_schedule_plan is not None:
-            b_schedule_plan.pre_process.backward(grad)
+            b_schedule_plan.pre_process.backward(b_grad)
 
     if f_schedule_plan:
         f_schedule_plan.wait_current_stream()

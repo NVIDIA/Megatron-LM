@@ -20,7 +20,7 @@ Shape = Union[List[int], torch.Size]
 def schedule_chunk_1f1b(
     f_schedule_plan,
     b_schedule_plan,
-    grad=None,
+    b_grad=None,
     f_context=None,
     b_context=None,
     pre_forward=None,
@@ -54,7 +54,7 @@ def schedule_chunk_1f1b(
     return type(f_schedule_plan or b_schedule_plan).forward_backward(
         f_schedule_plan,
         b_schedule_plan,
-        grad=grad,
+        b_grad=b_grad,
         f_context=f_context,
         b_context=b_context,
         pre_forward=pre_forward,
@@ -206,13 +206,13 @@ def forward_backward_step(
     use_outer_fp8_context = config.fp8 and config.fp8_recipe == Fp8Recipe.delayed
     outer_fp8_context = get_fp8_context(config) if use_outer_fp8_context else nullcontext()
 
-    grad = b_output_tensor_grad[0] if b_model else None
+    b_grad = b_output_tensor_grad[0] if b_model else None
     with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
         # schedule forward and backward
         output_tensor = schedule_chunk_1f1b(
             f_schedule_plan,
             b_schedule_plan,
-            grad,
+            b_grad,
             f_context=f_context,
             b_context=b_context,
             pre_forward=pre_forward,
@@ -235,9 +235,15 @@ def forward_backward_step(
     num_tokens = None
     if f_model is not None:
         with f_context:
+            vp_stage = f_context.vpp_rank
             # The same as the forward_step()
+            model_vp_stage = getattr(f_model, "vp_stage", None)
+            if vp_stage is not None and model_vp_stage is not None:
+                assert (
+                    vp_stage == model_vp_stage
+                ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
             num_tokens = torch.tensor(0, dtype=torch.int)
-            if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+            if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
                 if not collect_non_loss_data:
                     loss_node = ScheduleNode(
                         loss_func,
