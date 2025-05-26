@@ -420,7 +420,7 @@ def schedule_chunk_1f1b(
             if b_schedule_plan.post_process is not None:
                 with b_context:  # virtual pipeline parallel context
                     tmp = b_schedule_plan.post_process.backward(grad)
-                    b_schedule_plan.post_process.backward_dw()
+                    # b_schedule_plan.post_process.backward_dw()
 
         return tmp
 
