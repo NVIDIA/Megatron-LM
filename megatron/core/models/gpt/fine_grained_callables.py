@@ -255,8 +255,7 @@ class TransformerLayerNode(ScheduleNode):
         detached_grad = tuple([e.grad for e in self.detached])
         grads = output_grad + detached_grad
         self.default_backward_func(outputs + self.before_detached, grads)
-        self.before_detached = None
-        self.detached = None
+        self._release_state()
         # return grads for record stream
         return grads
 
@@ -265,7 +264,15 @@ class TransformerLayerNode(ScheduleNode):
         with torch.cuda.nvtx.range(f"{self.name} wgrad"):
             for module in self.bwd_dw_callables:
                 module.backward_dw()
+        self.bwd_dw_callables = None
 
+    def _release_state(self):
+        # Release reference as early as possible, this helps avoid memory leak.
+        self.before_detached = None
+        self.detached = None
+        self.common_state = None
+        self.chunk_state = None
+        self.submodule = None
 
 def build_transformer_layer_callables(layer):
     """
