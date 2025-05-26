@@ -220,7 +220,7 @@ def forward_backward_step(
             post_forward=post_forward,
             post_backward=post_backward,
         )
-
+    
     # forward post process
     num_tokens = None
     if f_model is not None:
