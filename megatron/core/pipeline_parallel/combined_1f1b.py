@@ -270,7 +270,7 @@ def forward_backward_step(
             # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
             # explicitly.
             if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-                # Calculate the loss scale based on the grad_scale_func if available,
+                # Calculate the loss scale based on the grad_scale_func if available
                 # else default to 1.
                 loss_scale = (
                     config.grad_scale_func(torch.ones(1, device=output_tensor.device))
@@ -282,7 +282,8 @@ def forward_backward_step(
 
             # Set the loss scale for Multi-Token Prediction (MTP) loss.
             if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-                # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+                # Calculate the loss scale based on the grad_scale_func if available
+                # else default to 1.
                 loss_scale = (
                     config.grad_scale_func(torch.ones(1, device=output_tensor.device))
                     if config.grad_scale_func is not None

@@ -247,12 +247,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
 
 
 def schedule_layer_1f1b(
-    f_layer,
-    b_layer,
-    f_input=None,
-    b_grad=None,
-    f_context=None,
-    b_context=None,
+    f_layer, b_layer, f_input=None, b_grad=None, f_context=None, b_context=None
 ):
     """Schedule one-forward-one-backward operations for a single layer.
 
@@ -369,7 +364,7 @@ def schedule_chunk_1f1b(
         assert b_grad is not None
 
         if pre_backward is not None:
-            # If post_process is FakeScheduleNode, it means the last node is running in the communication stream,
+            # FakeScheduleNode means the post_process node is running in the communication stream,
             if isinstance(b_schedule_plan.post_process, FakeScheduleNode):
                 stream = get_com_stream()
             else:
