@@ -275,10 +275,24 @@ def forward_backward_step(
                 loss_scale = (
                     config.grad_scale_func(torch.ones(1, device=output_tensor.device))
                     if config.grad_scale_func is not None
-                    else torch.tensor(1.0)
+                    else torch.ones(1, device=output_tensor.device)
                 )
                 # Set the loss scale
                 MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+            # Set the loss scale for Multi-Token Prediction (MTP) loss.
+            if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+                # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+                loss_scale = (
+                    config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+                    if config.grad_scale_func is not None
+                    else torch.ones(1, device=output_tensor.device)
+                )
+                # Set the loss scale
+                if config.calculate_per_token_loss:
+                    MTPLossAutoScaler.set_loss_scale(loss_scale)
+                else:
+                    MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
             if not unwrap_output_tensor:
                 output_tensor, num_tokens = [output_tensor], num_tokens
