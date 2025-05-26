@@ -245,6 +245,15 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         """Gets the model chunk state."""
         return self._model_chunk_state
 
+    def release_state(self):
+        """Release reference, this helps avoid memory leak."""
+        self._pre_process.model_chunk_state = None
+        self._pre_process = None
+        
+        if self._post_process is not None:
+            self._post_process.model_chunk_state = None
+            self._post_process = None
+
 
 def schedule_layer_1f1b(
     f_layer, b_layer, f_input=None, b_grad=None, f_context=None, b_context=None
@@ -316,7 +325,6 @@ def schedule_layer_1f1b(
             b_layer.attn.backward_dw()
 
     return f_input, b_grad
-
 
 def schedule_chunk_1f1b(
     f_schedule_plan,
@@ -438,6 +446,10 @@ def schedule_chunk_1f1b(
         f_schedule_plan.wait_current_stream()
     if b_schedule_plan:
         b_schedule_plan.wait_current_stream()
+
+    # Release reference as early as possible, this helps avoid memory leak.
+    if b_schedule_plan is not None:
+        b_schedule_plan.release_state()
 
     return f_input
 

@@ -160,18 +160,25 @@ class ScheduleNode:
         for g in output_grad:
             g.record_stream(self.stream)
 
-        return self.get_grad()
+        grads = self.get_grad()
+        self._release_state()
+        
+        return grads
 
     def get_grad(self):
         """Get the grad of inputs"""
         grad = tuple([e.grad if e is not None else None for e in self.inputs])
-        # clear state
-        self.inputs = None
-        self.output = None
         # multiple in, multiple out
         if len(grad) == 1:
             grad = grad[0]
         return grad
+    
+    def _release_state(self):
+        """Clear the state of the node"""
+        self.inputs = None
+        self.output = None
+        del self.forward_func
+        del self.backward_func
 
 
 class AbstractSchedulePlan(ABC):
