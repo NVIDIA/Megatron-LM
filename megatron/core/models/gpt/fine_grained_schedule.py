@@ -249,7 +249,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         """Release reference, this helps avoid memory leak."""
         self._pre_process.model_chunk_state = None
         self._pre_process = None
-        
+
         if self._post_process is not None:
             self._post_process.model_chunk_state = None
             self._post_process = None
@@ -325,6 +325,7 @@ def schedule_layer_1f1b(
             b_layer.attn.backward_dw()
 
     return f_input, b_grad
+
 
 def schedule_chunk_1f1b(
     f_schedule_plan,

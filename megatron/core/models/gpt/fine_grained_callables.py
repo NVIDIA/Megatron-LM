@@ -274,6 +274,7 @@ class TransformerLayerNode(ScheduleNode):
         self.chunk_state = None
         self.submodule = None
 
+
 def build_transformer_layer_callables(layer):
     """
     Create callables for transformer layer nodes.

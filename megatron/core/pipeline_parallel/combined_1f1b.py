@@ -6,11 +6,9 @@ from typing import List, Union
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode
-from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model
 
 # Types
@@ -163,6 +161,9 @@ def forward_backward_step(
             set_input_tensor = get_attr_wrapped_model(f_model, "set_input_tensor")
             set_input_tensor(input_tensor)
 
+            # GPTModel.build_schedule_plan(model_forward_inputs) is called in the forward_step_func.
+            # The return value becomes (forward_schedule_plan, loss_function),
+            # which is used to be (forward_output_tensor, loss_function).
             with context_manager:  # autocast context
                 f_schedule_plan, loss_func = forward_step_func(data_iterator, f_model)
                 assert isinstance(
@@ -187,14 +188,16 @@ def forward_backward_step(
         if not isinstance(b_output_tensor_grad, list):
             b_output_tensor_grad = [b_output_tensor_grad]
 
-        # Backward pass for loss function
+        # Get the schedule plan from the output tensor
         b_schedule_plan = b_output_tensor[0].schedule_plan
         b_output_tensor[0].schedule_plan = None
+        # Get the loss function from the output tensor
+        loss_node = b_output_tensor[0].loss_func
+        b_output_tensor[0].loss_func = None
+
         if b_output_tensor_grad[0] is None and config.grad_scale_func is not None:
-            # backward schedule plan
-            loss_node = b_output_tensor[0].loss_func
-            b_output_tensor[0].loss_func = None
             b_output_tensor[0] = config.grad_scale_func(b_output_tensor[0])
+            # Backward pass for loss function
             torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
             b_output_tensor_grad[0] = loss_node.get_grad()
 
@@ -220,80 +223,29 @@ def forward_backward_step(
             post_forward=post_forward,
             post_backward=post_backward,
         )
-    
+
     # forward post process
     num_tokens = None
     if f_model is not None:
         with f_context:
-            vp_stage = f_context.vpp_rank
-            # The same as the forward_step()
-            model_vp_stage = getattr(f_model, "vp_stage", None)
-            if vp_stage is not None and model_vp_stage is not None:
-                assert (
-                    vp_stage == model_vp_stage
-                ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
-            num_tokens = torch.tensor(0, dtype=torch.int)
-            if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
-                if not collect_non_loss_data:
-                    loss_node = ScheduleNode(
-                        loss_func,
-                        torch.cuda.current_stream(),
-                        f_schedule_plan.event,
-                        name="loss_func",
-                    )
-                    loss_func = loss_node.forward
-                    outputs = loss_func(output_tensor)
-                    if len(outputs) == 3:
-                        output_tensor, num_tokens, loss_reduced = outputs
-                        if not config.calculate_per_token_loss:
-                            output_tensor /= num_tokens
-                            output_tensor /= num_microbatches
-                    else:
-                        # preserve legacy loss averaging behavior
-                        # (ie, over the number of microbatches)
-                        assert len(outputs) == 2
-                        output_tensor, loss_reduced = outputs
-                        output_tensor = output_tensor / num_microbatches
-                    forward_data_store.append(loss_reduced)
+            from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
 
-                    # attach loss_func on output_tensor
-                    output_tensor.loss_func = loss_node
-                else:
-                    data = loss_func(output_tensor, non_loss_data=True)
-                    forward_data_store.append(data)
-            # attach schedule plan on output tensor
+            loss_node = ScheduleNode(
+                loss_func, torch.cuda.current_stream(), f_schedule_plan.event, name="loss_func"
+            )
+            loss_func = loss_node.forward
+            output_tensor, num_tokens = forward_step_calc_loss(
+                f_model,
+                output_tensor,
+                loss_func,
+                config,
+                f_context.vpp_rank,
+                collect_non_loss_data,
+                num_microbatches,
+                forward_data_store,
+            )
             output_tensor.schedule_plan = f_schedule_plan
-            if config.timers is not None:
-                config.timers('forward-compute').stop()
-
-            # Set the loss scale for the auxiliary loss of the MoE layer.
-            # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
-            # explicitly.
-            if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-                # Calculate the loss scale based on the grad_scale_func if available
-                # else default to 1.
-                loss_scale = (
-                    config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-                    if config.grad_scale_func is not None
-                    else torch.ones(1, device=output_tensor.device)
-                )
-                # Set the loss scale
-                MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
-
-            # Set the loss scale for Multi-Token Prediction (MTP) loss.
-            if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-                # Calculate the loss scale based on the grad_scale_func if available
-                # else default to 1.
-                loss_scale = (
-                    config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-                    if config.grad_scale_func is not None
-                    else torch.ones(1, device=output_tensor.device)
-                )
-                # Set the loss scale
-                if config.calculate_per_token_loss:
-                    MTPLossAutoScaler.set_loss_scale(loss_scale)
-                else:
-                    MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            output_tensor.loss_func = loss_node
 
             if not unwrap_output_tensor:
                 output_tensor, num_tokens = [output_tensor], num_tokens

@@ -162,7 +162,7 @@ class ScheduleNode:
 
         grads = self.get_grad()
         self._release_state()
-        
+
         return grads
 
     def get_grad(self):
@@ -172,7 +172,7 @@ class ScheduleNode:
         if len(grad) == 1:
             grad = grad[0]
         return grad
-    
+
     def _release_state(self):
         """Clear the state of the node"""
         self.inputs = None

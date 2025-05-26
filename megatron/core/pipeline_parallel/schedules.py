@@ -184,6 +184,78 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
 
 
+def forward_step_calc_loss(
+    model,
+    output_tensor,
+    loss_func,
+    config,
+    vp_stage,
+    collect_non_loss_data,
+    num_microbatches,
+    forward_data_store,
+):
+    """Calculate the loss and number of tokens for forward_step()"""
+    model_vp_stage = getattr(model, "vp_stage", None)
+    if vp_stage is not None and model_vp_stage is not None:
+        assert (
+            vp_stage == model_vp_stage
+        ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
+    num_tokens = torch.tensor(0, dtype=torch.int)
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+        if not collect_non_loss_data:
+            outputs = loss_func(output_tensor)
+            if len(outputs) == 3:
+                output_tensor, num_tokens, loss_reduced = outputs
+                if not config.calculate_per_token_loss:
+                    output_tensor /= num_tokens
+                    output_tensor /= num_microbatches
+            else:
+                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
+                assert len(outputs) == 2
+                output_tensor, loss_reduced = outputs
+                output_tensor *= parallel_state.get_context_parallel_world_size()
+                output_tensor /= num_microbatches
+            forward_data_store.append(loss_reduced)
+        else:
+            data = loss_func(output_tensor, non_loss_data=True)
+            forward_data_store.append(data)
+
+    if config.timers is not None:
+        config.timers('forward-compute').stop()
+
+    # Set the loss scale for the auxiliary loss of the MoE layer.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
+    # explicitly.
+    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for Multi-Token Prediction (MTP) loss.
+    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MTPLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    return output_tensor, num_tokens
+
+
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -294,64 +366,16 @@ def forward_step(
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
-
-    model_vp_stage = getattr(model, "vp_stage", None)
-    if vp_stage is not None and model_vp_stage is not None:
-        assert (
-            vp_stage == model_vp_stage
-        ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
-    num_tokens = torch.tensor(0, dtype=torch.int)
-    if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
-        if not collect_non_loss_data:
-            outputs = loss_func(output_tensor)
-            if len(outputs) == 3:
-                output_tensor, num_tokens, loss_reduced = outputs
-                if not config.calculate_per_token_loss:
-                    output_tensor /= num_tokens
-                    output_tensor /= num_microbatches
-            else:
-                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
-                assert len(outputs) == 2
-                output_tensor, loss_reduced = outputs
-                output_tensor *= parallel_state.get_context_parallel_world_size()
-                output_tensor /= num_microbatches
-            forward_data_store.append(loss_reduced)
-        else:
-            data = loss_func(output_tensor, non_loss_data=True)
-            forward_data_store.append(data)
-
-    if config.timers is not None:
-        config.timers('forward-compute').stop()
-
-    # Set the loss scale for the auxiliary loss of the MoE layer.
-    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
-    # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
-
-    # Set the loss scale for Multi-Token Prediction (MTP) loss.
-    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MTPLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+    output_tensor, num_tokens = forward_step_calc_loss(
+        model,
+        output_tensor,
+        loss_func,
+        config,
+        vp_stage,
+        collect_non_loss_data,
+        num_microbatches,
+        forward_data_store,
+    )
 
     # If T5 model and in decoder stack, then send encoder_hidden_state
     # downstream as well.
@@ -1082,11 +1106,8 @@ def forward_backward_pipelining_with_interleaving(
 
         return recv, next_model_chunk_id
 
-    def forward_step_helper(virtual_microbatch_id, checkpoint_activations_microbatch):
-        """Helper method to run forward step with model split into chunks"""
-        model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=True)
-        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
-
+    def forward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id, microbatch_id):
+        """Preprocess for forward_step_helper"""
         # launch param synchronization for next model chunk
         # Note: Asynchronous communication tends to slow down compute.
         # To reduce idling from mismatched microbatch times, we launch
@@ -1119,6 +1140,32 @@ def forward_backward_pipelining_with_interleaving(
         offset = num_released_microbatches(virtual_microbatch_id, model_chunk_id)
         input_tensor = input_tensors[model_chunk_id][microbatch_id - offset]
 
+        return input_tensor
+
+    def forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens):
+        """Postprocess for forward_step_helper"""
+        output_tensors[model_chunk_id].append(output_tensor)
+
+        nonlocal total_num_tokens
+        total_num_tokens += num_tokens
+
+        # If forward-only, no need to save tensors for a backward pass.
+        if forward_only:
+            # Release the tensor that have completed forward step.
+            input_tensors[model_chunk_id].pop(0)
+            output_tensors[model_chunk_id].pop()
+
+        return
+
+    def forward_step_helper(virtual_microbatch_id, checkpoint_activations_microbatch):
+        """Helper method to run forward step with model split into chunks"""
+        model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=True)
+        microbatch_id = get_microbatch_id_in_model_chunk(virtual_microbatch_id, forward=True)
+
+        input_tensor = forward_step_helper_preprocess(
+            virtual_microbatch_id, model_chunk_id, microbatch_id
+        )
+
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
@@ -1138,24 +1185,12 @@ def forward_backward_pipelining_with_interleaving(
             vp_stage=model_chunk_id,
         )
 
-        output_tensors[model_chunk_id].append(output_tensor)
-
-        nonlocal total_num_tokens
-        total_num_tokens += num_tokens
-
-        # If forward-only, no need to save tensors for a backward pass.
-        if forward_only:
-            # Release the tensor that have completed forward step.
-            input_tensors[model_chunk_id].pop(0)
-            output_tensors[model_chunk_id].pop()
+        forward_step_helper_postprocess(model_chunk_id, output_tensor, num_tokens)
 
         return output_tensor
 
-    def backward_step_helper(virtual_microbatch_id):
-        """Helper method to run backward step with model split into chunks"""
-        nonlocal output_tensor_grads
-        model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
-
+    def backward_step_helper_preprocess(virtual_microbatch_id, model_chunk_id):
+        """Preprocess for backward_step_helper"""
         # launch grad synchronization (default)
         if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
             virtual_microbatch_id
@@ -1171,10 +1206,10 @@ def forward_backward_pipelining_with_interleaving(
         output_tensor = output_tensors[model_chunk_id].pop(0)
         output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
 
-        input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
-        )
+        return input_tensor, output_tensor, output_tensor_grad
 
+    def backward_step_helper_postprocess(virtual_microbatch_id):
+        """Postprocess for backward_step_helper"""
         # launch grad synchronization (custom grad sync)
         # Note: Asynchronous communication tends to slow down compute.
         # To reduce idling from mismatched microbatch times, we launch
@@ -1192,6 +1227,21 @@ def forward_backward_pipelining_with_interleaving(
                 config.grad_sync_func[grad_sync_chunk_id](model[grad_sync_chunk_id].parameters())
                 synchronized_model_chunks.add(grad_sync_chunk_id)
         disable_grad_sync()
+
+    def backward_step_helper(virtual_microbatch_id):
+        """Helper method to run backward step with model split into chunks"""
+        nonlocal output_tensor_grads
+        model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
+
+        input_tensor, output_tensor, output_tensor_grad = backward_step_helper_preprocess(
+            virtual_microbatch_id, model_chunk_id
+        )
+
+        input_tensor_grad = backward_step(
+            input_tensor, output_tensor, output_tensor_grad, model_type, config
+        )
+
+        backward_step_helper_postprocess(virtual_microbatch_id)
 
         return input_tensor_grad
 
@@ -1213,67 +1263,32 @@ def forward_backward_pipelining_with_interleaving(
         f_model_chunk_id = None
         f_microbatch_id = None
         input_tensor = None
+        f_context = contextlib.nullcontext()
         if f_virtual_microbatch_id is not None:
             f_microbatch_id = get_microbatch_id_in_model_chunk(
                 f_virtual_microbatch_id, forward=True
             )
-        f_context = contextlib.nullcontext()
         if f_virtual_microbatch_id is not None:
-            model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
-            f_model_chunk_id = model_chunk_id
+            f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
             f_context = VppContextManager(f_model_chunk_id)
             with f_context:
-                # The same as the forward_step_helper
-                if config.param_sync_func is not None:
-                    param_sync_virtual_microbatch_id = (
-                        f_virtual_microbatch_id + pipeline_parallel_rank
-                    )
-                    if (
-                        param_sync_virtual_microbatch_id < total_num_microbatches
-                        and is_first_microbatch_for_model_chunk(param_sync_virtual_microbatch_id)
-                    ):
-                        param_sync_chunk_id = (
-                            get_model_chunk_id(param_sync_virtual_microbatch_id, forward=True) + 1
-                        )
-                        if 1 < param_sync_chunk_id < num_model_chunks:
-                            config.param_sync_func[param_sync_chunk_id](
-                                model[param_sync_chunk_id].parameters()
-                            )
-                if parallel_state.is_pipeline_first_stage(
-                    ignore_virtual=False, vp_stage=model_chunk_id
-                ):
-                    if len(input_tensors[model_chunk_id]) == len(output_tensors[model_chunk_id]):
-                        input_tensors[model_chunk_id].append(None)
-                offset = num_released_microbatches(f_virtual_microbatch_id, model_chunk_id)
-                input_tensor = input_tensors[model_chunk_id][f_microbatch_id - offset]
+                input_tensor = forward_step_helper_preprocess(
+                    f_virtual_microbatch_id, f_model_chunk_id, f_microbatch_id
+                )
 
         # backward prepare
         b_model_chunk_id = None
-        b_context = contextlib.nullcontext()
         b_input_tensor = None
         b_output_tensor = None
         b_output_tensor_grad = None
+        b_context = contextlib.nullcontext()
         if b_virtual_microbatch_id is not None:
-            model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
-            b_model_chunk_id = model_chunk_id
+            b_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
             b_context = VppContextManager(b_model_chunk_id)
             with b_context:
-                # The same as the backward_step_helper
-                if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
-                    b_virtual_microbatch_id
-                ):
-                    enable_grad_sync()
-                    synchronized_model_chunks.add(model_chunk_id)
-
-                # pylint: disable=E0606
-                if parallel_state.is_pipeline_last_stage(
-                    ignore_virtual=False, vp_stage=model_chunk_id
-                ):
-                    if len(output_tensor_grads[model_chunk_id]) == 0:
-                        output_tensor_grads[model_chunk_id].append(None)
-                b_input_tensor = input_tensors[model_chunk_id].pop(0)
-                b_output_tensor = output_tensors[model_chunk_id].pop(0)
-                b_output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+                b_input_tensor, b_output_tensor, b_output_tensor_grad = (
+                    backward_step_helper_preprocess(b_virtual_microbatch_id, b_model_chunk_id)
+                )
 
         # Call combined forward and backward step to overlap the communication and computation
         output_tensor, num_tokens, input_tensor_grad = forward_backward_step(
@@ -1310,37 +1325,14 @@ def forward_backward_pipelining_with_interleaving(
 
         # forward post process
         if f_model_chunk_id is not None:
-            # The same as the forward_step_helper
             with f_context:
-                output_tensors[f_model_chunk_id].append(output_tensor)
-                nonlocal total_num_tokens
-                total_num_tokens += num_tokens.item()
-                # If forward-only, no need to save tensors for a backward pass.
-                if forward_only:
-                    # Release the tensor that have completed forward step.
-                    input_tensors[f_model_chunk_id].pop(0)
-                    output_tensors[f_model_chunk_id].pop()
+                forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
 
         # backward post process
         if b_model_chunk_id:
             # The same as the backward_step_helper
             with b_context:
-                if config.grad_sync_func is not None:
-                    grad_sync_virtual_microbatch_id = (
-                        b_virtual_microbatch_id - pipeline_parallel_rank
-                    )
-                    if grad_sync_virtual_microbatch_id >= 0 and is_last_microbatch_for_model_chunk(
-                        grad_sync_virtual_microbatch_id
-                    ):
-                        grad_sync_chunk_id = get_model_chunk_id(
-                            grad_sync_virtual_microbatch_id, forward=False
-                        )
-                        enable_grad_sync()
-                        config.grad_sync_func[grad_sync_chunk_id](
-                            model[grad_sync_chunk_id].parameters()
-                        )
-                        synchronized_model_chunks.add(grad_sync_chunk_id)
-                disable_grad_sync()
+                backward_step_helper_postprocess(b_virtual_microbatch_id)
                 if input_tensor is not None:
                     assert input_tensor_grad is not None
 
