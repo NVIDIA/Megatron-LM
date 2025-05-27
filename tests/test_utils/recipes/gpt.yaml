@@ -77,7 +77,7 @@ products:
         scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
     products:
-      - environment: [dev, lts]
+      - environment: [lts]
         scope: [nightly]
       - environment: [dev]
         scope: [nightly]
