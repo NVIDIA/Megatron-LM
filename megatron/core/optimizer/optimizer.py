@@ -459,8 +459,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
-        if not self.is_stub_optimizer:
-            self._copy_main_params_to_param_buffer()
+        if not self.is_stub_optimizer: 
+            print(f"mxfp8_param: {self.config.mxfp8_param}")
+            self._copy_main_params_to_model_params() if not self.config.mxfp8_param else self._copy_main_params_to_param_buffer()
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 

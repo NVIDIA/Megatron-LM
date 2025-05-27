@@ -330,11 +330,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 gbuf_index, dtype, bucket_index = param_gbuf_map[model_param]
                 gbuf_range = gbuf_ranges[gbuf_index][dtype][bucket_index]
                 param_range = gbuf_range["param_map"][model_param]["param"]
-
+                shard_model_param = None
                 # # fp16, bf16 params.
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                     if not is_mxfp8tensor(model_param):
-                        print("is_bf16tensor")
                         # Generate sharded model param.
                         shard_model_param = model_param.detach().view(-1)[
                             param_range.start : param_range.end
@@ -374,17 +373,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         else:
                             # When using precision-aware optimizer, main params are held by FusedAdam.
                             shard_main_param = None
-
-                        # Store handle to main_param.
-                        model_param.main_param = shard_main_param
-                        model_param.main_param_sharded = True
-
-                        # Add to group.
-                        model_float16_params_this_group.append(model_param)
-                        shard_float16_params_this_group.append(shard_model_param)
-                        shard_fp32_from_float16_params_this_group.append(shard_main_param)
                     else:
-                        print("is_mxfp8tensor")
+                        # For mxfp8 params, we need to clone the param and view it as float.
                         main_param = model_param.detach().clone().float()
                         shard_main_param = main_param.view(-1)[
                             param_range.start : param_range.end
@@ -392,13 +382,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
-                        # Store handle to main_param.
-                        model_param.main_param = shard_main_param
-                        model_param.main_param_sharded = True
+                        if hasattr(model_param, 'shared'):
+                            shard_main_param.shared = model_param.shared
+                    # Store handle to main_param.
+                    model_param.main_param = shard_main_param
+                    model_param.main_param_sharded = True
 
-                        # Add to group.
-                        model_float16_params_this_group.append(model_param)
-                        shard_fp32_from_float16_params_this_group.append(shard_main_param)                  
+                    # Add to group.
+                    model_float16_params_this_group.append(model_param)
+                    if shard_model_param is not None:
+                        shard_float16_params_this_group.append(shard_model_param)
+                    shard_fp32_from_float16_params_this_group.append(shard_main_param)          
                 # fp32 params.
                 elif model_param.type() == 'torch.cuda.FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]

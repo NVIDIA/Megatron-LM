@@ -639,11 +639,12 @@ class _ParamAndGradBuffer:
             self.param_data = self.shared_buffer  
             self.grad_data = self.shared_buffer   
         else:
+            print("create param and grad buffer in bf16")
             # Only re-map param tensors if using distributed optimizer.
             if self.ddp_config.use_distributed_optimizer:
                 self.param_data = torch.zeros(
                     self.numel,
-                    dtype=torch.bfloat16,
+                    dtype=self.param_dtype,
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
