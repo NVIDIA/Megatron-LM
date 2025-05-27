@@ -230,8 +230,8 @@ class TransformerLayerNode(ScheduleNode):
         self.before_detached = tuple()
 
         # Create flags to indicate first and last layer
-        self.is_first = extra_args.get("is_first", False)
-        self.is_last = extra_args.get("is_last", False)
+        self.is_first_layer = extra_args.get("is_first_layer", False)
+        self.is_last_layer = extra_args.get("is_last_layer", False)
 
         # Initialize list to store registered dw callables
         self.bwd_dw_callables = []
