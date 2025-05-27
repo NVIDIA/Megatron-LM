@@ -57,6 +57,9 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
 
+    mxfp8_param: bool = False
+    """If true, the parameters are stored in mxfp8 precision."""
+
     use_custom_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
