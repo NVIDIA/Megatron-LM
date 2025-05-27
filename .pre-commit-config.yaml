@@ -1,0 +1,17 @@
+repos:
+- repo: https://github.com/psf/black
+  rev: 'refs/tags/24.4.2:refs/tags/24.4.2'
+  hooks:
+  - id: black
+    files: ^megatron/core/.*
+    args: ["--skip-magic-trailing-comma"]
+- repo: https://github.com/pycqa/pylint
+  rev: v3.2.6
+  hooks:
+  - id: pylint
+    files: ^megatron/core/.* 
+- repo: https://github.com/pycqa/isort
+  rev: 5.13.2
+  hooks:
+  - id: isort
+    files: ^megatron/core/.*
