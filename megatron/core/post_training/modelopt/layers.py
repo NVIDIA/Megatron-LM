@@ -11,16 +11,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
-try:
-    import modelopt.torch.quantization as mtq
-    from modelopt.torch.quantization.nn import QuantModuleRegistry
-    from modelopt.torch.quantization.nn.modules.quant_linear import _QuantLinear
-
-    has_nvidia_modelopt = True
-except Exception:
-    has_nvidia_modelopt = False
-
-
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
         "*weight_quantizer": {"num_bits": (4, 3), "axis": None},
@@ -164,10 +154,6 @@ class Linear(torch.nn.Linear):
         return out, None
 
 
-if has_nvidia_modelopt:
-    QuantModuleRegistry.register({Linear: Linear.__class__.__name__})(_QuantLinear)
-
-
 class RealQuantTransformerLayer(TransformerLayer):
     """Real quantization transformer layer base class.
 
@@ -185,8 +171,15 @@ class RealQuantTransformerLayer(TransformerLayer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if has_nvidia_modelopt and self.real_quant_cfg != "None":
 
+        try:
+            import modelopt.torch.quantization as mtq
+
+            has_nvidia_modelopt = True
+        except Exception:
+            has_nvidia_modelopt = False
+
+        if has_nvidia_modelopt and self.real_quant_cfg != "None":
             REAL_QUANT_CFG_CHOICES = {
                 "fp8_real_quant": FP8_PER_TENSOR_REAL_QUANT_CFG,
                 "fp8_blockwise_real_quant": FP8_2D_BLOCKWISE_REAL_QUANT_CFG,

@@ -27,6 +27,7 @@ def add_mmlu_args(parser):
     group = parser.add_argument_group(title='ModelOpt text generation ptq')
     group.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm.")
     group.add_argument("--percentage", type=float, default=1.0)
+    group.add_argument("--lower-bound", type=float, default=None)
     add_modelopt_args(parser)
     return parser
 
@@ -184,3 +185,6 @@ if __name__ == "__main__":
             ),
             flush=True,
         )
+
+    if args.lower_bound is not None:
+        assert sum(avg_correct) / len(avg_correct) > args.lower_bound
