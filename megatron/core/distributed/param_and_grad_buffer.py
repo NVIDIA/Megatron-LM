@@ -623,7 +623,6 @@ class _ParamAndGradBuffer:
         self.param_data = None
         # Partial support for MXFP8 param: AG in bfloat16 buffer which will be reused for grad RS.
         if self.ddp_config.use_distributed_optimizer and any(is_mxfp8tensor(p) for p in reversed(params)):
-            print("create shared buffer in bfloat16")
             self.shared_buffer = torch.zeros(
                 self.numel,
                 dtype=torch.bfloat16,
@@ -633,7 +632,6 @@ class _ParamAndGradBuffer:
             self.param_data = self.shared_buffer  
             self.grad_data = self.shared_buffer   
         else:
-            print("create param and grad buffer in bf16")
             # Only re-map param tensors if using distributed optimizer.
             if self.ddp_config.use_distributed_optimizer:
                 self.param_data = torch.zeros(
@@ -656,7 +654,6 @@ class _ParamAndGradBuffer:
         for param in params[::-1]:
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
             if not self.ddp_config.mxfp8_param:
-                print("assign param.data to bf16 buffer")
                 # Assign param.data to appropriate segment of self.param_data.
                 if self.param_data is not None:
                     new_param_data = self._get(
