@@ -347,7 +347,6 @@ class TransformerBlock(MegatronModule):
         packed_seq_params: PackedSeqParams,
         use_inner_fp8_context: bool,
         packed_seq_params_full: PackedSeqParams,
-        fullatt_block_indexes: List[int],
     ):
         """Forward method with activation checkpointing."""
 
@@ -356,7 +355,7 @@ class TransformerBlock(MegatronModule):
                 hidden_states, attention_mask, context, context_mask, rotary_pos_emb
             ):
                 for index in range(start, end):
-                    if fullatt_block_indexes is not None and index in fullatt_block_indexes:
+                    if self.config.fullatt_block_indexes is not None and index in self.config.fullatt_block_indexes:
                         packed_seq_params_now = packed_seq_params_full
                     else:
                         packed_seq_params_now = packed_seq_params
@@ -467,7 +466,6 @@ class TransformerBlock(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         packed_seq_params_full: Optional[PackedSeqParams] = None,
-        fullatt_block_indexes: Optional[list[int]] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ):
@@ -496,7 +494,6 @@ class TransformerBlock(MegatronModule):
                 processing.
             packed_seq_params_full (PackedSeqParams, optional): Parameters for packed sequence
                 processing for full attention.
-            fullatt_block_indexes (List, optional): Layer index for full attention.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -560,12 +557,11 @@ class TransformerBlock(MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_fp8_context=use_inner_fp8_context,
-                    packed_seq_params_full=packed_seq_params_full,
-                    fullatt_block_indexes=fullatt_block_indexes,
+                    packed_seq_params_full=packed_seq_params_full
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
-                    if fullatt_block_indexes is not None and l_no in fullatt_block_indexes:
+                    if self.config.fullatt_block_indexes is not None and l_no in self.config.fullatt_block_indexes:
                         packed_seq_params_now = packed_seq_params_full
                     else:
                         packed_seq_params_now = packed_seq_params
