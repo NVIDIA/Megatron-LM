@@ -10,6 +10,11 @@ from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
+from megatron.core.utils import get_batch_on_this_cp_rank
 
 try:
     import transformer_engine  # pylint: disable=unused-import
@@ -115,6 +120,7 @@ class CLIPViTModel(VisionModule):
         )
 
         self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
+        self.position_ids = get_batch_on_this_cp_rank({"key": self.position_ids})["key"]
 
         self.position_embeddings = torch.nn.Embedding(self.seq_length, self.visual_hidden_size)
 
@@ -170,7 +176,8 @@ class CLIPViTModel(VisionModule):
                 [class_token, x], dim=1
             )  # [batch, grid ** 2 + class_token_len, hidden_size]
 
-        assert x.shape[1] == self.seq_length, f"{x.shape[1]} != {self.seq_length}"
+        assert x.shape[1] * self.config.context_parallel_size == self.seq_length, \
+            f"{x.shape[1] * self.config.context_parallel_size} != {self.seq_length}"
         x = x + self.position_embeddings(self.position_ids)
         if self.ln_pre:
             x = self.ln_pre(x)
@@ -178,7 +185,12 @@ class CLIPViTModel(VisionModule):
         # `permute` can make the tensor non-contiguous, breaking pipelining.
         x = x.contiguous()
 
+        if self.config.sequence_parallel:
+            x = scatter_to_sequence_parallel_region(x)
         x = self.decoder(x, attention_mask)
+        if self.config.sequence_parallel:
+            x = gather_from_sequence_parallel_region(x, tensor_parallel_output_grad=False)
+
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
         if self.ln_post:
