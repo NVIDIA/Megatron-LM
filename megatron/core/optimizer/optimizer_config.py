@@ -44,6 +44,9 @@ class OptimizerConfig:
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
+    mxfp8_param: bool = False
+    """If true, the parameters are stored in mxfp8 precision. Defaults to False."""
+
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
 
