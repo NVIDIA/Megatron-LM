@@ -1,6 +1,11 @@
 #!/bin/bash
 
-TOKENIZER_MODEL="meta-llama/Llama-4-Scout-17B-16E-Instruct"
+if [ -z ${HF_MODEL_CKPT} ]; then
+    HF_MODEL_CKPT=meta-llama/Llama-4-Scout-17B-16E-Instruct
+    TOKENIZER_MODEL=meta-llama/Llama-4-Scout-17B-16E-Instruct
+else
+    TOKENIZER_MODEL=${HF_MODEL_CKPT}
+fi
 
 MODEL_ARGS=" \
     --save-interval 100000 \

@@ -48,6 +48,7 @@ def get_mamba_stack_modelopt_spec(
         ),
     )
 
+    attn_mask_type = AttnMaskType.causal
     core_attention = DotProductAttention if local_core_attention else TEDotProductAttention
     attention_layer = ModuleSpec(
         module=TransformerLayer,
@@ -55,7 +56,7 @@ def get_mamba_stack_modelopt_spec(
             input_layernorm=Norm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=core_attention,

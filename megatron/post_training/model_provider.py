@@ -17,7 +17,6 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
 from megatron.core.models.mamba import MambaModel as MCoreMambaModel
 from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
-    mcore_gpt_load_legacy_state_dict_pre_hook,
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
@@ -29,12 +28,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 def _add_load_convert_hooks(model: MCoreGPTModel):
     """Register some load_state_dict prehooks to handle some known state_dict key mismatch.
-
-    (legacy <-> modelopt) and (default te <-> modelopt)
     """
     args = get_args()
-    if args.export_legacy_megatron:
-        model._register_load_state_dict_pre_hook(mcore_gpt_load_legacy_state_dict_pre_hook)
     if args.export_te_mcore_model:
         model._register_load_state_dict_pre_hook(mcore_gpt_load_te_state_dict_pre_hook)
 
@@ -104,7 +99,6 @@ def _teacher_provider(config: Namespace, model_kwargs: Dict[str, Any]) -> MCoreG
 
     # Convert to `TransformerConfig` here to avoid ModelOpt pickling issues (contains local functions)
     config = core_transformer_config_from_args(config)
-    config.non_homogeneous_layers = True
 
     teacher = MCoreGPTModel(config=config, **model_kwargs)
     _add_load_convert_hooks(teacher)
@@ -143,7 +137,6 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     config = core_transformer_config_from_args(args)
-    config.non_homogeneous_layers = True
 
     if args.use_legacy_models:
         raise ValueError(
@@ -168,6 +161,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
                 local_core_attention=args.export_force_local_attention,
                 remap_te_layernorm=args.export_te_mcore_model,
                 real_quant_cfg=args.export_real_quant_cfg,
+                use_arbitrary_attention_mask=True,
             )
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,

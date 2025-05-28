@@ -1,6 +1,11 @@
 #!/bin/bash
 
-TOKENIZER_MODEL="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+if [ -z ${HF_MODEL_CKPT} ]; then
+    HF_MODEL_CKPT=meta-llama/Llama-4-Maverick-17B-128E-Instruct
+    TOKENIZER_MODEL=meta-llama/Llama-4-Maverick-17B-128E-Instruct
+else
+    TOKENIZER_MODEL=${HF_MODEL_CKPT}
+fi
 
 MODEL_ARGS=" \
     --recompute-activations \
@@ -42,5 +47,6 @@ MODEL_ARGS=" \
     --rope-scaling-factor 8.0 \
     --rotary-base 500000 \
     --rotary-interleaved \
+    --no-rope-freq 4 \
     --export-moe-apply-probs-on-input \
 "
