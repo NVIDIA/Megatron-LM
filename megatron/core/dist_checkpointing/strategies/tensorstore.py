@@ -6,6 +6,7 @@ from functools import partial
 from itertools import starmap
 from logging import getLogger
 from pathlib import Path
+from typing import Union
 
 import tensorstore as ts
 import torch
@@ -33,7 +34,10 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
         super().__init__()
         self.load_directly_on_device = load_directly_on_device
 
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
+        if isinstance(checkpoint_dir, str):
+            checkpoint_dir = Path(checkpoint_dir)
+
         if torch.distributed.get_rank() == 0:
             print(f'Loading distributed checkpoint with {self.__class__.__name__}')
             if self.load_directly_on_device:
@@ -46,7 +50,10 @@ class TensorStoreLoadShardedStrategy(LoadShardedStrategy):
         dict_list_map_inplace(load_fn, sharded_state_dict)
         return sharded_state_dict
 
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Union[str, Path]):
+        if isinstance(checkpoint_dir, str):
+            checkpoint_dir = Path(checkpoint_dir)
+
         def get_ts_shape_dtype(path):
             arr = open_ts_array(path)
             return arr.shape, arr.dtype.numpy_dtype
