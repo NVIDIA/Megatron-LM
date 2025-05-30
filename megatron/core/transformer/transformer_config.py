@@ -156,6 +156,9 @@ class TransformerConfig(ModelParallelConfig):
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
 
+    fullatt_block_indexes: Optional[list[int]] = None
+    """Layer index for full attention, the others use window attention."""
+
     ####################
     # initialization
     ####################

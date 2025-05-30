@@ -557,7 +557,7 @@ class TransformerBlock(MegatronModule):
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
                     use_inner_fp8_context=use_inner_fp8_context,
-                    packed_seq_params_full=packed_seq_params_full
+                    packed_seq_params_full=packed_seq_params_full,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):
