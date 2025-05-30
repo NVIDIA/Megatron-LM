@@ -83,7 +83,7 @@ class MultiLatentAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
-        mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale)
+        mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
 
         if self.config.rope_type == "rope":
