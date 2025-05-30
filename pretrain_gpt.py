@@ -42,12 +42,21 @@ stimer = StragglerDetector()
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
+
     args = get_args()
     config = core_transformer_config_from_args(args)
+
     # TODO: this is pretty hacky, find a better way
     if not is_first_or_last_pipeline_stage(vp_stage) and (
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
-        return None, None, None, None, None, None
+        if config.chunked_pipeline_model_parallel_splits > 1:
+            # The inner data iterator is None, so we need to mock the next batch.
+            # TODO(yuzhongw, tailaim): change this once `sft_sequence_packing` is supported.
+            data_iterator.mock_next(args.seq_length)
+            chunked_pp_params = data_iterator.get_current_chunked_pp_params()
+        else:
+            chunked_pp_params = None
+        return None, None, None, None, None, None, chunked_pp_params
 
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(
@@ -71,8 +80,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
     else: # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
-    return (*batch.values(), packed_seq_params)
+
+    if config.chunked_pipeline_model_parallel_splits > 1:
+        chunked_pp_params = data_iterator.get_current_chunked_pp_params()
+    else:
+        chunked_pp_params = None
+
+    return (*batch.values(), packed_seq_params, chunked_pp_params)
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -157,7 +171,15 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = get_batch(data_iterator, vp_stage)
+        (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            packed_seq_params,
+            chunked_pp_params,
+        ) = get_batch(data_iterator, vp_stage)
     timers('batch-generator').stop()
 
     with stimer:
@@ -167,13 +189,25 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             if return_schedule_plan:
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+                assert packed_seq_params is None, (
+                    "Packed sequence is not supported for returning schedule plan"
+                )
+                assert chunked_pp_params is None, (
+                    "Chunked pipeline model parallel is not supported for returning schedule plan"
+                )
                 schedule_plan = model.build_schedule_plan(
                     tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
+                    tokens,
+                    position_ids,
+                    attention_mask,
+                    labels=labels,
+                    loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params,
+                    chunked_pp_params=chunked_pp_params,
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

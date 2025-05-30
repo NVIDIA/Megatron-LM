@@ -213,6 +213,7 @@ class MultiLatentAttention(Attention):
         packed_seq_params=None,
         position_ids=None,
         sequence_len_offset=None,
+        chunked_pp_params=None,  # TODO(yuzhongw): support chunked PP for MLA
         *,
         inference_params=None,
     ):

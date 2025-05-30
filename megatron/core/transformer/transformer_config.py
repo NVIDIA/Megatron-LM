@@ -87,6 +87,9 @@ class TransformerConfig(ModelParallelConfig):
         vpp rank 1 pp rank 0~2 holds: decoder
         vpp rank 1 pp rank 3 holds: mtp, loss"""
 
+    chunked_pipeline_model_parallel_splits: int = 1
+    """Number of chunked pipeline model parallel splits."""
+
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
     layer in the context of partition and placement for pipeline parallelism."""
@@ -1262,6 +1265,11 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if "core_attn" in self.offload_modules:
+                assert self.chunked_pipeline_model_parallel_splits == 1, (
+                    "Core attention offloading is not supported with chunked PP, "
+                    f"but got {self.offload_modules=}."
+                )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -2057,3 +2065,7 @@ class MLATransformerConfig(TransformerConfig):
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
+
+        assert (
+            self.chunked_pipeline_model_parallel_splits == 1
+        ), "Chunked pipeline model parallel is not compatible with MLA for now."

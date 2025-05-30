@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,23 @@ __all__ = [
     'fused_apply_rotary_pos_emb_thd',
     'get_pos_emb_on_this_cp_rank',
 ]
+
+
+def get_pos_emb_on_this_chunked_pp_span(
+    pos_emb: Tensor, seq_dim: int, chunked_pp_params: ChunkedPipelineParallelParams
+):
+    """Get the position embedding on the current chunked pipeline parallel span.
+
+    Args:
+        pos_emb (Tensor): Positional embedding tensor
+        seq_dim (int): Sequence dimension
+        chunked_pp_params (ChunkedPipelineParallelParams): Chunked pipeline parallel parameters
+    """
+
+    span_idx = chunked_pp_params.span_idx_in_micro
+    spans = chunked_pp_params.spans
+    pos_emb = pos_emb.split(spans, dim=seq_dim)[span_idx]
+    return pos_emb
 
 
 def get_pos_emb_on_this_cp_rank(

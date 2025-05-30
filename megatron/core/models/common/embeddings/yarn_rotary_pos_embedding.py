@@ -10,8 +10,13 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from megatron.core.models.common.embeddings.rope_utils import get_pos_emb_on_this_cp_rank
+from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
+from megatron.core.models.common.embeddings.rope_utils import (
+    get_pos_emb_on_this_chunked_pp_span,
+    get_pos_emb_on_this_cp_rank,
+)
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import internal_api
 
@@ -159,7 +164,11 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
     @internal_api
     def forward(
-        self, max_seq_len: int, offset: int = 0, packed_seq_params: Optional[PackedSeqParams] = None
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
     ) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
@@ -172,14 +181,20 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             Tensor: Embeddings after applying Yarn RoPE.
         """
         emb, _mscale = self.get_emb(max_seq_len, offset)
+
+        if chunked_pp_params is not None:
+            # Slice rotary_pos_emb along sequence dimension
+            # and select the parition of the current chunked PP span
+            emb = get_pos_emb_on_this_chunked_pp_span(emb, 0, chunked_pp_params)
+
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             # Set CP group to dynamic CP group for CP slicing
             cp_group = packed_seq_params.cp_group
         else:
             cp_group = self.cp_group
-        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
-            # slice rotary_pos_emb along sequence dimension
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq and not chunked_pp:
+            # Slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
         return emb, _mscale

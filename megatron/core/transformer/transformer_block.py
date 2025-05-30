@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -427,6 +428,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         rotary_pos_emb: Tensor,
         attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
+        chunked_pp_params: ChunkedPipelineParallelParams,
         use_inner_quantization_context: bool,
         padding_mask: Optional[Tensor] = None,
     ):
@@ -471,6 +473,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             inference_context=None,
                             packed_seq_params=packed_seq_params,
                             padding_mask=padding_mask,
+                            chunked_pp_params=chunked_pp_params,
                         )
                 return hidden_states, context
 
@@ -608,6 +611,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         dynamic_inference_decode_only: Optional[bool] = None,
@@ -639,6 +643,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 optimizations.
             packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
                 processing.
+            chunked_pp_params (ChunkedPipelineParallelParams, optional): Parameters for
+                chunked pipeline model parallel.
             dynamic_inference_decode_only: Optional[bool]: If true, indicates that the current
                 inference context is for decode-only. This args is only used to uniquely
                 identify decode and non-decode cuda graph runners in the cuda graph manager.
@@ -716,6 +722,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     rotary_pos_emb=rotary_pos_emb,
                     attention_bias=attention_bias,
                     packed_seq_params=packed_seq_params,
+                    chunked_pp_params=chunked_pp_params,
                     use_inner_quantization_context=use_inner_quantization_context,
                     padding_mask=padding_mask,
                 )
@@ -754,6 +761,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             attention_bias=attention_bias,
                             inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
+                            chunked_pp_params=chunked_pp_params,
                             sequence_len_offset=sequence_len_offset,
                             padding_mask=padding_mask,
                         )
