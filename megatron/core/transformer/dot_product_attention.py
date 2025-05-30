@@ -93,7 +93,7 @@ class DotProductAttention(MegatronModule):
             config,
             attn_mask_type=self.attn_mask_type,
             mask_func=attention_mask_func,
-            scale=self.softmax_scale,
+            scale=coeff,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate
