@@ -1091,7 +1091,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             logger.warning(
                 '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
                 ' checkpoint is deprecated and will be removed in the future.'
-                ' Please switch to `full_sharded_model_space`.'
+                ' Please switch to `fully_sharded_model_space`.'
             )
 
         if self.ddp_config.use_custom_fsdp:
@@ -1392,7 +1392,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         logger.warning(
             '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
-            'checkpoint is deprecated. Please switch to `full_sharded_model_space`'
+            'checkpoint is deprecated. Please switch to `fully_sharded_model_space`'
         )
 
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
