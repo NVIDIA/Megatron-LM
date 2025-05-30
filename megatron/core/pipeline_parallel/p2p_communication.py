@@ -11,6 +11,7 @@ from megatron.core.parallel_state import (
     get_pipeline_model_parallel_prev_rank,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
+    is_inside_encoder,
 )
 from megatron.core.utils import nvtx_decorator
 
@@ -275,7 +276,11 @@ def _communicate(
         - tensor_recv_next: torch.Tensor if recv_next is True, None otherwise.
 
     """
-
+    # _pre_process_tensor is used to surppot the case
+    # that the encoder and decoder have different tensor/data parallel size.
+    tensor_send_next_list, tensor_send_prev_list = _pre_process_tensor(
+        tensor_send_next, tensor_send_prev, config
+    )
     tensor_recv_prev_func = None
     tensor_recv_next_func = None
 
@@ -373,9 +378,9 @@ def _communicate(
             tensor_recv_next = None
 
         p2p_reqs = p2p_func(
-            tensor_send_prev=tensor_send_prev,
+            tensor_send_prev=tensor_send_prev_list.pop(0),
             tensor_recv_prev=tensor_recv_prev,
-            tensor_send_next=tensor_send_next,
+            tensor_send_next=tensor_send_next_list.pop(0),
             tensor_recv_next=tensor_recv_next,
             group=group,
             prev_pipeline_rank=pr,
@@ -402,26 +407,11 @@ def _communicate(
         # User should assert that we have a modern enough PyTorch to not need this
         torch.cuda.synchronize()
 
-    def _handle_tensor_list(x):
-        """This basically handles all the cases that we expect to see. Either the list None,
-        or it's a singleton (the usual cases, since most ranks only belong to one pipeline group),
-        or everything returned is None, or everything returned is not None, and it has to be summed
-        together."""
-        if len(x) == 0:
-            return None
-        if len(x) == 1:
-            return x[0]
-        if all(xx is None for xx in x):
-            return None
-        # When the encoder's TP size differs from the decoder's TP size
-        # (with the constraint `encoder_tp_size <= decoder_tp_size`), each encoder TP rank
-        # may receive multiple gradients from corresponding decoder TP ranks.
-        # For example, if `ETP=1` and `DTP=2`, then encoder rank 0 will receive gradients
-        # from decoder ranks 1 and 2. These received gradients must be averaged.
-        return torch.stack(x, dim=0).mean(dim=0, dtype=torch.float32).to(x[0].dtype)
-
-    tensor_recv_prev = _handle_tensor_list(tensor_recv_prev_list)
-    tensor_recv_next = _handle_tensor_list(tensor_recv_next_list)
+    # _post_process_tensor is used to surppot the case
+    # that the encoder and decoder have different tensor/data parallel size.
+    tensor_recv_prev, tensor_recv_next = _post_process_tensor(
+        tensor_recv_prev_list, tensor_recv_next_list, config
+    )
 
     return tensor_recv_prev, tensor_recv_next, reqs
 
@@ -669,3 +659,156 @@ def send_forward_backward_recv_forward_backward(
     if config.timers is not None:
         config.timers('forward-backward-send-forward-backward-recv').stop()
     return input_tensor, output_tensor_grad
+
+
+def _pre_process_tensor(
+    tensor_send_next: torch.Tensor, tensor_send_prev: torch.Tensor, config: ModelParallelConfig
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Pre-process tensor before send in _communicate.
+    This function is used to support the case that the encoder and decoder
+    have different tensor/data parallel size.
+
+    Let's say we setup a model with encoder_tp=1, encoder_dp2, decoder_tp=2, decoder_dp=6.
+    In thise case, The encoder DP size is 3 times the decoder DP size.
+    and the encoder TP size is 2 times the decoder TP size.
+    Each encoder rank is stitched with 6(3*2) decoder ranks, which is called next_rank list.
+
+    For each encoder rank, the tensor_send_next is a tensor with shape
+    (seq_length, micro_batch_size*3, hidden_size).
+    The encoder rank will split the tensor_send_next into 3 chunks,
+    and each chunk has shape (seq_length, micro_batch_size, hidden_size).
+    Then the chunks are added to a list, by repeating each chunk 2 times.
+    Finally we get a list with 6 tensors, each tensor has shape
+    (seq_length, micro_batch_size, hidden_size).
+
+    _pre_process_tensor will return the list with 6 tensors to _communicate function.
+    """
+    # calculate the data_parallel_size for decoder
+    world_size = torch.distributed.get_world_size()
+    encoder_model_size = (
+        config.encoder_tensor_model_parallel_size
+        * config.encoder_pipeline_model_parallel_size
+        * config.context_parallel_size
+    )
+    decoder_model_size = (
+        config.tensor_model_parallel_size
+        * config.pipeline_model_parallel_size
+        * config.context_parallel_size
+    )
+    # For the case that encoder and decoder have different data parallel size
+    encoder_world_size = encoder_model_size * config.encoder_data_parallel_size
+    decoder_world_size = world_size - encoder_world_size
+    data_parallel_size = decoder_world_size // decoder_model_size
+
+    next_rank = get_pipeline_model_parallel_next_rank()
+    if not isinstance(next_rank, list):
+        next_rank = [next_rank]
+    num_next_rank = len(next_rank)
+    tensor_send_next_list = [tensor_send_next] * num_next_rank
+    tensor_send_prev_list = [tensor_send_prev] * num_next_rank
+
+    if (
+        config.encoder_data_parallel_size > 0
+        and is_inside_encoder()
+        and tensor_send_next is not None
+    ):
+        chunk_num = data_parallel_size // config.encoder_data_parallel_size
+        bs_dim = 1
+        split_size = tensor_send_next.shape[bs_dim] // chunk_num
+        chunks = torch.split(tensor_send_next, split_size, dim=bs_dim)
+        assert num_next_rank % chunk_num == 0
+        repeat_times = num_next_rank // chunk_num
+        for i in range(num_next_rank):
+            tensor_send_next_list[i] = chunks[i // repeat_times]
+
+    return tensor_send_next_list, tensor_send_prev_list
+
+
+def _post_process_tensor(
+    tensor_recv_prev_list: List[torch.Tensor],
+    tensor_recv_next_list: List[torch.Tensor],
+    config: ModelParallelConfig,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Post-process tensor after recv in _communicate.
+    This function is used to support the case that the encoder and decoder
+    have different tensor/data parallel size.
+
+    Let's say we setup a model with encoder_tp=1, encoder_dp2, decoder_tp=2, decoder_dp=6.
+    In thise case, The encoder DP size is 3 times the decoder DP size.
+    and the encoder TP size is 2 times the decoder TP size.
+    Each encoder rank is stitched with 6(3*2) decoder ranks, which is called next_rank list.
+    Let's name these 6 decoder ranks as d_tp0_dp0, d_tp1_dp0, d_tp0_dp1,
+    d_tp1_dp1, d_tp0_dp2, d_tp1_dp2, respectively.
+
+    For each encoder rank, it will receive 6 tensors from the decoder ranks,
+    and these tensors are stored in tensor_recv_next_list.
+    Each tensor in tensor_recv_next_list has shape (seq_length, micro_batch_size, hidden_size).
+
+    The encoder rank will merge the 6 tensors into a tensor with shape
+    (seq_length, micro_batch_size*3, hidden_size) by the following steps:
+    1. split the tensor_recv_next_list into 3 sub list,
+    the first sub list has tensor received from d_tp0_dp0 and d_tp1_dp0,
+    the second sub list has tensor received from d_tp0_dp1 and d_tp1_dp1,
+    the third sub list has tensor received from d_tp0_dp2 and d_tp1_dp2.
+    2. merge each sub list into a tensor with shape by averaging,
+    the merged tensor has shape (seq_length, micro_batch_size, hidden_size).
+    3. concat the 3 merged tensors into a tensor along batch dimension,
+    the final tensor has shape (seq_length, micro_batch_size*3, hidden_size).
+    """
+    if tensor_recv_next_list is None or len(tensor_recv_next_list) == 0:
+        tensor_recv_next = None
+    else:
+        tensor_recv_next = tensor_recv_next_list[0]
+
+    if tensor_recv_prev_list is None or len(tensor_recv_prev_list) == 0:
+        tensor_recv_prev = None
+    else:
+        tensor_recv_prev = tensor_recv_prev_list[0]
+    if (
+        config.encoder_data_parallel_size > 0
+        and is_inside_encoder()
+        and tensor_recv_next_list is not None
+        and len(tensor_recv_next_list) > 0
+        and tensor_recv_next_list[0] is not None
+    ):
+        # When the encoder's TP size differs from the decoder's TP size
+        # (with the constraint `encoder_tp_size <= decoder_tp_size`), each encoder TP rank
+        # may receive multiple gradients from corresponding decoder TP ranks.
+        # For example, if `ETP=1` and `DTP=2`, then encoder rank 0 will receive gradients
+        # from decoder ranks 1 and 2. These received gradients must be averaged.
+
+        # calculate the data_parallel_size for decoder
+        world_size = torch.distributed.get_world_size()
+        encoder_model_size = (
+            config.encoder_tensor_model_parallel_size
+            * config.encoder_pipeline_model_parallel_size
+            * config.context_parallel_size
+        )
+        decoder_model_size = (
+            config.tensor_model_parallel_size
+            * config.pipeline_model_parallel_size
+            * config.context_parallel_size
+        )
+        # For the case that encoder and decoder have different data parallel size
+        encoder_world_size = encoder_model_size * config.encoder_data_parallel_size
+        decoder_world_size = world_size - encoder_world_size
+        data_parallel_size = decoder_world_size // decoder_model_size
+
+        chunk_num = data_parallel_size // config.encoder_data_parallel_size
+        num_next_rank = len(tensor_recv_next_list)
+        num_repeated_batch = num_next_rank // chunk_num
+
+        chunk_list = []
+        for i in range(chunk_num):
+            sub_list = tensor_recv_next_list[i * num_repeated_batch : (i + 1) * num_repeated_batch]
+            merged_tensor = (
+                torch.stack(sub_list, dim=0).mean(dim=0, dtype=torch.float32).to(sub_list[0].dtype)
+            )
+            chunk_list.append(merged_tensor)
+        bs_dim = 1
+        chunk_tensor = torch.concat(chunk_list, dim=bs_dim)
+        tensor_recv_next = chunk_tensor
+
+    return tensor_recv_prev, tensor_recv_next

@@ -352,22 +352,37 @@ def validate_args(args, defaults={}):
     if args.encoder_pipeline_model_parallel_size > 0 and args.encoder_tensor_model_parallel_size == 0:
         args.encoder_tensor_model_parallel_size = args.tensor_model_parallel_size
 
+
     encoder_model_size = args.encoder_tensor_model_parallel_size * args.encoder_pipeline_model_parallel_size * args.context_parallel_size
     decoder_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
-    total_model_size = encoder_model_size + decoder_model_size
 
-    # Total model size.
-    assert args.world_size % total_model_size == 0, (
-        f"world size ({args.world_size}) is not divisible by total_model_size ({encoder_model_size=} + {decoder_model_size=})"
-    )
+    # Verify data parallel related parameters
+    if args.encoder_data_parallel_size > 0:
+        assert args.encoder_pipeline_model_parallel_size > 0, "encoder_pipeline_model_parallel_size must be > 0 when encoder_data_parallel_size > 0"
+        # For the case that encoder and decoder have different data parallel size
+        encoder_world_size = encoder_model_size * args.encoder_data_parallel_size
+        decoder_world_size = args.world_size - encoder_world_size
+        if decoder_world_size % decoder_model_size != 0:
+            raise RuntimeError(
+                f"decoder_world_size ({decoder_world_size}) is not divisible by {decoder_model_size}"
+            )
+        data_parallel_size: int = decoder_world_size // decoder_model_size
+        assert data_parallel_size % args.encoder_data_parallel_size == 0, (
+            f"data_parallel_size ({data_parallel_size}) is not divisible by encoder_data_parallel_size ({args.encoder_data_parallel_size})"
+        )
+    else:
+        # For the case that encoder and decoder have the same data parallel size
+        total_model_size = encoder_model_size + decoder_model_size
+        if args.world_size % total_model_size != 0:
+            raise RuntimeError(f"world_size ({args.world_size}) is not divisible by {total_model_size}")
+        data_parallel_size: int = args.world_size // total_model_size
+    args.data_parallel_size = data_parallel_size
 
     if args.attention_backend == AttnBackend.local:
         assert args.spec[0] == 'local' , '--attention-backend local is only supported with --spec local'
 
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
-
-    args.data_parallel_size = args.world_size // total_model_size
 
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
@@ -2165,6 +2180,9 @@ def _add_distributed_args(parser):
                        help='Degree of pipeline model parallelism.')
     group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=0,
                        help=('Degree of pipeline model parallelism in the encoder. This is '
+                             'independent of the amount of pipeline in the decoder.'))
+    group.add_argument('--encoder-data-parallel-size', type=int, default=0,
+                       help=('Degree of data model parallelism in the encoder. This is '
                              'independent of the amount of pipeline in the decoder.'))
     group.add_argument('--pipeline-model-parallel-split-rank',
                        type=int, default=None,

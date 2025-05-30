@@ -64,6 +64,18 @@ class ModelParallelConfig:
     """
 
     ###################
+    # For MLLM Parallel
+    ###################
+    encoder_pipeline_model_parallel_size: int = 0
+    """Pipeline model parallel size for encoder."""
+
+    encoder_tensor_model_parallel_size: int = 0
+    """Tensor model parallel size for encoder."""
+
+    encoder_data_parallel_size: int = 0
+    """Data parallel size for encoder."""
+
+    ###################
     # Initialization
     ###################
     perform_initialization: bool = True

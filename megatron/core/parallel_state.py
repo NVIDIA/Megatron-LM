@@ -470,6 +470,7 @@ def initialize_model_parallel(
     order: str = "tp-cp-ep-dp-pp",
     encoder_tensor_model_parallel_size: int = 0,
     encoder_pipeline_model_parallel_size: Optional[int] = 0,
+    encoder_data_parallel_size: Optional[int] = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
@@ -583,6 +584,9 @@ def initialize_model_parallel(
             then the encoder will use the first two pipeline stages for its layers, and the total
             amount of pipelineing is 6.
 
+        encoder_data_parallel_size (int, default = 0):
+            The number of data parallel GPU groups to allocate to the encoder.
+
         get_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
             A function that takes in a list of ranks for a pipeline group and returns
             those ranks that should have embeddings.
@@ -632,6 +636,17 @@ def initialize_model_parallel(
         global _PIPELINE_MODEL_PARALLEL_DECODER_START
         _PIPELINE_MODEL_PARALLEL_DECODER_START = encoder_pipeline_model_parallel_size
 
+    if encoder_data_parallel_size > 0:
+        assert (
+            order == "tp-cp-ep-dp-pp"
+        ), "Currently only support tp-cp-ep-dp-pp order when encoder_data_parallel_size > 0, but got {order}"
+        assert (
+            encoder_pipeline_model_parallel_size > 0
+        ), "encoder_pipeline_model_parallel_size should be greater than 0 when encoder_data_parallel_size > 0"
+        assert (
+            num_distributed_optimizer_instances == 1
+        ), "Currently do not support num_distributed_optimizer_instances > 1 when encoder_data_parallel_size > 0"
+
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
@@ -649,15 +664,36 @@ def initialize_model_parallel(
     decoder_model_size = (
         tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
     )
-    total_model_size = encoder_model_size + decoder_model_size
+    # Verify data parallel related parameters
+    if encoder_pipeline_model_parallel_size > 0 and encoder_data_parallel_size > 0:
+        # For the case that encoder and decoder have different data parallel size
+        encoder_world_size = encoder_model_size * encoder_data_parallel_size
+        decoder_world_size = world_size - encoder_world_size
+        if decoder_world_size % decoder_model_size != 0:
+            raise RuntimeError(
+                f"decoder_world_size ({decoder_world_size}) is not divisible by {decoder_model_size}"
+            )
+        data_parallel_size: int = decoder_world_size // decoder_model_size
+        assert data_parallel_size % encoder_data_parallel_size == 0, (
+            f"data_parallel_size ({data_parallel_size}) is not divisible by "
+            f"encoder_data_parallel_size ({encoder_data_parallel_size})"
+        )
+    else:
+        # For the case that encoder and decoder have the same data parallel size
+        total_model_size = encoder_model_size + decoder_model_size
+        if world_size % total_model_size != 0:
+            raise RuntimeError(f"world_size ({world_size}) is not divisible by {total_model_size}")
+        data_parallel_size: int = world_size // total_model_size
+        encoder_world_size = encoder_model_size * data_parallel_size
+        decoder_world_size = decoder_model_size * data_parallel_size
 
-    if world_size % total_model_size != 0:
-        raise RuntimeError(f"world_size ({world_size}) is not divisible by {total_model_size}")
+    def is_encoder_rank(rank) -> bool:
+        """Return True if the rank is an encoder rank."""
+        return rank < encoder_world_size
 
-    data_parallel_size: int = world_size // total_model_size
-
-    encoder_world_size = encoder_model_size * data_parallel_size
-    decoder_world_size = decoder_model_size * data_parallel_size
+    def is_decoder_rank(rank) -> bool:
+        """Return True if the rank is an decoder rank."""
+        return rank >= encoder_world_size and rank < encoder_world_size + decoder_world_size
 
     assert (
         encoder_world_size + decoder_world_size == world_size
@@ -696,7 +732,7 @@ def initialize_model_parallel(
         encoder_rank_generator = RankGenerator(
             tp=encoder_tensor_model_parallel_size,
             ep=1,
-            dp=data_parallel_size,
+            dp=encoder_data_parallel_size,
             pp=encoder_pipeline_model_parallel_size,
             cp=context_parallel_size,
             order=order,
@@ -750,19 +786,51 @@ def initialize_model_parallel(
     but got {decoder_rank_generator.get_ranks('pp')} and {expert_decoder_rank_generator.get_ranks('pp')}"
 
     def generator_wrapper(group_type, is_expert=False, **kwargs):
-        """The `RankGenerator` class produces a hyper-rectangle for a given set of
+        """This function is used to support the case that the encoder and decoder
+        have different tensor/data parallel size.
+
+        The `RankGenerator` class produces a hyper-rectangle for a given set of
         tensor, pipeline, data, expert, and context parallelism. If we have an encoder,
         in addition to the default decoder, we essentially instantiate two `RankGenerator`
         classes to construct the parallelism for each module separately, and we then have
         to stitch them together for the right groups. For now, this means pp and tp-pp.
 
-        Let's say we have a total of 6 GPUs denoted by g0 ... g5.
-        For encoder_tp=1, encoder_pp=1, decoder_tp=2, decoder_pp=1, dp=2,
-        g0, g1 belong to encoder and g2, ..., g5 belong to decoder.
-        The present function will create with "tp-dp-pp":
-        3 data-parallel groups: [g0, g1], [g2, g4], [g3, g5]
-        4 tensor model-parallel groups: [g0], [g1], [g2, g3], [g4, g5]
-        4 pipeline model-parallel groups: [g0, g2], [g0, g3], [g1, g4], [g1, g5]
+        Let's say we have a total of 18 GPUs denoted by g0 ... g17.
+        For encoder_tp=1, encoder_dp=2, encoder_pp=1, decoder_tp=2, decoder_pp=2, decoder_dp=4,
+        g0, g1 belong to encoder and g2, ..., g17 belong to decoder.
+        The present function will create with order "tp-dp-pp":
+
+        (1) tp groups
+        10 tensor model-parallel groups, 2 for encoder and 8 for decoder:
+        [ g0],
+        [ g1],
+        [ g2,  g4],
+        [ g3,  g5],
+        [ g6,  g8],
+        [ g7,  g9],
+        [g10, g12],
+        [g11, g13],
+        [g14, g16],
+        [g15, g17],
+
+        (2) dp groups
+        5 data-parallel groups, 1 for encoder and 4 for decoder:
+        [ g0,  g1],
+        [ g2,  g4,  g6,  g8],
+        [ g3,  g5,  g7,  g9],
+        [g10, g12, g14, g16],
+        [g11, g13, g15, g17],
+
+        (3) 8 pp groups
+        8 pipeline model-parallel groups, each pp group stitches encoder and decoder ranks together:
+        [ g0, g2, g10],
+        [ g0, g3, g11],
+        [ g0, g4, g12],
+        [ g0, g5, g13],
+        [ g1, g6, g14],
+        [ g1, g7, g15],
+        [ g1, g8, g16],
+        [ g1, g9, g17],
         """
         if is_expert:
             d_ranks = expert_decoder_rank_generator.get_ranks(group_type, **kwargs)
@@ -775,23 +843,43 @@ def initialize_model_parallel(
             return
         e_ranks = encoder_rank_generator.get_ranks(group_type, **kwargs)
         if group_type == 'pp':
-            # Map one encoder tp rank to several decoder tp ranks, because
-            # encoder tp and decoder tp won't be the same size.
-            # Assign this way to avoid getting the DP ranks mixed up with the PP ranks.
-            # For example, if e_ranks = [0,1,2] and d_ranks = [3,4,5,6]
-            # Should yield [0,3], [0,4], [1,5], [2,6]
-            rep = len(d_ranks) // len(e_ranks)
-            remain = len(d_ranks) % len(e_ranks)
-            e_ind = 0
-            e_rep = rep + int(e_ind < remain)
-            for i, y in enumerate(d_ranks):
-                x = e_ranks[e_ind]
-                e_rep -= 1
-                if e_rep == 0:
-                    e_ind += 1
-                    e_rep = rep + int(e_ind < remain)
-                yield x + y
-        elif group_type == 'tp-pp':
+            # Map decoder ranks to encoder ranks.
+            # encoder tp/dp and decoder tp/dp won't be the same size.
+            if encoder_data_parallel_size > 0:
+                # For the case that encoder and decoder have different data parallel size.
+                assert data_parallel_size % encoder_data_parallel_size == 0, (
+                    f"data_parallel_size ({data_parallel_size}) is not divisible by "
+                    f"encoder_data_parallel_size ({encoder_data_parallel_size})"
+                )
+                e_group_ids = torch.arange(len(e_ranks)).reshape(encoder_data_parallel_size, -1)
+            else:
+                # For the case that encoder and decoder have the same data parallel size.
+                e_group_ids = torch.arange(len(e_ranks)).reshape(data_parallel_size, -1)
+            # Create group ids and reshape
+            d_group_ids = torch.arange(len(d_ranks)).reshape(data_parallel_size, -1)
+            # Calculate repeats needed to match d_group_ids shape
+            repeats_dim0 = int(np.ceil(d_group_ids.size(0) / e_group_ids.size(0)))
+            repeats_dim1 = int(np.ceil(d_group_ids.size(1) / e_group_ids.size(1)))
+            # get the mapping from decoder ranks to encoder ranks, by repeating and trimming
+            # e_group_ids according to d_group_ids shape
+            d2e_mapping = (
+                e_group_ids.repeat_interleave(repeats_dim0, dim=0)
+                .repeat_interleave(repeats_dim1, dim=1)[
+                    : d_group_ids.size(0), : d_group_ids.size(1)
+                ]
+                .reshape(-1)
+            )
+            # concate encoder pp ranks and decoder pp ranks
+            for d_idx in range(len(d_ranks)):
+                d_pp_ranks = d_ranks[d_idx]
+                e_pp_ranks = e_ranks[d2e_mapping[d_idx]]
+                yield e_pp_ranks + d_pp_ranks
+
+        # 'tp-pp' group is used with optimizer, to calculate
+        # the norm of the whole model's gradient.
+        # For the case that encoder and decoder have different data parallel size,
+        # we treated "a whole model" as the encoder or decoder seperately.
+        elif group_type == 'tp-pp' and encoder_data_parallel_size == 0:
             # For this group, we can just return the concatenated
             # groups together, because their sizes are the same.
             assert len(e_ranks) == len(d_ranks)
@@ -1270,6 +1358,9 @@ def initialize_model_parallel(
     model_parallel_group_id = 0
     intra_dist_opt_ranks = []
     for ranks in generator_wrapper('tp-ep-pp', is_expert=True):
+        if not all(is_decoder_rank(rank) for rank in ranks):
+            # if the generatored ranks are not all decoder ranks, skip.
+            continue
         model_parallel_group_id += 1
         intra_dist_opt_ranks.extend(ranks)
         if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
@@ -1282,6 +1373,32 @@ def initialize_model_parallel(
             if rank in intra_dist_opt_ranks:
                 _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
             intra_dist_opt_ranks = []
+
+    # While building the intra distributed optimizer instance group for encoder,
+    # we need to consider the case that the encoder and decoder
+    # have different tensor/data parallel size,
+    # because encoder and decoder have different intra_partial_expert_data_parallel_size.
+    encoder_model_parallel_group_id = 0
+    encoder_intra_dist_opt_ranks = []
+    encoder_intra_partial_expert_data_parallel_size = (
+        encoder_data_parallel_size // num_distributed_optimizer_instances
+    )
+    for ranks in generator_wrapper('tp-ep-pp', is_expert=True):
+        if not all(is_encoder_rank(rank) for rank in ranks):
+            # if the generatored ranks are not all encoder ranks, skip.
+            continue
+        encoder_model_parallel_group_id += 1
+        encoder_intra_dist_opt_ranks.extend(ranks)
+        if encoder_model_parallel_group_id % encoder_intra_partial_expert_data_parallel_size == 0:
+            intra_dist_opt_instance_group = create_group(
+                encoder_intra_dist_opt_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('intra_dist_opt_instance', nccl_comm_cfgs),
+                group_desc='INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP',
+            )
+            if rank in encoder_intra_dist_opt_ranks:
+                _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = intra_dist_opt_instance_group
+            encoder_intra_dist_opt_ranks = []
 
     # Initialize global memory buffer
     # This isn't really "parallel state" but there isn't another good place to

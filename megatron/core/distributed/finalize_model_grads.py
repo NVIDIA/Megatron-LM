@@ -319,13 +319,51 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
             assert not isinstance(pp_group, list)
             pp_group = [pp_group]
 
-        # need to do a broadcast for every pp group, even though num_tokens should be the same.
+        # need to do a broadcast for every pp group
         num_tokens_list = []
         for lr, group in zip(last_rank, pp_group):
             torch.distributed.broadcast(num_tokens, src=lr, group=group)
             num_tokens_list.append(torch.clone(num_tokens))
-        assert all(x.item() == num_tokens_list[0] for x in num_tokens_list)
+        if len(num_tokens_list) > 1:
+            # For the case that encoder and decoder have different data parallel size,
+            # encoder split micro batch into chunks, and sends different chunks to
+            # each decoder ranks.
+            # the num_tokens for each chunk is calculated at the last pipeline
+            # stage of decoder and send back to encoder.
+            # So the encoder will receive a list of num_tokens from different decoder ranks.
 
+            # calculate the data_parallel_size for decoder
+            world_size = torch.distributed.get_world_size()
+            encoder_model_size = (
+                config.encoder_tensor_model_parallel_size
+                * config.encoder_pipeline_model_parallel_size
+                * config.context_parallel_size
+            )
+            decoder_model_size = (
+                config.tensor_model_parallel_size
+                * config.pipeline_model_parallel_size
+                * config.context_parallel_size
+            )
+            # For the case that encoder and decoder have different data parallel size
+            encoder_world_size = encoder_model_size * config.encoder_data_parallel_size
+            decoder_world_size = world_size - encoder_world_size
+            data_parallel_size = decoder_world_size // decoder_model_size
+
+            chunk_num = data_parallel_size // config.encoder_data_parallel_size
+            num_tokens_encoder = torch.zeros(1, dtype=num_tokens.dtype, device=num_tokens.device)
+            chunk_size = len(num_tokens_list) // chunk_num
+            for i in range(chunk_num):
+                # all of the num_tokens values in each chunk are received from the same
+                # decoder data parallel rank.
+                chunk = num_tokens_list[i * chunk_size : (i + 1) * chunk_size]
+                # For the num_tokens received from the same decoder data parallel rank,
+                # they should have the same value.
+                assert all(
+                    x.item() == chunk[0] for x in chunk
+                ), "num_tokens should be the same for each chunk"
+                # sum num_tokens along the decoder data parallel dimension.
+                num_tokens_encoder += chunk[0]
+            num_tokens = num_tokens_encoder
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(
             num_tokens, group=parallel_state.get_data_parallel_group(with_context_parallel=True)
