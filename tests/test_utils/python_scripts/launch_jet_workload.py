@@ -471,6 +471,7 @@ def main(
                 or "illegal instruction" in concat_allranks_logs
                 or "torch.distributed.DistNetworkError" in concat_allranks_logs
                 or "Segmentation fault" in concat_allranks_logs
+                or "found NaN in local forward loss calculation" in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
