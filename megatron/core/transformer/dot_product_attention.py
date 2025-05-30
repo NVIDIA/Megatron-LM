@@ -90,10 +90,7 @@ class DotProductAttention(MegatronModule):
             self.softmax_scale /= coeff
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
-            config,
-            attn_mask_type=self.attn_mask_type,
-            mask_func=attention_mask_func,
-            scale=coeff,
+            config, attn_mask_type=self.attn_mask_type, mask_func=attention_mask_func, scale=coeff
         )
 
         # Dropout. Note that for a single iteration, this layer will generate
