@@ -1,6 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Optional, Union, Callable
+from typing import Callable, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -97,10 +97,13 @@ class ScaledSoftmax(torch.autograd.Function):
 
 class SoftmaxOne(nn.Module):
     r"""
-        Softmax-off-by-one function as introduced in https://www.evanmiller.org/attention-is-off-by-one.html
-        Supports fixed or learnable offset
+    Softmax-off-by-one function as introduced in https://www.evanmiller.org/attention-is-off-by-one.html
+    Supports fixed or learnable offset
     """
-    def __init__(self, dim: Optional[int] = None, denominator_offset: Union[torch.Tensor, float] = 1.) -> None:
+
+    def __init__(
+        self, dim: Optional[int] = None, denominator_offset: Union[torch.Tensor, float] = 1.0
+    ) -> None:
         super().__init__()
         self.dim = dim
         self.denominator_offset = denominator_offset
@@ -144,7 +147,9 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.scale = scale
         if config.attention_softmax_denominator_offset == 'learnable':
             self.softmax_denominator_weight = nn.Parameter(
-                torch.empty(config.num_attention_heads // config.tensor_model_parallel_size)[None, :, None, None]
+                torch.empty(config.num_attention_heads // config.tensor_model_parallel_size)[
+                    None, :, None, None
+                ]
             )
         elif config.attention_softmax_denominator_offset is not None:
             self.softmax_denominator_weight = config.attention_softmax_denominator_offset
@@ -162,7 +167,10 @@ class FusedScaleMaskSoftmax(nn.Module):
         # [b, np, sq, sk]
         assert input.dim() == 4
 
-        if self.is_kernel_available(mask, *input.size()) and self.softmax_denominator_weight is None:
+        if (
+            self.is_kernel_available(mask, *input.size())
+            and self.softmax_denominator_weight is None
+        ):
             return self.forward_fused_softmax(input, mask)
         else:
             return self.forward_torch_softmax(input, mask)
