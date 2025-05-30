@@ -431,7 +431,18 @@ class CheckpointFunction(torch.autograd.Function):
             )
 
         # Store everything.
-        ctx.save_for_backward(*args)
+        assert not hasattr(ctx, 'no_grad_params')
+        assert not hasattr(ctx, 'no_grad_params_idx')
+        ctx.no_grad_params = []
+        ctx.no_grad_params_idx = []
+        new_args = []
+        for idx, arg in enumerate(list(args)):
+            if arg is None or isinstance(arg, torch.Tensor):
+                new_args.append(arg)
+            else:
+                ctx.no_grad_params.append(arg)
+                ctx.no_grad_params_idx.append(idx)
+        ctx.save_for_backward(*new_args)
 
         return outputs
 
@@ -454,10 +465,16 @@ class CheckpointFunction(torch.autograd.Function):
             # Set the states to what it used to be before the forward pass.
             _set_all_rng_states(*ctx.rng_states)
 
+            # restore inpute parameters in order
+            detached_inputs = list(detach_variable(inputs))
+            for idx, ele in enumerate(ctx.no_grad_params_idx):
+                detached_inputs.insert(ele, ctx.no_grad_params[idx])
             # Compute the forward pass.
-            detached_inputs = detach_variable(inputs)
             with torch.enable_grad():
                 outputs = ctx.run_function(*detached_inputs)
+            # ctx.no_grad_params grad must be None
+            for ele in ctx.no_grad_params_idx:
+                detached_inputs[ele] = None
 
         if isinstance(outputs, torch.Tensor):
             outputs = (outputs,)
