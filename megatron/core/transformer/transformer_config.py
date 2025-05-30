@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union, Literal
 
 import torch
 import torch.nn.functional as F
@@ -192,6 +192,10 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
+
+    attention_softmax_denominator_offset: Optional[Union[Literal['learnable'], float]] = None
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
+       This arg is only used in unfused DotProductAttention. If true, unfused torch softmax will be used"""
 
     ####################
     # initialization
