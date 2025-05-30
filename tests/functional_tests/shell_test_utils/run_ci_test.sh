@@ -132,9 +132,12 @@ for i in $(seq 1 $N_REPEAT); do
 
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
-    if [[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]]; then
-        echo "No frozen checkpoint found. Will skip second run."
+    IS_FROZEN_RESUME_BUT_NO_CHECKPOINT=$([[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]] && echo "true" || echo "false")
 
+    if [[ "$IS_FROZEN_RESUME_BUT_NO_CHECKPOINT" == "true" && ${RECORD_CHECKPOINTS} != "true" ]]; then
+        echo "No frozen checkpoint found, but test type is frozen-resume. Will abort."
+        exit 1
+    elif [[ "$IS_FROZEN_RESUME_BUT_NO_CHECKPOINT" == "true" && ${RECORD_CHECKPOINTS} == "true" ]]; then
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
         rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
