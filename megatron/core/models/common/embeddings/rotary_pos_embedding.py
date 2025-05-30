@@ -9,6 +9,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.inference.contexts import BaseInferenceContext
     from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.chunked_pipeline_parallel_utils import ChunkedPipelineParallelParams
 
 import logging
 import math
@@ -23,6 +24,7 @@ from megatron.core.models.common.embeddings.rope_utils import (  # for backward 
     _apply_rotary_pos_emb_thd,
     _rotate_half,
     apply_rotary_pos_emb,
+    get_pos_emb_on_this_chunked_pp_span,
     get_pos_emb_on_this_cp_rank,
 )
 from megatron.core.utils import deprecate_inference_params, internal_api
@@ -182,6 +184,7 @@ class RotaryEmbedding(nn.Module):
         offset: int = 0,
         packed_seq: bool = False,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
     ) -> Tensor:
         """Forward pass of RoPE embedding.
 
@@ -196,6 +199,12 @@ class RotaryEmbedding(nn.Module):
             Tensor: Embeddings after applying RoPE.
         """
         emb = self.get_emb(max_seq_len, offset)
+
+        if chunked_pp_params is not None:
+            # Slice rotary_pos_emb along sequence dimension
+            # and select the parition of the current chunked PP span
+            emb = get_pos_emb_on_this_chunked_pp_span(emb, 0, chunked_pp_params)
+
         if cp_group is None:
             cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1 and not packed_seq:
@@ -216,6 +225,7 @@ class RotaryEmbedding(nn.Module):
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        chunked_pp_params: Optional[ChunkedPipelineParallelParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> int:
@@ -235,7 +245,9 @@ class RotaryEmbedding(nn.Module):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        if packed_seq_params is not None:
+        if transformer_config.chunked_pipeline_model_parallel_splits > 1:
+            return sum(chunked_pp_params.spans)
+        elif packed_seq_params is not None:
             # max_seqlen are the max sequence length in the packed sequence before being divived
             # by the tp and cp size.
             return max(packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv)
@@ -251,7 +263,6 @@ class RotaryEmbedding(nn.Module):
                 rotary_seq_len *= transformer_config.tensor_model_parallel_size
 
         rotary_seq_len *= transformer_config.context_parallel_size
-
         return rotary_seq_len
 
 
