@@ -12,15 +12,24 @@ import pytest
 import torch
 import torch.nn as nn
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.mimo.submodules.base import ModalitySubmodules
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+xm = get_xla_model()
 
 class MockModalitySubmodule(ModalitySubmodules):
     """Concrete implementation of ModalitySubmodules for testing purposes."""
@@ -61,7 +70,7 @@ class TestBaseSubmodule:
         )
 
         # Create layer spec for transformer
-        self.layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        self.layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
 
         # Define vision encoder parameters
         self.img_h = 224
@@ -178,7 +187,7 @@ class TestVisionSubmodule:
         except Exception as e:
             print(f"Warning: Could not initialize model parallel: {e}")
 
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         self.hidden_size = 64
         self.vision_config = TransformerConfig(
@@ -189,7 +198,7 @@ class TestVisionSubmodule:
         )
 
         # Create layer spec for transformer
-        self.layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        self.layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
 
         # Define vision parameters
         self.img_h = 224
@@ -217,7 +226,7 @@ class TestVisionSubmodule:
             input_projections=[self.input_projection],
         )
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = get_current_device()
         self.vision_submodule = self.vision_submodule.to(self.device)
 
         # Set all modules to eval mode to disable dropout and other stochastic layers

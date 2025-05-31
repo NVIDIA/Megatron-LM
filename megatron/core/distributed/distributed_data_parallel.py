@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 
+from megatron.core.device_utils import get_current_device, get_xla_model
+
 from .. import parallel_state
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..fp8_utils import is_float8tensor
@@ -17,8 +19,19 @@ from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
 
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_APEX_OR_TE = True
+except ImportError:
+    try: 
+        import apex # pylint: disable=unused-import
+        HAVE_APEX_OR_TE = True
+    except ImportError:
+        HAVE_APEX_OR_TE = False
+        
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 class DistributedDataParallel(_BaseDataParallel):
     """
@@ -76,15 +89,24 @@ class DistributedDataParallel(_BaseDataParallel):
         if grad_comm_pgs is None and model_comm_pgs is None:
             self.dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
+            ) if not xm else parallel_state.get_data_parallel_group_gloo(
+                with_context_parallel=False, partial_data_parallel=False
             )
             self.dp_cp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=True, partial_data_parallel=False
-            )
+            ) if not xm else parallel_state.get_data_parallel_group_gloo(
+                with_context_parallel=True, partial_data_parallel=False
+            ) 
             self.intra_dp_cp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=True, partial_data_parallel=True
+            ) if not xm else parallel_state.get_data_parallel_group_gloo(
+                with_context_parallel=True, partial_data_parallel=True
             )
-            self.expt_dp_group = parallel_state.get_expert_data_parallel_group()
+            self.expt_dp_group = parallel_state.get_expert_data_parallel_group() \
+                if not xm else parallel_state.get_expert_data_parallel_group_gloo()
             self.intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
+                partial_expert_data_parallel=True
+            ) if not xm else parallel_state.get_expert_data_parallel_group_gloo(
                 partial_expert_data_parallel=True
             )
             if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -311,7 +333,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 assert (
                     self.ddp_config.use_distributed_optimizer
                 ), 'Partial DistOpt cannot be used without DistOpt'
-                communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
+                communication_stream = torch.cuda.Stream(device=get_current_device())
                 for bucket_group in bucket_groups:
                     bucket_group.inter_distributed_optimizer_instance_group = (
                         self.inter_dist_opt_group
@@ -375,7 +397,7 @@ class DistributedDataParallel(_BaseDataParallel):
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params, self.intra_dp_cp_group, gradient_scaling_factor=gradient_scaling_factor
         )
-
+        
         # Allocate separate param+grad buffers for expert parallel params' grads.
         self.expert_parallel_buffers, self.expert_parallel_bucket_groups = (
             _allocate_buffers_for_parameters(
@@ -505,13 +527,15 @@ class DistributedDataParallel(_BaseDataParallel):
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
                     param.main_grad.add_(param.grad.data)
+                elif not HAVE_APEX_OR_TE:
+                    param.main_grad = param.grad.to(device=param.main_grad.device, dtype=param.main_grad.dtype)
                 param.grad = None
 
                 if self.ddp_config.overlap_grad_reduce:
                     self.param_to_bucket_group[param].register_grad_ready(param)
 
         return hook
-
+    
     @contextmanager
     def no_sync(self):
         """

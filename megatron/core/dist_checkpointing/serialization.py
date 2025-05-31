@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
+import torch.distributed
 
 from megatron.core.msc_utils import MultiStorageClientFeature
 
@@ -62,6 +63,7 @@ def load(
     common_strategy: Union[LoadCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
+    process_group: torch.distributed.ProcessGroup = None
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -123,7 +125,7 @@ def load(
             checkpoint_dir, sharded_strategy, common_strategy  # type: ignore[arg-type]
         )
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
-        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)
+        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict, process_group=process_group)
 
     sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
         sharded_state_dict,
@@ -132,6 +134,7 @@ def load(
         local_metadata,
         global_metadata,
         ckpt_sharded_metadata,
+        process_group=process_group
     )
 
     # ShardedBase loading
@@ -250,7 +253,7 @@ def load_sharded_metadata(
     return sharded_metadata
 
 
-def load_plain_tensors(checkpoint_dir: str) -> StateDict:
+def load_plain_tensors(checkpoint_dir: str, process_group: torch.distributed.ProcessGroup=None) -> StateDict:
     """Load checkpoint tensors without any sharding and plain structure.
 
     NOTE: common state dict is NOT included.
@@ -264,7 +267,7 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
     sharded_state_dict = load_tensors_metadata(checkpoint_dir)
     # Don't validate integrity because shards will be overlapped
     # if world_size > 1 (all processes load whole tensors)
-    return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
+    return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False, process_group=process_group)
 
 
 #
@@ -299,6 +302,7 @@ def save(
     common_strategy: Union[SaveCommonStrategy, Tuple[str, int], None] = None,
     validate_access_integrity: bool = True,
     async_sharded_save: bool = False,
+    process_group: torch.distributed.ProcessGroup = None,
     preprocess_common_before_consistancy_check: Optional[
         Callable[[CommonStateDict], StateDict]
     ] = None,
@@ -379,9 +383,10 @@ def save(
         assert isinstance(common_strategy, tuple), type(common_strategy)
         common_strategy = get_default_strategy(StrategyAction.SAVE_COMMON, *common_strategy)
 
-    sharded_state_dict, state_dict = save_preprocess(
-        sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
-    )
+    sharded_state_dict, state_dict = save_preprocess(sharded_state_dict, 
+                                                     validate_access_integrity, 
+                                                     process_group=process_group,
+                                                     preprocess_common_before_consistancy_check=preprocess_common_before_consistancy_check)
 
     common_strategy.save_common(state_dict, checkpoint_dir)
 
@@ -398,7 +403,7 @@ def save(
                 CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
                 checkpoint_dir,
             )
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=process_group)
 
     if not async_sharded_save:
         sharded_strategy.save(sharded_state_dict, checkpoint_dir)

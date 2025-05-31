@@ -3,6 +3,7 @@
 """Inference API."""
 
 
+from megatron.core.device_utils import get_current_device, set_manual_seed
 import torch
 
 from megatron.core import mpu
@@ -143,7 +144,7 @@ def generate(model,
     random_seed = int(values_float_tensor[12].item())
 
     if random_seed != -1:
-        torch.random.manual_seed(random_seed)
+        set_manual_seed(random_seed)
 
     # Tokenize prompts and get the batch.
     # Note that these tensors are broadcasted to all ranks.
@@ -201,7 +202,7 @@ def beam_search_and_post_process(model,
                                  prevent_newline_after_colon=prevent_newline_after_colon)
     # Only post-process on first stage.
     if mpu.is_pipeline_first_stage():
-        lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=torch.cuda.current_device())
+        lengths = tokens.size(1)*torch.ones(beam_size, dtype=torch.int64, device=get_current_device())
         tokens, prompts_plus_generations, prompts_plus_generations_segments = detokenize_generations(tokens, lengths, detokenize_segments)
         scores = scores.cpu().numpy().tolist()
         return prompts_plus_generations, prompts_plus_generations_segments, scores

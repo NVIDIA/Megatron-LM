@@ -4,28 +4,35 @@ from unittest import mock
 
 import torch
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
 from megatron.training.training import get_model
 from megatron.training.utils import unwrap_model
 
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
 NUM_LAYERS = 8
 HIDDEN_SIZE = 16
 NUM_ATTENTION_HEADS = 8
 
+xm = get_xla_model()
 
 def initialize_gpt_model(
     pre_process=True, post_process=True, seed=0, use_glu=True, **config_kwargs
 ):
-    torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     default_config_kwargs = dict(
         num_layers=NUM_LAYERS,
@@ -61,10 +68,10 @@ def initialize_moe_model(
     use_grouped_mlp=False,
     **config_kwargs,
 ):
-    torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
     expert_num = 8
 
+    use_te = use_te and HAVE_TE
     default_config_kwargs = dict(
         num_layers=8,
         hidden_size=16,
@@ -106,9 +113,7 @@ def init_basic_mock_args(args, tp, pp, bf16=True):
     args.bf16 = bf16
     args.accumulate_allreduce_grads_in_fp32 = False
     args.overlap_grad_reduce = False
-    args.overlap_param_gather_with_optimizer_step = False
-    args.fp8_param_gather = False
-    args.use_distributed_optimizer = True
+    args.use_distributed_optimizer = xm is None
     args.ddp_bucket_size = None
     args.check_for_nan_in_loss_and_grad = False
     args.ddp_average_in_collective = False
@@ -165,6 +170,7 @@ def setup_model_and_optimizer(
     use_custom_fsdp=False,
     data_parallel_sharding_strategy="optim_grads_params",
 ):
+    dist_opt = dist_opt and xm is None
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
@@ -182,12 +188,11 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(
         bf16=bf16,
         params_dtype=torch.bfloat16 if bf16 else torch.float,
-        use_distributed_optimizer=dist_opt,
+        use_distributed_optimizer=dist_opt and  xm is None,
     )
     optimizer = get_megatron_optimizer(config, model)
 
-    torch.manual_seed(seed + 1)
-    model_parallel_cuda_manual_seed(seed + 1)
+    model_parallel_device_manual_seed(seed + 1)
 
     for group in optimizer.optimizer.param_groups:
         for p in group['params']:
@@ -237,6 +242,7 @@ def setup_moe_model_and_optimizer(
     use_grouped_mlp=False,
     use_glu=False,
 ):
+    dist_opt = dist_opt and xm is None
     mock_args = parse_args(ignore_unknown_args=True)
     with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
         init_basic_mock_args(mock_args, tp, pp, bf16=bf16)
@@ -263,15 +269,15 @@ def setup_moe_model_and_optimizer(
     )
     optimizer = get_megatron_optimizer(config, model)
 
-    torch.manual_seed(seed + 1)
-    model_parallel_cuda_manual_seed(seed + 1)
+    model_parallel_device_manual_seed(seed + 1)
 
-    for opt in optimizer.chained_optimizers:
-        for group in opt.param_groups:
-            for p in group['params']:
-                if len(opt.state[p]) == 0:
-                    opt.state[p]['exp_avg'] = torch.rand_like(p.data)
-                    opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
+    if hasattr(optimizer, "chained_optimizers"):
+        for opt in optimizer.chained_optimizers:
+            for group in opt.param_groups:
+                for p in group['params']:
+                    if len(opt.state[p]) == 0:
+                        opt.state[p]['exp_avg'] = torch.rand_like(p.data)
+                        opt.state[p]['exp_avg_sq'] = torch.rand_like(p.data)
 
     optimizer.reload_model_params()
 

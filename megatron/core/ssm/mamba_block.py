@@ -13,17 +13,30 @@ from typing import Optional, Union
 
 import torch
 from torch import Tensor, nn
+import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.enums import Fp8Recipe
-from megatron.core.extensions.transformer_engine import TENorm
-from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel import get_device_rng_tracker
+
+try:
+    from megatron.core.extensions.transformer_engine import (
+            TENorm as WrappedTorchNorm
+    )
+except ImportError:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    import warnings
+
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
+   
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -41,7 +54,7 @@ def _init_weights(
     rescale_prenorm_residual=True,
     n_residuals_per_layer=1,  # Change to 2 if we have MLP
 ):
-    with get_cuda_rng_tracker().fork():
+    with get_device_rng_tracker().fork():
         if isinstance(module, nn.Linear):
             if not getattr(module.weight, "_no_reinit", False):
                 nn.init.normal_(module.weight, std=initializer_range)
@@ -197,7 +210,7 @@ class MambaStack(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_norm = TENorm(
+            self.final_norm = WrappedTorchNorm(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
@@ -310,7 +323,7 @@ class MambaStack(MegatronModule):
             sequence_len_offset = torch.tensor(
                 [inference_context.sequence_len_offset] * inference_context.current_batch_size,
                 dtype=torch.int32,
-                device='cuda',
+                device=get_current_device(),
             )
         else:
             sequence_len_offset = None

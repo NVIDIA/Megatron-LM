@@ -5,13 +5,26 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.param_and_grad_buffer import partition_buckets
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_local_spec
+)
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from tests.unit_tests.test_utilities import TestModel, Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+xm = get_xla_model()
 
 class TestMoEModel(torch.nn.Module):
     def __init__(
@@ -39,15 +52,21 @@ class TestMoEModel(torch.nn.Module):
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
-        )
+
+        if HAVE_TE:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+            )
+        else:
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=num_moe_experts, moe_grouped_gemm=moe_grouped_gemm
+            )
         super().__init__()
         self.layers = torch.nn.ModuleList(
             [
                 MoELayer(
                     transformer_config, transformer_layer_spec.submodules.mlp.submodules
-                ).cuda()
+                ).to(device=get_current_device())
                 for _ in range(num_layers)
             ]
         )
@@ -66,6 +85,7 @@ def get_moe_model_and_buffers(
     average_in_collective: bool,
     num_distributed_optimizer_instances: int,
 ):
+    model_parallel_device_manual_seed(123)
     ddp_config = DistributedDataParallelConfig(
         grad_reduce_in_fp32=True,
         use_distributed_optimizer=use_distributed_optimizer,
@@ -101,7 +121,6 @@ def get_moe_model_and_buffers(
         ep_bucket_groups,
     )
 
-
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
 @pytest.mark.parametrize("average_in_collective", [False, True])
@@ -118,6 +137,9 @@ def test_grad_sync(
     etp_size: int,
     num_distributed_optimizer_instances: int,
 ):
+    use_distributed_optimizer = use_distributed_optimizer and xm is None
+    average_in_collective = average_in_collective and xm is None
+    
     Utils.initialize_model_parallel(
         expert_model_parallel_size=ep_size,
         expert_tensor_parallel_size=etp_size,
@@ -177,7 +199,7 @@ def test_grad_sync(
             parallel_state.get_data_parallel_world_size()
         )
     if ep_size > 1:
-        # For MoE models with exper parallelism, each expert will receive tokens from EPxETP times batches, such that the expert gradient will be EPxETP times after backward,
+        # For MoE models with expert parallelism, each expert will receive tokens from EPxETP times batches, such that the expert gradient will be EPxETP times after backward,
         # and the expected gradient after collective should be 1.0 as same as dense params.
         ep_param_and_grad_buffer.grad_data.data.fill_(float(ep_size * etp_size))
         ep_expected_grad_data_value_after_collective = 1

@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device_type
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     recv_from_prev_pipeline_rank_,
@@ -21,6 +22,7 @@ class TestCommunicationWithCustomPPGroup:
         self.size = [16, 8]
         self.dtype = torch.float32
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
         reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
@@ -48,7 +50,7 @@ class TestCommunicationWithCustomPPGroup:
 
         # Align with mcore minor-to-major order: tp-cp-dp-pp
         # Note init_device_mesh uses major-to-minor order, reverse the order of mcore
-        mesh = dist.init_device_mesh("cuda", (pp_size, tp_size), mesh_dim_names=["pp", "tp"])
+        mesh = dist.init_device_mesh(get_current_device_type(), (pp_size, tp_size), mesh_dim_names=["pp", "tp"])
         pp_group = mesh.get_group(mesh_dim="pp")
 
         # Broadcast using custom pp_group
@@ -63,6 +65,7 @@ class TestCommunicationWithCustomPPGroup:
         ), "broadcast_from_last_pipeline_stage should be the same with or without custom pp_group"
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"),
         reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
@@ -102,7 +105,7 @@ class TestCommunicationWithCustomPPGroup:
 
         # Align with mcore minor-to-major order: tp-cp-dp-pp
         # Note init_device_mesh uses major-to-minor order, reverse the order of mcore
-        mesh = dist.init_device_mesh("cuda", (pp_size, tp_size), mesh_dim_names=["pp", "tp"])
+        mesh = dist.init_device_mesh(get_current_device_type(), (pp_size, tp_size), mesh_dim_names=["pp", "tp"])
         pp_group = mesh.get_group(mesh_dim="pp")
 
         # Send/recv using custom pp_group

@@ -11,7 +11,8 @@ import torch
 import torch.nn as nn
 from transformers import WhisperConfig, WhisperModel
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.device_utils import get_current_device
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo.config.base_configs import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
@@ -22,6 +23,12 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 pytest.importorskip("modelopt", minversion="0.25")
 # modelopt version < 0.27 breaks HF AutoModel.from_pretrained API
 # so we need to skip the tests unitl versions are bumped in pyt LTS CI container
@@ -43,7 +50,7 @@ class AudioEncoderWrapper(torch.nn.Module):
 
 def get_vision_submodules_spec(hidden_size, img_h, img_w, patch_dim):
     """Get the submodule spec for the vision modality."""
-    vision_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    vision_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
 
     vision_config = TransformerConfig(
         num_layers=1, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True
@@ -122,7 +129,7 @@ def get_language_model_spec(hidden_size, vocab_size, seq_len):
     lm_config = TransformerConfig(
         num_layers=2, hidden_size=hidden_size, num_attention_heads=4, use_cpu_initialization=True
     )
-    language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    language_layer_spec = get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
     language_model_spec = ModuleSpec(
         module=GPTModel,
         params={
@@ -215,7 +222,7 @@ class TestMimoModel:
         )
 
         # Move to device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_current_device()
         mimo_model = mimo_model.to(device)
 
         # Test that modality submodules were initialized correctly
@@ -233,7 +240,7 @@ class TestMimoModel:
     def test_get_text_embeddings(self):
         """Test getting text embeddings."""
         # Create random input and position IDs (within vocab size range)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_current_device()
         input_ids = torch.randint(
             0, self.vocab_size, (self.batch_size, self.seq_len), device=device
         )
@@ -261,7 +268,7 @@ class TestMimoModel:
     def test_forward_text_only(self):
         """Test forward pass with only text input."""
         # Create inputs
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_current_device()
         input_ids = torch.randint(
             0, self.vocab_size, (self.batch_size, self.seq_len), device=device
         )
@@ -291,7 +298,7 @@ class TestMimoModel:
     def test_forward_with_image_modality(self):
         """Test forward pass with text and image input."""
         # Calculate expected number of image tokens based on image size and patch dimension
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_current_device()
         expected_img_seq_len = (self.img_h // self.patch_dim) * (
             self.img_w // self.patch_dim
         ) + 1  # +1 for CLS token
@@ -359,7 +366,7 @@ class TestMimoModel:
 
     def test_forward_with_image_and_audio_modality(self):
         """Test forward pass with text, image, and audio input."""
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = get_current_device()
 
         mimo_model = get_avlm_mimo_model(
             self.hidden_size,

@@ -41,6 +41,7 @@ import numpy as np
 from torchvision.datasets.utils import extract_archive, verify_str_arg, iterable_to_str
 from torchvision.datasets import VisionDataset
 from PIL import Image
+from megatron.core.device_utils import get_current_device
 from megatron.training import print_rank_0
 
 
@@ -99,7 +100,7 @@ class Cityscapes(VisionDataset):
          [0, 80, 100],
          [0, 0, 230],
          [119, 11, 32],
-         [0, 0, 0]], dtype=torch.float, device='cuda')
+         [0, 0, 0]], dtype=torch.float, device=get_current_device())
 
 
     # Based on https://github.com/mcordts/cityscapesScripts

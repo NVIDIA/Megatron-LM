@@ -11,6 +11,7 @@ from functools import partial
 # Add megatron to the path.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir)))
 
+from megatron.core.device_utils import get_current_device
 import numpy as np
 import torch
 from PIL import Image
@@ -113,7 +114,7 @@ def generate_samples(model):
 
     idx = 0
     while True:
-        image = images[idx].cuda()
+        image = images[idx].to(device=get_current_device())
         image_id = int(image_files[idx].split("_")[-1].split(".")[0])
 
         forward_step = partial(VLMForwardStep, image)

@@ -1,5 +1,6 @@
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -26,10 +27,10 @@ def get_batch(data_iterator):
 
     # only data parallelism; no need for broadcast
     if isinstance(data[0], list):
-        images = [aug.cuda() for aug in data[0]]
+        images = [aug.to(device=get_current_device()) for aug in data[0]]
     else:
-        images = data[0].cuda()
-    labels = data[1].cuda()
+        images = data[0].to(device=get_current_device())
+    labels = data[1].to(device=get_current_device())
 
     return images, labels
 

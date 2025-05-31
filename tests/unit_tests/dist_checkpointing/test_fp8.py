@@ -2,8 +2,8 @@
 
 import pytest
 import torch
-from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.serialization import (
     get_default_load_sharded_strategy,
@@ -13,34 +13,28 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
 )
+from megatron.core.parallel_state import get_default_process_group
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=W0611
 
-def to_float8(tensor: torch.Tensor) -> Float8Tensor:
-    """Convert a tensor to FP8 format."""
-    try:
-        return Float8Tensor.to_float8(tensor)
-    except Exception as e:
-        # Handle the case where the method fails (due to API changes in TransformerEngine)
-        # https://github.com/NVIDIA/TransformerEngine/commit/544dd14b4301beb47136f273deff3f532cdde181
-        import transformer_engine_torch as tex
-        from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
+    HAVE_TE = True
+except (ImportError, ModuleNotFoundError):
+    # Transformer Engine not found
+    HAVE_TE = False
 
-        fp8_dtype = tex.DType.kFloat8E4M3
-        scale = 1.0
+HAVE_TE_FLOAT8TENSOR = False
+try:
+    from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
-        # Create a quantizer for FP8 conversion
-        quantizer = Float8Quantizer(
-            scale=torch.full([1], scale, dtype=torch.float32, device="cuda"),
-            amax=torch.empty([1], dtype=torch.float32, device="cuda"),
-            fp8_dtype=fp8_dtype,
-        )
+    HAVE_TE_FLOAT8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # Float8Tensor not found
+    Float8Tensor = None
 
-        # Return the quantized tensor
-        return quantizer(tensor.cuda())
-
-
+@pytest.mark.skipif(not HAVE_TE, reason="Transormer Engine is required for fp8")
 class TestFP8:
     @pytest.mark.parametrize('dtype', ['bf16', 'fp16', 'fp8'])
     @pytest.mark.parametrize('src_rank', [0, 6])
@@ -49,11 +43,13 @@ class TestFP8:
 
         def get_ten(dtype: str = 'fp8'):
             if dtype == 'fp8':
-                return to_float8(torch.full((3,), Utils.rank, dtype=torch.bfloat16, device='cuda'))
+                return Float8Tensor.to_float8(
+                    torch.full((3,), Utils.rank, dtype=torch.bfloat16, device=get_current_device())
+                )
             elif dtype == 'bf16':
-                return torch.full((3,), Utils.rank, dtype=torch.bfloat16, device='cuda')
+                return torch.full((3,), Utils.rank, dtype=torch.bfloat16, device=get_current_device())
             elif dtype == 'fp16':
-                return torch.full((3,), Utils.rank, dtype=torch.float16, device='cuda')
+                return torch.full((3,), Utils.rank, dtype=torch.float16, device=get_current_device())
             else:
                 raise NotImplementedError(dtype)
 
@@ -79,7 +75,9 @@ class TestFP8:
         Utils.initialize_model_parallel(*src_tp_pp)
 
         def get_fp8_tensor(fill_val=1):
-            return to_float8(torch.full((3,), fill_val, dtype=torch.bfloat16, device='cuda'))
+            return Float8Tensor.to_float8(
+                torch.full((3,), fill_val, dtype=torch.bfloat16, device=get_current_device())
+            )
 
         def get_state_dict(fill_val=1):
             return {
@@ -97,7 +95,9 @@ class TestFP8:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_fp8_save_load', sync=True) as ckpt_dir:
             save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
-                save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, None, True)
+                save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, None, 
+                                                                 get_default_process_group(),
+                                                                 True)
             save(get_state_dict(4), ckpt_dir, save_strategy)
 
             Utils.destroy_model_parallel()

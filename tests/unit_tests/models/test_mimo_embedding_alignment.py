@@ -9,9 +9,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.model.base import MimoModel
 from megatron.core.transformer.spec_utils import ModuleSpec
+from tests.unit_tests.test_utilities import Utils
 
 
 class TestEmbeddingAlignment:
@@ -19,6 +21,8 @@ class TestEmbeddingAlignment:
 
     def setup_method(self):
         """Set up for each test."""
+        Utils.initialize_model_parallel(1, 1)
+            
         # Create a minimal MimoModelConfig
         language_model_spec = ModuleSpec(module=MagicMock, params={'config': MagicMock()})
         self.mimo_config = MimoModelConfig(
@@ -31,7 +35,11 @@ class TestEmbeddingAlignment:
         self.model = MimoModel(self.mimo_config)
 
         self.hidden_dim = 64
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = get_current_device()
+
+    def teardown_method(self, method):
+        '''teardown env'''
+        Utils.destroy_model_parallel()
 
     def create_marker_embeddings(self, num_embeddings, marker_positions=None, marker_values=None):
         """Create embeddings with marker values at specific positions.
@@ -130,8 +138,9 @@ class TestEmbeddingAlignment:
             (7, 1),  # Batch 1
         ]
 
+        value = torch.tensor(0.01)
         for s, b in text_positions:
-            assert torch.all(combined[s, b] == 0.01)
+            assert torch.allclose(combined[s, b], value)
 
     def test_multiple_modalities(self):
         """Test alignment with multiple modalities with special tokens at different positions."""

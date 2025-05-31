@@ -31,7 +31,7 @@ def report_draft_acceptance_length(model, osl: int = 64, draft_length: int = 7):
     for category, conversations in category_and_prompt.items():
         input_ids = tokenizer.apply_chat_template(
             conversations, return_tensors="pt", add_generation_prompt=True
-        ).to(torch.cuda.current_device())
+        ).to(get_current_device())
         output_ids, actual_osl, steps = simple_speculative_generate(
             unwrapped_model, input_ids, osl=osl, draft_length=draft_length, disable_tqdm=True
         )

@@ -3,12 +3,13 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP
@@ -20,7 +21,7 @@ class TestMambaBlock:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
     def get_model_comm_pgs(self):
         return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
@@ -49,15 +50,15 @@ class TestMambaBlock:
         """Test GPU forward pass."""
         hybrid_override_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         block = self.get_mamba_block(hybrid_override_pattern)
-        block.cuda()
+        block.to(device=get_current_device())
         micro_batch_size = 2
         sequence_length = 32
         hidden_states = torch.ones((sequence_length, micro_batch_size, block.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
         )
-        attention_mask = attention_mask.cuda()
+        attention_mask = attention_mask.to(device=get_current_device())
         output = block(hidden_states, attention_mask=attention_mask)
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size

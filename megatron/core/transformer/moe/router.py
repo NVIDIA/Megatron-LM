@@ -20,7 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     z_loss_func,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-
+from megatron.core.device_utils import get_current_device, get_xla_model
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -72,7 +72,7 @@ class Router(ABC, MegatronModule):
         """
         if self.weight.device.type == 'cpu':
             # move weights to GPU
-            self.weight.data = self.weight.data.to(device=torch.cuda.current_device())
+            self.weight.data = self.weight.data.to(device=get_current_device())
         # Convert to specified datatype for routing computation if enabled
         router_dtype = input.dtype
         if self.config.moe_router_dtype == 'fp32':
@@ -314,7 +314,7 @@ class TopKRouter(Router):
             aux_loss / moe_aux_loss_coeff,
             self.layer_number,
             self.config.num_layers,
-            reduce_group=sequence_partition_group,
+            reduce_group=sequence_partition_group
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -451,5 +451,4 @@ class TopKRouter(Router):
             logits = apply_random_logits(logits)
 
         scores, routing_map = self.routing(logits)
-
         return scores, routing_map

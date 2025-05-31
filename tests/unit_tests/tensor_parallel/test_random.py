@@ -1,18 +1,29 @@
+from megatron.core.device_utils import get_current_device, get_current_rng_state, get_xla_model
+from megatron.core.tensor_parallel.random import DeviceRNGStatesTracker
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed,get_device_rng_tracker
+from megatron.core.tensor_parallel.random import checkpoint
+from megatron.core.device_utils import set_manual_seed
+from tests.unit_tests.test_utilities import Utils
 import pytest
 import torch
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
-    CudaRNGStatesTracker,
+    DeviceRNGStatesTracker,
     checkpoint,
-    get_cuda_rng_tracker,
-    model_parallel_cuda_manual_seed,
+    model_parallel_device_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
 
-def test_cuda_rng_states_tracker():
-    rng_tracker = CudaRNGStatesTracker()
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+def test_device_rng_states_tracker():
+    rng_tracker = DeviceRNGStatesTracker()
     rng_tracker.set_states({"state1": 1234})
     assert rng_tracker.get_states()["state1"] == 1234
     rng_tracker.reset()
@@ -28,16 +39,19 @@ def test_cuda_rng_states_tracker():
         assert ()
 
     rng_tracker.fork("state2")
-    torch.cuda.manual_seed(seed)
-    rng_state = torch.cuda.get_rng_state()
-    assert torch.equal(rng_tracker.get_states()['state2'], rng_state)
+    set_manual_seed(seed)
+    rng_state = get_current_rng_state()
+    xm = get_xla_model()
+    if xm is None:
+        assert torch.equal(rng_tracker.get_states()['state2'], rng_state)
+    else:
+        assert int(rng_tracker.get_states()['state2']) == rng_state
 
-
-def test_model_parallel_cuda_manual_seed():
-    Utils.initialize_model_parallel(4, 2)
-    model_parallel_cuda_manual_seed(0)
-    rng_tracker = get_cuda_rng_tracker()
-    assert rng_tracker.get_states()['model-parallel-rng'] is not None
+def test_model_parallel_device_manual_seed():
+    Utils.initialize_model_parallel(4,2)
+    model_parallel_device_manual_seed(0)
+    rng_tracker = get_device_rng_tracker()
+    assert(rng_tracker.get_states()['model-parallel-rng'] is not None)
     Utils.destroy_model_parallel()
 
 
@@ -49,12 +63,13 @@ def test_checkpoint():
         torch.ones(16) * 3, checkpoint(test_forward, None, torch.ones(16), torch.ones(16) * 2)
     )
     Utils.initialize_model_parallel()
-    input1 = torch.ones((4, 4))
-    checkpoint(test_forward, True, input1, torch.ones((4, 4)) * 2)
-    assert torch.equal(torch.ones(input1.numel()).cuda(), input1)
+    input1 = torch.ones((4,4))
+    checkpoint(test_forward, True, input1, torch.ones((4,4))*2)
+    assert(torch.equal(torch.ones(input1.numel()).to(device=get_current_device()), input1))
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer engine required" )
 def test_checkpoint_without_output():
     def normal_forward(input):
         x = torch.nn.functional.gelu(input)

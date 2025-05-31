@@ -18,6 +18,7 @@ from time import time
 import torch
 
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
+from megatron.core.device_utils import get_current_device, get_current_rng_state, get_xla_model, set_current_rng_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.serialization import get_default_load_sharded_strategy
 from megatron.core.dist_checkpointing.strategies.fully_parallel import \
@@ -49,11 +50,13 @@ try:
     has_nvidia_modelopt = True
 except Exception:
     has_nvidia_modelopt = False
-
+        
 _CHECKPOINT_VERSION = None
 
 logger = getLogger(__name__)
 _NON_PERSISTENT_CKPT_SUBDIR = 'non_persistent'
+
+xm = get_xla_model()
 
 def set_checkpoint_version(value):
     global _CHECKPOINT_VERSION
@@ -259,9 +262,9 @@ def read_metadata(tracker_filename):
 
     # Get the max iteration retrieved across the ranks.
     if torch.distributed.is_initialized():
-        iters_cuda = torch.tensor([iteration], dtype=torch.long, device='cuda')
-        torch.distributed.all_reduce(iters_cuda, op=torch.distributed.ReduceOp.MAX)
-        max_iter = iters_cuda[0].item()
+        iters_device = torch.tensor([iteration], dtype=torch.long, device=get_current_device())
+        torch.distributed.all_reduce(iters_device, op=torch.distributed.ReduceOp.MAX)
+        max_iter = iters_device[0].item()
 
         # We should now have all the same iteration.
         # If not, print a warning and chose the maximum
@@ -287,18 +290,24 @@ def get_rng_state(ckpt_format: str):
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
         'torch_rng_state': torch.get_rng_state(),
-        'cuda_rng_state': torch.cuda.get_rng_state(),
-        'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
+        'current_rng_state': get_current_rng_state(),
+        'rng_tracker_states': tensor_parallel.get_device_rng_tracker().get_states()}
 
     rng_state_list = None
     if args.data_parallel_random_init and torch.distributed.is_initialized() and \
             mpu.get_data_parallel_world_size() > 1:
         rng_state_list = \
-            [None for i in range(mpu.get_data_parallel_world_size())]
-        torch.distributed.all_gather_object(
-            rng_state_list,
-            rng_state,
-            group=mpu.get_data_parallel_group())
+                [None for i in range(mpu.get_data_parallel_world_size())]
+        if xm:
+             torch.distributed.all_gather_object(
+                rng_state_list,
+                rng_state,
+                group=mpu.get_data_parallel_group_gloo())
+        else:
+            torch.distributed.all_gather_object(
+                rng_state_list,
+                rng_state,
+                group=mpu.get_data_parallel_group())
     else:
         rng_state_list = [rng_state]
 
@@ -395,7 +404,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Save distributed optimizer's custom parameter state.
     if (
-        args.use_distributed_optimizer
+        args.use_distributed_optimizer 
         and not args.no_save_optim
         and optimizer is not None
         and ckpt_type == CheckpointType.LEGACY
@@ -459,7 +468,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             logger.debug("Failed to plug in the read metadata from the load strategy...")
 
                 if args.ckpt_fully_parallel_save:
-                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True),
+                    save_strategy = FullyParallelSaveStrategyWrapper(save_strategy, mpu.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                                                                        mpu.get_data_parallel_group_gloo(with_context_parallel=True),
+                                                                     mpu.get_default_process_group(),
                                                                      args.ckpt_assume_constant_structure)
             # Store save strategy for future checkpoint saves
             if checkpointing_context is not None:
@@ -469,6 +480,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             async_save_request = dist_checkpointing.save(state_dict, checkpoint_name, save_strategy,
                                                          async_sharded_save=args.async_save,
                                                          validate_access_integrity=validate_sharding_integrity,
+                                                         process_group=mpu.get_default_process_group(),
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn)
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
@@ -482,6 +494,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             torch.distributed.checkpoint.save(
                 state_dict=state_dict,
                 storage_writer=fs_storage_writer,
+                process_group=mpu.get_default_process_group(),
             )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
@@ -506,7 +519,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                     cached_metadata = checkpointing_context['local_checkpoint_cache']
                 state_dict_for_save, cacheable_metadata = MCoreTensorAwareStateDict.from_state_dict(
                     state_dict, algo=algo, cached_metadata=cached_metadata,
-                    parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True)
+                    parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True) if xm is None \
+                        else mpu.get_data_parallel_group_gloo(with_context_parallel=True),
+                    process_group=mpu.get_default_process_group()
                 )
                 async_save_request = checkpointing_context['local_checkpoint_manager'].save(
                     state_dict_for_save, iteration, is_async=bool(args.async_save)
@@ -583,7 +598,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Wait so everyone is done (not necessary)
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=mpu.get_default_process_group())
 
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
@@ -649,12 +664,13 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
         basename=f'train_dataloader_dprank{dp_rank:03d}.pt'
     )
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    group=mpu.get_data_parallel_group() if xm is None else mpu.get_data_parallel_group_gloo()
+    torch.distributed.barrier(group=group)
 
     if mpu.get_data_parallel_rank() == 0:
         ensure_directory_exists(data_state_save_path)
 
-    torch.distributed.barrier(group=mpu.get_data_parallel_group())
+    torch.distributed.barrier(group=group)
 
     dataloader_save_dict = {}
     dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
@@ -833,7 +849,8 @@ def _load_non_persistent_base_checkpoint(
         state_dict = intermediate_state_dict.to_state_dict(
             sharded_state_dict,
             algo=args.non_persistent_local_ckpt_algo,
-            parallelization_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            parallelization_group=mpu.get_data_parallel_group(with_context_parallel=True) if xm is None \
+                        else mpu.get_data_parallel_group_gloo(with_context_parallel=True)
         )
         return state_dict, checkpoint_name, False, CheckpointType.LOCAL
     else:
@@ -862,12 +879,15 @@ def _load_global_dist_base_checkpoint(
     load_strategy = get_default_load_sharded_strategy(checkpoint_name)
     # NOTE: `args.ckpt_fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if args.ckpt_fully_parallel_load:
+        parallelization_group = mpu.get_data_parallel_group(with_context_parallel=True) \
+            if xm is None else mpu.get_data_parallel_group_gloo(with_context_parallel=True) 
         load_strategy = FullyParallelLoadStrategyWrapper(
-            load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)
+            strategy=load_strategy, 
+            parallelization_group=parallelization_group
         )
     if checkpointing_context is not None:
         checkpointing_context["load_strategy"] = load_strategy
-    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness)
+    state_dict = dist_checkpointing.load(sharded_state_dict, checkpoint_name, load_strategy, strict=args.dist_ckpt_strictness, process_group=mpu.get_default_process_group())
     return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
 
@@ -949,7 +969,7 @@ def _load_base_checkpoint(
         if args.exit_on_missing_checkpoint:
             print_rank_0(">> '--exit-on-missing-checkpoint' set ... exiting. <<")
             if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+                torch.distributed.barrier(group=mpu.get_default_process_group())
             sys.exit()
 
         return None, "", False, None
@@ -1012,6 +1032,7 @@ def _load_base_checkpoint(
             torch.distributed.checkpoint.load(
                 state_dict=state_dict,
                 checkpoint_id=checkpoint_name,
+                process_group=mpu.get_default_process_group()
             )
         else:
             # _load_base_checkpoint is called from load_checkpoint with a proper state dict.
@@ -1466,23 +1487,23 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])
-                torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
+                set_current_rng_state(rng_state['current_rng_state'])
                 # Check for empty states array
                 if not rng_state['rng_tracker_states']:
                     raise KeyError
-                tensor_parallel.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_device_rng_tracker().set_states(
                     rng_state['rng_tracker_states'])
             else:  # backward compatability
                 random.setstate(state_dict['random_rng_state'])
                 np.random.set_state(state_dict['np_rng_state'])
                 torch.set_rng_state(state_dict['torch_rng_state'])
-                torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
+                set_current_rng_state(state_dict['current_rng_state'])
                 # Check for empty states array
                 if not state_dict['rng_tracker_states']:
                     raise KeyError
-                tensor_parallel.get_cuda_rng_tracker().set_states(
+                tensor_parallel.get_device_rng_tracker().set_states(
                     state_dict['rng_tracker_states'])
-        except KeyError:
+        except KeyError as e:
             print_rank_0('Unable to load rng state from checkpoint {}. '
                          'Specify --no-load-rng or --finetune to prevent '
                          'attempting to load the rng state, '
@@ -1491,7 +1512,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+        torch.distributed.barrier(group=mpu.get_default_process_group())
 
     print_rank_0(f'  successfully loaded checkpoint from {load_dir} '
                  f'[ t {mpu.get_tensor_model_parallel_rank() + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
@@ -1503,7 +1524,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
        or is_last_rank():
         wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
 
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if iteration > 0:
         # Notify FT that a checkpoint was loaded.
@@ -1563,7 +1585,7 @@ def load_biencoder_checkpoint(model, only_query_model=False,
 
     assert len(model) == 1
     model[0].load_state_dict(ret_state_dict)
-    torch.distributed.barrier()
+    torch.distributed.barrier(group=mpu.get_default_process_group())
 
     if mpu.get_data_parallel_rank() == 0:
         print(' successfully loaded {}'.format(checkpoint_name))

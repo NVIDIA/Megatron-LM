@@ -5,6 +5,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable, List, Optional, Type, Union
 
+from megatron.core.device_utils import get_local_device_count
 import numpy
 import torch
 
@@ -364,7 +365,7 @@ class BlendedMegatronDatasetBuilder(object):
                     # but not too much to avoid overloading storage on miss path.
                     # if user set num_dataset_builder_threads to 1,
                     # i.e. meant for serial build, do not scale up.
-                    num_workers *= min(2, max(1, torch.cuda.device_count()))
+                    num_workers *= min(2, max(1, get_local_device_count()))
                 _threading_helper(
                     megatron_datasets, num_workers, prefixes, split, sizes_per_dataset
                 )

@@ -7,6 +7,9 @@ import torch
 from torch.optim import SGD as CPUSGD
 from torch.optim import AdamW as CPUAdam
 
+from megatron.core.device_utils import get_xla_model
+
+
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
     from transformer_engine.pytorch.optimizers import FusedSGD as SGD
@@ -15,9 +18,12 @@ except ImportError:
         from apex.optimizers import FusedAdam as Adam
         from apex.optimizers import FusedSGD as SGD
     except ImportError:
-        warnings.warn(
-            f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
-        )
+        import warnings
+
+        if torch.cuda.is_available():
+            warnings.warn(
+                f'Transformer Engine and Apex are not installed. Falling back to Torch optimizers.'
+            )
 
         # Apex's FusedAdam is a drop-in replacement for torch's AdamW.
         # pylint: disable-next=line-too-long.
@@ -42,6 +48,7 @@ from .optimizer_config import OptimizerConfig
 
 logger = logging.getLogger(__name__)
 
+xm = get_xla_model()
 
 def _get_param_groups(
     model_chunks: List[MegatronModule],
@@ -463,6 +470,7 @@ def get_megatron_optimizer(
         Instance of MegatronOptimizer.
     """
 
+    assert use_gloo_process_groups or xm is None, "XLA requires use_gloo_process_groups=True"
     log_single_rank(logger, logging.INFO, f'Setting up optimizer with config {config}')
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
@@ -474,7 +482,7 @@ def get_megatron_optimizer(
         overlap_param_gather_with_optimizer_step_flags = [False]
     model_parallel_rank = torch.distributed.get_rank(mpu.get_model_parallel_group())
 
-    if torch.distributed.get_world_size(
+    if config.use_distributed_optimizer and torch.distributed.get_world_size(
         mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=False)
     ) > torch.distributed.get_world_size(
         mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True)
@@ -544,7 +552,7 @@ def get_megatron_optimizer(
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
             data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(
-                with_context_parallel=True, partial_data_parallel=True
+                with_context_parallel=True, partial_data_parallel=config.use_distributed_optimizer
             )
         else:
             data_parallel_group_gloo = None
@@ -556,7 +564,7 @@ def get_megatron_optimizer(
                 per_model_buffers=buffers,
                 model_parallel_group=mpu.get_model_parallel_group(),
                 data_parallel_group=mpu.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=True
+                    with_context_parallel=True, partial_data_parallel=config.use_distributed_optimizer
                 ),
                 data_parallel_group_gloo=data_parallel_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,

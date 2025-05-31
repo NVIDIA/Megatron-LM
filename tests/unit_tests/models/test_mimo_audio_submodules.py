@@ -22,7 +22,7 @@ from transformers import (
 )
 
 from megatron.core.models.mimo.submodules.audio import AudioModalitySubmodules
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
 pytest.importorskip("modelopt", minversion="0.25")
@@ -123,7 +123,7 @@ class TestAudioSubmodule:
         except Exception as e:
             print(f"Warning: Could not initialize model parallel: {e}")
 
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         random.seed(123)  # For reproducible random test cases
 
         # Get model-specific parameters

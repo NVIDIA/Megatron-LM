@@ -5,14 +5,13 @@ import sys
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
-
+from megatron.core.device_utils import get_current_device
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import is_float8tensor
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -25,7 +24,14 @@ from megatron.training.training import setup_model_and_optimizer
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
-fp8_available, reason_for_no_fp8 = check_fp8_support()
+try:
+    from transformer_engine.pytorch.fp8 import check_fp8_support
+    fp8_available, reason_for_no_fp8 = check_fp8_support()
+    HAVE_TE=True
+except ImportError:
+    HAVE_TE=False
+    fp8_available = False
+    reason_for_no_fp8 = "Transformer Engine not available"
 
 
 class TestFP8Param:
@@ -47,7 +53,7 @@ class TestFP8Param:
         layer_spec_fn=get_gpt_layer_with_transformer_engine_spec,
         **config_kwargs,
     ):
-        model_parallel_cuda_manual_seed(_SEED)
+        model_parallel_device_manual_seed(_SEED)
         args = get_args()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn()
@@ -103,13 +109,13 @@ class TestFP8Param:
 
     def get_batch(self, seq_length, micro_batch_size):
         data = list(range(seq_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        labels = 1 + torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
+        labels = 1 + torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
         attention_mask = torch.ones(
             (micro_batch_size, 1, seq_length, seq_length), dtype=bool
-        ).cuda()
-        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
+        ).to(get_current_device())
+        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).to(get_current_device())
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
     def run_test(self, tp_size, recipe, **kwargs):

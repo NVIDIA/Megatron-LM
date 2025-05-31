@@ -2,10 +2,12 @@
 from copy import deepcopy
 from functools import partial
 from time import sleep
+import traceback
 from unittest import mock
 
 import pytest
 import torch
+import torch.distributed
 from torch.optim import Adam
 
 from megatron.core import parallel_state
@@ -26,7 +28,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
-from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.training.arguments import parse_args
@@ -40,7 +42,15 @@ from tests.unit_tests.dist_checkpointing import (
     setup_moe_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.device_utils import get_current_device, get_xla_model
 
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+xm = get_xla_model()
 
 class Model(torch.nn.Module):
     def __init__(self):
@@ -153,9 +163,10 @@ class TestOptimizer:
     def test_optimizer_params(self, tmp_path_dist_ckpt):
         Utils.initialize_model_parallel(1, 1)
         model = Model()
+        model.to(device=get_current_device())
         # Force optimizer state initialization
         for p in model.parameters():
-            p.grad = torch.ones_like(p.data)
+            p.grad = torch.ones_like(p.data, device=get_current_device())
         optim = Adam(model.parameters())
         optim.step()
 
@@ -180,7 +191,7 @@ class TestOptimizer:
 
 def initialize_small_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     return SwigluFactoryModel()
 
@@ -191,7 +202,7 @@ def initialize_1d_flatten_tensor_model(
     # This model is used to test whether a 1d flatten tensor can be correctly
     # transformed into torch dist-ckpt form
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     return Model1dFlattenTensor()
 
@@ -202,6 +213,7 @@ def load_checkpoint_no_arg_checks(*args, **kwargs):
             return load_checkpoint(*args, **kwargs)
 
 
+@pytest.mark.skipif(xm is not None, reason="Distributed Optimizer not supported on XLA")
 class TestDistributedOptimizer:
     def setup_method(self, method):
         pass
@@ -238,27 +250,29 @@ class TestDistributedOptimizer:
         Utils.initialize_model_parallel(*tp_pp)
 
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True,
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
             try:
                 Utils.set_world_size(src_world_size)
                 if Utils.rank >= 0:
                     # Save checkpoint A
                     model, optimizer_A = setup_model_and_optimizer(
-                        seed=2, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn
+                        seed=2, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn, dist_opt=True
                     )
-
                     save_strategy = get_default_save_sharded_strategy()
                     if use_fpsl:
                         save_strategy = FullyParallelSaveStrategyWrapper(
                             save_strategy,
-                            parallel_state.get_data_parallel_group(with_context_parallel=True),
+                            parallel_state.get_data_parallel_group(with_context_parallel=True) if xm is None else \
+                                parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
+                            parallel_state.get_default_process_group(),
                             True,
                         )
                     optim_state_dict = optimizer_A.sharded_state_dict(
                         model[0].sharded_state_dict(), sharding_type=sharding_type
                     )
                     save(optim_state_dict, ckpt_dir, save_strategy)
-                    optim_param_state_A = optimizer_A.get_parameter_state_dp_zero()
+                    optim_param_state_A = optimizer_A.chained_optimizers[0].get_parameter_state_dp_zero()
                     Utils.destroy_model_parallel()
                 else:
                     # this prevents NCCL errors when changing DP. TODO: fix it properly
@@ -272,9 +286,9 @@ class TestDistributedOptimizer:
                     Utils.initialize_model_parallel(*tp_pp)
 
                     model, optimizer_B = setup_model_and_optimizer(
-                        seed=3, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn
+                        seed=3, tp=tp_pp[0], pp=tp_pp[1], initialize_fn=initialize_fn, dist_opt=True
                     )
-                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
+                    optim_param_state_B = optimizer_B.chained_optimizers[0].get_parameter_state_dp_zero()
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     # Expect a mismatch in values - diffs[2] nonempty
                     if parallel_state.get_data_parallel_rank(with_context_parallel=True) == 0:
@@ -283,10 +297,10 @@ class TestDistributedOptimizer:
                     sharded_state_dict = optimizer_B.sharded_state_dict(
                         model[0].sharded_state_dict(), is_loading=True, sharding_type=sharding_type
                     )
-                    optim_state_dict = load(sharded_state_dict, ckpt_dir)
+                    optim_state_dict = load(sharded_state_dict, ckpt_dir,
+                                            process_group=parallel_state.get_default_process_group())
                     optimizer_B.load_state_dict(optim_state_dict)
-                    optim_param_state_B = optimizer_B.get_parameter_state_dp_zero()
-
+                    optim_param_state_B = optimizer_B.chained_optimizers[0].get_parameter_state_dp_zero()
                     # Test both param state dicts are equal
                     diffs = diff(optim_param_state_A, optim_param_state_B)
                     assert not any(map(bool, diffs)), diffs
@@ -306,7 +320,8 @@ class TestDistributedOptimizer:
         # sync=True to make sure other ranks wait for rank 0 to finish creating directory.
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True
+            tmp_path_dist_ckpt / 'test_finetune_doesnt_load_optimizer', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
@@ -318,8 +333,8 @@ class TestDistributedOptimizer:
                     tp=src_tp_pp[0],
                     pp=src_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
+                    dist_opt=True
                 )
-
                 save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 
@@ -331,10 +346,12 @@ class TestDistributedOptimizer:
                     tp=dest_tp_pp[0],
                     pp=dest_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
+                    dist_opt=True
                 )
                 model_unloaded_state_dict = deepcopy(model[0].state_dict())
                 optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
-
+                optim_unloaded_state_dict.pop('fp32_from_fp16_params', None)
+                
                 # Load with different TPxPP should raise DistributeOptimizer error
                 with pytest.raises(RuntimeError) as exc_info:
                     load_checkpoint_no_arg_checks(model, optimizer, None)
@@ -345,7 +362,9 @@ class TestDistributedOptimizer:
 
                 # Check that the state didn't change
                 assert not any(diff(model[0].state_dict(), model_unloaded_state_dict))
-                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
+                optim_state_dict = optimizer.state_dict()
+                optim_state_dict.pop('fp32_from_fp16_params', None)
+                assert not any(diff(optim_state_dict, optim_unloaded_state_dict))
 
                 # Now test the same with a `finetune` flag
                 mock_args.finetune = True
@@ -356,7 +375,9 @@ class TestDistributedOptimizer:
                 # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff -
                 # we expect only values diff
                 assert not diffs[0] and not diffs[1] and diffs[2]
-                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
+                optim_state_dict = optimizer.state_dict()
+                optim_state_dict.pop('fp32_from_fp16_params', None)
+                assert not any(diff(optim_state_dict, optim_unloaded_state_dict))
 
                 # ... or `no_load_optim` flag
                 model, optimizer = setup_model_and_optimizer(
@@ -364,6 +385,7 @@ class TestDistributedOptimizer:
                     tp=dest_tp_pp[0],
                     pp=dest_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
+                    dist_opt=True
                 )
                 mock_args.finetune = False
                 mock_args.no_load_optim = True
@@ -375,7 +397,9 @@ class TestDistributedOptimizer:
                 # diffs[0] and diffs[1] is structural diff, diffs[2] is values diff -
                 # we expect only values diff
                 assert not diffs[0] and not diffs[1] and diffs[2]
-                assert not any(diff(optimizer.state_dict(), optim_unloaded_state_dict))
+                optim_state_dict = optimizer.state_dict()
+                optim_state_dict.pop('fp32_from_fp16_params', None)
+                assert not any(diff(optim_state_dict, optim_unloaded_state_dict))
 
 
 class TestFP32Optimizer:
@@ -395,30 +419,39 @@ class TestFP32Optimizer:
             import copy
 
             preprocessed_optimzier_common_dict = copy.deepcopy(optim_common_dict)
-            list = preprocessed_optimzier_common_dict['optimizer']['param_groups']
-            for dict_item in list:
-                del dict_item['wd_mult']
+            try:
+                list = preprocessed_optimzier_common_dict['optimizer']['param_groups']
+                for dict_item in list:
+                    del dict_item['wd_mult']
+            except KeyError:
+                pass
+            
             return preprocessed_optimzier_common_dict
 
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True,
+                process_group=parallel_state.get_default_process_group()
             ) as ckpt_dir_B:
 
+                dist_opt = xm is None
                 model_A, optimizer_A = setup_model_and_optimizer(
                     seed=2,
                     tp=src_tp_pp[0],
                     pp=src_tp_pp[1],
                     initialize_fn=initialize_small_model,
                     bf16=False,
+                    dist_opt=dist_opt
                 )
 
                 save(
                     optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()),
                     ckpt_dir_A,
+                    process_group=parallel_state.get_default_process_group(),
                     preprocess_common_before_consistancy_check=preprocess_fn,
                 )
                 Utils.destroy_model_parallel()
@@ -431,23 +464,25 @@ class TestFP32Optimizer:
                     pp=dest_tp_pp[1],
                     initialize_fn=initialize_small_model,
                     bf16=False,
+                    dist_opt=dist_opt
                 )
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
                     model_B[0].sharded_state_dict()
                 )
-                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A,
+                                  process_group=parallel_state.get_default_process_group())
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B,
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal
                 Utils.initialize_model_parallel(1, 1)
-                plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
-                plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+                plain_state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+                plain_state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
-
 
 class TestOptimizerResharding:
     def setup_method(self, method):
@@ -472,12 +507,15 @@ class TestOptimizerResharding:
     def test_optimizer_resharding(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_dist_opt, bf16, use_custom_fsdp
     ):
+        use_dist_opt = use_dist_opt and xm is None
         Utils.initialize_model_parallel(*src_tp_pp)
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=False
+            tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_A', sync=True,
+            process_group=parallel_state.get_default_process_group()
         ) as ckpt_dir_A:
             with TempNamedDir(
-                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=False
+                tmp_path_dist_ckpt / 'test_fp32_optimizer_state_dict_B', sync=True,
+                process_group=parallel_state.get_default_process_group()
             ) as ckpt_dir_B:
                 extra_kwargs = {}
                 if use_custom_fsdp:
@@ -487,7 +525,8 @@ class TestOptimizerResharding:
                     seed=2, tp=src_tp_pp[0], pp=src_tp_pp[1], bf16=bf16, dist_opt=use_dist_opt
                 )
 
-                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A,
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -498,16 +537,18 @@ class TestOptimizerResharding:
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
                     model_B[0].sharded_state_dict()
                 )
-                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A,
+                                  process_group=parallel_state.get_default_process_group())
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B,
+                    process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal
                 Utils.initialize_model_parallel(1, 1)
-                plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
-                plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+                plain_state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+                plain_state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
 
@@ -541,6 +582,8 @@ class TestOptimizerResharding:
         use_grouped_mlp,
         use_glu,
     ):
+        use_dist_opt = use_dist_opt and xm is None
+        use_te = use_te and HAVE_TE
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
         with TempNamedDir(
@@ -562,7 +605,8 @@ class TestOptimizerResharding:
                     use_glu=use_glu,
                 )
 
-                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A)
+                save(optimizer_A.sharded_state_dict(model_A[0].sharded_state_dict()), ckpt_dir_A, 
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Load checkpoint A with different TP/PP and save as checkpoint B
@@ -583,16 +627,18 @@ class TestOptimizerResharding:
                 load_sharded_state_dict = optimizer_B.sharded_state_dict(
                     model_B[0].sharded_state_dict()
                 )
-                state_dict = load(load_sharded_state_dict, ckpt_dir_A)
+                state_dict = load(load_sharded_state_dict, ckpt_dir_A, 
+                                  process_group=parallel_state.get_default_process_group())
 
                 optimizer_B.load_state_dict(state_dict)
-                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B)
+                save(optimizer_B.sharded_state_dict(model_B[0].sharded_state_dict()), ckpt_dir_B, 
+                     process_group=parallel_state.get_default_process_group())
                 Utils.destroy_model_parallel()
 
                 # Test both checkpoints are equal
                 Utils.initialize_model_parallel(1, 1)
-                plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
-                plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
+                plain_state_dict_A = load_plain_tensors(ckpt_dir_A, process_group=parallel_state.get_default_process_group())
+                plain_state_dict_B = load_plain_tensors(ckpt_dir_B, process_group=parallel_state.get_default_process_group())
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()

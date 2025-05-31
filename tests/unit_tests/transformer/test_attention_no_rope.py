@@ -3,19 +3,26 @@
 import pytest
 import torch
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.device_utils import get_current_device
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 class TestParallelAttentionWithNoRope:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         # use BF16 and a large enough hidden size to enable FlashAttention
         self.transformer_config = TransformerConfig(
             num_layers=8,  # Using 8 layers to test patterns like [0,0,0,1,0,0,0,1]
@@ -28,9 +35,10 @@ class TestParallelAttentionWithNoRope:
             autocast_dtype=torch.bfloat16,
             flash_decode=False,  # Ensure flash_decode is off to test RoPE skipping
         )
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         self.parallel_attention = SelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            transformer_layer_spec.submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -69,13 +77,13 @@ class TestParallelAttentionWithNoRope:
         sequence_length = 32
         micro_batch_size = 1
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.to(get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.randn(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+        hidden_states = hidden_states.to(get_current_device()).to(torch.bfloat16)
 
         attention_mask = None
 
@@ -83,7 +91,7 @@ class TestParallelAttentionWithNoRope:
         # Shape: [seq_len, 1, 1, kv_channels]
         rotary_pos_emb = torch.randn(
             sequence_length, 1, 1, self.parallel_attention.config.kv_channels
-        ).cuda()
+        ).to(get_current_device())
 
         # For self-attention, rotary_pos_emb needs to be a tuple of (q_pos_emb, k_pos_emb)
         rotary_pos_emb = (rotary_pos_emb, rotary_pos_emb)
@@ -138,13 +146,13 @@ class TestParallelAttentionWithNoRope:
         sequence_length = 32
         micro_batch_size = 1
 
-        self.parallel_attention.cuda()
+        self.parallel_attention.to(get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.randn(
             (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+        hidden_states = hidden_states.to(get_current_device()).to(torch.bfloat16)
 
         attention_mask = None
 
@@ -152,7 +160,7 @@ class TestParallelAttentionWithNoRope:
         # Shape: [seq_len, 1, 1, kv_channels]
         rotary_pos_emb = torch.randn(
             sequence_length, 1, 1, self.parallel_attention.config.kv_channels
-        ).cuda()
+        ).to(get_current_device())
 
         # For self-attention, rotary_pos_emb needs to be a tuple of (q_pos_emb, k_pos_emb)
         rotary_pos_emb = (rotary_pos_emb, rotary_pos_emb)
@@ -174,9 +182,10 @@ class TestParallelAttentionWithNoRope:
         transformer_config.no_rope_freq = 4  # Use pattern [0,0,0,1,0,0,0,1]
         transformer_config.__post_init__()
 
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         checkpointed_parallel_attention = SelfAttention(
             transformer_config,
-            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            transformer_layer_spec.submodules.self_attention.submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -185,18 +194,18 @@ class TestParallelAttentionWithNoRope:
         sequence_length = 32
         micro_batch_size = 1
 
-        checkpointed_parallel_attention.cuda()
+        checkpointed_parallel_attention.to(get_current_device())
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
             (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
         )
-        hidden_states = hidden_states.cuda().to(torch.bfloat16)
+        hidden_states = hidden_states.to(get_current_device()).to(torch.bfloat16)
 
         attention_mask = None
         rotary_pos_emb = torch.ones(
             sequence_length, 1, 1, checkpointed_parallel_attention.config.kv_channels
-        ).cuda()
+        ).to(get_current_device())
 
         output, bias = checkpointed_parallel_attention(
             hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb

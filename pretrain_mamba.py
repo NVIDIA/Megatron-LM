@@ -2,10 +2,12 @@
 """Pretrain Mamba."""
 
 import os
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 from functools import partial
 from typing import List, Optional, Tuple, Union
 
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args
 from megatron.training import inprocess_restart
 from megatron.training import print_rank_0

@@ -1,12 +1,14 @@
 import os
-from datetime import timedelta
 
+import torch.distributed
+from megatron.core.device_utils import get_current_device, get_distributed_backend, get_local_device_count, get_xla_runtime
+from megatron.core.device_utils import get_distributed_init_method
 import torch
-from torch._C._distributed_c10d import PrefixStore
-from torch.distributed import rendezvous
 
+from megatron.core.dist_checkpointing.strategies.base import deinit_async_calls, init_async_calls
 import megatron.core.parallel_state as ps
 
+xr = get_xla_runtime()
 
 class TestModel(torch.nn.Module):
     def __init__(
@@ -28,48 +30,27 @@ class TestModel(torch.nn.Module):
 class Utils:
 
     world_size = int(os.environ['WORLD_SIZE'])
-    rank = int(os.environ['LOCAL_RANK'])
+    rank = int(os.environ['RANK'])
     inited = False
-    store = None
 
     @staticmethod
     def initialize_distributed():
-
-        os.environ.pop('NVTE_FLASH_ATTN', None)
-        os.environ.pop('NVTE_FUSED_ATTN', None)
-        os.environ.pop('NVTE_UNFUSED_ATTN', None)
-
-        if not torch.distributed.is_initialized() and Utils.rank >= 0:
-            print(
-                f'Initializing torch.distributed with rank: {Utils.rank}, '
-                f'world_size: {Utils.world_size}'
-            )
-            torch.cuda.set_device(Utils.rank % torch.cuda.device_count())
-            init_method = 'tcp://'
-            master_ip = os.getenv('MASTER_ADDR', 'localhost')
-            master_port = os.getenv('MASTER_PORT', '6000')
-            init_method += master_ip + ':' + master_port
-            rendezvous_iterator = rendezvous(
-                init_method, Utils.rank, Utils.world_size, timeout=timedelta(minutes=1)
-            )
-            store, rank, world_size = next(rendezvous_iterator)
-            store.set_timeout(timedelta(minutes=1))
-
-            # Use a PrefixStore to avoid accidental overrides of keys used by
-            # different systems (e.g. RPC) in case the store is multi-tenant.
-            store = PrefixStore("default_pg", store)
-            Utils.store = store
-
-            torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
-            )
+        if not torch.distributed.is_initialized():
+            print(f'Initializing torch.distributed with rank: {Utils.rank}, world_size: {Utils.world_size}')
+            
+            init_method = get_distributed_init_method()
+            backend = get_distributed_backend()  if not xr or not xr.is_spmd() else "gloo"
+ 
+            torch.distributed.init_process_group(backend=backend, 
+                                                 world_size=Utils.world_size, 
+                                                 rank=Utils.rank, init_method=init_method)
 
             torch.distributed.barrier()
         Utils.inited = True
 
     @staticmethod
     def set_world_size(world_size=None, rank=None):
-        Utils.world_size = torch.cuda.device_count() if world_size is None else world_size
+        Utils.world_size = int(os.environ['WORLD_SIZE']) if world_size is None else world_size
         if (
             torch.distributed.is_initialized()
             and Utils.world_size != torch.distributed.get_world_size()
@@ -77,7 +58,7 @@ class Utils:
             torch.distributed.destroy_process_group()
 
         if rank is None:
-            Utils.rank = int(os.environ['LOCAL_RANK'])
+            Utils.rank = int(os.environ['RANK'])
             if Utils.rank >= Utils.world_size:
                 Utils.rank = -1
         else:
@@ -92,6 +73,7 @@ class Utils:
             return
         torch.distributed.barrier()
         ps.destroy_model_parallel()
+        deinit_async_calls()
         Utils.inited = False
 
     @staticmethod
@@ -114,7 +96,9 @@ class Utils:
             pipeline_model_parallel_size,
             virtual_pipeline_model_parallel_size,
             **kwargs,
-        )
+        ) 
+        init_async_calls(process_group=ps.get_default_process_group())
+        get_current_device()
         Utils.inited = True
 
     @staticmethod

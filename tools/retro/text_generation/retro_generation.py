@@ -2,6 +2,7 @@
 
 
 """Generation utilities."""
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 from megatron.training import get_args, get_tokenizer
@@ -96,14 +97,14 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
         if return_output_log_probs:
             output_log_probs = torch.empty(output_log_probs_size,
                                            dtype=torch.float32,
-                                           device=torch.cuda.current_device())
+                                           device=get_current_device())
         generated_sequence_lengths = torch.ones(
             batch_size, dtype=torch.int64,
-            device=torch.cuda.current_device()) * max_sequence_length
+            device=get_current_device()) * max_sequence_length
 
     # Whether we have reached a termination id.
     is_generation_done = torch.zeros(batch_size, dtype=torch.uint8,
-                                     device=torch.cuda.current_device())
+                                     device=get_current_device())
 
     # =============
     # Run infernece
@@ -115,22 +116,23 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
         for context_length in range(min_prompt_length, max_sequence_length):
             prev_context_length = 0
             sizes_list = None
-            neighbor_tokens_cuda_long_tensor = None
+            neighbor_tokens_device_long_tensor = None
 
             # get the chunks for retrieval
             if torch.distributed.get_rank() == 0:
                 neighbor_tokens = neighbours_array
-                neighbor_tokens_cuda_long_tensor = torch.cuda.LongTensor(
-                    neighbor_tokens.reshape((-1, retro_args.retro_gpt_retrieved_length)))
-                sizes_list = [neighbor_tokens_cuda_long_tensor.size(0),  # Batch size
-                              neighbor_tokens_cuda_long_tensor.size(1)]  # Sequence lenght
+                neighbor_tokens_device_long_tensor = torch.tensor(
+                    neighbor_tokens.reshape((-1, retro_args.retro_gpt_retrieved_length)),
+                    dtype=torch.long, device=get_current_device())
+                sizes_list = [neighbor_tokens_device_long_tensor.size(0),  # Batch size
+                              neighbor_tokens_device_long_tensor.size(1)]  # Sequence lenght
             sizes_tensor = broadcast_int_list(2, int_list=sizes_list)
             sizes = sizes_tensor.tolist()
-            neighbor_tokens_cuda_long_tensor = broadcast_tensor(
-                sizes, torch.int64, tensor=neighbor_tokens_cuda_long_tensor)
+            neighbor_tokens_device_long_tensor = broadcast_tensor(
+                sizes, torch.int64, tensor=neighbor_tokens_device_long_tensor)
 
             _, _, neighbor_position_ids = get_ltor_masks_and_position_ids(
-                neighbor_tokens_cuda_long_tensor,
+                neighbor_tokens_device_long_tensor,
                 tokenizer.eod,
                 args.reset_position_ids,
                 args.reset_attention_mask,
@@ -144,7 +146,7 @@ def retro_generate_tokens_probs_and_return_on_first_stage(
                                  ..., prev_context_length:4096, :4096]
 
             logits = model(tokens2use, positions2use, attention_mask2use,
-                           retriever_input_ids=neighbor_tokens_cuda_long_tensor,
+                           retriever_input_ids=neighbor_tokens_device_long_tensor,
                            retriever_position_ids=neighbor_position_ids, retriever_attn_mask=neighbor_attention_mask,
                            )
 

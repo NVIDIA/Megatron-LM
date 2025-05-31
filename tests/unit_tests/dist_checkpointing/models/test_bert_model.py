@@ -11,7 +11,6 @@ from megatron.core.models.bert.bert_layer_specs import (
     bert_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.bert.bert_model import BertModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing.models.common import (
@@ -21,13 +20,15 @@ from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_vocab_size_padding_change,
 )
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec, bert_layer_with_transformer_engine_spec
 
 
 def initialize_bert_model(
     seed, layer_spec_fn=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs
 ):
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     layer_spec = layer_spec_fn() if callable(layer_spec_fn) else layer_spec_fn
 

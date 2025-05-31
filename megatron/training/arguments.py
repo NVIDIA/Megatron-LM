@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
+from megatron.core.device_utils import get_xla_model
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.retro.utils import (
     get_config_path as get_retro_config_path,
@@ -35,6 +36,19 @@ from megatron.training.activations import squared_relu
 from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0
 from megatron.core.msc_utils import MultiStorageClientFeature
 
+try:
+    import transformer_engine # pylint: disable=unused-import
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    import apex # pylint: disable=unused-import
+    HAVE_APEX = True
+except ImportError:
+    HAVE_APEX = False
+
+xm = get_xla_model()
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -544,9 +558,12 @@ def validate_args(args, defaults={}):
     if args.data_parallel_sharding_strategy == "optim_grads":
         args.overlap_grad_reduce = True
 
+    if args.use_distributed_optimizer:
+        assert xm is None, "--use-distributed-optimizer is not supported with XLA"
+
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer, \
-            '--overlap-param-gather only supported with distributed optimizer'
+            '--overlap-param-gather is only supported with distributed optimizer'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -810,7 +827,7 @@ def validate_args(args, defaults={}):
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
-    if (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
+    if torch.cuda.is_available() and  (args.tensor_model_parallel_size > 1 or args.context_parallel_size > 1) \
         and get_device_arch_version() < 10:
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.use_torch_fsdp2 or args.use_custom_fsdp:
@@ -942,6 +959,7 @@ def validate_args(args, defaults={}):
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.enable_gloo_process_groups:
+        assert xm is None, "XLA requires enable_gloo_process_groups=true"
         if args.use_distributed_optimizer:
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
@@ -989,6 +1007,29 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
+    if not HAVE_APEX:
+        print('Warning: No Apex found: forcing persist_layer_norm=False')
+        args.no_persist_layer_norm = True
+        args.persist_layer_norm = not args.no_persist_layer_norm
+        print('Warning: No Apex found: forcing gradient_accumulation_fusion=False')
+        args.no_gradient_accumulation_fusion = True
+        args.gradient_accumulation_fusion = not args.no_gradient_accumulation_fusion
+        print('Warning: No Apex found: forcing memory_efficient_layer_norm=False')
+        args.memory_efficient_layer_norm=False
+
+    if not HAVE_TE:
+        print('Warning: No Transformer Engine found: forcing transformer_impl=local')
+        args.transformer_impl = "local"
+        print('Warning: No Transformer Engine found: forcing scaled_masked_softmax_fusion=False')
+        args.scaled_masked_softmax_fusion=False
+        print('Warning: No Transformer Engine found: forcing masked_softmax_fusion=False')
+        args.masked_softmax_fusion=False
+        print('Warning: No Transformer Engine found: forcing apply_rope_fusion=False')
+        args.apply_rope_fusion=False
+        print('Warning: No Transformer Engine found: forcing bias_dropout_fusion=False')
+        args.bias_dropout_fusion=False
+        print('Warning: No Transformer Engine found: forcing bias_swiglu_fusion=False')
+        args.bias_swiglu_fusion=False
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
         assert args.use_precision_aware_optimizer, (

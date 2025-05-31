@@ -2,6 +2,7 @@
 
 """Vision-classification finetuning/evaluation."""
 
+from megatron.core.device_utils import get_current_device
 import torch.nn.functional as F
 from functools import partial
 from megatron.training import get_args, get_timers
@@ -35,8 +36,8 @@ def classification():
 
     def process_batch(batch):
         """Process batch and produce inputs for the model."""
-        images = batch[0].cuda().contiguous()
-        labels = batch[1].cuda().contiguous()
+        images = batch[0].to(device=get_current_device()).contiguous()
+        labels = batch[1].to(device=get_current_device()).contiguous()
         return images, labels
 
     def cross_entropy_loss_func(labels, output_tensor):

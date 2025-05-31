@@ -1,12 +1,13 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -25,7 +26,7 @@ class TestDynamicContext:
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
         )
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
     def _get_dynamic_context(
         self,
@@ -161,7 +162,7 @@ class TestDynamicContext:
         with pytest.raises(RequestOverflowError):
             for i in range(dynamic_context.max_requests + 1):
                 dynamic_context.add_request(
-                    i, torch.zeros(10, device='cuda')
+                    i, torch.zeros(10, device=get_current_device())
                 )  # Adding more than allowed requests
 
     @pytest.mark.experimental
@@ -184,7 +185,7 @@ class TestDynamicContext:
 
         with pytest.raises(TokenOverflowError):
             dynamic_context.add_request(
-                1, torch.arange(0, 25, device='cuda')
+                1, torch.arange(0, 25, device=get_current_device())
             )  # Exceeding max token count
 
     @pytest.mark.experimental
@@ -207,7 +208,7 @@ class TestDynamicContext:
         dynamic_context.paused_request_count = 5
         dynamic_context.padded_active_token_count = 10
         dynamic_context.padded_active_sample_count = 5
-        dynamic_context.paused_tokens = torch.tensor([1, 2, 3], device='cuda')
+        dynamic_context.paused_tokens = torch.tensor([1, 2, 3], device=get_current_device())
         dynamic_context.request_ids.fill_(1)
         dynamic_context.request_query_lengths.fill_(1)
         dynamic_context.request_kv_length_offsets.fill_(1)
@@ -274,7 +275,7 @@ class TestDynamicContext:
         ).cpu().detach().numpy().tolist() == [486, 487, 488, 489]
         assert dynamic_context.chunk_allocator.chunk_count_avail == 486
         dynamic_context.chunk_allocator.release_memory_chunks(
-            torch.tensor([488, 489], device='cuda')
+            torch.tensor([488, 489], device=get_current_device())
         )
         assert dynamic_context.chunk_allocator.chunk_count_avail == 488
         assert dynamic_context.chunk_allocator.allocate_memory_chunks(1).item() == 489
@@ -306,7 +307,7 @@ class TestDynamicContext:
         assert dynamic_context.chunk_size_tokens == 128
         context_length = 144
         dynamic_context.add_request(
-            request_id=0, tokens=torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            request_id=0, tokens=torch.arange(0, context_length, dtype=torch.long, device=get_current_device())
         )
         assert dynamic_context.total_request_count == 1
         assert dynamic_context.active_token_count == context_length
@@ -325,15 +326,15 @@ class TestDynamicContext:
         assert dynamic_context.request_last_kv_chunk_offset[0].item() == 15
         assert torch.all(
             dynamic_context.token_to_pos_ids[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device=get_current_device())
         )
         assert torch.all(
             dynamic_context.token_to_input_ids[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device=get_current_device())
         )
         assert torch.all(
             dynamic_context.token_to_position_in_request[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device=get_current_device())
         )
         assert torch.all(
             dynamic_context.token_to_chunk_idx[0:context_length][
@@ -349,7 +350,7 @@ class TestDynamicContext:
         )
         assert torch.all(
             dynamic_context.token_to_local_position_within_kv_chunk[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device=get_current_device())
             % dynamic_context.chunk_size_tokens
         )
 
@@ -407,10 +408,10 @@ class TestDynamicContext:
             buffer_overflow_factor=None,
         )
 
-        active_requests_mask = torch.Tensor([1, 0, 1, 1, 1, 0, 0, 1]).cuda().int()
-        next_tokens = torch.arange(2, 10, device='cuda').int()
+        active_requests_mask = torch.Tensor([1, 0, 1, 1, 1, 0, 0, 1]).to(get_current_device()).int()
+        next_tokens = torch.arange(2, 10, device=get_current_device()).int()
         dynamic_context.paused_request_count = 2
-        dynamic_context.paused_tokens = torch.Tensor([0, 1]).cuda().int()
+        dynamic_context.paused_tokens = torch.Tensor([0, 1]).to(get_current_device()).int()
         dynamic_context.total_request_count = 5
 
         # Total req count should be equal to paused + num elements in active request mask.
@@ -461,7 +462,7 @@ class TestDynamicContext:
 
         # Then set up the test data
         dynamic_context.request_ids[0:10] = torch.tensor(
-            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device=torch.cuda.current_device()
+            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device=get_current_device()
         )
 
         # Now verify the values
@@ -557,12 +558,12 @@ class TestDynamicContext:
 
         # Create an active_requests_mask where requests 0, 2, and 4 are finished (0),
         # and requests 1 and 3 are still active (1)
-        active_requests_mask = torch.tensor([0, 1, 0, 1, 0], device=torch.cuda.current_device())
+        active_requests_mask = torch.tensor([0, 1, 0, 1, 0], device=get_current_device())
 
         # Call update_requests with these parameters
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask,
-            new_tokens=torch.tensor([10, 11, 12, 13, 14], device=torch.cuda.current_device()),
+            new_tokens=torch.tensor([10, 11, 12, 13, 14], device=get_current_device()),
         )
 
         # After the update, we should have released 3 chunks (for requests 0, 2, and 4)
@@ -622,12 +623,12 @@ class TestDynamicContext:
             dynamic_context.request_ids[i] = i
 
         # Create an active_requests_mask where all requests are finished
-        active_requests_mask = torch.tensor([0, 0, 0], device=torch.cuda.current_device())
+        active_requests_mask = torch.tensor([0, 0, 0], device=get_current_device())
 
         # Call update_requests with these parameters
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask,
-            new_tokens=torch.tensor([10, 11, 12], device=torch.cuda.current_device()),
+            new_tokens=torch.tensor([10, 11, 12], device=get_current_device()),
         )
 
         # After the update, we should have released all 6 chunks and have 0 active requests

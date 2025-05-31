@@ -3,12 +3,13 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.ssm.mamba_mixer import MambaMixer
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -16,7 +17,7 @@ class TestMambaMixer:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             hidden_size=256,  # The Mamba layer places several constraints on this
             # Need to specify num_attention_heads and num_layers or TransformerConfig
@@ -50,11 +51,11 @@ class TestMambaMixer:
             mixer = self.mixer
         else:
             mixer = self.mixer_no_mem_eff_path
-        mixer.cuda()
+        mixer.to(device=get_current_device())
         micro_batch_size = 2
         sequence_length = 32
         hidden_states = torch.ones((sequence_length, micro_batch_size, mixer.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         output, bias = mixer(hidden_states)
         assert mixer.config.mamba_num_heads == None
         assert output.shape[0] == sequence_length
@@ -64,7 +65,7 @@ class TestMambaMixer:
 
     def test_variable_batch_size_inference(self):
         mixer = self.mixer
-        mixer.cuda()
+        mixer.to(get_current_device())
 
         # Test cases where batch size decreases, remains the same, and increases
         micro_batch_sizes = [4, 2, 2, 8]
@@ -79,7 +80,7 @@ class TestMambaMixer:
             hidden_states = torch.ones(
                 (sequence_length, micro_batch_size, mixer.config.hidden_size)
             )
-            hidden_states = hidden_states.cuda()
+            hidden_states = hidden_states.to(get_current_device())
             output, bias = mixer(hidden_states, inference_context=inference_context)
             assert mixer.config.mamba_num_heads == None
             assert output.shape[0] == sequence_length

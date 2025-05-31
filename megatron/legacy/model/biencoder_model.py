@@ -3,6 +3,7 @@ import os
 import torch
 import sys
 
+from megatron.core.device_utils import get_xla_model
 from megatron.training import get_args, print_rank_0, get_tokenizer
 from megatron.core import mpu
 from megatron.training.checkpointing import fix_query_key_value_ordering
@@ -15,6 +16,8 @@ from megatron.legacy.model.utils import get_linear_layer
 from megatron.legacy.model.utils import init_method_normal
 from megatron.legacy.model.utils import scaled_init_method_normal
 from .module import MegatronModule
+
+xm = get_xla_model()
 
 def get_model_provider(only_query_model=False, only_context_model=False,
         biencoder_shared_query_context_model=False):
@@ -115,6 +118,9 @@ class BiEncoderModel(MegatronModule):
                 context_tokens, context_attention_mask, context_types):
         """Run a forward pass for each of the models and
         return the respective embeddings."""
+
+        if xm:
+            xm.mark_step()
 
         if self.use_query_model:
             query_logits = self.embed_text(self.query_model,

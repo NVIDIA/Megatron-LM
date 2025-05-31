@@ -8,11 +8,18 @@ from datetime import timedelta
 from functools import partial
 from typing import Callable, List, Optional
 
+from .device_utils import get_xla_model, get_xla_runtime
 import einops
 import numpy as np
 import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
+
+xm = get_xla_model()
+xr = get_xla_runtime()
+
+#  None for CUDA, and 'gloo' backend group with all ranks for XLA
+_DEFAULT_PROCESS_GROUP = None
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -135,7 +142,7 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
 
     When an option (e.g., max_ctas) is not found in the config, use the NCCL default setting.
     """
-    if pg_name in nccl_comm_cfgs:
+    if pg_name in nccl_comm_cfgs and torch.cuda.is_available():
         nccl_options = torch.distributed.ProcessGroupNCCL.Options()
         nccl_options.config.cga_cluster_size = nccl_comm_cfgs[pg_name].get('cga_cluster_size', 4)
         nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name].get('max_ctas', 32)
@@ -165,7 +172,7 @@ def create_group(
     kwargs = {
         'ranks': ranks,
         'timeout': timeout,
-        'backend': backend,
+        'backend': backend if not xr or not xr.is_spmd() else "gloo", # XLA backend is not supported with SPMD for now
         'pg_options': pg_options,
         'use_local_synchronization': use_local_synchronization,
         'group_desc': group_desc,
@@ -180,6 +187,10 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop('timeout')
+    if xm:
+        kwargs.pop('use_local_synchronization')
+        kwargs.pop('group_desc')
+
     return torch.distributed.new_group(**kwargs)
 
 
@@ -612,6 +623,7 @@ def initialize_model_parallel(
     ranks 8 to 15 belong to the second box.
 
     """
+    assert create_gloo_process_groups or  xm is None, "XLA requires create_gloo_process_groups=True"
     if encoder_pipeline_model_parallel_size is None:
         encoder_pipeline_model_parallel_size = 0
 
@@ -884,7 +896,7 @@ def initialize_model_parallel(
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
     # Apply SHARP to DP process groups
-    if use_sharp:
+    if use_sharp and torch.cuda.is_available():
         if rank == 0:
             print(
                 "The number of process groups to use SHARP with depends on the type "
@@ -1261,6 +1273,9 @@ def initialize_model_parallel(
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO
     ### End of expert related parallel groups initialization
 
+    global _DEFAULT_PROCESS_GROUP
+    if xm is not None:
+        _DEFAULT_PROCESS_GROUP = torch.distributed.new_group(backend="gloo")
     # build the intra distributed optimizer instance group
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     assert (
@@ -1315,6 +1330,11 @@ def model_parallel_is_initialized():
         return False
     return True
 
+def get_default_process_group():
+    global _DEFAULT_PROCESS_GROUP
+    assert xm is None or _DEFAULT_PROCESS_GROUP is not None, \
+        "_DEFAULT_PROCESS_GROUP is None for XLA" 
+    return _DEFAULT_PROCESS_GROUP
 
 def get_model_parallel_group(check_initialized=True):
     """Get the model-parallel group the caller rank belongs to."""
@@ -2253,3 +2273,9 @@ def destroy_model_parallel():
 
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP = None
+
+    global _DEFAULT_PROCESS_GROUP
+    if _DEFAULT_PROCESS_GROUP is not None:
+        torch.distributed.barrier(group=_DEFAULT_PROCESS_GROUP)
+        torch.distributed.destroy_process_group(_DEFAULT_PROCESS_GROUP)
+    _DEFAULT_PROCESS_GROUP = None

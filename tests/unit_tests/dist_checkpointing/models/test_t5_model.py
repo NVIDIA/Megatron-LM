@@ -23,7 +23,6 @@ from megatron.core.models.T5.t5_spec import encoder_model_with_local_spec as t5_
 from megatron.core.models.T5.t5_spec import (
     encoder_model_with_transformer_engine_default_spec as t5_encoder_te_spec,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -31,12 +30,13 @@ from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
 )
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
 
 def initialize_t5_model(seed, encoder_decoder_spec_fn, num_layers=8, **config_kwargs):
     encoder_spec_fn, decoder_spec_fn = encoder_decoder_spec_fn
     torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
+    model_parallel_device_manual_seed(seed)
 
     if ps.get_pipeline_model_parallel_decoder_start() is None:
         encoder_layers_per_pipeline = num_layers // ps.get_pipeline_model_parallel_world_size()
@@ -124,14 +124,15 @@ class TestT5Model:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_gpt_model') as ckpt_dir:
             # Save
             sharded_state_dict = gpt_model.sharded_state_dict()
-            save(sharded_state_dict, ckpt_dir)
+            save(sharded_state_dict, ckpt_dir, process_group=ps.get_default_process_group())
 
             # Load
             gpt_model = initialize_t5_model(2, dst_encoder_decoder_spec_fn)
             sharded_state_dict = gpt_model.sharded_state_dict()
 
             state_dict, missing_keys, unexpected_keys = load(
-                sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL
+                sharded_state_dict, ckpt_dir, strict=StrictHandling.RETURN_ALL,
+                process_group=ps.get_default_process_group()
             )
             # Potential mismatch is because of extra states which is ok
             assert all('_extra_state' in k for k in missing_keys)
