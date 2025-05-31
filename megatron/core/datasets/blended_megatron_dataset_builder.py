@@ -13,7 +13,6 @@ from megatron.core.datasets.blended_dataset import BlendedDataset
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split, normalize
-from megatron.core.parallel_state import get_virtual_pipeline_model_parallel_rank
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -76,11 +75,10 @@ class BlendedMegatronDatasetBuilder(object):
 
         if torch.distributed.is_initialized():
             gb_rank = torch.distributed.get_rank()
-            vp_rank = get_virtual_pipeline_model_parallel_rank()
-            if gb_rank == 0 and (vp_rank == 0 or vp_rank is None):
+            if gb_rank == 0:
                 assert (
                     self.is_built_on_rank()
-                ), "is_built_on_rank must return True when global rank = 0 and vp rank = 0"
+                ), "is_built_on_rank must return True when global rank = 0"
 
     def build(self) -> List[Optional[TopLevelDataset]]:
         """Build all dataset splits according to the provided blend(s)

@@ -359,6 +359,12 @@ class FullyShardedDataParallel(_BaseDataParallel):
             ]
             if overwrite_main_grad:
                 if not param.grad_added_to_main_grad:
+                    # Get `main_grad` will allocate bucket, check that the currently
+                    # used main_grad buffer does not exceed the scope of two FSDP Unit
+                    # Modules, i.e., the buffer limit imposed by double-buffer allocator.
+                    if self.ddp_config.fsdp_double_buffer:
+                        self.grad_reduce_pipeline._enforce_double_buffer_limit([group_id])
+
                     if param.grad is not None:
                         param.main_grad.copy_(param.grad)
                         del param.grad

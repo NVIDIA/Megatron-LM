@@ -5,10 +5,9 @@ import pathlib
 import re
 import signal
 import sys
-import tempfile
 import time
 import zipfile
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import click
 import jetclient
@@ -145,12 +144,14 @@ def launch_and_wait_for_completion(
     return pipeline
 
 
-def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[str]:
+def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> Optional[pathlib.Path]:
     if not logs:
         logger.info("No logs found for download.")
-        return [""]
+        return None
 
-    assets_base_path = BASE_PATH / ".." / ".." / ".." / "results" / f"iteration={iteration}"
+    assets_base_path = (
+        BASE_PATH / ".." / ".." / ".." / "results" / f"iteration={iteration}"
+    ).resolve()
 
     for restart_idx, log in enumerate(logs):
         assets = log.get_assets()
@@ -162,20 +163,52 @@ def download_job_assets(logs: List[jet_log.JETLog], iteration: int = 0) -> List[
                 dest = pathlib.Path(fh.name)
                 logger.info("Downloading log %s to %s", asset.source_path, str(dest))
                 asset.download(dest)
-    return assets
+    return assets_base_path
 
 
-def extract_logs_to_string(logs: List[jet_log.JETLog]) -> List[str]:
-    if not logs:
-        logger.info("No logs found for download.")
-        return [""]
+def extract_torchrunlogs_to_string(logs_path: pathlib.Path) -> Dict[int, List[str]]:
+    logs_dict = {}
 
-    with tempfile.NamedTemporaryFile() as tmp_file:
-        assets = logs[-1].get_assets()
-        asset = [asset for asset in assets if asset.name == "output_script-0.log"][0]
-        asset.download(pathlib.Path(tmp_file.name))
-        with open(pathlib.Path(tmp_file.name), "r") as fh:
-            return fh.readlines()
+    # Iterate through all restart folders
+    for restart_dir in logs_path.glob("restart=*"):
+        # Find all stdout.log files
+        for stdout_file in restart_dir.glob("assets/basic/*/logs/*/*/attempt_0/*/std*.log"):
+            # Extract rank from path
+            rank = int(stdout_file.parent.name)
+
+            # Read log file
+            try:
+                with open(stdout_file) as f:
+                    log_content = f.readlines()
+                    if rank not in logs_dict:
+                        logs_dict[rank] = log_content
+                    else:
+                        logs_dict[rank] += log_content
+            except Exception as e:
+                logger.error(f"Error reading log file {stdout_file}: {e}")
+                continue
+    return logs_dict
+
+
+def extract_main_log_to_string(logs_path: pathlib.Path) -> List[str]:
+    logs = []
+
+    # Iterate through all restart folders
+    for restart_dir in logs_path.glob("restart=*"):
+        # Find all stdout.log files
+        for stdout_file in restart_dir.glob(
+            "assets/basic/*/jet_assets/output_logs/output_script-0.log"
+        ):
+
+            # Read log file
+            try:
+                with open(stdout_file) as f:
+                    log_content = f.readlines()
+                    logs += log_content
+            except Exception as e:
+                logger.error(f"Error reading log file {stdout_file}: {e}")
+                continue
+    return logs
 
 
 def parse_failed_job(logs: List[str]) -> Optional[bool]:
@@ -352,8 +385,11 @@ def main(
             try:
                 main_job = [job for job in pipeline.get_jobs() if job.name.startswith("basic")][0]
                 jet_log = main_job.get_logs()
-                logs = extract_logs_to_string(logs=jet_log)
-                download_job_assets(logs=jet_log, iteration=n_iteration)
+                assets_base_path = download_job_assets(logs=jet_log, iteration=n_iteration)
+                if assets_base_path is None:
+                    break
+                allranks_logs = extract_torchrunlogs_to_string(logs_path=assets_base_path)
+                mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
                 no_log = False
                 break
             except (
@@ -373,16 +409,20 @@ def main(
 
         if no_log:
             logger.error("Did not find any logs to download, retry.")
+            n_attempts += 1
             continue
 
-        concat_logs = "\n".join(logs)
-        if concat_logs.strip() == "":
+        concat_allranks_logs = "\n".join(
+            ["\n".join(log_lines) for log_lines in allranks_logs.values()]
+        )
+        concat_mainrank_log = "\n".join(mainrank_log)
+        if concat_allranks_logs.strip() == "":
             logger.error("No logs found. Try again.")
             n_attempts += 1
             continue
 
         if test_type != "release":
-            print(f"Logs:\n{concat_logs}")
+            print(f"Logs:\n{concat_mainrank_log}")
 
         n_status_attempts = 0
         status = None
@@ -404,7 +444,7 @@ def main(
         if test_type == "unit_test":
             if (
                 "The server socket has failed to listen on any local network address."
-                in concat_logs
+                in concat_allranks_logs
             ):
                 logger.error("TCP error, attempt restart.")
                 n_attempts += 1
@@ -424,18 +464,19 @@ def main(
 
             if (
                 "The server socket has failed to listen on any local network address."
-                in concat_logs
-                or "Some NCCL operations have failed or timed out." in concat_logs
-                or "uncorrectable ECC error encountered" in concat_logs
-                or "illegal memory access" in concat_logs
-                or "illegal instruction" in concat_logs
-                or "torch.distributed.DistNetworkError" in concat_logs
+                in concat_allranks_logs
+                or "Some NCCL operations have failed or timed out." in concat_allranks_logs
+                or "uncorrectable ECC error encountered" in concat_allranks_logs
+                or "illegal memory access" in concat_allranks_logs
+                or "illegal instruction" in concat_allranks_logs
+                or "torch.distributed.DistNetworkError" in concat_allranks_logs
+                or "Segmentation fault" in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
                 continue
 
-            if "FAILED tests/functional_tests/python_test_utils" in concat_logs:
+            if "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log:
                 logger.error("Non-determinism, let's try another node.")
                 n_nondeterminism_attemps += 1
                 continue
@@ -448,11 +489,11 @@ def main(
                 is_integration_test=enable_lightweight_mode,
             )
 
-        if parse_failed_job(logs=logs):
+        if parse_failed_job(logs=mainrank_log):
             n_attempts += 1
             continue
 
-        if parse_finished_training(logs=logs):
+        if parse_finished_training(logs=mainrank_log):
             sys.exit(int(not success))  # invert for exit 0
         n_iteration += 1
 

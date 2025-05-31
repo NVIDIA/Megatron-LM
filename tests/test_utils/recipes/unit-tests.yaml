@@ -50,7 +50,7 @@ spec:
       --bucket $BUCKET \
       --unit-test-repeat $UNIT_TEST_REPEAT \
       --unit-test-timeout $UNIT_TEST_TIMEOUT \
-      --log-dir {assets_dir}
+      --log-dir {assets_dir}/logs/1/
 
     ls -al 
     cp $TEST_PATH/.coverage_0 {assets_dir}/coverage_report

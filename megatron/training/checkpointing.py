@@ -27,7 +27,7 @@ from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from .async_utils import schedule_async_save, is_empty_async_queue
-from .global_vars import get_args, get_one_logger
+from .global_vars import get_args
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
 from ..core.dist_checkpointing.serialization import \
     get_default_save_sharded_strategy
@@ -695,7 +695,6 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     for i in range(len(model)):
         key = "model"
         if len(model) > 1:
-            mpu.set_virtual_pipeline_model_parallel_rank(i)
             key = f"model{i}"
 
         model_sd = None
@@ -1421,7 +1420,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             ddp_model[0].load_state_dict(state_dict['model'], strict=strict)
         else:
             for i in range(len(ddp_model)):
-                mpu.set_virtual_pipeline_model_parallel_rank(i)
                 ddp_model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.

@@ -48,81 +48,36 @@ from megatron.core.transformer.transformer_layer import (
 )
 
 
-def get_gpt_layer_modelopt_spec(
-    num_experts: Optional[int] = None,
-    local_core_attention: bool = False,
-    moe_grouped_gemm: bool = False,
-    remap_te_layernorm: bool = False,
-    qk_layernorm: bool = False,
-    qk_l2_norm: Optional[bool] = False,
-) -> ModuleSpec:
-    """Mix the native spec with TENorm.
-
-    This is essentially the native local spec except for the layernorm implementation
-    is using TENorm from Transformer-Engine. The issue is that FusedLayerNorm from apex
-    has stopped supporting RMSNorm needed by llama.
-    """
-    warnings.warn(
-        "`get_gpt_layer_modelopt_spec` will be deprecated in a future release."
-        "Use `get_gpt_modelopt_spec` instead."
-    )
-
-    core_attention = DotProductAttention if local_core_attention else TEDotProductAttention
-    mlp = get_mlp_module_spec(
-        use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm, fp8=False
-    )
-    sharded_state_dict_keys_map = {}
-    if remap_te_layernorm:
-        if num_experts:
-            sharded_state_dict_keys_map = {
-                'input_layernorm.': 'self_attention.linear_qkv.layer_norm_'
-            }
-        else:
-            sharded_state_dict_keys_map = {
-                'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
-                'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
-            }
-    norm = L2Norm if qk_l2_norm else (Norm if qk_layernorm else IdentityOp)
-    return ModuleSpec(
-        module=TransformerLayer,
-        submodules=TransformerLayerSubmodules(
-            input_layernorm=Norm,
-            self_attention=ModuleSpec(
-                module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
-                submodules=SelfAttentionSubmodules(
-                    linear_qkv=ColumnParallelLinear,
-                    core_attention=core_attention,
-                    linear_proj=RowParallelLinear,
-                    q_layernorm=norm,
-                    k_layernorm=norm,
-                ),
-            ),
-            self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=Norm,
-            mlp=mlp,
-            mlp_bda=get_bias_dropout_add,
-            # Map TE-layernorm-fusion keys back
-            sharded_state_dict_keys_map=sharded_state_dict_keys_map,
-        ),
-    )
-
-
 def get_gpt_modelopt_spec(
     config: TransformerConfig,
     local_core_attention: bool = False,
     remap_te_layernorm: bool = False,
     real_quant_cfg: str = "None",
     qk_l2_norm: bool = False,
+    use_arbitrary_attention_mask: bool = False,
 ):
     """Mix the native spec with TENorm.
 
     This is essentially the native local spec except for the layernorm implementation
     is using TENorm from Transformer-Engine. The issue is that FusedLayerNorm from apex
     has stopped supporting RMSNorm needed by llama.
+
+    Args:
+        config: model's transformer config
+        local_core_attention: whether to use local DotProductAttention or TEDotProductAttention
+        remap_te_layernorm: whether to perform sharded state_dict prefix mapping on layernorm
+        real_quant_cfg: TensorRT Model Optimizer real quantization config
+        qk_l2_norm: whether to use Llama4 L2 norm for Q and K
+        use_arbitrary_attention_mask: whether to use arbitrary attention mask instead of causal
     """
+    num_layers_to_build = get_num_layers_to_build(config)
+
     # Llama4 Scout-16E support for NeMo. NeMo's GPTConfig is using attribute .qk_l2_norm directly.
     qk_l2_norm = getattr(config, "qk_l2_norm", qk_l2_norm)
+    if use_arbitrary_attention_mask:
+        attn_mask_type = AttnMaskType.arbitrary
+    else:
+        attn_mask_type = AttnMaskType.causal
 
     moe_sharded_state_dict_keys_map = {}
     dense_sharded_state_dict_keys_map = {}
@@ -184,7 +139,7 @@ def get_gpt_modelopt_spec(
             input_layernorm=Norm,
             self_attention=ModuleSpec(
                 module=attn_module,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=attn_submodules,
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -197,7 +152,9 @@ def get_gpt_modelopt_spec(
     )
 
     if config.num_moe_experts is None:
-        return dense_layer_spec
+        return TransformerBlockSubmodules(
+            layer_specs=[dense_layer_spec] * num_layers_to_build, layer_norm=Norm
+        )
 
     moe_mlp_spec = get_mlp_module_spec(
         use_te=False,
@@ -212,7 +169,7 @@ def get_gpt_modelopt_spec(
             input_layernorm=Norm,
             self_attention=ModuleSpec(
                 module=attn_module,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": attn_mask_type},
                 submodules=attn_submodules,
             ),
             self_attn_bda=get_bias_dropout_add,
@@ -257,7 +214,6 @@ def get_gpt_modelopt_spec(
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
     offset = get_transformer_layer_offset(config)
-    num_layers_to_build = get_num_layers_to_build(config)
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.

@@ -79,3 +79,30 @@ class DistributedDataParallelConfig:
 
     keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False
     """If true, keep the fp8 transpose cache when using custom FSDP."""
+
+    nccl_ub: bool = False
+    """If true, allocate and register NCCL userbuffer for param and grad buffer.
+      This flag enables SM efficient nccl algorithm that could improve the performance
+      of FSDP and DP with comm_overlap. This flag will be much more effective when used
+      together with sharp. 
+      The follwoing will be the expected number of SM usage for various cases.
+      (Note that this is just a reference number and the number of SM usage could vary 
+      on message size, communication domain size and nccl version.)
+      ----------------------------------------------------------
+      | Communication domain | use_sharp | SM usage of "AG/RS" |
+      |----------------------|-----------|---------------------|
+      | NVL                  | N/A       | 4 / 5               |
+      | NVL+IB               | False     | 16 / 16             |
+      | NVL+IB               | True      | 6 / 6               |
+      | IB                   | False     | 1 / 4               |
+      | IB                   | True      | 1 / 1               |
+      ----------------------------------------------------------
+    """
+
+    fsdp_double_buffer: bool = False
+    """If true, use persistently allocated double buffers for the 
+      temporary memory needed in the custom FSDP communications.
+      This option will cause additional memory overhead, however, it is necessary for
+      to register user buffer (nccl_ub=True) for the custom FSDP. 
+      This option will be automatically set to True when nccl_ub=True.
+   """

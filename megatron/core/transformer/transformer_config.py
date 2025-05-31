@@ -410,6 +410,10 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
+    moe_router_force_load_balancing: bool = False
+    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+    and group-limited topk. This is an experimental feature and only for benchmark."""
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -570,6 +574,9 @@ class TransformerConfig(ModelParallelConfig):
 
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
+
+    hetereogenous_dist_checkpoint: bool = False
+    """Whether to use heterogenous layers in distributed checkpoint."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

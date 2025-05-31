@@ -32,6 +32,27 @@ class TestModel(torch.nn.Module):
         return x
 
 
+# Test model with uniform shaped weights for testing FSDP
+class TestModelUniform(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear4 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.activation = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+        x = self.activation(x)
+        x = self.linear3(x)
+        x = self.activation(x)
+        x = self.linear4(x)
+        return x
+
+
 class TestFullyShardedDataParallel:
     @classmethod
     def setup_class(cls):
@@ -155,6 +176,154 @@ class TestFullyShardedDataParallel:
 
         out1, loss1 = train_step(fsdp_model1, optimizer1, input_data)
         out2, loss2 = train_step(fsdp_model2, optimizer2, input_data)
+
+        testing.assert_close(out1, out2, rtol=0, atol=0)
+        testing.assert_close(loss1, loss2, rtol=0, atol=0)
+
+        # Check parameters after optimization step
+        for (name1, param1), (_, param2) in zip(
+            model1.named_parameters(), model2.named_parameters()
+        ):
+            if hasattr(param1, 'fully_shard_param_local_shard') and hasattr(
+                param2, 'fully_shard_param_local_shard'
+            ):
+                testing.assert_close(
+                    param1.fully_shard_param_local_shard,
+                    param2.fully_shard_param_local_shard,
+                    rtol=0,
+                    atol=0,
+                    msg=f"Parameters for {name1} don't match",
+                )
+
+        if hasattr(torch.nn.parameter.Parameter, "main_grad"):
+            # Custom fsdp adds the `main_grad` attribute function to the
+            # torch Parameter, remove this attribute function so that
+            # it doesn't conflict with the code in the non-custom fsdp
+            # test branch.
+            delattr(torch.nn.parameter.Parameter, "main_grad")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="nccl_ub requires a recent version of APEX",
+    )
+    # Testing fsdp_double_buffer with and without nccl_ub
+    @pytest.mark.parametrize(
+        ("dp_size", "nccl_ub", "fsdp_double_buffer"), [(8, False, True), (8, True, True)]
+    )
+    def test_fsdp_user_buffer_registration(self, dp_size, nccl_ub, fsdp_double_buffer):
+        """Test that FSDP works correctly with user buffer registration.
+        This test compares the training results of the baseline fsdp with the target fsdp config.
+        Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False
+        Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False]
+        """
+
+        # Skip test if we don't have enough GPUs
+        world_size = torch.distributed.get_world_size()
+        if world_size != dp_size:
+            pytest.skip(f"This test requires {dp_size} GPUs, but only {world_size} are available")
+
+        # Model config
+        hidden_dim = 16
+
+        # Setup FSDP config - baseline fsdp config
+        baseline_fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_custom_fsdp=True,
+            nccl_ub=False,
+            fsdp_double_buffer=False,
+        )
+
+        # Setup FSDP config - target fsdp config
+        target_fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_custom_fsdp=True,
+            nccl_ub=nccl_ub,
+            fsdp_double_buffer=fsdp_double_buffer,
+        )
+
+        # Create two identical models
+        model1 = TestModelUniform(hidden_dim=hidden_dim).to(get_current_device())
+        model2 = TestModelUniform(hidden_dim=hidden_dim).to(get_current_device())
+
+        # Ensure identical weights
+        for p1, p2 in zip(model1.parameters(), model2.parameters()):
+            p2.data.copy_(p1.data)
+
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1  # Explicitly set CP=1
+        )
+        baseline_fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=baseline_fsdp_config,
+            module=model1,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        target_fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=target_fsdp_config,
+            module=model2,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        # Create optimizer config
+        lr = 3
+        optimizer_config = OptimizerConfig(optimizer="adam", lr=lr)
+        grad_scaler = None
+
+        optimizer1 = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=grad_scaler,
+            init_state_fn=None,
+            model_chunks=[baseline_fsdp_model],
+            per_model_buffers={0: [baseline_fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=baseline_fsdp_model.dp_cp_group,
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+
+        optimizer2 = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=grad_scaler,
+            init_state_fn=None,
+            model_chunks=[target_fsdp_model],
+            per_model_buffers={0: [target_fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=target_fsdp_model.dp_cp_group,
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=1,
+        )
+
+        # Create identical inputs
+        batch_size = 2
+        input_data = torch.randint(0, 10, (batch_size, hidden_dim), device=get_current_device(), dtype=torch.long)
+        input_data = input_data.float()
+        input_data.requires_grad = True
+
+        def loss_fn(output, _):
+            return output.sum()
+
+        def train_step(model, optimizer, inputs):
+            inputs_clone = inputs.clone().detach().requires_grad_(True)
+            optimizer.zero_grad()
+            outputs = model(inputs_clone)
+            loss = loss_fn(outputs, None)
+            loss.backward()
+            optimizer.step()
+            return outputs, loss
+
+        out1, loss1 = train_step(baseline_fsdp_model, optimizer1, input_data)
+        out2, loss2 = train_step(target_fsdp_model, optimizer2, input_data)
 
         testing.assert_close(out1, out2, rtol=0, atol=0)
         testing.assert_close(loss1, loss2, rtol=0, atol=0)

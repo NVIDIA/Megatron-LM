@@ -1,16 +1,17 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import dataclasses
+import functools
 import gc
 import inspect
 import logging
 import math
 import traceback
 import warnings
-from collections import namedtuple
-from contextlib import ExitStack
+from collections import defaultdict, namedtuple
+from contextlib import ExitStack, nullcontext
 from enum import Enum
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 from torch.distributed import _coalescing_manager
@@ -33,6 +34,12 @@ try:
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
 except:
     pass
+
+try:
+    import apex.contrib.nccl_allocator as nccl_allocator
+except ImportError:
+    nccl_allocator = None
+NCCL_MEMORY_POOL = None
 
 
 xm = get_xla_model()
@@ -100,6 +107,64 @@ ShardBucketIndex = namedtuple(
     'ShardBucketIndex',
     ['bucket_id', 'global_data_index', 'local_data_index', 'bucket_data_index', 'size'],
 )
+
+
+class DualUBRAllocator:
+    """
+    A custom allocator class that registers a single memory pool with two different
+    communication groups, which is not natively supported by apex's nccl_allocator.
+
+    This is particularly useful for Mixture of Experts (MoE) models where:
+    - Non-expert parameters/gradients use the data-parallel + context-parallel group (dp_cp_group)
+    - Expert parameters/gradients use the expert-parallel + data-parallel group (ep_dp_group)
+
+    Since Megatron-Core FSDP uses a contiguous single tensor for the entire model's parameters, we
+    need to register the same memory pool with both communication groups to enable nccl algorithms
+    that is relying on the user buffer registration for both expert and non-expert parameters.
+
+    Implementation:
+        It uses apex nccl_allocator internally to create a Tensor using ncclMemAlloc
+        and register to the `group` and then registers the Mempool also for the `additional_group`
+
+    Example:
+        ```
+        import apex.contrib.nccl_allocator as nccl_allocator
+        nccl_allocator.init()
+        pool = nccl_allocator.create_nccl_mem_pool()
+        group_1 = torch.distributed.new_group(ranks=[0, 1, 2, 3, 4, 5, 6, 7], backend="nccl")
+        group_2 = torch.distributed.new_group(ranks=[0, 2, 4, 6], backend="nccl")
+        with DualUBRAllocator(pool, group_1, group_2):
+            a = torch.zeros(1024, dtype=torch.float32, device="cuda")
+            b = torch.zeros(1024, dtype=torch.float32, device="cuda")
+        ```
+    """
+
+    def __init__(
+        self,
+        pool,  # torch.cuda.MemPool
+        group,  # torch.distributed.ProcessGroup
+        additional_group,  # torch.distributed.ProcessGroup
+    ):
+        self.pool = pool
+        self.group = group
+        self.additional_group = additional_group
+        self.mem_allocator = nccl_allocator.nccl_mem(self.pool, group=self.group)
+
+    def __enter__(self):
+        backend = self.additional_group._get_backend(get_current_device())
+        try:
+            # Since the registration is done in mempool granularity, we need to deregister
+            # the tensors in the mempool and re-register the mempool including the newly created
+            # tensors after the context is exited.
+            backend.deregister_mem_pool(self.pool)
+        except RuntimeError:
+            pass
+        self.mem_allocator.__enter__()
+
+    def __exit__(self, *args):
+        self.mem_allocator.__exit__(*args)
+        backend = self.additional_group._get_backend(get_current_device())
+        backend.register_mem_pool(self.pool)
 
 
 @dataclasses.dataclass
@@ -269,7 +334,12 @@ class TemporaryBucketAllocator:
         self.buckets = {}
 
     def allocate(
-        self, bucket_id: int, size: int, dtype: torch.dtype, device: torch.device
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -297,7 +367,12 @@ class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
         self.buckets = {}  # {bucket_id: Bucket}
 
     def allocate(
-        self, bucket_id: int, size: int, dtype: torch.dtype, device: torch.device
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -337,7 +412,7 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
         allocator = RotaryBucketAllocator(name="gpt_parameters")
 
         # Get a temporary buffer from the pool
-        temp_bucket = allocator.allocate(size=1024, dtype=torch.float32)
+        temp_bucket = allocator.allocate(dtype=torch.float32)
 
         # Use the temporary bucket for FSDP operations
         # ... perform all-gather or reduce-scatter ...
@@ -355,7 +430,12 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
         self.buckets = {}
 
     def allocate(
-        self, bucket_id: int, size: int, dtype: torch.dtype, device: torch.device
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -363,7 +443,10 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
 
         def _get_global_buffer(buffer_id: int):
             return parallel_state.get_global_memory_buffer().get_tensor(
-                [size], dtype=dtype, name=self._get_gbuf_name(buffer_id)
+                [size],
+                dtype=dtype,
+                name=self._get_gbuf_name(buffer_id),
+                mem_alloc_context=mem_alloc_context,
             )
 
         if bucket_id in self.using_buffer:
@@ -392,6 +475,158 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
             self.idle_buffer.append(buffer_id)
 
 
+class FixedPoolAllocator(TemporaryBucketAllocator):
+    """
+    A specialized temporary bucket allocator that implements a buffer recycling strategy
+    to minimize memory fragmentation in FSDP operations.
+
+    This allocator maintains a fixed pool of pre-allocated buffers, reusing them
+    to reduce the overhead and fragmentation caused by frequent allocation and
+    deallocation of temporary buffers during FSDP operations.
+    """
+
+    def __init__(self, name: str, fsdp_param_groups: List["ParameterGroup"], size: int = 2):
+        self.name = name
+        self.fsdp_param_groups = fsdp_param_groups
+        self.size = size  # Number of buffers in the pool (default is 2 for double buffering)
+        self.allocation_tracker = {}  # tracking the global buffer allocation status
+
+        # Build a mapping from FSDP unit id to its associated bucket ids.
+        fsdp_unit_buckets = defaultdict(list)
+        for bucket_id, param_group in enumerate(fsdp_param_groups):
+            if param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None:
+                continue
+            fsdp_unit_buckets[param_group.fsdp_unit_id].append(bucket_id)
+        self.fsdp_unit_buckets = fsdp_unit_buckets
+
+        # Identify the largest group of FSDP units that share the same buffer storage.
+        fsdp_units_to_double_buffer = []
+        for fsdp_unit_id, bucket_ids in fsdp_unit_buckets.items():
+            same_storage_fsdp_units = []
+            for i in fsdp_unit_buckets:
+                if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids):
+                    same_storage_fsdp_units.append(i)
+            # Track the largest group of FSDP units sharing the same buffer storage
+            if len(same_storage_fsdp_units) > len(fsdp_units_to_double_buffer):
+                fsdp_units_to_double_buffer = same_storage_fsdp_units
+
+        # --- Fixed Pool Buffering Check ---
+        # Ensure there is at least one group of FSDP units eligible for fixed pool buffering.
+        # If not, the allocator cannot provide its intended memory recycling benefits.
+        assert (
+            len(fsdp_units_to_double_buffer) > 0
+        ), "Found no FSDP units to use fixed-size buffering"
+        self.fsdp_double_buffer_units = fsdp_units_to_double_buffer
+
+        # Initialize buffer group status.
+        # Each buffer group represents a set of buffers associated with an FSDP unit's bucket group.
+        self.idle_buffer = []  # List of available (buf_group_id, offset) tuples.
+        self.using_buffer = {}  # Map from bucket_id to (buf_group_id, offset) in use.
+
+        # Populate the idle buffer pool with all buffer group and bucket offset combinations.
+        for buf_group_id in range(self.size):  # Iterate over each buffer group in the pool.
+            num_bucket = len(self.fsdp_unit_buckets[self.fsdp_double_buffer_units[0]])
+            for bucket_offset in range(num_bucket):
+                self.idle_buffer.append((buf_group_id, bucket_offset))
+
+        # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
+        self.backup_allocator = TemporaryBucketAllocator()
+
+    def _is_two_bucket_group_equal(self, group_a, group_b):
+        # Check if two bucket groups are equivalent in dtype and size.
+        if len(group_a) != len(group_b):
+            return False
+
+        for a, b in zip(group_a, group_b):
+            pg_a = self.fsdp_param_groups[a]
+            pg_b = self.fsdp_param_groups[b]
+            a_size = sum(p.numel() for p in pg_a.params)
+            b_size = sum(p.numel() for p in pg_b.params)
+            if pg_a.dtype != pg_b.dtype or a_size != b_size:
+                return False
+        return True
+
+    def allocate(
+        self,
+        bucket_id: int,
+        size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        mem_alloc_context: Optional[Callable] = None,
+    ) -> Bucket:
+        """
+        allocate a temporary bucket.
+        """
+        fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if fsdp_unit_id in self.fsdp_double_buffer_units:
+            # Try to allocate from the buffer pool.
+            bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
+            buffer_name = None
+            if bucket_id in self.using_buffer:
+                # If this bucket is already using a buffer, reuse it.
+                buf_group_id, bucket_offset = self.using_buffer[bucket_id]
+                buffer_name = self._get_gbuf_name(buf_group_id, bucket_offset)
+            else:
+                # Otherwise, find an available buffer group for this bucket offset.
+                for buf_group_id in range(self.size):
+                    if (buf_group_id, bucket_offset) in self.idle_buffer:
+                        self.using_buffer[bucket_id] = (buf_group_id, bucket_offset)
+                        buffer_name = self._get_gbuf_name(buf_group_id, bucket_offset)
+                        self.idle_buffer.remove((buf_group_id, bucket_offset))
+                        break
+
+            assert buffer_name is not None, (
+                f"[FSDP][Rank {torch.distributed.get_rank()}][{self.name}]"
+                f"No buffer found for bucket_id: {bucket_id}, fsdp_unit_id: {fsdp_unit_id}, "
+                f"bucket_offset: {bucket_offset} \n"
+                f"current using_buffer: {self.using_buffer} \n"
+                f"current idle_buffer: {self.idle_buffer}"
+            )
+            # Synchronization is required before the allocation for the user buffer
+            if mem_alloc_context is not None and mem_alloc_context != nullcontext:
+                # Check if a new buffer allocation is required
+                if (
+                    self.allocation_tracker.get((buffer_name, dtype), None) is None
+                    or self.allocation_tracker[(buffer_name, dtype)] < size
+                ):
+                    # Requires synchronization for new buffer allocation
+                    self.allocation_tracker[(buffer_name, dtype)] = size
+                    torch.cuda.synchronize()
+            return Bucket(
+                data=parallel_state.get_global_memory_buffer().get_tensor(
+                    [size], dtype=dtype, name=buffer_name, mem_alloc_context=mem_alloc_context
+                )
+            )
+
+        # If the bucket is not eligible for fixed pool buffering, or no buffer is available,
+        # fall back to dynamic allocation via the backup allocator. This means that we
+        # will do dynamic memory allocation.
+        logging.debug(f"[FSDP] Using backup allocator for {bucket_id} {fsdp_unit_id}")
+        return self.backup_allocator.allocate(
+            bucket_id=bucket_id, size=size, dtype=dtype, device=device
+        )
+
+    def _get_gbuf_name(self, buf_group_id: int, bucket_index: int):
+        return f"{self.name}_{buf_group_id}_{bucket_index}"
+
+    def free(self, bucket_id: int):
+        """
+        free a temporary bucket.
+        """
+        fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
+        if fsdp_unit_id in self.fsdp_double_buffer_units:
+            if bucket_id not in self.using_buffer:
+                # This bucket is not allocated by fixed pool allocator.
+                return
+            # Return the buffer to the idle pool.
+            self.idle_buffer.append(self.using_buffer[bucket_id])
+            del self.using_buffer[bucket_id]
+            return
+        # If not managed by fixed pool allocator, delegate to the backup allocator.
+        logging.debug(f"[FSDP] Free from the backup allocator for {bucket_id} {fsdp_unit_id}")
+        self.backup_allocator.free(bucket_id)
+
+
 class DataParallelBuffer:
     """
     A class that manages the data parallel buffer for Fully Sharded Data Parallel (FSDP) training.
@@ -410,6 +645,7 @@ class DataParallelBuffer:
         init_meta_only: bool = False,
         is_dtype_float8: bool = False,
         gradient_scaling_factor: Optional[float] = None,
+        mem_alloc_context: Optional[Callable] = None,
     ) -> None:
         self.ddp_config = ddp_config
         self.params = params
@@ -427,6 +663,7 @@ class DataParallelBuffer:
         )
         self.is_dtype_float8 = is_dtype_float8
         self.gradient_scaling_factor = gradient_scaling_factor
+        self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
 
         (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
             build_data_parallel_buffer_index(
@@ -487,6 +724,7 @@ class DataParallelBuffer:
                 size=bucket_index.size,
                 dtype=dtype,
                 device=self.device,
+                mem_alloc_context=self.mem_alloc_context,
             )
 
             if and_allocate_params_data:
@@ -896,6 +1134,29 @@ class ParamAndGradBuffer:
             reset_parameters_for_meta_device_init_module
         )
 
+        # User buffer registration related settings
+        if self.ddp_config.nccl_ub and nccl_allocator:
+            # Since the user buffer registration requires (non-dynamic) persistent memory,
+            # it always uses fsdp double buffer.
+            self.ddp_config.fsdp_double_buffer = True
+            # Initialize the NCCL memory pool.
+            global NCCL_MEMORY_POOL
+            NCCL_MEMORY_POOL = nccl_allocator.create_nccl_mem_pool()
+            if torch.distributed.get_rank() == 0:
+                logging.info(
+                    f"[Rank {torch.distributed.get_rank()}] Created NCCL memory pool for \
+                        UserBuffer Registration"
+                )
+                logging.info(
+                    f"[Rank {torch.distributed.get_rank()}] FSDP double buffer is enabled."
+                )
+        # If using nccl_ub, it returns a function that registers buffers to the NCCL memory pool
+        # Buffer is registered to data_parallel_group and expert_data_parallel_group if it exists
+        # In the case of not using nccl_ub, it returns a nullcontext
+        self.mem_alloc_context = self.get_mem_alloc_context(
+            group=self.data_parallel_group, additional_group=self.expert_data_parallel_group
+        )
+
         # Mark fp8 param.
         meta_device_init_fp8_params = {}
         if reset_parameters_for_meta_device_init_module:
@@ -920,6 +1181,37 @@ class ParamAndGradBuffer:
         self.optimizer_named_parameters = self._init_optimizer_named_parameters()
 
         self._log_parameter_groups()
+
+    def get_mem_alloc_context(self, group=None, additional_group=None):
+        """
+        Get the memory allocation context for the parameter and gradient buffers.
+        """
+        if self.ddp_config.nccl_ub and nccl_allocator:
+            assert nccl_allocator is not None, "NCCL allocator is not available."
+            global NCCL_MEMORY_POOL
+            if group is None:
+                # data parallel group is a default group for user buffer registration
+                group = self.data_parallel_group
+            if additional_group is None:
+                # register buffers to the default group directly using apex memory allocator
+                mem_alloc_context = functools.partial(
+                    nccl_allocator.nccl_mem, NCCL_MEMORY_POOL, group=group
+                )
+            else:
+                # In case of MoE, we need to register buffer to both DP and EP communicator groups.
+                # Custom DualUBRAllocator class is used to register buffers to both groups.
+                # Register buffers to the data_parallel_group using apex memory allocator
+                # and register buffers to the expert_data_parallel_group.
+                assert group != additional_group, "Group and additional group must be different."
+                mem_alloc_context = functools.partial(
+                    DualUBRAllocator,
+                    NCCL_MEMORY_POOL,
+                    group=group,
+                    additional_group=additional_group,
+                )
+            return mem_alloc_context
+        else:
+            return nullcontext
 
     def _log_parameter_groups(self):
         """
@@ -974,8 +1266,24 @@ class ParamAndGradBuffer:
             raise ValueError(
                 f'Invalid data_parallel_sharding_strategy: {data_parallel_sharding_strategy}'
             )
+        if self.ddp_config.nccl_ub:
+            assert self.ddp_config.fsdp_double_buffer, (
+                "NCCL UB is only supported with FSDP double buffer. "
+                "Please set fsdp_double_buffer=True in the ddp config."
+            )
+        if self.ddp_config.fsdp_double_buffer:
+            UB_BUFFER_NUM = 2
+            self.weight_alloc = FixedPoolAllocator(
+                name="fsdp_params", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+            )
+            self.main_grad_alloc = FixedPoolAllocator(
+                name="fsdp_grads", fsdp_param_groups=self.parameter_groups, size=UB_BUFFER_NUM
+            )
+            self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
+        else:
+            self.weight_alloc = StorageResizeBasedBucketAllocator()
+            self.main_grad_alloc = None
 
-        self.memory_allocator_for_model_weight_buffer = StorageResizeBasedBucketAllocator()
         self.buffer_all_in_one = True
 
         preserve_fp32_weights = self.preserve_fp32_weights
@@ -1007,7 +1315,6 @@ class ParamAndGradBuffer:
                 not self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
                 or group.requires_grad
             )
-
             # Initialize the model weight buffer.
             if data_parallel_sharding_strategy != 'no_shard':
                 group.model_weight_buffer = DataParallelBuffer(
@@ -1020,8 +1327,9 @@ class ParamAndGradBuffer:
                     data_parallel_group=dp_group,
                     init_meta_only=True,
                     is_dtype_float8=is_dtype_float8,
-                    temporary_bucket_allocator=self.memory_allocator_for_model_weight_buffer,
+                    temporary_bucket_allocator=self.weight_alloc,
                     bucket_id=group_id,
+                    mem_alloc_context=self.mem_alloc_context,
                 )
 
             # Initialize the main weight buffer.
@@ -1036,6 +1344,7 @@ class ParamAndGradBuffer:
                     data_parallel_group=dp_group,
                     init_meta_only=True,
                     bucket_id=group_id,
+                    mem_alloc_context=self.mem_alloc_context,
                 )
 
             # Initialize the main grad buffer.
@@ -1050,8 +1359,10 @@ class ParamAndGradBuffer:
                     data_parallel_group=dp_group,
                     init_meta_only=True,
                     is_dtype_float8=not grad_reduce_in_fp32 and grad_dtype is torch.uint8,
+                    temporary_bucket_allocator=self.main_grad_alloc,
                     gradient_scaling_factor=gradient_scaling_factor,
                     bucket_id=group_id,
+                    mem_alloc_context=self.mem_alloc_context,
                 )
                 if grad_reduce_in_fp32:
                     buffer_size[torch.float32] += group.main_grad_buffer.data_size
@@ -1090,7 +1401,8 @@ class ParamAndGradBuffer:
         for group in self.parameter_groups:
             wbuf = group.model_weight_buffer
             if wbuf:
-                wbuf.data = torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
+                with self.mem_alloc_context():
+                    wbuf.data = torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
                 bucket = wbuf.fetch_bucket()
             mbuf = group.main_weight_buffer
             if mbuf:
@@ -1178,18 +1490,21 @@ class ParamAndGradBuffer:
 
         # Allocate the main_weight buffer and main_grad buffer data in one buffer.
         if self.buffer_all_in_one:
-            self.buffer = {
-                torch.float32: torch.empty(
-                    buffer_size[torch.float32], dtype=torch.float32, device=self.device
-                ),
-                torch.float16: torch.empty(
-                    buffer_size[torch.float16], dtype=torch.float16, device=self.device
-                ),
-                torch.bfloat16: torch.empty(
-                    buffer_size[torch.bfloat16], dtype=torch.bfloat16, device=self.device
-                ),
-                "float8": torch.empty(buffer_size["float8"], dtype=torch.uint8, device=self.device),
-            }
+            with self.mem_alloc_context():
+                self.buffer = {
+                    torch.float32: torch.empty(
+                        buffer_size[torch.float32], dtype=torch.float32, device=self.device
+                    ),
+                    torch.float16: torch.empty(
+                        buffer_size[torch.float16], dtype=torch.float16, device=self.device
+                    ),
+                    torch.bfloat16: torch.empty(
+                        buffer_size[torch.bfloat16], dtype=torch.bfloat16, device=self.device
+                    ),
+                    "float8": torch.empty(
+                        buffer_size["float8"], dtype=torch.uint8, device=self.device
+                    ),
+                }
             offset = {torch.float32: 0, torch.float16: 0, torch.bfloat16: 0, "float8": 0}
 
         def _alloc(dtype, size):
@@ -1206,7 +1521,8 @@ class ParamAndGradBuffer:
             gbuf = group.main_grad_buffer
             if not gbuf:
                 continue
-            gbuf.data = _alloc(gbuf.dtype, gbuf.data_size)
+            with self.mem_alloc_context():
+                gbuf.data = _alloc(gbuf.dtype, gbuf.data_size)
             gbuf.data.zero_()
             for item_id, p in enumerate(group.params):
                 p.fsdp_managed_main_grad = gbuf.get_item(item_id)
@@ -1613,7 +1929,7 @@ class GradReducePipeline:
                 self.wait_for_previous_grad_reduce(
                     suggested_queue_capacity=suggested_queue_capacity
                 )
-                self.mark_bucket_ready(bucket_id, async_rs=True)
+                self._mark_bucket_ready(bucket_id, async_rs=True)
 
     def wait_for_previous_grad_reduce(
         self, suggested_queue_size: int = 1, suggested_queue_capacity: Optional[int] = None
@@ -1646,7 +1962,29 @@ class GradReducePipeline:
                 grad_reduce_event.wait()
                 free_up_grad_bucket()
 
-    def mark_bucket_ready(self, bucket_id: int, async_rs: bool = False) -> bool:
+    def _enforce_double_buffer_limit(self, add_buckets):
+        if not self.buffer.ddp_config.fsdp_double_buffer:
+            return
+
+        param_groups = self.buffer.parameter_groups
+        double_buf_units = set()
+        for bucket_id in add_buckets:
+            fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
+            if fsdp_unit_id in self.buffer.double_buf_units:
+                double_buf_units.add(fsdp_unit_id)
+        assert len(double_buf_units) <= 2, (
+            f"Double buffer limit exceeded. " f"Current double_buf_units: {double_buf_units}."
+        )
+
+        keep_n = len(self.grad_reduce_queue)
+        for _, _, bucket_id in reversed(self.grad_reduce_queue):
+            fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
+            double_buf_units.add(fsdp_unit_id)
+            if len(double_buf_units) > 2:
+                keep_n -= 1
+        self.wait_for_previous_grad_reduce(keep_n)
+
+    def _mark_bucket_ready(self, bucket_id: int, async_rs: bool = False) -> bool:
         """Mark the bucket ready for reduce-scatter/all-reduce, if all bucket in
         the bucket group are ready, then do the reduce-scatter/all-reduce.
         Args:
@@ -1667,6 +2005,11 @@ class GradReducePipeline:
             param_group = self.buffer.parameter_groups[bucket_id]
             if len(self.bucket_grad_ready_params[bucket_id]) != len(param_group.params):
                 return False
+
+        # When using FSDP double buffer, the number of enqueued FSDP units for reduction
+        # should not exceed the capacity of the double buffer.
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            self._enforce_double_buffer_limit(bucket_group)
 
         current_stream = torch.cuda.current_stream()
         reduce_scatter_stream = (
@@ -1696,7 +2039,8 @@ class GradReducePipeline:
                         # new empty is important for memory safety, when using
                         # TORCH_NCCL_AVOID_RECORD_STREAMS=1.
                         # For reference: https://dev-discuss.pytorch.org/t/fsdp-cudacachingallocator-an-outsider-newb-perspective/1486
-                        grad_shard = torch.empty_like(grad_shard)
+                        if not self.buffer.ddp_config.nccl_ub:
+                            grad_shard = torch.empty_like(grad_shard)
                         torch.distributed.reduce_scatter_tensor(
                             output=grad_shard,
                             input=bucket.data,
@@ -1835,6 +2179,17 @@ class AllGatherPipeline:
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))
         parameter_groups = self.buffer.parameter_groups
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            double_buf_units = set()
+            for bucket_id in ag_buckets:
+                fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
+                if fsdp_unit_id in self.buffer.double_buf_units:
+                    double_buf_units.add(fsdp_unit_id)
+            if len(double_buf_units) > 2:
+                raise ValueError(
+                    f"{double_buf_units} FSDP units were requested, "
+                    "but double buffers can support no more than 2 FSDP units."
+                )
 
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
         if prefetch:
@@ -1856,6 +2211,18 @@ class AllGatherPipeline:
                     return None
                 return bucket_id
 
+            def need_skip_prefetch(bucket_id):
+                # If use double buffer, we need to check if the next bucket
+                # is exceeding the coverage of the double buffer.
+                if self.buffer.ddp_config.fsdp_double_buffer:
+                    fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
+                    double_buf_units.add(fsdp_unit_id)
+                    if len(double_buf_units) > 2:
+                        # Prefetching the next bucket will exceed the coverage of
+                        # the double buffer, so we need to stop prefetching.
+                        return True
+                return False
+
             if suggested_AG_prefetch_size is not None:
                 bucket_id = next_bucket_id(ag_buckets)
                 while bucket_id is not None:
@@ -1867,11 +2234,19 @@ class AllGatherPipeline:
                     )
                     if all_gather_size >= suggested_AG_prefetch_size:
                         break
+
+                    if need_skip_prefetch(bucket_id):
+                        break
+
                     ag_buckets.extend(self.buffer.bucket_group_of_bucket[bucket_id])
                     ag_buckets = list(sorted(set(ag_buckets)))
                     bucket_id = next_bucket_id(ag_buckets)
             else:
                 bucket_id = next_bucket_id(ag_buckets)
+
+                if need_skip_prefetch(bucket_id):
+                    bucket_id = None
+
                 if bucket_id is not None:
                     ag_buckets.extend(self.buffer.bucket_group_of_bucket[bucket_id])
                     ag_buckets = list(sorted(set(ag_buckets)))

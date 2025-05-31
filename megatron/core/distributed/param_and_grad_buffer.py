@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import logging
 import math
 import warnings
@@ -17,6 +18,11 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from ..fp8_utils import is_float8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
+
+try:
+    import apex.contrib.nccl_allocator as nccl_allocator
+except ImportError:
+    nccl_allocator = None
 
 logger = logging.getLogger(__name__)
 
@@ -472,6 +478,7 @@ class _ParamAndGradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
         gradient_scaling_factor: float,
         param_indices: List[int],
+        nccl_ub: bool,
     ):
         self.ddp_config = ddp_config
         self.params = params
@@ -492,6 +499,7 @@ class _ParamAndGradBuffer:
             group=self.data_parallel_group
         )
         self.gradient_scaling_factor = gradient_scaling_factor
+        self.nccl_ub = nccl_ub
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -616,20 +624,33 @@ class _ParamAndGradBuffer:
 
         self.param_data = None
         # Only re-map param tensors if using distributed optimizer.
-        if self.ddp_config.use_distributed_optimizer:
-            assert xm is None, "Distributed optimizer is not supported on XLA"
-            self.param_data = torch.zeros(
+        if self.nccl_ub:
+            # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
+            if not nccl_allocator:
+                raise RuntimeError("NCCL allocator importing failed but nccl ub is still requested")
+            pool = nccl_allocator.create_nccl_mem_pool()
+            mem_alloc_context = functools.partial(
+                nccl_allocator.nccl_mem, pool, group=self.data_parallel_group
+            )
+        else:
+            # If nccl_ub is False, mem_alloc_context is nullcontext.
+            mem_alloc_context = nullcontext
+
+        with mem_alloc_context():
+            if self.ddp_config.use_distributed_optimizer:
+                assert xm is None, "Distributed optimizer is not supported on XLA"
+                self.param_data = torch.zeros(
+                    self.numel,
+                    dtype=self.param_dtype,
+                    device=get_current_device(),
+                    requires_grad=False,
+                )
+            self.grad_data = torch.zeros(
                 self.numel,
-                dtype=self.param_dtype,
-                device=get_current_device(),
+                dtype=self.grad_dtype,
+                device=get_current_device() if xm is None else torch.device("cpu"),
                 requires_grad=False,
             )
-        self.grad_data = torch.zeros(
-            self.numel,
-            dtype=self.grad_dtype,
-            device=get_current_device() if xm is None else torch.device("cpu"),
-            requires_grad=False,
-        )
 
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []

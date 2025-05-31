@@ -1,6 +1,11 @@
 #!/bin/bash
 
-DECODER_TYPE="llama"
+if [ -z ${HF_MODEL_CKPT} ]; then
+    HF_MODEL_CKPT=meta-llama/Llama-3.2-1B-Instruct
+    TOKENIZER_MODEL=nvidia/Llama-3.1-70B-Instruct-FP8
+else
+    TOKENIZER_MODEL=${HF_MODEL_CKPT}
+fi
 
 MODEL_ARGS=" \
     --save-interval 100000 \
@@ -29,7 +34,3 @@ MODEL_ARGS=" \
     --use-rope-scaling \
     --export-force-local-attention \
 "
-
-if [ -z ${TOKENIZER_MODEL} ]; then
-    TOKENIZER_MODEL=nvidia/Llama-3.1-70B-Instruct-FP8
-fi

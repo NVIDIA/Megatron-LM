@@ -127,6 +127,31 @@ class TestTop2Router:
             assert scores.dtype == torch.float64, "Router output should be fp64 when enabled"
             assert out[0].dtype == torch.bfloat16
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_force_load_balancing(self):
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size), device=get_current_device())
+        hidden_states.requires_grad = True
+
+        # First forward pass with normal routing
+        normal_scores, normal_routing_map = self.router(hidden_states)
+
+        # Second forward pass with force load balancing
+        self.router.config.moe_router_force_load_balancing = True
+        force_scores, force_routing_map = self.router(hidden_states)
+
+        assert normal_scores.shape == force_scores.shape
+        assert normal_routing_map.shape == force_routing_map.shape
+        assert torch.equal(normal_scores, force_scores) == False
+
+        # Backward pass for force load balancing
+        self.router.zero_grad()
+        force_scores.sum().backward()
+        assert hidden_states.grad is not None
+        assert self.router.weight.grad.norm() > 0
+
+        self.router.config.moe_router_force_load_balancing = False
+
 
 class TestGroupLimitedRouter:
     def setup_method(self, method):

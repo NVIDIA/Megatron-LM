@@ -16,6 +16,7 @@ import threading
 import time
 import traceback
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache, reduce, wraps
@@ -425,7 +426,7 @@ class GlobalMemoryBuffer:
     def __init__(self):
         self.buffer = {}
 
-    def get_tensor(self, tensor_shape, dtype, name):
+    def get_tensor(self, tensor_shape, dtype, name, mem_alloc_context: Optional[Callable] = None):
         """
         Returns (potentially) a sub-tensor from the self.buffer for the given shape.
         """
@@ -1960,7 +1961,7 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
         def another_function():
             pass
     """
-    
+
     def decorator(func: Callable) -> Callable:
         if HAVE_NVTX and _nvtx_enabled:
             return nvtx.annotate(

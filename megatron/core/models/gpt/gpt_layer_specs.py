@@ -337,6 +337,7 @@ def get_gpt_decoder_block_spec(
     use_transformer_engine: bool,
     normalization: Optional[str] = None,
     qk_l2_norm: Optional[bool] = False,
+    vp_stage: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     if use_transformer_engine:
@@ -418,8 +419,8 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config)
-    num_layers_to_build = get_num_layers_to_build(config)
+    offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
     layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.

@@ -235,8 +235,7 @@ class TestPipelineParallelTransformerBlock:
                 parallel_state.set_pipeline_model_parallel_rank(i)
                 if virtual_pipeline_model_parallel_size is not None:
                     for j in range(virtual_pipeline_model_parallel_size):
-                        parallel_state.set_virtual_pipeline_model_parallel_rank(j)
-                        num_layers_to_build = get_num_layers_to_build(transformer_config)
+                        num_layers_to_build = get_num_layers_to_build(transformer_config, j)
                         total_build_layers += num_layers_to_build
                 else:
                     num_layers_to_build = get_num_layers_to_build(transformer_config)
