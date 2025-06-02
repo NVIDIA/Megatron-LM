@@ -948,25 +948,28 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
         if self.apply_rope_fusion:
-            if self.rotary_interleaved:
-                if not is_te_min_version("2.3.0.dev0"):
-                    raise ValueError(
-                        "rotary_interleaved does not work with apply_rope_fusion for "
-                        "TE < 2.3.0.dev0. Please install TE >= 2.3.0.dev0"
-                    )
+            if self.multi_latent_attention:
+                warnings.warn(
+                    "apply_rope_fusion for multi-latent attention only supports training. "
+                    "It is experimental and may change in future versions."
+                )
+            else:
+                if self.rotary_interleaved:
+                    if not is_te_min_version("2.3.0.dev0"):
+                        raise ValueError(
+                            "rotary_interleaved does not work with apply_rope_fusion for "
+                            "TE < 2.3.0.dev0. Please install TE >= 2.3.0.dev0"
+                        )
 
-            from megatron.core.models.common.embeddings.rope_utils import (
-                fused_apply_rotary_pos_emb,
-                fused_apply_rotary_pos_emb_thd,
-            )
-
-            if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
-                raise ValueError(
-                    "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
+                from megatron.core.models.common.embeddings.rope_utils import (
+                    fused_apply_rotary_pos_emb,
+                    fused_apply_rotary_pos_emb_thd,
                 )
 
-            if self.multi_latent_attention:
-                raise ValueError("multi_latent_attention does not support apply_rope_fusion.")
+                if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
+                    raise ValueError(
+                        "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
+                    )
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
@@ -1184,3 +1187,8 @@ class MLATransformerConfig(TransformerConfig):
 
     mscale_all_dim: float = 0.707
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
