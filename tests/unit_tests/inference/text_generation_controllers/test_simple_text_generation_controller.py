@@ -132,7 +132,7 @@ class TestTextGenerationController:
         top_n_logprobs_dict = defaultdict(list)
 
         class MockTokenizer:
-            def detokenize(self, inp):
+            def detokenize(self, inp, skip_special_tokens=False):
                 return inp[0]
 
         self.text_generation_controller.tokenizer = MockTokenizer()
@@ -188,7 +188,7 @@ class TestTextGenerationController:
 
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+        self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(
             [
                 ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
                 for _ in range(len(x))
@@ -254,7 +254,7 @@ class TestTextGenerationController:
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.bos = 0
         self.mock_tokenizer.eod = self.vocab_size - 1
-        self.mock_tokenizer.detokenize.side_effect = lambda x: ' '.join(
+        self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(
             [
                 ''.join(random.choices(string.ascii_letters, k=random.randint(4, 10)))
                 for _ in range(len(x))
