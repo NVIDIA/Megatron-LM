@@ -21,7 +21,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
 
     Args:
         kv_channels (int): Projection weights dimension in multi-head attention. Obtained from
-            transformer config
+            transformer config.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
         rotary_interleaved (bool, optional): If True, interleaved rotary position embeddings.
             Defaults to False.
@@ -30,7 +30,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         rotary_base (float, optional): Base period for rotary position embeddings. Defaults to
             10000.
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly on
-            the GPU. Defaults to False
+            the GPU. Defaults to False.
         scaling_factor (float, optional): Scaling factor for Yarn RoPE. Defaults to 1.0.
         original_max_position_embeddings (int, optional): Original maximum position embeddings
             length. Defaults to 4096.
@@ -47,7 +47,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         kv_channels: int,
         rotary_percent: float = 1.0,
         rotary_interleaved: bool = False,
-        seq_len_interpolation_factor: float = None,
+        seq_len_interpolation_factor: Optional[float] = None,
         rotary_base: float = 10000.0,
         use_cpu_initialization: bool = False,
         scaling_factor: float = 1.0,
@@ -85,6 +85,10 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             rotary_base,
             use_cpu_initialization,
             cp_group,
+        )
+
+        self._set_cos_sin_cache(
+            self.original_max_position_embeddings, offset=0, dtype=torch.get_default_dtype()
         )
 
     @lru_cache(maxsize=32)
@@ -144,6 +148,29 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb, _mscale
+
+    def _set_cos_sin_cache(self, seq_len, offset, dtype):
+        self.max_seq_len_cached = seq_len
+        self.offset_cached = offset
+        self.dtype_cached = dtype
+
+        emb, _mscale = self.forward(seq_len, offset)
+        self.register_buffer(
+            "cos_cached", (emb.cos() * _mscale).to(dtype).contiguous(), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", (emb.sin() * _mscale).to(dtype).contiguous(), persistent=False
+        )
+
+    def get_cached_cos_sin(self, seq_len, offset=0, dtype=torch.get_default_dtype()):
+        """Get cached cos and sin values."""
+        if (
+            seq_len > self.max_seq_len_cached
+            or offset != self.offset_cached
+            or dtype != self.dtype_cached
+        ):
+            self._set_cos_sin_cache(seq_len, offset, dtype)
+        return (self.cos_cached[:seq_len, ...], self.sin_cached[:seq_len, ...])
 
 
 # Inverse dim formula to find dim based on number of rotations
