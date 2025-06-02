@@ -7,6 +7,7 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
+from megatron.core.device_utils import get_current_device
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -84,8 +85,8 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
             mask_decoder = decoder_prompts_tokens_numpy[i] == tokenizer.pad
             batch_mask_encoder.append(mask_encoder)
             batch_mask_decoder.append(mask_decoder)
-        batch_mask_encoder = torch.tensor(numpy.array(batch_mask_encoder)).cuda()
-        batch_mask_decoder = torch.tensor(numpy.array(batch_mask_decoder)).cuda()
+        batch_mask_encoder = torch.tensor(numpy.array(batch_mask_encoder)).to(device=get_current_device())
+        batch_mask_decoder = torch.tensor(numpy.array(batch_mask_decoder)).to(device=get_current_device())
 
         return {
             "encoder_tokens": encoder_prompts_tokens,
@@ -143,7 +144,7 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
             padding_size = max_sequence_length - len(encoder_prompt_tokens)
             encoder_prompt_tokens.extend([tokenizer.pad] * padding_size)
 
-        return torch.tensor(encoder_prompts_tokens_list).cuda()
+        return torch.tensor(encoder_prompts_tokens_list).to(device=get_current_device())
 
     def get_batch_for_context_window(
         self,

@@ -6,6 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import List
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.utils import is_torch_min_version
@@ -133,7 +134,8 @@ class Timer(TimerBase):
         assert not self._started, 'timer has already been started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         self._start_time = time.time()
         self._started = True
 
@@ -146,7 +148,8 @@ class Timer(TimerBase):
         assert self._started, 'timer is not started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         elapsed = time.time() - self._start_time
         self._elapsed += elapsed
         self._active_time += elapsed
@@ -270,7 +273,7 @@ class Timers:
         # and since we are only gathering a small amount of data,
         # it should be ok to use all-gather instead of gather.
         rank_name_to_time = torch.zeros(
-            (world_size, len(names)), dtype=torch.float, device=torch.cuda.current_device()
+            (world_size, len(names)), dtype=torch.float, device=get_current_device()
         )
         for i, name in enumerate(names):
             if name in self._timers:
@@ -281,7 +284,11 @@ class Timers:
                 rank_name_to_time[rank, i] = self._timers[name].elapsed(reset=reset)
 
         # See the note above for why we are not using gather.
-        dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
+        xm = get_xla_model()
+        if xm:
+            rank_name_to_time = xm.all_gather(rank_name_to_time[rank, :], pin_layout=False).view(rank_name_to_time.size())
+        else:
+            dist_all_gather_func(rank_name_to_time.view(-1), rank_name_to_time[rank, :].view(-1))
 
         return rank_name_to_time
 

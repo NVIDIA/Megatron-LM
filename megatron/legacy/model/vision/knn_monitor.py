@@ -1,6 +1,7 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch.nn.functional as F
 import torch
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 from megatron.training import print_rank_0, get_args
 from megatron.core import mpu
 from megatron.legacy.data.vit_dataset import ClassificationTransform
@@ -54,8 +55,8 @@ def compute_feature_bank(model):
 
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            images = batch[0].cuda().contiguous()
-            labels = batch[1].cuda().contiguous()
+            images = batch[0].to(device=get_current_device()).contiguous()
+            labels = batch[1].to(device=get_current_device()).contiguous()
             student_feature, teacher_feature = model[0](images)
             feature = F.normalize(teacher_feature.float(), dim=1)
             feature_bank.append(feature)
@@ -68,20 +69,29 @@ def compute_feature_bank(model):
     feature_bank = torch.cat(feature_bank, dim=0).contiguous()
     feature_label = torch.cat(feature_label, dim=0).contiguous()
 
-    feature_banks = [torch.zeros_like(feature_bank)
-                     for i in range(mpu.get_data_parallel_world_size())]
-    torch.distributed.all_gather(feature_banks,
-                                 feature_bank,
-                                 group=mpu.get_data_parallel_group())
+    xm = get_xla_model()
+    if xm:
+        wpg = WrappedProcessGroup(mpu.get_data_parallel_group())
+        feature_banks = list(xm.all_gather(feature_bank, groups=wpg.rank_groups, pin_layout=False).split(feature_bank.size()[0]))
+    else:
+        feature_banks = [torch.zeros_like(feature_bank)
+                        for i in range(mpu.get_data_parallel_world_size())]
+        torch.distributed.all_gather(feature_banks,
+                                    feature_bank,
+                                    group=mpu.get_data_parallel_group())
 
     assert torch.all(torch.eq(feature_banks[mpu.get_data_parallel_rank()],
                               feature_bank))
 
-    feature_labels = [torch.zeros_like(feature_label)
-                      for i in range(mpu.get_data_parallel_world_size())]
-    torch.distributed.all_gather(feature_labels,
-                                 feature_label,
-                                 group=mpu.get_data_parallel_group())
+    if xm:
+        wpg = WrappedProcessGroup(mpu.get_data_parallel_group())
+        feature_labels = list(xm.all_gather(feature_label, groups=wpg.rank_groups, pin_layout=False).split(feature_label.size()[0]))
+    else:
+        feature_labels = [torch.zeros_like(feature_label)
+                        for i in range(mpu.get_data_parallel_world_size())]
+        torch.distributed.all_gather(feature_labels,
+                                    feature_label,
+                                    group=mpu.get_data_parallel_group())
 
     # [D, N]
     feature_banks = torch.cat(feature_banks, dim=0).t().contiguous()

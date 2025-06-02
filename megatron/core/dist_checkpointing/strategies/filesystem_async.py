@@ -43,7 +43,7 @@ _results_queue = None
 def _get_write_results_queue():
     global _results_queue
     if _results_queue is None:
-        ctx = mp.get_context('fork')
+        ctx = mp.get_context('spawn')
         _results_queue = ctx.Manager().Queue()
     return _results_queue
 
@@ -218,7 +218,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                 (item, tensor.to("cpu", non_blocking=non_blocking)) for item, tensor in tensor_data
             ]
             result.append((file_name, storage_key, (bytes_data, tensor_data)))
-        if non_blocking:
+        if non_blocking and torch.cuda.is_available():
             torch.cuda.synchronize()
         return result
 

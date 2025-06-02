@@ -5,11 +5,12 @@ import json
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
@@ -22,6 +23,13 @@ first_layer = {
     "attention": {"no_op": False, "replace_with_linear": False, "num_query_groups": 8},
     "mlp": {"no_op": False, "replace_with_linear": False, "ffn_hidden_size": 14336},
 }
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 @pytest.fixture
@@ -68,7 +76,7 @@ def heterogeneous_gpt_model(request, tmp_path):
     return GPTModel(
         transformer_config,
         transformer_layer_spec=get_gpt_heterogeneous_layer_spec(
-            transformer_config, use_te=use_transformer_engine
+            transformer_config, use_te=use_transformer_engine and HAVE_TE
         ),
         vocab_size=128256,
         position_embedding_type="rope",
@@ -115,7 +123,7 @@ def heterogeneous_gpt_model(request, tmp_path):
 class TestHeterogeneousGPTModel:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -132,14 +140,14 @@ class TestHeterogeneousGPTModel:
         sequence_length = heterogeneous_gpt_model.max_sequence_length
         micro_batch_size = 2
 
-        heterogeneous_gpt_model.cuda()
+        heterogeneous_gpt_model.to(get_current_device())
 
         data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+        ).to(get_current_device())
 
         logits = heterogeneous_gpt_model.forward(
             input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask

@@ -17,13 +17,16 @@ import torch
 from torch.distributed import _coalescing_manager
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.fp8_utils import is_float8tensor, modify_underlying_storage, quantize_param_shard
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel import get_device_rng_tracker
 from megatron.core.utils import is_submodule, is_te_min_version, log_on_each_pipeline_stage
 
 try:
     from transformer_engine.pytorch import fp8_model_init
+    from transformer_engine.pytorch.cpp_extensions import cast_to_fp8
+    from megatron.core.fp8_utils import is_float8tensor, quantize_param_fragment
 except:
     pass
 
@@ -39,6 +42,7 @@ except ImportError:
 NCCL_MEMORY_POOL = None
 
 
+xm = get_xla_model()
 logger = logging.getLogger(__name__)
 
 
@@ -147,9 +151,7 @@ class DualUBRAllocator:
         self.mem_allocator = nccl_allocator.nccl_mem(self.pool, group=self.group)
 
     def __enter__(self):
-        backend = self.additional_group._get_backend(
-            torch.device("cuda", torch.cuda.current_device())
-        )
+        backend = self.additional_group._get_backend(get_current_device())
         try:
             # Since the registration is done in mempool granularity, we need to deregister
             # the tensors in the mempool and re-register the mempool including the newly created
@@ -161,9 +163,7 @@ class DualUBRAllocator:
 
     def __exit__(self, *args):
         self.mem_allocator.__exit__(*args)
-        backend = self.additional_group._get_backend(
-            torch.device("cuda", torch.cuda.current_device())
-        )
+        backend = self.additional_group._get_backend(get_current_device())
         backend.register_mem_pool(self.pool)
 
 
@@ -1110,10 +1110,11 @@ class ParamAndGradBuffer:
         grad_reduce_in_fp32: bool = True,
         gradient_scaling_factor: Optional[float] = None,
         expert_gradient_scaling_factor: Optional[float] = None,
-        device: torch.device = torch.device('cuda'),
+        device: torch.device = None,
         only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad: bool = True,
         reset_parameters_for_meta_device_init_module: bool = False,
     ):
+        self.device = device if device else get_current_device()
         self.ddp_config = ddp_config
         self.module = module
         self.bucketing_policy = bucketing_policy
@@ -1134,7 +1135,7 @@ class ParamAndGradBuffer:
         )
 
         # User buffer registration related settings
-        if self.ddp_config.nccl_ub:
+        if self.ddp_config.nccl_ub and nccl_allocator:
             # Since the user buffer registration requires (non-dynamic) persistent memory,
             # it always uses fsdp double buffer.
             self.ddp_config.fsdp_double_buffer = True
@@ -1185,7 +1186,7 @@ class ParamAndGradBuffer:
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
-        if self.ddp_config.nccl_ub:
+        if self.ddp_config.nccl_ub and nccl_allocator:
             assert nccl_allocator is not None, "NCCL allocator is not available."
             global NCCL_MEMORY_POOL
             if group is None:
@@ -1379,19 +1380,19 @@ class ParamAndGradBuffer:
                     self.param_to_direct_module[p] = (name, m)
 
             meta_params_numel = 0
-            cuda_params_numel = 0
+            device_params_numel = 0
             cpu_params_numel = 0
             for group in self.parameter_groups:
                 for p in group.params:
                     if p.is_meta:
                         meta_params_numel += p.numel()
-                    elif p.device.type == 'cuda':
-                        cuda_params_numel += p.numel()
+                    elif p.device.type == 'cuda' or p.device.type == 'xla':
+                        device_params_numel += p.numel()
                     else:
                         cpu_params_numel += p.numel()
             log_str = (
                 f"Meta params numel: {meta_params_numel / 1_000_000:.2f} M, "
-                f"CUDA params numel: {cuda_params_numel / 1_000_000:.2f} M, "
+                f"Device params numel: {device_params_numel / 1_000_000:.2f} M, "
                 f"CPU params numel: {cpu_params_numel / 1_000_000:.2f} M"
             )
             log_on_each_pipeline_stage(logger, logging.INFO, log_str)
@@ -1862,6 +1863,8 @@ class GradReducePipeline:
         cuda_stream: Optional[torch.cuda.Stream] = None,
         check_nans: bool = False,
     ) -> None:
+        assert xm is None, "GradReducePipeline is not supported for XLA"
+        
         self.buffer = param_and_grad_buffer
         self.grad_reduce_queue = []
         self.bucket_status = {
@@ -2374,7 +2377,7 @@ def check_gpu_memory(threshold=0.9):
     """
     if not torch.cuda.is_available():
         return False
-    device = torch.cuda.current_device()
+    device = get_current_device()
     allocated = torch.cuda.memory_allocated(device)
     reserved = torch.cuda.memory_reserved(device)
     total = torch.cuda.get_device_properties(device).total_memory
@@ -2411,7 +2414,7 @@ class ResetParametersContext:
             self.stack.enter_context(fp8_model_init(**args))
 
         if self.with_cuda_rng_tracker:
-            self.stack.enter_context(get_cuda_rng_tracker().fork())
+            self.stack.enter_context(get_device_rng_tracker().fork())
 
         return self
 

@@ -8,7 +8,14 @@ slurm*
 logs
 .vscode
 local/
+*.log
+.gitmodules
+*.out
+=*
 .gitmodules
 wandb/
 onelogger.log
 onelogger.err
+docker-pytorch-xla-*.sh
+test*.py
+.nfs*

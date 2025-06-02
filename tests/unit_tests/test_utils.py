@@ -4,11 +4,12 @@ import urllib.request as req
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import mock
+import unittest.mock as mock
 import numpy as np
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device, get_local_device_count, get_xla_model
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
@@ -17,12 +18,21 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
+
 success_string = "hello,world"
 
 
 @util.experimental_cls(introduced_with_version="0.1.0")
 class A:
 
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        self.device=get_current_device()
+        
     def __init__(self):
         pass
 
@@ -79,51 +89,43 @@ def test_experimental_cls_exception_static():
 
 
 def test_global_memory_buffer():
+    Utils.initialize_model_parallel(1, 1)
     global_memory_buffer = util.GlobalMemoryBuffer()
     obtained_tensor = global_memory_buffer.get_tensor((3, 2), torch.float32, "test_tensor")
-    expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=torch.cuda.current_device())
+    expected_tensor = torch.empty((3, 2), dtype=torch.float32, device=get_current_device())
     assert obtained_tensor.shape == expected_tensor.shape
+    Utils.destroy_model_parallel()
 
 
 def test_make_viewless_tensor():
+    Utils.initialize_model_parallel(1, 1)
     inp = torch.rand((3, 4))
     assert torch.equal(inp, util.make_viewless_tensor(inp, True, True))
     assert torch.equal(inp, util.make_viewless_tensor(inp, True, False))
+    Utils.destroy_model_parallel()
 
 
 def test_safely_set_viewless_tensor_data():
+    Utils.initialize_model_parallel(1, 1)
     tensor = torch.zeros((3, 4))
     new_data_tensor = torch.tensor(np.random.rand(3, 4))
     util.safely_set_viewless_tensor_data(tensor, new_data_tensor)
     assert torch.equal(tensor, new_data_tensor)
+    Utils.destroy_model_parallel()
 
 
 def test_assert_viewless_tensor():
+    Utils.initialize_model_parallel(1, 1)
     tensor = torch.rand((3, 4))
     assert torch.equal(util.assert_viewless_tensor(tensor), tensor)
     input_tensor_list = [tensor, tensor, tensor]
     output_tensor_list = util.assert_viewless_tensor(input_tensor_list)
     for inp, out in zip(input_tensor_list, output_tensor_list):
         assert torch.equal(inp, out)
+    Utils.destroy_model_parallel()
 
 
-# Initialize torch.distributed; do not call init_process_group here, call
-# Utils.initialize_distributed() instead.
-def _init_distributed(world, rank):
-    Utils.initialize_distributed()
-    assert torch.distributed.is_initialized() == True
-    assert torch.distributed.get_rank() == rank
-    assert torch.cuda.device_count() == world
-    torch.distributed.barrier()
-
-
-# Deinitialization and cleanup.
-# Do not call torch.distributed.destroy_process_group, may be needed by other tests.
-def _deinit_distributed():
-    assert torch.distributed.is_initialized() == True
-    torch.distributed.barrier()
-
-
+@pytest.mark.skipif(not util.HAVE_NVTX, reason="NVTX module not available")
 @pytest.mark.parametrize(
     "msg,suffix",
     [(None, None), ("test_message", None), (None, "test_suffix"), ("test_message", "test_suffix")],
@@ -150,7 +152,7 @@ def test_nvtx_range(msg, suffix):
         _call_nvtx_range()
         assert execution_tracker['ranges']
 
-
+@pytest.mark.skipif(not util.HAVE_NVTX, reason="NVTX module not available")
 def test_nvtx_decorator():
     # Track function execution
     execution_tracker = {'decorated': False, 'decorated_with_message': False}
@@ -186,9 +188,8 @@ def test_check_param_hashes_across_dp_replicas():
     rank = int(os.getenv('RANK', '0'))
 
     # Setup.
-    _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False, device='cuda')
+    model = torch.nn.Linear(100, 100, bias=False, device=get_current_device())
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
@@ -202,18 +203,16 @@ def test_check_param_hashes_across_dp_replicas():
     assert param_hashes_match == expected_param_hashes_match
 
     # Teardown.
-    _deinit_distributed()
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.flaky_in_dev
 def test_cross_check_param_hashes_across_dp_replicas():
-    world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
 
     # Setup.
-    _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False, device='cuda')
+    model = torch.nn.Linear(100, 100, bias=False, device=get_current_device())
 
     # First check case where all replicas agree.
     model.weight.data.fill_(1.0)
@@ -225,19 +224,19 @@ def test_cross_check_param_hashes_across_dp_replicas():
     assert not util.check_param_hashes_across_dp_replicas([model], True)
 
     # Teardown.
-    _deinit_distributed()
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.flaky_in_dev
 def test_param_norm(use_distributed_optimizer: bool):
-    world = int(os.getenv('WORLD_SIZE', '1'))
-    rank = int(os.getenv('RANK', '0'))
+
+    if xm and use_distributed_optimizer:
+        return
 
     # Setup: distributed, model, mock_args.
-    _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device=get_current_device())
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
@@ -275,9 +274,9 @@ def test_param_norm(use_distributed_optimizer: bool):
         ) == pytest.approx(100.0)
 
     # Teardown.
-    _deinit_distributed()
+    Utils.destroy_model_parallel()
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.flaky_in_dev
 def test_straggler_detector():
     world = int(os.getenv('WORLD_SIZE', '1'))
@@ -307,8 +306,8 @@ def test_straggler_detector():
         M = 20
         K = 30
         N = 40
-        mat1 = torch.randn(M, K, device='cuda')
-        mat2 = torch.randn(K, N, device='cuda')
+        mat1 = torch.randn(M, K, device=get_current_device())
+        mat2 = torch.randn(K, N, device=get_current_device())
         # batch_data.
         with stimer(bdata=True):
             time.sleep(s)
@@ -340,8 +339,8 @@ def test_straggler_detector():
         N = 20
         P = 30
         M = 40
-        mat1 = torch.randn(N, P, device='cuda')
-        mat2 = torch.randn(P, M, device='cuda')
+        mat1 = torch.randn(N, P, device=get_current_device())
+        mat2 = torch.randn(P, M, device=get_current_device())
         tfp = (N * M) * (2 * P - 1)  # Theoretical.
         iter = 10  # Mock.
         # batch_data.
@@ -356,7 +355,7 @@ def test_straggler_detector():
 
     # Start test.
     # Setup.
-    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
 
     # Create a straggler_detector with enabled set to false.
     stimer = util.StragglerDetector()
@@ -378,4 +377,5 @@ def test_straggler_detector():
     straggler_detector_exception_propagate()
     util.StragglerDetector._configured = False
     # Teardown.
-    _deinit_distributed()
+    Utils.destroy_model_parallel()
+    

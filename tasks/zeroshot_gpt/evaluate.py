@@ -4,8 +4,10 @@
 
 import math
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args
 from megatron.training import print_rank_0, is_last_rank
 from megatron.training import get_tokenizer
@@ -52,8 +54,8 @@ def process_batch(batch):
     args = get_args()
     tokenizer = get_tokenizer()
 
-    loss_mask = batch['pad_mask'].long().cuda().contiguous().byte()
-    tokens_ = batch['text'].long().cuda().contiguous()
+    loss_mask = batch['pad_mask'].long().to(device=get_current_device()).contiguous().byte()
+    tokens_ = batch['text'].long().to(device=get_current_device()).contiguous()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
 
@@ -130,9 +132,7 @@ def evaluate(data_loader, model, eval_metric):
 
             # Reduce across processes.
             if parallel_state.is_pipeline_last_stage():
-                torch.distributed.all_reduce(output,
-                                             group=parallel_state.get_data_parallel_group())
-
+                all_reduce(tensor=output, group=parallel_state.get_data_parallel_group())
                 total_output += output
 
     return total_output

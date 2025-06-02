@@ -6,12 +6,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
 
+xm = get_xla_model()
 
 class Net(nn.Module):
     def __init__(self):
@@ -32,7 +33,7 @@ class Net(nn.Module):
         x = self.fc3(x)
         return x
 
-
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_chained_optimizer():
     net = Net()
     optimizer_1 = Adam(list(net.parameters())[:2], lr=0.01)
@@ -55,24 +56,28 @@ def test_chained_optimizer():
     assert len(chained_optimizer.state) != 0
 
     # 2. check the state is a reference
-    assert not list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
-    assert not list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+    exp_avg = list(optimizer_1.state.values())[0]["exp_avg"]
+    momentum_buffer = list(optimizer_2.state.values())[0]["momentum_buffer"]
+    assert not exp_avg.is_cuda
+    assert not momentum_buffer.is_cuda
 
-    def to_cuda(d):
+    def to_device(d):
         for k, v in d.items():
             if isinstance(v, torch.Tensor):
-                d[k] = v.to("cuda")
+                d[k] = v.to(device=get_current_device())
             elif isinstance(v, dict):
-                to_cuda(v)
+                to_device(v)
         return d
 
     for k, v in chained_optimizer.state.items():
-        chained_optimizer.state[k] = to_cuda(v)
+        chained_optimizer.state[k] = to_device(v)
 
-    assert list(optimizer_1.state.values())[0]["exp_avg"].is_cuda
-    assert list(optimizer_2.state.values())[0]["momentum_buffer"].is_cuda
+    exp_avg = list(optimizer_1.state.values())[0]["exp_avg"]
+    momentum_buffer = list(optimizer_2.state.values())[0]["momentum_buffer"]
+    assert exp_avg.is_cuda
+    assert momentum_buffer.is_cuda
 
-
+pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_precision_aware_fused_adam():
     try:
         from transformer_engine.pytorch.optimizers import FusedAdam
@@ -89,7 +94,7 @@ def test_precision_aware_fused_adam():
             # Skip the test if TE doesn't support precision aware FusedAdam.
             return
 
-    tensor = torch.rand(278011, dtype=torch.bfloat16).cuda()
+    tensor = torch.rand(278011, dtype=torch.bfloat16).to(device=get_current_device())
     params_1 = [torch.nn.Parameter(tensor.float())]  # FP32 reference
     params_2 = [torch.nn.Parameter(tensor.clone())]  # BF16
 
@@ -123,13 +128,11 @@ def test_precision_aware_fused_adam():
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 @pytest.mark.parametrize("precision", ['bf16', 'fp32'])
 def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: str):
-    world = int(os.getenv('WORLD_SIZE', '1'))
-    rank = int(os.getenv('RANK', '0'))
-
     # Setup: distributed, model, mock_args.
-    _init_distributed(world, rank)
+    use_distributed_optimizer = use_distributed_optimizer and xm is None
+    
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device=get_current_device())
     model.requires_grad_(True)
     model.weight.data.fill_(1.0)
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)

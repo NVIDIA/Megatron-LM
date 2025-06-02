@@ -8,6 +8,7 @@ from dataclasses import replace
 from logging import getLogger
 from typing import Callable, Dict, List, Optional, Tuple
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 HAVE_APEX_OR_TE = True
@@ -43,6 +44,7 @@ from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
 
+xm = get_xla_model()
 
 class Range:
     """
@@ -332,7 +334,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_range = gbuf_range["param_map"][model_param]["param"]
 
                 # fp16, bf16 params.
-                if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                model_param_type = model_param.type().split('.')[-1]
+                if model_param_type in ['HalfTensor', 'BFloat16Tensor']:
 
                     # Generate sharded model param.
                     if is_float8tensor(model_param):
@@ -391,7 +394,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     shard_fp32_from_float16_params_this_group.append(shard_main_param)
 
                 # fp32 params.
-                elif model_param.type() == 'torch.cuda.FloatTensor':
+                elif model_param_type == 'FloatTensor':
                     shard_model_param = model_param.view(-1)[param_range.start : param_range.end]
                     model_fp32_params_this_group.append(model_param)
                     shard_fp32_params_this_group.append(shard_model_param)
@@ -404,10 +407,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 else:
                     raise TypeError(
                         'Wrapped parameters must be one of '
-                        'torch.cuda.FloatTensor,  '
-                        'torch.cuda.HalfTensor, or '
-                        'torch.cuda.BFloat16Tensor. '
-                        'Received {}'.format(model_param.type())
+                        'FloatTensor,  '
+                        'HalfTensor, or '
+                        'BFloat16Tensor. '
+                        'Received {}'.format(model_param_type)
                     )
 
             # Update optimizer's params.
@@ -475,6 +478,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             distributed_optimizer_instance_id (int): index of the Distributed Optimizer instance.
         """
 
+        assert xm is None, "Distributed Optimizer is not supported for XLA"
+        
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
@@ -610,9 +615,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # Extract 'step', for non-Apex/TE support.
         if not HAVE_APEX_OR_TE:
-            steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
-            assert len(steps) == 1
-            step = steps[0]
+            try:
+                steps = list(set([s["step"].item() for s in inner_state_dict["state"].values()]))
+                if steps:
+                    assert len(steps) == 1, f"inner_state_dict: {inner_state_dict}."
+                    step = steps[0]
+                else:
+                    step = 0.0
+            except KeyError:
+                step = 0.0
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             step = None
             for optimizer in self.optimizer.sub_optimizers:
@@ -620,7 +631,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     if len(optimizer.state) == 0:
                         continue
                     steps = list(set([s["step"].item() for s in optimizer.state.values()]))
-                    assert len(steps) == 1, f"steps: {optimizer.state}"
+                    assert len(steps) == 1, f"optimizer.state: {optimizer.state}"
                     step = steps[0]
                     break
 
@@ -723,7 +734,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # Allocate dummy tensors.
                             numel = len(param_range_map["gbuf_world"])
                             init_shard = lambda dtype=torch.float32: torch.empty(
-                                (numel,), dtype=dtype, device=torch.cuda.current_device()
+                                (numel,), dtype=dtype, device=get_current_device()
                             )
 
                             # For precision_aware_optimizer, the empty tensors should also be
@@ -753,8 +764,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if not HAVE_APEX_OR_TE:
             steps = list(set([g["step"] for g in state_dict["optimizer"]["param_groups"]]))
             assert len(steps) == 1
-            step = torch.tensor(steps[0], dtype=torch.float)
-
+            step = steps[0]
+           
             for s in state_dict_state.values():
                 # Native PyTorch state dict requires step (i.e., iteration).
                 s["step"] = step
@@ -845,6 +856,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
+            if not HAVE_APEX_OR_TE:
+                optim_state.pop('step', None)
             tensors = {"param": main_param, **optim_state}
         return tensors
 
@@ -891,6 +904,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
             optim_state = self.optimizer.state[main_param]
+            if not HAVE_APEX_OR_TE:
+                optim_state.pop('step', None)
             dst_tensors = {"param": main_param, **optim_state}
             for key in dst_tensors:
                 dst_tensors[key].copy_(tensors[key])
@@ -1262,9 +1277,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             tensors['padding'] = False
 
                         for key in tensors:
-                            if key == 'padding':
+                            if key == 'padding' or (not HAVE_APEX_OR_TE and key == 'step'):
                                 tensors[key] = LocalNonpersistentObject(tensors[key])
                                 continue
+
                             assert tensors[key].shape == (gbuf_local_end - gbuf_local_start,), (
                                 tensors[key].shape,
                                 gbuf_local_start,
@@ -1452,11 +1468,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
                 for gbuf_range_map in gbuf_range_map_for_all_buckets:
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        group_index, group_order = self.model_param_group_index_map[model_param]
+                        main_param = self.optimizer.param_groups[group_index]["params"][group_order]
+                        optim_state = self.optimizer.state[main_param]
+
+                        if not HAVE_APEX_OR_TE:
+                            optim_state.pop('step', None)
+
                         src_tensors = {}
                         for k, v in state_dict[param_idx].items():
-                            if k == "step":
-                                # Handle torch Adam "step" state separately.
-                                continue
                             if k == "fp32_param":
                                 src_tensors["param"] = v
                             else:
@@ -2003,7 +2023,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
                     else:
-                        shard_main_param.grad = shard_model_grad.float()
+                        shard_main_param.grad = shard_model_grad.float().to(device=shard_main_param.device)
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer:

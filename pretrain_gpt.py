@@ -2,8 +2,9 @@
 
 """Pretrain GPT."""
 
-import datetime
-import os
+from functools import partial
+from typing import List, Optional, Tuple, Union
+
 import torch
 
 from functools import partial
@@ -14,7 +15,6 @@ from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.training import get_tokenizer
-from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -79,9 +79,8 @@ def model_provider(
 
     use_te = args.transformer_impl == "transformer_engine"
 
-    if args.record_memory_history:
-        torch.cuda.memory._record_memory_history(
-            True,
+    if args.record_memory_history and torch.cuda.is_available():
+        torch.cuda.memory._record_memory_history(True,
             # keep 100,000 alloc/free events from before the snapshot
             trace_alloc_max_entries=100000,
             # record stack information for the trace events

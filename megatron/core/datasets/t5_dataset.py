@@ -17,7 +17,6 @@ from megatron.core.datasets.masked_dataset import (
 from megatron.core.datasets.utils import Split
 from megatron.core.utils import get_te_version
 
-
 @dataclass
 class T5MaskedWordPieceDatasetConfig(MaskedWordPieceDatasetConfig):
     """Configuration object for Megatron Core T5 WordPiece datasets
@@ -195,7 +194,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
             # Check for older TE version than 1.10, adjust attention mask accordingly
             flash_attention_enabled = os.getenv('NVTE_FLASH_ATTN') == '1'
             fused_attention_enabled = os.getenv('NVTE_FUSED_ATTN') == '1'
-            if (te_version < PkgVersion("1.10.0")) and (te_version >= PkgVersion("1.7.0")):
+            if (te_version and te_version < PkgVersion("1.10.0")) and (te_version >= PkgVersion("1.7.0")):
                 if not (flash_attention_enabled) and not (fused_attention_enabled):
                     encoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
                         encoder_tokens, encoder_tokens
@@ -205,7 +204,7 @@ class T5MaskedWordPieceDataset(MaskedWordPieceDataset):
                     )
                 else:
                     pass
-            elif te_version < PkgVersion("1.7.0"):
+            elif te_version and te_version < PkgVersion("1.7.0"):
                 if not (flash_attention_enabled) and not (fused_attention_enabled):
                     encoder_mask = T5MaskedWordPieceDataset._build_b1ss_attention_mask(
                         encoder_tokens, encoder_tokens

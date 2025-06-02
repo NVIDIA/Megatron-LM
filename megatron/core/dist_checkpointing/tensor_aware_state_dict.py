@@ -2,6 +2,7 @@
 
 """ Utilities for transforming state_dict, including a tensor-aware implementation."""
 
+import copy
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
@@ -9,13 +10,16 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 import torch
 from nvidia_resiliency_ext.checkpointing.local.base_state_dict import TensorAwareStateDict
 
+from megatron.core.device_utils import get_xla_model
+from megatron.core.parallel_state import get_default_process_group
+
 from .dict_utils import dict_list_map_inplace, dict_list_map_outplace, merge, nested_values
 from .exchange_utils import (
     ShardDistribution,
     determine_main_replica_uniform_distribution,
     exchange_by_distribution,
 )
-from .mapping import ShardedObject, ShardedStateDict, ShardedTensor, StateDict, apply_factory_merges
+from .mapping import CommonStateDict, ShardedObject, ShardedStateDict, ShardedTensor, StateDict, apply_factory_merges
 from .state_dict_utils import load_preprocess, save_preprocess
 from .utils import (
     _sharded_object_id,
@@ -25,6 +29,8 @@ from .utils import (
     zip_strict,
 )
 from .validation import determine_global_metadata, validate_sharding_integrity
+
+xm = get_xla_model()
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +87,12 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                     ):
                         sh_base.data = None
 
+    @staticmethod
+    def preprocess_common_state_dict(state_dict: CommonStateDict) -> CommonStateDict:
+        state_dict = copy.deepcopy(state_dict)
+        state_dict.pop('optimizer', None)
+        return state_dict
+
     @classmethod
     @debug_time("from_state_dict", logger)
     def from_state_dict(
@@ -89,6 +101,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         algo: str = 'fully_parallel',
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         cached_metadata: ShardDistribution = None,
+        process_group: torch.distributed.ProcessGroup = None,
     ) -> Tuple[TensorAwareStateDict, ShardDistribution]:
         """
         Constructs a TensorAwareStateDict from a sharded state dictionary.
@@ -113,7 +126,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
             cls._validate_params(algo)
             fully_parallel = algo == 'fully_parallel'
             sharded_part, common_state_dict = save_preprocess(
-                sharded_state_dict, cached_metadata is None
+                sharded_state_dict, cached_metadata is None, process_group=process_group,
+                preprocess_common_before_consistancy_check=cls.preprocess_common_state_dict
             )
             cacheable_distribution = cls._get_distribution(
                 fully_parallel, sharded_part, parallelization_group, cached_metadata
@@ -228,6 +242,9 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         Using non_blocking=True allows for asynchronous copying.
         """
         assert not self.is_hollow  # TODO raise exception
+        if xm:
+            xm.mark_step()
+
         for sh_ten in self._sharded_tensors:
             if sh_ten.data.device.type == 'cpu':
                 # Skip cloning if it's already confirmed to be a copy
@@ -251,6 +268,9 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                 sh_ten.data = sh_ten.data.to(sh_ten.orig_device, non_blocking=non_blocking)
                 delattr(sh_ten, 'orig_device')
 
+        if xm:
+            xm.mark_step()
+            
     def _insert_sharded_data(
         self, fully_parallel, sharded_part, parallelization_group, exchange_algo
     ):
@@ -279,7 +299,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                         parallelization_group,
                         exchange_algo,
                     )
-                    torch.cuda.synchronize()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
         loaded_objects = {}
         for sh_base in nested_values(self.sharded_state_dict):
             if not isinstance(sh_base, ShardedTensor):
@@ -333,7 +354,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
 
         if validate_access_integrity:
             with debug_time("validate_sharding_integrity", logger):
-                validate_sharding_integrity(determine_global_metadata(sharded_part)[1])
+                validate_sharding_integrity(determine_global_metadata(sharded_part,
+                                                                      process_group=get_default_process_group())[1])
 
         # load sharded tensors and sharded objects to sharded_part
         with debug_time("_insert_sharded_data", logger):

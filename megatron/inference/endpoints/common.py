@@ -9,10 +9,10 @@ LOCK = threading.Lock()
 
 
 def send_do_generate():
-    choice = torch.tensor([GENERATE_NUM], dtype=torch.long, device="cuda")
+    choice = torch.tensor([GENERATE_NUM], dtype=torch.long, device=get_current_device())
     torch.distributed.broadcast(choice, 0)
 
 
 def send_do_beam_search():
-    choice = torch.tensor([BEAM_NUM], dtype=torch.long, device="cuda")
+    choice = torch.tensor([BEAM_NUM], dtype=torch.long, device=get_current_device())
     torch.distributed.broadcast(choice, 0)

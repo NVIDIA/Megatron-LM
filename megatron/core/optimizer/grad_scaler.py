@@ -5,6 +5,7 @@
 from abc import ABC, abstractmethod
 from typing import Dict
 
+from megatron.core.device_utils import get_current_device
 import torch
 
 
@@ -12,7 +13,7 @@ class MegatronGradScaler(ABC):
     def __init__(self, initial_scale: float):
         """Initialize scale value with the input initial scale."""
         assert initial_scale > 0.0
-        self._scale = torch.tensor([initial_scale], dtype=torch.float, device='cuda')
+        self._scale = torch.tensor([initial_scale], dtype=torch.float, device=get_current_device())
 
     @property
     def scale(self):
@@ -85,13 +86,13 @@ class DynamicGradScaler(MegatronGradScaler):
         # Lower bound on the scale.
         assert min_scale > 0.0
         assert min_scale <= initial_scale
-        self.min_scale = torch.tensor([min_scale], dtype=torch.float, device='cuda')
+        self.min_scale = torch.tensor([min_scale], dtype=torch.float, device=get_current_device())
         # Growth and backoff factors for the scale.
         assert growth_factor > 1.0
-        self.growth_factor = torch.tensor([growth_factor], dtype=torch.float, device='cuda')
+        self.growth_factor = torch.tensor([growth_factor], dtype=torch.float, device=get_current_device())
         assert backoff_factor < 1.0
         assert backoff_factor > 0.0
-        self.backoff_factor = torch.tensor([backoff_factor], dtype=torch.float, device='cuda')
+        self.backoff_factor = torch.tensor([backoff_factor], dtype=torch.float, device=get_current_device())
         # Interval over which if we don't see any inf/nan,
         # we will scale the grad scale by the growth factor.
         assert growth_interval > 0
@@ -137,6 +138,6 @@ class DynamicGradScaler(MegatronGradScaler):
         return state_dict
 
     def load_state_dict(self, state_dict: Dict):
-        self._scale = state_dict['scale'].cuda(torch.cuda.current_device())
+        self._scale = state_dict['scale'].to(get_current_device())
         self._growth_tracker = state_dict['growth_tracker']
         self._hysteresis_tracker = state_dict['hysteresis_tracker']

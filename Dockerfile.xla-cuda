@@ -1,0 +1,32 @@
+FROM us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla:r2.5.0_3.10_cuda_12.4
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PJRT_DEVICE=CUDA
+
+RUN pip3 install --extra-index-url https://pypi.nvidia.com --no-cache-dir --upgrade-strategy only-if-needed -v \
+    einops \
+    flask-restful \
+    nltk \
+    pytest \
+    pytest-cov \
+    pytest_mock \
+    pytest_asyncio \ 
+    pytest-random-order \
+    sentencepiece \
+    tiktoken \
+    wrapt \
+    zarr \
+    wandb \
+    tensorstore==0.1.45 \
+    pynvml==11.5.3 \
+    triton==3.1.0
+
+RUN pip3 install --upgrade pip
+RUN git clone https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git /nvidia-resiliency-ext-x
+RUN cd /nvidia-resiliency-ext-x && git fetch origin 87a2c60e494498525a163af598dacbd57c8528b0
+RUN cd /nvidia-resiliency-ext-x && git reset --hard 87a2c60e494498525a163af598dacbd57c8528b0
+RUN cd /nvidia-resiliency-ext-x && sed -e '/cupti_build\.py/ s/^/#/' -i pyproject.toml
+RUN cd /nvidia-resiliency-ext-x && pip3 install -e .
+RUN pip3 install multi-storage-client==0.20.3
+RUN pip3 install transformers==4.47.1 
+WORKDIR /megatron

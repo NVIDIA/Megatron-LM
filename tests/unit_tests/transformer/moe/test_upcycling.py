@@ -1,16 +1,18 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import sys
+import traceback
 
 import pytest
 import torch
 import torch.distributed
 
 from megatron.core import mpu
+from megatron.core.device_utils import get_current_device, set_manual_seed
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
@@ -29,15 +31,23 @@ from tests.unit_tests.test_utilities import Utils
 
 _SEED = 42
 
+try:
+    import apex  # pylint: disable=unused-import
+
+    HAVE_APEX = True
+except ImportError:
+    HAVE_APEX = False
 
 def model_provider(
     pre_process=True, post_process=True, layer_spec_fn=get_gpt_layer_local_spec, **config_kwargs
 ):
-    model_parallel_cuda_manual_seed(_SEED)
+    model_parallel_device_manual_seed(_SEED)
     args = get_args()
 
     config = core_transformer_config_from_args(args)
-
+    config.persist_layer_norm = HAVE_APEX
+    config.gradient_accumulation_fusion = HAVE_APEX
+    
     model = GPTModel(
         config=config,
         transformer_layer_spec=layer_spec_fn(
@@ -132,18 +142,19 @@ class TestGPTModel:
         ('tp_pp_ep', 'enable_vp', 'enable_grouped_gemm'), [((1, 1, 2), (False), (False))]
     )
     def test_upcycling(self, tp_pp_ep, enable_vp, enable_grouped_gemm):
+
         tp = tp_pp_ep[0]
         pp = tp_pp_ep[1]
         ep = tp_pp_ep[2]
         args = create_test_args(tp, pp, enable_vp, enable_grouped_gemm)
         set_args(args)
 
-        torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         )
+        set_manual_seed(_SEED)
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             model_provider, ModelType.encoder_or_decoder
@@ -157,21 +168,27 @@ class TestGPTModel:
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         )
         set_upcycling_args(enable_grouped_gemm, ep)
-        # model_parallel_cuda_manual_seed(_SEED+1)
+        # model_parallel_device_manual_seed(_SEED+1)
         moe_model = get_model(model_provider, ModelType.encoder_or_decoder)
 
         # Upcycle the dense model to the MoE model
         moe_model = unwrap_model(moe_model)
         dense_model = unwrap_model(dense_model)
 
+        for m in moe_model:
+            m.to(device=get_current_device())
+
+        for d in dense_model:
+            d.to(device=get_current_device())
+
         data = list(range(args.seq_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).to(device=get_current_device())
         position_ids = (
-            torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
+            torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).to(device=get_current_device())
         )
         attention_mask = torch.ones(
             (args.micro_batch_size, 1, args.seq_length, args.seq_length), dtype=bool
-        ).cuda()
+        ).to(device=get_current_device())
 
         dense_logits = dense_model[0].forward(
             input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
@@ -189,3 +206,4 @@ class TestGPTModel:
         )
 
         torch.allclose(dense_logits, moe_logits, rtol=1e-03, atol=1e-03)
+

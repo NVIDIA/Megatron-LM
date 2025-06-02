@@ -1,7 +1,10 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
-from typing import List, Sequence
+from typing import List, Sequence, Union
 
+import torch.distributed
+
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.utils import (
@@ -9,6 +12,7 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_torch_min_version,
 )
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
@@ -64,7 +68,7 @@ def split_tensor_into_1d_equal_chunks(tensor, new_buffer=False, tp_group=None):
         data = torch.empty(
             partition_size,
             dtype=tensor.dtype,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
             requires_grad=False,
         )
         data.copy_(tensor.view(-1)[start_index:end_index])
@@ -82,14 +86,20 @@ def gather_split_1d_tensor(tensor, tp_group=None):
     Args:
         tensor: A Tensor or view of this rank's portion of the data.
     """
+    
     tp_group = get_tensor_model_parallel_group_if_none(tp_group)
     numel_gathered = torch.numel(tensor) * tp_group.size()
-    gathered = torch.empty(
-        numel_gathered, dtype=tensor.dtype, device=torch.cuda.current_device(), requires_grad=False
-    )
-    dist_all_gather_func(gathered, tensor, group=tp_group)
+    xm = get_xla_model()
+    if xm:
+        wpg = WrappedProcessGroup(tp_group)
+        gathered = xm.all_gather(tensor, groups=wpg.rank_groups, pin_layout=False).view(numel_gathered)
+    else:
+        gathered = torch.empty(numel_gathered, dtype=tensor.dtype, device=get_current_device(), 
+                               requires_grad=False)
+        dist_all_gather_func(gathered, tensor, group=tp_group)
+    
+    
     return gathered
-
 
 class VocabUtility:
     """Split the vocabulary into `world_size` chunks and return the first

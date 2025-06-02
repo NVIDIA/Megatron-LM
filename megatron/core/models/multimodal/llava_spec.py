@@ -1,16 +1,37 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from typing import Optional
 
-from megatron.core.extensions.transformer_engine import (
-    TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
-    TENorm,
-    TERowParallelLinear,
-)
+import torch
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.attention import (
+    CrossAttention,
+    CrossAttentionSubmodules,
+    SelfAttention,
+    SelfAttentionSubmodules,
+)
+try :
+    
+    from megatron.core.extensions.transformer_engine import (
+        TEDotProductAttention,
+        TELayerNormColumnParallelLinear,
+        TENorm,
+        TERowParallelLinear,
+    )
+    HAVE_TE=True
+except ImportError:
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+    import warnings
+
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
+    
+    HAVE_TE = False
+
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -31,7 +52,6 @@ except ImportError:
 
     warnings.warn('Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
-
 
 def decoder_model_with_transformer_engine_default_spec(
     num_experts: Optional[int] = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False

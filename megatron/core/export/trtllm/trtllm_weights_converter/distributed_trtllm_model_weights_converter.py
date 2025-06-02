@@ -6,6 +6,7 @@ import torch
 from tqdm import tqdm
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.trtllm_layers import NON_TRANSFORMER_LAYERS_NAMES, TRTLLMLayers
 from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_prefix as suffix
@@ -213,7 +214,7 @@ class DistributedTRTLLMModelWeightsConverter:
             dim_size = list(val.size())
             dim_size[0] = vocab_size_padded
             gathered_val = torch.zeros(
-                dim_size, dtype=val.dtype, device=torch.cuda.current_device()
+                dim_size, dtype=val.dtype, device=get_current_device()
             )
             gathered_val[vocab_start_index:vocab_end_index] = val
             torch.distributed.all_reduce(gathered_val, group=self.tp_group)

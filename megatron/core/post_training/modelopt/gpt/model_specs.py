@@ -1,14 +1,30 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
+import warnings
+from typing import Optional
+
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+try:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+    HAVE_TE = True
+except ModuleNotFoundError:
+    TEDotProductAttention = None
+    HAVE_TE = False
+
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
-from megatron.core.post_training.modelopt.layers import (
-    BlockwiseFP8WeightTransformerLayer,
-    FP8WeightTransformerLayer,
-    Linear,
-    Norm,
-)
+try:
+    from megatron.core.post_training.modelopt.layers import (
+        BlockwiseFP8WeightTransformerLayer,
+        FP8WeightTransformerLayer,
+        Norm,
+    )
+except ModuleNotFoundError:
+    BlockwiseFP8WeightTransformerLayer = None
+    FP8WeightTransformerLayer = None
+    Norm = WrappedTorchNorm
+
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention

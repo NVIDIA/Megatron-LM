@@ -52,12 +52,21 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
         torch.cuda.set_device(rank)
         torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
-        # Megatron core distributed training initialization
-        parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
-    ```
-    <br>
+def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1):
+    parallel_state.destroy_model_parallel()
 
-1. Set up the GPT model:
+    # Torch setup for distributed training
+    local_rank = int(os.environ['LOCAL_RANK'])
+    local_world_size = get_local_device_count()
+    torch.distributed.init_process_group(backend=get_distributed_backend(), 
+                                         init_nmethod=get_distributed_init_method(), 
+                                         world_size=local_world_size, rank=local_rank)
+
+    # Megatron core distributed training initialization
+    parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
+
+```
+<br>
 
     Use the following code snippet to create a GPT model. For a list of other configurations that you can pass into the model, open and review [transformer_config.py](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/transformer_config.py).
 
@@ -142,7 +151,70 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
     ```python
     from functools import partial
 
-    def forward_step_func(data_iterator, model):
+def forward_step_func(data_iterator, model):
+   
+    def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
+
+        losses = output_tensor.float()
+        loss_mask = loss_mask.view(-1).float()
+        loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+        # If you have data parallel reduce loss across data parallel groups. 
+        # If pipeline parallel, loss computation is done only in last stage.
+
+        return loss, {'lm loss': loss}
+
+    data = next(data_iterator)
+    tokens = data['tokens'].to(device)
+    attention_mask = data['attention_mask'].to(device)
+    position_ids = data['position_ids'].to(device)
+    labels = data['labels'].to(device)
+    loss_mask = data['loss_mask'].to(device)
+   
+    output_tensor = model(tokens, position_ids, attention_mask,
+                          labels=labels)
+
+    return output_tensor, partial(loss_func, loss_mask)   
+```
+<br>
+
+**STEP 5 - Load and Save Distributed Checkpoint**
+
+Megatron Core uses distributed checkpoints for loading and saving models. This gives you the flexibility to convert the model from one model parallel setting to another when you load a model. For example, a model trained with tensor parallel size 2, can be loaded again as tensor model parallel size 4, and so forth.
+
+```python
+from megatron.core import dist_checkpointing
+
+def save_distributed_checkpoint(checkpoint_path, gpt_model):
+    sharded_state_dict = gpt_model.sharded_state_dict(prefix='')
+    dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+
+def load_distributed_checkpoint(checkpoint_path, gpt_model):
+    sharded_state_dict=gpt_model.sharded_state_dict(prefix='')
+    checkpoint = dist_checkpointing.load(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
+    gpt_model.load_state_dict(checkpoint)
+    return gpt_model
+```
+<br>
+
+**STEP 6 - Main Function**
+
+The following code snippet is the main function that needs to go into your script. It runs the model for 5 iterations, saves the model, and loads the data model.  
+
+```python
+from pathlib import Path
+from torch.optim import Adam
+from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+
+if __name__ == "__main__":
+    initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    model_parallel_device_manual_seed(123)
+
+    gpt_model = model_provider()
+    device = get_current_device()
+    gpt_model.to(device)
+
+    optim = Adam(gpt_model.parameters())
     
         def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
 

@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import torch
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import (
@@ -20,12 +21,17 @@ try:
         TEColumnParallelLinear,
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
-        TENorm,
+        TENorm as WrappedTorchNorm,
         TERowParallelLinear,
     )
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
+    
     HAVE_TE = False
 
 try:
@@ -43,10 +49,12 @@ except ImportError:
     warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 
-
 def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 encoder TE spec (uses Transformer Engine components)."""
 
+    if not HAVE_TE:
+        return encoder_model_with_local_spec()
+    
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -76,6 +84,9 @@ def encoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
 def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
     """T5 decoder TE spec (uses Transformer Engine components)."""
 
+    if not HAVE_TE:
+        return decoder_model_with_local_spec()
+    
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
@@ -91,7 +102,7 @@ def decoder_model_with_transformer_engine_default_spec() -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_cross_attn_layernorm=TENorm,
+            pre_cross_attn_layernorm=WrappedTorchNorm,
             cross_attention=ModuleSpec(
                 module=CrossAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
@@ -206,7 +217,7 @@ def get_t5_encoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = encoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchNorm)
     return block_spec
 
 
@@ -220,7 +231,7 @@ def get_t5_decoder_with_transformer_engine_block_spec(
     """
 
     layer_spec = decoder_model_with_transformer_engine_default_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchNorm)
     return block_spec
 
 
@@ -232,7 +243,7 @@ def get_t5_encoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = encoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchNorm)
     return block_spec
 
 
@@ -244,5 +255,5 @@ def get_t5_decoder_with_local_block_spec(num_layers: int) -> TransformerBlockSub
     """
 
     layer_spec = decoder_model_with_local_spec()
-    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=TENorm)
+    block_spec = TransformerBlockSubmodules([layer_spec] * num_layers, layer_norm=WrappedTorchNorm)
     return block_spec

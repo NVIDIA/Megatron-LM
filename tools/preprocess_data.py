@@ -1,5 +1,3 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-
 """Processing large data for pretraining."""
 import argparse
 import math
@@ -17,6 +15,7 @@ import multiprocessing
 try:
     import nltk
     from nltk.tokenize.punkt import PunktLanguageVars
+    from nltk.tokenize import sent_tokenize
     nltk_available = True
 except ImportError:
     PunktLanguageVars = object  # Fallback to the built-in object class
@@ -44,6 +43,11 @@ class IdentitySplitter(object):
     def tokenize(self, *text):
         return text
 
+class NltkSentenceSplitter(object):
+    def tokenize(self, *text):
+        tokenized_text = sent_tokenize(*text)
+        return tokenized_text
+
 
 class Encoder(object):
     def __init__(self, args):
@@ -62,14 +66,17 @@ class Encoder(object):
             else:
                 library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
                 url = f"nltk:{library}"
-            splitter = nltk.load(url)
-            if self.args.keep_newlines:
-                # this prevents punkt from eating newlines after sentences
-                Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
-                    train_text = splitter._params,
-                    lang_vars = CustomLanguageVars())
-            else:
-                Encoder.splitter = splitter
+            try:
+                splitter = nltk.load(url)
+                if self.args.keep_newlines:
+                    # this prevents punkt from eating newlines after sentences
+                    Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
+                        train_text = splitter._params,
+                        lang_vars = CustomLanguageVars())
+                else:
+                    Encoder.splitter = splitter
+            except:
+                Encoder.splitter = NltkSentenceSplitter()
 
         else:
             Encoder.splitter = IdentitySplitter()

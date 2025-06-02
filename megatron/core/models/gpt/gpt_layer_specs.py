@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import torch
 import warnings
 from typing import Optional, Union
 
@@ -46,6 +47,9 @@ try:
 
     HAVE_TE = True
 except ImportError:
+    import warnings
+    if torch.cuda.is_available():
+        warnings.warn('Transformer Engine is not installed. Falling back to Megatron Local')
     HAVE_TE = False
 
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
@@ -64,7 +68,6 @@ except ImportError:
 
     warnings.warn('Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
-
 
 def get_gpt_layer_with_transformer_engine_spec(
     num_experts: Optional[int] = None,
@@ -90,6 +93,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     Returns:
         ModuleSpec: Module specification with TE modules
     """
+    
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
@@ -302,6 +306,7 @@ def get_mlp_module_spec(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
+    use_te = use_te & HAVE_TE
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "_get_mlp_module_spec" has been deprecated'

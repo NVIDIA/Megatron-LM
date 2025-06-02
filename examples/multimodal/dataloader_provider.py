@@ -107,7 +107,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
 
     rank = parallel_state.get_data_parallel_rank()
     world_size = parallel_state.get_data_parallel_world_size()
-    data_parallel_group = parallel_state.get_data_parallel_group()
+    data_parallel_group = parallel_state.get_data_parallel_group().process_group
 
     worker_config = WorkerConfig(
         rank=rank,

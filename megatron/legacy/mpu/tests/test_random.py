@@ -1,7 +1,8 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+## Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 from commons import print_separator
 from commons import initialize_distributed
+from megatron.core.device_utils import get_current_device
 import mpu
 import torch
 import sys
@@ -20,7 +21,7 @@ def test_set_cuda_rng_state(tensor_model_parallel_size):
     size = 123
     seed = 1234
     torch.cuda.manual_seed(1234)
-    tensor = torch.tensor(size, dtype=torch.float, device='cuda')
+    tensor = torch.tensor(size, dtype=torch.float, device=get_current_device())
 
     # Get the state
     rng_state = torch.cuda.get_rng_state()
@@ -82,7 +83,7 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
     seed_1 = 1234
     seed_2 = 4321
     size = [12, 21]
-    tensor = torch.tensor(size, dtype=torch.float, device='cuda')
+    tensor = torch.tensor(size, dtype=torch.float, device=get_current_device())
 
     # Set to seed_1 and generate two tensors.
     torch.cuda.manual_seed(seed_1)
@@ -101,19 +102,19 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
     # Now if we interleave seed_1 and seed_2,
     # we should still get the same tensors
     torch.cuda.manual_seed(seed_1)
-    mpu.get_cuda_rng_tracker().add('test', seed_2)
+    mpu.get_device_rng_tracker().add('test', seed_2)
 
     torch.randn(size, out=tensor)
     result_11 = tensor.clone()
 
-    with mpu.get_cuda_rng_tracker().fork('test'):
+    with mpu.get_device_rng_tracker().fork('test'):
         torch.randn(size, out=tensor)
         result_21 = tensor.clone()
 
     torch.randn(size, out=tensor)
     result_12 = tensor.clone()
 
-    with mpu.get_cuda_rng_tracker().fork('test'):
+    with mpu.get_device_rng_tracker().fork('test'):
         torch.randn(size, out=tensor)
         result_22 = tensor.clone()
 
@@ -131,7 +132,7 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
     assert error < 1.0e-6
 
     # Reset the tracker
-    mpu.get_cuda_rng_tracker().reset()
+    mpu.get_device_rng_tracker().reset()
 
     # Reset groups
     mpu.destroy_model_parallel()
@@ -141,7 +142,7 @@ def test_cuda_rng_tracker(tensor_model_parallel_size):
         print('>> passed the test :-)')
 
 
-def test_model_parallel_cuda_manual_seed(tensor_model_parallel_size):
+def test_model_parallel_device_manual_seed(tensor_model_parallel_size):
 
     if torch.distributed.get_rank() == 0:
         print('> testing model parallel cuda manual seed with size {} ...'.
@@ -150,14 +151,14 @@ def test_model_parallel_cuda_manual_seed(tensor_model_parallel_size):
     mpu.initialize_model_parallel(tensor_model_parallel_size)
     tensor_model_parallel_size = mpu.get_tensor_model_parallel_world_size()
 
-    mpu.model_parallel_cuda_manual_seed(12345)
+    mpu.model_parallel_device_manual_seed(12345)
     assert torch.cuda.initial_seed() == 12345
-    with mpu.get_cuda_rng_tracker().fork():
+    with mpu.get_device_rng_tracker().fork():
         assert torch.cuda.initial_seed() == (12345 + 2718 +
                                              mpu.get_tensor_model_parallel_rank())
 
     # Reset the tracker
-    mpu.get_cuda_rng_tracker().reset()
+    mpu.get_device_rng_tracker().reset()
 
     # Reset groups
     mpu.destroy_model_parallel()
@@ -187,5 +188,5 @@ if __name__ == '__main__':
     tensor_model_parallel_size = 1
     while tensor_model_parallel_size <= world_size:
         print_separator('test model parallel cuda manual seed')
-        test_model_parallel_cuda_manual_seed(tensor_model_parallel_size)
+        test_model_parallel_device_manual_seed(tensor_model_parallel_size)
         tensor_model_parallel_size *= 2

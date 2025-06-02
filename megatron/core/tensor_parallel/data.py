@@ -1,8 +1,10 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
 _MAX_DATA_DIM = 5
 
@@ -34,12 +36,17 @@ def _build_key_size_numel_dictionaries(keys, data, tp_group=None):
             offset += max_dim
 
     # Move to GPU and broadcast.
-    sizes_cuda = torch.tensor(sizes, dtype=torch.long, device='cuda')
+    sizes_device = torch.tensor(sizes, dtype=torch.long, device=get_current_device())
+    xm = get_xla_model()
     group_ranks = torch.distributed.get_process_group_ranks(group=tp_group)
-    torch.distributed.broadcast(sizes_cuda, group_ranks[0], group=tp_group)
+    if xm:
+        wpg = WrappedProcessGroup(tp_group)
+        xm.collective_broadcast([sizes_device], group_ranks[0], groups=wpg.rank_groups, pin_layout=False)
+    else:
+        torch.distributed.broadcast(sizes_device, group_ranks[0], group=tp_group)
 
     # Move back to cpu and unpack.
-    sizes_cpu = sizes_cuda.cpu()
+    sizes_cpu = sizes_device.cpu()
     key_size = {}
     key_numel = {}
     total_numel = 0
@@ -81,13 +88,18 @@ def broadcast_data(keys, data, datatype, tp_group=None):
         # Check that all keys have the same data type.
         _check_data_types(keys, data, datatype)
         # Flatten the data associated with the keys
-        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).cuda()
+        flatten_data = torch.cat([data[key].contiguous().view(-1) for key in keys], dim=0).to(device=get_current_device())
     else:
-        flatten_data = torch.empty(total_numel, device=torch.cuda.current_device(), dtype=datatype)
+        flatten_data = torch.empty(total_numel, device=get_current_device(), dtype=datatype)
 
     # Broadcast
+    xm = get_xla_model()
     group_ranks = torch.distributed.get_process_group_ranks(group=tp_group)
-    torch.distributed.broadcast(flatten_data, group_ranks[0], group=tp_group)
+    if xm:
+        wpg = WrappedProcessGroup(tp_group)
+        xm.collective_broadcast([flatten_data], group_ranks[0], groups=wpg.rank_groups, pin_layout=False)
+    else:
+        torch.distributed.broadcast(flatten_data, group_ranks[0], group=tp_group)
 
     # Unpack
     output = {}

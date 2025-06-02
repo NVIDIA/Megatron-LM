@@ -16,13 +16,14 @@ from tqdm import tqdm
 
 from megatron.core import parallel_state
 from megatron.core.datasets.gpt_dataset import _get_ltor_masks_and_position_ids
+from megatron.core.device_utils import get_current_device, set_manual_seed
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.multimodal.llava_model import DEFAULT_IMAGE_TOKEN_INDEX, LLaVAModel
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.mappings import all_reduce, gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args, get_tokenizer
@@ -215,8 +216,8 @@ class Pipeline:
         set_global_variables(args)
 
         # Random seed.
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        set_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # Model.
         models = self.build_model()
@@ -248,7 +249,7 @@ class Pipeline:
             )
             np.random.seed(orig_numpy_seed)
 
-            torch_input_ids = torch.from_numpy(numpy_input_ids).to("cuda")
+            torch_input_ids = torch.from_numpy(numpy_input_ids).to(device=get_current_device())
 
             return torch_input_ids
         else:
@@ -283,18 +284,18 @@ class Pipeline:
             input_ids = torch.empty(
                 (args.micro_batch_size, args.seq_length),
                 dtype=torch.int64,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             position_ids = torch.empty(
                 (args.micro_batch_size, args.seq_length),
                 dtype=torch.int64,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             if args.create_attention_mask_in_dataloader:
                 attention_mask = torch.empty(
                     (args.micro_batch_size, 1, args.seq_length, args.seq_length),
                     dtype=torch.bool,
-                    device=torch.cuda.current_device(),
+                    device=get_current_device(),
                 )
             else:
                 attention_mask = None
@@ -396,7 +397,7 @@ class Pipeline:
                 emb = model.module.module.shared_embedding_or_output_weight()
                 # Make embedding the same on ranks that has is
                 if emb is not None:
-                    torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
+                    all_reduce(emb, group=parallel_state.get_embedding_group())
 
     def save_checkpoint(self):
         """Initialize params, forward pass data, and save checkpoint."""
@@ -534,7 +535,7 @@ class Pipeline:
             Utils.destroy_model_parallel()
 
             # Broadcast MSE's.
-            mses = torch.zeros((2,), dtype=torch.float, device="cuda")
+            mses = torch.zeros((2,), dtype=torch.float, device=get_current_device())
             if rank == world_size - 1:
                 mses[0] = mse_real
                 mses[1] = mse_fake
@@ -651,7 +652,7 @@ class LLaVAPipeline(Pipeline):
     @staticmethod
     def get_test_image():
         args = get_args()
-        test_image = torch.ones((1, 3, args.img_h, args.img_w)).to("cuda")
+        test_image = torch.ones((1, 3, args.img_h, args.img_w)).to(get_current_device())
         return test_image
 
     @staticmethod
@@ -673,7 +674,7 @@ class LLaVAPipeline(Pipeline):
 
             numpy_input_ids[0] = DEFAULT_IMAGE_TOKEN_INDEX
 
-            torch_input_ids = torch.from_numpy(numpy_input_ids).to("cuda")
+            torch_input_ids = torch.from_numpy(numpy_input_ids).to(get_current_device())
 
             return torch_input_ids
         else:
@@ -819,7 +820,7 @@ class LLaVAPipeline(Pipeline):
 
         # Random seed.
         torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # Model.
         models = self.build_model()
@@ -892,7 +893,8 @@ def test_all_pipelines():
         mses = pipeline.run()
         latency = time.time() - t
         results.append((latency, *mses))
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Print results.
     if int(os.environ["RANK"]) == 0:

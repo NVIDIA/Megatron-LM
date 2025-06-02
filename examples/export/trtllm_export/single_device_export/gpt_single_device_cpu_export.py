@@ -6,7 +6,7 @@ from megatron.core.export.model_type import ModelType
 from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
 from megatron.core.export.trtllm.trtllm_helper import TRTLLMHelper
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
@@ -56,7 +56,7 @@ def load_distributed_checkpoint(checkpoint_path, gpt_model):
 if __name__ == "__main__":
     # Need to use TP1 PP1 for export on single device
     initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-    model_parallel_cuda_manual_seed(123)
+    model_parallel_device_manual_seed(123)
 
     gpt_model = model_provider()
 

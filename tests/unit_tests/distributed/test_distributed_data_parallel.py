@@ -1,13 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import numpy as np
 import pytest
 import torch
 from packaging import version
 from torch import testing
 
+from megatron.core.device_utils import get_current_device, get_current_device_type
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from megatron.core.transformer import TransformerConfig
+
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -25,7 +28,6 @@ class TestModel(torch.nn.Module):
         x = self.linear2(x)
         return x
 
-
 class TestDistributedDataParallel:
     @classmethod
     def setup_class(cls):
@@ -35,6 +37,7 @@ class TestDistributedDataParallel:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
@@ -57,8 +60,8 @@ class TestDistributedDataParallel:
         ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
 
         # Create two identical models
-        model1 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
-        model2 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        model1 = TestModel(input_dim=input_dim, output_dim=output_dim).to(get_current_device())
+        model2 = TestModel(input_dim=input_dim, output_dim=output_dim).to(get_current_device())
 
         # Ensure identical weights
         for p1, p2 in zip(model1.parameters(), model2.parameters()):
@@ -75,7 +78,7 @@ class TestDistributedDataParallel:
 
         # Create device mesh for explicit process groups
         # Create a mesh with dimension dp [dp_size], 1 pp size and 1 ep size
-        device_mesh = init_device_mesh("cuda", (dp_size, 1, 1), mesh_dim_names=("dp", "ep", "pp"))
+        device_mesh = init_device_mesh(get_current_device_type(), (dp_size, 1, 1), mesh_dim_names=("dp", "ep", "pp"))
 
         # Create process groups config with ONLY dp group
         grad_comm_pgs = GradCommProcessGroups()
@@ -96,7 +99,7 @@ class TestDistributedDataParallel:
 
         # Create identical inputs with integer values
         batch_size = 2
-        input_data = torch.randint(0, 10, (batch_size, input_dim), device='cuda', dtype=torch.long)
+        input_data = torch.randint(0, 10, (batch_size, input_dim), device=get_current_device(), dtype=torch.long)
         input_data = input_data.float()  # Convert to float for model compatibility
 
         # Forward pass

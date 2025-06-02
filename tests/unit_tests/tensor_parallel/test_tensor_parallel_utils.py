@@ -1,3 +1,4 @@
+from megatron.core.device_utils import get_current_device
 import torch
 
 import megatron.core.parallel_state as ps
@@ -30,7 +31,7 @@ def test_split_tensor_into_1d_equal_chunks():
 
 def test_gather_split_1d_tensor():
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=4)
-    input_tensor = torch.ones((2, 4)).cuda() * rank
+    input_tensor = torch.ones((2,4)).to(device=get_current_device()) * rank
     actual_output_tensor = util.gather_split_1d_tensor(input_tensor)
     if rank % 2 == 0:
         expected_output_tensor = torch.concat((input_tensor.flatten(), input_tensor.flatten() + 1))

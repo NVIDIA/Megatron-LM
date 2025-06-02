@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 import torch
 from packaging.version import Version as PkgVersion
 from torch import Tensor
-
+from megatron.core.device_utils import get_current_device
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
@@ -16,7 +16,6 @@ from megatron.core.utils import divide as core_divide
 
 from .base_context import BaseInferenceContext
 from .dynamic_chunk_allocator import ChunkAllocator
-
 
 class ContextOverflowError(Exception):
     '''Base exception for when a new request would not fit.'''
@@ -184,7 +183,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-request state.
         self.request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), -1, dtype=torch.int32, device=get_current_device()
         )
         # request_query_lengths is the input prompt tokens length during prefill phase (1st step) and then 1 for the decode phase (i.e During generation)
         self.request_query_lengths = torch.empty_like(self.request_ids)
@@ -199,7 +198,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Per-token state.
         self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
+            (self.max_tokens,), 0, dtype=torch.long, device=get_current_device()
         )
         self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
         self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
@@ -225,7 +224,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ),
             -1,
             dtype=self.params_dtype,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         # Chunk ids.
@@ -234,7 +233,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             (self.max_requests, self.max_kv_chunk_count),
             -1,
             dtype=torch.int,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         # `*_decode_only` tensors are for use with cuda graphs to maintain
@@ -248,23 +247,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         # are enabled.
 
         self.query_seq_lengths_decode_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), 0, dtype=torch.int32, device=get_current_device()
         )
         self.cu_query_seq_lengths_decode_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests + 1,), 0, dtype=torch.int32, device=get_current_device()
         )
         self.kv_seq_lengths_decode_only = torch.full(
-            (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests,), 0, dtype=torch.int32, device=get_current_device()
         )
         self.cu_kv_seq_lengths_decode_only = torch.full(
-            (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            (self.max_requests + 1,), 0, dtype=torch.int32, device=get_current_device()
         )
 
         self.kv_memory_decode_only = torch.full(
             (self.max_requests, self.max_kv_chunk_count),
             0,
             dtype=torch.int,
-            device=torch.cuda.current_device(),
+            device=get_current_device(),
         )
 
         # Guaranteed active requests.
@@ -428,6 +427,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Query tensor after applying rotary embeddings.
         """
+        # Import here to avoid circular dependency
+        from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
         n = self.padded_active_token_count
         query_seq_idx = self.token_to_pos_ids[:n]
         query_emb = query_emb[query_seq_idx]
@@ -458,6 +459,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             (Tensor) Key tensor after applying rotary embeddings.
         """
+        # Import here to avoid circular dependency
+        from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
         n = self.padded_active_token_count
         key_seq_idx = self.token_to_position_in_request[:n]
         key_emb = key_emb[key_seq_idx]
@@ -525,7 +528,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (self.total_request_count - self.paused_request_count + 1,),
                 0,
                 dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             self.cu_query_seq_lengths[1:] = cu_query_lengths
             self.max_seqlen_q = query_lengths.max().item()
@@ -545,7 +548,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (self.total_request_count - self.paused_request_count + 1,),
                 0,
                 dtype=torch.int32,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
             self.cu_kv_seq_lengths[1:] = torch.cumsum(self.kv_seq_lengths, dim=0)
             self.max_seqlen_k = self.kv_seq_lengths.max().item()
@@ -715,7 +718,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ) % self.chunk_size_tokens
 
         # Update token state.
-        arange_context_length = torch.arange(context_length, device=torch.cuda.current_device())
+        arange_context_length = torch.arange(context_length, device=get_current_device())
 
         self.token_to_pos_ids[
             self.active_token_count : (self.active_token_count + context_length)
@@ -978,7 +981,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             row_idx = torch.arange(
                 self.paused_request_count,
                 self.paused_request_count + resume_request_count,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
+                dtype=torch.int
             )
             col_idx = self.request_kv_chunk_counts[
                 self.paused_request_count : (self.paused_request_count + resume_request_count)
@@ -993,7 +997,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # 9. We make relevant changes to the token bookkeeping tensors
         self.token_to_request_idx[: self.active_token_count] = torch.arange(
-            self.paused_request_count, self.total_request_count, device=torch.cuda.current_device()
+            self.paused_request_count, self.total_request_count, device=get_current_device(), dtype=torch.int
         )
         self.token_to_position_in_request[: self.active_token_count] = (
             self.request_kv_length_offsets[self.paused_request_count : self.total_request_count]

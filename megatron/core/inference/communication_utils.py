@@ -5,7 +5,10 @@ import torch
 from torch.distributed import ProcessGroup
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 
+xm = get_xla_model()
 
 def is_pipeline_first_stage(pp_group: ProcessGroup):
     """Check if the current process is the first stage of the pipeline"""
@@ -25,10 +28,10 @@ def is_pipeline_last_stage(pp_group: ProcessGroup):
         return pp_group.rank() == pp_group.size() - 1
 
 
-def _is_cuda(tensor):
-    """Check if a tensor is not none and is cuda."""
+def _is_device(tensor):
+    """Check if a tensor is not none and is on a device."""
     assert tensor is not None
-    assert tensor.is_cuda
+    assert tensor.is_cuda or tensor.is_xla
 
 
 def broadcast_from_last_pipeline_stage(
@@ -65,13 +68,18 @@ def broadcast_from_last_pipeline_stage(
             tensor.shape
         ), f"Expected tensor of shape {size} but got {list(tensor.shape)}"
         assert dtype == tensor.dtype, f"Expected tensor of type {dtype} but got {tensor.dtype}"
-        _is_cuda(tensor)
+        _is_device(tensor)
         assert tensor.is_contiguous()
     else:
-        tensor = torch.empty(size, dtype=dtype, device=torch.cuda.current_device())
+        tensor = torch.empty(size, dtype=dtype, device=get_current_device())
 
-    # Broadcast the tensor
-    torch.distributed.broadcast(tensor, src=last_rank, group=pp_group)
+    if xm:
+        wpg = WrappedProcessGroup(process_group=pp_group)
+        xm.collective_broadcast([tensor], last_rank, groups=wpg.rank_groups, pin_layout=False)
+    else:
+        # Broadcast the tensor
+        torch.distributed.broadcast(tensor, src=last_rank, group=pp_group)
+
     return tensor
 
 
@@ -96,15 +104,29 @@ def recv_from_prev_pipeline_rank_(
             (pp_group.rank() - 1) % pp_group.size()
         ]
 
+    assert recv_buffer is not None
+    if xm:
+        xm.mark_step()
+        device = recv_buffer.device
+        recv_buffer_orig = recv_buffer
+        recv_buffer = recv_buffer.cpu()
+
     # Create receive operation
-    recv_prev_op = torch.distributed.P2POp(torch.distributed.irecv, recv_buffer, prev_rank)
+    recv_prev_op = torch.distributed.P2POp(torch.distributed.irecv, recv_buffer, prev_rank, 
+                                           group=parallel_state.get_default_process_group())
 
     reqs = torch.distributed.batch_isend_irecv([recv_prev_op])
     for req in reqs:
         req.wait()
-    # To protect against race condition when using batch_isend_irecv().
-    torch.cuda.synchronize()
 
+    if xm:
+        recv_buffer_orig.data = recv_buffer.to(device=device)
+
+    # To protect against race condition when using batch_isend_irecv().
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif xm:
+        xm.mark_step()
 
 def send_to_next_pipeline_rank(
     tensor: torch.Tensor = None, pp_group: Optional[ProcessGroup] = None
@@ -127,11 +149,19 @@ def send_to_next_pipeline_rank(
             (pp_group.rank() + 1) % pp_group.size()
         ]
 
+    if xm:
+        xm.mark_step()
+        tensor = tensor.cpu()
+
     # Create send operation
-    send_next_op = torch.distributed.P2POp(torch.distributed.isend, tensor, next_rank)
+    send_next_op = torch.distributed.P2POp(torch.distributed.isend, tensor, next_rank, 
+                                           group=parallel_state.get_default_process_group())
 
     reqs = torch.distributed.batch_isend_irecv([send_next_op])
     for req in reqs:
         req.wait()
     # To protect against race condition when using batch_isend_irecv().
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elif xm:
+        xm.mark_step()

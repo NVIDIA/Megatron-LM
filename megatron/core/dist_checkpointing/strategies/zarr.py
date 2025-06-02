@@ -136,7 +136,8 @@ def _save_to_existing_array(sharded_tensor: ShardedTensor, arr: Optional[zarr.Ar
     assert arr is not None
     x = sharded_tensor.data
     x = x.detach().cpu()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+            torch.cuda.synchronize()
     if x.dtype == torch.bfloat16:
         x = x.float()
         x = x.numpy()

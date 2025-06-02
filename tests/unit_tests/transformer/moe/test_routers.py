@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device, get_xla_model
 import pytest
 import torch
 
@@ -11,6 +12,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class TestTop2Router:
     def setup_method(self, method):
@@ -50,27 +52,27 @@ class TestTop2Router:
         assert num_weights == 12 * 4, num_weights
 
     @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.parametrize("moe_router_pre_softmax", [(True), (False)])
     @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
     def test_router_forward(self, moe_router_pre_softmax, score_function):
         with torch.no_grad():
-            self.router = self.router.cuda()
+            self.router = self.router.to(device=get_current_device())
             self.router.config.moe_router_pre_softmax = moe_router_pre_softmax
             self.router.config.moe_router_score_function = score_function
             # [num tokens, hidden size]
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-            hidden_states = hidden_states.cuda()
+            hidden_states = hidden_states.to(device=get_current_device())
             scores, indices = self.router(hidden_states)
 
     @pytest.mark.internal
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_aux_loss(self):
-        self.sequential_mlp = self.sequential_mlp.cuda()
-
+        self.sequential_mlp = self.sequential_mlp.to(device=get_current_device())
+        
         # Without aux loss
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-        hidden_states = hidden_states.cuda().bfloat16()
+        hidden_states = hidden_states.to(device=get_current_device()).bfloat16()
         out = self.sequential_mlp(hidden_states)[0]
         out.sum().mul_(0).backward()
         assert self.sequential_mlp.router.weight.grad.abs().sum() == 0
@@ -92,10 +94,10 @@ class TestTop2Router:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_dtype(self):
-        self.router = self.router.cuda()
-        self.sequential_mlp = self.sequential_mlp.cuda()
+        self.router = self.router.to(device=get_current_device())
+        self.sequential_mlp = self.sequential_mlp.to(device=get_current_device())
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
 
         # Test with default setting (bf16)
         self.router.config.moe_router_dtype = None
@@ -128,7 +130,7 @@ class TestTop2Router:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_force_load_balancing(self):
-        hidden_states = torch.randn((32, 2, self.router.config.hidden_size), device="cuda")
+        hidden_states = torch.randn((32, 2, self.router.config.hidden_size), device=get_current_device())
         hidden_states.requires_grad = True
 
         # First forward pass with normal routing
@@ -189,7 +191,7 @@ class TestGroupLimitedRouter:
         )
         self.moe_layer = MoELayer(
             self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
-        ).cuda()
+        ).to(device=get_current_device())
         self.router = self.moe_layer.router
 
     def teardown_method(self, method):
@@ -226,7 +228,7 @@ class TestGroupLimitedRouter:
             num_tokens = seq_len * batch_size
             # hidden_states shape: [seq_len, batch_size, hidden_size]
             hidden_states = (
-                torch.randn((seq_len, batch_size, self.router.config.hidden_size)).cuda().bfloat16()
+                torch.randn((seq_len, batch_size, self.router.config.hidden_size)).to(device=get_current_device()).bfloat16()
             )
             scores, routing_map = self.router(hidden_states)
             assert scores.shape == (num_tokens, self.router.config.num_moe_experts), scores.shape
@@ -277,8 +279,8 @@ class TestAuxLossFreeTop2Router:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_router_forward_aux_free(self):
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-        hidden_states = hidden_states.cuda().bfloat16()
-        self.router = self.router.cuda()
+        hidden_states = hidden_states.to(device=get_current_device()).bfloat16()
+        self.router = self.router.to(device=get_current_device())
 
         # First forward pass
         initial_bias = self.router.expert_bias.clone()

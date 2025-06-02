@@ -4,6 +4,9 @@
 import os
 import sys
 
+from megatron.core.device_utils import get_current_device_type
+from megatron.core.tensor_parallel.mappings import all_reduce
+
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
@@ -125,13 +128,13 @@ def calibrate(data_loader, model):
             if iteration % args.log_interval == 0:
                 print_rank_0('> working on iteration: {}'.format(iteration))
             with te.fp8_autocast(enabled=False, calibrating=True), torch.autocast(
-                device_type='cuda', dtype=torch.bfloat16
+                device_type=get_current_device_type(), dtype=torch.bfloat16
             ):
                 output = forward_step(batch, model, config)
 
                 # Reduce across processes.
                 if parallel_state.is_pipeline_last_stage():
-                    torch.distributed.all_reduce(
+                    all_reduce(
                         output, group=parallel_state.get_data_parallel_group()
                     )
 
@@ -140,12 +143,12 @@ def calibrate(data_loader, model):
 
         print_rank_0(f"Compute scaling factors with FP8 autocast ...")
         with te.fp8_autocast(enabled=True), torch.autocast(
-            device_type='cuda', dtype=torch.bfloat16
+            device_type=get_current_device_type(), dtype=torch.bfloat16
         ):
             forward_step(batch, model, config)
 
             if parallel_state.is_pipeline_last_stage():
-                torch.distributed.all_reduce(output, group=parallel_state.get_data_parallel_group())
+                all_reduce(output, group=parallel_state.get_data_parallel_group())
 
                 total_output += output
 

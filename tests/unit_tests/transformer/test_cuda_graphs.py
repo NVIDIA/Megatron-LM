@@ -3,11 +3,12 @@
 import pytest
 import torch
 
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
-    model_parallel_cuda_manual_seed,
+    model_parallel_device_manual_seed,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -22,7 +23,7 @@ class TestParallelTransformerBlockCudagraphs:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=2, pipeline_model_parallel_size=2
         )
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # initialize transformer model
         num_layers = 8
@@ -47,7 +48,7 @@ class TestParallelTransformerBlockCudagraphs:
     )
     def test_gpu_cudagraph(self):
         parallel_transformer_block = self.parallel_transformer_block
-        parallel_transformer_block.cuda()
+        parallel_transformer_block.to(get_current_device())
 
         # [sequence length, batch size, hidden size]
         sequence_length = 32
@@ -56,8 +57,8 @@ class TestParallelTransformerBlockCudagraphs:
         num_layers = transformer_config.num_layers
         hidden_size = transformer_config.hidden_size
         hidden_states = torch.ones((sequence_length, micro_batch_size, hidden_size))
-        hidden_states = hidden_states.cuda()
-        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+        hidden_states = hidden_states.to(get_current_device())
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).to(get_current_device())
 
         hidden_states = parallel_transformer_block(
             hidden_states=hidden_states, attention_mask=attention_mask

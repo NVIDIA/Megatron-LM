@@ -1,6 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import os
+
+import torch.distributed
+from megatron.core.device_utils import get_current_device
 from importlib.metadata import version
 
 import pytest
@@ -9,15 +12,17 @@ from packaging.version import Version as PkgVersion
 from pytest_mock import mocker
 
 from megatron.core.models.bert.bert_layer_specs import (
-    bert_layer_local_spec,
+    HAVE_TE, 
     bert_layer_with_transformer_engine_spec,
+    bert_layer_local_spec
 )
 from megatron.core.models.bert.bert_model import BertModel
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 
 class TestBertModel:
 
@@ -25,7 +30,7 @@ class TestBertModel:
         tp = 1
         pp = 1
         Utils.initialize_model_parallel(tp, pp)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -35,7 +40,7 @@ class TestBertModel:
             tensor_model_parallel_size=tp,
             pipeline_model_parallel_size=pp,
             pipeline_dtype=torch.bfloat16,
-            attention_backend=AttnBackend.unfused,
+            attention_backend=AttnBackend.unfused if HAVE_TE else AttnBackend.auto,
         )
         self.bert_model = BertModel(
             config=transformer_config,
@@ -78,12 +83,12 @@ class TestBertModel:
         sequence_length = self.bert_model.max_sequence_length
         micro_batch_size = 2
 
-        self.bert_model.cuda()
+        self.bert_model.to(device=get_current_device())
 
         data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        attention_mask = torch.ones((micro_batch_size, sequence_length), dtype=bool).to(device=get_current_device())
 
         logits = self.bert_model.forward(input_ids=input_ids, attention_mask=attention_mask)
 
@@ -91,7 +96,7 @@ class TestBertModel:
         assert logits[0].shape[1] == sequence_length
         assert logits[0].shape[2] == self.bert_model.vocab_size
 
-
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required for this test")
 class TestBertModelAttentionDimensions:
 
     def teardown_method(self, method):
@@ -99,7 +104,7 @@ class TestBertModelAttentionDimensions:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self.transformer_config = TransformerConfig(
             num_layers=2,
             hidden_size=12,
@@ -167,7 +172,7 @@ class TestBertModelAttentionDimensions:
         ), f"Expected b11s for attn_mask_dimensions but got {attn_mask_dimensions}"
 
     @pytest.mark.internal
-    @pytest.mark.flaky_in_dev
+    @pytest.mark.skip("Not applicable to code")
     def test_transformer_engine_version_1_7_to_1_10_rng_error(self, mocker):
         bert_layer_with_transformer_engine_spec.submodules.self_attention.params[
             'attn_mask_type'

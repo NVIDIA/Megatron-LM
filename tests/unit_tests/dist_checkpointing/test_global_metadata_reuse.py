@@ -4,6 +4,7 @@
 from unittest import mock
 
 import pytest
+import torch
 
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -14,7 +15,6 @@ from tests.unit_tests.dist_checkpointing import (
     setup_model_and_optimizer,
 )
 from tests.unit_tests.test_utilities import Utils
-
 
 class TestGlobalMetadataReuse:
     def setup_method(self, method):
@@ -93,6 +93,7 @@ class TestGlobalMetadataReuse:
 
             assert resume_ckpt_context['save_strategy'].validated_loaded_metadata_reuse
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for this test")
     @pytest.mark.parametrize(('tp,pp'), [(2, 4)])
     def test_no_global_metadata_reuse_on_different_parallelism(self, tmp_path_dist_ckpt, tp, pp):
         Utils.initialize_model_parallel(tp, pp)

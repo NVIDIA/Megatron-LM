@@ -29,8 +29,6 @@ class WrappedTorchNorm:
 
         assert not config.persist_layer_norm, f"persist_layer_norm not supported by torch LayerNorm"
 
-        assert not config.sequence_parallel, f"sequence parallel not supported by torch LayerNorm"
-
         assert (
             not config.memory_efficient_layer_norm
         ), f"memory_efficient_layer_norm not supported by torch LayerNorm"

@@ -8,6 +8,13 @@ import time
 import warnings
 from datetime import timedelta
 
+from megatron.core.device_utils import (
+    get_current_device, get_distributed_backend, 
+    get_local_device_count, 
+    get_xla_model, 
+    set_manual_seed,
+    get_distributed_init_method
+)
 import numpy as np
 import torch
 
@@ -32,14 +39,15 @@ from megatron.training.checkpointing import load_args_from_checkpoint
 from megatron.training.global_vars import set_global_variables
 from megatron.training.yaml_arguments import validate_yaml
 
-logger = logging.getLogger(__name__)
+xm = get_xla_model()
 
+logger = logging.getLogger(__name__)
 
 def initialize_megatron(
     extra_args_provider=None,
     args_defaults={},
     ignore_unknown_args=False,
-    allow_no_cuda=False,
+    allow_no_cuda=not torch.cuda.is_available(),
     skip_mpu_initialization=False,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
@@ -96,11 +104,13 @@ def initialize_megatron(
 
     # init rerun state
     def state_save_func():
-        return {'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states()}
+        return {
+            'rng_tracker_states': tensor_parallel.get_device_rng_tracker().get_states()
+        }
 
     def state_restore_func(state_dict):
         if state_dict['rng_tracker_states']:
-            tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
+            tensor_parallel.get_device_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
     args = get_args()
     initialize_rerun_state_machine(
@@ -135,7 +145,7 @@ def initialize_megatron(
         if args.num_experts is not None:
             from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 
-            MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=torch.cuda.current_device()))
+            MoEAuxLossAutoScaler.set_loss_scale(torch.ones(1, device=get_current_device()))
 
     if skip_mpu_initialization:
         return None
@@ -159,11 +169,12 @@ def initialize_megatron(
         _init_autoresume()
 
         # Compile dependencies.
-        _compile_dependencies()
+        if torch.cuda.is_available():
+            _compile_dependencies()
 
-        if args.tp_comm_overlap:
-            # TODO: Should this be activated with just decoder-tp-comm-overlap too?
-            _initialize_tp_communicators()
+            if args.tp_comm_overlap:
+                #TODO: Should this be activated with just decoder-tp-comm-overlap too?
+                _initialize_tp_communicators()
 
         # No continuation function
         return None
@@ -298,7 +309,6 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
 
-    device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():
 
         if args.rank == 0:
@@ -310,15 +320,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         args.world_size = torch.distributed.get_world_size()
 
     else:
-
         if args.rank == 0:
             print("> initializing torch distributed ...", flush=True)
-        # Manually set the device ids.
-        if device_count > 0:
-            torch.cuda.set_device(args.local_rank)
-            device_id = torch.device(f'cuda:{args.local_rank}')
-        else:
-            device_id = None
 
         # Set to non-default stream for cudagraph capturing.
         if args.external_cuda_graph:
@@ -326,18 +329,20 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
         # Call the init process
         init_process_group_kwargs = {
-            'backend': args.distributed_backend,
-            'store': store,
+            'backend' : get_distributed_backend(backend=args.distributed_backend),
+            'init_method': get_distributed_init_method(),
             'world_size': args.world_size,
             'rank': args.rank,
             'timeout': timedelta(minutes=args.distributed_timeout_minutes),
         }
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
-        inprocess_restart.maybe_force_nccl_backend_init(device_id)
+        if torch.distributed.get_backend() == torch.distributed.Backend.NCCL:
+            inprocess_restart.maybe_force_nccl_backend_init(get_current_device())
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
+    device_count = get_local_device_count()
     if device_count > 0:
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
@@ -399,9 +404,9 @@ def _set_random_seed(
             seed = seed + (10 * mpu.get_data_parallel_rank())
         random.seed(seed)
         np.random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.device_count() > 0:
-            tensor_parallel.model_parallel_cuda_manual_seed(
+        set_manual_seed(seed)
+        if get_local_device_count() > 0:
+            tensor_parallel.model_parallel_device_manual_seed(
                 seed, te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng
             )
     else:
@@ -419,6 +424,11 @@ def write_args_to_tensorboard():
 
 def set_jit_fusion_options():
     """Set PyTorch JIT layer fusion options."""
+
+    if xm:
+        logger.warning(f"Torch JIT comile not supported for XLA")
+        return
+    
     # flags required to enable jit fusion kernels
     if is_torch_min_version("2.2.0a0"):
         pass  # we're using torch.compile for jit fusion
@@ -453,7 +463,9 @@ def _warmup_jit_function():
 
     # Warmup fused bias+gelu
     bias = torch.rand(
-        args.ffn_hidden_size // args.tensor_model_parallel_size, dtype=dtype, device="cuda"
+        args.ffn_hidden_size // args.tensor_model_parallel_size,
+        dtype=dtype,
+        device=get_current_device(),
     )
     input = torch.rand(
         (
@@ -462,7 +474,7 @@ def _warmup_jit_function():
             args.ffn_hidden_size // args.tensor_model_parallel_size,
         ),
         dtype=dtype,
-        device="cuda",
+        device=get_current_device(),
     )
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
@@ -483,14 +495,16 @@ def _warmup_jit_function():
     input = torch.rand(
         (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
         dtype=dtype,
-        device="cuda",
+        device=get_current_device(),
     )
     residual = torch.rand(
         (seq_length // args.context_parallel_size, args.micro_batch_size, args.hidden_size),
         dtype=dtype,
-        device="cuda",
+        device=get_current_device(),
     )
-    bias = torch.rand((args.hidden_size), dtype=dtype, device="cuda").expand_as(residual)
+    bias = torch.rand((args.hidden_size), dtype=dtype, device=get_current_device()).expand_as(
+        residual
+    )
     dropout_rate = 0.1
     # Warmup JIT fusions with the input grad_enable state of both forward
     # prop and recomputation
@@ -501,7 +515,8 @@ def _warmup_jit_function():
         for _ in range(5):
             output = bias_dropout_add_fused_train([input, bias], residual, dropout_rate)
     del bias, input, residual, output
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def setup_logging() -> None:

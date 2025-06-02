@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union, cast
 import torch
 from packaging.version import Version as PkgVersion
 from torch.distributed import checkpoint
+import torch.distributed
 from torch.distributed._shard.metadata import ShardMetadata
 from torch.distributed._shard.sharded_tensor import Shard
 from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchShardedTensor
@@ -83,6 +84,7 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from megatron.core.device_utils import get_current_device_type
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 MSC_PREFIX = "msc://"
@@ -90,18 +92,17 @@ MSC_PREFIX = "msc://"
 _metadata_fn: str = ".metadata"
 
 
-def register_default_torch_strategies():
+def register_default_torch_strategies(process_group: torch.distributed.ProcessGroup=None):
     """Register default strategies related to PyT Distributed backend."""
     register_default_strategy(
-        StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy()
+        StrategyAction.LOAD_SHARDED, 'torch_dist', 1, TorchDistLoadShardedStrategy(process_group=process_group)
     )
     register_default_strategy(
-        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1)
+        StrategyAction.SAVE_SHARDED, 'torch_dist', 1, TorchDistSaveShardedStrategy('torch_dist', 1, process_group=process_group)
     )
 
 
 logger = getLogger(__name__)
-
 
 def flatten_state_dict(
     state_dict: ShardedStateDict,
@@ -237,7 +238,7 @@ def sharded_tensor_to_torch_sharded_tensor(
         offset = tuple(map(lambda x: x[0] * x[1], zip(fragment_offsets, offsets_shape)))
         if offset in local_global_offsets:
             # local shard
-            placement = f"rank:{rank}/cuda"
+            placement = f"rank:{rank}/{get_current_device_type()}"
             for sh_ten in local_global_offsets[offset]:
                 if has_flattened_range:
                     assert offset == sh_ten.local_chunk_offset_in_global()
@@ -255,13 +256,13 @@ def sharded_tensor_to_torch_sharded_tensor(
             # during TorchShardedTensor._init_from_local_shards_and_global_metadata call.
             # Due to a bug in PyT 24.05 container we must specify some concrete rank within a world size.
             # The exact rank doesn't matter as long as it's different than my rank - hence (rank + 1) % WS.
-            placement = f"rank:{(rank + 1) % world_size}/cuda"
+            placement = f"rank:{(rank + 1) % world_size}/{get_current_device_type()}"
             if has_flattened_range:
                 offset = offset + (0,)
                 size = (1,) * len(offsets_shape) + global_shape[-1:]
             else:
                 size = offsets_shape
-            shard_metadata.append(ShardMetadata(offset, size, placement))
+            shard_metadata.append(ShardMetadata(offset, size, get_current_device_type()))
 
     tensor = some_sh_ten.data
     sharded_tensor_metadata = ShardedTensorMetadata(
@@ -659,6 +660,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         keep_only_main_replica: bool = True,
         thread_count: int = 2,
         cached_metadata: bool = False,
+        process_group:  torch.distributed.ProcessGroup=None,
         separation_hint: Optional[str] = None,
     ):
         """Adds parameters specific to PyT Distributed format
@@ -694,6 +696,8 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         # The knob to enable cached metadata communication in saving
         self.use_cached_ckpt_structure: bool = cached_metadata
 
+        self.process_group = process_group
+        
         self.separation_hint = separation_hint
 
         self.validated_loaded_metadata_reuse = False
@@ -753,7 +757,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         ) = save_state_dict_async_plan(
             pyt_state_dict,
             writer,
-            None,
+            self.process_group,
             coordinator,
             planner=MCoreSavePlanner(
                 dedup_replicated_tensors=not self.keep_only_main_replica, flatten_state_dict=False
@@ -798,9 +802,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
 
         def finalize_fn():
             save_state_dict_async_finalize(*save_state_dict_ret)
-            torch.distributed.barrier()
+            torch.distributed.barrier(group=self.process_group)
 
-        return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn)
+        return AsyncRequest(save_fn, save_args, [finalize_fn], preload_fn=preload_fn, 
+                            group=self.process_group)
 
     def can_handle_sharded_objects(self):
         return True
@@ -864,9 +869,13 @@ def get_reformulation_metadata(
 class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     """Basic load strategy for the PyT Distributed format."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        process_group:  torch.distributed.ProcessGroup=None
+    ):
         self.cached_global_metadata: Optional[Metadata] = None
         super().__init__()
+        self.process_group = process_group
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
@@ -919,6 +928,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
             ),
+            process_group=self.process_group
         )
 
         self.cached_global_metadata = (
@@ -1018,6 +1028,10 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
         fs_reader = FileSystemReader(checkpoint_dir)
         original_metadata = fs_reader.read_metadata()
+
+        original_metadata.state_dict_metadata = original_metadata.state_dict_metadata or {}
+        original_metadata.planner_data = original_metadata.planner_data or {}
+        original_metadata.storage_data = original_metadata.storage_data or {}
 
         new_state_dict_metadata = {}
         new_planner_data = {}

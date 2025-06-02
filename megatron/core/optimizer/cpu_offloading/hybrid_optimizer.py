@@ -4,6 +4,9 @@ from typing import Dict
 
 import torch
 
+from megatron.core.device_utils import get_current_device, get_xla_model
+
+xm = get_xla_model()
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -54,6 +57,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         overlap_cpu_optimizer_d2h_h2d: bool = True,
         **kwargs
     ):
+        assert xm is None, "HybridDeviceOptimizer is not supported with XLA"
+        
         super(HybridDeviceOptimizer, self).__init__(
             params,
             defaults={
@@ -364,8 +369,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
                         self.state[orig_param][k] = state[k] = v.to("cpu")
                     else:
-                        self.state[orig_param][k] = state[k] = v.to("cuda")
-
+                        self.state[orig_param][k] = state[k] = v.to(device=get_current_device())
     def _update_fp32_params_by_new_state(self):
         if not self.param_update_in_fp32:
             return

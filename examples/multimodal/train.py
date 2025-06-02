@@ -5,8 +5,11 @@ import os
 import sys
 from functools import partial
 
+from megatron.core.device_utils import get_xla_model
 import torch
 import yaml
+
+from megatron.core.tensor_parallel.mappings import all_reduce
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))

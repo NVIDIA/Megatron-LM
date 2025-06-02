@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+from megatron.core.device_utils import get_current_device
+
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.core.transformer.transformer_block import TransformerBlock
@@ -75,9 +77,13 @@ class RotaryEmbedding(nn.Module):
         self.rotary_interleaved = rotary_interleaved
 
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
-        device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()
+        device = 'cpu' if use_cpu_initialization else get_current_device()
         self.inv_freq = 1.0 / (
-            rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+            rotary_base
+            ** (
+                torch.arange(0, dim, 2, dtype=torch.float32, device=device)
+                / dim
+            )
         )
 
         if rope_scaling:
@@ -161,7 +167,7 @@ class RotaryEmbedding(nn.Module):
         """
         if self.inv_freq.device.type == 'cpu':
             # move `inv_freq` to GPU once at the first micro-batch forward pass
-            self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
+            self.inv_freq = self.inv_freq.to(device=get_current_device())
 
         freqs = self.get_freqs_non_repeated(max_seq_len, offset)
         # first part even vector components, second part odd vector components,
@@ -268,7 +274,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         self.inv_freq = 1.0 / (
             rotary_base
             ** (
-                torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device())
+                torch.arange(0, dim, 2, dtype=torch.float32, device=get_current_device())
                 / dim
             )
         )

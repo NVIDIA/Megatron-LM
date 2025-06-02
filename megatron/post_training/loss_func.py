@@ -7,7 +7,9 @@ import os
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.device_utils import get_current_device
 from megatron.core.models.gpt import GPTModel
+from megatron.core.tensor_parallel.mappings import all_reduce
 from megatron.training import get_args
 from megatron.training.utils import average_losses_across_data_parallel_group, unwrap_model
 
@@ -33,12 +35,12 @@ def _mask_loss(output_tensor, loss_mask):
 
     loss = torch.cat([torch.sum(losses * loss_mask).view(1), num_tokens.view(1)])
     if args.context_parallel_size > 1:
-        torch.distributed.all_reduce(loss, group=parallel_state.get_context_parallel_group())
+        all_reduce(loss, group=parallel_state.get_context_parallel_group())
     loss = loss[0] / loss[1]
 
     if tp_reduce or is_sequence_parallel:
         # Losses on parallel tensors require extra all-reduce to sync across MP ranks.
-        torch.distributed.all_reduce(loss, group=parallel_state.get_tensor_model_parallel_group())
+        all_reduce(loss, group=parallel_state.get_tensor_model_parallel_group())
 
     return loss
 
@@ -53,7 +55,7 @@ def _allreduce_losses(losses):
         for loss in losses:
             assert not loss.isnan(), (
                 f'Rank {global_rank}: found NaN in local forward loss calculation. '
-                f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
+                f'Device: {get_current_device()}, node: {os.uname()[1]}'
             )
 
     # Reduce loss for logging.

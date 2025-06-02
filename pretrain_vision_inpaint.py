@@ -2,6 +2,7 @@
 
 """Pretrain VIT"""
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn.functional as F
 from functools import partial
@@ -38,8 +39,8 @@ def get_batch(data_iterator):
     data = next(data_iterator)
 
     # only data parallelism; no need for broadcast
-    images = data[0][0].cuda()
-    masks = data[0][1].cuda()
+    images = data[0][0].to(device=get_current_device())
+    masks = data[0][1].to(device=get_current_device())
     return images, masks
 
 

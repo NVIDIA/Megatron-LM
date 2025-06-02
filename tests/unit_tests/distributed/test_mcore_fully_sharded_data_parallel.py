@@ -4,6 +4,8 @@ import torch
 from packaging import version
 from torch import testing
 
+
+from megatron.core.device_utils import get_current_device, get_current_device_type
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.custom_fsdp.fully_sharded_data_parallel import (
     FullyShardedDataParallel,
@@ -65,6 +67,7 @@ class TestFullyShardedDataParallel:
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
     def test_fsdp_with_process_groups(self, dp_size):
         """Test that FSDP works correctly with different process group configurations."""
         from torch.distributed.device_mesh import init_device_mesh
@@ -88,8 +91,8 @@ class TestFullyShardedDataParallel:
         )
 
         # Create two identical models
-        model1 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
-        model2 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        model1 = TestModel(input_dim=input_dim, output_dim=output_dim).to(get_current_device())
+        model2 = TestModel(input_dim=input_dim, output_dim=output_dim).to(get_current_device())
 
         # Ensure identical weights
         for p1, p2 in zip(model1.parameters(), model2.parameters()):
@@ -106,7 +109,7 @@ class TestFullyShardedDataParallel:
         )
 
         # Create a 1D mesh with dimension [dp_size]
-        device_mesh = init_device_mesh("cuda", (dp_size,), mesh_dim_names=("dp",))
+        device_mesh = init_device_mesh(get_current_device_type(), (dp_size,), mesh_dim_names=("dp",))
         grad_comm_pgs = GradCommProcessGroups()
 
         # Get dp process group from device mesh
@@ -155,7 +158,7 @@ class TestFullyShardedDataParallel:
 
         # Create identical inputs
         batch_size = 2
-        input_data = torch.randint(0, 10, (batch_size, input_dim), device='cuda', dtype=torch.long)
+        input_data = torch.randint(0, 10, (batch_size, input_dim), device=get_current_device(), dtype=torch.long)
         input_data = input_data.float()
         input_data.requires_grad = True
 
@@ -199,6 +202,7 @@ class TestFullyShardedDataParallel:
             # test branch.
             delattr(torch.nn.parameter.Parameter, "main_grad")
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="nccl_ub requires a recent version of APEX",
@@ -245,8 +249,8 @@ class TestFullyShardedDataParallel:
         )
 
         # Create two identical models
-        model1 = TestModelUniform(hidden_dim=hidden_dim).cuda()
-        model2 = TestModelUniform(hidden_dim=hidden_dim).cuda()
+        model1 = TestModelUniform(hidden_dim=hidden_dim).to(get_current_device())
+        model2 = TestModelUniform(hidden_dim=hidden_dim).to(get_current_device())
 
         # Ensure identical weights
         for p1, p2 in zip(model1.parameters(), model2.parameters()):
@@ -302,7 +306,7 @@ class TestFullyShardedDataParallel:
 
         # Create identical inputs
         batch_size = 2
-        input_data = torch.randint(0, 10, (batch_size, hidden_dim), device='cuda', dtype=torch.long)
+        input_data = torch.randint(0, 10, (batch_size, hidden_dim), device=get_current_device(), dtype=torch.long)
         input_data = input_data.float()
         input_data.requires_grad = True
 

@@ -10,6 +10,7 @@ import warnings
 from dataclasses import dataclass, replace
 from typing import List, Optional, Union
 
+from megatron.core.device_utils import get_current_device
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +18,7 @@ import torch.nn.functional as F
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel import get_device_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -34,7 +35,7 @@ except ImportError:
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
+except (ModuleNotFoundError, ImportError):
     causal_conv1d_fn = None
     causal_conv1d_update = None
 
@@ -44,12 +45,14 @@ try:
         mamba_chunk_scan_combined,
         mamba_split_conv1d_scan_combined,
     )
-except ImportError:
-    raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
+except (ModuleNotFoundError, ImportError):
+    from megatron.core.ssm.ops import RMSNormGated
+    from megatron.core.ssm.ops import  mamba_chunk_scan_combined
+    mamba_split_conv1d_scan_combined = None
 
 try:
     from einops import rearrange, repeat
-except ImportError:
+except (ModuleNotFoundError, ImportError):
     raise ImportError("einops is required by the Mamba model but cannot be imported")
 
 
@@ -226,9 +229,8 @@ class MambaMixer(MegatronModule):
             tp_group=self.tp_group,
         )
 
-        conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state  # A CD
-        with get_cuda_rng_tracker().fork():
-            # weight dim: [conv_dim, conv_dim, d_conv]
+        conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state
+        with get_device_rng_tracker().fork():
             self.conv1d = nn.Conv1d(
                 in_channels=conv_dim,
                 out_channels=conv_dim,
@@ -236,7 +238,7 @@ class MambaMixer(MegatronModule):
                 kernel_size=d_conv,
                 groups=conv_dim,
                 padding=d_conv - 1,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
                 dtype=config.params_dtype,
             )
             setattr(self.conv1d.weight, 'tensor_model_parallel', True)
@@ -248,11 +250,11 @@ class MambaMixer(MegatronModule):
         self.activation = "silu"
         self.act = nn.SiLU()
 
-        with get_cuda_rng_tracker().fork():
+        with get_device_rng_tracker().fork():
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
             dt = torch.exp(
                 torch.rand(
-                    self.nheads_local, device=torch.cuda.current_device(), dtype=config.params_dtype
+                    self.nheads_local, device=get_current_device(), dtype=config.params_dtype
                 )
                 * (math.log(dt_max) - math.log(dt_min))
                 + math.log(dt_min)
@@ -272,7 +274,7 @@ class MambaMixer(MegatronModule):
 
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
             A = torch.empty(
-                self.nheads_local, dtype=torch.float32, device=torch.cuda.current_device()
+                self.nheads_local, dtype=torch.float32, device=get_current_device()
             ).uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
@@ -283,7 +285,7 @@ class MambaMixer(MegatronModule):
         self.D = nn.Parameter(
             torch.ones(
                 self.d_inner_local if self.D_has_hdim else self.nheads_local,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
             )
         )  # Keep in fp32
         self.D._no_weight_decay = True
@@ -296,7 +298,7 @@ class MambaMixer(MegatronModule):
                 eps=1e-5,
                 group_size=self.d_inner_local // self.ngroups_local,
                 norm_before_gate=self.norm_before_gate,
-                device=torch.cuda.current_device(),
+                device=get_current_device(),
                 dtype=config.params_dtype,
             )
 
@@ -352,7 +354,7 @@ class MambaMixer(MegatronModule):
         # transpose: l b pd --> b l pd
         xz = rearrange(xz, "l b d -> b l d").contiguous()
 
-        if self.use_mem_eff_path and inference_context is None:
+        if self.use_mem_eff_path and inference_context is None and mamba_split_conv1d_scan_combined:
             assert ssm_state is None
 
             if self.conv1d.bias is not None:

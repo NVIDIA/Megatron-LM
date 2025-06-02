@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import copy
+from megatron.core.device_utils import get_current_device, get_xla_model
 import dataclasses
 
 import pytest
@@ -15,6 +16,7 @@ from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+xm = get_xla_model()
 
 class MoEModelTestContainer:
     def __init__(
@@ -82,14 +84,19 @@ class MoEModelTestContainer:
         transformer_layer_spec = get_gpt_layer_local_spec(
             num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
         )
-        new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = MoELayer(new_config, transformer_layer_spec.submodules.mlp.submodules).cuda()
-        moe_layer.set_layer_number(0)
-        return moe_layer
+        self.moe_layer = MoELayer(
+            self.config, transformer_layer_spec.submodules.mlp.submodules
+        ).to(device=get_current_device())
+        self.moe_layer.set_layer_number(0)
+        return self.moe_layer
 
     def __del__(self):
         torch.distributed.barrier()
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
+
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
@@ -102,7 +109,7 @@ class MoEModelTestContainer:
         # rank = torch.distributed.get_rank()
         # torch.manual_seed(1000 + rank)
         hidden_states = torch.randn((bs, seql, moe_layer.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         # Permute and then unpermute data are supposed to restore original data
         ans = hidden_states
         hidden_states.requires_grad = True
@@ -138,7 +145,7 @@ class MoEModelTestContainer:
         moe_layer = self.moe_layer
         num_tokens = 16
         hidden_states = torch.randn((num_tokens, moe_layer.config.hidden_size))
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         hidden_states.requires_grad = True
         probs, indices = moe_layer.router(hidden_states)
 
@@ -192,7 +199,7 @@ class MoEModelTestContainer:
         moe_layer = self.new_moe_layer(moe_pad_expert_input_to_capacity=False)
 
         num_tokens = 16
-        hidden_states = torch.randn((num_tokens, moe_layer.config.hidden_size)).cuda()
+        hidden_states = torch.randn((num_tokens, moe_layer.config.hidden_size)).to(device=get_current_device())
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
@@ -206,7 +213,13 @@ class MoEModelTestContainer:
         torch.autograd.backward(forward_answer, forward_answer)
         backward_answer = hidden_states.grad.clone()
         hidden_states.grad = None
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elif xm:
+            xm.mark_step()
+
+        moe_layer.token_dispatcher.drop_and_pad = True
+        moe_layer.config.moe_pad_expert_input_to_capacity = True
         # End
 
         moe_layer_2 = self.new_moe_layer(moe_pad_expert_input_to_capacity=True)
@@ -264,7 +277,7 @@ class TestAllgatherDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4), (1, 1)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
@@ -282,7 +295,7 @@ class TestAllgatherDispatcher:
 
         container.dispatcher_dropless_test()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
     @pytest.mark.parametrize(

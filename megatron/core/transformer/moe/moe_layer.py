@@ -197,7 +197,7 @@ class MoELayer(BaseMoELayer):
                 output, mlp_bias = te_checkpoint(
                     custom_forward,
                     False,
-                    tensor_parallel.random.get_cuda_rng_tracker,
+                    tensor_parallel.random.get_device_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
                 )

@@ -6,10 +6,12 @@ import pytest
 import torch
 from packaging.version import Version
 
+from megatron.core.device_utils import get_current_device
 from megatron.core import dist_checkpointing
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
+    get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -20,13 +22,18 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
 from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_te_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch_size: int = 2):
     inference_context: StaticInferenceContext = StaticInferenceContext(
@@ -43,11 +50,11 @@ def model_forward(model: torch.nn.Module, config: TransformerConfig, micro_batch
         inference_context.sequence_len_offset = offset
 
         data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(device=get_current_device())
         attention_mask = torch.ones(
             (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
+        ).to(device=get_current_device())
 
         logits = model.forward(
             input_ids=input_ids,
@@ -67,15 +74,16 @@ class TestModelOptGPTModel:
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         self._dist_checkpoint_name = "standard_gpt_model"
 
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
         )
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         self.default_model = GPTModel(
             config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=100,
             max_sequence_length=4,
         )
@@ -104,7 +112,7 @@ class TestModelOptGPTModel:
         if not self._test_inference:
             return
         config: TransformerConfig = self.modelopt_model.config
-        model = self.modelopt_model.cuda()
+        model = self.modelopt_model.to(device=get_current_device())
         model_forward(model, config)
 
     def teardown_method(self, method):
@@ -115,7 +123,7 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # Early version of TE DotProductAttention does not support
         # q, k, v to have different shapes.
@@ -154,7 +162,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         # Early version of TE DotProductAttention does not support
         # q, k, v to have different shapes.
@@ -197,7 +205,7 @@ class TestModelOptMambaModel(TestModelOptGPTModel):
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
         transformer_config = TransformerConfig(
             num_layers=3, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
         )

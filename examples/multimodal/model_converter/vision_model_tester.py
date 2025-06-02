@@ -3,6 +3,8 @@ import argparse
 import os
 import sys
 
+from megatron.core.device_utils import get_current_device
+
 # Add megatron and the multimodal example to the path.
 sys.path.append(
     os.path.abspath(
@@ -64,7 +66,7 @@ def run_mcore_vision(model_path):
 
     vision_model.eval()
 
-    images = torch.ones((1, 3, 448, 448), dtype=torch.bfloat16, device="cuda")
+    images = torch.ones((1, 3, 448, 448), dtype=torch.bfloat16, device=get_current_device())
 
     output = vision_model(images)
 
@@ -75,11 +77,11 @@ def run_hf_vision(model_name):
     """Run HF vision model."""
     model = (
         AutoModel.from_pretrained(model_name, torch_dtype=torch.bfloat16, trust_remote_code=True)
-        .cuda()
+        .to(device=get_current_device())
         .eval()
     )
 
-    images = torch.ones((1, 3, 448, 448), dtype=torch.bfloat16, device="cuda")
+    images = torch.ones((1, 3, 448, 448), dtype=torch.bfloat16, device=get_current_device())
 
     outputs = model(images, return_dict=True)
 

@@ -5,6 +5,8 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from megatron.core.device_utils import get_current_device
+
 
 class ChunkAllocator:
     """Allocator that manages chunks of memory for the KV cache.
@@ -30,7 +32,7 @@ class ChunkAllocator:
 
         # Initialize chunk pool as a "stack" data structure
         self.chunk_bag = torch.arange(
-            self.chunk_count_total, dtype=torch.int32, device=torch.cuda.current_device()
+            self.chunk_count_total, dtype=torch.int32, device=get_current_device()
         )
 
     def is_memory_available(self, num_chunks: int, safe: bool = False) -> bool:

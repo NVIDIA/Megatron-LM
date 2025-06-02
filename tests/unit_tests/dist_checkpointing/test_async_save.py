@@ -4,6 +4,7 @@ from unittest import mock
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
@@ -48,25 +49,30 @@ class TestAsyncSave:
             ),
         }
 
+        process_group=parallel_state.get_default_process_group()
         with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_equivalence_async'
+            tmp_path_dist_ckpt / 'test_equivalence_async',
+            process_group=process_group
         ) as async_ckpt_dir, TempNamedDir(
-            tmp_path_dist_ckpt / 'test_equivalence_sync'
+            tmp_path_dist_ckpt / 'test_equivalence_sync',
+            process_group=process_group
         ) as sync_ckpt_dir:
             # async
-            async_calls = AsyncCallsQueue(persistent)
-            async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
+            async_calls = AsyncCallsQueue(process_group=process_group)
+            async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True,
+                                 process_group=process_group)
             async_calls.schedule_async_request(async_request)
 
             # sync
-            save(sharded_state_dict, sync_ckpt_dir, async_sharded_save=False)
+            save(sharded_state_dict, sync_ckpt_dir, async_sharded_save=False,
+                 process_group=process_group)
 
             # finalize async
             async_calls.maybe_finalize_async_calls(blocking=True)
 
             # load and compare
-            loaded_async_state_dict = load(sharded_state_dict, async_ckpt_dir)
-            loaded_sync_state_dict = load(sharded_state_dict, sync_ckpt_dir)
+            loaded_async_state_dict = load(sharded_state_dict, async_ckpt_dir,process_group=process_group)
+            loaded_sync_state_dict = load(sharded_state_dict, sync_ckpt_dir,process_group=process_group)
             diffs = diff(loaded_async_state_dict, loaded_sync_state_dict)
             assert not any(map(bool, diffs)), diffs
             async_calls.close()
@@ -82,25 +88,30 @@ class TestAsyncSave:
             for i in range(4)  # make sure there is enough non-empty saving workers
         }
 
-        with TempNamedDir(tmp_path_dist_ckpt / 'test_errors_are_reported') as ckpt_dir:
-            async_calls = AsyncCallsQueue()
-            save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=8)
-
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_errors_are_reported', 
+                          process_group=parallel_state.get_default_process_group()) as ckpt_dir:
+            async_calls = AsyncCallsQueue(process_group=parallel_state.get_default_process_group())
+            save_strategy = TorchDistSaveShardedStrategy('torch_dist', 1, thread_count=8, 
+                                                         process_group=parallel_state.get_default_process_group())
             try:
                 orig_fn = FileSystemWriterAsync.write_preloaded_data
                 FileSystemWriterAsync.write_preloaded_data = worker_fn
                 with pytest.raises(RuntimeError) as exc_info:
                     if async_save:
                         async_request = save(
-                            sharded_state_dict, ckpt_dir, save_strategy, async_sharded_save=True
+                            sharded_state_dict, ckpt_dir, save_strategy, 
+                            async_sharded_save=True,
+                            process_group=parallel_state.get_default_process_group()
                         )
                         async_calls.schedule_async_request(async_request)
                         async_calls.maybe_finalize_async_calls(blocking=True)
                     else:
-                        save(sharded_state_dict, ckpt_dir, save_strategy)
+                        save(sharded_state_dict, ckpt_dir, save_strategy, 
+                             process_group=parallel_state.get_default_process_group())
                 assert 'Worker failure' in str(exc_info.value)
 
             finally:
                 FileSystemWriterAsync.write_preloaded_data = orig_fn
-
+                torch.distributed.barrier(group=parallel_state.get_default_process_group())
+                
         Utils.destroy_model_parallel()

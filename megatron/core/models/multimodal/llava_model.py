@@ -27,6 +27,9 @@ try:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
     from megatron.core.utils import is_te_min_version
 
+    from megatron.core.extensions.transformer_engine import TENorm
+
+    NORM_IMPL = TENorm
     HAVE_TE = True
     try:
         import transformer_engine_torch as tex
@@ -35,6 +38,8 @@ try:
     except:
         HAVE_TEX = False
 except:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    NORM_IMPL = WrappedTorchNorm
     HAVE_TE = False
 
 
@@ -274,9 +279,8 @@ class LLaVAModel(MegatronModule):
                     max_img_h = 1792
                     max_img_w = 1792
                     embedder_bias = True
-                    from megatron.core.extensions.transformer_engine import TENorm
 
-                    ln_post_impl = TENorm
+                    ln_post_impl = NORM_IMPL
                     use_mask_token = True
                 self.vision_model = RADIOViTModel(
                     vision_transformer_config,
@@ -499,6 +503,8 @@ class LLaVAModel(MegatronModule):
                 max_seq_len = self._language_max_sequence_length
 
             batch_indices, non_image_indices = torch.where(image_token_mask != True)
+            batch_indices = batch_indices.to(torch.int32)
+            non_image_indices = non_image_indices.to(torch.int32)
 
             # New position ids for the text tokens, shifted by the image sequence length.
             # E.g. for input_ids = [-200, 1, 2, 3] and img_seq_len = 576, we get
@@ -567,7 +573,7 @@ class LLaVAModel(MegatronModule):
                 final_embedding[:1, :1, :1] += 0 * image_embeddings[:1, :1, :1]
             else:
                 final_embedding[images_mask] = (
-                    image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+                    image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous().to(dtype=final_embedding.dtype)
                 )
 
         # Create the final labels and loss mask (if this is the last language model stage).
@@ -600,6 +606,8 @@ class LLaVAModel(MegatronModule):
             # Loss mask last text position just before an image
             # so that text token does not need to predict the first image token.
             batch_image_indices, image_indices = torch.where(image_token_mask)
+            batch_image_indices = batch_image_indices.to(torch.int32)
+            image_indices = image_indices.to(torch.int32)
             # Indices just before image tokens. If it's -1, skip it.
             before_image_indices = image_indices - 1
             valid = before_image_indices >= 0

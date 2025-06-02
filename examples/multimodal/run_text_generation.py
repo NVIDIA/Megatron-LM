@@ -12,6 +12,7 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
+from megatron.core.device_utils import get_current_device
 import torch
 import yaml
 from config import EvaluationConfig
@@ -211,8 +212,8 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         )
 
     for idx, (imgs, num_tiles, sample_id, question, answers, metadata) in enumerate(dataloader):
-        imgs = imgs.to("cuda")
-        num_tiles = num_tiles.to("cuda")
+        imgs = imgs.to(device=get_current_device())
+        num_tiles = num_tiles.to(device=get_current_device())
 
         conv = get_conversation(config.task, question, metadata)
 

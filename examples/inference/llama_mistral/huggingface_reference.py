@@ -1,6 +1,8 @@
 import argparse
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from megatron.core.device_utils import get_current_device
+
 # Set up argument parsing
 parser = argparse.ArgumentParser(description="Script for text generation with a specific model and prompt.")
 parser.add_argument('--prompt', type=str, required=True, help="Prompt text to use for text generation")
@@ -14,11 +16,11 @@ prompt = args.prompt
 
 config = AutoConfig.from_pretrained(model_path)
 tokenizer = AutoTokenizer.from_pretrained(model_path, config=config)
-model = AutoModelForCausalLM.from_pretrained(model_path, config=config).cuda()
+model = AutoModelForCausalLM.from_pretrained(model_path, config=config).to(device=get_current_device())
 
 inputs = tokenizer(prompt, return_tensors="pt")
 for key in inputs:
-    inputs[key] = inputs[key].cuda()
+    inputs[key] = inputs[key].to(device=get_current_device())
 # top_k, top_p and do_sample are set for greedy argmax based sampling
 
 outputs = model.generate(**inputs, max_length=100, do_sample=False, top_p=0, top_k=0, temperature=1.0)

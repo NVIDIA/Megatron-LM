@@ -7,7 +7,9 @@ import pytest
 import torch
 
 from megatron.core import config
+from megatron.core.device_utils import get_current_device
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
+from tests.unit_tests.test_utilities import Utils
 
 
 class PytorchIndicesToMultihot:
@@ -44,14 +46,15 @@ class TestIndicesToMultihot:
         if config.ENABLE_EXPERIMENTAL is True:
             config.ENABLE_EXPERIMENTAL = False
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
     @pytest.mark.experimental
     @pytest.mark.parametrize("num_of_token", [3, 5, 8, 128, 512])
     @pytest.mark.parametrize("topk", [2, 4, 6, 7, 8])
     @pytest.mark.parametrize("num_of_local_experts", [4, 7, 8, 12, 20, 30, 31, 32])
     def test_indices_to_multihot(self, num_of_token, topk, num_of_local_experts):
         # construct the indices and probs_indices
-        indices = torch.full((num_of_token, topk), -1, dtype=torch.int32, device='cuda')
-        probs_indices = torch.full((num_of_token, topk), 0, dtype=torch.float32, device='cuda')
+        indices = torch.full((num_of_token, topk), -1, dtype=torch.int32, device=get_current_device())
+        probs_indices = torch.full((num_of_token, topk), 0, dtype=torch.float32, device=get_current_device())
         # Fill the indices with random values
         # There are 2 non-ordinary values in each row
         for i in range(num_of_token):

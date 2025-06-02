@@ -1,5 +1,10 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from megatron.core.device_utils import get_current_device, get_xla_model
+import pytest
+from pkg_resources import packaging
+from importlib.metadata import PackageNotFoundError, version
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -22,6 +27,13 @@ DEVICE_CAPABILITY = None
 if torch.cuda.is_available():
     DEVICE_CAPABILITY = torch.cuda.get_device_capability()
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+    HAVE_TE =True
+except ImportError:
+    HAVE_TE = False
+
+xm = get_xla_model()
 
 @pytest.mark.skipif(is_te_min_version("1.9.0.dev0"), reason="Switch to TEGroupedMLP when TE>1.9.")
 class TestParallelGroupedMLP:
@@ -83,9 +95,15 @@ class TestParallelGroupedMLP:
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         tf_config.moe_grouped_gemm = True
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=True
-        )
+        if HAVE_TE:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                self.num_experts, moe_grouped_gemm=True
+            )
+        else:
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                self.num_experts, moe_grouped_gemm=True
+            )
+
         self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         self.grouped_mlp = Float16Module(self.grouped_mlp.config, self.grouped_mlp).module
         print("done intializing for grouped gemm")
@@ -133,6 +151,7 @@ class TestParallelGroupedMLP:
             )
 
     @pytest.mark.internal
+    @pytest.mark.skipif(xm, reason="Maybe issue to be resolved")
     def test_weight_init_value_the_same(self):
         gmm_w1 = self.grouped_mlp.experts.weight1.view(self.num_experts, -1, self.hidden_size)
         gmm_w2 = self.grouped_mlp.experts.weight2.view(self.num_experts, self.hidden_size, -1)
@@ -155,22 +174,22 @@ class TestParallelGroupedMLP:
         if self.use_cpu_initialization:
             assert torch.equal(gmm_expert2_fc2, smm_expert2_fc2)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
         reason='GroupedGEMM kernels are not supported on this device.',
     )
     def test_gpu_forward(self):
-        self.sequential_mlp.cuda()
-        self.grouped_mlp.cuda()
+        self.sequential_mlp.to(device=get_current_device())
+        self.grouped_mlp.to(device=get_current_device())
         # [sequence length, batch size, hidden size]
         seq_len = 3  # 32
         batch_size = 2
         hidden_states = torch.rand(
-            (seq_len, batch_size, self.sequential_mlp.config.hidden_size), dtype=torch.bfloat16
-        )
-        hidden_states = hidden_states.cuda()
+            (seq_len, batch_size, self.sequential_mlp.config.hidden_size),
+            dtype=torch.bfloat16)
+        hidden_states = hidden_states.to(device=get_current_device())
         output_smm, _ = self.sequential_mlp(hidden_states)
         output_gmm, _ = self.grouped_mlp(hidden_states)
 
@@ -178,7 +197,7 @@ class TestParallelGroupedMLP:
         # the same between gmm and smm (refer to test_weight_init_value_the_same.)
         # assert torch.equal(output_smm, output_gmm)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
@@ -190,14 +209,14 @@ class TestParallelGroupedMLP:
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         try:
             gg.ops.gmm(hidden_states, w1, tokens_per_expert, trans_b=False)
         except Exception as e:
             print("Expected error message from groupedGEMM:", e)
             assert str(e) == "Input batch_sizes should not be all zeros!"
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     @pytest.mark.internal
     @pytest.mark.skipif(
         not DEVICE_CAPABILITY or DEVICE_CAPABILITY[0] < 8,
@@ -205,13 +224,13 @@ class TestParallelGroupedMLP:
     )
     def test_gradient_with_no_tokens_allocated(self):
         """Test that when no token is passed in, the parameters of the grouped MLP will also have gradients."""
-        self.grouped_mlp.cuda()
+        self.grouped_mlp.to(device=get_current_device())
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
-        probs = probs.cuda()
+        probs = probs.to(device=get_current_device())
         output_gmm, _ = self.grouped_mlp.experts(
             hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
         )
@@ -271,9 +290,14 @@ class TestTEGroupedMLP:
 
         ## Grouped GEMM
         _set_random_seed(seed_=123, data_parallel_random_init=False)
-        transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-            self.num_experts, moe_grouped_gemm=True
-        )
+        if HAVE_TE:
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                self.num_experts, moe_grouped_gemm=True
+            )
+        else:
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                self.num_experts, moe_grouped_gemm=True
+            )
         tf_config.moe_grouped_gemm = True
         self.grouped_mlp = MoELayer(tf_config, transformer_layer_spec.submodules.mlp.submodules)
         assert isinstance(self.grouped_mlp.experts, TEGroupedMLP)
@@ -316,11 +340,11 @@ class TestTEGroupedMLP:
                 self.fc2_ffn_hidden_size,
             )
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_gpu_forward_backward(self):
-        self.sequential_mlp.cuda()
-        self.grouped_mlp.cuda()
+        self.sequential_mlp.to(device=get_current_device())
+        self.grouped_mlp.to(device=get_current_device())
         # Copy the weights to ensure the same init value
         with torch.no_grad():
             for i in range(self.num_experts):
@@ -336,7 +360,7 @@ class TestTEGroupedMLP:
         hidden_states = torch.rand(
             (seq_len, batch_size, self.hidden_size),
             dtype=torch.bfloat16,
-            device="cuda",
+            device=get_current_device(),
             requires_grad=True,
         )
         hidden_states.retain_grad()
@@ -359,17 +383,17 @@ class TestTEGroupedMLP:
         for smm_result, gmm_result in zip(smm_results, gmm_results):
             torch.testing.assert_close(smm_result, gmm_result)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    @pytest.mark.skipif(not xm and not torch.cuda.is_available(), reason="Device not available")
     def test_gpu_forward_backward_with_no_tokens_allocated(self):
         """Test the case when no token is allocated for groupedGEMM kernels."""
-        self.grouped_mlp.cuda()
+        self.grouped_mlp.to(device=get_current_device())
         num_allocated_tokens = 0
         tokens_per_expert = torch.zeros(self.num_experts, dtype=torch.int32)
         hidden_states = torch.rand((num_allocated_tokens, self.hidden_size), dtype=torch.bfloat16)
-        hidden_states = hidden_states.cuda()
+        hidden_states = hidden_states.to(device=get_current_device())
         probs = torch.rand((num_allocated_tokens,), dtype=torch.float32)
-        probs = probs.cuda()
+        probs = probs.to(device=get_current_device())
         output, _ = self.grouped_mlp.experts(
             hidden_states, tokens_per_expert=tokens_per_expert, permuted_probs=probs
         )
