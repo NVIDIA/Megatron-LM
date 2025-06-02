@@ -277,6 +277,10 @@ def load_workloads(
                 workloads.append(build_workload)
         workload.spec.n_repeat = n_repeat
         workload.spec.time_limit = time_limit
+        workload.spec.artifacts = {
+            key: value.replace(r'{platforms}', workload.spec.platforms)
+            for key, value in workload.spec.artifacts.items()
+        }
 
         if record_checkpoints == 'true':
             workload.outputs = [
@@ -291,3 +295,11 @@ def load_workloads(
                 }
             ]
     return workloads
+
+
+if __name__ == "__main__":
+    workflows = load_workloads(container_tag="main")
+    # Save workflows to YAML file
+    output_file = "workflows.yaml"
+    with open(output_file, "w") as f:
+        yaml.dump([workflow.model_dump() for workflow in workflows], f)

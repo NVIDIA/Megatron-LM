@@ -6,7 +6,7 @@ import os
 from functools import partial
 from logging import getLogger
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -71,7 +71,10 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
             ' Please switch to PyTorch Distributed format (`torch_dist`).'
         )
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
+        if isinstance(checkpoint_dir, str):
+            checkpoint_dir = Path(checkpoint_dir)
+
         sharded_tensors = list(nested_values(sharded_state_dict))
         arrays = _create_or_open_zarr_arrays(sharded_tensors, checkpoint_dir)
         for ten, arr in zip(sharded_tensors, arrays):
@@ -176,16 +179,22 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
 class ZarrLoadShardedStrategy(LoadShardedStrategy):
     """Load strategy for the Zarr backend."""
 
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
+        if isinstance(checkpoint_dir, str):
+            checkpoint_dir = Path(checkpoint_dir)
+
         dict_list_map_inplace(
             partial(_load_from_array, checkpoint_dir=checkpoint_dir), sharded_state_dict
         )
         return sharded_state_dict
 
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Union[str, Path]):
         def get_zarr_shape_dtype(path):
             arr = zarr.open(path, 'r')
             return arr.shape, arr.dtype
+
+        if isinstance(checkpoint_dir, str):
+            checkpoint_dir = Path(checkpoint_dir)
 
         return load_zarr_based_sharded_metadata(checkpoint_dir, get_zarr_shape_dtype)
 

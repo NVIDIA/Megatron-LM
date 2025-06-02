@@ -122,7 +122,7 @@ def load(
     strict = parse_strict_flag(strict)
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
         ckpt_sharded_metadata = load_sharded_metadata(
-            checkpoint_dir, sharded_strategy, common_strategy
+            checkpoint_dir, sharded_strategy, common_strategy  # type: ignore[arg-type]
         )
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
         local_metadata, global_metadata = determine_global_metadata(sharded_state_dict, process_group=process_group)
@@ -245,10 +245,10 @@ def load_sharded_metadata(
     sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
         checkpoint_dir, sharded_strategy, common_strategy
     )
-    sharded_metadata = sharded_strategy.load_sharded_metadata(Path(checkpoint_dir))
+    sharded_metadata = sharded_strategy.load_sharded_metadata(checkpoint_dir)
     if not sharded_strategy.can_handle_sharded_objects:
         validate_sharded_objects_handling(sharded_strategy, common_strategy)
-        common_metadata = common_strategy.load_sharded_metadata(Path(checkpoint_dir))
+        common_metadata = common_strategy.load_sharded_metadata(checkpoint_dir)
         sharded_metadata = merge(sharded_metadata, common_metadata)
     return sharded_metadata
 
