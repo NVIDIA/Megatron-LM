@@ -833,7 +833,7 @@ class DataParallelBuffer:
 
         return self._get_item_local_shard_index(item_id)
 
-    def set_item(self, item_id: int, item_data: torch.Tensor) -> None:
+    def set_item(self, item_id: int, item: torch.Tensor) -> None:
         """
         Update a tensor item managed by the `DataParallelBuffer` instance.
 
@@ -842,11 +842,16 @@ class DataParallelBuffer:
 
         Args:
             item_id (int): The ID of the tensor item to update.
-            item_data (torch.Tensor): The new data for the tensor item.
+            item (torch.Tensor): The original tensor to be put into the buffer.
 
         Returns:
             None
         """
+        if is_float8tensor(item):
+            item_data = item._data
+        else:
+            item_data = item.data
+
         if self.is_data_distributed:
             slice_start, slice_end = self._get_item_slice_in_shard(item_id)
             item_data = item_data.flatten()[slice_start:slice_end]
@@ -1443,7 +1448,7 @@ class ParamAndGradBuffer:
                                         _param._transpose_invalid = True
                                         _param._transpose = None
                     assert not p.is_meta, (self.param_to_name[p], module_reset_flag)
-                    wbuf.set_item(item_id, p.data)
+                    wbuf.set_item(item_id, p)
 
                     # reset the parameter data to the buffer
                     new_param_data = wbuf.get_item_from_bucket(bucket, item_id).view(p.shape)
