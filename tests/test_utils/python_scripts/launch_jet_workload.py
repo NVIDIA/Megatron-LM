@@ -386,6 +386,7 @@ def main(
                 jet_log = main_job.get_logs()
                 assets_base_path = download_job_assets(logs=jet_log, iteration=n_iteration)
                 if assets_base_path is None:
+                    no_log = True
                     break
                 allranks_logs = extract_torchrunlogs_to_string(logs_path=assets_base_path)
                 mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
