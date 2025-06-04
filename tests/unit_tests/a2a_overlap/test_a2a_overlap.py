@@ -5,11 +5,8 @@ import torch
 from contextlib import nullcontext
 
 from megatron.core.models.gpt.fine_grained_schedule import LayerSchedulePlan, schedule_layer_1f1b
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_decoder_block_spec
-from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.utils import is_te_min_version
 from megatron.core.fp8_utils import get_fp8_context
 from tests.unit_tests.test_utilities import Utils
@@ -92,135 +89,6 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
         torch.cuda.synchronize()
     # backward for last microbatch
     schedule_layer_1f1b(None, layers[-1], f_input=None, b_grad=torch.ones_like(output))
-    torch.cuda.synchronize()
-    capture = {"outputs": output_tensors}
-    for name, param in model.named_parameters():
-        capture[name] = param.grad
-
-    return capture
-
-
-def run_mtp_layer_ref_with_capture(
-    model, 
-    hidden_states, 
-    input_ids, 
-    position_ids, 
-    labels, 
-    attention_mask, 
-    rotary_pos_emb, 
-    rotary_pos_cos, 
-    rotary_pos_sin, 
-    microbatches,
-):
-    """
-    Runs the model in reference mode and captures outputs and gradients.
-
-    Args:
-        model: The transformer model to run.
-        input_tensors: List of input tensors for each iteration.
-        iterations: Number of iterations to run the model.
-
-    Returns:
-        dict: A dictionary containing model outputs and parameter gradients.
-    """
-    for module in model.modules():
-        if hasattr(module, 'fuse_wgrad_accumulation'):
-            module.fuse_wgrad_accumulation = False
-
-    mtp_block = model.mtp
-
-    output_tensors = []
-    for i in range(microbatches):
-        output = mtp_block(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            labels=labels,
-            hidden_states=hidden_states[i].clone(),
-            attention_mask=attention_mask,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            embedding=model.embedding,
-            output_layer=model.output_layer,
-            compute_language_model_loss=model.compute_language_model_loss,
-        )
-        output_tensors.append(output)
-        output.backward(torch.ones_like(output))
-
-    capture = {"outputs": output_tensors}
-    for name, param in model.named_parameters():
-        capture[name] = param.grad
-
-    return capture
-
-
-def run_mtp_layer_a2a_overlap_with_capture(
-    model, 
-    hidden_states, 
-    input_ids, 
-    position_ids, 
-    labels, 
-    attention_mask, 
-    rotary_pos_emb, 
-    rotary_pos_cos, 
-    rotary_pos_sin, 
-    microbatches,
-):
-    """
-    Runs the model with all-to-all overlap optimization and captures outputs and gradients.
-
-    Args:
-        model: The transformer model to run.
-        input_tensors: List of input tensors for each microbatch.
-        microbatches: Number of microbatches to process.
-
-    Returns:
-        dict: A dictionary containing model outputs and parameter gradients.
-    """
-    for i in range(len(hidden_states)):
-        hidden_states[i] = hidden_states[i].clone()
-    for module in model.modules():
-        if hasattr(module, 'fuse_wgrad_accumulation'):
-            module.fuse_wgrad_accumulation = False
-
-    comp_stream = torch.cuda.current_stream()
-    com_stream = torch.cuda.Stream(device="cuda")
-    layers = []
-    for _ in range(microbatches):
-        state = DummyState()
-        state.labels_for_mtp = labels
-        state.input_ids = input_ids
-        state.position_ids = position_ids
-        state.attention_mask = attention_mask
-        state.rotary_pos_emb = rotary_pos_emb
-        state.rotary_pos_cos = rotary_pos_cos
-        state.rotary_pos_sin = rotary_pos_sin
-        state.model = model
-        event = torch.cuda.Event()
-        layers.append(
-            LayerSchedulePlan(
-                model.mtp.layers[0],
-                event,
-                state,
-                comp_stream,
-                com_stream,
-                extra_args={"is_moe": True, "enable_deepep": False, "is_first_layer": True, "is_last_layer": True},
-            )
-        )
-    output_tensors = []
-    # forward for 1st microbatch
-    f_input, _= schedule_layer_1f1b(layers[0], None, f_input=hidden_states[0], b_grad=None)
-    output_tensors.append(f_input)
-    torch.cuda.synchronize()
-    # overlapped forward and backward
-    for i in range(1, microbatches):
-        f_input, b_grad = schedule_layer_1f1b(
-            layers[i], layers[i - 1], f_input=hidden_states[i], b_grad=torch.ones_like(f_input)
-        )
-        output_tensors.append(f_input)
-        torch.cuda.synchronize()
-    # backward for last microbatch
-    schedule_layer_1f1b(None, layers[-1], f_input=None, b_grad=torch.ones_like(f_input))
     torch.cuda.synchronize()
     capture = {"outputs": output_tensors}
     for name, param in model.named_parameters():

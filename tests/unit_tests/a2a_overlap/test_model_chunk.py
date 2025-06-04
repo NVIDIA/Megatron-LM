@@ -3,7 +3,7 @@ import pytest
 import torch
 import gc
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import is_te_min_version
 from megatron.core.pipeline_parallel.combined_1f1b import schedule_chunk_1f1b
@@ -34,13 +34,11 @@ def build_model(config):
         config=config,
         use_transformer_engine=True
     )
-    mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec.layer_specs[-1], True)
     
     # build model
     gpt_model = GPTModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        mtp_block_spec=mtp_block_spec,
         vocab_size=100,
         pre_process=True,
         post_process=True,
@@ -77,7 +75,7 @@ class TestA2AOverlap:
     @pytest.mark.parametrize("fp8", ["e4m3", None])
     @pytest.mark.parametrize("fp8_recipe", ["blockwise"])
     @pytest.mark.parametrize("layers", [[2,1], [1,2], [1,1]])
-    def test_1f1b_schedule_mtp_model_chunk(self, dispatcher_type, fp8, fp8_recipe, layers):
+    def test_1f1b_schedule_model_chunk(self, dispatcher_type, fp8, fp8_recipe, layers):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
