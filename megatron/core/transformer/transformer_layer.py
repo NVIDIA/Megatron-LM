@@ -548,23 +548,12 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
-    def _pre_mlp_layernorm_maybe_recompute(self, hidden_states):
-        """
-        Forward pass for pre mlp layernorm, with recompute if enabled.
-        """
-        if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            return self.pre_mlp_norm_checkpoint.checkpoint(self.pre_mlp_layernorm, hidden_states)
-        else:
-            return self.pre_mlp_layernorm(hidden_states)
-
-    def _forward_mlp(self, hidden_states, inference_context=None, state=None):
+    def _forward_mlp(self, hidden_states, inference_context=None):
         """
         Perform a forward pass through the feed-forward layer.
 
         Args:
             hidden_states (Tensor): Transformed hidden states before the MLP layernorm.
-            state (Any, optional): Placeholder for submodule callable wrapper.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -574,7 +563,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
-        pre_mlp_layernorm_output = self._pre_mlp_layernorm_maybe_recompute(hidden_states)
+        if self.recompute_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                self.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
