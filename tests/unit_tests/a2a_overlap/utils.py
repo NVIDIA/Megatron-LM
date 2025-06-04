@@ -78,14 +78,18 @@ def deterministic_mode():
         "NVTE_FWD_LAYERNORM_SM_MARGIN": "8",
         "NVTE_BWD_LAYERNORM_SM_MARGIN": "8",
     }
+    origin_envs = {}
     for k, v in envs.items():
+        origin_envs[k] = os.environ.get(k)
         os.environ[k] = v
     _set_random_seed(seed_=123, data_parallel_random_init=False)
     try:
         yield
     finally:
         for k in envs:
-            if k in os.environ:
+            if origin_envs[k] is not None:
+                os.environ[k] = origin_envs[k]
+            elif k in os.environ:
                 del os.environ[k]
 
 
