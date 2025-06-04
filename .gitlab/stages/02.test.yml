@@ -10,6 +10,12 @@ include:
 
 wait_for_resources:
   extends: [.test_rules]
+  needs:
+    - test:linting_formatting
+    - test:linting_copyright
+    - job: test:linting_secret_detection
+      optional: true
+    - test:build_image
   image: python:3.10
   timeout: 7 days
   tags:
@@ -24,6 +30,7 @@ wait_for_resources:
     - pip install --no-cache-dir python-gitlab click
     - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
     - export GITLAB_ENDPOINT
+    - export NUM_CONCURRENT_JOBS
     - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
