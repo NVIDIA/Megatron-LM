@@ -4,6 +4,7 @@ import weakref
 
 import torch
 
+from megatron.core import tensor_parallel
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
@@ -306,7 +307,13 @@ def build_transformer_layer_callables(layer):
         Run forward pass for computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
         """
-        pre_mlp_layernorm_output = layer._pre_mlp_layernorm_maybe_recompute(hidden_states)
+        if layer.recompute_pre_mlp_layernorm:
+            layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
+                layer.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
         probs, routing_map = layer.mlp.router(pre_mlp_layernorm_output)
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
