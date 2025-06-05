@@ -1141,7 +1141,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
 
         # Count the zeros in the grads.
-        num_zeros_in_grad = self.count_zeros()
+        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
 
         update_successful = self.step_with_ready_grads()
 
