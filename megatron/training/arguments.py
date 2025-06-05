@@ -826,6 +826,15 @@ def validate_args(args, defaults={}):
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1"
 
+    # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
+    # Assigning high priority to communication streams ensures that communication kernels are scheduled
+    # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
+    if args.use_torch_fsdp2 or args.use_custom_fsdp and get_device_arch_version() >= 10:
+        if 'dp_cp' not in args.high_priority_stream_groups:
+            args.high_priority_stream_groups.append('dp_cp')
+        if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
+            args.high_priority_stream_groups.append('ep_dp')
+
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False
@@ -1900,6 +1909,8 @@ def _add_training_args(parser):
                        choices=['nccl', 'ucc'],
                        help='Select a communicator backend for pipeline parallel communication. '
                        'If None, the default backend will be used.')
+    group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
+                       help='The communicator group names to use high priority streams.')
 
     return parser
 

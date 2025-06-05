@@ -362,6 +362,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.enable_gloo_process_groups,
+                high_priority_stream_groups=args.high_priority_stream_groups,
             )
             if args.rank == 0:
                 print(
