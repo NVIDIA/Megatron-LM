@@ -359,6 +359,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
                 encoder_tensor_model_parallel_size=args.encoder_tensor_model_parallel_size,
                 encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
+                encoder_data_parallel_size=args.encoder_data_parallel_size,
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
                 create_gloo_process_groups=args.enable_gloo_process_groups,

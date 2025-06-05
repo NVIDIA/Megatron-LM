@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 import os
-
+from typing import Dict, Any, List
+import numpy as np
 import torch
 from dataset_helpers import TaskEncoder, print_error_handler
 
@@ -23,11 +24,17 @@ from megatron.training.checkpointing import get_checkpoint_name
 def datasets_provider(worker_config=None):
     """Create multimodal train, validation and test datasets."""
     args = get_args()
-
+    if args.encoder_data_parallel_size > 0:
+        # For the case that encoder and decoder have different DP size,
+        # we need to change the batch size for decoder while getting data from dataset.
+        chunk_num = args.data_parallel_size // args.encoder_data_parallel_size
+        batch_size = args.micro_batch_size * chunk_num
+    else:
+        batch_size = args.micro_batch_size
     dname = args.data_path[0] if type(args.data_path) is list else args.data_path
     train_dataset = get_train_dataset(
         dname,
-        batch_size=args.micro_batch_size,
+        batch_size=batch_size,
         task_encoder=TaskEncoder(),
         virtual_epoch_length=1000,
         max_samples_per_sequence=100,
@@ -40,7 +47,7 @@ def datasets_provider(worker_config=None):
 
     val_datasets = get_val_datasets(
         dname,
-        batch_size=args.micro_batch_size,
+        batch_size=batch_size,
         # This is the total number over all workers
         # limit=args.eval_iters * get_num_microbatches(),
         task_encoder=TaskEncoder(),
@@ -109,6 +116,29 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples):
     world_size = parallel_state.get_data_parallel_world_size()
     data_parallel_group = parallel_state.get_data_parallel_group()
 
+    if (
+        args.encoder_data_parallel_size > 0
+        and args.data_parallel_size != args.encoder_data_parallel_size
+    ):
+        # For the case that encoder and decoder have different DP size,
+        # micro batch will be prepared with the following steps:
+        # (step 1) init worker_config, which is just done as the following code.
+        # For both encoder and decoder, set world size in worker_config to encoder DP world size.
+        # For encoder, set rank in worker_config to (DP rank).
+        # For decoder, set rank in worker_config to (DP rank) // (encoder DP world size).
+        # (step 2) init train dataset and val datasets with worker_config,
+        # which will be done in datasets_provider() function of this file.
+        # For both encoder and decoder, set micro batch size in dataset as
+        # args.micro_batch_size * args.data_parallel_size // args.encoder_data_parallel_size
+        # (step 3) get batch, which will be done in get_batch() function of train.py.
+        # For encoder, use all of the sample in micro batch, just as usually.
+        # For decoder, filter data from one micro batch according to
+        # (DP rank) % (encoder DP world size).
+        if parallel_state.is_inside_decoder():
+            # change args for decoder dataset
+            chunk_num = args.data_parallel_size // args.encoder_data_parallel_size
+            rank = rank // chunk_num
+            world_size = args.encoder_data_parallel_size
     worker_config = WorkerConfig(
         rank=rank,
         world_size=world_size,
@@ -168,3 +198,32 @@ def cyclic_iter(iter):
     while True:
         for x in iter:
             yield x
+
+
+def get_batch_on_this_decoder_rank(batch: Dict[str, Any], keys_to_filter: List[str]):
+    """
+    For the case that encoder and decoder have different DP size,
+    filter data in decoder's batch according to (DP rank) % (encoder DP world size).
+    """
+    dp_rank = parallel_state.get_data_parallel_rank()
+    args = get_args()
+    chunk_num = args.data_parallel_size // args.encoder_data_parallel_size
+    chunk_idx = dp_rank % chunk_num
+    for key, val in batch.items():
+        if val is not None and key in keys_to_filter:
+            bs_dim = 0
+            val = val.cuda()
+            val = val.view(
+                *val.shape[0:bs_dim],
+                chunk_num,
+                val.shape[bs_dim] // chunk_num,
+                *val.shape[(bs_dim + 1) :],
+            )
+            index = torch.tensor(
+                [chunk_idx], device="cpu", pin_memory=True
+            ).cuda(non_blocking=True)
+            val = val.index_select(bs_dim, index)
+            val = val.view(*val.shape[0:bs_dim], -1, *val.shape[(bs_dim + 2) :])
+            batch[key] = val
+
+    return batch
