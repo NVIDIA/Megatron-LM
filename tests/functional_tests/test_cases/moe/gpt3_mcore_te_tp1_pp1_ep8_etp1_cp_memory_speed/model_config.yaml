@@ -105,6 +105,7 @@ MODEL_ARGS:
   --moe-router-dtype: fp32
   --moe-permute-fusion: true
   --moe-expert-capacity-factor: 1.0
+  --overlap-moe-expert-parallel-comm: true
 
   # Add MLA args
   --q-lora-rank: 1536
