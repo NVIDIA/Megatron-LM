@@ -1198,6 +1198,35 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     args = get_args()
     load_dir = getattr(args, load_arg)
 
+    # Check for model-opt format loading
+    if hasattr(args, 'load_model_opt_format') and args.load_model_opt_format:
+        print_rank_0(f'Loading checkpoint using ModelOpt format from {load_dir}')
+        from megatron.post_training.checkpointing import load_modelopt_checkpoint
+
+        # Call the ModelOpt checkpoint loading function
+        load_modelopt_checkpoint(
+            ddp_model,
+            optimizer=optimizer,
+            opt_param_scheduler=opt_param_scheduler,
+            strict=strict,
+            load_arg=load_arg
+        )
+        
+        # Since load_modelopt_checkpoint doesn't return iteration count, we need to get it
+        if torch.distributed.is_initialized():
+            tracker_filename = get_checkpoint_tracker_filename(load_dir)
+            if os.path.isfile(tracker_filename):
+                iteration, release = read_metadata(tracker_filename)
+                if release:
+                    iteration = 0
+            else:
+                iteration = 0
+        else:
+            iteration = 0
+        
+        # We don't have a reliable way to get num_floating_point_operations_so_far from ModelOpt format
+        return iteration, 0
+
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
     if pretrained_dir is not None and not checkpoint_exists(load_dir):

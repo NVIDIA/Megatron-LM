@@ -346,12 +346,6 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
-        # Process inference output.
-        if inference_context and not inference_context.is_static_batching():
-            hidden_states = inference_context.last_token_logits(
-                hidden_states.squeeze(1).unsqueeze(0)
-            ).unsqueeze(1)
-
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -385,10 +379,17 @@ class GPTModel(LanguageModule):
         if (
             not self.training
             and inference_context is not None
-            and inference_context.is_static_batching()
             and inference_context.materialize_only_last_token_logits
         ):
-            hidden_states = hidden_states[-1:, :, :]
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
+                # state ([B, H]) → unsqueeze back to [1, B, H]
+                # (so that the output layer, which expects S×B×H, receives only the final token)
+                hidden_states = inference_context.last_token_logits(
+                    hidden_states.squeeze(1).unsqueeze(0)
+                ).unsqueeze(1)
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )

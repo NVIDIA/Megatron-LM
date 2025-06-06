@@ -17,7 +17,7 @@ class StaticInferenceContext(BaseInferenceContext):
     """
 
     def __init__(self, max_batch_size: int, max_sequence_length: int):
-        super().__init__()
+        super().__init__(materialize_only_last_token_logits=False)
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
         self.current_batch_size = max_batch_size  # Required for bookkeeping variable-sized batches
@@ -25,7 +25,6 @@ class StaticInferenceContext(BaseInferenceContext):
         self.batch_size_offset = 0
         self.key_value_memory_dict = {}
         self.decode_mode = False
-        self.materialize_only_last_token_logits = False
 
     @classmethod
     def from_config(cls, config: InferenceWrapperConfig) -> "StaticInferenceContext":
