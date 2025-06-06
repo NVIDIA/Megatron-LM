@@ -38,7 +38,7 @@ class LayerSchedulePlan:
     """Schedule plan for a transformer layer.
 
     This class organizes the computation nodes for a transformer layer,
-    including attention, MLP, dispatch, and combine nodes.
+    including attention, post attention, MLP, dispatch, and combine nodes.
     """
 
     attn = None
