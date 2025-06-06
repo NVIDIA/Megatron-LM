@@ -16,6 +16,22 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
+def token_permutation(token_dispatcher, hidden_states, probs, indices):
+    hidden_states, probs = token_dispatcher.dispatch_preprocess(hidden_states, indices, probs)
+    hidden_states, probs = token_dispatcher.token_dispatch(hidden_states, probs)
+    hidden_states, tokens_per_expert, permuted_probs = token_dispatcher.dispatch_postprocess(
+        hidden_states, probs
+    )
+    return hidden_states, tokens_per_expert, permuted_probs
+
+
+def token_unpermutation(token_dispatcher, hidden_states):
+    hidden_states = token_dispatcher.combine_preprocess(hidden_states)
+    hidden_states = token_dispatcher.token_combine(hidden_states)
+    hidden_states = token_dispatcher.combine_postprocess(hidden_states)
+    return hidden_states, None
+
+
 class MoEModelTestContainer:
     def __init__(
         self,
@@ -109,14 +125,14 @@ class MoEModelTestContainer:
         probs, indices = moe_layer.router(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
-            moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
         permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
 
-        restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
-            permuted_local_hidden_states
+        restored_hidden_states, restored_bias = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_local_hidden_states
         )
 
         # reduce across TP rank equals to multiply data by a scale of ETP
@@ -148,8 +164,8 @@ class MoEModelTestContainer:
         local_probss = probs
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
-            moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
         # Check tokens per expert not exceed the capacity.
@@ -169,8 +185,8 @@ class MoEModelTestContainer:
 
         permuted_local_hidden_states /= moe_layer.config.tensor_model_parallel_size
 
-        restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
-            permuted_local_hidden_states
+        restored_hidden_states, restored_bias = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_local_hidden_states
         )
         assert torch.allclose(
             restored_hidden_states, restored_hidden_states_answer
@@ -196,12 +212,12 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
-        (permuted_input_1, tokens_per_expert, permuted_probs_1) = (
-            moe_layer.token_dispatcher.token_permutation(hidden_states, probs_1, indices_1)
+        (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
-        forward_answer, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
-            permuted_input_1
+        forward_answer, restored_bias = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_input_1
         )
         torch.autograd.backward(forward_answer, forward_answer)
         backward_answer = hidden_states.grad.clone()
@@ -213,12 +229,12 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
-        (permuted_input_2, tokens_per_expert, permuted_probs_2) = (
-            moe_layer_2.token_dispatcher.token_permutation(hidden_states, probs_2, indices_2)
+        (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
+            moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
-        restored_hidden_states, restored_bias = moe_layer_2.token_dispatcher.token_unpermutation(
-            permuted_input_2
+        restored_hidden_states, restored_bias = token_unpermutation(
+            moe_layer_2.token_dispatcher, permuted_input_2
         )
 
         # # Check tokens per expert equals to the capacity.

@@ -1,17 +1,24 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-import pytest
-import torch
 import gc
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+import pytest
+import torch
+
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.utils import is_te_min_version
 from megatron.core.pipeline_parallel.combined_1f1b import schedule_chunk_1f1b
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
-
+from megatron.core.utils import is_te_min_version
+from tests.unit_tests.a2a_overlap.utils import (
+    compare_captures,
+    deterministic_mode,
+    get_test_config,
+)
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.a2a_overlap.utils import compare_captures, deterministic_mode, get_test_config
+
 
 def build_model(config):
     seq_len = 32
@@ -23,18 +30,15 @@ def build_model(config):
     data = {
         "input_ids": torch.tensor(ids, dtype=torch.int64).repeat((1, 1)).cuda(),
         "labels": torch.tensor(ids, dtype=torch.int64).repeat((1, 1)).cuda(),
-        "position_ids": torch.tensor([i for i in range(seq_len)], dtype=torch.int64).repeat((1, 1)).cuda(),
-        "attention_mask": torch.ones(
-            (1, 1, seq_len, seq_len), dtype=bool
-        ).cuda(),
+        "position_ids": torch.tensor([i for i in range(seq_len)], dtype=torch.int64)
+        .repeat((1, 1))
+        .cuda(),
+        "attention_mask": torch.ones((1, 1, seq_len, seq_len), dtype=bool).cuda(),
     }
-    
+
     # build layer spec
-    transformer_layer_spec = get_gpt_decoder_block_spec(
-        config=config,
-        use_transformer_engine=True
-    )
-    
+    transformer_layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)
+
     # build model
     gpt_model = GPTModel(
         config=config,
@@ -67,15 +71,15 @@ class TestA2AOverlap:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-        
-
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     # TODO: Add flex dispatcher test back in when CI image installs DeepEP.
     @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
     @pytest.mark.parametrize("fp8", ["e4m3", None])
     @pytest.mark.parametrize("fp8_recipe", ["blockwise"])
-    @pytest.mark.parametrize("layers", [[2,1], [1,2], [1,1]])
-    def test_1f1b_schedule_model_chunk(self, dispatcher_type, fp8, fp8_recipe, layers):
+    @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
+    def test_1f1b_schedule_model_chunk(
+        self, dispatcher_type, fp8, fp8_recipe, layers
+    ):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
@@ -86,11 +90,9 @@ class TestA2AOverlap:
         schedule_plans = []
         ref_captures = []
         datas = []
-        
+
         # create TransformerConfig
-        extra_kwargs = {
-            "moe_token_dispatcher_type": dispatcher_type,
-        }
+        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
             extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
@@ -101,7 +103,7 @@ class TestA2AOverlap:
             for layer_num in layers:
                 output_tensors = []
                 # build config
-                config = get_test_config(num_layers = layer_num, extra_kwargs = extra_kwargs)
+                config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)
                 # build model
                 gpt_model, schedule_plan, data = build_model(config)
                 gpt_model.cuda()
@@ -130,31 +132,24 @@ class TestA2AOverlap:
             for i in range(microbatches):
                 # 1st forward
                 if i > 0:
-                    assert schedule_plans[0].pre_process is None, "pre_process should be released after backward"
+                    assert (
+                        schedule_plans[0].pre_process is None
+                    ), "pre_process should be released after backward"
                     schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])
                     schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])
-                f_input_0 = schedule_chunk_1f1b(
-                    schedule_plans[0],
-                    None
-                )
+                f_input_0 = schedule_chunk_1f1b(schedule_plans[0], None)
                 capture_0["outputs"].append(f_input_0)
                 # overlap
                 f_input_1 = schedule_chunk_1f1b(
-                    schedule_plans[1],
-                    schedule_plans[0],
-                    b_grad=torch.ones_like(f_input_0)
+                    schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)
                 )
                 capture_1["outputs"].append(f_input_1)
                 # last backward
-                schedule_chunk_1f1b(
-                    None,
-                    schedule_plans[1],
-                    b_grad=torch.ones_like(f_input_1)
-                )
+                schedule_chunk_1f1b(None, schedule_plans[1], b_grad=torch.ones_like(f_input_1))
             for i in range(len(gpt_models)):
                 for name, param in gpt_models[i].named_parameters():
                     a2a_captures[i][name] = param.grad
-            
+
             # compare results
             for i in range(len(ref_captures)):
                 comp_res = compare_captures(ref_captures[i], a2a_captures[i], True, True)
@@ -172,4 +167,3 @@ class TestA2AOverlap:
                 gpt_models[i] = None
             gc.collect()
             torch.cuda.empty_cache()
-    

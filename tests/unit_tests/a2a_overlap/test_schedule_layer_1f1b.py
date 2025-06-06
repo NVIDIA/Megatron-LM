@@ -1,16 +1,25 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+from contextlib import nullcontext
+
 import pytest
 import torch
 
-from contextlib import nullcontext
-
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.fine_grained_schedule import LayerSchedulePlan, schedule_layer_1f1b
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import is_te_min_version
-from megatron.core.fp8_utils import get_fp8_context
+from tests.unit_tests.a2a_overlap.utils import (
+    DummyState,
+    build_data,
+    compare_captures,
+    deterministic_mode,
+    get_test_config,
+    reset_model,
+)
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.a2a_overlap.utils import build_data, compare_captures, deterministic_mode, reset_model, get_test_config, DummyState
 
 
 def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
@@ -114,22 +123,18 @@ class TestA2AOverlap:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_transformer_layer_overlap_dense(self):
         """
         Verifies all-to-all overlap optimization in dense transformer layer produces
         the same results as the reference implementation.
         """
-        extra_kwargs = {
-            "moe_token_dispatcher_type": "alltoall",
-        }
+        extra_kwargs = {"moe_token_dispatcher_type": "alltoall"}
         config = get_test_config(num_moe_experts=None, extra_kwargs=extra_kwargs)
         microbatches = 4
         with deterministic_mode():
             transformer_layer_spec = get_gpt_decoder_block_spec(
-                config=config,
-                use_transformer_engine=True
+                config=config, use_transformer_engine=True
             )
             gpt_model = GPTModel(
                 config=config,
@@ -144,17 +149,20 @@ class TestA2AOverlap:
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            )
             with fp8_context:
-                capture_ref = run_transformer_layer_ref_with_capture(model, input_tensors, microbatches)
+                capture_ref = run_transformer_layer_ref_with_capture(
+                    model, input_tensors, microbatches
+                )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                 model, input_tensors, microbatches
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
-    
-    
+
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_transformer_layer_overlap_shared_expert(self):
         """
@@ -169,8 +177,7 @@ class TestA2AOverlap:
         microbatches = 4
         with deterministic_mode():
             transformer_layer_spec = get_gpt_decoder_block_spec(
-                config=config,
-                use_transformer_engine=True
+                config=config, use_transformer_engine=True
             )
             gpt_model = GPTModel(
                 config=config,
@@ -185,9 +192,13 @@ class TestA2AOverlap:
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            )
             with fp8_context:
-                capture_ref = run_transformer_layer_ref_with_capture(model, input_tensors, microbatches)
+                capture_ref = run_transformer_layer_ref_with_capture(
+                    model, input_tensors, microbatches
+                )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                 model, input_tensors, microbatches
@@ -205,10 +216,8 @@ class TestA2AOverlap:
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
         """
-        
-        extra_kwargs = {
-            "moe_token_dispatcher_type": dispatcher_type,
-        }
+
+        extra_kwargs = {"moe_token_dispatcher_type": dispatcher_type}
         if dispatcher_type == "flex":
             extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
@@ -219,8 +228,7 @@ class TestA2AOverlap:
         microbatches = 4
         with deterministic_mode():
             transformer_layer_spec = get_gpt_decoder_block_spec(
-                config=config,
-                use_transformer_engine=True
+                config=config, use_transformer_engine=True
             )
             gpt_model = GPTModel(
                 config=config,
@@ -235,9 +243,13 @@ class TestA2AOverlap:
             params = reset_model(gpt_model)
             input_tensors = [build_data() for _ in range(microbatches)]
 
-            fp8_context = get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            fp8_context = (
+                get_fp8_context(config, model.layer_number - 1) if config.fp8 else nullcontext()
+            )
             with fp8_context:
-                capture_ref = run_transformer_layer_ref_with_capture(model, input_tensors, microbatches)
+                capture_ref = run_transformer_layer_ref_with_capture(
+                    model, input_tensors, microbatches
+                )
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                 model, input_tensors, microbatches
