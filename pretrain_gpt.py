@@ -123,7 +123,7 @@ def model_provider(
             if args.num_experts:
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, vp_stage=vp_stage
+                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
                 )
             elif args.heterogeneous_layers_config_path is not None:
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
@@ -136,6 +136,7 @@ def model_provider(
                         args.qk_layernorm,
                         args.multi_latent_attention,
                         args.moe_use_legacy_grouped_gemm,
+                        qk_l2_norm=args.qk_l2_norm
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(

@@ -2121,6 +2121,9 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
+    group.add_argument('--load-model-opt-format', action='store_true',
+                       help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
+                            'This function can also be used to load NeMo .nemo sharded checkpoints.')
     return parser
 
 
@@ -2606,6 +2609,8 @@ def _add_vision_args(parser):
     # regularization arguments
     group.add_argument('--qk-layernorm', action='store_true',
                        help='Whether to layer normalize the q and k attention embeddings.')
+    group.add_argument('--qk-l2-norm', action='store_true',
+                       help='Use llama 4 qk l2 norm')
 
     return parser
 
@@ -2711,7 +2716,8 @@ def _add_moe_args(parser):
                        help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
     group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
                        help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
-
+    group.add_argument('--moe-apply-probs-on-input', action='store_true',
+                       help='Apply probs before mlp activation for moe routing.')
     return parser
 
 def _add_mla_args(parser):
