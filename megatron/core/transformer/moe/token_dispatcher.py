@@ -63,36 +63,123 @@ class MoETokenDispatcher:
         self.ep_size = self.ep_group.size()
 
     @abstractmethod
-    def token_permutation(
-        self, tokens: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    def dispatch_preprocess(
+        self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
-        """Dispatch tokens to experts.
+        """
+        Prepare tokens and routing information for distributed dispatch operations.
 
+        This method performs all computational preparations needed before inter-device
+        communication begins. It handles tensor reshaping, metadata extraction, and
+        any local computations that can be overlapped with communication streams.
+        Try to avoid any inter-device communication operations here to enable optimal
+        computation-communication overlapping.
         Args:
             tokens (torch.Tensor): Input tokens.
-            probs (torch.Tensor): The routing probability tensor [num_tokens, num_experts].
             routing_map (torch.Tensor): Token to expert mapping tensor.
+            probs (torch.Tensor): The routing probability tensor [num_tokens, num_experts].
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - Permuted token embeddings for local experts.
-                - Number of tokens per expert.
-                - Permuted probs of each token produced by the router.
+            torch.Tensor: Preprocessed token embeddings.
+            torch.Tensor: Preprocessed probs.
         """
-        raise NotImplementedError("Dispatch function not implemented.")
+        raise NotImplementedError("dispatch_preprocess function not implemented.")
 
     @abstractmethod
-    def token_unpermutation(self, expert_output: torch.Tensor, bias: torch.Tensor = None):
-        """Restores the expert output to its original ordering.
+    def token_dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """
+        Execute inter-device communication to redistribute tokens across expert ranks.
+
+        This method handles the core communication operations (AllGather, AlltoAll, etc.)
+        that move tokens from their original locations to the devices hosting their
+        assigned experts. Computational operations should be minimized to avoid SM
+        contention and enable better overlap with computations.
 
         Args:
-            expert_output (torch.Tensor): The output tensor from the expert models.
-            bias (torch.Tensor): The bias tensor.
+            hidden_states (torch.Tensor): Preprocessed hidden states to be dispatched
+            probs (torch.Tensor): Preprocessed probs for each token-expert pair
 
         Returns:
-            (torch.Tensor, torch.Tensor): Unpermuted activation and optional bias.
+            torch.Tensor: Dispatched tokens ready for expert processing
+            torch.Tensor: Dispatched probs ready for expert processing
         """
-        raise NotImplementedError("Restore function not implemented.")
+        raise NotImplementedError("token_dispatch function not implemented.")
+
+    @abstractmethod
+    def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
+        """
+        Finalize token organization and prepare data structures for expert processing.
+
+        This method handles post-communication computational tasks such as token
+        reordering, expert assignment finalization, and metadata preparation for
+        the expert forward pass. These operations can be overlapped with operations
+        on the communication stream. Try to avoid any inter-device communication
+        operations here to enable optimal computation-communication overlapping.
+
+        Args:
+            hidden_states (torch.Tensor): Processed hidden states from experts
+            probs (torch.Tensor): Routing probabilities used for dispatch
+
+        Returns:
+            torch.Tensor: Post-processed hidden states ready for final output
+            torch.Tensor: Post-processed probs ready for final output
+        """
+        raise NotImplementedError("dispatch_postprocess function not implemented.")
+
+    @abstractmethod
+    def combine_preprocess(self, hidden_states):
+        """
+        Prepare expert outputs for distributed combination operations.
+
+        This method performs computational preparations on expert outputs before
+        inter-device communication begins. It handles tensor transformations,
+        scaling operations, and layout optimizations that can be overlapped
+        with expert computation on other devices. Try to avoid any inter-device
+        communication operations here to enable optimal computation-communication
+        overlapping.
+
+        Args:
+            hidden_states (torch.Tensor): The output tensor from the expert models.
+
+        Returns:
+            torch.Tensor: Preprocessed expert output.
+        """
+        raise NotImplementedError("combine_preprocess function not implemented.")
+
+    @abstractmethod
+    def token_combine(self, hidden_states):
+        """
+        Execute inter-device communication to aggregate expert outputs across ranks.
+
+        This method performs the reduction scatter operation to combine tokens across
+        tensor parallel and expert parallel ranks after expert processing.
+
+        Args:
+            hidden_states (torch.Tensor): Output tokens from expert processing.
+
+        Returns:
+            torch.Tensor: Combined tokens after reduction scatter.
+        """
+        raise NotImplementedError("token_combine function not implemented.")
+
+    @abstractmethod
+    def combine_postprocess(self, hidden_states):
+        """
+        Finalize token reconstruction and restore original tensor organization.
+
+        This method handles post-communication computational tasks including token
+        unpermutation, tensor reshaping, and final output preparation. These
+        operations can be overlapped with operations on the communication stream.
+        Try to avoid any inter-device communication operations here to enable optimal
+        computation-communication overlapping.
+
+        Args:
+            hidden_states (torch.Tensor): Combined hidden states from token combination
+
+        Returns:
+            torch.Tensor: Post-processed hidden states ready for final output
+        """
+        raise NotImplementedError("combine_postprocess function not implemented.")
 
     def set_shared_experts(self, shared_experts):
         """Set shared expert to the dispatcher."""
@@ -135,31 +222,40 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # device token permutation is enabled and **AllGahter** is performed.
         self.global_local_map = None
 
-    def token_permutation(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
+    def dispatch_preprocess(
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
-        """Dispatch tokens to local experts. It's composed of two stages:
-        (1) Gather the tokens across the expert parallel devices. After this stage,
-        each device receives all of the tokens assigned to its local set of experts
-        in its local HBM.
-        (2) Permute the tokens locally so that they are grouped by their expert
-        assignment.
+        """
+        This method performs tensor reshaping operations and stores routing information
+        that will be needed throughout the dispatch-combine pipeline.
 
         Args:
-            hidden_states: 3D tensor [S/TP, B, H]. Input tokens.
-            probs: 2D tensor [S/TP*B, num_experts]. Each row of probs contains
-            the probility distribution across `topk` experts for one local token.
-            routing_map: 2D tensor [S/TP*B, num_experts], representing token assignment to
-            global experts.
+            hidden_states (torch.Tensor): Input tokens.
+            routing_map (torch.Tensor): Token to expert mapping tensor.
+            probs (torch.Tensor): The routing probability tensor [num_tokens, num_experts].
 
         Returns:
-            permuted_local_hidden_states: Permutation of tokens to local experts group.
-            tokens_per_expert: the number of tokens each local expert to process.
-            permuted_probs: the permuted probs of each token produced by the router.
+            torch.Tensor: Preprocessed hidden states ready for dispatch.
+            torch.Tensor: The input probs directly returned for dispatch.
         """
         self.hidden_shape = hidden_states.shape
         # [S/TP, B, H] -> [S*B/TP, H]
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        self.routing_map = routing_map
+        return hidden_states, probs
+
+    def token_dispatch(self, hidden_states, probs):
+        """
+        Execute AllGather operations across TP*EP communication groups for token distribution.
+
+        Args:
+            hidden_states (torch.Tensor): Preprocessed hidden states to be dispatched.
+            probs (torch.Tensor): Preprocessed probs for each token-expert pair.
+
+        Returns:
+            torch.Tensor: Gathered hidden states ready for dispatch.
+            torch.Tensor: Gathered probs ready for dispatch.
+        """
 
         # Permute the tokens across the expert parallel devices.
         if self.tp_size > 1 or self.ep_size > 1:
@@ -167,23 +263,42 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             with torch.no_grad():
                 # [num_local_tokens, num_experts] -> [num_global_tokens, num_experts], where:
                 #     num_local_tokens=(S/TP)*B, num_global_tokens=S*B*EP
-                routing_map = gather_from_sequence_parallel_region(
-                    routing_map, group=self.tp_ep_group
+                self.routing_map = gather_from_sequence_parallel_region(
+                    self.routing_map, group=self.tp_ep_group
                 )
 
             ## local_probs calculation
             # max_prob: [S/TP*B, num_experts] -> global_probs: [S*B*EP, num_experts]
             probs = gather_from_sequence_parallel_region(probs, group=self.tp_ep_group)
-
             # Note that this allgather spans the communication domain of TP*EP.
             #  [(S/TP)*B, H] -> [((S/TP)*B)*(TP*EP), H] = [S*B*EP, H]
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, group=self.tp_ep_group, use_global_buffer=True
             )
+
+        return hidden_states, probs
+
+    def dispatch_postprocess(self, hidden_states, probs):
+        """
+        Extract local expert assignments and perform token permutation for expert processing.
+
+        This method processes the globally gathered tokens to extract assignments for local
+        experts, computes per-expert token counts, and performs the permutation operation
+        that organizes tokens by expert assignment.
+
+        Args:
+            hidden_states (torch.Tensor): Hidden states after dispatch
+            probs (torch.Tensor): Routing probabilities for each token-expert pair
+
+        Returns:
+            torch.Tensor: Permuted hidden states for local experts.
+            torch.Tensor: Number of tokens assigned to each local expert.
+            torch.Tensor: Processed probabilities for local experts.
+        """
         self.hidden_shape_before_permute = hidden_states.shape
 
         # The routing map and probs that for local experts.
-        self.local_map = routing_map[
+        self.local_map = self.routing_map[
             :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
         ].contiguous()
         # probs of global token assignment to local experts.
@@ -203,28 +318,24 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.local_probs = self.local_probs.T.contiguous().masked_select(
             self.local_map.T.contiguous()
         )
-
+        self.routing_map = None
         return permuted_local_hidden_states, tokens_per_expert, self.local_probs
 
-    def token_unpermutation(self, hidden_states: torch.Tensor, bias: torch.Tensor = None):
+    def combine_preprocess(self, hidden_states):
         """
-        Reverse process of `dispatch()` which permutes the output of local
-        experts locallay and across expert parallel rank into the original order to
-        produce the final output.
+        Reverse token permutation to restore original ordering before reduction operations.
+
+        This method unpermutes the expert outputs using the cached permutation mapping
+        from the dispatch phase. The unpermutation operation restores tokens to their
+        original sequence positions, preparing them for the subsequent reduction scatter
+        operation that will aggregate results across ranks.
 
         Args:
-            hidden_states: 2D tensor [num_permuted_tokens_for_local_experts, H],
-            output of local experts.
-            bias (optional): The bias tensor.
+            hidden_states (torch.Tensor): Hidden states after expert processing.
 
         Returns:
-            output_total: un-permuted updated hidden states output from all local experts
-            with shape of [S/TP, B, H]
+            torch.Tensor: Unpermuted hidden states ready for combining.
         """
-        assert bias is None, "Bias is not supported in MoEAllGatherTokenDispatcher"
-
-        # Scale the expert output prior to reduction and subsequent to local unpermutation if k > 1.
-        # Unpermute the expert output and bias
         unpermuted_local_hidden = unpermute(
             hidden_states,
             self.reversed_local_input_permutation_mapping,
@@ -232,16 +343,42 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             routing_map=self.local_map,
             fused=self.config.moe_permute_fusion,
         )
-        output_total = unpermuted_local_hidden
+        return unpermuted_local_hidden
 
+    def token_combine(self, hidden_states):
+        """
+        Execute ReduceScatter communication to redistribute expert outputs back to original ranks.
+
+        This method performs the ReduceScatter communication operation to collect expert
+        outputs from their processing ranks and redistribute tokens back to the ranks that
+        are originally held. This completes the expert processing
+        communication pattern and prepares tokens for final unpermutation.
+
+        Args:
+            hidden_states (torch.Tensor): Preprocessed hidden states from expert processing.
+
+        Returns:
+            torch.Tensor: Combined tokens after reduction scatter.
+        """
         # Unpermute the tokens across ranks.
         if self.tp_size > 1 or self.ep_size > 1:
-            output_total = reduce_scatter_to_sequence_parallel_region(
-                output_total.to(self.local_probs.dtype), group=self.tp_ep_group
-            ).to(output_total.dtype)
+            hidden_states = reduce_scatter_to_sequence_parallel_region(
+                hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
+            ).to(hidden_states.dtype)
+        self.local_probs = None
+        return hidden_states
 
-        output_total = output_total.view(self.hidden_shape)
-        return output_total, None
+    def combine_postprocess(self, hidden_states):
+        """
+        Finalize token reconstruction and restore original tensor shape.
+
+        Args:
+            hidden_states (torch.Tensor): Combined hidden states from token combine
+
+        Returns:
+            torch.Tensor: Reshaped output matching the original input shape.
+        """
+        return hidden_states.view(self.hidden_shape)
 
 
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
@@ -249,9 +386,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     AlltoAll-based token dispatcher.
 
     The workflow of AlltoAll token dispatcher is as follows:
-    (1) preprocess(): calculate necessary metadata for communication and permute
-    (2) token_permutation(): permute->A2A(EP)->AG(TP)->sort_chunk(if num_local_experts>1)
-    (3) token_unpermutation(): sort_chunk(if num_local_experts>1)->RS(TP)->A2A(EP)->unpermute
+    (1) preprocess: calculate necessary metadata for communication and permute
+    (2) dispatch process: permute tokens
+    (3) token dispatch: A2A(EP)
+    (4) dispatch postprocess: AG(TP)->sort_chunk(if num_local_experts>1)
+    (5) combine preprocess: sort_chunk(if num_local_experts>1)->RS(TP)
+    (6) token combine: A2A(EP)
+    (7) combine postprocess: unpermute tokens
     """
 
     def __init__(
@@ -314,7 +455,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor
         self.capacity = None
 
-        # A cuda stream synchronization is needed in self.token_permutation() in some cases,
+        # A cuda stream synchronization is needed in during token permutation in some cases,
         # because there are several non-blocking DtoH data transfers called at
         # `self.cuda_dtoh_point`. The synchronization happens at `self.cuda_sync_point`, which is
         # decided based on the MoE and parallel settings. Valid points are "before_permutation_1",
@@ -461,8 +602,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         Preprocess hidden states for dispatching.
 
-        This method prepares the hidden states for dispatching by reshaping them and
-        performing the first permutation step. It also handles shared experts if they are enabled.
+        This method prepares the hidden states for dispatching by reshaping them and performing
+        the first permutation step. It also gathers cached_fc1_input for shared experts if
+        --moe-shared-expert-overlap is enabled.
 
         Args:
             hidden_states (torch.Tensor): Input token embeddings.
@@ -471,7 +613,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Returns:
             torch.Tensor: Preprocessed hidden states ready for dispatching.
             torch.Tensor: Preprocessed probs ready for dispatching.
-            torch.Tensor: Number of tokens per expert.
         """
         # Preprocess: Get the metadata for communication, permutation and computation operations.
         self.hidden_shape = hidden_states.shape
@@ -505,7 +646,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         )
         return permutated_local_input_tokens, permuted_probs
 
-    def dispatch_all_to_all(self, permutated_local_input_tokens, permuted_probs):
+    def token_dispatch(self, permutated_local_input_tokens, permuted_probs):
         """
         Perform all-to-all communication for dispatching tokens.
 
@@ -515,9 +656,11 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         Args:
             permutated_local_input_tokens (torch.Tensor): Preprocessed and permuted input tokens.
+            permuted_probs (torch.Tensor): Preprocessed and permuted probs.
 
         Returns:
             torch.Tensor: Tokens after all-to-all communication.
+            torch.Tensor: Probs after all-to-all communication.
         """
         # Perform expert parallel AlltoAll communication
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -537,14 +680,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         Postprocess tokens after all-to-all communication.
 
         This method performs postprocessing steps after all-to-all communication, including
-        handling shared experts, gathering from sequence parallel region if needed, and
-        sorting tokens by local expert if multiple local experts exist.
+        running fc1 of shared experts(if enabled), gathering from sequence parallel region
+        if needed, and sorting tokens by local expert if multiple local experts exist.
 
         Args:
             global_input_tokens (torch.Tensor): Tokens after all-to-all communication.
+            global_probs (torch.Tensor): Probs after all-to-all communication.
 
         Returns:
             torch.Tensor: Fully processed tokens ready for expert processing.
+            torch.Tensor: Fully processed probs ready for expert processing.
         """
         if self.shared_experts is not None:
             self.shared_experts.linear_fc1_forward_and_act(global_input_tokens)
@@ -604,49 +749,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = None
         return global_input_tokens, tokens_per_expert, global_probs
 
-    def token_permutation(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Dispatch tokens to local experts using AlltoAll communication.
-
-        This method performs the following steps:
-        1. Preprocess the routing map to get metadata for communication,
-            permutation and computation operations.
-        2. Permute input tokens for AlltoAll communication.
-        3. Perform expert parallel AlltoAll communication.
-        4. Sort tokens by local expert (if multiple local experts exist).
-
-        Args:
-            hidden_states (torch.Tensor): Input token embeddings.
-            probs (torch.Tensor): The probabilities of token to experts assignment.
-            routing_map (torch.Tensor): The mapping of token to experts assignment.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - Permuted token embeddings for local experts.
-                - Number of tokens per expert.
-                - Permuted probs of each token produced by the router.
-        """
-        # Preprocess: Get the metadata for communication, permutation and computation operations.
-        permutated_local_input_tokens, permuted_probs = self.dispatch_preprocess(
-            hidden_states, routing_map, probs
-        )
-        global_input_tokens, global_probs = self.dispatch_all_to_all(
-            permutated_local_input_tokens, permuted_probs
-        )
-        global_input_tokens, tokens_per_expert, global_probs = self.dispatch_postprocess(
-            global_input_tokens, global_probs
-        )
-
-        return global_input_tokens, tokens_per_expert, global_probs
-
     def combine_preprocess(self, hidden_states):
         """
-        Preprocess hidden states for combining after expert processing.
-
-        This method prepares the hidden states for combining by unsorting tokens by local expert
-        if multiple local experts exist, and reducing scatter to sequence parallel region if needed.
+        Preprocess hidden states for token combine after expert processing.
         """
         # Unpermutation 2: Unsort tokens by local expert.
         if self.num_local_experts > 1:
@@ -683,18 +788,20 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         return hidden_states
 
-    def combine_all_to_all(self, hidden_states):
+    def token_combine(self, hidden_states):
         """
-        Perform all-to-all communication for combining tokens.
+        Execute AlltoAll communication to redistribute expert outputs back to original ranks.
 
-        This method performs the all-to-all communication step to combine tokens across
-        expert parallel ranks after expert processing.
+        This method performs the inverse AlltoAll communication operation to collect expert
+        outputs from their processing ranks and redistribute them back to the ranks that
+        originally held the corresponding tokens. This completes the expert processing
+        communication pattern and prepares tokens for final unpermutation.
 
         Args:
             hidden_states (torch.Tensor): Preprocessed hidden states from expert processing.
 
         Returns:
-            torch.Tensor: Tokens after all-to-all communication for combining.
+            torch.Tensor: Tokens after AlltoAll communication for combining.
         """
         # Perform expert parallel AlltoAll communication
         # hidden_states: [SEQL, H] -> [SEQL, H/TP]
@@ -705,11 +812,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
     def combine_postprocess(self, permutated_local_input_tokens):
         """
-        Postprocess tokens after all-to-all communication for combining.
+        Finalize token reconstruction with unpermutation and shared expert integration.
 
-        This method performs postprocessing steps after all-to-all communication for combining,
-        including handling shared experts, unpermuting tokens to restore the original order,
-        and reshaping the output tensor.
+        This method performs the final computational steps to restore the original token
+        organization and integrate shared expert outputs. It handles the unpermutation
+        operation to restore tokens to their original sequence positions, tensor reshaping
+        to match input dimensions, and addition of shared expert outputs when enabled.
+
+        Args:
+            permutated_local_input_tokens (torch.Tensor): Permuted hidden states from token combine
+
+        Returns:
+            torch.Tensor: Post-processed hidden states ready for final output
         """
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(permutated_local_input_tokens)
@@ -733,35 +847,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             shared_expert_output = self.shared_experts.get_output()
             output += shared_expert_output
         return output
-
-    def token_unpermutation(
-        self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Reverse the token permutation to restore the original order.
-
-        This method performs the following steps:
-        1. Unsort tokens by local expert (if multiple local experts exist).
-        2. Perform expert parallel AlltoAll communication to restore the original order.
-        3. Unpermute tokens to restore the original order.
-
-        Args:
-            hidden_states (torch.Tensor): Output from local experts.
-            bias (torch.Tensor, optional): Bias tensor (not supported).
-
-        Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor]]:
-                - Unpermuted token embeddings in the original order.
-                - None (bias is not supported).
-
-        Raises:
-            AssertionError: If bias is not None.
-        """
-        assert bias is None, "Bias is not supported in MoEAlltoAllTokenDispatcher"
-        hidden_states = self.combine_preprocess(hidden_states)
-        permutated_local_input_tokens = self.combine_all_to_all(hidden_states)
-        output = self.combine_postprocess(permutated_local_input_tokens)
-        return output, None
 
     def _maybe_update_cuda_sync_point(self, point: str):
         """
@@ -1120,7 +1205,13 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """
-        Preprocesses the hidden states and routing information before dispatching tokens to experts.
+        Initialize routing metadata and prepare tensor layouts for DeepEP fused dispatch.
+
+        This method reshapes input tensors and processes routing information into the
+        unified format required by DeepEP's fused communication kernels. The routing
+        map is expanded to cover the TPxEP communication domain, enabling the DeepEP
+        backend to handle token distribution agnostic of specific parallelism strategies.
+
         Args:
             hidden_states (torch.Tensor): Input hidden states to be processed
             routing_map (torch.Tensor): Map indicating which expert each token should be routed to
@@ -1141,7 +1232,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
 
-    def dispatch_all_to_all(
+    def token_dispatch(
         self,
         hidden_states: torch.Tensor,
         probs: torch.Tensor = None,
@@ -1149,7 +1240,23 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         allocate_on_comm_stream: bool = True,
     ):
         """
-        Performs all-to-all communication to dispatch tokens across expert parallel ranks.
+        Execute fused permutation and AlltoAll communication using DeepEP kernels.
+
+        This method leverages DeepEP's fused dispatch kernel that combines token
+        permutation and AlltoAll communication in a single optimized operation.
+        The fused approach reduces memory bandwidth requirements and enables
+        better overlap between computation and communication operations.
+
+        Args:
+            hidden_states (torch.Tensor): Preprocessed hidden states to be dispatched
+            probs (torch.Tensor): Routing probabilities (unused in current implementation)
+            async_finish (bool): Whether to use asynchronous communication completion
+            allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
+
+        Returns:
+            Tuple containing:
+            - torch.Tensor: Dispatched tokens ready for expert processing
+            - torch.Tensor: Dispatched probabilities ready for expert processing
         """
         return (
             self._comm_manager.dispatch(hidden_states, async_finish, allocate_on_comm_stream),
@@ -1158,36 +1265,27 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
 
     def dispatch_postprocess(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """
-        Post-processes the dispatched hidden states after all-to-all communication.
+        Convert dispatched data to per-expert organization for efficient expert processing.
 
-        This method retrieves the permuted hidden states by experts, calculates the number of tokens
-        per expert, and returns the processed data ready for expert processing.
+        This method transforms the output of DeepEP's fused dispatch operation into
+        the tensor organization required for expert processing. It converts routing
+        indices back to multihot format and performs token permutation to group
+        tokens by expert assignment.
+
+        Args:
+            hidden_states (torch.Tensor): Hidden states after fused dispatch
+            probs (torch.Tensor): Routing probabilities after fused dispatch
+
+        Returns:
+            Tuple containing:
+            - torch.Tensor: Permuted tokens organized by expert assignment
+            - torch.Tensor: Number of tokens assigned to each expert
+            - torch.Tensor: Permuted probabilities aligned with token organization
         """
         global_input_tokens, permuted_probs = (
             self._comm_manager.get_permuted_hidden_states_by_experts(hidden_states)
         )
         tokens_per_expert = self._comm_manager.get_number_of_tokens_per_expert()
-        return global_input_tokens, tokens_per_expert, permuted_probs
-
-    def token_permutation(
-        self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Permutes tokens according to the routing map and dispatches them to experts.
-
-        This method implements the token permutation process in three steps:
-        1. Preprocess the hidden states and routing information
-        2. Perform all-to-all communication to dispatch tokens
-        3. Post-process the dispatched tokens for expert processing
-        """
-        hidden_states, _ = self.dispatch_preprocess(hidden_states, routing_map, probs)
-        hidden_states, _ = self.dispatch_all_to_all(
-            hidden_states, async_finish=False, allocate_on_comm_stream=False
-        )
-        global_input_tokens, tokens_per_expert, permuted_probs = self.dispatch_postprocess(
-            hidden_states, None
-        )
-
         return global_input_tokens, tokens_per_expert, permuted_probs
 
     def combine_preprocess(self, hidden_states: torch.Tensor):
@@ -1200,39 +1298,40 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         hidden_states = self._comm_manager.get_restored_hidden_states_by_experts(hidden_states)
         return hidden_states
 
-    def combine_all_to_all(
+    def token_combine(
         self,
         hidden_states: torch.Tensor,
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ):
         """
-        Performs all-to-all communication to combine tokens after expert processing.
+        Execute fused unpermutation and AlltoAll communication using DeepEP kernels.
+
+        This method uses DeepEP's fused combine kernel that reverses the dispatch
+        operation by performing unpermutation and AlltoAll communication in a single
+        optimized operation.
+
+        Args:
+            hidden_states (torch.Tensor): Expert outputs ready for combination
+            async_finish (bool): Whether to use asynchronous communication completion
+            allocate_on_comm_stream (bool): Whether to allocate buffers on communication stream
+
+        Returns:
+            torch.Tensor: Combined tokens after fused unpermutation and communication
         """
         return self._comm_manager.combine(hidden_states, async_finish, allocate_on_comm_stream)
 
     def combine_postprocess(self, hidden_states: torch.Tensor):
         """
-        Post-processes the combined hidden states after all-to-all communication.
+        Restore original tensor shape and finalize MoE layer output.
 
-        This method reshapes the combined hidden states to match the original input shape.
+        This method performs the final step of the MoE token processing pipeline
+        by reshaping the combined tokens back to their original input dimensions.
+
+        Args:
+            hidden_states (torch.Tensor): Combined tokens from fused combine operation
+
+        Returns:
+            torch.Tensor: Final MoE layer output reshaped to original dimensions
         """
         return hidden_states.view(self.hidden_shape)
-
-    def token_unpermutation(
-        self, hidden_states: torch.Tensor, bias: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Reverses the token permutation process to restore the original token order.
-
-        This method implements the token unpermutation process in three steps:
-        1. Pre-process the hidden states to restore their original ordering
-        2. Perform all-to-all communication to combine tokens
-        3. Post-process the combined tokens to match the original input shape
-        """
-        assert bias is None, "Bias is not supported in MoEFlexTokenDispatcher"
-        hidden_states = self.combine_preprocess(hidden_states)
-        hidden_states = self.combine_all_to_all(hidden_states, False, False)
-        hidden_states = self.combine_postprocess(hidden_states)
-
-        return hidden_states, None

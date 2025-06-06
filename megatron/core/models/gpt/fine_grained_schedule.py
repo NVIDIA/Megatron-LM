@@ -373,7 +373,7 @@ def schedule_chunk_1f1b(
         assert b_grad is not None
 
         if pre_backward is not None:
-            # FakeScheduleNode means the post_process node is running in the communication stream,
+            # FakeScheduleNode means the post_process node is running in the communication stream
             if isinstance(b_schedule_plan.post_process, FakeScheduleNode):
                 stream = get_com_stream()
             else:

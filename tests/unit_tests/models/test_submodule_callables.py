@@ -6,9 +6,15 @@ from megatron.core.models.gpt.fine_grained_callables import build_layer_callable
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
+from tests.unit_tests.a2a_overlap.utils import (
+    DummyNode,
+    build_data,
+    compare_captures,
+    deterministic_mode,
+    get_test_config,
+    reset_model,
+)
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.a2a_overlap.utils import build_data, compare_captures, deterministic_mode, reset_model, get_test_config, DummyNode
-
 
 
 def run_model_ref_with_capture(model, input_tensors, iterations):
@@ -97,7 +103,6 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         capture[name] = param.grad
 
     return capture
-
 
 
 class TestTransformerLayerSubmoduleCallables:

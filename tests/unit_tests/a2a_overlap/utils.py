@@ -3,8 +3,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
-from megatron.training.initialize import _set_random_seed
+
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.training.initialize import _set_random_seed
 
 
 @dataclass
@@ -15,6 +16,7 @@ class DummyState:
     This class is used to simulate the state object that would normally be passed
     to transformer layers in a real model.
     """
+
     def __getattr__(self, name):
         """
         Get an attribute from the state. If the attribute is not found, set it to None and return None.
@@ -30,9 +32,10 @@ class DummyNode:
     This class is used to simulate the node object that would normally be passed
     to transformer layers in a real model.
     """
+
     common_state = DummyState()
     chunk_state = DummyState()
-    
+
     def detach(self, x):
         return x
 
@@ -189,7 +192,7 @@ def compare_captures(capture_ref, capture_a2a_overlap, verbose=False, skip_embed
     return True, "pass"
 
 
-def get_test_config(num_layers=16, num_moe_experts=16, extra_kwargs={},):
+def get_test_config(num_layers=16, num_moe_experts=16, extra_kwargs={}):
     config = MLATransformerConfig(
         attention_backend="unfused",
         pipeline_model_parallel_size=1,

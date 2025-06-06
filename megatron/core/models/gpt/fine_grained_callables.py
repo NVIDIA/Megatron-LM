@@ -314,19 +314,17 @@ def build_transformer_layer_callables(layer):
             )
         else:
             pre_mlp_layernorm_output = layer.pre_mlp_layernorm(hidden_states)
-        probs, routing_map = layer.mlp.router(pre_mlp_layernorm_output)
+
+        local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
+
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
             # as a gradient hook of unpermuted probs
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(probs)
-
-        local_tokens, probs = layer.mlp.token_dispatcher.dispatch_preprocess(
-            pre_mlp_layernorm_output, routing_map, probs
-        )
+            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(local_tokens)
 
         # Detach here for mlp_bda residual connection
         node.common_state.residual = node.detach(hidden_states)
-        if layer.mlp.use_shared_expert:
+        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
             # Detach here for shared expert connection
             node.common_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
 
@@ -342,7 +340,7 @@ def build_transformer_layer_callables(layer):
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
 
-        return token_dispatcher.dispatch_all_to_all(local_tokens, probs)
+        return layer.mlp.dispatch(local_tokens, probs)
 
     def submodule_moe_forward(node, dispatched_tokens, probs):
         """
@@ -355,18 +353,11 @@ def build_transformer_layer_callables(layer):
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = probs
-        dispatched_tokens, tokens_per_expert, permuted_probs = (
-            token_dispatcher.dispatch_postprocess(dispatched_tokens, probs)
+
+        pre_mlp_layernorm_output = getattr(node.common_state, 'pre_mlp_layernorm_output', None)
+        expert_output, shared_expert_output, mlp_bias = layer.mlp.experts_compute(
+            dispatched_tokens, probs, pre_mlp_layernorm_output
         )
-        expert_output, mlp_bias = layer.mlp.experts(
-            dispatched_tokens, tokens_per_expert, permuted_probs
-        )
-        assert mlp_bias is None, f"Bias is not supported in {token_dispatcher.__class__.__name__}"
-        if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
-            shared_expert_output = layer.mlp.shared_experts(
-                node.common_state.pre_mlp_layernorm_output
-            )
-        expert_output = layer.mlp.token_dispatcher.combine_preprocess(expert_output)
 
         # release tensor reference after use
         node.common_state.pre_mlp_layernorm_output = None
@@ -380,12 +371,10 @@ def build_transformer_layer_callables(layer):
         Combines tokens and performs post processing.
         """
         residual = node.common_state.residual
-        token_dispatcher = layer.mlp.token_dispatcher
-        output = token_dispatcher.combine_all_to_all(output)
-        output = token_dispatcher.combine_postprocess(output)
-        if shared_expert_output is not None:
-            output = output + shared_expert_output
+
+        output = layer.mlp.combine(output, shared_expert_output)
         mlp_output_with_bias = (output, None)
+
         with layer.bias_dropout_add_exec_handler():
             hidden_states = layer.mlp_bda(layer.training, layer.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, layer.hidden_dropout
