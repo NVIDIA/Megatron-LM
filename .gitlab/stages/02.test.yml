@@ -8,9 +8,43 @@
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
+wait_for_resources:
+  extends: [.test_rules]
+  needs:
+    - test:linting_formatting
+    - test:linting_copyright
+    - job: test:linting_secret_detection
+      optional: true
+    - test:build_image
+  image: python:3.10
+  timeout: 7 days
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - pip install --no-cache-dir python-gitlab click
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export NUM_CONCURRENT_JOBS
+    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
+  rules:
+    - if: $CI_MERGE_REQUEST_LABELS =~ /fast-track/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: on_success
+    - when: never
+
 test:unit_tests_configure:
   extends: [.test_rules]
-  needs: [test:build_image]
+  needs:
+    - test:build_image
+    - job: wait_for_resources
+      optional: true
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - arch/amd64

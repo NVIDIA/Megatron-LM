@@ -84,48 +84,50 @@ if [ ! -d "$RECIPES_DIR" ]; then
     exit 1
 fi
 
+# Create copy of recipes with interpolated artifacts
+python -m tests.test_utils.python_scripts.common --recipes-dir $RECIPES_DIR --output-dir $RECIPES_DIR/interpolated
+
 # Add current directory to container mounts
 CONTAINER_MOUNTS="$(pwd):/opt/megatron-lm"
 
 # Process each YAML file in the recipes directory
-for YAML_FILE in "$RECIPES_DIR"/*.yaml; do
-    if [ ! -f "$YAML_FILE" ]; then
+if [ ! -f "$YAML_FILE" ]; then
+    continue
+fi
+
+echo "Processing $(basename "$YAML_FILE")..."
+YAML_FILE=workflows.yaml
+# Extract artifacts from YAML file
+while IFS=: read -r value key; do
+    # Skip empty or malformed entries
+    if [ -z "$value" ] || [ -z "$key" ] || [ "$value" = "/data/" ] || [ "$key" = "/data/" ]; then
         continue
     fi
 
-    echo "Processing $(basename "$YAML_FILE")..."
+    # Skip entries that don't start with a forward slash
+    if [[ ! "$key" =~ ^/ ]]; then
+        continue
+    fi
 
-    # Extract artifacts from YAML file
-    while IFS=: read -r value key; do
-        # Skip empty or malformed entries
-        if [ -z "$value" ] || [ -z "$key" ] || [ "$value" = "/data/" ] || [ "$key" = "/data/" ]; then
-            continue
-        fi
+    # Create the mount string
+    mount="${DATASET_DIR}/${value}:${key}"
 
-        # Skip entries that don't start with a forward slash
-        if [[ ! "$key" =~ ^/ ]]; then
-            continue
-        fi
+    # Skip if we've seen this mount before
+    if [ "${seen_mounts[$mount]}" = "1" ]; then
+        echo "Skipping duplicate mount: $mount"
+        continue
+    fi
 
-        # Create the mount string
-        mount="${DATASET_DIR}/${value}:${key}"
+    # Mark this mount as seen
+    seen_mounts[$mount]=1
 
-        # Skip if we've seen this mount before
-        if [ "${seen_mounts[$mount]}" = "1" ]; then
-            echo "Skipping duplicate mount: $mount"
-            continue
-        fi
-
-        # Mark this mount as seen
-        seen_mounts[$mount]=1
-
-        if [ -z "$CONTAINER_MOUNTS" ]; then
-            CONTAINER_MOUNTS="$mount"
-        else
-            CONTAINER_MOUNTS="${CONTAINER_MOUNTS},$mount"
-        fi
-    done < <(yq eval '.spec.artifacts | to_entries | .[] | "\(.value):\(.key)"' "$YAML_FILE")
-done
+    if [ -z "$CONTAINER_MOUNTS" ]; then
+        CONTAINER_MOUNTS="$mount"
+    else
+        CONTAINER_MOUNTS="${CONTAINER_MOUNTS},$mount"
+    fi
+done < <(yq eval '.[].spec.artifacts | to_entries | .[] | "\(.value):\(.key)"' "$YAML_FILE")
+rm $YAML_FILE
 
 # Build the final srun command
 SRUN_CMD="srun \

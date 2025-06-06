@@ -60,13 +60,13 @@ def launch_and_wait_for_completion(
 ) -> jetclient.JETPipeline:
     cluster_config = {"account": account}
     if partition is not None:
-        cluster_config['partition'] = partition
+        cluster_config["partition"] = partition
 
     n_submission_attempts = 0
     while n_submission_attempts < 3:
         try:
             pipeline = jetclient.JETClient(
-                customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
+                customer="mcore", gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
             ).workloads.submit(
                 workloads=common.load_workloads(
                     test_case=test_case,
@@ -199,7 +199,6 @@ def extract_main_log_to_string(logs_path: pathlib.Path) -> List[str]:
         for stdout_file in restart_dir.glob(
             "assets/basic/*/jet_assets/output_logs/output_script-0.log"
         ):
-
             # Read log file
             try:
                 with open(stdout_file) as f:
@@ -239,8 +238,8 @@ def telemetrics_and_exit(
                 "environment": environment,
                 "is_integration_test": is_integration_test,
                 "duration_seconds": (
-                    pd.Timestamp.now(tz='UTC')
-                    - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz='UTC')
+                    pd.Timestamp.now(tz="UTC")
+                    - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz="UTC")
                 ).total_seconds(),
                 "is_merge_request": os.getenv("CI_MERGE_REQUEST_IID") is not None,
                 "ci_merge_request_iid": os.getenv("CI_MERGE_REQUEST_IID"),
@@ -256,7 +255,7 @@ def telemetrics_and_exit(
     res = requests.post(
         DASHBOARD_ENDPOINT,
         data=payload,
-        headers={'Content-Type': 'application/json', 'Accept-Charset': 'UTF-8'},
+        headers={"Content-Type": "application/json", "Accept-Charset": "UTF-8"},
     )
 
     if not res.ok:
@@ -270,7 +269,7 @@ def telemetrics_and_exit(
 @click.option("--model", required=True, type=str, help="Model")
 @click.option("--test-case", required=True, type=str, help="Test case")
 @click.option(
-    "--environment", required=True, type=click.Choice(['dev', 'lts']), help="Pytorch LTS or DEV"
+    "--environment", required=True, type=click.Choice(["dev", "lts"]), help="Pytorch LTS or DEV"
 )
 @click.option("--n-repeat", required=False, default=1, type=int)
 @click.option("--time-limit", required=False, default=1800, type=int)
@@ -327,7 +326,7 @@ def main(
     enable_lightweight_mode: bool = False,
 ):
     logging.basicConfig(level=logging.INFO)
-    logger.info('Started')
+    logger.info("Started")
 
     model_config_path = pathlib.Path(
         BASE_PATH
@@ -347,11 +346,11 @@ def main(
             except yaml.YAMLError as exc:
                 print(exc)
 
-        test_type = test_case_dict['TEST_TYPE']
+        test_type = test_case_dict["TEST_TYPE"]
     else:
         test_type = "unit_test"
 
-    logger.info('test_type will be %s', test_type)
+    logger.info("test_type will be %s", test_type)
 
     if test_type == "release" and (run_name is None or wandb_experiment is None):
         logger.error(f"Not all arguments provided ({run_name=}, {wandb_experiment=})")
@@ -387,6 +386,7 @@ def main(
                 jet_log = main_job.get_logs()
                 assets_base_path = download_job_assets(logs=jet_log, iteration=n_iteration)
                 if assets_base_path is None:
+                    no_log = True
                     break
                 allranks_logs = extract_torchrunlogs_to_string(logs_path=assets_base_path)
                 mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
@@ -402,7 +402,7 @@ def main(
                 time.sleep(2 * n_download_attempt * 15)
                 n_download_attempt += 1
                 no_log = True
-            except (KeyError, IndexError) as e:
+            except Exception as e:
                 logger.error(e)
                 no_log = True
                 break
@@ -470,6 +470,8 @@ def main(
                 or "illegal memory access" in concat_allranks_logs
                 or "illegal instruction" in concat_allranks_logs
                 or "torch.distributed.DistNetworkError" in concat_allranks_logs
+                or "Segmentation fault" in concat_allranks_logs
+                or "found NaN in local forward loss calculation" in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1

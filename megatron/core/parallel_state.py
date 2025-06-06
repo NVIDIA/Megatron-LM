@@ -132,16 +132,24 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
     Args:
         pg_name (str): process group name
         nccl_comm_cfgs (dict): nccl communicator configurations
-
     When an option (e.g., max_ctas) is not found in the config, use the NCCL default setting.
     """
     if pg_name in nccl_comm_cfgs:
-        nccl_options = torch.distributed.ProcessGroupNCCL.Options()
-        nccl_options.config.cga_cluster_size = nccl_comm_cfgs[pg_name].get('cga_cluster_size', 4)
-        nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name].get('max_ctas', 32)
-        nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name].get('min_ctas', 1)
+        # When fields in nccl_options.config are not specified, NCCL applies default settings.
+        # The default values for Hopper GPUs are as follows:
+        # cga_cluster_size = 4, max_ctas = 32, min_ctas = 1
+        # Default values may differ between GPU generations and NCCL versions.
+        nccl_options = torch.distributed.ProcessGroupNCCL.Options(
+            is_high_priority_stream=nccl_comm_cfgs[pg_name].get('is_high_priority_stream', False)
+        )
+        if 'cga_cluster_size' in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.cga_cluster_size = nccl_comm_cfgs[pg_name]['cga_cluster_size']
+        if 'max_ctas' in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name]['max_ctas']
+        if 'min_ctas' in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name]['min_ctas']
         if 'net_name' in nccl_comm_cfgs[pg_name]:
-            nccl_options.config.net_name = nccl_comm_cfgs[pg_name].get('net_name')
+            nccl_options.config.net_name = nccl_comm_cfgs[pg_name]['net_name']
             # verify net_name value
             if nccl_options.config.net_name.lower() not in ['ib', 'socket']:
                 raise RuntimeError(
@@ -453,6 +461,13 @@ def default_position_embedding_ranks(pp_ranks, split_rank=None):
         return [pp_ranks[0]]
 
 
+def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
+    """Overwrite the nccl_comm_cfgs for the given pg_name with the given key_value_pair."""
+    if pg_name not in nccl_comm_cfgs:
+        nccl_comm_cfgs[pg_name] = {}
+    nccl_comm_cfgs[pg_name][key_value_pair[0]] = key_value_pair[1]
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -473,6 +488,7 @@ def initialize_model_parallel(
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
+    high_priority_stream_groups: Optional[List[str]] = [],
 ) -> None:
     # pylint: disable=line-too-long
     """Initialize model data parallel groups.
@@ -595,6 +611,13 @@ def initialize_model_parallel(
             Create Gloo process groups if set to True. If set to False, Gloo process groups are
             not created and calls to get Gloo process groups will result in assertion errors.
 
+        high_priority_stream_groups (List[str], default = []):
+            Specify which communicator groups should use high priority streams during creation.
+            Assigning high priority to communication streams ensures that communication kernels
+            are scheduled with higher priority, minimizing the exposed communication when it is
+            overlapped with other computation kernels.
+            Example: initialize_parallel_groups(..., high_priority_stream_groups=['dp_cp','ep_dp'])
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -691,6 +714,10 @@ def initialize_model_parallel(
 
         with open(nccl_communicator_config_path, "r") as stream:
             nccl_comm_cfgs = yaml.safe_load(stream)
+
+    # Set is_high_priority_stream flag to the nccl_comm_cfgs if it is in high_priority_stream_groups
+    for pg_name in high_priority_stream_groups:
+        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ('is_high_priority_stream', True))
 
     if encoder_world_size > 0:
         encoder_rank_generator = RankGenerator(

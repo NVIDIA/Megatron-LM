@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import re
 import types
 import warnings
 
@@ -258,6 +259,16 @@ def load_retro_args(args):
     args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
     args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
 
+def _eval_pattern(pattern):
+    """ Validate and evaluate a string containing a Python list expression """
+    assert isinstance(pattern, str)
+
+    # validate input, only allow comma, digits, [, ], (, ), +, and *
+    if bool(re.compile(r'[^,\d\[\]\(\)\+\*]').search(pattern)):
+        raise ValueError(f"Invalid pattern: {pattern}")
+
+    return eval(pattern)
+
 def no_rope_freq_type(x):
     """ Controls which layers to skip performing Rotary Position Embedding.
     - An integer N: Represents a 1:N ratio, meaning RoPE is skipped every N-1 layers.
@@ -276,8 +287,7 @@ def no_rope_freq_type(x):
     assert isinstance(x, str)
     if '[' in x:
         # it's a custom pattern
-        pattern = eval(x)
-        return pattern
+        return _eval_pattern(x)
     else:
         # it's a single int but in str
         return int(x)
@@ -302,8 +312,7 @@ def moe_freq_type(x):
     assert isinstance(x, str)
     if '[' in x:
         # it's a custom pattern
-        pattern = eval(x)
-        return pattern
+        return _eval_pattern(x)
     else:
         # it's a single int but in str
         return int(x)
@@ -822,6 +831,15 @@ def validate_args(args, defaults={}):
             assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1"
+
+    # Setting FSDP communication groups for high priority streams for Blackwell and later architectures
+    # Assigning high priority to communication streams ensures that communication kernels are scheduled
+    # with higher priority, minimizing the exposed communication when it is overlapped with other computation kernels.
+    if args.use_torch_fsdp2 or args.use_custom_fsdp and get_device_arch_version() >= 10:
+        if 'dp_cp' not in args.high_priority_stream_groups:
+            args.high_priority_stream_groups.append('dp_cp')
+        if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
+            args.high_priority_stream_groups.append('ep_dp')
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -1943,6 +1961,8 @@ def _add_training_args(parser):
                        choices=['nccl', 'ucc'],
                        help='Select a communicator backend for pipeline parallel communication. '
                        'If None, the default backend will be used.')
+    group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
+                       help='The communicator group names to use high priority streams.')
 
     return parser
 
@@ -2153,6 +2173,9 @@ def _add_checkpointing_args(parser):
                             ' Check StrictHandling docs for flags meaning.'
                             ' NOTE: This flag controls only distributed checkpoint'
                             ' load from storage, not loading state dict into the model.')
+    group.add_argument('--load-model-opt-format', action='store_true',
+                       help='Load a checkpoint for TensorRT model optimizer (nvidia-modelopt).'
+                            'This function can also be used to load NeMo .nemo sharded checkpoints.')
     return parser
 
 
@@ -2638,6 +2661,8 @@ def _add_vision_args(parser):
     # regularization arguments
     group.add_argument('--qk-layernorm', action='store_true',
                        help='Whether to layer normalize the q and k attention embeddings.')
+    group.add_argument('--qk-l2-norm', action='store_true',
+                       help='Use llama 4 qk l2 norm')
 
     return parser
 
@@ -2752,6 +2777,8 @@ def _add_moe_args(parser):
     group.add_argument('--delay-wgrad-compute', action='store_true',
                        help='Delay the wgrad compute for batch-level overlapping')                       
 
+    group.add_argument('--moe-apply-probs-on-input', action='store_true',
+                       help='Apply probs before mlp activation for moe routing.')
     return parser
 
 def _add_mla_args(parser):

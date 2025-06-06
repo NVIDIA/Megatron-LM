@@ -340,34 +340,20 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
-    from run_text_generation import generate_and_write_samples
+    # Import the common evaluation functions
+    from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
-    with open(args.online_evaluation_config, "r") as f:
-        config_dict = yaml.safe_load(f)['datasets']
+    # Use the common config loading function
+    configs = get_evaluation_configs(config_path=args.online_evaluation_config)
 
-    scores = {}
-
-    for key, value in config_dict.items():
-        config = EvaluationConfig(**value)
-
-        # The inference code assumes the first rank is the leader.
-        # Tensorboard writer is on the last rank.
-        # We must write to a storage space that all ranks see.
-        output_dir = os.path.join(args.save, "online_eval")
-        os.makedirs(output_dir, exist_ok=True)
-        config.output_path = os.path.join(output_dir, args.language_model_type + '-' + key)
-
-        # The actual generation.
-        generate_and_write_samples(model[0].module, config, print_output=False)
-
-        # Make sure the first rank is done writing so that the last rank can run eval.
-        torch.distributed.barrier()
-
-        if is_last_rank():
-            from run_text_generation import run_eval
-            scores.update(run_eval(config))
-
-        torch.distributed.barrier()
+    # The inference code assumes the first rank is the leader.
+    # Tensorboard writer is on the last rank.
+    # We must write to a storage space that all ranks see.
+    output_dir = os.path.join(args.save, "online_eval")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Use the common evaluation loop
+    scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
 
     return [scores]
 

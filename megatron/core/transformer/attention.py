@@ -330,8 +330,18 @@ class Attention(MegatronModule, ABC):
             # Flash Decoding assumes that the keys stored in the KV Cache already have RoPE applied.
             # Apply RoPE before we store the keys to make it compatible with flash decoding kernel
             if rotary_pos_sin_q is not None and rotary_pos_sin_k is not None:
-                key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos_k, rotary_pos_sin_k)
-                query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos_q, rotary_pos_sin_q)
+                key = apply_rotary_pos_emb_with_cos_sin(
+                    key,
+                    rotary_pos_cos_k,
+                    rotary_pos_sin_k,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
+                query = apply_rotary_pos_emb_with_cos_sin(
+                    query,
+                    rotary_pos_cos_q,
+                    rotary_pos_sin_q,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
         else:
             rotary_pos_cos_q = None
             rotary_pos_sin_q = None
@@ -387,6 +397,7 @@ class Attention(MegatronModule, ABC):
         inference_value_memory: Tensor,
         rotary_cos: Tensor,
         rotary_sin: Tensor,
+        rotary_interleaved: bool = False,
     ) -> (Tensor, Tensor):
         """
         The flash decoding kernel will do the following in a single execution:
@@ -418,7 +429,7 @@ class Attention(MegatronModule, ABC):
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
             cache_seqlens=sequence_len_offset,
-            rotary_interleaved=False,
+            rotary_interleaved=rotary_interleaved,
         )
         return out
 
@@ -623,6 +634,7 @@ class Attention(MegatronModule, ABC):
                 inference_value_memory=inference_value_memory,
                 rotary_cos=rotary_pos_cos,
                 rotary_sin=rotary_pos_sin,
+                rotary_interleaved=self.config.rotary_interleaved,
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)

@@ -617,6 +617,9 @@ class TransformerBlock(MegatronModule):
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False
         )
+        if self.config.hetereogenous_dist_checkpoint:
+            non_homogeneous_layers = True
+
         if isinstance(self.config.moe_layer_freq, int):
             if self.config.moe_layer_freq > 1:
                 non_homogeneous_layers = True

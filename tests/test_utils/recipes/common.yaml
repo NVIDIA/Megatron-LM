@@ -47,6 +47,7 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+        platforms: [dgx_a100]

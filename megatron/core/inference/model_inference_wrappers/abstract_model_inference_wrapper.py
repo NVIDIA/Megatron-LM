@@ -202,8 +202,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         logits = self._forward(inference_input)
         logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits, self.tp_group)
-        if self.inference_context.is_static_batching():
-            self.inference_context.sequence_len_offset += tokens.size(1)
+        self.inference_context.increment_sequence_len_offset(tokens.size(1))
 
         return logits
 
@@ -239,7 +238,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
                 output_tensor.type(dtype=self.pipeline_communication_dtype), self.pp_group
             )
 
-        self.inference_context.sequence_len_offset += seq_len
+        self.inference_context.increment_sequence_len_offset(seq_len)
 
         logits = None
         if is_pipeline_last_stage(self.pp_group):
@@ -340,8 +339,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             logits = logits.to(self.inference_wrapper_config.params_dtype)
 
         # Once done with all micro batches, we reset batch size offset and seq len offset
-        self.inference_context.sequence_len_offset += seq_len
-        self.inference_context.batch_size_offset = 0
+        self.inference_context.increment_sequence_len_offset(seq_len)
+        self.inference_context.reset_batch_size_offset()
 
         # NOTE: Only returns the logits on the last pipeline stage
         return logits
