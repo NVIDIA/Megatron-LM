@@ -488,7 +488,7 @@ def initialize_model_parallel(
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
-    high_priority_stream_groups: Optional[List[str]] = [],
+    high_priority_stream_groups: Optional[List[str]] = None,
 ) -> None:
     # pylint: disable=line-too-long
     """Initialize model data parallel groups.
@@ -611,7 +611,7 @@ def initialize_model_parallel(
             Create Gloo process groups if set to True. If set to False, Gloo process groups are
             not created and calls to get Gloo process groups will result in assertion errors.
 
-        high_priority_stream_groups (List[str], default = []):
+        high_priority_stream_groups (List[str], default = None):
             Specify which communicator groups should use high priority streams during creation.
             Assigning high priority to communication streams ensures that communication kernels
             are scheduled with higher priority, minimizing the exposed communication when it is
@@ -716,6 +716,7 @@ def initialize_model_parallel(
             nccl_comm_cfgs = yaml.safe_load(stream)
 
     # Set is_high_priority_stream flag to the nccl_comm_cfgs if it is in high_priority_stream_groups
+    high_priority_stream_groups = high_priority_stream_groups or []
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ('is_high_priority_stream', True))
 
