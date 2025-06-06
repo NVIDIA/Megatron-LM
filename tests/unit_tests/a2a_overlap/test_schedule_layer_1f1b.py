@@ -6,9 +6,7 @@ import torch
 
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.fine_grained_schedule import LayerSchedulePlan, schedule_layer_1f1b
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
@@ -104,6 +102,7 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
         capture[name] = param.grad
 
     return capture
+
 
 class TestA2AOverlap:
     """

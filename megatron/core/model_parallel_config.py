@@ -316,7 +316,9 @@ class ModelParallelConfig:
     """If true, use batch-level overlapping in 1f1b stage for A2A communication hiding."""
 
     delay_wgrad_compute: bool = False
-    """If true, delay the wgrad compute for better overlapping in overlap_moe_expert_parallel_comm."""
+    """If true, delay the wgrad compute for better overlapping
+       in overlap_moe_expert_parallel_comm.
+   """
 
     ###################
     # CPU Offloading

@@ -1250,11 +1250,10 @@ def forward_backward_pipelining_with_interleaving(
         post_forward=None,
         post_backward=None,
     ):
-        """Helper method to run combined forward and backward step for overlap_moe_expert_parallel_comm execution.
+        """Helper method to run combined forward and backward step for A2A communication hiding.
         This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
         eventually calls `forward_backward_step` function defined in `combined_1f1b.py`.
         This method is called only if `overlap_moe_expert_parallel_comm` is true."""
-        assert config.overlap_moe_expert_parallel_comm, "overlap_moe_expert_parallel_comm must be true"
 
         # forward prepare
         f_model_chunk_id = None
@@ -1348,9 +1347,6 @@ def forward_backward_pipelining_with_interleaving(
         wrap forward_helper, backward_helper, and combined_forward_backward_helper in a unified way
         """
         if config.overlap_moe_expert_parallel_comm and not forward_only:  # Combined 1F1B path
-            assert (
-                checkpoint_activations_microbatch is None
-            ), "checkpoint_activations_microbatch not supported when overlap_moe_expert_parallel_comm is true"
 
             return combined_forward_backward_helper(
                 f_virtual_microbatch_id=f_virtual_microbatch_id,
