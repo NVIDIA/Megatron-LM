@@ -86,7 +86,7 @@ def forward_backward_step(
     current_microbatch=None,
     encoder_decoder_xattn=False,
 ):
-    """Merged forward and backward step for combined_1f1b.
+    """Merged forward and backward step for overlap_moe_expert_parallel_comm.
 
     Args:
         Need to accept the argument of both forward_step() and backward_step().
@@ -128,12 +128,7 @@ def forward_backward_step(
     """
     assert (
         checkpoint_activations_microbatch is None
-    ), "checkpoint_activations_microbatch is not supported for combined_1f1b"
-
-    if config.combined_1f1b_recipe != "ep_a2a":
-        raise NotImplementedError(
-            f"combined_1f1b_recipe {config.combined_1f1b_recipe} not supported yet"
-        )
+    ), "checkpoint_activations_microbatch is not supported for overlap_moe_expert_parallel_comm"
 
     from .schedules import set_current_microbatch
 

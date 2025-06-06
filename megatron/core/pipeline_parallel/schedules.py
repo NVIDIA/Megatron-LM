@@ -523,13 +523,10 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
-    if config.combined_1f1b and not forward_only:
-        assert (
-            config.combined_1f1b_recipe == "ep_a2a"
-        ), "only ep_a2a recipe is supported for combined_1f1b"
+    if config.overlap_moe_expert_parallel_comm and not forward_only:
         f_context = contextlib.nullcontext()
         b_context = contextlib.nullcontext()
-        # in combined_1f1b, we need to wrap the forward_step_func
+        # in overlap_moe_expert_parallel_comm, we need to wrap the forward_step_func
         # to return a schedule plan instead of the forward output tensor
         forward_step_func = wrap_forward_func(forward_step_func)
         set_streams()
@@ -701,7 +698,7 @@ def get_pp_rank_microbatches(
     num_model_chunks,
     microbatch_group_size_per_vp_stage,
     forward_only=False,
-    combined_1f1b=False,
+    overlap_moe_expert_parallel_comm=False,
 ):
     """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -725,9 +722,9 @@ def get_pp_rank_microbatches(
             # immediately start with 1F1B).
             num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
             num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
-            # When enabling combined_1f1b, we need to add one more microbatch
+            # When enabling overlap_moe_expert_parallel_comm, we need to add one more microbatch
             # before 1f1b stages for a2a overlap.
-            if combined_1f1b:
+            if overlap_moe_expert_parallel_comm:
                 num_warmup_microbatches = num_warmup_microbatches + 1
     else:
         # forward_backward_no_pipelining
@@ -841,8 +838,8 @@ def forward_backward_pipelining_with_interleaving(
 
     config = get_model_config(model[0])
     set_streams()
-    if config.combined_1f1b and not forward_only:
-        # in combined_1f1b, we need to wrap the forward_step_func
+    if config.overlap_moe_expert_parallel_comm and not forward_only:
+        # in overlap_moe_expert_parallel_comm, we need to wrap the forward_step_func
         # to return a schedule plan instead of the forward output tensor
         forward_step_func = wrap_forward_func(forward_step_func)
     if config.overlap_p2p_comm and config.batch_p2p_comm:
@@ -975,7 +972,7 @@ def forward_backward_pipelining_with_interleaving(
         num_model_chunks,
         config.microbatch_group_size_per_vp_stage,
         forward_only,
-        config.combined_1f1b,
+        config.overlap_moe_expert_parallel_comm,
     )
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
@@ -1253,11 +1250,11 @@ def forward_backward_pipelining_with_interleaving(
         post_forward=None,
         post_backward=None,
     ):
-        """Helper method to run combined forward and backward step for `combined_1f1b` execution.
+        """Helper method to run combined forward and backward step for overlap_moe_expert_parallel_comm execution.
         This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
         eventually calls `forward_backward_step` function defined in `combined_1f1b.py`.
-        This method is called only if `combined_1f1b` is true."""
-        assert config.combined_1f1b, "combined_1f1b must be true"
+        This method is called only if `overlap_moe_expert_parallel_comm` is true."""
+        assert config.overlap_moe_expert_parallel_comm, "overlap_moe_expert_parallel_comm must be true"
 
         # forward prepare
         f_model_chunk_id = None
@@ -1350,10 +1347,10 @@ def forward_backward_pipelining_with_interleaving(
         """
         wrap forward_helper, backward_helper, and combined_forward_backward_helper in a unified way
         """
-        if config.combined_1f1b and not forward_only:  # Combined 1F1B path
+        if config.overlap_moe_expert_parallel_comm and not forward_only:  # Combined 1F1B path
             assert (
                 checkpoint_activations_microbatch is None
-            ), "checkpoint_activations_microbatch not supported when combined_1f1b is true"
+            ), "checkpoint_activations_microbatch not supported when overlap_moe_expert_parallel_comm is true"
 
             return combined_forward_backward_helper(
                 f_virtual_microbatch_id=f_virtual_microbatch_id,

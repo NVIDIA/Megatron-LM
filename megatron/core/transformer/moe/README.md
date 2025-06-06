@@ -197,10 +197,9 @@ Enable A2A overlap in the interleaved 1F1B pipeline parallel introduced from the
 **Usage** 
 ```bash
 # Add the following flags to your training scripts
---combined-1f1b
---combined-1f1b-recipe ep_a2a
+--overlap-moe-expert-parallel-comm
 # [optional] only works with specific TE version
---split-bw
+--delay-wgrad-compute
 ```
 
 ### MoE Related Arguments
@@ -246,9 +245,8 @@ Enable A2A overlap in the interleaved 1F1B pipeline parallel introduced from the
 | --moe-shared-expert-intermediate-size | Set shared expert total ffn hidden size. It should be equal to `num_shared_experts * ffn_size_of_each_shared_expert` if there are multiple shared experts. None means no shared expert. |
 | --moe-shared-expert-overlap | (Experimental, may changed) If this is set, the communications/computations in the shared experts and the dispatcher will overlap (The `alltoall` dispatcher is needed.) Otherwise, the shared expert runs after the routed experts. |
 | --moe-use-upcycling | Load the dense model checkpoint, convert it into an MoE model at runtime and start training. The converted model will be saved to the path specified by `--save` before training begins. Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.|
-| --combined-1f1b | Enable batch-level overlapping in 1f1b stage. |
-| --combined-1f1b-recipe | Choice of the overlapping recipe of `combined-1f1b` execution. `ep_a2a` is only supported recipe currently. |
-| --split-bw | Enable split dgrad and wgrad for `combined-1f1b` execution. Increasing room to hide communication latency by more finegrained control. |
+| --overlap-moe-expert-parallel-comm | Enable batch-level overlapping in 1f1b stage. |
+| --delay-wgrad-compute | Enable split dgrad and wgrad for `overlap-moe-expert-parallel-comm` execution. Increasing room to hide communication latency by more finegrained control. |
 
 </details>
 

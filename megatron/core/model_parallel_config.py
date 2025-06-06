@@ -312,14 +312,11 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
-    combined_1f1b: bool = False
-    """If true, use combined 1F1B for communication hiding."""
-
-    combined_1f1b_recipe: str = 'ep_a2a'
-    """Recipe to use for combined 1F1B. Currently only 'ep_a2a' is supported."""
+    overlap_moe_expert_parallel_comm: bool = False
+    """If true, use batch-level overlapping in 1f1b stage for A2A communication hiding."""
 
     delay_wgrad_compute: bool = False
-    """If true, delay the wgrad compute for better overlapping in combined 1F1B."""
+    """If true, delay the wgrad compute for better overlapping in overlap_moe_expert_parallel_comm."""
 
     ###################
     # CPU Offloading
@@ -405,16 +402,7 @@ class ModelParallelConfig:
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
 
-        if self.combined_1f1b:
-            if self.combined_1f1b_recipe not in ["ep_a2a"]:
-                raise ValueError(
-                    f"combined_1f1b_recipe {self.combined_1f1b_recipe} not supported, "
-                    f"supported recipes are 'ep_a2a' now."
-                )
-        if self.delay_wgrad_compute and not (
-            self.combined_1f1b and self.combined_1f1b_recipe == "ep_a2a"
-        ):
+        if self.delay_wgrad_compute and not self.overlap_moe_expert_parallel_comm:
             raise ValueError(
-                "Delaying wgrad compute only works when setting --combined-1f1b and "
-                "--combined-1f1b-recipe ep_a2a"
+                "Delaying wgrad compute only works when setting --overlap-moe-expert-parallel-comm"
             )

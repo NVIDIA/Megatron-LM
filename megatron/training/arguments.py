@@ -821,11 +821,11 @@ def validate_args(args, defaults={}):
                 "settings for best performance. sequence parallelism requires setting the "
                 f"environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while {fsdp_impl} "
                 "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
-        elif args.combined_1f1b:
-            warnings.warn("Try not to use tensor model parallelism or context parallelism with combined_1f1b. "
+        elif args.overlap_moe_expert_parallel_comm:
+            warnings.warn("Try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
                          "Using tensor/context model parallelism requires setting the environment "
                          "variable CUDA_DEVICE_MAX_CONNECTIONS to 1. "
-                         "While combined_1f1b requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
+                         "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
                          "for better parallelization.")
         else:
             assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
@@ -1011,45 +1011,41 @@ def validate_args(args, defaults={}):
             "as the hybrid device optimizer reuses the code path of this flag."
         )
 
-    if args.combined_1f1b:
-        # Basic requirements for combined 1F1B
+    if args.overlap_moe_expert_parallel_comm:
+        # Basic requirements for overlap_moe_expert_parallel_comm
         assert args.distributed_backend == 'nccl', \
-            'combined 1F1B is only supported with NCCL backend'
-        # assert args.pipeline_model_parallel_size > 1, \
-        #     'combined 1F1B is only supported with pipeline model parallelism'
-        # assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
-        #     'virtual pipeline parallel should be enabled for combined 1F1B'
-
-        # Additional requirements for ep_a2a recipe
-        if args.combined_1f1b_recipe == 'ep_a2a':
-            # Expert model parallelism requirements
-            assert args.expert_model_parallel_size > 1, \
-                'Combined 1f1b recipe ep_a2a is only supported with expert model parallelism'
-            assert args.moe_token_dispatcher_type in ['alltoall', 'flex'], \
-                'Combined 1f1b recipe ep_a2a is only supported with alltoall token dispatcher'
-            
-            # Disable recomputation as it conflicts with combined 1F1B's memory management
-            assert args.recompute_granularity != 'full', \
-                'recompute_granularity must not be full when combined_1f1b_recipe is ep_a2a'
-            assert args.recompute_method is None, \
-                'recompute_method must be None when combined_1f1b_recipe is ep_a2a'
-            assert args.recompute_num_layers is None, \
-                'recompute_num_layers must be None when combined_1f1b_recipe is ep_a2a'
-            
-            # Check if bf16 or fp16 is used
-            assert args.bf16 or args.fp16, \
-                'Currently, combined_1f1b_recipe ep_a2a is only supported with bf16 or fp16 model'
-            
-            # Disable shared expert overlap as it conflicts with ep_a2a
-            assert not args.moe_shared_expert_overlap, \
-                'moe_shared_expert_overlap is not supported when combined_1f1b_recipe is ep_a2a'
-            assert args.mtp_num_layers is None, \
-                'MTP is not supported when enabling 1f1b overlap.'
+            'overlap_moe_expert_parallel_comm is only supported with NCCL backend'
+        if args.pipeline_model_parallel_size > 1:
+            assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
+                'overlap_moe_expert_parallel_comm is only supported with interleaved pipeline model parallelism when pp > 1.'
+        # Expert model parallelism requirements
+        assert args.expert_model_parallel_size > 1, \
+            'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
+        assert args.moe_token_dispatcher_type in ['alltoall', 'flex'], \
+            'overlap_moe_expert_parallel_comm is only supported with alltoall/flex token dispatcher'
+        
+        # Disable recomputation as it conflicts with overlap_moe_expert_parallel_comm's memory management
+        assert args.recompute_granularity != 'full', \
+            'recompute_granularity must not be full when overlap_moe_expert_parallel_comm is enabled'
+        assert args.recompute_method is None, \
+            'recompute_method must be None when overlap_moe_expert_parallel_comm is enabled'
+        assert args.recompute_num_layers is None, \
+            'recompute_num_layers must be None when overlap_moe_expert_parallel_comm is enabled'
+        
+        # Check if bf16 or fp16 is used
+        assert args.bf16 or args.fp16, \
+            'Currently, overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
+        
+        # Disable shared expert overlap as it conflicts with ep_a2a
+        assert not args.moe_shared_expert_overlap, \
+            'moe_shared_expert_overlap is not supported when overlap_moe_expert_parallel_comm is enabled'
+        assert args.mtp_num_layers is None, \
+            '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
             
     # Check delay_wgrad_compute compatibility
     if args.delay_wgrad_compute:
-        assert args.combined_1f1b and args.combined_1f1b_recipe == 'ep_a2a', \
-            'delay_wgrad_compute is only supported when combined_1f1b and combined_1f1b_recipe is ep_a2a'
+        assert args.overlap_moe_expert_parallel_comm, \
+            'delay_wgrad_compute is only supported when overlap_moe_expert_parallel_comm is enabled'
         assert not args.moe_use_legacy_grouped_gemm, \
             'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
         assert args.transformer_impl == 'transformer_engine', \
@@ -2768,14 +2764,10 @@ def _add_moe_args(parser):
                        help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
     group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
                        help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
-    group.add_argument('--combined-1f1b', action='store_true',
-                       help='Batch-level overlapping in 1f1b stage.')
-    group.add_argument('--combined-1f1b-recipe', type=str,
-                       choices=['ep_a2a'],
-                       default='ep_a2a',
-                       help="1) ep_a2a: Hiding expert parallelism's all-to-all communication in the combined-1f1b execution. Options are only 'ep_a2a' now.")
+    group.add_argument('--overlap-moe-expert-parallel-comm', action='store_true',
+                       help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')
     group.add_argument('--delay-wgrad-compute', action='store_true',
-                       help='Delay the wgrad compute for batch-level overlapping')                       
+                       help='Delay the wgrad compute for batch-level overlapping')  
 
     group.add_argument('--moe-apply-probs-on-input', action='store_true',
                        help='Apply probs before mlp activation for moe routing.')
