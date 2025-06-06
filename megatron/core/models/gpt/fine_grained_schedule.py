@@ -268,9 +268,6 @@ def schedule_layer_1f1b(
         b_layer (TransformerLayerSchedulePlan): Backward layer (for previous microbatch)
         f_input (Tensor): Input for forward computation
         b_grad (Tensor): Gradient for backward computation
-        pre_forward (Callable): Callback to get forward input if not provided
-        pre_backward (Callable): Callback to get backward gradient if not provided
-        pre_backward_dw (Callable): Callback for weight gradient computation
         f_context (VppContextManager or None): The VppContextManager for the forward pass.
         b_context (VppContextManager or None): The VppContextManager for the backward pass
 
@@ -307,9 +304,6 @@ def schedule_layer_1f1b(
         with f_context and f_layer.get_fp8_context():
             f_input = f_layer.mlp.forward(f_input)
 
-    # TODO: Find a better way to handle pre_backward and pre_forward.
-    # Ideally pre_forward should launch before pre_backward only if
-    # pre_forward is communication.
     if f_layer is not None:
         with f_context and f_layer.get_fp8_context():
             f_input = f_layer.combine.forward(f_input)
@@ -373,7 +367,8 @@ def schedule_chunk_1f1b(
         assert b_grad is not None
 
         if pre_backward is not None:
-            # FakeScheduleNode means the post_process node is running in the communication stream
+            # If the post_process node is FakeScheduleNode, it means the last node of
+            # the backward pass is combine node, which is running in the communication stream.
             if isinstance(b_schedule_plan.post_process, FakeScheduleNode):
                 stream = get_com_stream()
             else:
@@ -480,9 +475,11 @@ def build_model_chunk_schedule_plan(
         attention_mask: Attention mask.
         decoder_input: Decoder input tensor.
         labels: Labels for loss computation.
+        inference_params: Inference parameters.
         packed_seq_params: Parameters for packed sequences.
         extra_block_kwargs: Additional keyword arguments for blocks.
         runtime_gather_output: Whether to gather output at runtime.
+        loss_mask (torch.Tensor): Used to mask out some portions of the loss
 
     Returns:
         The model chunk schedule plan.

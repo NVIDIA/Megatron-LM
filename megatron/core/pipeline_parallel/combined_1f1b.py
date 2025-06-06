@@ -239,6 +239,8 @@ def forward_backward_step(
                 num_microbatches,
                 forward_data_store,
             )
+            # Set the schedule plan and loss function to the output tensor
+            # This is used to get the schedule plan and loss function in the backward pass
             output_tensor.schedule_plan = f_schedule_plan
             output_tensor.loss_func = loss_node
 
