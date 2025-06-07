@@ -80,6 +80,11 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                 - num_layers_in_first_pipeline_stage
                 - num_layers_in_last_pipeline_stage
             )
+            middle_pipeline_rank = (
+                pipeline_rank
+                if config.num_layers_in_first_pipeline_stage is None
+                else pipeline_rank - 1
+            )
 
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
                 assert (
@@ -120,10 +125,12 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                     offset = (
                         vp_stage * total_virtual_chunks
                         + num_layers_per_virtual_model_chunk_in_first_pipeline_stage
-                        + (pipeline_rank - 1)
+                        + middle_pipeline_rank
                         * (
                             num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
                             // middle_pipeline_stages
+                            if middle_num_layers > 0
+                            else 0
                         )
                     )
             else:
@@ -131,12 +138,6 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                     num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
                 else:
                     num_layers_per_pipeline_rank = 0
-
-                middle_pipeline_rank = (
-                    pipeline_rank
-                    if config.num_layers_in_first_pipeline_stage is None
-                    else pipeline_rank - 1
-                )
 
                 if pipeline_rank == 0:
                     offset = 0
