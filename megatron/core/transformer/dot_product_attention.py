@@ -53,10 +53,6 @@ class DotProductAttention(MegatronModule):
             self.config.context_parallel_size == 1
         ), "Context parallelism is only supported by TEDotProductAttention!"
 
-        assert (
-            self.config.window_size is None
-        ), "Sliding Window Attention is only supported by TEDotProductAttention!"
-
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type  # unused for now
@@ -90,7 +86,11 @@ class DotProductAttention(MegatronModule):
             self.softmax_scale /= coeff
 
         self.scale_mask_softmax = FusedScaleMaskSoftmax(
-            config, attn_mask_type=self.attn_mask_type, mask_func=attention_mask_func, scale=coeff
+            config,
+            attn_mask_type=self.attn_mask_type,
+            mask_func=attention_mask_func,
+            layer_number=layer_number,
+            scale=coeff,
         )
 
         # Dropout. Note that for a single iteration, this layer will generate

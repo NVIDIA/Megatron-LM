@@ -7,7 +7,8 @@ import torch.nn as nn
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.utils import get_default_causal_mask
+from megatron.core.transformer.utils import get_default_causal_mask, get_sliding_window_causal_mask, \
+    is_layer_window_attention
 
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
@@ -131,6 +132,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         config: TransformerConfig,
         attn_mask_type: AttnMaskType,
         mask_func: Callable,
+        layer_number: int,
         scale: Optional[float] = None,
     ):
         super(FusedScaleMaskSoftmax, self).__init__()
@@ -144,7 +146,9 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.scaled_masked_softmax_fusion = config.masked_softmax_fusion
         self.mask_func = mask_func
         self.softmax_in_fp32 = config.attention_softmax_in_fp32
+        self.layer_number = layer_number
         self.scale = scale
+        self.config = config
         if config.attention_softmax_denominator_offset == 'learnable':
             self.softmax_denominator_weight = nn.Parameter(
                 torch.empty(config.num_attention_heads // config.tensor_model_parallel_size)[
@@ -224,7 +228,10 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         # Generate causal mask if not given
         sq, sk = input.size(2), input.size(3)
-        if self.attn_mask_type == AttnMaskType.causal and mask is None and sq > 1:
+
+        if is_layer_window_attention(self.config, self.layer_number):
+            mask = get_sliding_window_causal_mask(sq, sk, self.config.window_size)
+        elif self.attn_mask_type == AttnMaskType.causal and mask is None and sq > 1:
             # If sq == 1 then either KV cache is used or one-element context is passed
             # so keeping mask=None in this case; subsequent code should handle it
             assert sq == sk, "causal mask is only for self attention"

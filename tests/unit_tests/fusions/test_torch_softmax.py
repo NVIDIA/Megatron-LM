@@ -24,6 +24,7 @@ class TestTorchSoftmax:
             config=transformer_config,
             attn_mask_type=AttnMaskType.causal,
             mask_func=attention_mask_func,
+            layer_number=1,
             scale=None,
         )
 
@@ -69,6 +70,7 @@ class TestSoftmaxOne:
             config=self.transformer_config,
             attn_mask_type=AttnMaskType.causal,
             mask_func=attention_mask_func,
+            layer_number=1,
             scale=None,
         )
 
@@ -102,6 +104,7 @@ class TestSoftmaxOne:
             config=config_learnable,
             attn_mask_type=AttnMaskType.causal,
             mask_func=attention_mask_func,
+            layer_number=1,
             scale=None,
         ).to("cuda")
 
@@ -138,3 +141,206 @@ class TestSoftmaxOne:
         y_expected /= 1.0 + torch.arange(1, sq + 1, device="cuda").reshape((-1, 1))
 
         assert torch.allclose(y, y_expected, rtol=1e-5)
+
+
+class TestFusedScaleMaskSoftmaxComprehensive:
+    """Comprehensive tests for FusedScaleMaskSoftmax including window attention and scaling."""
+    
+    def setup_method(self, method):
+        self.base_config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            fp16=False,
+            bf16=False,
+            masked_softmax_fusion=False,
+            attention_softmax_in_fp32=True,
+            tensor_model_parallel_size=1,
+        )
+    
+    def teardown_method(self):
+        get_default_causal_mask.cache_clear()
+    
+    def test_initialization_with_layer_number(self):
+        """Test FusedScaleMaskSoftmax initialization with different layer numbers."""
+        for layer_num in [1, 2, 5]:
+            softmax = FusedScaleMaskSoftmax(
+                config=self.base_config,
+                attn_mask_type=AttnMaskType.causal,
+                mask_func=attention_mask_func,
+                layer_number=layer_num,
+                scale=None,
+            )
+            assert softmax.layer_number == layer_num
+    
+    def test_scaling_factor(self):
+        """Test softmax with different scaling factors."""
+        x = torch.randn(2, 4, 8, 8, device="cuda")
+        
+        for scale in [0.5, 1.0, 2.0]:
+            softmax = FusedScaleMaskSoftmax(
+                config=self.base_config,
+                attn_mask_type=AttnMaskType.causal,
+                mask_func=attention_mask_func,
+                layer_number=1,
+                scale=scale,
+            )
+            
+            y = softmax(x, None)
+            assert x.shape == y.shape
+            # Check if output is a valid probability distribution
+            assert torch.allclose(y.sum(dim=-1), torch.ones_like(y.sum(dim=-1)), rtol=1e-5)
+    
+    def test_window_attention_integration(self):
+        """Test FusedScaleMaskSoftmax with window attention configuration."""
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            fp16=False,
+            bf16=False,
+            masked_softmax_fusion=False,
+            attention_softmax_in_fp32=True,
+            tensor_model_parallel_size=1,
+            window_size=[10, 0],  # Sliding window attention
+        )
+        
+        softmax = FusedScaleMaskSoftmax(
+            config=config,
+            attn_mask_type=AttnMaskType.causal,
+            mask_func=attention_mask_func,
+            layer_number=1,
+            scale=None,
+        )
+        
+        x = torch.randn(2, 4, 16, 16, device="cuda")
+        y = softmax(x, None)
+        assert x.shape == y.shape
+    
+    def test_fused_kernel_availability(self):
+        """Test is_kernel_available method with different configurations."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            fp16=True,  # Enable fp16 for fusion
+            bf16=False,
+            masked_softmax_fusion=True,  # Enable fusion
+            attention_softmax_in_fp32=False,
+            tensor_model_parallel_size=1,
+        )
+        
+        softmax = FusedScaleMaskSoftmax(
+            config=config,
+            attn_mask_type=AttnMaskType.causal,
+            mask_func=attention_mask_func,
+            layer_number=1,
+            scale=None,
+        )
+        
+        # Test with different input dimensions
+        b, np, sq, sk = 4, 8, 32, 32  # Valid dimensions for fusion
+        is_available = softmax.is_kernel_available(None, b, np, sq, sk)
+        # Kernel availability depends on CUDA extensions being available
+        assert isinstance(is_available, bool)
+    
+    def test_different_mask_types(self):
+        """Test FusedScaleMaskSoftmax with different attention mask types."""
+        for mask_type in [AttnMaskType.causal, AttnMaskType.padding]:
+            softmax = FusedScaleMaskSoftmax(
+                config=self.base_config,
+                attn_mask_type=mask_type,
+                mask_func=attention_mask_func,
+                layer_number=1,
+                scale=None,
+            )
+            
+            x = torch.randn(2, 4, 8, 8, device="cuda")
+            if mask_type == AttnMaskType.padding:
+                # Create a padding mask
+                mask = torch.ones(2, 1, 8, 8, dtype=torch.bool, device="cuda")
+                mask[:, :, :, -2:] = False  # Mask last 2 positions
+            else:
+                mask = None
+            
+            y = softmax(x, mask)
+            assert x.shape == y.shape
+    
+    def test_mixed_precision(self):
+        """Test FusedScaleMaskSoftmax with different precision configurations."""
+        test_configs = [
+            {"fp16": True, "bf16": False, "attention_softmax_in_fp32": True},
+            {"fp16": False, "bf16": True, "attention_softmax_in_fp32": True},
+            {"fp16": False, "bf16": False, "attention_softmax_in_fp32": False},
+        ]
+        
+        for config_params in test_configs:
+            config = TransformerConfig(
+                num_layers=2,
+                hidden_size=64,
+                num_attention_heads=8,
+                masked_softmax_fusion=False,
+                tensor_model_parallel_size=1,
+                **config_params
+            )
+            
+            softmax = FusedScaleMaskSoftmax(
+                config=config,
+                attn_mask_type=AttnMaskType.causal,
+                mask_func=attention_mask_func,
+                layer_number=1,
+                scale=None,
+            )
+            
+            x = torch.randn(2, 4, 8, 8, device="cuda")
+            if config_params["fp16"]:
+                x = x.half()
+            elif config_params["bf16"]:
+                x = x.bfloat16()
+            
+            y = softmax(x, None)
+            assert x.shape == y.shape
+    
+    def test_gradient_flow(self):
+        """Test gradient flow through FusedScaleMaskSoftmax."""
+        softmax = FusedScaleMaskSoftmax(
+            config=self.base_config,
+            attn_mask_type=AttnMaskType.causal,
+            mask_func=attention_mask_func,
+            layer_number=1,
+            scale=1.0,
+        )
+        
+        x = torch.randn(2, 4, 8, 8, device="cuda", requires_grad=True)
+        y = softmax(x, None)
+        loss = y.sum()
+        loss.backward()
+        
+        assert x.grad is not None
+        assert x.grad.shape == x.shape
+    
+    def test_config_missing_layer_number(self):
+        """Test that FusedScaleMaskSoftmax handles missing layer_number in config correctly."""
+        # Note: layer_number is passed as parameter, not from config
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            tensor_model_parallel_size=1,
+        )
+        
+        # Window size requires config to be available in forward_torch_softmax
+        config.window_size = None
+        
+        softmax = FusedScaleMaskSoftmax(
+            config=config,
+            attn_mask_type=AttnMaskType.causal,
+            mask_func=attention_mask_func,
+            layer_number=1,
+            scale=None,
+        )
+        
+        # This should work as layer_number is provided as parameter
+        x = torch.randn(2, 4, 8, 8, device="cuda")
+        y = softmax(x, None)
+        assert x.shape == y.shape

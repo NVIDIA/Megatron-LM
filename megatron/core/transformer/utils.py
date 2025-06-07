@@ -3,7 +3,7 @@
 """Utilities for transformer layers."""
 from functools import lru_cache
 from operator import itemgetter
-from typing import Any, Dict, Iterable, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Optional, Tuple, Union, TYPE_CHECKING
 
 import torch
 
@@ -14,6 +14,9 @@ from megatron.core.utils import (
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
+
+if TYPE_CHECKING:
+    from megatron.core.transformer import TransformerConfig
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
@@ -30,6 +33,16 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
     return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
+
+@lru_cache(maxsize=32)
+def get_sliding_window_causal_mask(sq, skv, window_size):
+    """Create the equivalent attention mask for SWA in [sq, skv] shape"""
+    m = torch.ones(sq, skv, dtype=torch.bool, device="cuda")
+    mu = torch.triu(m, diagonal=skv - sq - window_size[0])
+    ml = torch.tril(mu, diagonal=skv - sq + window_size[1])
+    ml = ~ml
+
+    return ml
 
 
 # pylint: disable=missing-function-docstring
@@ -269,3 +282,20 @@ def set_model_to_sequence_parallel(model, set_to=False, exclude_modules=None):
     for attr, modules in _sequence_parallel_attr_cache[model_id].items():
         for module in modules:
             setattr(module, attr, set_to)
+
+
+def is_layer_window_attention(config: 'TransformerConfig', layer_number: int) -> bool:
+    # layer_number is 1-indexed
+    if not config.window_size:
+        return False
+    if config.window_attn_skip_freq is None:
+        return True
+    if isinstance(config.window_attn_skip_freq, int):
+        return layer_number % config.window_attn_skip_freq != 0
+    if isinstance(config.window_attn_skip_freq, list):
+        return bool(config.window_attn_skip_freq[layer_number - 1])
+
+    raise ValueError(
+        f"Invalid `window_attn_skip_freq`: {type(config.window_attn_skip_freq)}, "
+        f"{config.window_attn_skip_freq}"
+    )
