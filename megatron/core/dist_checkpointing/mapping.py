@@ -204,7 +204,7 @@ class ShardedTensor(ShardedBase):
             )
 
         # TODO: np.unravel_index?
-        mask = np.zeros(np.product(self.local_shape), dtype=bool)
+        mask = np.zeros(np.prod(self.local_shape), dtype=bool)
         mask[self.flattened_range] = True
         return np.nonzero(mask.reshape(self.local_shape))
 
