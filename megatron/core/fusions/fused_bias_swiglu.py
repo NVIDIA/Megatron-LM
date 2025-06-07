@@ -40,6 +40,7 @@ def bias_swiglu(y, bias):
     y = y + bias
     return swiglu(y)
 
+
 @jit_fuser
 def bias_alphaswiglu(y, bias, alpha):
     """Performs AlphaSwiGLU activation with bias addition.
@@ -75,10 +76,15 @@ def bias_alphaswiglu_back(g, y, bias, alpha):
     y_1, y_2 = torch.chunk(y, 2, -1)
     return torch.cat(
         (
-            g * torch.sigmoid(alpha * y_1) * (1 + alpha * y_1 * (1 - torch.sigmoid(alpha * y_1))) * (y_2 + 1),
-            g * y_1 * torch.sigmoid(alpha * y_1)
+            g
+            * torch.sigmoid(alpha * y_1)
+            * (1 + alpha * y_1 * (1 - torch.sigmoid(alpha * y_1)))
+            * (y_2 + 1),
+            g * y_1 * torch.sigmoid(alpha * y_1),
         ),
-    -1)
+        -1,
+    )
+
 
 @jit_fuser
 def weighted_swiglu(y, weights):

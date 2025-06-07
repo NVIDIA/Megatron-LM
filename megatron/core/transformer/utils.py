@@ -3,7 +3,7 @@
 """Utilities for transformer layers."""
 from functools import lru_cache
 from operator import itemgetter
-from typing import Any, Dict, Iterable, Optional, Tuple, Union, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 
@@ -33,6 +33,7 @@ def get_linear_layer(rows, columns, init_method, perform_initialization=True):
 def get_default_causal_mask(sq: int) -> torch.Tensor:
     """Return the causal upper triangular mask for softmax input."""
     return torch.triu(torch.ones(sq, sq, device="cuda"), diagonal=1).bool()
+
 
 @lru_cache(maxsize=32)
 def get_sliding_window_causal_mask(sq, skv, window_size):

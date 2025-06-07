@@ -7,8 +7,11 @@ import torch.nn as nn
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.utils import get_default_causal_mask, get_sliding_window_causal_mask, \
-    is_layer_window_attention
+from megatron.core.transformer.utils import (
+    get_default_causal_mask,
+    get_sliding_window_causal_mask,
+    is_layer_window_attention,
+)
 
 
 class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
