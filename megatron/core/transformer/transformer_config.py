@@ -155,6 +155,10 @@ class TransformerConfig(ModelParallelConfig):
     """Store the input of MLP activation function in FP8 for backprop to save memory.
     The stored input is casted back to the original precision before backprop compuatation."""
 
+    swiglu_alpha: Optional[float] = None
+    """Multiplicative factor inside of the sigmoid function for Swiglu activation. Also adds a +1 
+    bias term in the non-glu part of activation.    """
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""

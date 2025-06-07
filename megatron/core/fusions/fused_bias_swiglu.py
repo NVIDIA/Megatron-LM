@@ -40,6 +40,45 @@ def bias_swiglu(y, bias):
     y = y + bias
     return swiglu(y)
 
+@jit_fuser
+def bias_alphaswiglu(y, bias, alpha):
+    """Performs AlphaSwiGLU activation with bias addition.
+
+    Args:
+        y (torch.Tensor): Input tensor.
+        bias (torch.Tensor): Bias tensor to be added to input.
+        alpha (float): Multiplier for in sigmoid function.
+
+    Returns:
+        torch.Tensor: Result of bias addition followed by AlphaSwiGLU activation.
+    """
+    y = y + bias
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    return y_1 * torch.sigmoid(alpha * y_1) * (y_2 + 1)
+
+
+@jit_fuser
+def bias_alphaswiglu_back(g, y, bias, alpha):
+    """Computes the gradient for the biased AlphaSwiGLU activation function.
+
+    Args:
+        g (torch.Tensor): Gradient tensor from the subsequent layer.
+        y (torch.Tensor): Input tensor that was used in the forward pass.
+        bias (torch.Tensor): Bias tensor that was added in the forward pass.
+        alpha (float): Multiplier for in sigmoid function.
+
+    Returns:
+        torch.Tensor: Gradient with respect to the input tensor, computed after
+            applying the bias addition.
+    """
+    y = y + bias
+    y_1, y_2 = torch.chunk(y, 2, -1)
+    return torch.cat(
+        (
+            g * torch.sigmoid(alpha * y_1) * (1 + alpha * y_1 * (1 - torch.sigmoid(alpha * y_1))) * (y_2 + 1),
+            g * y_1 * torch.sigmoid(alpha * y_1)
+        ),
+    -1)
 
 @jit_fuser
 def weighted_swiglu(y, weights):
@@ -144,6 +183,59 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         return tmp, tmp, None, None
 
 
+class BiasAlphaSwiGLUFunction(torch.autograd.Function):
+    """Custom autograd function for AlphaSwiGLU activation with bias support.
+    Compared with regular SwiGLU function, there is an extra multiplier (α) in the sigmoid function
+    and a +1 bias in the linear part
+
+    Regular SwiGLU: z = y1 * σ(y1) * y2
+    AlphaSwiGLU: z = y1 * σ(α*y1) * (y2 + 1)
+    """
+
+    @staticmethod
+    @nvtx_decorator()
+    def forward(ctx, input, bias, fp8_input_store, alpha):
+        """Forward pass of biased AlphaSwiGLU activation.
+
+        Args:
+            ctx: Autograd context object for saving tensors for backward pass.
+            input (torch.Tensor): Input tensor to apply AlphaSwiGLU to.
+            bias (torch.Tensor): Bias tensor to be added to input before AlphaSwiGLU.
+            fp8_input_store (bool): If True, stores intermediate values in FP8 format.
+            alpha (float): Multiplier for in sigmoid function.
+
+        Returns:
+            torch.Tensor: Result of applying bias addition followed by AlphaSwiGLU activation.
+        """
+        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        ctx.save_for_backward(input_for_backward, bias)
+        ctx.ori_input_dtype = input.dtype
+        ctx.fp8_input_store = fp8_input_store
+        ctx.alpha = alpha
+        return bias_alphaswiglu(input, bias, alpha)
+
+    @staticmethod
+    @nvtx_decorator()
+    def backward(ctx, grad_output):
+        """Backward pass of biased AlphaSwiGLU activation.
+
+        Args:
+            ctx: Autograd context object containing saved tensors from forward pass.
+            grad_output (torch.Tensor): Gradient of the loss with respect to the output.
+
+        Returns:
+            tuple: Tuple containing:
+                - Gradient with respect to the input tensor
+                - Gradient with respect to the bias tensor
+                - None for fp8_input_store parameter
+                - None for alpha parameter
+        """
+        input, bias = ctx.saved_tensors
+        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        tmp = bias_alphaswiglu_back(grad_output, input, bias, ctx.alpha)
+        return tmp, tmp, None, None
+
+
 class SwiGLUFunction(torch.autograd.Function):
     """Custom autograd function for SwiGLU activation without bias."""
 
@@ -218,6 +310,7 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
             uses the bias-free SwiGLU variant.
         fp8_input_store (bool, optional): Whether to store intermediate values in FP8 format.
             Defaults to False.
+        alpha (float): Multiplier for in sigmoid function for AlphaSwiGLU.
 
     Returns:
         torch.Tensor: Result of biased SwiGLU activation.
