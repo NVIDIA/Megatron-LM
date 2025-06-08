@@ -48,6 +48,7 @@ class TestIndicesToMultihot:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
     @pytest.mark.experimental
+    @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     @pytest.mark.parametrize("num_of_token", [3, 5, 8, 128, 512])
     @pytest.mark.parametrize("topk", [2, 4, 6, 7, 8])
     @pytest.mark.parametrize("num_of_local_experts", [4, 7, 8, 12, 20, 30, 31, 32])

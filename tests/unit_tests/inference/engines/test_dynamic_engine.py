@@ -9,7 +9,7 @@ import pytest
 import torch
 from tqdm import tqdm
 
-from megatron.core import parallel_state
+from megatron.core import config, parallel_state
 from megatron.core.device_utils import get_current_device
 from megatron.core.inference.contexts.dynamic_context import (
     ChunkOverflowError,
@@ -330,6 +330,7 @@ class TestDynamicInferenceEngine:
         Utils.destroy_model_parallel()
 
     @pytest.mark.experimental
+    @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -360,6 +361,7 @@ class TestDynamicInferenceEngine:
             assert request.output == expected_output
 
     @pytest.mark.experimental
+    @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
@@ -377,6 +379,7 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.max_tokens == 420
 
     @pytest.mark.experimental
+    @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )

@@ -32,6 +32,16 @@ try:
 except ImportError:
     HAVE_TE=False
 
+try:
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import (
+        fused_apply_mla_rope_for_kv,
+        fused_apply_mla_rope_for_q,
+    )
+except:
+    fused_apply_mla_rope_for_kv = None
+    fused_apply_mla_rope_for_q = None
+
+
 @dataclass
 class MLASelfAttentionSubmodules:
     """Submodules for the MLA self-attention layer."""
@@ -99,7 +109,6 @@ class MultiLatentAttention(Attention):
                 cp_group=self.model_comm_pgs.cp,
             )
         elif self.config.rope_type == "yarn":
-            assert not self.config.apply_rope_fusion, "MLA Yarn RoPE does not support RoPE fusion"
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=self.config.rotary_base,
@@ -389,11 +398,24 @@ class MLASelfAttention(MultiLatentAttention):
 
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
+        rotary_pos_cos = None
+        rotary_pos_sin = None
         if self.config.rope_type == "rope":
             packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
-            rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
+            if self.config.apply_rope_fusion:
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                    rotary_seq_len, dtype=hidden_states.dtype
+                )
+                rotary_pos_emb = None
+                assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
+                assert (
+                    fused_apply_mla_rope_for_q is not None
+                    and fused_apply_mla_rope_for_kv is not None
+                ), "Fused MLA RoPE apply is not imported successfully"
+            else:
+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
 
         if packed_seq_params is not None:
             cu_seqlens_q = packed_seq_params.cu_seqlens_q
@@ -420,8 +442,6 @@ class MLASelfAttention(MultiLatentAttention):
                 q_compressed = gather_from_tensor_model_parallel_region(q_compressed)
                 if self.config.sequence_parallel:
                     q_compressed = scatter_to_sequence_parallel_region(q_compressed)
-
-            q_compressed = self.q_layernorm(q_compressed)
         else:
             q_compressed = hidden_states
 
@@ -449,7 +469,13 @@ class MLASelfAttention(MultiLatentAttention):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
 
-        kv_compressed = self.kv_layernorm(kv_compressed)
+        if packed_seq_params is not None:
+            # If sequence packing, TE expect [t, h, d] shaped qkv input.
+            # In Megatron-Core, the qkv shape is [t, 1, h, d].
+            # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
+            q_compressed = q_compressed.squeeze(1)
+            kv_compressed = kv_compressed.squeeze(1)
+            k_pos_emb = k_pos_emb.squeeze(1)
 
         # =========================================
         # QKV up projection and RoPE apply
@@ -465,6 +491,7 @@ class MLASelfAttention(MultiLatentAttention):
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
                 q, _ = self.linear_q_up_proj(q_compressed)
+                q_compressed = self.q_layernorm(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
@@ -473,6 +500,7 @@ class MLASelfAttention(MultiLatentAttention):
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
+            kv_compressed = self.kv_layernorm(kv_compressed)
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
 
@@ -483,76 +511,88 @@ class MLASelfAttention(MultiLatentAttention):
                 self.config.qk_head_dim + self.config.v_head_dim,
             )
 
-            q_len = q.size()[0]
-            if inference_context is not None:
-                # add offset to the sequence start for inference
-                sequence_start = inference_context.sequence_len_offset
-                sequence_end = sequence_start + q_len
-                rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-            else:
-                # Shorten rotary_pos_emb to the sequence length when inference_params
-                # is not provided. This makes sure we can run forward directly with
-                # any sequence length. During training, the sequence length is always
-                # the full rotary_pos_emb length.
-                rotary_pos_emb = rotary_pos_emb[0:q_len]
-
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
-            # q_no_pe: [num_tokens, n, qk_head_dim]
-            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-            q_no_pe, q_pos_emb = torch.split(
-                q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-            )
-
-            # k_no_pe: [num_tokens, n, qk_head_dim]
-            # value: [num_tokens, n, v_head_dim]
-            k_no_pe, value = torch.split(
-                kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
-            )
-
-            # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-            q_pos_emb = apply_rotary_pos_emb(
-                q_pos_emb,
-                rotary_pos_emb,
-                config=self.config,
-                cu_seqlens=cu_seqlens_q,
-                mscale=mscale,
-                cp_group=self.model_comm_pgs.cp,
-            )
-            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = apply_rotary_pos_emb(
-                k_pos_emb,
-                rotary_pos_emb,
-                config=self.config,
-                cu_seqlens=cu_seqlens_kv,
-                mscale=mscale,
-                cp_group=self.model_comm_pgs.cp,
-            )
-
-            # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
-            query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
-
-            # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
-            if k_pos_emb.ndim == 4:
-                k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+            if self.config.apply_rope_fusion:
+                query = fused_apply_mla_rope_for_q(
+                    q,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_head_dim,
+                    self.config.qk_pos_emb_head_dim,
+                    cu_seqlens_q,
+                )
+                key, value = fused_apply_mla_rope_for_kv(
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                    cu_seqlens_kv,
+                )
             else:
-                assert k_pos_emb.ndim == 3
-                k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
-            key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                q_len = q.size()[0]
+                if inference_context is not None:
+                    # add offset to the sequence start for inference
+                    sequence_start = inference_context.sequence_len_offset
+                    sequence_end = sequence_start + q_len
+                    rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
+                else:
+                    # Shorten rotary_pos_emb to the sequence length when inference_params
+                    # is not provided. This makes sure we can run forward directly with
+                    # any sequence length. During training, the sequence length is always
+                    # the full rotary_pos_emb length.
+                    rotary_pos_emb = rotary_pos_emb[0:q_len]
+
+                # q_no_pe: [num_tokens, n, qk_head_dim]
+                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                q_no_pe, q_pos_emb = torch.split(
+                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+                )
+
+                # k_no_pe: [num_tokens, n, qk_head_dim]
+                # value: [num_tokens, n, v_head_dim]
+                k_no_pe, value = torch.split(
+                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+                )
+
+                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                q_pos_emb = apply_rotary_pos_emb(
+                    q_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_q,
+                    mscale=mscale,
+                    cp_group=self.model_comm_pgs.cp,
+                )
+                # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                k_pos_emb = apply_rotary_pos_emb(
+                    k_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_kv,
+                    mscale=mscale,
+                    cp_group=self.model_comm_pgs.cp,
+                )
+
+                # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+
+                # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                if k_pos_emb.ndim == 4:
+                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                else:
+                    assert k_pos_emb.ndim == 3
+                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
+                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
             query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()
             return query, key, value
-
-        if packed_seq_params is not None:
-            # If sequence packing, TE expect [t, h, d] shaped qkv input.
-            # In Megatron-Core, the qkv shape is [t, 1, h, d].
-            # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
-            q_compressed = q_compressed.squeeze(1)
-            kv_compressed = kv_compressed.squeeze(1)
-            k_pos_emb = k_pos_emb.squeeze(1)
 
         if self.recompute_up_proj:
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)

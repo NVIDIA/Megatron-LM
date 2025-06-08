@@ -12,6 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from megatron.core import config
 from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.mimo.submodules.base import ModalitySubmodules
@@ -53,6 +54,7 @@ class MockModalitySubmodule(ModalitySubmodules):
 
 
 @pytest.mark.experimental
+@pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
 class TestBaseSubmodule:
     """Test the base ModalitySubmodules class initialization."""
 
@@ -176,6 +178,7 @@ class TestBaseSubmodule:
 
 
 @pytest.mark.experimental
+@pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
 class TestVisionSubmodule:
     """Test the VisionModalitySubmodules class with forward passes."""
 

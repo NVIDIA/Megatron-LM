@@ -3,11 +3,19 @@
 import math
 
 import torch
-import triton
-import triton.language as tl
 
 from megatron.core.device_utils import get_current_device
 from megatron.core.utils import experimental_fn
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
+    import warnings
+
+    warnings.warn("Triton is not imported successfully.")
 
 
 # Assign a block to a row([1,topk]), generate a local routing map([1,num_of_local_experts])
