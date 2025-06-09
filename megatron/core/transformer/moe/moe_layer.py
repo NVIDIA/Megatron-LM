@@ -9,9 +9,6 @@ import torch
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.moe.legacy_a2a_token_dispatcher import (  # type: ignore
-    MoEAlltoAllSEQTokenDispatcher,
-)
 from megatron.core.transformer.moe.moe_utils import get_default_model_comm_pgs
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
@@ -57,7 +54,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.layer_number = layer_number
         self.ep_group = model_comm_pgs.ep
         # use model_comm_pgs.expt_tp_group as tensor parallel group in this module.
-        self.tp_group = model_comm_pgs.expt_tp
+        self.attn_tp_group = model_comm_pgs.tp
         ep_size = self.ep_group.size()
         ep_rank = self.ep_group.rank()
         assert ep_size > 0, "Expected non-negative expert parallel size"
@@ -134,13 +131,6 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 model_comm_pgs=model_comm_pgs,
             )
-        elif config.moe_token_dispatcher_type == "alltoall_seq":
-            self.token_dispatcher = MoEAlltoAllSEQTokenDispatcher(
-                self.num_local_experts,
-                self.local_expert_indices,
-                config=self.config,
-                model_comm_pgs=model_comm_pgs,
-            )
         elif config.moe_token_dispatcher_type == "flex":
             self.token_dispatcher = MoEFlexTokenDispatcher(
                 self.num_local_experts,
@@ -170,7 +160,7 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
     def forward(self, hidden_states: torch.Tensor):
-        if self.training and self.tp_group.size() > 1 and not self.config.sequence_parallel:
+        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."

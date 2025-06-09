@@ -218,7 +218,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
 | --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
 | --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |
-| --moe-token-dispatcher-type | Determines the token dispatcher type. Choices are "allgather", "alltoall" and "alltoall_seq". Default is "allgather". We recommend using 'alltoall' if expert parallelism is applied. We have upgraded the "alltoall" dispatcher in place during MCore v0.9, while retaining the original implementation, renamed as "alltoall_seq".|
+| --moe-token-dispatcher-type | Determines the token dispatcher type. Choices are "allgather", "alltoall". Default is "allgather". We recommend using 'alltoall' if expert parallelism is applied. We have upgraded the "alltoall" dispatcher in place during MCore v0.9, while the original implementation renamed as "alltoall_seq" is retained until MCore v0.13.|
 | --moe-enable-deepep | (Experimental) Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex. |
 | --moe-per-layer-logging | Enable per-layer logging for MoE, currently supports auxiliary loss and z loss. |
 | --moe-expert-capacity-factor | The capacity factor for each expert, None means no token will be dropped. Default is None. |
@@ -416,7 +416,6 @@ By setting `--expert-tensor-parallel-size`, we can set MoE-specific TP size.
 - Token Dispatcher sends tokens to the designated expert, involves tensor rearangement and communications.
 - Dispatcher `allgather` is the default option. It achieves better performance and efficiency when only tensor parallelism is used or when the Top-k value is very large.
 - Dispatcher `alltoall` is recommended if expert parallelism is applied.
-- Dispatcher `alltoall_seq` is the original implementation of `alltoall` and is retained for potential compatibility risk.
 - Dispatcher `flex` is a new dispatcher decouples communication group from model parallelism. Currently, only the DeepEP backend is supported for by setting `--moe-enable-deepep`.
 
 **Enable Communication Overlap**
