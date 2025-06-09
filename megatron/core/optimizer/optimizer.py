@@ -1193,7 +1193,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
             if torch.distributed.get_rank(optimizer.data_parallel_group) == 0 and states is None:
-                states = torch.load(filename)
+                states = torch.load(filename, weights_only=False)
 
             state_dict = states[idx] if states else None
             optimizer.load_parameter_state_from_dp_zero(
