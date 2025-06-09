@@ -287,10 +287,6 @@ class MambaStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        # Update the inference parameters with the current batch size in case it is variable
-        if inference_context and not self.training:
-            inference_context.current_batch_size = hidden_states.size(1)
-
         if inference_context:
             assert (
                 inference_context.is_static_batching()
@@ -307,8 +303,9 @@ class MambaStack(MegatronModule):
             and inference_context.is_static_batching()
             and not self.training
         ):
+            current_batch_size = hidden_states.shape[1]
             sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * inference_context.current_batch_size,
+                [inference_context.sequence_len_offset] * current_batch_size,
                 dtype=torch.int32,
                 device='cuda',
             )
