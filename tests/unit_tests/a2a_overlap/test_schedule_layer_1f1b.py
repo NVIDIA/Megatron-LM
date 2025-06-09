@@ -15,6 +15,8 @@ from tests.unit_tests.a2a_overlap.utils import (
     compare_captures,
     deterministic_mode,
     get_test_config,
+    get_valid_fp8_flags,
+    get_valid_token_dispatcher_types,
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -166,11 +168,12 @@ class TestA2AOverlap:
     def test_transformer_layer_overlap_shared_expert(self):
         """
         Verifies all-to-all overlap optimization in transformer layer with shared expert produces
-        the same results as the reference implementation.
+        the same results as the reference implement
+        ation.
         """
         extra_kwargs = {
             "moe_token_dispatcher_type": "alltoall",
-            "moe_shared_expert_intermediate_size": 1024,
+            "moe_shared_expert_intermediate_size": 512,
         }
         config = get_test_config(extra_kwargs=extra_kwargs)
         microbatches = 4
@@ -206,11 +209,9 @@ class TestA2AOverlap:
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    # TODO: Add flex dispatcher test back in when CI image installs DeepEP.
-    @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
-    @pytest.mark.parametrize("fp8", [None])
-    @pytest.mark.parametrize("fp8_recipe", ["tensorwise"])
-    def test_transformer_layer_overlap(self, dispatcher_type, fp8, fp8_recipe):
+    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
+    def test_transformer_layer_overlap(self, dispatcher_type, fp8_flag):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
@@ -220,9 +221,9 @@ class TestA2AOverlap:
         if dispatcher_type == "flex":
             extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
-        if fp8 is not None:
-            extra_kwargs["fp8_recipe"] = fp8_recipe
-            extra_kwargs["fp8"] = fp8
+        if fp8_flag is not None:
+            extra_kwargs["fp8"] = fp8_flag[0]
+            extra_kwargs["fp8_recipe"] = fp8_flag[1]
         config = get_test_config(extra_kwargs=extra_kwargs)
         microbatches = 4
         with deterministic_mode():

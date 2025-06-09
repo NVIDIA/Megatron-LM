@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import torch
 
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.core import config
+from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 
 
@@ -48,7 +50,7 @@ def build_data(seq_len=1024):
         torch.Tensor: A random tensor of shape (1024, 1, 1024) with bfloat16 dtype
                      and requires_grad set to True.
     """
-    hidden_states = torch.randn(*(seq_len, 1, 1024), dtype=torch.bfloat16, device="cuda") * 100
+    hidden_states = torch.randn(*(seq_len, 1, 512), dtype=torch.bfloat16, device="cuda") * 100
     hidden_states.requires_grad = True
 
     return hidden_states
@@ -70,6 +72,7 @@ def deterministic_mode():
     Yields:
         None: This is a context manager that yields control back to the caller.
     """
+    config.ENABLE_EXPERIMENTAL = True
     envs = {
         "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
         "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
@@ -192,7 +195,7 @@ def compare_captures(capture_ref, capture_a2a_overlap, verbose=False, skip_embed
     return True, "pass"
 
 
-def get_test_config(num_layers=16, num_moe_experts=16, extra_kwargs={}):
+def get_test_config(num_layers=1, num_moe_experts=8, extra_kwargs={}, moe_grouped_gemm=True):
     config = MLATransformerConfig(
         attention_backend="unfused",
         pipeline_model_parallel_size=1,
@@ -202,16 +205,45 @@ def get_test_config(num_layers=16, num_moe_experts=16, extra_kwargs={}):
         params_dtype=torch.bfloat16,
         pipeline_dtype=torch.bfloat16,
         num_layers=num_layers,
-        hidden_size=1024,
+        hidden_size=512,
         add_bias_linear=False,
         num_attention_heads=128,
-        ffn_hidden_size=1024,
+        ffn_hidden_size=512,
         kv_channels=128,
         hidden_dropout=0.0,
         attention_dropout=0.0,
         multi_latent_attention=True,
         num_moe_experts=num_moe_experts,
-        moe_grouped_gemm=True,
+        moe_grouped_gemm=moe_grouped_gemm,
         **extra_kwargs,
     )
     return config
+
+
+def get_valid_token_dispatcher_types():
+    try:
+        from deep_ep import Buffer
+        from deep_ep.utils import EventHandle, EventOverlap
+
+        return ["alltoall", "flex"]
+    except ImportError:
+        return ["alltoall"]
+
+
+def get_valid_fp8_flags():
+    from megatron.core.enums import Fp8Recipe
+
+    fp8_types = ["e4m3", "hybrid"]
+    recipes = []
+    valid_flags = []
+    if is_te_min_version("2.3.0.dev0"):
+        recipes.append(Fp8Recipe.blockwise)
+    if is_te_min_version("2.2.0.dev0"):
+        recipes.append(Fp8Recipe.tensorwise)
+
+    for fp8_type in fp8_types:
+        for recipe in recipes:
+            valid_flags.append((fp8_type, recipe))
+    valid_flags.append(None)
+
+    return valid_flags

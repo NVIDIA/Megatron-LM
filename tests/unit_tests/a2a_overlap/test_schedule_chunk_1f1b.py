@@ -10,7 +10,13 @@ from megatron.core.pipeline_parallel.combined_1f1b import schedule_chunk_1f1b
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version
-from tests.unit_tests.a2a_overlap.utils import compare_captures, deterministic_mode, get_test_config
+from tests.unit_tests.a2a_overlap.utils import (
+    compare_captures,
+    deterministic_mode,
+    get_test_config,
+    get_valid_fp8_flags,
+    get_valid_token_dispatcher_types,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -66,12 +72,10 @@ class TestA2AOverlap:
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    # TODO: Add flex dispatcher test back in when CI image installs DeepEP.
-    @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
-    @pytest.mark.parametrize("fp8", [None])
-    @pytest.mark.parametrize("fp8_recipe", ["blockwise"])
+    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
-    def test_1f1b_schedule_model_chunk(self, dispatcher_type, fp8, fp8_recipe, layers):
+    def test_1f1b_schedule_model_chunk(self, dispatcher_type, fp8_flag, layers):
         """
         Verifies all-to-all overlap optimization in transformer layer produces
         the same results as the reference implementation.
@@ -88,9 +92,9 @@ class TestA2AOverlap:
         if dispatcher_type == "flex":
             extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
-        if fp8 is not None:
-            extra_kwargs["fp8_recipe"] = fp8_recipe
-            extra_kwargs["fp8"] = fp8
+        if fp8_flag is not None:
+            extra_kwargs["fp8"] = fp8_flag[0]
+            extra_kwargs["fp8_recipe"] = fp8_flag[1]
         with deterministic_mode():
             for layer_num in layers:
                 output_tensors = []
