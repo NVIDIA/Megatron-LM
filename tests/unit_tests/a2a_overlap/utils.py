@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
-from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core import config
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 
