@@ -11,7 +11,8 @@ from tests.unit_tests.transformer.moe.test_token_dispatcher import (
 
 
 def test_placeholder():
-    """This is here because otherwise there's no other test in this module (all disabled) and pytest would fail."""
+    """This is here because otherwise there's no other test in this module (all disabled)
+    and pytest would fail."""
     pass
 
 
@@ -37,27 +38,6 @@ class TestAlltoAllDispatcher:
             moe_router_load_balancing_type="aux_loss",
             moe_token_dispatcher_type="alltoall",
             moe_permute_fusion=permute_fusion,
-        )
-        container.dispatcher_dropless_test()
-
-    # TODO(Hepteract): recover this test after all_to_all_sp2hp can accept process group argument.
-    @pytest.mark.skip(
-        "Skip tests temporarily, because they are broken after parallel states refactor MR2988."
-    )
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
-    @pytest.mark.timeout(120)
-    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])
-    def test_a2aseq_forward_backward(self, tp_size, ep_size):
-        container = MoEModelTestContainer(
-            tp_size=tp_size,
-            ep_size=ep_size,
-            pp_size=1,
-            num_moe_experts=8,
-            moe_router_topk=2,
-            moe_router_load_balancing_type="aux_loss",
-            moe_token_dispatcher_type="alltoall_seq",
-            moe_permute_fusion=False,
         )
         container.dispatcher_dropless_test()
 
