@@ -20,7 +20,6 @@ class StaticInferenceContext(BaseInferenceContext):
         super().__init__(materialize_only_last_token_logits=False)
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
-        self.current_batch_size = max_batch_size  # Required for bookkeeping variable-sized batches
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
         self.key_value_memory_dict = {}
@@ -72,7 +71,6 @@ class StaticInferenceContext(BaseInferenceContext):
 
     def reset(self):
         """Resets the inference state for a new batch."""
-        self.current_batch_size = self.max_batch_size
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
         self.enable_prefill_mode()
@@ -81,7 +79,6 @@ class StaticInferenceContext(BaseInferenceContext):
         return (
             f"StaticInferenceContext(max_seq_len = {self.max_sequence_length}, "
             f"max_batch_size = {self.max_batch_size}, "
-            f"current_batch_size = {self.current_batch_size}, "
             f"sequence_len_offset = {self.sequence_len_offset}, "
             f"batch_size_offset = {self.batch_size_offset}, "
             f"key_value_memory_dict = {self.key_value_memory_dict.keys()})"
@@ -101,7 +98,6 @@ class StaticInferenceContext(BaseInferenceContext):
         basic_attrs = [
             'max_sequence_length',
             'max_batch_size',
-            'current_batch_size',
             'sequence_len_offset',
             'batch_size_offset',
             'decode_mode',
