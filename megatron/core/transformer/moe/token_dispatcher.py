@@ -1,12 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core.config import ENABLE_EXPERIMENTAL
+from megatron.core import config as experimental_config
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
+from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -17,6 +20,7 @@ from megatron.core.transformer.moe.moe_utils import (
     ModelCommProcessGroups,
     get_capacity,
     maybe_move_tensor_to_cpu,
+    pad_routing_map,
     permute,
     sort_chunks_by_idxs,
     unpermute,
@@ -377,17 +381,18 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # [num_experts], number of tokens assigned to each expert from the current rank's input.
         num_local_tokens_per_expert = routing_map.sum(dim=0).long()
 
-        if self.config.moe_expert_capacity_factor is not None:
-            # Drop tokens to capacity, no padding.
+        if (
+            self.config.moe_expert_capacity_factor is not None
+            or self.config.moe_router_padding_for_fp8
+        ):
+            # When using token dropping or router padding, output size is dynamic.
+            # Need to sync output size GPU->CPU before allocating output buffer
             self.num_out_tokens = num_local_tokens_per_expert.sum()
-
-            # A synchronization is needed before the first permutation
-            # to get the `num_out_tokens` CPU value.
             self._maybe_update_cuda_sync_point("before_permutation_1")
         else:
-            # Dropless
+            # For dropless training, output size is static (num_tokens * topk)
+            # No explicit sync needed
             self.num_out_tokens = routing_map.size(0) * self.config.moe_router_topk
-
         if self.ep_size > 1 or self.tp_size > 1:
             # ===================================================
             # Calculate input_splits, output_splits for alltoall/allgather in variable size.
@@ -486,6 +491,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+
+        if self.config.moe_router_padding_for_fp8:
+            pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+            if experimental_config.ENABLE_EXPERIMENTAL and self.config.moe_permute_fusion:
+                self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
+            else:
+                self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
         tokens_per_expert = self.preprocess(self.routing_map)
 
         if self.shared_experts is not None:
@@ -502,7 +514,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.reversed_local_input_permutation_mapping,
         ) = permute(
             hidden_states,
-            routing_map,
+            self.routing_map,
             probs=probs,
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
@@ -779,20 +791,31 @@ class _DeepepManager(_DispatchManager):
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
         router_topk: int,
-        permute_fusion: bool = False,
-        capacity_factor: Optional[float] = None,
-        num_experts: Optional[int] = None,
-        num_local_experts: Optional[int] = None,
-        router_dtype: Optional[str] = None,
+        num_experts: int,
+        config: TransformerConfig,
     ):
+        """
+        Initialize the DeepEP dispatcher.
+
+        Args:
+            group (torch.distributed.ProcessGroup): The process group to use for communication.
+                This should be the ETPxEP group.
+            num_local_experts (int): The number of local experts.
+            router_topk (int): The number of experts for each token to select.
+            num_experts (int): The total number of experts in the group.
+            config (TransformerConfig): The configuration for the transformer model.
+        """
         self.group = group
-        self.router_topk = router_topk
-        self.capacity_factor = capacity_factor
-        self.permute_fusion = permute_fusion
-        self.num_experts = num_experts
         self.num_local_experts = num_local_experts
-        self.router_dtype = router_dtype
+        self.config = config
+
+        self.router_topk = router_topk
+        self.num_experts = num_experts
+        self.router_dtype = config.moe_router_dtype
+        self.capacity_factor = config.moe_expert_capacity_factor
+        self.permute_fusion = config.moe_permute_fusion
 
         # Metadata
         self.token_indices: Optional[torch.Tensor] = None
@@ -882,8 +905,40 @@ class _DeepepManager(_DispatchManager):
         self.handle = None
         return hidden_states
 
+    def _pad_routing_map(
+        self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pad the routing map to the nearest multiple of the pad_multiple.
+        """
+        pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+
+        num_input_tokens = routing_map.shape[0]
+        target_tokens_per_expert = (
+            torch.ceil(tokens_per_expert / pad_multiple) * pad_multiple
+        ).long()
+
+        # Check if there are enough tokens to pad
+        enough_tokens_to_pad = torch.all(target_tokens_per_expert <= num_input_tokens)
+        if not enough_tokens_to_pad:
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Not enough tokens to pad. The total number of tokens received in this rank "
+                "is smaller than the target number of tokens for each expert. "
+                "Falling back to explicit padding within GroupedMLP"
+            )
+        else:
+            if experimental_config.ENABLE_EXPERIMENTAL and self.permute_fusion:
+                from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+
+                routing_map = fused_pad_routing_map(routing_map, pad_multiple)
+            else:
+                routing_map = pad_routing_map(routing_map, pad_multiple)
+            tokens_per_expert = target_tokens_per_expert
+        return routing_map, tokens_per_expert
+
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if ENABLE_EXPERIMENTAL and self.permute_fusion:
+        if experimental_config.ENABLE_EXPERIMENTAL and self.permute_fusion:
             self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs, self.num_local_experts
             )
@@ -891,13 +946,18 @@ class _DeepepManager(_DispatchManager):
             self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs
             )
+        if self.config.moe_router_padding_for_fp8:
+            self.dispatched_routing_map, self.tokens_per_expert = self._pad_routing_map(
+                self.dispatched_routing_map, self.tokens_per_expert
+            )
+
         self.hidden_shape_before_permute = hidden_states.shape
         assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
         hidden_states, permuted_probs, self.reversed_mapping_for_combine = permute(
             hidden_states,
             self.dispatched_routing_map,
             probs=self.dispatched_probs,
-            num_out_tokens=sum(self.tokens_per_expert),
+            num_out_tokens=self.tokens_per_expert.sum().item(),
             fused=self.permute_fusion,
         )
         if self.router_dtype == "fp64":
@@ -949,12 +1009,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         ), "Flex token dispatcher does not support --moe-pad-expert-input-to-capacity"
         self._comm_manager = _DeepepManager(
             group=self.tp_ep_group,
-            router_topk=self.tp_size * self.config.moe_router_topk,
-            permute_fusion=self.config.moe_permute_fusion,
-            capacity_factor=self.config.moe_expert_capacity_factor,
-            num_experts=self.tp_size * self.config.num_moe_experts,
             num_local_experts=self.num_local_experts,
-            router_dtype=self.config.moe_router_dtype,
+            router_topk=self.tp_size * self.config.moe_router_topk,
+            num_experts=self.tp_size * self.config.num_moe_experts,
+            config=self.config,
         )
 
     def set_shared_experts(self, shared_experts):

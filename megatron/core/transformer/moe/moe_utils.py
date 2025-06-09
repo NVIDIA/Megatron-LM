@@ -488,6 +488,41 @@ def group_limited_topk(
     return probs, top_indices
 
 
+def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
+    """Pad the routing map to ensure each expert has a multiple of pad_multiple tokens.
+
+    This function ensures that each expert has a number of tokens that is a multiple of
+    pad_multiple by converting some 0s to 1s in the routing map. The padding is done by
+    selecting the first N zero elements in each row, where N is the number needed to reach
+    the next multiple of pad_multiple.
+
+    Args:
+        routing_map (torch.Tensor): A boolean or integer tensor of shape [num_tokens,
+            num_experts] indicating which tokens are routed to which experts.
+        pad_multiple (int): The multiple to pad each expert's token count to.
+
+    Returns:
+        torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
+    """
+    # Transpose to [num_experts, num_tokens] for easier row-wise operations
+    routing_map = routing_map.transpose(0, 1)  # [num_experts, num_tokens]
+
+    # Calculate how many tokens need to be padded for each expert
+    num_ones = routing_map.sum(dim=1)
+    num_to_pad = (-num_ones) % pad_multiple
+
+    # Find the positions of zeros in each row and their ranks
+    is_zero = routing_map == 0
+    zero_ranks = torch.cumsum(is_zero.int(), dim=1)
+
+    # Create mask for elements that need to be padded (converted from 0 to 1)
+    mask = zero_ranks <= num_to_pad.unsqueeze(1)
+    routing_map[mask] = 1
+
+    routing_map = routing_map.transpose(0, 1)
+    return routing_map
+
+
 def topk_softmax_with_capacity(
     logits: torch.Tensor,
     topk: int,
@@ -520,7 +555,6 @@ def topk_softmax_with_capacity(
         deterministic_mode (bool): Deprecated.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
-
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
