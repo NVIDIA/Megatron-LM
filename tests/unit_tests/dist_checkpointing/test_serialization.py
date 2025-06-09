@@ -130,6 +130,7 @@ class TestSerialization:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     def test_multi_process_save_log_difference(self, tmp_path_dist_ckpt, caplog):
         Utils.initialize_model_parallel(2, 4)
 
