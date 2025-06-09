@@ -80,10 +80,10 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist]
-  #   products: # non-determinism: #419
-  #     - environment: [dev, lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp2_resume_torch_dist]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4]
     products:
       - environment: [lts]
@@ -91,10 +91,10 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  # - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist]
-  #   products: # non-determinism: #420
-  #     - environment: [dev, lts]
-  #       scope: [nightly]
+  - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp1_pp4_resume_torch_dist]
+    products:
+      - environment: [dev, lts]
+        scope: [nightly]
   - test_case: [gpt3_345m_nightly_dgx_a100_1N8G_mcore_tp4_pp1_resume_torch]
     products:
       - environment: [lts]
