@@ -214,6 +214,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
 | --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
 | --moe-router-force-load-balancing | (Experimental) Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only! |
+| --moe-router-padding-for-fp8 | Pad the routing_map to make sure the number of tokens each expert received is a multiple of 16/32 for FP8 precision. It is suggested to enable this for dropless training with FP8 precision when num_local_experts > 1. This is a more efficient way to pad for FP8 which eliminates the explicit padding in the GroupedMLP layer. |
 | --moe-aux-loss-coeff | Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended. Default is 0.0. |
 | --moe-z-loss-coeff | Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended. Default is None. |
 | --moe-input-jitter-eps | Add noise to the input tensor by applying jitter with a specified epsilon value. Default is None. |
@@ -436,6 +437,11 @@ Therefore, there are two recommended ways during the first 200 steps to avoid th
 **Leverage DeepSeek's DeepEP for High-Performance Cross-Node Token Dispatching**
 - The primary advantage of DeepEP is its cross-node token communication efficiency, which delivers substantial performance improvements when deploying expert parallelism across multiple nodes with large TopK values.
 - To enable DeepEP in your training configuration, simply set `--moe-token-dispatcher-type=flex` and `--moe-enable-deepep` in your command line arguments.
+
+**FP8 Training Best Practice**
+- Using latest version of [TransformerEngine](https://github.com/NVIDIA/TransformerEngine).
+- Enable router padding with `--moe-router-padding-for-fp8` to reduce padding overhead.
+- Enable native FP8 weights with `--fp8-param-gather` to reduce weights memory cost.
 
 ### Reference Best Parallel Mapping
 

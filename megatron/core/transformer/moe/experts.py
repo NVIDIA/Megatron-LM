@@ -20,6 +20,7 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedTensorFactory,
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
@@ -901,9 +902,9 @@ class SequentialMLP(MegatronModule):
             self.local_experts.append(expert)
 
     def _pad_tensor_for_fp8(self, hidden, probs):
-        """Padding tensor shape to multiples of 16."""
+        """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
-        divisor = 16
+        divisor = get_fp8_align_size(self.config.fp8_recipe)
         padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
         if padded_num_tokens > 0:
             pad_tensor = torch.zeros(
