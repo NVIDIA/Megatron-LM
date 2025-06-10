@@ -365,7 +365,6 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
             hidden_states = reduce_scatter_to_sequence_parallel_region(
                 hidden_states.to(self.local_probs.dtype), group=self.tp_ep_group
             ).to(hidden_states.dtype)
-        self.local_probs = None
         return hidden_states
 
     def combine_postprocess(self, hidden_states):
