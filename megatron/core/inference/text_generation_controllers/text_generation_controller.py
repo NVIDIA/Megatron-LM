@@ -3,6 +3,7 @@
 import concurrent
 import copy
 import functools
+import inspect
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
@@ -73,11 +74,42 @@ class TextGenerationController:
 
         return prompt_tokens
 
+    def _detokenize(self, tokens: list[int], skip_special_tokens: bool = True) -> str:
+        """
+        Detokenize a sequence of token IDs, handling skip_special_tokens for
+        different tokenizer APIs.
+
+        On the first call, inspects `self.tokenizer.detokenize` to see if it accepts
+        a `skip_special_tokens` keyword argument, and caches that result on `self`.
+        Subsequent calls will use the cached flag to invoke `detokenize` with the
+        correct signature (with or without `skip_special_tokens`).
+
+        Args:
+            tokens (List[int]): The token IDs to convert back to text.
+            skip_special_tokens (bool): Whether to remove special tokens (e.g. BOS/EOS)
+                during detokenization. Only passed through if the tokenizer supports it.
+
+        Returns:
+            str: The detokenized string.
+        """
+        # cache the check on first call
+        if not hasattr(self, "_detok_accepts_skip"):
+            sig_params = inspect.signature(self.tokenizer.detokenize).parameters.values()
+            self._detok_accepts_skip = any(
+                p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
+                for p in sig_params
+            )
+        if self._detok_accepts_skip:
+            return self.tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+        else:
+            return self.tokenizer.detokenize(tokens)
+
     def detokenize_generations(
         self,
         tokens_gpu_tensor: torch.Tensor,
         lengths_gpu_tensor: torch.Tensor,
         detokenize_segments: bool,
+        skip_special_tokens: bool = True,
     ) -> tuple[str, Optional[List[List[str]]]]:
         """Detokenize the generated tokens.
 
@@ -87,6 +119,8 @@ class TextGenerationController:
             detokenize_segments (bool): If True, returns individually detokenized tokens. If False,
             returns None as second element. Helpful for understanding per-token boundaries in
             generated text.
+            skip_special_tokens (bool): If True removes special tokens like bos
+            during detokenization.
 
         Returns:
             tuple[str, List[str] | None]: A tuple containing:
@@ -97,18 +131,17 @@ class TextGenerationController:
 
         if not detokenize_segments:
             tokens = tokens_gpu_tensor.cpu().numpy().tolist()
-            return self.tokenizer.detokenize(tokens), None
+            return self._detokenize(tokens, skip_special_tokens=skip_special_tokens), None
 
         prompts_plus_generations: List[str] = []
         prompts_plus_generations_segments: List[List[str]] = []
-
         tokens_gpu_tensor = torch.unsqueeze(tokens_gpu_tensor, 0)
         tokens = tokens_gpu_tensor.cpu().numpy().tolist()
         lengths = lengths_gpu_tensor.cpu().numpy().tolist()
 
         for sequence_tokens, length in zip(tokens, lengths):
             sequence_tokens = sequence_tokens[:length]
-            detok_str = self.tokenizer.detokenize(sequence_tokens)
+            detok_str = self._detokenize(sequence_tokens)
             prompts_plus_generations.append(detok_str)
             offsets = self.tokenizer.offsets(sequence_tokens, detok_str)
             words = [
@@ -117,7 +150,7 @@ class TextGenerationController:
 
             prompts_plus_generations_segments.append(words)
 
-        text = self.tokenizer.detokenize(tokens[0])
+        text = self._detokenize(tokens[0], skip_special_tokens=skip_special_tokens)
 
         return text, prompts_plus_generations_segments
 
@@ -349,6 +382,23 @@ class TextGenerationController:
         with torch.inference_mode():
             logits = self.inference_wrapped_model.run_one_forward_step(
                 {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+            )
+
+        if self.model_is_pipeline_parallel:
+            # In dynamic batching we assume sequence length 1
+            logits_seq_len = 1
+            batch_size = input_ids.shape[0]
+            vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
+            logits_shape = [batch_size, logits_seq_len, vocab_size]
+
+            if is_pipeline_last_stage(self.pp_group):
+                assert logits is not None and torch.Size(logits_shape) == logits.shape
+
+            logits = broadcast_from_last_pipeline_stage(
+                logits_shape,
+                dtype=self.inference_wrapped_model.inference_wrapper_config.params_dtype,
+                tensor=logits,
+                pp_group=self.pp_group,
             )
 
         last_token_logits = logits.squeeze(0)

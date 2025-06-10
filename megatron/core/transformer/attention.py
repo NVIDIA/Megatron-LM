@@ -330,8 +330,18 @@ class Attention(MegatronModule, ABC):
             # Flash Decoding assumes that the keys stored in the KV Cache already have RoPE applied.
             # Apply RoPE before we store the keys to make it compatible with flash decoding kernel
             if rotary_pos_sin_q is not None and rotary_pos_sin_k is not None:
-                key = apply_rotary_pos_emb_with_cos_sin(key, rotary_pos_cos_k, rotary_pos_sin_k)
-                query = apply_rotary_pos_emb_with_cos_sin(query, rotary_pos_cos_q, rotary_pos_sin_q)
+                key = apply_rotary_pos_emb_with_cos_sin(
+                    key,
+                    rotary_pos_cos_k,
+                    rotary_pos_sin_k,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
+                query = apply_rotary_pos_emb_with_cos_sin(
+                    query,
+                    rotary_pos_cos_q,
+                    rotary_pos_sin_q,
+                    rotary_interleaved=self.config.rotary_interleaved,
+                )
         else:
             rotary_pos_cos_q = None
             rotary_pos_sin_q = None
@@ -387,6 +397,7 @@ class Attention(MegatronModule, ABC):
         inference_value_memory: Tensor,
         rotary_cos: Tensor,
         rotary_sin: Tensor,
+        rotary_interleaved: bool = False,
     ) -> (Tensor, Tensor):
         """
         The flash decoding kernel will do the following in a single execution:
@@ -418,7 +429,7 @@ class Attention(MegatronModule, ABC):
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
             cache_seqlens=sequence_len_offset,
-            rotary_interleaved=False,
+            rotary_interleaved=rotary_interleaved,
         )
         return out
 
@@ -599,16 +610,16 @@ class Attention(MegatronModule, ABC):
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
 
+        in_decode_mode = (
+            inference_context is not None
+            and inference_context.is_decode_only()
+            and not self.training
+        )
+
         # This branch only runs in the decode phase of flash decoding and returns after the linear
         # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
         nvtx_range_push(suffix="adjust_key_value")
-        if (
-            self.config.flash_decode
-            and inference_context is not None
-            and inference_context.is_decode_only()
-            and not self.training
-            and rotary_pos_cos is not None
-        ):
+        if in_decode_mode and self.config.flash_decode:
             assert self.layer_number in inference_context.key_value_memory_dict
             assert inference_context.sequence_len_offset is not None
             inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
@@ -623,11 +634,19 @@ class Attention(MegatronModule, ABC):
                 inference_value_memory=inference_value_memory,
                 rotary_cos=rotary_pos_cos,
                 rotary_sin=rotary_pos_sin,
+                rotary_interleaved=self.config.rotary_interleaved,
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = self.linear_proj(context_layer)
             return output, bias
+
+        if (
+            in_decode_mode
+            and self.config.enable_cuda_graph
+            and inference_context.is_static_batching()
+        ):
+            raise ValueError(f"CUDA graphs must use flash decode with static batching!")
 
         query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
             self._adjust_key_value_for_inference(

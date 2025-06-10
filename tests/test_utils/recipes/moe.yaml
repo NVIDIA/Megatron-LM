@@ -123,41 +123,41 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_multi_dist_optimizer_instances_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_overlap_grad_reduce_param_gather_groupedGEMM_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts_etp1_ep4_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_zp_z3_resume_torch_dist_te_8experts2parallel_top2router_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_te_8experts2parallel_ddp_average_in_collective_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   #######################################################################
@@ -167,12 +167,12 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_te_8experts2parallel_groupedGEMM_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   ###########################
   # Merge train tests       #
   ###########################
@@ -180,18 +180,18 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
       - environment: [dev]
         scope: [mr-slim]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
         scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
       - environment: [dev]
         scope: [mr-slim]
-        platforms: [dgx_a100, dgx_h100]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp1_pp1_ep8_etp1_cp_memory_speed]
     products:
       - environment: [dev]

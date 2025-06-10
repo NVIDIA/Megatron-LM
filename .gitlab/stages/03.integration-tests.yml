@@ -15,32 +15,8 @@ include:
     ref: main
     file: downstreams.yml
 
-wait_for_resources:
-  extends: [.integration_tests_rules]
-  image: python:3.10
-  timeout: 7 days
-  tags:
-    - arch/amd64
-    - env/prod
-    - origin/jet-fleet
-    - owner/jet-core
-    - purpose/utility
-    - team/megatron
-  script:
-    - env
-    - pip install --no-cache-dir python-gitlab click
-    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
-    - export GITLAB_ENDPOINT
-    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
-  rules:
-    - if: $INTEGRATION_TEST == "yes" && $CI_PIPELINE_SOURCE == "merge_request_event"
-      when: on_success
-    - when: never
-
 integration:configure:
   needs:
-    - job: wait_for_resources
-      optional: true
     - test:build_image
     - job: test:unit_tests_pyt(DEV)_mcore(latest)
       optional: true

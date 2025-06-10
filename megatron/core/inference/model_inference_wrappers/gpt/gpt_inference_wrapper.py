@@ -47,7 +47,7 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
             A dict with all the inference input needed for the batch.
         """
         assert (
-            not self.inference_params.is_decode_only()
+            not self.inference_context.is_decode_only()
         ), "`prep_inference_input` should only be called in prefill mode"
 
         attention_mask, position_ids = self._build_attention_mask_and_position_ids(prompts_tokens)
