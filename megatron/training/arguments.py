@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 from pathlib import Path
+import re
 import types
 import warnings
 
@@ -246,6 +247,16 @@ def load_retro_args(args):
     args.retro_bert_tokenizer_type = retro_config.retro_bert_tokenizer_type
     args.retro_bert_vocab_file = retro_config.retro_bert_vocab_file
 
+def _eval_pattern(pattern):
+    """ Validate and evaluate a string containing a Python list expression """
+    assert isinstance(pattern, str)
+
+    # validate input, only allow comma, digits, [, ], (, ), +, and *
+    if bool(re.compile(r'[^,\d\[\]\(\)\+\*]').search(pattern)):
+        raise ValueError(f"Invalid pattern: {pattern}")
+
+    return eval(pattern)
+
 def moe_freq_type(x):
     """Frequency between MoE layers and Dense layers.
 
@@ -266,8 +277,7 @@ def moe_freq_type(x):
     assert isinstance(x, str)
     if '[' in x:
         # it's a custom pattern
-        pattern = eval(x)
-        return pattern
+        return _eval_pattern(x)
     else:
         # it's a single int but in str
         return int(x)
