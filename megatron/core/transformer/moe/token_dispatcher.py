@@ -2,7 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -632,7 +632,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
-        tokens_per_expert = self.preprocess(self.routing_map)
+        self.tokens_per_expert = self.preprocess(self.routing_map)
 
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
