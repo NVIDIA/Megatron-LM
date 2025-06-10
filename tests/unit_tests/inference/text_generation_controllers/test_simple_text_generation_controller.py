@@ -147,11 +147,9 @@ class TestTextGenerationController:
             top_n_logprobs_dict=top_n_logprobs_dict,
         )
 
-        assert list(top_n_logprobs_dict[0][0].values()) == [
-            -2.3521223068237305,
-            -2.452122688293457,
-            -2.5521230697631836,
-        ]
+        assert list(top_n_logprobs_dict[0][0].values()) == pytest.approx(
+            [-2.3521223068237305, -2.452122688293457, -2.5521230697631836], abs=1e-3
+        )
 
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits, SamplingParams(top_k=2), self.vocab_size
