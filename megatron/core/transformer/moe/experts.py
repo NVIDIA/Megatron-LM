@@ -113,7 +113,6 @@ class GroupedMLP(MegatronModule):
             config.add_bias_linear == False
         ), "bias not supported in Grouped GEMM yet, please set '--disable-bias-linear' instead."
 
-        self.expert_parallel = config.expert_model_parallel_size > 1
         if self.config.gated_linear_unit:
             if self.config.activation_func not in (F.silu, F.gelu):
                 raise ValueError("Activation function must be silu or gelu when using GroupedMLP.")
@@ -147,6 +146,7 @@ class GroupedMLP(MegatronModule):
         # How many feature each rank holds for fc1 and fc2, respectively.
         tp_size = self.tp_group.size()
         tp_rank = self.tp_group.rank()
+        self.moe_parallel_folding = tp_size != config.tensor_model_parallel_size or config.expert_model_parallel_size > 1
 
         fc1_output_size = self.config.moe_ffn_hidden_size * self.num_local_experts
         if config.gated_linear_unit:
@@ -223,8 +223,8 @@ class GroupedMLP(MegatronModule):
                 _initialize_affine_weight_gpu(
                     self.weight2, config.output_layer_init_method, partition_dim=0, is_expert=True
                 )
-        setattr(self.weight1, 'allreduce', not self.expert_parallel)
-        setattr(self.weight2, 'allreduce', not self.expert_parallel)
+        setattr(self.weight1, 'allreduce', not self.moe_parallel_folding)
+        setattr(self.weight2, 'allreduce', not self.moe_parallel_folding)
 
         def remove_extra_states_check(self, incompatible_keys):
             """

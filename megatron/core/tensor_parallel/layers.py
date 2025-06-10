@@ -773,7 +773,6 @@ class ColumnParallelLinear(torch.nn.Module):
         # Divide the weight matrix along the last dimension.
         self.skip_bias_add = skip_bias_add
         self.is_expert = is_expert
-        self.expert_parallel = config.expert_model_parallel_size > 1
         self.embedding_activation_buffer = embedding_activation_buffer
         self.grad_output_buffer = grad_output_buffer
         self.config = config
@@ -785,7 +784,8 @@ class ColumnParallelLinear(torch.nn.Module):
         )
         world_size = self.tp_group.size()
         rank = self.tp_group.rank()
-        self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
+        self.moe_parallel_folding = is_expert and (world_size != config.tensor_model_parallel_size or config.expert_model_parallel_size > 1)
+        self.explicit_expert_comm = is_expert and (world_size > 1 or config.expert_model_parallel_size > 1)
         self.output_size_per_partition = divide(output_size, world_size)
 
         # Parameters.
@@ -830,7 +830,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         is_expert=self.is_expert,
                     )
 
-            setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
+            setattr(self.weight, 'allreduce', not self.moe_parallel_folding)
         else:
             self.weight = None
 
@@ -852,7 +852,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, 'allreduce', not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, 'allreduce', not self.moe_parallel_folding)
         else:
             self.register_parameter('bias', None)
 
@@ -1079,7 +1079,6 @@ class RowParallelLinear(torch.nn.Module):
         self.skip_bias_add = skip_bias_add
         self.config = config
         self.is_expert = is_expert
-        self.expert_parallel = config.expert_model_parallel_size > 1
         self.gradient_accumulation_fusion = config.gradient_accumulation_fusion
         self.sequence_parallel = config.sequence_parallel
         self.tp_group = tp_group
@@ -1094,7 +1093,8 @@ class RowParallelLinear(torch.nn.Module):
 
         world_size = self.tp_group.size()
         rank = self.tp_group.rank()
-        self.explicit_expert_comm = self.is_expert and (world_size > 1 or self.expert_parallel)
+        self.moe_parallel_folding = is_expert and (world_size != config.tensor_model_parallel_size or config.expert_model_parallel_size > 1)
+        self.explicit_expert_comm = is_expert and (world_size > 1 or config.expert_model_parallel_size > 1)
 
         self.input_size_per_partition = divide(input_size, world_size)
 
@@ -1139,7 +1139,7 @@ class RowParallelLinear(torch.nn.Module):
                     stride=stride,
                     is_expert=self.is_expert,
                 )
-        setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
+        setattr(self.weight, 'allreduce', not self.moe_parallel_folding)
 
         if bias:
             if config.use_cpu_initialization:
@@ -1157,7 +1157,7 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, 'allreduce', not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, 'allreduce', not self.moe_parallel_folding)
             setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
         else:
             self.register_parameter('bias', None)
