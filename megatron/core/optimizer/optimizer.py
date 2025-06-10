@@ -92,9 +92,6 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
-
-
 class MegatronOptimizer(ABC):
     """
     Base class for all Megatron optimizers.
@@ -319,54 +316,6 @@ class MegatronOptimizer(ABC):
     def _restore_common_per_param_step(state_dict: Dict, step: Union[int, torch.Tensor]):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
-
-    @staticmethod
-    def _filter_and_reorder_param_groups(
-        current_groups: List[Dict], state_dict_groups: List[Dict]
-    ) -> List[Dict]:
-        """Filter and reorder state_dict parameter groups to match current optimizer groups.
-        Keys used for matching align with those from _get_param_groups:
-        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
-
-        Args:
-            current_groups (List[Dict]): Parameter groups from the current optimizer instance.
-            state_dict_groups (List[Dict]): Parameter groups loaded from a state dict.
-
-        Returns:
-            List[Dict]: Filtered and reordered parameter groups matching the current optimizer.
-
-        Raises:
-            ValueError: If parameter groups in state dict don't match current optimizer.
-        """
-        # Define groups order that is needed in the current optimizer (coming from runtime)
-        needed_groups = [
-            tuple(g[key] for key in param_group_identifier_keys) for g in current_groups
-        ]
-
-        # Keep state_dict param group order since groups are LocalNonpersistentObject
-        # and their order is determined at runtime, not from the checkpoint.
-        params_in_state_dict_order = [g['params'] for g in state_dict_groups]
-        loaded_groups_map = {
-            tuple(group[key] for key in param_group_identifier_keys): group
-            for group in state_dict_groups
-        }
-
-        final_groups = []
-        for key, params in zip(needed_groups, params_in_state_dict_order):
-            if key not in loaded_groups_map:
-                available_keys = '\n'.join(str(k) for k in loaded_groups_map.keys())
-                raise ValueError(
-                    f"Could not find parameter group with key {key} in loaded checkpoint.\n"
-                    f"Available keys:\n{available_keys}\n"
-                    f"Parameter group key definition: {param_group_identifier_keys}"
-                )
-
-            # Update group's parameters to preserve state dict ordering
-            group = loaded_groups_map[key]
-            group['params'] = params
-            final_groups.append(group)
-
-        return final_groups
 
 
 class MixedPrecisionOptimizer(MegatronOptimizer):
@@ -780,11 +729,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         if 'common_step' in state_dict[optimizer_key]['state']:
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
-
-        # Filter and reorder param groups to match current optimizer
-        state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
-        )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
         # Grad scaler.
@@ -928,11 +872,6 @@ class FP32Optimizer(MegatronOptimizer):
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
-
-        # Filter and reorder param groups to match current optimizer
-        state_dict['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict['param_groups']
-        )
         self.optimizer.load_state_dict(state_dict)
 
     def sharded_state_dict(
@@ -1202,7 +1141,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
 
         # Count the zeros in the grads.
-        num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
+        num_zeros_in_grad = self.count_zeros()
 
         update_successful = self.step_with_ready_grads()
 

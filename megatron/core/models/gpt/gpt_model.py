@@ -315,9 +315,8 @@ class GPTModel(LanguageModule):
             and inference_context.is_static_batching()
             and not self.training
         ):
-            current_batch_size = input_ids.shape[0]
             sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * current_batch_size,
+                [inference_context.sequence_len_offset] * inference_context.current_batch_size,
                 dtype=torch.int32,
                 device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
             )
@@ -346,6 +345,12 @@ class GPTModel(LanguageModule):
             sequence_len_offset=sequence_len_offset,
             **(extra_block_kwargs or {}),
         )
+
+        # Process inference output.
+        if inference_context and not inference_context.is_static_batching():
+            hidden_states = inference_context.last_token_logits(
+                hidden_states.squeeze(1).unsqueeze(0)
+            ).unsqueeze(1)
 
         # logits and loss
         output_weight = None
@@ -380,17 +385,10 @@ class GPTModel(LanguageModule):
         if (
             not self.training
             and inference_context is not None
+            and inference_context.is_static_batching()
             and inference_context.materialize_only_last_token_logits
         ):
-            if inference_context.is_static_batching():
-                hidden_states = hidden_states[-1:, :, :]
-            else:
-                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
-                # state ([B, H]) → unsqueeze back to [1, B, H]
-                # (so that the output layer, which expects S×B×H, receives only the final token)
-                hidden_states = inference_context.last_token_logits(
-                    hidden_states.squeeze(1).unsqueeze(0)
-                ).unsqueeze(1)
+            hidden_states = hidden_states[-1:, :, :]
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )

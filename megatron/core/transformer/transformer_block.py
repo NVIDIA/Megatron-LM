@@ -502,6 +502,10 @@ class TransformerBlock(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
+        # Update the inference parameters with the current batch size in case it is variable
+        if inference_context and not self.training:
+            inference_context.current_batch_size = hidden_states.size(1)
+
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'

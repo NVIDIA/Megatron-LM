@@ -6,6 +6,7 @@ from typing import Callable, Optional
 
 import torch
 
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ModelCommProcessGroups,
@@ -299,7 +300,10 @@ class TopKRouter(Router):
             return activation
 
         sequence_partition_group = None
-        if self.tp_cp_group.size() > 1:
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
+            sequence_partition_group = self.cp_group
+            moe_aux_loss_coeff /= self.tp_group.size()
+        elif self.tp_cp_group.size() > 1:
             sequence_partition_group = self.tp_cp_group
 
         aux_loss = load_balancing_loss_func(
@@ -393,6 +397,10 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
+
+        if self.config.moe_token_dispatcher_type == "alltoall_seq":
+            # Gather the logits from the TP region
+            logits = gather_from_sequence_parallel_region(logits, self.tp_group)
 
         if self.routing_type == "sinkhorn":
             scores, routing_map = self.sinkhorn_load_balancing(logits)

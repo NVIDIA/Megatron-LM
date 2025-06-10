@@ -613,17 +613,12 @@ class MambaMixer(MegatronModule):
         )
         return conv_state, ssm_state
 
-    def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
-        """Initializes or retrieves the SSM state tensors from the cache.
-
-        At the start of any inference (at the prefill step), if there is no cache or if the
-        cached batch size has changed, then new tensors are initialized and stored in the cache.
-        Otherwise the existing tensors are retrieved from the cache and zeroed out.
-        """
+    def _get_states_from_cache(
+        self, inference_context, batch_size, initialize_states=False, *, inference_params=None
+    ):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        assert inference_context is not None
         assert self.layer_number is not None
         if (
             self.layer_number not in inference_context.key_value_memory_dict
@@ -648,8 +643,7 @@ class MambaMixer(MegatronModule):
             self.cached_batch_size = batch_size
         else:
             conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
-            # TODO: Remove reference to `inference_context.sequence_len_offset` for dynamic batching
-            if inference_context.sequence_len_offset == 0:
+            if initialize_states:
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state

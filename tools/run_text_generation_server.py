@@ -24,15 +24,10 @@ import torch
 
 import megatron
 from megatron.core.inference.engines import AbstractEngine, StaticInferenceEngine
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
+from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import InferenceWrapperConfig
 from megatron.core.models.gpt import GPTModel
 from megatron.training import get_model
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec, get_gpt_layer_with_transformer_engine_spec
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import import_module
 from megatron.inference.text_generation import beam_search_and_post_process
@@ -96,10 +91,7 @@ def model_provider(
         else:
             if use_te:
                 transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                    args.num_experts,
-                    args.moe_grouped_gemm,
-                    args.qk_layernorm,
-                    qk_l2_norm=args.qk_l2_norm,
+                    args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
                 )
             else:
                 transformer_layer_spec = get_gpt_layer_local_spec(
@@ -149,13 +141,11 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         padded_vocab_size=args.padded_vocab_size,
         inference_max_seq_length=args.inference_max_seq_length,
         inference_max_requests=args.inference_max_batch_size,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
     )
 
     inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)
-    text_generation_controller = TextGenerationController(
-        inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
-    )
+    text_generation_controller = TextGenerationController(inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer)
     return StaticInferenceEngine(
         text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
     )
@@ -203,6 +193,7 @@ if __name__ == "__main__":
             'exit_on_missing_checkpoint': True,
         },
     )
+
     args = get_args()
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
@@ -234,11 +225,7 @@ if __name__ == "__main__":
             prompts=["Test prompt"], sampling_params=SamplingParams(num_tokens_to_generate=10)
         )
 
-    if (
-        mpu.is_pipeline_first_stage()
-        and mpu.get_tensor_model_parallel_rank() == 0
-        and mpu.get_expert_model_parallel_rank() == 0
-    ):
+    if mpu.is_pipeline_first_stage() and mpu.get_tensor_model_parallel_rank() == 0:
         server = MegatronServer(inference_engine, args)
         server.run("0.0.0.0", port=args.port)
 
@@ -252,8 +239,6 @@ if __name__ == "__main__":
                 pass
         elif choice.item() == 1:
             try:
-                beam_search_and_post_process(
-                    inference_engine.text_generation_controller.inference_wrapped_model.model
-                )
+                beam_search_and_post_process(inference_engine.text_generation_controller.inference_wrapped_model.model)
             except ValueError as ve:
                 pass

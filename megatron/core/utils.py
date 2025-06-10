@@ -1787,6 +1787,48 @@ def configure_nvtx_profiling(enabled: bool) -> None:
     _nvtx_enabled = enabled
 
 
+def _nvtx_range_push(msg: str) -> None:
+    """Push NVTX range onto stack, if NVTX range profiling is enabled.
+
+    Args:
+        msg (str): Message to associate with range
+
+    Note:
+        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
+    """
+    if not _nvtx_enabled:
+        return
+    _nvtx_range_messages.append(msg)
+    torch.cuda.nvtx.range_push(msg)
+
+
+def _nvtx_range_pop(msg: Optional[str] = None) -> None:
+    """Pop NVTX range from stack, if NVTX range profiling is enabled.
+
+    Args:
+        msg (str, optional): Message associated with range
+
+    Note:
+        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
+    """
+    # Return immediately if NVTX range profiling is not enabled
+    if not _nvtx_enabled:
+        return
+
+    # Update list of NVTX range messages and check for consistency
+    if not _nvtx_range_messages:
+        raise RuntimeError("Attempted to pop NVTX range from empty stack")
+    last_msg = _nvtx_range_messages.pop()
+    if msg is not None and msg != last_msg:
+        raise ValueError(
+            f"Attempted to pop NVTX range from stack with msg={msg}, "
+            f"but last range has msg={last_msg}"
+        )
+
+    # Pop NVTX range
+    torch.cuda.nvtx.range_pop()
+
+
 def _nvtx_range_get_func_path():
     """Get the path of a function. Assumes being called from nvtx_range_push/pop.
 
@@ -1808,19 +1850,12 @@ def nvtx_range_push(msg=None, suffix=None) -> None:
         msg (str, optional): Message to associate with range
         suffix (str, optional): Suffix to append to the message
     """
-    if not _nvtx_enabled:
-        return
-
     if msg is None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
 
-    # Track messages to ensure consistency when popping
-    _nvtx_range_messages.append(msg)
-
-    # Push NVTX range
-    torch.cuda.nvtx.range_push(msg)
+    _nvtx_range_push(msg)
 
 
 def nvtx_range_pop(msg=None, suffix=None) -> None:
@@ -1830,26 +1865,12 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
         msg (str, optional): Message to associate with range
         suffix (str, optional): Suffix to append to the message
     """
-    if not _nvtx_enabled:
-        return
-
     if msg is None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
 
-    # Update list of NVTX range messages and check for consistency
-    if not _nvtx_range_messages:
-        raise RuntimeError("Attempted to pop NVTX range from empty stack")
-    last_msg = _nvtx_range_messages.pop()
-    if msg is not None and msg != last_msg:
-        raise ValueError(
-            f"Attempted to pop NVTX range from stack with msg={msg}, "
-            f"but last range has msg={last_msg}"
-        )
-
-    # Pop NVTX range
-    torch.cuda.nvtx.range_pop()
+    _nvtx_range_pop(msg)
 
 
 @lru_cache(maxsize=None)

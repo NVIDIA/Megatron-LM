@@ -362,11 +362,6 @@ class TransformerConfig(ModelParallelConfig):
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
 
-    moe_router_padding_for_fp8: Optional[bool] = False
-    """Whether to pad the routing_map to make sure the number of tokens each expert received
-    is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
-    GroupedMLP layer."""
-
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
     When using group-limited routing:
@@ -999,6 +994,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None:
             assert not self.add_bias_linear, "Bias is not supported for MoE"
 
+        if self.moe_token_dispatcher_type == "alltoall_seq":
+            if self.tensor_model_parallel_size != self.expert_tensor_parallel_size:
+                raise ValueError(
+                    "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
+                )
+            if self.moe_permute_fusion:
+                raise ValueError("alltoall_seq dispatcher does not support permute fusion.")
+
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
                 "Expert bias for aux-loss-free routing only supports sigmoid score function."
@@ -1017,16 +1020,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
                     f"but your version is {get_te_version()}."
-                )
-
-        if self.moe_router_padding_for_fp8:
-            if self.fp8 is None:
-                raise ValueError("fp8 must be specified when moe_router_padding_for_fp8 is True.")
-
-            if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
-                raise ValueError(
-                    "allgather and alltoall_seq dispatcher does not support "
-                    "moe_router_padding_for_fp8."
                 )
 
         if (
@@ -1072,7 +1065,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.recompute_granularity:
                 raise ValueError("CUDA graphs not supported with activation recomputation.")
 
-        if self.moe_token_dispatcher_type in ['allgather']:
+        if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
