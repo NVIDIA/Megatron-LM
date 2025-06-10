@@ -1375,7 +1375,8 @@ except ImportError:
 
 try:
 
-    from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+    # from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+    from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
 
     def fused_apply_rotary_pos_emb(
         t: torch.Tensor,

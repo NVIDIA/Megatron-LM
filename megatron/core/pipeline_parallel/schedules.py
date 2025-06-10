@@ -193,6 +193,7 @@ def forward_step(
     current_microbatch=None,
     encoder_decoder_xattn=False,
     vp_stage=None,
+    do_not_average_loss=False,
 ):
     """Forward step for passed-in model.
 
@@ -257,6 +258,11 @@ def forward_step(
             The current microbatch. Defaults to None.
         vp_stage (int, optional):
             The virtual pipeline stage. Defaults to None.
+        do_not_average_loss (bool, optional):
+            Whether to not average the loss. 
+            You may handle loss averaging yourself in your loss function, in which case,
+            you should avoid the loss averaging over microbatches done here.
+            Defaults to False.
 
     Returns:
         Tensor or list[Tensor]: The output object(s) from the forward step.
@@ -299,15 +305,16 @@ def forward_step(
             outputs = loss_func(output_tensor)
             if len(outputs) == 3:
                 output_tensor, num_tokens, loss_reduced = outputs
-                if not config.calculate_per_token_loss:
+                if not config.calculate_per_token_loss and not do_not_average_loss:
                     output_tensor /= num_tokens
                     output_tensor /= num_microbatches
             else:
                 # preserve legacy loss averaging behavior (ie, over the number of microbatches)
                 assert len(outputs) == 2
                 output_tensor, loss_reduced = outputs
-                output_tensor *= parallel_state.get_context_parallel_world_size()
-                output_tensor /= num_microbatches
+                if not do_not_average_loss:
+                    output_tensor *= parallel_state.get_context_parallel_world_size()
+                    output_tensor /= num_microbatches
             forward_data_store.append(loss_reduced)
         else:
             data = loss_func(output_tensor, non_loss_data=True)
@@ -327,6 +334,7 @@ def forward_step(
             else torch.ones(1, device=output_tensor.device)
         )
         # Set the loss scale
+        # TODO @sahilj: I haven't thought through how MoE Aux loss should work with out-of-megatron loss averaging.
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
@@ -341,6 +349,7 @@ def forward_step(
             else torch.ones(1, device=output_tensor.device)
         )
         # Set the loss scale
+        # TODO @sahilj: I haven't thought through how MTP loss should work with out-of-megatron loss averaging.
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
         else:
@@ -456,6 +465,7 @@ def forward_backward_no_pipelining(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
+    do_not_average_loss: bool = False,
 ):
     """Run forward and backward passes with no pipeline parallelism
     (no inter-stage communication).
@@ -504,6 +514,7 @@ def forward_backward_no_pipelining(
                 collect_non_loss_data,
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
                 current_microbatch=i,
+                do_not_average_loss=do_not_average_loss,
             )
             total_num_tokens += num_tokens
             if not forward_only:
@@ -524,6 +535,7 @@ def forward_backward_no_pipelining(
             first_val_step, forward_only, num_microbatches == 1
         ),
         current_microbatch=num_microbatches - 1,
+        do_not_average_loss=do_not_average_loss,
     )
     total_num_tokens += num_tokens
 
@@ -698,6 +710,7 @@ def forward_backward_pipelining_with_interleaving(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,  # unused
+    do_not_average_loss: bool = False,
 ):
     """Run interleaved 1F1B schedule (model split into model chunks), with
     communication between pipeline stages as needed.
@@ -1038,6 +1051,7 @@ def forward_backward_pipelining_with_interleaving(
             ),
             current_microbatch=microbatch_id,
             vp_stage=model_chunk_id,
+            do_not_average_loss=do_not_average_loss,
         )
 
         output_tensors[model_chunk_id].append(output_tensor)
@@ -1761,6 +1775,7 @@ def forward_backward_pipelining_without_interleaving(
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
     adjust_tensor_shapes_fn: Optional[Callable] = None,
+    do_not_average_loss: bool = False,
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
@@ -1896,6 +1911,7 @@ def forward_backward_pipelining_without_interleaving(
             check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
             encoder_decoder_xattn=encoder_decoder_xattn,
+            do_not_average_loss=do_not_average_loss,
         )
         send_forward(
             output_tensor, send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
@@ -1942,6 +1958,7 @@ def forward_backward_pipelining_without_interleaving(
             ),
             current_microbatch=i + num_warmup_microbatches,
             encoder_decoder_xattn=encoder_decoder_xattn,
+            do_not_average_loss=do_not_average_loss,
         )
         total_num_tokens += num_tokens
 
