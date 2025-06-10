@@ -211,7 +211,10 @@ class LLaVAModel(MegatronModule):
                     rope_scaling=language_rope_scaling,
                     rope_scaling_factor=language_rope_scaling_factor,
                     scatter_embedding_sequence_parallel=False,
-                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                )
+
+                self.share_embeddings_and_output_weights = (
+                    self.language_model.share_embeddings_and_output_weights
                 )
 
             self._language_max_sequence_length = language_max_sequence_length
