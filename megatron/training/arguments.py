@@ -1219,6 +1219,12 @@ def validate_args(args, defaults={}):
                 'Disabling --async-save.'
             )
             args.async_save = False
+        elif args.dist_ckpt_workers > 1:
+            warn_rank_0(
+                'async ckpt forks processes for parallel writing which may introduce '
+                'instability on checkpoints. Consider using --dist-ckpt-workers=1 in case of '
+                'issues.'
+            )
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -2255,6 +2261,10 @@ def _add_checkpointing_args(parser):
     group.add_argument('--dist-ckpt-format',
                        dest='dist_ckpt_format_deprecated',
                        help='Deprecated: see --ckpt-format.')
+    group.add_argument('--dist-ckpt-workers', type=int, default=1,
+                       help='Number of workers for distributed checkpointing. '
+                       'Only used for async save. '
+                       'If set to 1, the checkpointing is performed in a single process.')
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
