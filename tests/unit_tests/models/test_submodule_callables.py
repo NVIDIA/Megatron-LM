@@ -12,6 +12,7 @@ from tests.unit_tests.a2a_overlap.utils import (
     compare_captures,
     deterministic_mode,
     get_test_config,
+    get_valid_token_dispatcher_types,
     reset_model,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -120,9 +121,10 @@ class TestTransformerLayerSubmoduleCallables:
         pass
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    # TODO: Add flex dispatcher test back in when CI image installs DeepEP.
-    @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
-    def test_1f1b_overlap(self, dispatcher_type):
+    @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
+    @pytest.mark.parametrize("grouped_gemm", [True, False])
+    @pytest.mark.parametrize("permute_fusion", [True, False])
+    def test_1f1b_overlap(self, dispatcher_type, grouped_gemm, permute_fusion):
         """
         Tests the 1-forward-1-backward overlap optimization.
 
@@ -136,17 +138,19 @@ class TestTransformerLayerSubmoduleCallables:
             expert_model_parallel_size=2,
             virtual_pipeline_model_parallel_size=2,
         )
-        extra_kwargs = {}
-        extra_kwargs["moe_token_dispatcher_type"] = dispatcher_type
+        extra_kwargs = {
+            "moe_token_dispatcher_type": dispatcher_type,
+            "moe_permute_fusion": permute_fusion,
+        }
         if dispatcher_type == "flex":
             extra_kwargs["moe_enable_deepep"] = True
             extra_kwargs["moe_router_dtype"] = "fp32"
-        config = get_test_config(extra_kwargs=extra_kwargs)
+        config = get_test_config(extra_kwargs=extra_kwargs, moe_grouped_gemm=grouped_gemm)
         microbatches = 4
         with deterministic_mode():
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                num_experts=16,
-                moe_grouped_gemm=True,
+                num_experts=8,
+                moe_grouped_gemm=grouped_gemm,
                 qk_layernorm=True,
                 multi_latent_attention=True,
             )
