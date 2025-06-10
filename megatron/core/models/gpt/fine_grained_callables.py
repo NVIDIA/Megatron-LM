@@ -210,6 +210,7 @@ class TransformerLayerNode(ScheduleNode):
             submodule (function): The submodule contain forward and dw function
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
+            bwd_dw_callables (list): List of weight gradient functions for the layer.
         """
         # determine whether to free input memory
         is_moe = extra_args.get("is_moe", False)

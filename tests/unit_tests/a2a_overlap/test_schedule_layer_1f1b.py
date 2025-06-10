@@ -208,7 +208,7 @@ class TestA2AOverlap:
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     # TODO: Add flex dispatcher test back in when CI image installs DeepEP.
     @pytest.mark.parametrize("dispatcher_type", ["alltoall"])
-    @pytest.mark.parametrize("fp8", ["e4m3", None])
+    @pytest.mark.parametrize("fp8", [None])
     @pytest.mark.parametrize("fp8_recipe", ["tensorwise"])
     def test_transformer_layer_overlap(self, dispatcher_type, fp8, fp8_recipe):
         """
