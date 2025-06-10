@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 from packaging.version import Version as PkgVersion
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
 
@@ -54,6 +55,14 @@ def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
         return fp8_tensor.dequantize()
     else:
         return fp8_tensor.from_float8()
+
+
+def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
+    """Get the alignment size required for fp8 GEMM."""
+    if fp8_recipe == Fp8Recipe.mxfp8:
+        return 32
+    else:
+        return 16
 
 
 """
@@ -344,7 +353,6 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
 
 if HAVE_TE:
     from megatron.core import parallel_state
-    from megatron.core.enums import Fp8Recipe
     from megatron.core.extensions.transformer_engine import TEDelayedScaling
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):

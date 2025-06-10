@@ -1076,6 +1076,10 @@ def validate_args(args, defaults={}):
             + f"The supported position embedding types are rope and none."
         )
 
+    # CUDA Graphs
+    if args.external_cuda_graph:
+        assert args.te_rng_tracker, "--te-rng-tracker must be enabled when using CUDA Graphs."
+
     # Print arguments.
     _print_args("arguments", args)
 
@@ -2740,6 +2744,12 @@ def _add_moe_args(parser):
                        'The default value 1e-3 is same as that used in DeepSeekV3.')
     group.add_argument('--moe-router-force-load-balancing', action='store_true',
                        help='[Experimental] Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only!')
+    group.add_argument('--moe-router-padding-for-fp8', action='store_true',
+                       help='Pad the routing_map to make sure the number of tokens each expert received '
+                       'is a multiple of 16/32 for FP8 precision. It is suggested to enable this for '
+                       'dropless training with FP8 precision when num_local_experts > 1. This is a more '
+                       'efficient way to pad for FP8 which eliminates the explicit padding in the '
+                       'GroupedMLP layer.')
     group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
@@ -2750,9 +2760,9 @@ def _add_moe_args(parser):
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
     # Token dispatcher arguments
     group.add_argument('--moe-token-dispatcher-type', type=str,
-                       choices=['allgather', 'alltoall', 'flex', 'alltoall_seq'],
+                       choices=['allgather', 'alltoall', 'flex'],
                        default='allgather',
-                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall' and 'alltoall_seq'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
+                       help="The type of token dispatcher to use. The default is 'allgather'. Options are 'allgather', 'alltoall'. We recommend using 'alltoall' when applying expert parallelism. For more information, please refer to the documentation in core/moe/README.")
     group.add_argument('--moe-enable-deepep', action='store_true',
                        help='[Experimental] Enable DeepSeek/DeepEP for efficient token dispatching and combine in MoE models. Only works with flex token dispatcher by setting --moe-token-dispatcher-type=flex.')
     group.add_argument('--moe-permute-fusion', action='store_true',
