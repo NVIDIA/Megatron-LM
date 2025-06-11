@@ -170,7 +170,7 @@ class PostProcessNode(ScheduleNode):
             rotary_pos_emb=self.model_chunk_state.rotary_pos_emb,
             rotary_pos_cos=self.model_chunk_state.rotary_pos_cos,
             rotary_pos_sin=self.model_chunk_state.rotary_pos_sin,
-            mtp_in_postprocess=False,  # MTP changes assumptions of final layer norm, not supported for now
+            mtp_in_postprocess=False,
             loss_mask=self.model_chunk_state.loss_mask,
             attention_mask=self.model_chunk_state.attention_mask,
             packed_seq_params=self.model_chunk_state.packed_seq_params,
