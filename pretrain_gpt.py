@@ -279,6 +279,9 @@ def forward_step(data_iterator, model: GPTModel):
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
+            if model.config.overlap_moe_expert_parallel_comm:
+                # model is now a function to build ModelChunkSchedulePlan
+                model = model.build_schedule_plan
             output_tensor = model(
                 tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
             )

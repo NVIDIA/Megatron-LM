@@ -242,7 +242,6 @@ class GPTModel(LanguageModule):
         decoder_input: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
-        **kwargs,
     ):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -346,21 +345,14 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        kwargs = {
-            'input_ids': input_ids,
-            'position_ids': position_ids,
-            'decoder_input': decoder_input,
-            'attention_mask': attention_mask,
-            'packed_seq_params': packed_seq_params,
-            'labels': labels,
-            'extra_block_kwargs': extra_block_kwargs,
-            'runtime_gather_output': runtime_gather_output,
-            'loss_mask': loss_mask,
-            'inference_context': inference_context,
-            'inference_params': inference_params,
-        }
         decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
-            self._preprocess(**kwargs)
+            self._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
         )
 
         # Run decoder.
@@ -376,13 +368,25 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
-        kwargs['decoder_input'] = decoder_input
-        kwargs['rotary_pos_emb'] = rotary_pos_emb
-        kwargs['rotary_pos_cos'] = rotary_pos_cos
-        kwargs['rotary_pos_sin'] = rotary_pos_sin
-        kwargs['use_mtp'] = self.mtp_process
-
-        return self._postprocess(hidden_states=hidden_states, **kwargs)
+        return self._postprocess(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mtp_in_postprocess=self.mtp_process,
+            loss_mask=loss_mask,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            runtime_gather_output=runtime_gather_output,
+            extra_block_kwargs=extra_block_kwargs,
+            inference_context=inference_context,
+        )
 
     def _postprocess(
         self,
@@ -393,7 +397,7 @@ class GPTModel(LanguageModule):
         rotary_pos_emb,
         rotary_pos_cos,
         rotary_pos_sin,
-        use_mtp=None,
+        mtp_in_postprocess=None,
         loss_mask=None,
         decoder_input=None,
         attention_mask=None,
@@ -409,7 +413,7 @@ class GPTModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if use_mtp:
+        if mtp_in_postprocess:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,

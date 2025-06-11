@@ -269,18 +269,3 @@ def unwrap_model(model):
     if not return_list:
         return unwrapped_model[0]
     return unwrapped_model
-
-
-def wrap_forward_func(forward_step_func):
-    """Wrap the input to forward_step_func.
-    The wrapped function will return forward_schedule_plan and the loss_function.
-    """
-
-    def wrapped_func(data_iterator, model):
-        # Model is unwrapped to get GPTModel instance.
-        # GPTModel.build_schedule_plan(model_forward_inputs) is called in the forward_step.
-        # The return value becomes (forward_schedule_plan, loss_function),
-        # which is used to be (forward_output_tensor, loss_function).
-        return forward_step_func(data_iterator, unwrap_model(model).build_schedule_plan)
-
-    return wrapped_func

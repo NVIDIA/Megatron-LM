@@ -279,12 +279,12 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
-        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = (
-            moe_layer.token_dispatcher.token_permutation(hidden_states, probs_1, indices_1)
+        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
-        restored_hidden_states_1, _ = moe_layer.token_dispatcher.token_unpermutation(
-            permuted_input_1
+        restored_hidden_states_1, _ = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_input_1
         )
         torch.autograd.backward(restored_hidden_states_1, restored_hidden_states_1)
         grad_1 = hidden_states.grad.clone()
@@ -295,8 +295,8 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
-        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = (
-            moe_layer_2.token_dispatcher.token_permutation(hidden_states, probs_2, indices_2)
+        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
+            moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         assert (
             sum(tokens_per_expert_2) == permuted_input_2.shape[0]
@@ -308,8 +308,8 @@ class MoEModelTestContainer:
             ), "number of tokens for expert is not a multiple of 16"
 
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
-        restored_hidden_states_2, _ = moe_layer_2.token_dispatcher.token_unpermutation(
-            permuted_input_2
+        restored_hidden_states_2, _ = token_unpermutation(
+            moe_layer_2.token_dispatcher, permuted_input_2
         )
 
         # Check that the results are the same

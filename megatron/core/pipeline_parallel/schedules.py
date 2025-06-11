@@ -24,7 +24,7 @@ from megatron.core.utils import (
 )
 
 from .combined_1f1b import forward_backward_step
-from .utils import VppContextManager, set_streams, wrap_forward_func
+from .utils import VppContextManager, set_streams
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -526,9 +526,6 @@ def forward_backward_no_pipelining(
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         f_context = contextlib.nullcontext()
         b_context = contextlib.nullcontext()
-        # in overlap_moe_expert_parallel_comm, we need to wrap the forward_step_func
-        # to return a schedule plan instead of the forward output tensor
-        forward_step_func = wrap_forward_func(forward_step_func)
         set_streams()
         # The forward step for the first microbatch is executed alone, no a2a overlapping
         output_tensor, num_tokens, _ = forward_backward_step(
@@ -838,10 +835,6 @@ def forward_backward_pipelining_with_interleaving(
 
     config = get_model_config(model[0])
     set_streams()
-    if config.overlap_moe_expert_parallel_comm and not forward_only:
-        # in overlap_moe_expert_parallel_comm, we need to wrap the forward_step_func
-        # to return a schedule plan instead of the forward output tensor
-        forward_step_func = wrap_forward_func(forward_step_func)
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 

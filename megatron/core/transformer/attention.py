@@ -969,11 +969,8 @@ class SelfAttention(Attention):
 
     def backward_dw(self) -> NoReturn:
         """Execute weight update operations"""
-        try:
-            self._backward_qkv_proj()
-            self._backward_output_proj()
-        except Exception as e:
-            raise RuntimeError(f"Error in SelfAttention backward_dw: {str(e)}")
+        self._backward_qkv_proj()
+        self._backward_output_proj()
 
     def _backward_qkv_proj(self):
         """Update weights for QKV projection layer"""
