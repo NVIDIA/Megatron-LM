@@ -253,10 +253,10 @@ def get_mtp_layer_offset(config: TransformerConfig) -> int:
     return 0
 
 
-def get_mtp_num_layers_to_build(config: TransformerConfig) -> int:
+def get_mtp_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """Get the number of MTP layers to build."""
     # Currently, we only support put all of MTP layers on the last pipeline stage.
-    if mpu.is_pipeline_last_stage():
+    if mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
         return config.mtp_num_layers if config.mtp_num_layers else 0
     else:
         return 0
@@ -333,11 +333,13 @@ class MultiTokenPredictionLayer(MegatronModule):
         config: TransformerConfig,
         submodules: MultiTokenPredictionLayerSubmodules,
         layer_number: int = 1,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number
+        self.vp_stage = vp_stage
 
         self_attention_spec = self.submodules.transformer_layer.submodules.self_attention
         attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
@@ -377,7 +379,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
         )
-        self.transformer_layer = build_module(self.submodules.transformer_layer, config=self.config)
+        self.transformer_layer = build_module(
+            self.submodules.transformer_layer, config=self.config, vp_stage=vp_stage
+        )
 
         self.final_layernorm = build_module(
             self.submodules.layer_norm,
@@ -576,17 +580,23 @@ class MultiTokenPredictionBlock(MegatronModule):
     """
 
     def __init__(
-        self, config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec]
+        self,
+        config: TransformerConfig,
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
+        self.vp_stage = vp_stage
         self._build_layers()
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
 
     def _build_layers(self):
         def build_layer(layer_spec, layer_number):
-            return build_module(layer_spec, config=self.config, layer_number=layer_number)
+            return build_module(
+                layer_spec, config=self.config, layer_number=layer_number, vp_stage=self.vp_stage
+            )
 
         self.layers = torch.nn.ModuleList(
             [

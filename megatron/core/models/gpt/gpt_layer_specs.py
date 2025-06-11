@@ -428,9 +428,10 @@ def get_gpt_mtp_block_spec(
     config: TransformerConfig,
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     use_transformer_engine: bool,
+    vp_stage: Optional[int] = None,
 ) -> MultiTokenPredictionBlockSubmodules:
     """GPT Multi-Token Prediction (MTP) block spec."""
-    num_layers_to_build = get_mtp_num_layers_to_build(config)
+    num_layers_to_build = get_mtp_num_layers_to_build(config, vp_stage=vp_stage)
     if num_layers_to_build == 0:
         return None
 
