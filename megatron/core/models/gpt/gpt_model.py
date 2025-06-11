@@ -177,7 +177,9 @@ class GPTModel(LanguageModule):
         )
 
         if self.mtp_process:
-            self.mtp = MultiTokenPredictionBlock(config=self.config, spec=self.mtp_block_spec)
+            self.mtp = MultiTokenPredictionBlock(
+                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage
+            )
 
         # Output
         if self.post_process or self.mtp_process:
