@@ -160,7 +160,7 @@ class PostProcessNode(ScheduleNode):
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
 
-        # Run GPTModle._postprocess
+        # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
             hidden_states=hidden_states,
             input_ids=self.model_chunk_state.input_ids,
@@ -170,7 +170,7 @@ class PostProcessNode(ScheduleNode):
             rotary_pos_emb=self.model_chunk_state.rotary_pos_emb,
             rotary_pos_cos=self.model_chunk_state.rotary_pos_cos,
             rotary_pos_sin=self.model_chunk_state.rotary_pos_sin,
-            use_mtp=False,  # MTP changes assumptions of final layer norm, not supported for now
+            mtp_in_postprocess=False,  # MTP changes assumptions of final layer norm, not supported for now
             loss_mask=self.model_chunk_state.loss_mask,
             attention_mask=self.model_chunk_state.attention_mask,
             packed_seq_params=self.model_chunk_state.packed_seq_params,

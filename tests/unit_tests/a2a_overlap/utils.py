@@ -238,7 +238,7 @@ def get_valid_fp8_flags():
     valid_flags = []
     if is_te_min_version("2.3.0.dev0"):
         recipes.append(Fp8Recipe.blockwise)
-    if is_te_min_version("2.2.0.dev0"):
+    if is_te_min_version("2.2.0"):
         recipes.append(Fp8Recipe.tensorwise)
 
     for fp8_type in fp8_types:
