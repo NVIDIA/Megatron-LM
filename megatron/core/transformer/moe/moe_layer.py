@@ -284,7 +284,7 @@ class MoELayer(BaseMoELayer):
         return output
 
     def forward(self, hidden_states: torch.Tensor, start="None", end=None):
-        if self.training and self.tp_group.size() > 1 and not self.config.sequence_parallel:
+        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."

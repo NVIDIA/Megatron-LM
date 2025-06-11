@@ -8,7 +8,7 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode
+from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode, unwrap_model
 from megatron.core.utils import get_attr_wrapped_model
 
 # Types
@@ -90,8 +90,8 @@ def forward_backward_step(
 
     Args:
         Need to accept the argument of both forward_step() and backward_step().
-        forward_step_func (callable): is wrapped by wrap_forward_func() which is now returning
-            a forward schedule plan which is an input of schedule_chunk_1f1b function.
+        forward_step_func (callable): A function returning a forward schedule plan which is
+            an input of schedule_chunk_1f1b function.
         f_context (VppContextManager or nullcontext): The context manager for setting vpp ranks.
         b_context (VppContextManager or nullcontext): The context manager for setting vpp ranks.
 
@@ -160,7 +160,7 @@ def forward_backward_step(
             # The return value becomes (forward_schedule_plan, loss_function),
             # which is used to be (forward_output_tensor, loss_function).
             with context_manager:  # autocast context
-                f_schedule_plan, loss_func = forward_step_func(data_iterator, f_model)
+                f_schedule_plan, loss_func = forward_step_func(data_iterator, unwrap_model(f_model))
                 assert isinstance(
                     f_schedule_plan, AbstractSchedulePlan
                 ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"

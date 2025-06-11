@@ -318,11 +318,6 @@ def build_transformer_layer_callables(layer):
 
         local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
 
-        if layer.recompute_pre_mlp_layernorm:
-            # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of unpermuted probs
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(local_tokens)
-
         # Detach here for mlp_bda residual connection
         node.common_state.residual = node.detach(hidden_states)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
@@ -359,6 +354,11 @@ def build_transformer_layer_callables(layer):
         expert_output, shared_expert_output, mlp_bias = layer.mlp.experts_compute(
             dispatched_tokens, probs, pre_mlp_layernorm_output
         )
+
+        if layer.recompute_pre_mlp_layernorm:
+            # discard the output of the pre-mlp layernorm and register the recompute
+            # as a gradient hook of unpermuted probs
+            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
         # release tensor reference after use
         node.common_state.pre_mlp_layernorm_output = None
