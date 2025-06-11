@@ -88,10 +88,11 @@ class BaseMoELayer(MegatronModule, ABC):
 
 
 class MoELayer(BaseMoELayer):
-    """Mixture of experts Layer **currently only supports no token dropping**.
+    """Mixture of Experts layer.
 
-    Args:
-        BaseMoELayer (MegatronModule): Base class for MoE layers
+    This layer implements a Mixture of Experts model, where each token is routed to a
+    subset of experts. This implementation supports different token dispatching
+    strategies such as All-to-All and All-Gather.
     """
 
     def __init__(
@@ -160,27 +161,12 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
-        """
-        Determines token-to-expert routing and preprocesses tokens for dispatch.
+        """Compute and preprocess token routing for dispatch.
 
-        - Saves the input `hidden_states` as a residual.
-        - Uses the MoE router to calculate routing probabilities (`probs`) and the
-          binary routing map (`routing_map`) indicating expert assignments for each token.
-        - Calls the token dispatcher's `dispatch_preprocess` method,
-          which typically involves permuting and reshaping `hidden_states` and `probs`
-          to prepare them for the communication phase (dispatch).
-
-        Args:
-            hidden_states (torch.Tensor): The input tensor to the MoE layer.
-            Shape: (sequence_length, batch_size, hidden_dim) or (num_tokens, hidden_dim).
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-                - hidden_states (torch.Tensor): The input hidden_states, preprocessed
-                  for dispatch.
-                - probs (torch.Tensor): Routing probabilities preprocessed for dispatch.
-                - residual (torch.Tensor): The original input `hidden_states`, preserved
-                  for shared expert connection.
+        This method uses the router to determine which experts to send each token to,
+        producing routing probabilities and a mapping. It then preprocesses the
+        hidden states and probabilities for the token dispatcher. The original
+        hidden states are returned as a residual connection.
         """
         residual = hidden_states
         probs, routing_map = self.router(hidden_states)
@@ -190,56 +176,23 @@ class MoELayer(BaseMoELayer):
         return hidden_states, probs, residual
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
-        """
-        Dispatches tokens and their probabilities to the assigned expert ranks.
-
+        """Dispatches tokens to assigned expert ranks via communication.
         This method performs the actual communication (e.g., All-to-All) to distribute
         tokens and their associated probabilities to the devices hosting their assigned
         experts.
-
-        Args:
-            hidden_states (torch.Tensor): Tokens preprocessed for dispatch.
-            probs (torch.Tensor): Routing probs preprocessed for dispatch.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]:
-                - hidden_states (torch.Tensor): Tokens dispatched to local experts.
-                - probs (torch.Tensor): Routing probs dispatched to local experts.
         """
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     def experts_compute(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, residual: torch.Tensor
     ):
-        """
-        Processes dispatched tokens through local experts and prepares for combine.
+        """Computes the output of the experts on the dispatched tokens.
 
-        This method performs the following steps:
-        1. Calls `token_dispatcher.dispatch_postprocess` to organize the dispatched
-           `hidden_states` and `probs` per expert for efficient local computation.
-        2. Passes the processed tokens and probabilities to the local experts.
-        3. Calls `token_dispatcher.combine_preprocess` to prepare the output for the
-           subsequent combine/communication phase (e.g., restoring token order before
-           dispatch).
-        4. Computes the shared_expert_output if enabled.
-
-        Note: For optimal performance, especially with All-to-All overlapping, this
-        function should ideally not contain inter-device communication.
-
-        Args:
-            hidden_states (torch.Tensor): Hidden states dispatched to local experts.
-            probs (torch.Tensor): Routing probabilities dispatched to local experts.
-            residual (torch.Tensor): The original input to the MoE layer, used for
-                                     the shared expert if applicable.
-
-        Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-                - output (torch.Tensor): The output from local experts, preprocessed by
-                  `combine_preprocess` and ready for the combine phase.
-                - shared_expert_output (Optional[torch.Tensor]): The output from the
-                  shared expert, if applicable and computed. Otherwise, None.
-                - mlp_bias (Optional[torch.Tensor]): Bias from the MLP experts, if any.
-                  Currently asserted to be None for this dispatcher type.
+        This method first post-processes the dispatched input to get permuted tokens
+        for each expert. It then passes the tokens through the local experts.
+        If a shared expert is configured and not overlapped with communication,
+        it is also applied. The output from the experts is preprocessed for the
+        combine step.
         """
         shared_expert_output = None
         dispatched_input, tokens_per_expert, permuted_probs = (
@@ -248,34 +201,19 @@ class MoELayer(BaseMoELayer):
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
+
         if self.use_shared_expert and not self.shared_expert_overlap:
-            # if shared_expert_overlap is True, the expert calculation happens in
-            # the token_dispatcher to overlap communications and computations
+            # Compute the shared expert separately when not overlapped with communication.
             shared_expert_output = self.shared_experts(residual)
 
         return output, shared_expert_output, mlp_bias
 
     def combine(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
-        """
-        Combines outputs from experts and finalizes the MoE layer output.
+        """Combines expert outputs via communication and adds shared expert output.
 
-        This method performs the following steps:
-        1. Calls `token_dispatcher.token_combine` to gather processed expert outputs
-           from different expert ranks (e.g., All-to-All, Reduce-Scatter, etc.).
-        2. Calls `token_dispatcher.combine_postprocess` to perform final processing
-           on the combined output, such as unpermuting tokens to their original
-           order and reshaping the tensor to its original input shape.
-        3. If `shared_expert_output` is provided, it's added to the combined expert
-           outputs.
-
-        Args:
-            output (torch.Tensor): The expert outputs, preprocessed and ready for combination
-                                   (from `experts_compute`).
-            shared_expert_output (Optional[torch.Tensor]): The output from the shared expert,
-                                                          if applicable.
-
-        Returns:
-            torch.Tensor: The final output tensor of the MoE layer.
+        This method uses the token dispatcher to combine the outputs from different
+        experts (e.g., via an All-to-All communication). It then adds the output
+        from the shared expert if it exists.
         """
         output = self.token_dispatcher.token_combine(output)
         output = self.token_dispatcher.combine_postprocess(output)
@@ -283,15 +221,28 @@ class MoELayer(BaseMoELayer):
             output = output + shared_expert_output
         return output
 
-    def forward(self, hidden_states: torch.Tensor, start="None", end=None):
+    def forward(self, hidden_states: torch.Tensor):
+        """Forward pass for the MoE layer.
+
+        The forward pass comprises four main steps:
+        1. Routing & Preprocessing: Route tokens to the assigned experts and prepare for dispatch.
+        2. Dispatch: Tokens are sent to the expert devices using communication collectives.
+        3. Expert Computation: Experts process the dispatched tokens.
+        4. Combine: The outputs from the experts are combined and returned.
+
+        Args:
+            hidden_states (torch.Tensor): The input tensor to the MoE layer.
+
+        Returns:
+            A tuple containing the output tensor and the MLP bias, if any.
+        """
         if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
 
-        # process MoE
-        # TODO: refactor all token dispatcher to use the same pre/postprocess interface
+        # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states):
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
             dispatched_input, probs = self.dispatch(hidden_states, probs)
@@ -318,13 +269,7 @@ class MoELayer(BaseMoELayer):
         return output, mlp_bias
 
     def backward_dw(self):
-        """Performs backward pass for weight gradients in MoELayer.
-
-        This method executes the backward pass for weight gradients by calling
-        backward_dw() on both the experts and shared_experts components.
-        This ensures that gradients are properly computed for all expert weights
-        in the mixture of experts layer.
-        """
+        """Compute weight gradients for experts and shared experts."""
         self.experts.backward_dw()
         if self.use_shared_expert and not self.shared_expert_overlap:
             self.shared_experts.backward_dw()

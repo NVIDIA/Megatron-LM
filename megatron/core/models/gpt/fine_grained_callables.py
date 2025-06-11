@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import weakref
+from typing import Optional
 
 import torch
 
@@ -279,15 +280,37 @@ class TransformerLayerNode(ScheduleNode):
         self.submodule = None
 
 
-def build_transformer_layer_callables(layer):
-    """
-    Create callables for transformer layer nodes.
+def build_transformer_layer_callables(layer: TransformerLayer):
+    """Create callables for transformer layer nodes.
+    Divides the transformer layer's operations into a sequence of smaller, independent
+    functions. This decomposition separates computation-heavy tasks (e.g., self-attention,
+    MLP) from communication-heavy tasks (e.g., MoE's All-to-All).
+
+    The five callables are:
+    1. Attention (computation)
+    2. Post-Attention (computation)
+    3. MoE Dispatch (communication)
+    4. MLP / MoE Experts (computation)
+    5. MoE Combine (communication)
+
+    By assigning these functions to different CUDA streams (e.g., a compute stream
+    and a communication stream), the scheduler can overlap their execution, preventing
+    tasks from competing for resources and hiding communication latency by running them
+    in parallel with functions from other micro-batches.
+
+    Args:
+        layer: The transformer layer to build callables for.
+
+    Returns:
+        A tuple containing:
+        - forward_funcs: List of callable functions for the layer
+        - backward_dw: Dict of weight gradient functions for the layer
     """
 
     is_moe = isinstance(layer.mlp, MoELayer)
     enable_deepep = layer.config.moe_enable_deepep
 
-    def submodule_attn_forward(node, hidden_states):
+    def submodule_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
         Performs same attnention forward logic as GPT Model.
         """
@@ -303,7 +326,7 @@ def build_transformer_layer_callables(layer):
         )
         return hidden_states
 
-    def submodule_post_attn_forward(node, hidden_states):
+    def submodule_post_attn_forward(node: ScheduleNode, hidden_states: torch.Tensor):
         """
         Run forward pass for computations between attention and dispatch:
             pre mlp layernorm->router->dispatch preprocess
@@ -326,7 +349,9 @@ def build_transformer_layer_callables(layer):
 
         return local_tokens, probs
 
-    def submodule_dispatch_forward(node, local_tokens, probs):
+    def submodule_dispatch_forward(
+        node: ScheduleNode, local_tokens: torch.Tensor, probs: torch.Tensor
+    ):
         """
         Dispatches tokens to the experts based on the router output.
         """
@@ -338,7 +363,9 @@ def build_transformer_layer_callables(layer):
 
         return layer.mlp.dispatch(local_tokens, probs)
 
-    def submodule_moe_forward(node, dispatched_tokens, probs):
+    def submodule_moe_forward(
+        node: ScheduleNode, dispatched_tokens: torch.Tensor, probs: torch.Tensor
+    ):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
@@ -367,9 +394,18 @@ def build_transformer_layer_callables(layer):
             return expert_output
         return expert_output, shared_expert_output
 
-    def submodule_combine_forward(node, output, shared_expert_output=None):
+    def submodule_combine_forward(
+        node: ScheduleNode,
+        output: torch.Tensor,
+        shared_expert_output: Optional[torch.Tensor] = None,
+    ):
         """
-        Combines tokens and performs post processing.
+        # Triggers token combine and the remaining computation in the transformer layer.
+        # The `mlp_bda` computation is placed after `mlp.combine` due to data dependency.
+        # This ordering is also critical for pipeline performance. Starting the `mlp.combine`
+        # communication at first allows it to be overlapped with computation from another
+        # microbatch. If `mlp_bda` were to run first, it would compete for SM resources
+        # with another microbatch's computation and expose the communication.
         """
         residual = node.common_state.residual
 
@@ -391,7 +427,7 @@ def build_transformer_layer_callables(layer):
         node.common_state.residual = None
         return output
 
-    def mlp_wrapper(node, *args, **kwargs):
+    def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
         """Wrapper for Dense forward."""
         return layer._forward_mlp(*args, **kwargs)
 

@@ -3,14 +3,12 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
-import os
 
 try:
     from deep_ep import Buffer
     from deep_ep.utils import EventHandle, EventOverlap
 
     HAVE_DEEP_EP = True
-    Buffer.set_num_sms(int(os.environ.get("DEEP_EP_SM_NUMS", 20)))
 except ImportError:
     HAVE_DEEP_EP = False
 
@@ -256,6 +254,11 @@ if HAVE_DEEP_EP:
         """
         return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
 
+    def set_deepep_num_sms(num_sms):
+        """Sets the number of SMs to use for DeepEP"""
+        Buffer.set_num_sms(num_sms)
+
 else:
     fused_dispatch = None
     fused_combine = None
+    set_deepep_num_sms = None
