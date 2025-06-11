@@ -280,8 +280,10 @@ def forward_step(data_iterator, model: GPTModel):
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
             if model.config.overlap_moe_expert_parallel_comm:
-                # model is now a function to build ModelChunkSchedulePlan
-                model = model.build_schedule_plan
+                # When overlap_moe_expert_parallel_comm is enabled, return SchedulePlan instead, the actual 
+                # scheduling is called in combined_1f1b.py::forward_backward_step()
+                schedule_plan = model.build_schedule_plan(tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask)
+                return schedule_plan, partial(loss_func, loss_mask, model=model)
             output_tensor = model(
                 tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
             )
