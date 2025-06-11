@@ -39,6 +39,7 @@ try:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
+        TEFusedMLP,
         TELayerNormColumnParallelLinear,
         TENorm,
         TERowParallelLinear,
@@ -74,6 +75,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
+    use_te_op_fuser: Optional[bool] = False,
 ) -> ModuleSpec:
     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
 
@@ -86,9 +88,12 @@ def get_gpt_layer_with_transformer_engine_spec(
         moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
                                                       Defaults to False.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_te_op_fuser (bool, optional): Use Transformer Engine's operation-based API, which may
+                                          enable certain operation fusions. Defaults to False.
 
     Returns:
         ModuleSpec: Module specification with TE modules
+
     """
     if fp8 is not None:
         warnings.warn(
@@ -101,6 +106,7 @@ def get_gpt_layer_with_transformer_engine_spec(
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
         moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+        use_te_op_fuser=use_te_op_fuser,
     )
 
     if multi_latent_attention:
@@ -166,6 +172,14 @@ def get_gpt_layer_with_transformer_engine_spec(
                 pre_mlp_layernorm=TENorm if num_experts else IdentityOp,
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
+                sharded_state_dict_keys_map={
+                    'mlp.0.weight': 'mlp.linear_fc1.layer_norm_weight',
+                    'mlp.0.bias': 'mlp.linear_fc1.layer_norm_bias',
+                    'mlp.1.basic_ops.0.weight': 'mlp.linear_fc1.weight',
+                    'mlp.1.basic_ops.1.bias': 'mlp.linear_fc1.bias',
+                    'mlp.3.basic_ops.0.weight': 'mlp.linear_fc2.weight',
+                    'mlp.3.basic_ops.1.bias': 'mlp.linear_fc2.bias',
+                },
             ),
         )
 
@@ -300,6 +314,7 @@ def get_mlp_module_spec(
     moe_grouped_gemm: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-arguments
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    use_te_op_fuser: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MLP/MoE"""
     if fp8 is not None:
@@ -307,16 +322,28 @@ def get_mlp_module_spec(
             'The fp8 argument in "_get_mlp_module_spec" has been deprecated'
             ' and will be removed soon. Please update your code accordingly.'
         )
+    if use_te_op_fuser:
+        if not is_te_min_version("1.13.0"):
+            raise ValueError(
+                'Transformer Engine operation-based API requires Transformer Engine 1.13+'
+            )
+        if num_experts is not None:
+            raise ValueError(
+                'Transformer Engine operation-based API does not support mixture-of-experts'
+            )
 
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
-        return ModuleSpec(
-            module=MLP,
-            submodules=MLPSubmodules(
-                linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
-                linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
-            ),
-        )
+        if use_te_op_fuser:
+            return ModuleSpec(module=TEFusedMLP)
+        else:
+            return ModuleSpec(
+                module=MLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
+                    linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+                ),
+            )
     else:
         # Mixture of experts with modules in megatron core.
         return get_moe_module_spec(

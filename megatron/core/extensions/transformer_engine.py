@@ -5,9 +5,10 @@ import io
 import os
 import pickle
 import warnings
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple, Type
 
 import torch
+import torch.nn.functional as F
 import transformer_engine as te
 from packaging.version import Version as PkgVersion
 from torch import Tensor
@@ -1277,6 +1278,118 @@ else:
     TEGroupedLinear = None  # type: ignore[assignment, misc]
     TEColumnParallelGroupedLinear = None  # type: ignore[assignment, misc]
     TERowParallelGroupedLinear = None  # type: ignore[assignment, misc]
+
+
+if is_te_min_version("1.13.0"):
+
+    class TEFusedMLP(te.pytorch.ops.Sequential):
+        """
+        A fused MLP implementation using Transformer Engine's operation-based API
+        """
+
+        def __init__(
+            self,
+            config: TransformerConfig,
+            *,
+            is_expert: bool = False,
+            input_size: Optional[int] = None,
+            ffn_hidden_size: Optional[int] = None,
+            tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        ):
+            self.config: TransformerConfig = config
+
+            # MoE is not supported
+            # Note: This option is for compatibility with MLP class
+            if is_expert:
+                raise ValueError(
+                    'Transformer Engine operation-based API does not support mixture-of-experts'
+                )
+
+            # Tensor-parallel group
+            tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+
+            # Layer sizes
+            if ffn_hidden_size is None:
+                warnings.warn(
+                    "MLP requires ffn_hidden_size, but it was not provided. Using "
+                    "config.ffn_hidden_size by default.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                ffn_hidden_size = config.ffn_hidden_size
+            fc1_in_size = input_size if input_size != None else config.hidden_size
+            fc1_out_size = 2 * ffn_hidden_size if config.gated_linear_unit else ffn_hidden_size
+            fc2_in_size = ffn_hidden_size
+            fc2_out_size = fc1_in_size
+
+            # Linear ops
+            fc1_op = te.pytorch.ops.Linear(
+                in_features=fc1_in_size,
+                out_features=fc1_out_size,
+                sequence_parallel=config.sequence_parallel,
+                tensor_parallel_group=tp_group,
+                rng_state_tracker_function=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                bias=config.add_bias_linear,
+            )
+            fc2_op = te.pytorch.ops.Linear(
+                in_features=fc2_in_size,
+                out_features=fc2_out_size,
+                sequence_parallel=config.sequence_parallel,
+                tensor_parallel_group=tp_group,
+                rng_state_tracker_function=(
+                    get_cuda_rng_tracker if get_cuda_rng_tracker().is_initialized() else None
+                ),
+                bias=config.add_bias_linear,
+            )
+
+            # Normalization op
+            norm_type: Type[te.pytorch.ops.FusibleOperation]
+            if config.normalization == 'LayerNorm':
+                norm_type = te.pytorch.ops.LayerNorm
+            elif config.normalization == "RMSNorm":
+                norm_type = te.pytorch.ops.RMSNorm
+            else:
+                raise ValueError(f"Unsupported normalization: {config.normalization}")
+            norm_op = norm_type(
+                fc1_in_size,
+                eps=config.layernorm_epsilon,
+                zero_centered_gamma=config.layernorm_zero_centered_gamma,
+            )
+
+            # Activation op
+            activation_type = {
+                (F.gelu, False): te.pytorch.ops.GELU,
+                (F.gelu, True): te.pytorch.ops.GEGLU,
+                (F.silu, True): te.pytorch.ops.SwiGLU,
+                (F.relu, False): te.pytorch.ops.ReLU,
+                (F.relu, True): te.pytorch.ops.ReGLU,
+            }[config.activation_func, config.gated_linear_unit]
+            activation_kwargs = {}
+            if is_te_min_version("2.3"):
+                activation_kwargs["cache_quantized_input"] = config.activation_func_fp8_input_store
+            activation_op = activation_type(**activation_kwargs)
+
+            # Construct layers
+            super().__init__(norm_op, fc1_op, activation_op, fc2_op)
+
+        def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
+            """Forward."""
+            out = super().forward(hidden_states)
+            bias = self[-1].bias  # Bias from last layer
+            return out, bias
+
+        def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+            """Sharding along axis 0, bias sharded"""
+            state_dict = self.state_dict(prefix='', keep_vars=True)
+            return make_sharded_tensors_for_checkpoint(
+                state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            )
+
+else:
+
+    TEFusedMLP = None  # type: ignore[assignment, misc]
 
 
 class TEDelayedScaling(te.common.recipe.DelayedScaling):
