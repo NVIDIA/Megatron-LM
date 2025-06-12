@@ -116,12 +116,19 @@ class CLIPViTModel(VisionModule):
 
         self.position_ids = torch.arange(self.seq_length).expand(1, -1).cuda()
 
-        self.position_embeddings = torch.nn.Embedding(self.seq_length, self.visual_hidden_size)
+        self.position_embeddings = torch.nn.Embedding(
+            self.seq_length, self.visual_hidden_size, dtype=transformer_config.params_dtype
+        )
 
         self.add_class_token = add_class_token
         if self.add_class_token:
             self.class_token = torch.nn.Parameter(
-                torch.randn(1, self.class_token_len, self.visual_hidden_size)
+                torch.randn(
+                    1,
+                    self.class_token_len,
+                    self.visual_hidden_size,
+                    dtype=transformer_config.params_dtype,
+                )
             )
 
         self.model_type = ModelType.encoder_or_decoder
