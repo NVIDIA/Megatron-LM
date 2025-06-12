@@ -107,8 +107,8 @@ def experimental_fn(introduced_with_version: str):
         @wraps(func)
         def wrapped_func(*args, **kwargs):
 
-            if config.ENABLE_EXPERIMENTAL is not True:
-                raise ExperimentalNotEnabledError(f"Flag {config.ENABLE_EXPERIMENTAL} not enabled.")
+            if config.is_experimental_enabled() is not True:
+                raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
 
             logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
 
@@ -176,11 +176,11 @@ def experimental_cls(introduced_with_version: str):
                     Attribute of callee.
                 """
                 if attr == "is_experimental":
-                    return config.ENABLE_EXPERIMENTAL
+                    return config.is_experimental_enabled()
 
-                if config.ENABLE_EXPERIMENTAL is not True:
+                if config.is_experimental_enabled() is not True:
                     raise ExperimentalNotEnabledError(
-                        f"Flag {config.ENABLE_EXPERIMENTAL} not enabled."
+                        f"Flag config.ENABLE_EXPERIMENTAL not enabled."
                     )
 
                 logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")

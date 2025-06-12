@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from megatron.core import config as experimental_config
+from megatron.core.config import is_experimental_enabled
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
@@ -494,7 +494,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         if self.config.moe_router_padding_for_fp8:
             pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
-            if experimental_config.ENABLE_EXPERIMENTAL and self.config.moe_permute_fusion:
+            if is_experimental_enabled() and self.config.moe_permute_fusion:
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
@@ -928,7 +928,7 @@ class _DeepepManager(_DispatchManager):
                 "Falling back to explicit padding within GroupedMLP"
             )
         else:
-            if experimental_config.ENABLE_EXPERIMENTAL and self.permute_fusion:
+            if is_experimental_enabled() and self.permute_fusion:
                 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 
                 routing_map = fused_pad_routing_map(routing_map, pad_multiple)
@@ -938,7 +938,7 @@ class _DeepepManager(_DispatchManager):
         return routing_map, tokens_per_expert
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if experimental_config.ENABLE_EXPERIMENTAL and self.permute_fusion:
+        if is_experimental_enabled() and self.permute_fusion:
             self.dispatched_routing_map, self.dispatched_probs = fused_indices_to_multihot(
                 self.dispatched_indices, self.dispatched_probs, self.num_local_experts
             )
