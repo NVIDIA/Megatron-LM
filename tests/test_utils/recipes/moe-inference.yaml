@@ -1,0 +1,63 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: moe
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 1
+  n_repeat: 1
+  platforms: dgx_a100
+  artifacts:
+    /workspace/data/deepseek_16b_pyt/model: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
+    /workspace/data/deepseek_16b_pyt/tokenizer: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
+  script_setup: |
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    ARGUMENTS=(
+        "CHECKPOINT_LOAD_PATH=/workspace/data"
+        "CHECKPOINT_SAVE_PATH=/tmp/checkpoints"
+        "DATA_PATH=/workspace/data"
+        "DATA_CACHE_PATH=/workspace/data/cache"
+        "TRAINING_SCRIPT_PATH=examples/inference/gpt/gpt_static_inference.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/generations.json"
+        "N_REPEAT={n_repeat}"
+        "ENABLE_LIGHTWEIGHT_MODE=false"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [gpt_inference_tp1_pp1_ep1_16B_logitsmatch]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
