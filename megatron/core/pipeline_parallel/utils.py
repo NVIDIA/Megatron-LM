@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from typing import Callable, Optional
 
 import torch
 from torch.autograd import Variable
@@ -55,22 +56,29 @@ class ScheduleNode:
 
     def __init__(
         self,
-        forward_func,
-        stream,
-        event,
-        backward_func=None,
-        free_input=False,
-        name="schedule_node",
+        forward_func: Callable,
+        stream: torch.cuda.Stream,
+        event: torch.cuda.Event,
+        backward_func: Optional[Callable] = None,
+        free_input: bool = False,
+        name: str = "schedule_node",
     ):
         """Initialize a schedule node.
 
         Args:
-            forward_func (callable): Function to execute during forward pass
-            stream (torch.cuda.Stream): CUDA stream for computation
-            event (torch.cuda.Event): Event for synchronization
-            backward_func (callable, optional): Function for backward pass
-            memory_strategy (MemoryManagementStrategy, optional): Strategy for memory management
-            name (str): Name of the node for debugging
+            forward_func (callable): Function to execute during the forward pass.
+            stream (torch.cuda.Stream): The CUDA stream for this node's computation.
+                This can be either a 'compute' stream or a 'communicate' stream.
+                - 'compute' stream: Used for computational nodes like attention and experts.
+                - 'communicate' stream: Used for nodes that handle token communication,
+                  such as token dispatch and combine operations in MoE layers.
+            event (torch.cuda.Event): The CUDA event used for synchronization. Each
+                microbatch within a model chunk shares the same event, which is used
+                to manage dependencies between nodes operating on different streams.
+            backward_func (callable, optional): Function for the backward pass.
+            free_input (bool): Flag to indicate if the input should be freed after the
+                forward pass.
+            name (str): Name of the node for debugging purposes.
         """
         self.name = name
         self.forward_func = forward_func

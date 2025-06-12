@@ -197,6 +197,7 @@ class GPTModel(LanguageModule):
             else:
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
+
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -243,6 +244,12 @@ class GPTModel(LanguageModule):
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
     ):
+        """Preprocesses inputs for the transformer decoder.
+
+        Applies embeddings to input tokens, or uses `decoder_input` from a previous
+        pipeline stage. Also sets up rotary positional embeddings.
+        """
+
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
@@ -408,6 +415,11 @@ class GPTModel(LanguageModule):
         extra_block_kwargs=None,
         inference_context=None,
     ):
+        """Postprocesses decoder hidden states to generate logits or compute loss.
+
+        Applies Multi-Token Prediction if enabled, generates output logits through
+        the output layer, and computes language model loss when labels are provided.
+        """
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
