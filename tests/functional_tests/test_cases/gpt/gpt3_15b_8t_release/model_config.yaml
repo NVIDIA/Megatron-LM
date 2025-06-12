@@ -21,7 +21,7 @@ MODEL_ARGS:
   --sequence-parallel: true
   --disable-bias-linear: true
   --micro-batch-size: 4
-  --rampup-batch-size: "384 384 97656250"
+  --rampup-batch-size: "[384 384 97656250]"
   --global-batch-size: 1152
   --train-samples: 19531250
   --manual-gc: true
@@ -81,7 +81,7 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-throughput: true
   --log-interval: 100
-  --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
+  --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args

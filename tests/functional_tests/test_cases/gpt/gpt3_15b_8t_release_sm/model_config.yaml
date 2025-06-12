@@ -68,8 +68,8 @@ MODEL_ARGS:
   --eval-iters: 32
   --eval-interval: 2000
   # Add checkpointing args
-  --load: ${OUTPUT_PATH}/checkpoints
-  --save: ${OUTPUT_PATH}/checkpoints
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
   --save-interval: 1000
   # Add initialization args
   --init-method-std: 0.0134
@@ -81,7 +81,7 @@ MODEL_ARGS:
   --log-validation-ppl-to-tensorboard: true
   --log-throughput: true
   --log-interval: 100
-  --tensorboard-dir: ${OUTPUT_PATH}/tensorboard
+  --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
