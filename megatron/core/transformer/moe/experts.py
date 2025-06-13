@@ -1080,14 +1080,14 @@ class SequentialMLP(MegatronModule):
                 else:
                     output, output_bias = expert(tokens, probs)
                 output_local_list.append(output)
-                if self.add_bias:
-                    output_bias_list.append(output_bias.expand_as(output))
+                # if self.add_bias:
+                #     output_bias_list.append(output_bias.expand_as(output))
 
             output_local = torch.cat(output_local_list, dim=0)
-            if self.add_bias:
-                output_bias_local = torch.cat(output_bias_list, dim=0)
-            else:
-                output_bias_local = None
+            # if self.add_bias:
+            #     output_bias_local = torch.cat(output_bias_list, dim=0)
+            # else:
+            output_bias_local = None
 
             return output_local, output_bias_local
 

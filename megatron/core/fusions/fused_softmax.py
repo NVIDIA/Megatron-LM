@@ -114,9 +114,10 @@ class SoftmaxOne(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # subtract the max for stability
-        exp_x = torch.exp(x - x.max(dim=self.dim, keepdim=True).values)
+        x_max = x.max(dim=self.dim, keepdim=True).values
+        exp_x = torch.exp(x - x_max)
         # add denominator offset
-        return exp_x / (self.denominator_offset + exp_x.sum(dim=self.dim, keepdim=True))
+        return exp_x / (torch.exp(self.denominator_offset - x_max) + exp_x.sum(dim=self.dim, keepdim=True))
 
 
 class FusedScaleMaskSoftmax(nn.Module):

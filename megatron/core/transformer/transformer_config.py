@@ -173,8 +173,8 @@ class TransformerConfig(ModelParallelConfig):
 
     window_attn_skip_freq: Optional[Union[int, List[int]]] = None
     """Frequency of full attention layers among sliding window attention layers. Accepts either:
-    - An integer N: Represents a (N-1):1 ratio, meaning 1 full attention layer after (N-1) sliding window attention layers.
-    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+    - An integer N: Represents a (N-1):1 ratio, meaning one full attention layer after (N-1) SWA layers.
+    - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0], where 1 represents SWA. """
 
     normalization: str = "LayerNorm"
     """Which norm to use for normalization layers, valid options are `LayerNorm` and `RMSNorm`."""
@@ -204,7 +204,8 @@ class TransformerConfig(ModelParallelConfig):
 
     attention_softmax_denominator_offset: Optional[Union[Literal['learnable'], float]] = None
     """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       This arg is only used in unfused DotProductAttention. If true, unfused torch softmax will be used"""
+       This arg is only used in unfused DotProductAttention. If true, unfused torch softmax will be used
+       The offset is exponentiated. (i.e. set to value to 0 for a +1 in the denominator"""
 
     ####################
     # initialization

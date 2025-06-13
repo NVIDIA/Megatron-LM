@@ -189,7 +189,9 @@ class MLP(MegatronModule):
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None:
-            assert output_bias is None, "Bias is not supported with per_token_scale"
+            output += output_bias[None, :]
+            output_bias = None
+            # assert output_bias is None, "Bias is not supported with per_token_scale"
 
         return output, output_bias
 
