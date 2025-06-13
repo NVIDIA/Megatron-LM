@@ -24,7 +24,7 @@ from megatron.core.pipeline_parallel.utils import (
 )
 
 
-class ModelChunkSate:
+class ModelChunkState:
     """State shared across a model chunk.
 
     This class holds state that is shared between different components
@@ -147,7 +147,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         super().__init__()
         self._pre_process = None
         self._post_process = None
-        self._model_chunk_state = ModelChunkSate()
+        self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._mtp_layers = []
         self._event = torch.cuda.Event()
