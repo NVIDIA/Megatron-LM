@@ -8,7 +8,11 @@ import pytest
 import torch
 import transformer_engine as te
 
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    TEColumnParallelLinear,
+    TELinear,
+    get_gpt_layer_with_transformer_engine_spec,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
@@ -37,6 +41,16 @@ def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
     return packed_seq_params
 
 
+def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
+    submodules = get_gpt_layer_with_transformer_engine_spec(
+        multi_latent_attention=True
+    ).submodules.self_attention.submodules
+    if linear_qkv_down_proj is not None:
+        submodules.linear_q_down_proj = linear_qkv_down_proj
+        submodules.linear_kv_down_proj = linear_qkv_down_proj
+    return submodules
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttention:
 
@@ -60,9 +74,7 @@ class TestParallelMLAAttention:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -272,9 +284,10 @@ class TestParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+@pytest.mark.parametrize("linear_qkv_down_proj", (TELinear, TEColumnParallelLinear))
 class TestSequenceParallelMLAAttention:
-
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, linear_qkv_down_proj):
         self.tensor_parallel_size = 2
         Utils.initialize_model_parallel(self.tensor_parallel_size, 1)
         model_parallel_cuda_manual_seed(123)
@@ -294,9 +307,7 @@ class TestSequenceParallelMLAAttention:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -330,8 +341,10 @@ class TestSequenceParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+@pytest.mark.parametrize("linear_qkv_down_proj", (TELinear, TEColumnParallelLinear))
 class TestTensorParallelMLAAttention:
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, linear_qkv_down_proj):
         self.tensor_parallel_size = 2
         Utils.initialize_model_parallel(self.tensor_parallel_size, 1)
         model_parallel_cuda_manual_seed(123)
@@ -351,9 +364,7 @@ class TestTensorParallelMLAAttention:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -413,9 +424,7 @@ class TestParallelMLAAttentionPrecision:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
