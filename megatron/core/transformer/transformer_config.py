@@ -418,6 +418,9 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
+    moe_topk_router_fusion: bool = False
+    """Fused topk softmax ops during topk router for TopK Router fusion."""    
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped

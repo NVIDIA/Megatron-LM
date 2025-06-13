@@ -20,6 +20,8 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+from megatron.core.fusions.fused_topk_routing import fused_topk_softmax_without_capacity
+from megatron.core.config import is_experimental_enabled
 
 class Router(ABC, MegatronModule):
     """Base Router class"""
@@ -215,20 +217,39 @@ class TopKRouter(Router):
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mask of token to experts assignment.
         """
-        probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
-            logits,
-            self.topk,
-            capacity_factor=self.config.moe_expert_capacity_factor,
-            pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
-            drop_policy=self.config.moe_token_drop_policy,
-            use_pre_softmax=self.config.moe_router_pre_softmax,
-            num_groups=self.config.moe_router_num_groups,
-            group_topk=self.config.moe_router_group_topk,
-            scaling_factor=self.config.moe_router_topk_scaling_factor,
-            deterministic_mode=self.config.deterministic_mode,
-            score_function=self.score_function,
-            expert_bias=self.expert_bias,
-        )
+        if (self.config.moe_topk_router_fusion
+            and self.config.moe_router_pre_softmax == True
+            and self.config.moe_expert_capacity_factor is None
+            and is_experimental_enabled()):
+            probs, routing_map, tokens_per_expert = fused_topk_softmax_without_capacity(
+                logits,
+                self.topk,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                drop_policy=self.config.moe_token_drop_policy,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                deterministic_mode=self.config.deterministic_mode,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+            )
+        else:
+            probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
+                logits,
+                self.topk,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                drop_policy=self.config.moe_token_drop_policy,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                deterministic_mode=self.config.deterministic_mode,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+            )
 
         if self.training and torch.is_grad_enabled():
             # Apply auxiliary load balancing loss
@@ -257,21 +278,39 @@ class TopKRouter(Router):
             probs (torch.Tensor): The probabilities of token to experts assignment.
             routing_map (torch.Tensor): The mask of token to experts assignment.
         """
-
-        probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
-            logits,
-            self.topk,
-            capacity_factor=self.config.moe_expert_capacity_factor,
-            pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
-            drop_policy=self.config.moe_token_drop_policy,
-            use_pre_softmax=self.config.moe_router_pre_softmax,
-            num_groups=self.config.moe_router_num_groups,
-            group_topk=self.config.moe_router_group_topk,
-            scaling_factor=self.config.moe_router_topk_scaling_factor,
-            deterministic_mode=self.config.deterministic_mode,
-            score_function=self.score_function,
-            expert_bias=self.expert_bias,
-        )
+        if (self.config.moe_topk_router_fusion
+            and self.config.moe_router_pre_softmax == True
+            and self.config.moe_expert_capacity_factor is None
+            and is_experimental_enabled()):
+            probs, routing_map, tokens_per_expert = fused_topk_softmax_without_capacity(
+                logits,
+                self.topk,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                drop_policy=self.config.moe_token_drop_policy,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                deterministic_mode=self.config.deterministic_mode,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+            )
+        else:
+            probs, routing_map, tokens_per_expert = topk_softmax_with_capacity(
+                logits,
+                self.topk,
+                capacity_factor=self.config.moe_expert_capacity_factor,
+                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                drop_policy=self.config.moe_token_drop_policy,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                scaling_factor=self.config.moe_router_topk_scaling_factor,
+                deterministic_mode=self.config.deterministic_mode,
+                score_function=self.score_function,
+                expert_bias=self.expert_bias,
+            )
 
         if self.training and torch.is_grad_enabled():
             # Apply sequence-auxiliary load balancing loss

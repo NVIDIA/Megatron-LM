@@ -2710,6 +2710,9 @@ def _add_moe_args(parser):
                        help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
     group.add_argument('--moe-per-layer-logging', action='store_true',
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
+    group.add_argument('--moe-topk-router-fusion', action="store_true",
+                       help='experimental use trion fusion op in topk router, '
+                       'moe-router-pre-softmax must be set to true, moe-expert-capacity-factor must be set to None, enable-experimental must be set to true')
     # Token dispatcher arguments
     group.add_argument('--moe-token-dispatcher-type', type=str,
                        choices=['allgather', 'alltoall', 'flex'],
