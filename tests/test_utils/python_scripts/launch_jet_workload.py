@@ -472,6 +472,7 @@ def main(
                 or "torch.distributed.DistNetworkError" in concat_allranks_logs
                 or "Segmentation fault" in concat_allranks_logs
                 or "found NaN in local forward loss calculation" in concat_allranks_logs
+                or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
