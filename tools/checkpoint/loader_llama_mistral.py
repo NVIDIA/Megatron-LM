@@ -5,7 +5,7 @@ import os
 import sys
 import torch
 
-from tools.checkpoint.utils import _ConverterFakeProcessGroup
+from utils import _ConverterFakeProcessGroup
 try:
     import transformers
 except ImportError:
@@ -517,7 +517,7 @@ def _load_checkpoint(queue, args):
     mpu.set_pipeline_model_parallel_world_size(margs.pipeline_model_parallel_size)
     mpu.set_virtual_pipeline_model_parallel_world_size(margs.virtual_pipeline_model_parallel_size)
     fused_kernels.load(margs)
-    
+
     # For backward compatibility during local parallel states refactoring
     fake_tp_group = _ConverterFakeProcessGroup(size=margs.tensor_model_parallel_size)
     fake_ep_group = _ConverterFakeProcessGroup(size=margs.expert_model_parallel_size)
