@@ -493,6 +493,51 @@ products:
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_a100, dgx_h100]
+  # - test_case: [gpt3_345m_weekly_dgx_b200_1N8G_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_345m_weekly_dgx_b200_1N8G_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_345m_weekly_dgx_b200_1N8G_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_345m_weekly_dgx_b200_1N8G_mcore_tp4_cp2_mxfp8_tp_sp_cp]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  # - test_case: [gpt3_345m_weekly_dgx_b200_1N8G_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_b200]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
+    products:
+      - environment: [dev]
+        scope: [weekly]
+        platforms: [dgx_h100]
+  # - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_cp2_current_scaling_native_fp8_tp_fsdp]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_h100]
+  # - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [weekly]
+  #       platforms: [dgx_h100]
+  - test_case: [gpt3_345m_weekly_dgx_h100_1N8G_mcore_tp4_cp2_native_fp8_tp_sp_cp_tp_overlap]
+    products:
+      - environment: [dev]
+        scope: [weekly]
         platforms: [dgx_h100]
   # - test_case: [gpt3_mr_mcore_tp2_pp2_resume_torch_dist_uninstall_te_dgx_a100_1N8G]
   #   products:
