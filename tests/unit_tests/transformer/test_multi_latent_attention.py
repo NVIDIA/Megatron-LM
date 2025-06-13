@@ -650,3 +650,72 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
 
             assert torch.equal(output_thd, output_thd_fine_grained)
             assert torch.equal(bias_thd, bias_thd_fine_grained)
+
+
+class TestMlaLayernormFix:
+    """
+    This test suite is specifically designed to verify the bug fix
+    for the missing q_layernorm in the LoRA path of MLASelfAttention.
+    """
+
+    def setup_method(self, method):
+        """Set up a clean model parallel environment before each test."""
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        """Clean up the model parallel environment after each test."""
+        Utils.destroy_model_parallel()
+
+    def _run_layernorm_test(self, q_lora_rank: int = None):
+        """
+        Helper function to test the q_layernorm call under different configs.
+        """
+        transformer_config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=q_lora_rank,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+        )
+        parallel_attention = MLASelfAttention(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec(
+                multi_latent_attention=True
+            ).submodules.self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).cuda()
+
+        hidden_states = torch.ones(
+            (32, 2, transformer_config.hidden_size), dtype=torch.float32
+        ).cuda()
+        attention_mask = torch.ones((1, 1, 32, 32), dtype=bool).cuda()
+
+        with patch.object(
+            parallel_attention, 'q_layernorm', wraps=parallel_attention.q_layernorm
+        ) as spy_q_layernorm:
+            _ = parallel_attention(hidden_states=hidden_states, attention_mask=attention_mask)
+
+            spy_q_layernorm.assert_called_once()
+
+    def test_q_layernorm_is_called_without_lora(self):
+        """Tests that q_layernorm is called in the standard path (LoRA disabled)."""
+        print("Running Layernorm test with LoRA disabled...")
+        self._run_layernorm_test(q_lora_rank=None)
+        print("LoRA disabled test PASSED.")
+
+    def test_q_layernorm_is_called_with_lora(self):
+        """
+        Tests that q_layernorm is called in the LoRA path (LoRA enabled).
+        This is the critical test that would have failed before the fix.
+        """
+        print("Running Layernorm test with LoRA enabled...")
+        self._run_layernorm_test(q_lora_rank=8)
+        print("LoRA enabled test PASSED.")
