@@ -12,7 +12,7 @@ MODEL_ARGS:
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
-  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --tensorboard-dir: /opt/megatron-lm/runs/dc677536-e046-47f2-aeb8-4cbb43a03933/tensorboard
   --micro-batch-size: 4
   --global-batch-size: 32
   --seq-length: 1024
@@ -20,11 +20,11 @@ MODEL_ARGS:
   --train-iters: 50
   --timing-log-level: 2
   --lr-decay-iters: 320000
-  --save: ${CHECKPOINT_SAVE_PATH}
-  --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/bpe/merges.txt
+  --save: /opt/megatron-lm/runs/dc677536-e046-47f2-aeb8-4cbb43a03933/checkpoints
+  --load: /tmp/checkpoints/
+  --data-path: /workspace/data/gpt3_data/my-gpt3_00_text_document
+  --vocab-file: /workspace/data/gpt3_data/bpe/vocab.json
+  --merge-file: /workspace/data/gpt3_data/bpe/merges.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015
@@ -51,13 +51,16 @@ MODEL_ARGS:
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --moe-grouped-gemm: true
+  --moe-token-dispatcher-type: alltoall
+  --overlap-moe-expert-parallel-comm: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true
   --ckpt-format: torch_dist
-  --dist-ckpt-strictness: log_all  # backward compatibility for TE changes
-  --data-cache-path: ${DATA_CACHE_PATH}
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+  --data-cache-path: /workspace/data/cache
   --bf16: true
   --attention-backend: unfused
   --no-bias-gelu-fusion: true
   --log-memory-to-tensorboard: true
+  --exit-interval: 50
 TEST_TYPE: regular

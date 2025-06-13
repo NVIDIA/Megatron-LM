@@ -234,7 +234,7 @@ def forward_backward_step(
                 output_tensor,
                 loss_func,
                 config,
-                f_context.vpp_rank,
+                f_context.vpp_rank if hasattr(f_context, 'vpp_rank') else None,
                 collect_non_loss_data,
                 num_microbatches,
                 forward_data_store,
