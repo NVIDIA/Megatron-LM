@@ -7,6 +7,7 @@ import sys
 import torch
 
 from megatron.core import Timers
+from megatron.core.config import set_experimental_flag
 from megatron.core.num_microbatches_calculator import init_num_microbatches_calculator, unset_num_microbatches_calculator
 from megatron.training import dist_signal_handler
 from megatron.training.tokenizer import build_tokenizer
@@ -96,6 +97,9 @@ def set_global_variables(args, build_tokenizer=True):
     _set_one_logger(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
+
+    if args.enable_experimental:
+        set_experimental_flag(True)
 
     if args.exit_signal_handler:
         _set_signal_handler()

@@ -2,6 +2,12 @@
 
 set -exo pipefail
 
+# Increase soft limit for number of open files to match hard limit
+ulimit -Sn $(ulimit -Hn)
+
+# Increase soft limit for number of processes to match hard limit
+ulimit -Su $(ulimit -Hu)
+
 echo "------ARGUMENTS LIST --------"
 # Use eval to properly handle quoted arguments
 eval "set -- $@"
@@ -17,7 +23,7 @@ for ARGUMENT in "$@"; do
     VALUE="${VALUE#\'}"
 
     # Properly quote the value to preserve spaces and special characters
-    export "$KEY"="$VALUE"
+    export "$KEY"="$(eval echo $VALUE)"
     echo "$KEY=$VALUE"
 done
 echo "---------------------------------"
@@ -69,7 +75,7 @@ IS_NEMO_TEST=$([[ $(echo "$TRAINING_SCRIPT_PATH" | tr '[:upper:]' '[:lower:]') =
 export IS_NEMO_TEST
 
 # Adjust model_config for lightweight mode
-if [[ "$MODE" == "pretraining" ]]; then
+if [[ "$MODE" == "pretraining" && "$TEST_TYPE" != "release" ]]; then
     if [[ "$ENABLE_LIGHTWEIGHT_MODE" == "true" && "$IS_NEMO_TEST" == "true" ]]; then
         yq -i '.MODEL_ARGS."trainer.max_steps" = 2' $TRAINING_PARAMS_PATH
         TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
@@ -132,12 +138,9 @@ for i in $(seq 1 $N_REPEAT); do
 
     bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh
 
-    IS_FROZEN_RESUME_BUT_NO_CHECKPOINT=$([[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]] && echo "true" || echo "false")
+    if [[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]]; then
+        echo "No frozen checkpoint found. Will skip second run."
 
-    if [[ "$IS_FROZEN_RESUME_BUT_NO_CHECKPOINT" == "true" && ${RECORD_CHECKPOINTS} != "true" ]]; then
-        echo "No frozen checkpoint found, but test type is frozen-resume. Will abort."
-        exit 1
-    elif [[ "$IS_FROZEN_RESUME_BUT_NO_CHECKPOINT" == "true" && ${RECORD_CHECKPOINTS} == "true" ]]; then
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
         rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt

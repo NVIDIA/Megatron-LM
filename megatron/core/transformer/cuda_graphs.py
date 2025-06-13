@@ -171,6 +171,14 @@ class _CudagraphGlobalRecord:
                         prev_fwd_hidden_state_output = runner.fwd_graph_outputs
 
                 else:
+                    # In vision models, encoder and decoder transformers have different
+                    # hidden_states shapes. Each has its own first and last layers that
+                    # are noncontiguous. Reset prev_bwd_hidden_state_inputgrad to None at
+                    # each last layer to avoid shape mismatch when transitioning between
+                    # encoder and decoder.
+                    if runner.is_last_layer:
+                        prev_bwd_hidden_state_inputgrad = None
+
                     runner.create_bwd_graph(prev_bwd_hidden_state_inputgrad)
 
                     # The first input grad TransformerLayer is for 'hidden_states'
@@ -333,13 +341,16 @@ class _CudagraphReplayNode(torch.autograd.Function):
         for param, grad_added in runner.groundtruth_grad_added_to_main_grad.items():
             param.grad_added_to_main_grad = grad_added
 
+        grads, is_dummy_grad = runner.get_input_grads_with_dummy_flags()
         if runner.is_first_layer:
             output_grads = tuple(
-                b.clone().detach() if b is not None else b for b in runner.get_input_grads()
+                b.clone().detach() if not (b is None or dummy) else b
+                for dummy, b in zip(is_dummy_grad, grads)
             )
         else:
             output_grads = tuple(
-                b.detach() if b is not None else b for b in runner.get_input_grads()
+                b.detach() if not (b is None or dummy) else b
+                for dummy, b in zip(is_dummy_grad, grads)
             )
         return None, None, *output_grads
 
@@ -581,20 +592,23 @@ class _CudaGraphRunner(torch.nn.Module):
         self.static_grad_outputs = static_grad_outputs
         self.static_grad_inputs = static_grad_inputs
 
-    def get_input_grads(self):
+    def get_input_grads_with_dummy_flags(self):
         """Get the inputs grads that are returned by the bwd cudagraph call. If using grad accum
         fusion, wgrads have already been accumulated, so return dummy wgrads."""
 
+        is_dummy_grad = [False] * len(self.static_grad_inputs)
         if not self.fuse_wgrad_accumulation:
-            return self.static_grad_inputs
+            return self.static_grad_inputs, is_dummy_grad
         else:
             num_dgrads = len(self.static_grad_inputs) - len(list(self.base_module.parameters()))
             dgrads = self.static_grad_inputs[:num_dgrads]
             wgrads = self.static_grad_inputs[num_dgrads:]
 
             wgrads_with_placeholders = []
+            is_dummy_grad = [False] * len(dgrads)
             for idx, param in enumerate(self.base_module.parameters()):
-                if getattr(param, "grad_added_to_main_grad", False):
+                wgrad_is_dummy = getattr(param, "grad_added_to_main_grad", False)
+                if wgrad_is_dummy:
                     if getattr(param, "zero_out_wgrad", False):
                         wgrad = torch.zeros(
                             param.main_grad.shape,
@@ -612,7 +626,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 else:
                     wgrad = wgrads[idx]
                 wgrads_with_placeholders.append(wgrad)
-            return tuple(dgrads + wgrads_with_placeholders)
+                is_dummy_grad.append(wgrad_is_dummy)
+            return tuple(dgrads + wgrads_with_placeholders), is_dummy_grad
 
     def record_graph_capture(self, args, kwargs):
         """Records the data needed to create this runner's forward cudagraph.
