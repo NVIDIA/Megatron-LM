@@ -405,7 +405,10 @@ def main(
             except Exception as e:
                 logger.error(e)
                 no_log = True
+                n_download_attempt += 1
                 break
+            
+            n_download_attempt += 1
 
         if no_log:
             logger.error("Did not find any logs to download, retry.")
