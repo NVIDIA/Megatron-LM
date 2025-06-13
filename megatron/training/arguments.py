@@ -1086,6 +1086,8 @@ def validate_args(args, defaults={}):
         iterations_to_skip_from_file = RerunStateMachine.get_skipped_iterations_from_tracker_file(
             args.result_rejected_tracker_filename
         )
+        if args.rank == 0:
+            print(f"Adding {iterations_to_skip_from_file} to args.iterations_to_skip...")
         args.iterations_to_skip.extend(iterations_to_skip_from_file)
 
     # Make sure all functionality that requires Gloo process groups is disabled.

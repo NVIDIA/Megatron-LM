@@ -962,8 +962,8 @@ class RerunStateMachine:
             list[int]: List of iterations to skip.
         """
         iterations_to_skip: set[int] = set()
-        seen: set[Tuple[int, int]]
-        regex = r"ts=.+ node=.+ device=.+ jobID=.+ rank=(.+) iteration=(.+) status=(.+) .+"
+        seen: set[Tuple[int, int]] = set()
+        regex = r"ts=.+ node=.+ device=.+ jobID=.+ rank=(.+) iteration=(.+) status=(.+) result=.+ message=.+"
         try:
             with open(tracker_file_name, 'r') as f:
                 for line in f.readlines():
@@ -976,12 +976,12 @@ class RerunStateMachine:
                         # - Reruns were disabled and it has failed on the same rank twice.
                         # or
                         # - Reruns were enabled and it was reproducible on the 2nd rerun
-                        if status == RerunValidationStatus.RERUN_DISABLED:
+                        if status == "RerunValidationStatus.RERUN_DISABLED":
                             if (rank, iteration) in seen:
                                 iterations_to_skip.add(iteration)
                             else:
                                 seen.add((rank, iteration))
-                        elif status == RerunValidationStatus.SECOND_RERUN_REPRODUCIBLE:
+                        elif status == "RerunValidationStatus.SECOND_RERUN_REPRODUCIBLE":
                             iterations_to_skip.add(iteration)
         except Exception as e:
             logger.error(f"Could not parse iterations to skip in tracker file! ({e})")
