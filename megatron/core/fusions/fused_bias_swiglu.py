@@ -102,7 +102,7 @@ class BiasSwiGLUFunction(torch.autograd.Function):
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, bias, fp8_input_store):
+    def forward(ctx, input, bias, fp8_input_store, cpu_offload_input):
         """Forward pass of biased SwiGLU activation.
 
         Args:
@@ -115,6 +115,9 @@ class BiasSwiGLUFunction(torch.autograd.Function):
             torch.Tensor: Result of applying bias addition followed by SwiGLU activation.
         """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        if cpu_offload_input:
+            input_for_backward.activation_offloading = True
+            bias.activation_offloading = True
         ctx.save_for_backward(input_for_backward, bias)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
@@ -138,7 +141,7 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         input, bias = ctx.saved_tensors
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = bias_swiglu_back(grad_output, input, bias)
-        return tmp, tmp, None
+        return tmp, tmp, None, None
 
 
 class SwiGLUFunction(torch.autograd.Function):
@@ -146,7 +149,7 @@ class SwiGLUFunction(torch.autograd.Function):
 
     @staticmethod
     @nvtx_decorator()
-    def forward(ctx, input, fp8_input_store):
+    def forward(ctx, input, fp8_input_store, cpu_offload_input):
         """Forward pass of SwiGLU activation.
 
         Args:
@@ -158,6 +161,8 @@ class SwiGLUFunction(torch.autograd.Function):
             torch.Tensor: Result of applying SwiGLU activation.
         """
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        if cpu_offload_input:
+            input_for_backward.activation_offloading = True
         ctx.save_for_backward(input_for_backward)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
@@ -180,7 +185,7 @@ class SwiGLUFunction(torch.autograd.Function):
         input = ctx.saved_tensors[0]
         input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = swiglu_back(grad_output, input)
-        return tmp, None
+        return tmp, None, None
 
 
 class WeightedSwiGLUFunction(torch.autograd.Function):
@@ -201,7 +206,7 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
         return tmp, wgrad, None
 
 
-def bias_swiglu_impl(input, bias, fp8_input_store=False):
+def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False):
     """Implementation of biased SwiGLU that handles different input shapes.
 
     This function reshapes the input if necessary, applies the SwiGLU activation
@@ -224,9 +229,9 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False):
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
-        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store)
+        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
     else:
-        output = SwiGLUFunction.apply(input, fp8_input_store)
+        output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
