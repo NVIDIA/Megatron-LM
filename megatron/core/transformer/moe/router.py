@@ -185,7 +185,7 @@ class TopKRouter(Router):
         scores = logits * map
         return scores, map
 
-    def compute_routing_scores_for_aux_loss(self, logits: torch.Tensor) -> torch.Tensor:
+    def compute_routing_scores_for_aux_loss(self, logits: torch.Tensor):
         """Compute routing scores based on the score function.
 
         Args:
@@ -198,12 +198,14 @@ class TopKRouter(Router):
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif self.score_function == "sigmoid":
             scores = torch.sigmoid(logits)
-            scores = (
-                scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.topk > 1 else scores
-            )
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {self.score_function}")
-        return scores
+
+        _, top_indices = torch.topk(scores, k=self.topk, dim=1)
+        topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+        return scores, topk_map
 
     def aux_loss_load_balancing(self, logits: torch.Tensor):
         """Apply auxiliary loss-based load balancing to the logits tensor.
@@ -233,11 +235,11 @@ class TopKRouter(Router):
         if self.training and torch.is_grad_enabled():
             # Apply auxiliary load balancing loss
             # Skip auxiliary loss calculations when using torch.no_grad() or checkpointing.
-            scores = self.compute_routing_scores_for_aux_loss(logits)
+            scores, loss_routing_map = self.compute_routing_scores_for_aux_loss(logits)
             aux_loss_func = partial(
                 switch_load_balancing_loss_func,
                 probs=scores,
-                tokens_per_expert=tokens_per_expert,
+                tokens_per_expert=loss_routing_map.sum(dim=0),
                 topk=self.topk,
             )
             probs = self.apply_load_balancing_loss(
@@ -275,11 +277,11 @@ class TopKRouter(Router):
 
         if self.training and torch.is_grad_enabled():
             # Apply sequence-auxiliary load balancing loss
-            scores = self.compute_routing_scores_for_aux_loss(logits)
+            scores, loss_routing_map = self.compute_routing_scores_for_aux_loss(logits)
             aux_loss_func = partial(
                 sequence_load_balancing_loss_func,
                 probs=scores,
-                routing_map=routing_map,
+                routing_map=loss_routing_map,
                 batch_size=bsz,
                 seq_length=seq_length,
                 topk=self.topk,
