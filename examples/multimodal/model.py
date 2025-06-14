@@ -117,7 +117,7 @@ def model_provider(
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
-    if vision_model_type in ["clip", "siglip", "radio"]:
+    if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
         if use_te:
             vision_transformer_layer_spec = get_layer_spec_te(
                 is_vit=True

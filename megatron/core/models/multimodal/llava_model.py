@@ -250,7 +250,7 @@ class LLaVAModel(MegatronModule):
                     model_subtype=vision_transformer_config.vision_model_type,
                     add_class_token=add_class_token,
                 )
-            elif vision_transformer_config.vision_model_type in ("radio", "radio-g"):
+            elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
                 # TODO: should refactor into model code itself?
                 class_token_len = 0
                 max_img_h = 0
@@ -275,6 +275,13 @@ class LLaVAModel(MegatronModule):
 
                     ln_post_impl = TENorm
                     use_mask_token = True
+                elif vision_transformer_config.vision_model_type == "cradio-g":
+                    class_token_len = 8
+                    max_img_h = 2048
+                    max_img_w = 2048
+                    embedder_bias = False
+                    ln_post_impl = None
+                    use_mask_token = False
                 self.vision_model = RADIOViTModel(
                     vision_transformer_config,
                     vision_transformer_layer_spec,
