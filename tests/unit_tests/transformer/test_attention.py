@@ -22,7 +22,12 @@ class TestParallelAttention:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
         )
         self.parallel_attention = SelfAttention(
             self.transformer_config,
@@ -38,7 +43,7 @@ class TestParallelAttention:
         assert self.parallel_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
-        assert num_weights == 648
+        assert num_weights == 66304
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -54,7 +59,8 @@ class TestParallelAttention:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
+            dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
 
@@ -78,7 +84,8 @@ class TestParallelAttention:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size),
+            dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
 
@@ -114,7 +121,8 @@ class TestParallelAttention:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
+            (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size),
+            dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.cuda()
 
@@ -139,8 +147,13 @@ class TestSelfAttention:
         Utils.destroy_model_parallel()
 
     def run_self_attention(self, model_comm_pgs):
+        tensor_model_parallel_size = torch.distributed.get_world_size(model_comm_pgs.tp)
         self.transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=128, num_attention_heads=4, use_cpu_initialization=False
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            use_cpu_initialization=False,
         )
         self.self_attention = SelfAttention(
             self.transformer_config,
@@ -172,7 +185,6 @@ class TestSelfAttention:
         assert bias.shape[0] == config.hidden_size
 
     @pytest.mark.internal
-    @pytest.mark.flaky
     def test_self_attention_mpu(self):
 
         tp_size = 4
@@ -194,7 +206,6 @@ class TestSelfAttention:
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
-    @pytest.mark.flaky
     @pytest.mark.internal
     def test_self_attention_independent_pg_smoke(self):
 
