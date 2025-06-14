@@ -40,6 +40,9 @@ class OptimizerConfig:
     ##############
     # Precision
     ##############
+    fp8_recipe: Optional[str] = None
+    """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
+
     fp16: bool = False
     """If true, train with fp16 mixed precision training. Defaults to False."""
 
@@ -161,7 +164,7 @@ class OptimizerConfig:
     barrier_with_L1_time: bool = False
     """If true, use barrier with level 1 time measurements."""
 
-    timers: Callable = None
+    timers: Optional[Callable] = None
     """Function to get timers."""
 
     config_logger_dir: str = ""
@@ -169,6 +172,17 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        # The following condition is used to avoid repetition in distrib_optimizer.py.
+        # This is because in distrib_optimizer.py, the process to handle parameters are
+        # different for different training precision settings. FP8 cases require different
+        # handling while FP8 delayed scaling is an exception because the Adam optimizer in
+        # TransformerEngine supports it in the kernel computation.
+        self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
+            self.use_precision_aware_optimizer
+            and (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+        )
+
         if self.use_precision_aware_optimizer:
             assert (
                 self.optimizer == 'adam'

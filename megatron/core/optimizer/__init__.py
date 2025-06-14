@@ -342,13 +342,23 @@ def _get_megatron_optimizer_based_on_param_groups(
             if config.use_precision_aware_optimizer:
                 kwargs.update(
                     {
-                        "master_weights": True,
-                        "use_decoupled_grad": True,
-                        "master_weight_dtype": config.main_params_dtype,
                         "exp_avg_dtype": config.exp_avg_dtype,
                         "exp_avg_sq_dtype": config.exp_avg_sq_dtype,
                     }
                 )
+                # Master weight is managed by MCore when main_params_dtype is fp32. This is
+                # because we want to use fp8 primary weight with precision aware optimizer.
+                # Otherwise, master weight will be managed by TransformerEngine.
+                # Delayed scaling is an exception because casting as well as the computation
+                # of the scaling factor can be conducted in the adam kernel.
+                if config.main_params_dtype != torch.float32 or config.fp8_recipe == "delayed":
+                    kwargs.update(
+                        {
+                            "master_weights": True,
+                            "use_decoupled_grad": True,
+                            "master_weight_dtype": config.main_params_dtype,
+                        }
+                    )
 
                 if is_te_min_version("2.1.0.dev0"):
                     kwargs.update({"store_param_remainders": config.store_param_remainders})
