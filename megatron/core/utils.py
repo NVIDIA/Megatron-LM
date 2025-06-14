@@ -580,7 +580,7 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """If torch distributed is initialized, log only on rank
+    """If torch distributed is initialized, write log on only one rank
 
     Args:
         logger (logging.Logger): The logger to write the logs

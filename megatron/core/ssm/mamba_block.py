@@ -170,7 +170,7 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
-                        tp_group=model_comm_pgs.tp,
+                        model_comm_pgs=model_comm_pgs,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     # Transformer layers apply their own pp_layer_offset
