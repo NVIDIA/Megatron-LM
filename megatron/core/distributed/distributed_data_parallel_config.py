@@ -57,6 +57,10 @@ class DistributedDataParallelConfig:
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
 
+    reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+
     use_custom_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
@@ -107,3 +111,8 @@ class DistributedDataParallelConfig:
       to register user buffer (nccl_ub=True) for the custom FSDP. 
       This option will be automatically set to True when nccl_ub=True.
    """
+
+    def __post_init__(self):
+        """Check the validity of the config."""
+        if self.reuse_grad_buf_for_mxfp8_param_ag:
+            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."

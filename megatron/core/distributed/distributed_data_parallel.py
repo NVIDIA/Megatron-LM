@@ -545,6 +545,21 @@ class DistributedDataParallel(_BaseDataParallel):
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_param_sync(force_sync=force_sync)
+            # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
+            # the param.data, since param buffer is not mapped to model params for MXFP8 case.
+            # The paramaters are cast from bf16 to MXFP8 during copy.
+            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                assert (
+                    not self.ddp_config.overlap_param_gather
+                ), "MXFP8 param currently does not support DP AG overlap."
+                for bucket in bucket_group.buckets:
+                    for param in bucket.params:
+                        param_start, param_end = bucket.param_to_index[param]
+                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                        param.data.copy_(param_slice.view(param.data.shape))
+                    # All-gathered params are not needed after being copied to param.data.
+                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
+                    bucket.grad_data.zero_()
 
     def start_grad_sync(self, *unused):
         """

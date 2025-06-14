@@ -49,6 +49,10 @@ class OptimizerConfig:
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
+    reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
 

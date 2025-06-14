@@ -14,7 +14,7 @@ from torch.distributed import _coalescing_manager
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor, modify_underlying_storage
+from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
@@ -93,6 +93,11 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        self.param_to_index = {}
+        offset = 0
+        for param in params:
+            self.param_to_index[param] = (offset, offset + param.numel())
+            offset += param.numel()
 
 
 class _ParamAndGradBucketGroup:
@@ -616,7 +621,7 @@ class _ParamAndGradBuffer:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
-        # Only re-map param tensors if using distributed optimizer.
+
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             if not nccl_allocator:
@@ -630,19 +635,39 @@ class _ParamAndGradBuffer:
             mem_alloc_context = nullcontext
 
         with mem_alloc_context():
-            if self.ddp_config.use_distributed_optimizer:
-                self.param_data = torch.zeros(
+            # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
+            # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
+            # It can be temporarily reused by param AG.
+            if self.ddp_config.use_distributed_optimizer and any(is_mxfp8tensor(p) for p in params):
+                self.shared_buffer = torch.zeros(
                     self.numel,
-                    dtype=self.param_dtype,
+                    dtype=self.grad_dtype,
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
-            self.grad_data = torch.zeros(
-                self.numel,
-                dtype=self.grad_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=False,
-            )
+                # For FP32 weight grads, only half of the buffer is used to store params in bf16.
+                if self.grad_dtype == torch.float32:
+                    self.param_data = self.shared_buffer[: math.ceil(self.numel / 2)].view(
+                        torch.bfloat16
+                    )
+                else:
+                    self.param_data = self.shared_buffer
+                self.grad_data = self.shared_buffer
+            else:
+                # Only re-map param tensors if using distributed optimizer.
+                if self.ddp_config.use_distributed_optimizer:
+                    self.param_data = torch.zeros(
+                        self.numel,
+                        dtype=self.param_dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                self.grad_data = torch.zeros(
+                    self.numel,
+                    dtype=self.grad_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
 
         # Finally, map param.data and param.main_grad fields to buffers.
         bucket_params = []
@@ -650,21 +675,22 @@ class _ParamAndGradBuffer:
         cur_bucket_id = 0
         for param in params[::-1]:
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-
-            # Assign param.data to appropriate segment of self.param_data.
-            if self.param_data is not None:
-                new_param_data = self._get(
-                    param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                )
-                if is_float8tensor(param):
-                    modify_underlying_storage(param, new_param_data)
-                else:
-                    old_param_data = param.data
-                    param.data = new_param_data
-                    assert old_param_data._base is None
-                    # Copy tensor values (from initialization or checkpoint).
-                    param.data.detach().copy_(old_param_data)
-                    del old_param_data
+            # For MXFP8 param: we only need to map weight gradients to the buffer.
+            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                # Assign param.data to appropriate segment of self.param_data.
+                if self.param_data is not None:
+                    new_param_data = self._get(
+                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                    )
+                    if is_float8tensor(param):
+                        modify_underlying_storage(param, new_param_data)
+                    else:
+                        old_param_data = param.data
+                        param.data = new_param_data
+                        assert old_param_data._base is None
+                        # Copy tensor values (from initialization or checkpoint).
+                        param.data.detach().copy_(old_param_data)
+                        del old_param_data
 
             param.main_grad = self._get(
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
