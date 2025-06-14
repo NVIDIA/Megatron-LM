@@ -264,8 +264,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
                         assert (
-                            gradient_scaling_factor
-                            / torch.distributed.get_world_size(group=data_parallel_group)
+                            gradient_scaling_factor / data_parallel_group.size()
                             == target_gradient_scaling_factor
                         )
                     else:

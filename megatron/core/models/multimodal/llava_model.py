@@ -157,7 +157,7 @@ class LLaVAModel(MegatronModule):
             if self.context_parallel_lm > 1:
                 self.cp_group = get_context_parallel_group() if cp_group is None else cp_group
                 assert (
-                    torch.distributed.get_world_size(self.cp_group) == self.context_parallel_lm
+                    self.cp_group.size() == self.context_parallel_lm
                 ), "CP Group size should match the Language Model CP size"
                 assert is_te_min_version(
                     "1.10.0"

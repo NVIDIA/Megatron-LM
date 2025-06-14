@@ -126,7 +126,7 @@ def _allreduce_word_embedding_grads(model: List[torch.nn.Module], config: Transf
 
     if (
         parallel_state.is_rank_in_embedding_group(ignore_virtual=True)
-        and torch.distributed.get_world_size(parallel_state.get_embedding_group()) > 1
+        and parallel_state.get_embedding_group().size() > 1
     ):
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             model_module = model[0]
@@ -161,7 +161,7 @@ def _allreduce_position_embedding_grads(model: List[torch.nn.Module], config: Tr
     """
     if (
         parallel_state.is_rank_in_position_embedding_group()
-        and torch.distributed.get_world_size(parallel_state.get_position_embedding_group()) > 1
+        and parallel_state.get_position_embedding_group().size() > 1
     ):
         if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
             model_module = model[0]
