@@ -208,7 +208,8 @@ class TELinear(te.pytorch.Linear):
             assert tp_group is not None, "Parallel linear should always have tp_group set"
             tp_size = tp_group.size()
 
-        self.expert_parallel = self.config.expert_model_parallel_size > 1
+        self.moe_parallel_folding = is_expert and (tp_size != config.tensor_model_parallel_size or config.expert_model_parallel_size > 1)
+        explicit_expert_comm = is_expert and (tp_size > 1 or config.expert_model_parallel_size > 1)
         if is_expert:
             rng_tracker_name = get_expert_parallel_rng_tracker_name()
         else:
@@ -224,11 +225,9 @@ class TELinear(te.pytorch.Linear):
             # Handle non-parallel case
             tp_group = None
             tp_size = 1
-            explicit_expert_comm = False
             te_parallel_mode = None
         else:
             # Disable communications in TE when using TP or EP by
-            explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
             if explicit_expert_comm:
                 if parallel_mode == "column":
@@ -260,7 +259,7 @@ class TELinear(te.pytorch.Linear):
         for param in self.parameters():
             if is_expert:
                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, 'allreduce', not self.expert_parallel)
+                setattr(param, 'allreduce', not self.moe_parallel_folding)
             else:
                 # Reduce the gradient on DP group
                 setattr(param, 'allreduce', True)
@@ -921,7 +920,6 @@ if is_te_min_version("1.9.0.dev0"):
             extra_kwargs = _get_extra_te_kwargs(config)
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
-            self.expert_parallel = self.config.expert_model_parallel_size > 1
             if is_expert:
                 extra_kwargs["rng_tracker_name"] = get_expert_parallel_rng_tracker_name()
 
@@ -930,9 +928,10 @@ if is_te_min_version("1.9.0.dev0"):
             tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
             tp_size = tp_group.size()
 
-            self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
+            self.moe_parallel_folding = is_expert and (tp_size != config.tensor_model_parallel_size or config.expert_model_parallel_size > 1)
+            explicit_expert_comm = is_expert and (tp_size > 1 or config.expert_model_parallel_size > 1)
 
-            if self.explicit_expert_comm:
+            if explicit_expert_comm:
                 if parallel_mode == "column":
                     output_size = divide(output_size, tp_size)
                 elif parallel_mode == "row":
@@ -960,7 +959,7 @@ if is_te_min_version("1.9.0.dev0"):
             )
 
             for param in self.parameters():
-                setattr(param, 'allreduce', not (is_expert and self.expert_parallel))
+                setattr(param, 'allreduce', not self.moe_parallel_folding)
 
             def merge_extra_states(
                 self,
