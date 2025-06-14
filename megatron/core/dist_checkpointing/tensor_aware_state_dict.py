@@ -24,7 +24,12 @@ from .utils import (
     extract_sharded_base,
     zip_strict,
 )
-from .validation import determine_global_metadata, validate_sharding_integrity
+from .validation import (
+    StrictHandling,
+    determine_global_metadata,
+    parse_strict_flag,
+    validate_integrity_and_strict_load,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +312,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         exchange_algo: str = 'broadcast',
         validate_access_integrity: bool = True,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+        strict: StrictHandling = StrictHandling.ASSUME_OK_UNEXPECTED,
+        return_mismatch_keys: bool = False,
     ):
         """
         Convert tensor-aware dict back to the original state_dict
@@ -331,9 +338,28 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
 
             sharded_part, _ = extract_sharded_base(sharded_state_dict)
 
-        if validate_access_integrity:
-            with debug_time("validate_sharding_integrity", logger):
-                validate_sharding_integrity(determine_global_metadata(sharded_part)[1])
+        # Strictness
+        ckpt_sharded_metadata = None
+        local_metadata, global_metadata = None, None
+        strict = parse_strict_flag(strict)
+
+        if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
+            ckpt_sharded_metadata = {
+                sh_base.key: sh_base.without_data()
+                for sh_base in nested_values(self.sharded_state_dict)
+            }
+
+        if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
+            local_metadata, global_metadata = determine_global_metadata(sharded_part)
+
+        sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
+            sharded_part,
+            strict,
+            validate_access_integrity,
+            local_metadata,
+            global_metadata,
+            ckpt_sharded_metadata,
+        )
 
         # load sharded tensors and sharded objects to sharded_part
         with debug_time("_insert_sharded_data", logger):
@@ -344,4 +370,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
             sharded_part = apply_factory_merges(sharded_part, sh_ten_factories)
             # __adding__ sharded_part
             merge(recreated_state_dict, sharded_part)
-        return recreated_state_dict
+
+        if return_mismatch_keys:
+            return recreated_state_dict, missing_keys, unexpected_keys
+        else:
+            return recreated_state_dict
