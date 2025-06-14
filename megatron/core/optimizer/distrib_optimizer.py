@@ -2065,6 +2065,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
         copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
 
+    def _copy_main_params_to_param_buffer(self):
+        """
+        This function is only used for MXFP8 params.
+        Copy FP32 main params directly to param buffer for param all-gather since
+        param buffer is not mapped to model params for MXFP8 case.
+
+        """
+        for shard_main_group, model_group in zip(
+            self.shard_fp32_from_float16_groups, self.model_float16_groups
+        ):
+            for shard_main_param, model_param in zip(shard_main_group, model_group):
+                # Get position in param buffer
+                param_range_map = self._get_model_param_range_map(model_param)
+                world_range = param_range_map["gbuf_world_in_bucket"]
+
+                # Get param buffer
+                gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+
+                # Get the correct slice of param buffer
+                shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
+
+                shard_param_buffer.copy_(shard_main_param)
+
     def _copy_model_params_to_main_params(self):
         """
         Copy model params to main params.

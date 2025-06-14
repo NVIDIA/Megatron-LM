@@ -22,6 +22,7 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import setup_model_and_optimizer
+from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
@@ -92,6 +93,10 @@ class TestFP8Param:
         args.fp8 = "e4m3"
         args.fp8_recipe = recipe
         args.fp8_param_gather = True
+
+        # MXFP8 test settings
+        if recipe == "mxfp8":
+            args.reuse_grad_buf_for_mxfp8_param_ag = True
 
         for key, value in kwargs.items():
             assert hasattr(args, key)
@@ -196,6 +201,15 @@ class TestFP8Param:
     @pytest.mark.parametrize("tp_size", [4])
     def test_blockwise_scaling(self, tp_size):
         self.run_test(tp_size=tp_size, recipe="blockwise")
+
+    @pytest.mark.skipif(
+        get_device_arch_version() < 10, reason="MXFP8 is supported since Blackwell architecture"
+    )
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
+    @pytest.mark.parametrize("tp_size", [2])
+    def test_mxfp8(self, tp_size):
+        self.run_test(tp_size=tp_size, recipe="mxfp8")
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")

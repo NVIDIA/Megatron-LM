@@ -36,6 +36,16 @@ except (ImportError, ModuleNotFoundError):
     # FP8 tensor class not found
     pass
 
+# Check if Transformer Engine has MXFP8Tensor class
+HAVE_TE_MXFP8TENSOR = False
+try:
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    HAVE_TE_MXFP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # MXFP8Tensor not found
+    pass
+
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor.
@@ -47,6 +57,11 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
     and for TE2.x, FP8_TENSOR_CLASS is QuantizedTensor.
     """
     return HAVE_TE_FP8_TENSOR_CLASS and isinstance(tensor, FP8_TENSOR_CLASS)
+
+
+def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine MXFP8Tensor"""
+    return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
 
 
 def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
