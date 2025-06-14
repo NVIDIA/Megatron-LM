@@ -5,7 +5,7 @@ import io
 import os
 import pickle
 import warnings
-from typing import Any, Callable, Optional, Tuple, Type
+from typing import Any, Callable, List, Optional, Tuple, Type
 
 import torch
 import torch.nn.functional as F
@@ -1606,3 +1606,48 @@ try:
 except ImportError:
 
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
+
+try:
+
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+    from transformer_engine.pytorch.module.base import get_workspace
+
+    def te_general_gemm(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out_dtype: Optional[torch.dtype] = None,
+        layout: str = "TN",
+        out: Optional[torch.Tensor] = None,
+        bias: Optional[torch.Tensor] = None,
+        grad: bool = False,
+    ) -> List[torch.Tensor]:
+        """
+        Wrapper for TE's general_gemm function.
+        It supports fp32, bf16, fp16, and fp8 GEMMs with TN, NN, and NT layouts.
+        The output dtype can be specified by `out_dtype`.
+        Note: not all combinations of these settings are supported. If not supported,
+        cublaslt will throw an error.
+        """
+        return general_gemm(
+            A,
+            B,
+            workspace=get_workspace(),
+            out_dtype=out_dtype,
+            quantization_params=None,
+            gelu=None,
+            gelu_in=None,
+            accumulate=False,
+            layout=layout,
+            out=out,
+            bias=bias,
+            use_split_accumulator=False,
+            grad=grad,
+            ub=None,
+            ub_type=None,
+            extra_output=None,
+            bulk_overlap=False,
+        )
+
+except ImportError:
+
+    te_general_gemm = None  # type: ignore[assignment, misc]

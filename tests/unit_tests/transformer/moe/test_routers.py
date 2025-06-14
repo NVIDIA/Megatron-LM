@@ -5,7 +5,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias
+from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
@@ -60,7 +60,7 @@ class TestTop2Router:
             self.router.config.moe_router_score_function = score_function
             # [num tokens, hidden size]
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
-            hidden_states = hidden_states.cuda()
+            hidden_states = hidden_states.cuda().bfloat16()
             scores, indices = self.router(hidden_states)
 
     @pytest.mark.internal
@@ -128,7 +128,9 @@ class TestTop2Router:
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_force_load_balancing(self):
-        hidden_states = torch.randn((32, 2, self.router.config.hidden_size), device="cuda")
+        hidden_states = torch.randn(
+            (32, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
         hidden_states.requires_grad = True
 
         # First forward pass with normal routing
@@ -180,6 +182,8 @@ class TestGroupLimitedRouter:
             hidden_size=12,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
 
@@ -259,6 +263,8 @@ class TestAuxLossFreeTop2Router:
             moe_router_enable_expert_bias=True,  # Enable expert bias
             moe_router_bias_update_rate=0.1,  # Set bias update rate
             moe_router_topk=2,
+            bf16=True,
+            params_dtype=torch.bfloat16,
             add_bias_linear=False,
         )
         transformer_layer_spec = get_gpt_layer_local_spec(
@@ -299,3 +305,33 @@ class TestAuxLossFreeTop2Router:
 
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("router_dtype", [torch.bfloat16, torch.float32, torch.float64])
+def test_router_gating_linear(router_dtype):
+    tols = dict(rtol=2.0e-2, atol=1.0e-3)
+
+    ref_inp = torch.randn((4096, 7168), dtype=torch.bfloat16, device="cuda")
+    ref_weight = torch.randn((256, 7168), dtype=torch.bfloat16, device="cuda")
+    ref_inp.requires_grad = True
+    ref_weight.requires_grad = True
+    bwd_input = torch.randn((4096, 256), dtype=router_dtype, device="cuda")
+
+    ref_output = torch.nn.functional.linear(ref_inp.to(router_dtype), ref_weight.to(router_dtype))
+    ref_output.backward(bwd_input)
+
+    inp = ref_inp.detach()
+    weight = ref_weight.detach()
+    inp.requires_grad = True
+    weight.requires_grad = True
+    output = router_gating_linear(inp, weight, router_dtype)
+    output.backward(bwd_input)
+
+    assert output.dtype == router_dtype
+    assert ref_inp.grad.dtype == ref_inp.dtype
+    assert ref_weight.grad.dtype == ref_weight.dtype
+    assert torch.allclose(output, ref_output, **tols)
+    assert torch.allclose(inp.grad, ref_inp.grad, **tols)
+    assert torch.allclose(weight.grad, ref_weight.grad, **tols)
