@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
+import torch
 from transformers import AutoConfig, AutoModel
 
 from megatron.core.transformer.module import MegatronModule
@@ -16,6 +17,20 @@ class HuggingFaceModule(MegatronModule):
     def set_input_tensor(self, input_tensor):
         """Dummy function for set_input_tensor"""
         self.input_tensor = input_tensor
+
+    def __setattr__(self, name: str, value):
+        """
+        Set average_gradients_across_tp_domain attribute true on all params so that during
+        finalize_model_grads an all-reduce is performed on this module’s gradients across
+        tensor parallel ranks. This keeps replicated weights synchronized and prevents drift
+        due to non determinism in HF models producing slightly different grads in replicated
+        models on the same inputs.
+        """
+        super().__setattr__(name, value)
+
+        if isinstance(value, torch.nn.Module):
+            for param in value.parameters(recurse=True):
+                setattr(param, "average_gradients_across_tp_domain", True)
 
 
 class AutoHuggingFaceModel(HuggingFaceModule):

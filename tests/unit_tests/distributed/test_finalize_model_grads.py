@@ -9,7 +9,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
-    _allreduce_layernorm_grads,
+    _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -67,7 +67,7 @@ class TestAllReduceLNGrads:
             else:
                 param.grad = torch.ones_like(param)
 
-        _allreduce_layernorm_grads([self.model], self.transformer_config)
+        _allreduce_non_tensor_model_parallel_grads([self.model], self.transformer_config)
 
     @pytest.mark.parametrize(
         ("freeze_model", "pp_size", "share_embeddings"),
