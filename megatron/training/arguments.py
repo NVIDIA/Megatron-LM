@@ -70,6 +70,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
+    parser = _add_sft_args(parser)
 
     return parser
 
@@ -2381,7 +2382,8 @@ def _add_tokenizer_args(parser):
                                 'TikTokenizer',
                                 'MultimodalTokenizer',
                                 'NullTokenizer',
-                                'NullMultimodalTokenizer'],
+                                'NullMultimodalTokenizer',
+                                'SFTTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
@@ -2862,4 +2864,11 @@ def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
     group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
                        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
+    return parser
+
+def _add_sft_args(parser):
+    group = parser.add_argument_group(title='sft')
+    group.add_argument('--sft', action="store_true", help='Megatron SFT training')
+    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned", 
+                       help='SFT prompt format.')
     return parser
