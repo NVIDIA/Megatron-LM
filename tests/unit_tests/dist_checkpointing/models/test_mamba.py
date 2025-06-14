@@ -18,6 +18,7 @@ from megatron.core.extensions.transformer_engine import (
     TELayerNormColumnParallelLinear,
     TERowParallelLinear,
 )
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -33,8 +34,8 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     num_moe_experts = 8
     default_config_kwargs = dict(
         num_layers=pp_size,
-        hidden_size=128,
-        num_attention_heads=4,
+        hidden_size=256,  # for Mamba: expand=2, headdim=64 -> nheads=8 (divisible by ngroups=8)
+        num_attention_heads=8,  # must be divisible by tp_size (testing up to tp_size=8)
         num_moe_experts=num_moe_experts,
         use_cpu_initialization=True,
         gated_linear_unit=glu,
@@ -46,12 +47,13 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     submodules = MambaMixerSubmodules(
         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
     )
+    model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'cp'])
     model = MambaMixer(
         transformer_config,
         submodules,
         transformer_config.hidden_size,
         rmsnorm=True,
-        tp_group=parallel_state.get_tensor_model_parallel_group(),
+        model_comm_pgs=model_comm_pgs,
     )
     return model
 
@@ -64,31 +66,37 @@ def get_pp_offsets():
 
 class TestMambaReconfiguration:
     @pytest.mark.parametrize(
-        "use_fpsl,src_tp_pp_exp,dest_tp_pp_exp,use_glu",
+        "use_fpsl,src_tp_pp_exp_cp,dest_tp_pp_exp_cp,use_glu",
         [
-            # changing PP is impossible because the number of layers must be the same
-            (False, (2, 4, 1), (2, 4, 1), False),
-            (True, (2, 4, 1), (2, 4, 1), False),
-            (False, (1, 1, 1), (1, 1, 1), False),
-            (True, (1, 1, 1), (1, 1, 4), False),
-            (False, (1, 1, 8), (1, 1, 2), False),
-            (False, (2, 2, 2), (4, 2, 1), False),
-            # (True,  (1, 1, 4), (8, 1, 1), False),
-            (False, (1, 8, 1), (1, 8, 1), False),
-            (False, (1, 1, 4), (2, 1, 1), False),
-            (False, (1, 1, 1), (1, 1, 1), True),
-            (False, (1, 1, 1), (1, 1, 4), True),
-            (True, (1, 1, 1), (2, 1, 1), True),
-            # (False, (1, 1, 4), (8, 1, 1), True),
+            (False, (2, 4, 1, 1), (2, 4, 1, 1), False),
+            (True, (2, 4, 1, 1), (2, 4, 1, 1), False),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), False),
+            (True, (1, 1, 1, 1), (1, 1, 4, 1), False),
+            (False, (1, 1, 8, 1), (1, 1, 2, 1), False),
+            (False, (2, 2, 2, 1), (4, 2, 1, 1), False),
+            (True, (1, 1, 4, 1), (8, 1, 1, 1), False),
+            (False, (1, 8, 1, 1), (1, 8, 1, 1), False),
+            (False, (1, 1, 4, 1), (2, 1, 1, 1), False),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), True),
+            (False, (1, 1, 1, 1), (1, 1, 4, 1), True),
+            (True, (1, 1, 1, 1), (2, 1, 1, 1), True),
+            (False, (1, 1, 4, 1), (8, 1, 1, 1), True),
+            # CP-focused cases:
+            (False, (8, 1, 1, 1), (1, 1, 1, 8), False),
+            (False, (4, 1, 1, 2), (2, 1, 1, 4), False),
+            # TODO(duncan): investigate why changing pp_size (up or down) yields an unexpected shape
+            #     mismatch error on dt_bias
         ],
     )
     def test_parallel_reconfiguration_e2e(
-        self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, use_fpsl
+        self, tmp_path_dist_ckpt, src_tp_pp_exp_cp, dest_tp_pp_exp_cp, use_glu, use_fpsl
     ):
         """Test model saving and loading with different TP/PP/expert parallelism"""
-        src_tp, src_pp, src_exp = src_tp_pp_exp
-        Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
-        dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
+        src_tp, src_pp, src_exp, src_cp = src_tp_pp_exp_cp
+        Utils.initialize_model_parallel(
+            src_tp, src_pp, expert_model_parallel_size=src_exp, context_parallel_size=src_cp
+        )
+        dest_tp, dest_pp, dest_exp, dest_cp = dest_tp_pp_exp_cp
         with TempNamedDir(
             tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_A'
         ) as ckpt_dir_A, TempNamedDir(
@@ -101,6 +109,7 @@ class TestMambaReconfiguration:
                 tensor_model_parallel_size=src_tp,
                 pipeline_model_parallel_size=src_pp,
                 expert_model_parallel_size=src_exp,
+                context_parallel_size=src_cp,
                 # Sequence parallelism is required when using both expert and tensor parallelism
                 sequence_parallel=(src_exp > 1 and src_pp > 1),
             )
@@ -116,15 +125,18 @@ class TestMambaReconfiguration:
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
             Utils.destroy_model_parallel()
 
-            # Load checkpoint A with different TP/PP/expert and save as checkpoint B
+            # Load checkpoint A with different TP/PP/expert/CP and save as checkpoint B
             # No FPS this time, only FPL
-            Utils.initialize_model_parallel(dest_tp, dest_pp, expert_model_parallel_size=dest_exp)
+            Utils.initialize_model_parallel(
+                dest_tp, dest_pp, expert_model_parallel_size=dest_exp, context_parallel_size=dest_cp
+            )
             model_B = initialize_mamba(
                 2,
                 use_glu,
                 tensor_model_parallel_size=dest_tp,
                 pipeline_model_parallel_size=dest_pp,
                 expert_model_parallel_size=dest_exp,
+                context_parallel_size=dest_cp,
                 # Sequence parallelism is required when using both expert and tensor parallelism
                 sequence_parallel=(dest_exp > 1 and dest_pp > 1),
             )

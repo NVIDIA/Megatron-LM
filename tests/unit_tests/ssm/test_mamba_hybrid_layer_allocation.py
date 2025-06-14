@@ -9,6 +9,7 @@ import torch
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, allocate_layers
 
 
+@pytest.mark.internal
 class TestMambaHybridLayerAllocation:
 
     def test_hybrid_layer_allocation(self):
