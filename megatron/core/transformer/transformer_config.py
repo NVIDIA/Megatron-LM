@@ -10,6 +10,7 @@ from packaging.version import Version as PkgVersion
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -49,6 +50,32 @@ class TransformerConfig(ModelParallelConfig):
     num_layers_in_last_pipeline_stage: Optional[int] = None
     """Number of transformer layers on last pipeline stage.
     None implies equal layer division across PP ranks."""
+
+    pipeline_model_parallel_layout: Optional[Union[str, list, PipelineParallelLayerLayout]] = None
+    """Custom definition of the pipeline parallel partitioning.
+    Support type:
+    - str: e.g., 'Et*3|(tt|)*29,m|L'. Stages are split by '|', replicated stages or layers
+    can be described with multiplication. Commas can be used cosmetically.
+    - list: e.g., [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']].
+    - PipelineParallelLayerLayout: a PipelineParallelLayerLayout object.
+    If given either a string or a list, it will be transferred into a PipelineParallelLayerLayout
+    in post init. Let i = a * pp_size + b, then layout[i] gives a list of the layers 
+    in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ..., 
+    vpp(i)pp(j), vpp(i)pp(j+1), ..., vpp(-1)pp(-2), vpp(-1)pp(-1).
+    In the inner lists of layers, 'embedding' or 'E' denotes the embedding layer, 'loss' or 'L'
+    denotes the loss function, and 'decoder' or 't' denotes the transformer decoder layer.
+    Examples:
+        [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']]:
+        pp = 2, vpp = None
+        pp rank 0 holds: embedding, decoder
+        pp rank 1 holds: decoder*3, loss
+        'E|(tt|)*2,(t|)*4,mL':
+        pp = 2, vpp = 4
+        vpp rank 0 pp rank 0 holds: embedding
+        vpp rank 0 pp rank 1~2 holds: decoder*2
+        vpp rank 0 pp rank 3 holds: decoder
+        vpp rank 1 pp rank 0~2 holds: decoder
+        vpp rank 1 pp rank 3 holds: mtp, loss"""
 
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
@@ -827,7 +854,59 @@ class TransformerConfig(ModelParallelConfig):
                 'and account_for_loss_in_pipeline_split'
             )
 
-        if (
+        # PP layout
+        if self.pipeline_model_parallel_layout is not None:
+            # If pipeline layout is set, we will check the conflicts
+            # with other pipeline layout arguments.
+            any_conflict = (
+                self.num_layers_in_first_pipeline_stage is not None
+                or self.num_layers_in_last_pipeline_stage is not None
+                or self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            )
+            if any_conflict:
+                raise ValueError(
+                    "pipeline_model_parallel_layout cannot be set"
+                    " with other pipeline layout arguments."
+                    f" {self.num_layers_in_first_pipeline_stage=},"
+                    f" {self.num_layers_in_last_pipeline_stage=},"
+                    f" {self.account_for_embedding_in_pipeline_split=},"
+                    f" {self.account_for_loss_in_pipeline_split=}."
+                )
+
+            # Transfer pipeline_model_parallel_layout from str or list to
+            # PipelineParallelLayerLayout
+            if isinstance(self.pipeline_model_parallel_layout, str):
+                self.pipeline_model_parallel_layout = PipelineParallelLayerLayout.from_str(
+                    layout=self.pipeline_model_parallel_layout,
+                    pipeline_model_parallel_size=self.pipeline_model_parallel_size,
+                )
+            elif isinstance(self.pipeline_model_parallel_layout, list):
+                # Since list is not hashable, the initialization will not be cached.
+                self.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
+                    layout=self.pipeline_model_parallel_layout,
+                    pipeline_model_parallel_size=self.pipeline_model_parallel_size,
+                )
+
+            # Check whether the input VPP size conflicts with the PP layout
+            detected_vpp_size = (
+                self.pipeline_model_parallel_layout.virtual_pipeline_model_parallel_size
+            )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                assert self.virtual_pipeline_model_parallel_size == detected_vpp_size, (
+                    f"virtual_pipeline_model_parallel_size conflicts with"
+                    f" pipeline_model_parallel_layout,"
+                    f" ({self.virtual_pipeline_model_parallel_size=}, "
+                    f" {detected_vpp_size=})"
+                )
+            elif detected_vpp_size > 1:
+                self.virtual_pipeline_model_parallel_size = detected_vpp_size
+
+            # Check whether the layout is valid.
+            self.pipeline_model_parallel_layout.validate_layer_layout(num_layers=self.num_layers)
+
+        # Uneven PP
+        elif (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None
         ):
@@ -872,13 +951,17 @@ class TransformerConfig(ModelParallelConfig):
                 num_layers -= self.num_layers_in_last_pipeline_stage
                 pipeline_parallel_size -= 1
 
-            if not num_layers % pipeline_parallel_size == 0:
+            # Here pipeline_parallel_size is the number of middle PP stages. If there are middle
+            # PP stages, check number of layers at middle stage is divisible by middle PP size.
+            if pipeline_parallel_size and not num_layers % pipeline_parallel_size == 0:
                 raise ValueError(
                     f'number of layers at middle stage: {num_layers} must be divisible by'
                     f'the middle pipeline model parallel size {pipeline_parallel_size}'
                 )
 
-            if self.virtual_pipeline_model_parallel_size is not None:
+            # If there are middle PP stages, check number of layers
+            # on each middle PP rank is divisible by VPP size.
+            if pipeline_parallel_size and self.virtual_pipeline_model_parallel_size is not None:
                 num_layers_per_middle_pipeline_rank = num_layers // pipeline_parallel_size
                 if (
                     not num_layers_per_middle_pipeline_rank
@@ -891,7 +974,9 @@ class TransformerConfig(ModelParallelConfig):
                         f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
                     )
 
-        if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
+        elif (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
             if self.virtual_pipeline_model_parallel_size is None:
                 num_layers = self.num_layers
 

@@ -16,6 +16,7 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -60,6 +61,13 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    # If we have a custom PP layout, straightforwardly
+    # return the number of decoders in the layout array.
+    if config.pipeline_model_parallel_layout is not None:
+        return config.pipeline_model_parallel_layout.get_num_layers_to_build(
+            layer_type=LayerType.decoder, vp_stage=vp_stage
+        )
+
     if (
         config.num_layers_in_first_pipeline_stage is not None
         or config.num_layers_in_last_pipeline_stage is not None
@@ -85,10 +93,15 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
             layers_to_distribute -= config.num_layers_in_last_pipeline_stage
             pipeline_stages_left -= 1
 
-        assert (
-            layers_to_distribute % pipeline_stages_left == 0
-        ), "With uneven pipelineing the left over layers must be divisible by left over stages"
-        num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+        # If pp_size <= 2, we do not have any intermediate pipeline stages, and we do not
+        # need to check if the left over layers are divisible by the left over stages.
+        if pipeline_stages_left > 0:
+            assert (
+                layers_to_distribute % pipeline_stages_left == 0
+            ), "With uneven pipelineing the left over layers must be divisible by left over stages"
+            num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+        else:
+            num_layers_per_pipeline_rank = 0
 
         # If the uneven first (last) pipeline stage is enabled, return the specified number
         # of layers for all virtual pipeline parallel stages within the first (last) pipeline
@@ -584,6 +597,11 @@ class TransformerBlock(MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
+
+        # If this TransformerBlock is empty, input and output hidden states will be the same node
+        # on the computational graph and will lead to unexpected errors in pipeline schedules.
+        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
+            hidden_states = hidden_states.clone()
 
         return hidden_states
 

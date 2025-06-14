@@ -1370,7 +1370,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         }
         load_kwargs["sharded_state_dict"] = sharded_state_dict
 
-
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
         load_dir, args, rank0=False, checkpointing_context=checkpointing_context,
         **load_kwargs
@@ -1428,6 +1427,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             ddp_model[0].load_state_dict(state_dict['model'], strict=strict)
         else:
             for i in range(len(ddp_model)):
+                # If there is no corresponding model in the state_dict, it will be ignored.
+                # It means that this is an empty stage.
+                if 'model%d' % i not in state_dict:
+                    continue
                 ddp_model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
 
     # Fix up query/key/value matrix ordering if needed.
