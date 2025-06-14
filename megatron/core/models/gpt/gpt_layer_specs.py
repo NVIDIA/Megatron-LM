@@ -8,7 +8,7 @@ from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
-from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.multi_latent_attention import (
@@ -414,12 +414,23 @@ def get_gpt_decoder_block_spec(
 
     # Slice the layer specs to only include the layers that are built in this pipeline stage.
     # Note: MCore layer_number starts at 1
-    offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
-    layer_specs = layer_specs[offset : offset + num_layers_to_build]
+
+    if config.pipeline_model_parallel_layout is not None:
+        local_layer_specs = [
+            layer_specs[layer_id]
+            for layer_id in config.pipeline_model_parallel_layout.get_layer_id_list(
+                layer_type=LayerType.decoder, vp_stage=vp_stage
+            )
+        ]
+    else:
+        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
+        local_layer_specs = layer_specs[offset : offset + num_layers_to_build]
 
     # Block spec.
-    block_spec = TransformerBlockSubmodules(layer_specs=layer_specs, layer_norm=layer_norm_impl)
+    block_spec = TransformerBlockSubmodules(
+        layer_specs=local_layer_specs, layer_norm=layer_norm_impl
+    )
 
     return block_spec
 
