@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""Pretrain GPT."""
+"""Pretrain and SFT GPT."""
 
 import datetime
 import os
@@ -40,6 +40,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
 )
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+from megatron.training.datasets.sft_dataset import SFTDataset
 
 import megatron.legacy.model  # isort: skip
 
@@ -331,10 +332,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.mock_data:
-        dataset_type = MockGPTDataset
+    if args.sft:
+        dataset_type = SFTDataset
     else:
-        dataset_type = GPTDataset
+        if args.mock_data:
+            dataset_type = MockGPTDataset
+        else:
+            dataset_type = GPTDataset
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 

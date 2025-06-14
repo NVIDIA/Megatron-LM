@@ -15,6 +15,7 @@ from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 from megatron.training.tokenizer.multimodal_tokenizer import MultimodalTokenizer
+from megatron.training.tokenizer.sft_tokenizer import SFTTokenizer
 
 
 def build_tokenizer(args, **kwargs):
@@ -92,6 +93,11 @@ def build_tokenizer(args, **kwargs):
             args.special_tokens,
             args.image_tag_type,
             args.force_system_message,
+        )
+    elif args.tokenizer_type == "SFTTokenizer":
+        tokenizer = SFTTokenizer(
+            args.tokenizer_model,
+            args.sft_tokenizer_prompt_format, 
         )
     elif args.tokenizer_type == 'NullMultimodalTokenizer':
         assert args.vocab_size is not None
