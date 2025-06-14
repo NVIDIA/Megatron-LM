@@ -11,6 +11,7 @@ from megatron.core.transformer.moe.moe_utils import (
     ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
     apply_random_logits,
+    router_gating_linear,
     save_to_aux_losses_tracker,
     sequence_load_balancing_loss_func,
     sinkhorn,
@@ -78,7 +79,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = torch.nn.functional.linear(input.to(router_dtype), self.weight.to(router_dtype))
+        logits = router_gating_linear(input, self.weight, router_dtype)
         return logits
 
     @abstractmethod
