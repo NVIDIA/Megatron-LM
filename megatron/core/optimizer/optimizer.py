@@ -1225,7 +1225,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
                 # needs to be saved.
-                if torch.distributed.get_rank(optimizer.data_parallel_group) == 0:
+                if optimizer.data_parallel_group.rank() == 0:
                     states.append(state_dict)
                     save_states = True
                 else:
@@ -1253,7 +1253,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 continue
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
-            if torch.distributed.get_rank(optimizer.data_parallel_group) == 0 and states is None:
+            if optimizer.data_parallel_group.rank() == 0 and states is None:
                 states = torch.load(filename)
 
             state_dict = states[idx] if states else None

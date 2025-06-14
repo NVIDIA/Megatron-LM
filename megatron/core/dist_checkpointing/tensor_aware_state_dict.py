@@ -71,14 +71,14 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
     def _remove_redundant_data(
         fully_parallel, sharded_part, shard_to_saving_rank, parallelization_group
     ):
+        if parallelization_group is None:
+            parallelization_group = torch.distributed.group.WORLD
         if fully_parallel:
             for sh_base in nested_values(sharded_part):
                 # TODO remove redundant objects as well
                 if isinstance(sh_base, ShardedTensor):
                     shard_id = _sharded_tensor_shard_id(sh_base)
-                    if shard_to_saving_rank[shard_id] != torch.distributed.get_rank(
-                        group=parallelization_group
-                    ):
+                    if shard_to_saving_rank[shard_id] != parallelization_group.rank():
                         sh_base.data = None
 
     @classmethod

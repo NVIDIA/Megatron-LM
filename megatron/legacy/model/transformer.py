@@ -226,7 +226,7 @@ class SwitchMLP(MegatronModule):
 
     def gather_indices(self, local_indices):
         """ Gather tensors and concatinate along the first dimension."""
-        world_size = torch.distributed.get_world_size(group=self.tp_ep_group)
+        world_size = self.tp_ep_group.size()
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return local_indices

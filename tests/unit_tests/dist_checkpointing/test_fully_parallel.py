@@ -46,6 +46,7 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     MCoreLoadPlanner,
     TorchDistSaveShardedStrategy,
 )
+from megatron.core.utils import get_pg_rank
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -190,9 +191,9 @@ class TestFullyParallelSaveAndLoad:
         parallelization_group = (
             parallel_state.get_data_parallel_group(with_context_parallel=True)
             if parallelization_along_dp
-            else None
+            else torch.distributed.group.WORLD
         )
-        dp_rank = torch.distributed.get_rank(parallelization_group)
+        dp_rank = get_pg_rank(parallelization_group)
         expected_keys_saved_by_current_rank = {
             k for k, v in expected_key_to_saving_ranks.items() if dp_rank in v
         }
@@ -297,9 +298,9 @@ class TestFullyParallelSaveAndLoad:
         parallelization_group = (
             parallel_state.get_data_parallel_group(with_context_parallel=True)
             if parallelize_within_dp
-            else None
+            else torch.distributed.group.WORLD
         )
-        dp_rank = torch.distributed.get_rank(parallelization_group)
+        dp_rank = get_pg_rank(parallelization_group)
         expected_keys_loaded_by_current_rank = {
             k for k, v in expected_key_to_loading_ranks.items() if dp_rank in v
         }
@@ -580,7 +581,9 @@ class TestCrossRanksReads:
     ):
         Utils.initialize_model_parallel(tp_size, 1)
         parallelization_group = (
-            parallel_state.get_data_parallel_group() if parallel_within_dp else None
+            parallel_state.get_data_parallel_group()
+            if parallel_within_dp
+            else torch.distributed.group.WORLD
         )
         state_dict = self.get_sharded_state_dict(ranks_placement)
         with TempNamedDir(tmp_path_dist_ckpt / 'determine_cross_rank_reads') as ckpt_dir:

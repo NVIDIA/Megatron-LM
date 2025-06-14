@@ -123,9 +123,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.use_distributed_optimizer:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
-            self.intra_distributed_optimizer_instance_rank = torch.distributed.get_rank(
-                group=collective_group
-            )
+            self.intra_distributed_optimizer_instance_rank = collective_group.rank()
         else:
             self.data_parallel_group = collective_group
 
@@ -492,9 +490,7 @@ class _ParamAndGradBuffer:
         self.param_dtype = param_dtype
         self.grad_dtype = grad_dtype
         self.data_parallel_group = data_parallel_group
-        self.data_parallel_world_size = torch.distributed.get_world_size(
-            group=self.data_parallel_group
-        )
+        self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
         self.nccl_ub = nccl_ub
 
