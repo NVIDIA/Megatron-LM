@@ -1,0 +1,71 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --timing-log-level: 2
+  --load: ${CHECKPOINT_LOAD_PATH}/mamba_hybrid_2b/checkpoint
+  --tokenizer-model: ${DATA_PATH}/mamba_hybrid_2b/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --tokenizer-type: TikTokenizer
+  --tiktoken-pattern: v2
+  --distributed-backend: nccl
+  --log-interval: 1
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --expert-model-parallel-size: 1
+  --use-mcore-models: true
+  --is-hybrid-model: true
+  --model-provider: mamba
+  --init-method-std: 0.0198
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --init-method-std: 0.014
+  --position-embedding-type: none
+  --num-layers: 50
+  --hidden-size: 2048
+  --ffn-hidden-size: 11264
+  --num-attention-heads: 16
+  --kv-channels: 128
+  --hybrid-override-pattern: M-M-M-M*-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-
+  --spec: megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec
+  --normalization: RMSNorm
+  --swiglu: true
+  --attention-dropout: 0.0
+  --hidden-dropout: 0.0
+  --seq-length: 4096
+  --max-position-embeddings: 4096
+  --micro-batch-size: 1
+  --ckpt-format: torch_dist
+  --ckpt-fully-parallel-save: true
+  --ckpt-fully-parallel-load: true
+  --ckpt-assume-constant-structure: true
+  --dist-ckpt-strictness: log_unexpected
+  --bf16: true
+  --attention-backend: flash
+  --no-create-attention-mask-in-dataloader: true
+  --num-workers: 8
+  --flash-decode: true
+  --use-checkpoint-args: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --no-load-optim: true
+  --deterministic-mode: true
+  --save-interval: 2000
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 4096
+  --output-path: ${TENSORBOARD_PATH}
+  --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
+METRICS:
+  - "generated_tokens"
+  - "logprobs"
