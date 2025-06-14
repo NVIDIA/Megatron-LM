@@ -94,7 +94,7 @@ def diff(x1: Any, x2: Any, prefix: Tuple = ()) -> Tuple[list, list, list]:
     elif isinstance(x1, list) or isinstance(x1, tuple) or isinstance(x1, np.ndarray):
         assert type(x1) == type(x2)
         only_left = list(range(len(x1) - 1, len(x2) - 1, -1))
-        only_right = list(range(len(x1) - 1, len(x2) - 1, -1))
+        only_right = list(range(len(x2) - 1, len(x1) - 1, -1))
         for i, (v1, v2) in enumerate(zip(x1, x2)):
             _left, _right, _mismatch = diff(v1, v2, prefix + (i,))
             only_left.extend(_left)
