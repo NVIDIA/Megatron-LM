@@ -4,6 +4,9 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.ssm.mamba_block import MambaStack
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -233,6 +236,67 @@ class TestLLaVACudaGraph:
 
         # Verify that CUDA graphs were created successfully
         assert _CudagraphGlobalRecord.cudagraph_created, "CUDA graphs should be created"
+
+
+class TestParallelMambaBlockCudagraphs:
+    def setup_method(self, method):
+        # initialize parallel state
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(123)
+
+        def get_model_comm_pgs():
+            return ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
+        def get_mamba_block(hybrid_override_pattern):
+            transformer_config = TransformerConfig(
+                hidden_size=256,  # The Mamba layer places several constraints on this
+                # Need to specify num_attention_heads and num_layers or TransformerConfig
+                # will generate errors.
+                num_layers=len(hybrid_override_pattern),
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                enable_cuda_graph=True,
+            )
+            modules = mamba_stack_spec.submodules
+            return MambaStack(
+                transformer_config,
+                modules,
+                hybrid_override_pattern=hybrid_override_pattern,
+                model_comm_pgs=get_model_comm_pgs(),
+            )
+
+        self.mamba_block = get_mamba_block(hybrid_override_pattern="M-M*-")
+        self.transformer_config = self.mamba_block.config
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_gpu_cudagraph(self):
+        parallel_mamba_block = self.mamba_block
+        parallel_mamba_block.cuda()
+
+        # [sequence length, batch size, hidden size]
+        sequence_length = 32
+        micro_batch_size = 2
+        transformer_config: TransformerConfig = parallel_mamba_block.config
+        num_layers = transformer_config.num_layers
+        hidden_size = transformer_config.hidden_size
+        hidden_states = torch.ones((sequence_length, micro_batch_size, hidden_size))
+        hidden_states = hidden_states.cuda()
+        attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+
+        hidden_states = parallel_mamba_block(
+            hidden_states=hidden_states, attention_mask=attention_mask
+        )
+
+        for _ in range(num_layers):
+            assert hasattr(parallel_mamba_block.layers[0], "cudagraph_manager")
+            assert len(parallel_mamba_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
 
 
 if __name__ == "__main__":
