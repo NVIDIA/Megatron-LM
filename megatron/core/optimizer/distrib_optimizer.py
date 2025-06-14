@@ -335,7 +335,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 if model_param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
 
                     # Generate sharded model param.
-                    if is_float8tensor(model_param):
+                    if is_float8tensor(model_param) and config.fp8_recipe != "delayed":
                         # MXFP8Tensor and BlockwiseQTensor don't support view(-1)
                         shard_model_param = None
                     else:
@@ -349,7 +349,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             shard_model_param.shared = model_param.shared
 
                     # Generate main param.
-                    if not config.use_precision_aware_optimizer:
+                    if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # If we use FP8 params to initialize FP32 main params (compared to using the
                         # bf16/fp16 params to initialize the main params), there will be a loss of
                         # precision at the beginning of training (this problem will not occur if the
@@ -411,7 +411,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
 
             # Update optimizer's params.
-            if not config.use_precision_aware_optimizer:
+            if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 group_range["orig_group"]["params"] = [
                     *shard_fp32_params_this_group,
                     *shard_fp32_from_float16_params_this_group,
@@ -732,7 +732,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 "exp_avg": init_shard(self.config.exp_avg_dtype),
                                 "exp_avg_sq": init_shard(self.config.exp_avg_sq_dtype),
                             }
-                            if self.config.use_precision_aware_optimizer:
+                            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                                 if self.config.store_param_remainders and self.config.bf16:
                                     tensors["master_param"] = init_shard(torch.int16)
                                 else:
@@ -760,7 +760,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 s["step"] = step
         elif isinstance(self.optimizer, HybridDeviceOptimizer):
             # Handle Torch AdamW special case, which, unlike FusedAdam, Torch AdamW
-            # has an extra optimizer state “step”.
+            # has an extra optimizer state "step".
             steps = list(
                 set([g["step"] for g in state_dict["optimizer"]["param_groups"] if "step" in g])
             )
@@ -832,7 +832,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return {"param": main_param, **self.optimizer.state[main_param]}
 
         group_index, group_order = self.model_param_group_index_map[model_param]
-        if self.config.use_precision_aware_optimizer:
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             tensors = {}
             for k in self.optimizer.state[sharded_model_param]:
@@ -875,7 +875,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             return
 
         group_index, group_order = self.model_param_group_index_map[model_param]
-        if self.config.use_precision_aware_optimizer:
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             for k, v in tensors.items():
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
@@ -1876,12 +1876,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.shard_float16_groups,  # grad empty/unused here?
             self.shard_fp32_groups,  # throws grad-access warning
         ]
-        if not self.config.use_precision_aware_optimizer:
+        if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             total_groups.append(self.shard_fp32_from_float16_groups)
         for groups in total_groups:
             for group in groups:
                 _zero_grad_group_helper(
-                    group, set_to_none, self.config.use_precision_aware_optimizer
+                    group, set_to_none, self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
                 )
 
     def _collect_main_grad_data_for_unscaling(self):
@@ -1889,7 +1889,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Note: this should be equivalent to the float-16 optimizer's method,
         but written differently, so the two should be combined.
         """
-        if self.config.use_precision_aware_optimizer:
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return [
                 param.decoupled_grad.data
                 for group in self.optimizer.param_groups
@@ -1913,7 +1913,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ):
             for model_param, main_param in zip(model_group, main_group):
                 model_data.append(model_param.data)
-                if self.config.use_precision_aware_optimizer:
+                if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                     main_data.append(None)
                 else:
                     main_data.append(main_param.data)
@@ -1995,7 +1995,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                     model_grad = model_param.main_grad
                     shard_model_grad = model_grad.view(-1)[param_range.start : param_range.end]
-                    if self.config.use_precision_aware_optimizer:
+                    if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                         # Pytorch requires a param and its' grad to be the same dtype, but we want
                         # their types to be different in precision-aware optimizer. So we use
                         # ".decoupled_grad" to replace ".grad".
@@ -2006,7 +2006,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         shard_main_param.grad = shard_model_grad.float()
 
         # Copy model groups to shard groups.
-        if self.config.use_precision_aware_optimizer:
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             copy_group_grads(self.model_float16_groups, self.shard_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
         else:
@@ -2031,7 +2031,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
-        if self.config.use_precision_aware_optimizer:
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
         quantize_param_shard(
@@ -2084,7 +2084,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
-        if self.config.use_precision_aware_optimizer:
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
         # Utility method for copying group params.
