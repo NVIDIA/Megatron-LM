@@ -48,7 +48,7 @@ def get_sliding_window_causal_mask(sq, skv, window_size):
 
 # pylint: disable=missing-function-docstring
 def attention_mask_func(attention_scores, attention_mask):
-    attention_scores.masked_fill_(attention_mask, -10000.0)
+    attention_scores.masked_fill_(attention_mask, -torch.inf)
     return attention_scores
 
 

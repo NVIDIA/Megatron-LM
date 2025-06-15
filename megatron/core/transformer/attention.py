@@ -543,6 +543,7 @@ class Attention(MegatronModule, ABC):
         rotary_pos_emb: Optional[Union[Tensor, Tuple[Tensor, Tensor]]] = None,
         rotary_pos_cos: Optional[Tensor] = None,
         rotary_pos_sin: Optional[Tensor] = None,
+        yarn_mscale: float = 1.0,
         attention_bias: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[int] = None,
@@ -695,6 +696,7 @@ class Attention(MegatronModule, ABC):
                         config=self.config,
                         cu_seqlens=cu_seqlens_q,
                         cp_group=self.model_comm_pgs.cp,
+                        mscale=yarn_mscale,
                     )
                 else:
                     query = inference_context.apply_rotary_emb_query(
@@ -707,6 +709,7 @@ class Attention(MegatronModule, ABC):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     cp_group=self.model_comm_pgs.cp,
+                    mscale=yarn_mscale,
                 )
 
             # TODO, can apply positional embedding to value_layer so it has

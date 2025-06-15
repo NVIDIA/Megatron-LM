@@ -999,7 +999,6 @@ class SequentialMLP(MegatronModule):
             sequential_mlp_config.ffn_hidden_size = config.moe_ffn_hidden_size
             super().__init__(config=sequential_mlp_config)
 
-        self.add_bias = config.add_bias_linear
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
         self.ep_group = model_comm_pgs.ep
@@ -1070,7 +1069,6 @@ class SequentialMLP(MegatronModule):
             probs_list = torch.split(permuted_probs, tokens_per_expert)
 
             output_local_list = []
-            output_bias_list = []
 
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
                 if self.config.fp8:
@@ -1080,15 +1078,10 @@ class SequentialMLP(MegatronModule):
                 else:
                     output, output_bias = expert(tokens, probs)
                 output_local_list.append(output)
-                # if self.add_bias:
-                #     output_bias_list.append(output_bias.expand_as(output))
 
             output_local = torch.cat(output_local_list, dim=0)
-            # if self.add_bias:
-            #     output_bias_local = torch.cat(output_bias_list, dim=0)
-            # else:
             output_bias_local = None
-
+            # Note: if bias is enabled on experts, it is already added to the output at this point
             return output_local, output_bias_local
 
     def backward_dw(self):

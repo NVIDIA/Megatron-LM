@@ -119,11 +119,11 @@ class MultiLatentAttention(Attention):
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=self.config.rotary_base,
                 scaling_factor=self.config.rotary_scaling_factor,
-                original_max_position_embeddings=self.config.original_max_position_embeddings,
-                beta_fast=self.config.beta_fast,
-                beta_slow=self.config.beta_slow,
-                mscale=self.config.mscale,
-                mscale_all_dim=self.config.mscale_all_dim,
+                original_max_position_embeddings=self.config.yarn_original_max_position_embeddings,
+                beta_fast=self.config.yarn_beta_fast,
+                beta_slow=self.config.yarn_beta_slow,
+                mscale=self.config.yarn_mscale,
+                mscale_all_dim=self.config.yarn_mscale_all_dim,
                 cp_group=self.model_comm_pgs.cp,
             )
         else:

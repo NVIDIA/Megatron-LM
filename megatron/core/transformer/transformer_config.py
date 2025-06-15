@@ -1144,8 +1144,8 @@ class TransformerConfig(ModelParallelConfig):
                 multiplier=2.0 if not self.is_hybrid_model else 1.0,
             )
 
-        if self.num_moe_experts is not None:
-            assert not self.add_bias_linear, "Bias is not supported for MoE"
+        if self.num_moe_experts is not None and self.add_bias_linear:
+            assert not self.moe_grouped_gemm, "Bias in Moe is only supported for SequentialMLP (moe_grouped_gemm=False)"
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
@@ -1388,39 +1388,20 @@ class MLATransformerConfig(TransformerConfig):
     rotary_scaling_factor: float = 40
     """Rotary scaling factor for the rotary embeddings, used by yarn."""
 
-    max_position_embeddings: int = 4096
-    """This arg is not used, will be deprecated."""
+    yarn_original_max_position_embeddings: int = 4096
+    """Maximum position embeddings for the original model, used by yarn."""
 
-    original_max_position_embeddings: int = 4096
-    """Original maximum position embeddings for the original model, used by yarn."""
-
-    beta_fast: float = 32
+    yarn_beta_fast: float = 32
     """Beta fast for YaRN RoPE, used by yarn."""
 
-    beta_slow: float = 1
+    yarn_beta_slow: float = 1
     """Beta slow for YaRN RoPE, used by yarn."""
 
-    mscale: float = 1.0
+    yarn_mscale: float = 0.707
     """Mscale for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
-    mscale_all_dim: float = 0.0
+    yarn_mscale_all_dim: float = 0.707
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
-    def __post_init__(self):
-        super().__post_init__()
-        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
-            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
-
-        # TODO(boxiangw): Deprecate this check
-        if self.max_position_embeddings != 4096:
-            if self.original_max_position_embeddings == 4096:
-                # only override the original_max_position_embeddings if it is not set
-                self.original_max_position_embeddings = self.max_position_embeddings
-            self.max_position_embeddings = 4096
-            warnings.warn(
-                "MLA config max_position_embeddings is overridden by customer input, "
-                "please use the original_max_position_embeddings instead for YaRN!"
-                "max_position_embeddings will be deprecated in the future."
-                "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
-                "and assigned max_position_embeddings back to the original value."
-            )
+    yarn_correction_range_round_to_int: bool = True
+    """Whether to round dim range bounds to integer"""

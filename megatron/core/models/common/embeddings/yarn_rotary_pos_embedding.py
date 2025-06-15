@@ -38,6 +38,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow (float, optional): Slow beta value for Yarn RoPE. Defaults to 1.
         mscale (float, optional): Mscale value for Yarn RoPE. Defaults to 1.
         mscale_all_dim (float, optional): Mscale all dim value for Yarn RoPE. Defaults to 0.
+        correction_range_round_to_int (bool): Whether to round dim range bounds to integer. Defaults to True
         cp_group (torch.distributed.ProcessGroup, optional): Process group for context parallel.
             Defaults to None.
     """
@@ -56,6 +57,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         beta_slow: float = 1.0,
         mscale: float = 1.0,
         mscale_all_dim: float = 0.0,
+        correction_range_round_to_int: bool = True,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.dim = kv_channels
@@ -66,6 +68,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         self.beta_slow = beta_slow
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
+        self.correction_range_round_to_int = correction_range_round_to_int
 
         device = 'cpu' if use_cpu_initialization else torch.cuda.current_device()
         self.inv_freq_extra = 1.0 / (
@@ -78,13 +81,15 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
         )
         super().__init__(
-            kv_channels,
-            rotary_percent,
-            rotary_interleaved,
-            seq_len_interpolation_factor,
-            rotary_base,
-            use_cpu_initialization,
-            cp_group,
+            kv_channels=kv_channels,
+            rotary_percent=rotary_percent,
+            rotary_interleaved=rotary_interleaved,
+            seq_len_interpolation_factor=seq_len_interpolation_factor,
+            rotary_base=rotary_base,
+            rope_scaling=True,
+            rope_scaling_factor=scaling_factor,
+            use_cpu_initialization=use_cpu_initialization,
+            cp_group=cp_group,
         )
 
         self._set_cos_sin_cache(
@@ -121,6 +126,7 @@ class YarnRotaryEmbedding(RotaryEmbedding):
             self.dim,
             self.rotary_base,
             self.original_max_position_embeddings,
+            self.correction_range_round_to_int,
         )
         inv_freq_mask = 1.0 - _yarn_linear_ramp_mask(low, high, self.dim // 2).to(
             device=self.inv_freq_extra.device, dtype=torch.float32
@@ -194,9 +200,13 @@ def _yarn_find_correction_range(
     dim: int,
     rotary_base: float = 10000,
     max_position_embeddings: int = 2048,
+    round_to_int: bool = True,
 ) -> tuple[int, int]:
-    low = math.floor(_yarn_find_correction_dim(low_rot, dim, rotary_base, max_position_embeddings))
-    high = math.ceil(_yarn_find_correction_dim(high_rot, dim, rotary_base, max_position_embeddings))
+    low = _yarn_find_correction_dim(low_rot, dim, rotary_base, max_position_embeddings)
+    high = _yarn_find_correction_dim(high_rot, dim, rotary_base, max_position_embeddings)
+    if round_to_int:
+        low = math.floor(low)
+        high = math.ceil(high)
     return max(low, 0), min(high, dim - 1)  # Clamp values just in case
 
 

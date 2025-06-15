@@ -171,7 +171,11 @@ class MLP(MegatronModule):
 
                 def glu(x):
                     x = torch.chunk(x, 2, dim=-1)
-                    return self.config.activation_func(x[0]) * x[1]
+                    if self.config.swiglu_alpha is not None:
+                        return self.config.activation_func(self.config.swiglu_alpha * x[0]) * (x[1] + 1) / self.config.swiglu_alpha
+                    else:
+                        return self.config.activation_func(x[0]) * x[1]
+
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
@@ -189,9 +193,10 @@ class MLP(MegatronModule):
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None:
+            # if this MLP is an expert, and bias is required, we add the bias to output directly
+            # without doing bda later.
             output += output_bias[None, :]
             output_bias = None
-            # assert output_bias is None, "Bias is not supported with per_token_scale"
 
         return output, output_bias
 

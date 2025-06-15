@@ -113,13 +113,12 @@ class SoftmaxOne(nn.Module):
         self.denominator_offset = denominator_offset
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # subtract the max for stability
-        x_max = x.max(dim=self.dim, keepdim=True).values
-        exp_x = torch.exp(x - x_max)
-        # add denominator offset
-        return exp_x / (
-            torch.exp(self.denominator_offset - x_max) + exp_x.sum(dim=self.dim, keepdim=True)
-        )
+        if isinstance(self.denominator_offset, torch.Tensor) and self.denominator_offset.dim() == 1:
+            self.denominator_offset.data = self.denominator_offset[None, :, None, None]
+
+        qk = torch.cat([x, self.denominator_offset.expand(-1, -1, x.size(2), -1)], dim=-1)
+        ret = torch.softmax(qk, dim=-1)[..., :-1]
+        return ret
 
 
 class FusedScaleMaskSoftmax(nn.Module):
@@ -157,9 +156,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.config = config
         if config.attention_softmax_denominator_offset == 'learnable':
             self.softmax_denominator_weight = nn.Parameter(
-                torch.empty(config.num_attention_heads // config.tensor_model_parallel_size)[
-                    None, :, None, None
-                ]
+                torch.empty(config.num_attention_heads // config.tensor_model_parallel_size)
             )
         elif config.attention_softmax_denominator_offset is not None:
             self.softmax_denominator_weight = config.attention_softmax_denominator_offset
@@ -179,7 +176,7 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         if (
             self.is_kernel_available(mask, *input.size())
-            and self.softmax_denominator_weight is None
+            and not isinstance(self.softmax_fn, SoftmaxOne)
         ):
             return self.forward_fused_softmax(input, mask)
         else:

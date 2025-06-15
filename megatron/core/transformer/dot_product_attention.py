@@ -2,19 +2,20 @@
 
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import attention_mask_func
+from megatron.core.transformer.utils import attention_mask_func, make_sharded_tensors_for_checkpoint
 from megatron.core.utils import divide
 
 
@@ -209,3 +210,18 @@ class DotProductAttention(MegatronModule):
         context = context.view(*new_context_shape)
 
         return context
+
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ) -> ShardedStateDict:
+        if self.scale_mask_softmax.softmax_denominator_weight is not None:
+            state_dict = self.scale_mask_softmax.state_dict()
+        else:
+            state_dict = {}
+        return make_sharded_tensors_for_checkpoint(
+            state_dict, prefix+"scale_mask_softmax.", {'softmax_denominator_weight': 0}, sharded_offsets
+        )
+
