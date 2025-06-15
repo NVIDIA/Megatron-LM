@@ -1245,13 +1245,25 @@ def setup_model_and_optimizer(
             "Upcycling should only be set for the first run when converting the dense model. "
             "All subsequent runs should remove this flag. "
         )
+        # before changing moe related global args, save them in local variables
         num_experts = args.num_experts
-        args.num_experts = None
         expert_model_parallel_size = args.expert_model_parallel_size
+        moe_ffn_hidden_size = args.ffn_hidden_size
+
+        # set dense model related args in to global args before getting dense model
+        args.num_experts = None
         args.expert_model_parallel_size = 1
+        args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity 
+
+        # get dense model
         dense_model_for_upcycling = get_model(model_provider_func, model_type)
+
+        # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts
         args.expert_model_parallel_size = expert_model_parallel_size
+        args.ffn_hidden_size = moe_ffn_hidden_size
+
+        # execute upcycling
         _, args.num_floating_point_operations_so_far = upcycling_utils.load_and_upcycle_model(
             load_checkpoint,
             unwrapped_model,
