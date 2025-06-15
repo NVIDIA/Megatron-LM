@@ -2,7 +2,7 @@ encoder-decoder-parallelism package
 ===================================
 
 Mcore (as of 0.9) supports heterogeneous parallelism for encoder-decoder models.
-In particular, the user is now able to specify the amount of tensor and pipeline parallelism and have it be
+In particular, the user is now able to specify the amount of tensor/data/pipeline parallelism and have it be
 distinct from that in the decoder.
 
 Submodules
@@ -37,18 +37,32 @@ to send the activations of one encoder rank to several decoder ranks; correspond
 (downstream) decoder ranks for the encoder rank. We have not seen a quantization-related degradation from summing these gradient tensors
 together yet; it could happen in very large models.
 
+Encoder Data Parallelism
+------------------------
+
+Supported in: LLaVa.
+
+Since we expect encoders to be much smaller than decoders, we also give users the ability to set a different amount of data
+parallelism than the decoder. This is achieved with the argument `--encoder-data-model-parallel-size`. To use this option, you must
+be using encoder pipeline parallelism (ie, `--encoder-pipeline-model-parallel-size` > 0).
+
+For the case that the argument `--encoder-data-model-parallel-size` > 0, the decoder data parallelism size will be calculated
+according to the parallelism parameters and the world size. Currently, We only support cases where decoder DP size is an integer
+multiple of encoder DP size.
+
+For more information, please refer to the paper `DistTrain <https://arxiv.org/abs/2408.04275>`_.
 
 Number of GPUs Required
 -----------------------
 
 The total amount of GPUs required to train a model when these options enabled is:
 
-dp * etp * epp * cp + dp * tp * pp * cp
+edp * etp * epp * cp + dp * tp * pp * cp
 
 where:
-dp: amount of data parallelism (this is the same for the encoder & decoder)
-[e]tp: amount of tensor parallelism
-[e]pp: amount of pipeline parallelism
-cp: amount of context parallelism (as with dp, this is the same for the encoder & decoder)
+[e]dp: amount of data parallelism.
+[e]tp: amount of tensor parallelism.
+[e]pp: amount of pipeline parallelism.
+cp: amount of context parallelism (this is the same for the encoder & decoder).
 
-The default value of this argument is 0; in practice, we will use the amount of tensor parallelism in the decoder to construct the encoder.
+The default value of edp/etp/epp argument is 0; For the default case, we will use the amount of tensor/data parallelism in the decoder to construct the encoder.
