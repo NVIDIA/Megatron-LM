@@ -243,7 +243,6 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
     )
 
 
-@pytest.mark.experimental
 @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
 @pytest.mark.internal
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")

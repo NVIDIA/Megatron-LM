@@ -53,7 +53,6 @@ class MockModalitySubmodule(ModalitySubmodules):
         return None
 
 
-@pytest.mark.experimental
 @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
 class TestBaseSubmodule:
     """Test the base ModalitySubmodules class initialization."""
@@ -177,7 +176,6 @@ class TestBaseSubmodule:
         assert projection.out_features == self.vision_config.hidden_size
 
 
-@pytest.mark.experimental
 @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
 class TestVisionSubmodule:
     """Test the VisionModalitySubmodules class with forward passes."""

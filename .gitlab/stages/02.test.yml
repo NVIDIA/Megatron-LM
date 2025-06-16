@@ -33,6 +33,8 @@ wait_for_resources:
     - export NUM_CONCURRENT_JOBS
     - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
   rules:
+    - if: $CI_MERGE_REQUEST_LABELS =~ /fast-track/
+      when: never
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       when: on_success
     - when: never

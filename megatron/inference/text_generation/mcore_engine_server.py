@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import inspect
 from typing import Any, Dict, Iterable, List, Optional, Union
 
 from megatron.core import mpu
@@ -74,10 +75,21 @@ def run_mcore_engine(
     for p, l in zip(context_tokens_tensor, context_length_tensor):
         tokenized_prompts.append(p[:l].cpu().numpy().tolist())
 
+    tokenizer = engine.text_generation_controller.tokenizer
+
+    # detect if detokenize supports skip_special_tokens or **kwargs
+    sig_params = inspect.signature(tokenizer.detokenize).parameters.values()
+    accepts_skip = any(
+        p.name == "skip_special_tokens" or p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig_params
+    )
+
     # Detokenize prompts into strings to pass through the engine
     detokenized_prompts = [
-        engine.text_generation_controller.tokenizer.detokenize(prompt)
-        for prompt in tokenized_prompts
+        tokenizer.detokenize(p, skip_special_tokens=True)
+        if accepts_skip
+        else tokenizer.detokenize(p)
+        for p in tokenized_prompts
     ]
 
     requests = []

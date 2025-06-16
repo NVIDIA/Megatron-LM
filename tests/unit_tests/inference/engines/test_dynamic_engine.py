@@ -329,7 +329,6 @@ class TestDynamicInferenceEngine:
         set_rounder(64)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.experimental
     @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -360,7 +359,6 @@ class TestDynamicInferenceEngine:
         for request, expected_output in zip(env.requests, expected_outputs):
             assert request.output == expected_output
 
-    @pytest.mark.experimental
     @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -378,7 +376,6 @@ class TestDynamicInferenceEngine:
         assert env.engine.context.max_requests == 420
         assert env.engine.context.max_tokens == 420
 
-    @pytest.mark.experimental
     @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

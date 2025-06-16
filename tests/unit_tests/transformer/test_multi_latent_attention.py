@@ -124,7 +124,6 @@ class TestParallelMLAAttention:
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
 
-    @pytest.mark.experimental
     @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
     def test_gpu_forward_with_yarn_rope_fusion(self):
         if self.transformer_config.rope_type == "rope":
@@ -539,7 +538,6 @@ class TestParallelMLAAttentionPrecision:
                     raise e
 
 
-@pytest.mark.experimental
 @pytest.mark.skipif(not config.ENABLE_EXPERIMENTAL, reason="experiemntal not enabled")
 @pytest.mark.skipif(not is_torch_min_version("2.5.0"), reason="Requires PyTorch >= 2.5.0")
 class TestParallelMLAAttentionPrecisionWithRopeFusion:

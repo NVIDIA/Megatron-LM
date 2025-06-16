@@ -51,7 +51,7 @@ def add_static_inference_args(parser):
         help='Max number of prompts to process at once'
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
-    group.add_argument("--output-path", type=str, default='/tmp', help="Path to save generations as JSON")
+    group.add_argument("--output-path", type=str, default=None, help="Path to save generations as JSON. Default None does not save json.")
 
     return parser
 
