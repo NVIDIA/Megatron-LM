@@ -160,7 +160,7 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
 
     def forward(self, hidden_states: torch.Tensor):
-        if self.training and self.attn_tp_group.size() > 1 and not self.config.sequence_parallel:
+        if self.training and self.config.tensor_model_parallel_size > 1 and not self.config.sequence_parallel:
             raise ValueError(
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
