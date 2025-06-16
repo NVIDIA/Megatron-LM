@@ -2810,6 +2810,7 @@ def _add_moe_args(parser):
                        help='Pads the input for each expert to match the expert capacity length, effective only after the --moe-expert-capacity-factor is set.')
     group.add_argument('--moe-token-drop-policy', type=str, default='probs', choices=['probs', 'position'],
                        help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
+    # MoE communication overlap arguments
     group.add_argument('--overlap-moe-expert-parallel-comm', action='store_true',
                        help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')
     group.add_argument('--delay-wgrad-compute', action='store_true',
@@ -2817,9 +2818,6 @@ def _add_moe_args(parser):
 
     group.add_argument('--moe-apply-probs-on-input', action='store_true',
                        help='Apply probs before mlp activation for moe routing.')
-    # MoE communication overlap arguments
-    group.add_argument('--delay-wgrad-compute', action='store_true',
-                       help='Delay the wgrad compute for batch-level overlapping')
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
