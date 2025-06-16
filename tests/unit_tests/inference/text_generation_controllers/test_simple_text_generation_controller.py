@@ -149,11 +149,9 @@ class TestTextGenerationController:
             top_n_logprobs_dict=top_n_logprobs_dict,
         )
 
-        assert list(top_n_logprobs_dict[0][0].values()) == [
-            -2.3521223068237305,
-            -2.452122688293457,
-            -2.5521230697631836,
-        ]
+        assert list(top_n_logprobs_dict[0][0].values()) == pytest.approx(
+            [-2.3521223068237305, -2.452122688293457, -2.5521230697631836], abs=1e-3
+        )
 
         sampled_logits = self.text_generation_controller.sample_from_logits(
             last_token_logits, SamplingParams(top_k=2), self.vocab_size
@@ -305,6 +303,102 @@ class TestTextGenerationController:
             assert request.generated_length > 0, f"Generated length should be greater than zero"
             assert request.generated_text is not None, "Generated text should not be None"
             assert len(request.generated_log_probs) == request.generated_length
+
+    @pytest.mark.parametrize("num_tokens_to_generate", [0, 4])
+    @pytest.mark.parametrize("return_prompt_top_n_logprobs", [True, False])
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    def test_logprobs_and_topn_consistency(
+        self, num_tokens_to_generate, return_prompt_top_n_logprobs, dtype
+    ):
+        """
+        1.  Ensures that a batch request containing prompts of
+            *different* lengths still returns the correct number of log‑probs for
+            every request.
+        2.  Verifies that, for every token whose log prob is returned, the value
+            exactly matches the log prob reported for that same token in the
+            `top_n_logprobs` payload.
+        """
+        self.setup_model(dtype)
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda toks, **_: " ".join(
+            f"T{t}" for t in toks
+        )  # unique, deterministic
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == " "
+        ] + [len(s)]
+
+        prompts = ["a", "foo", "foobar", "lorem ipsum"]
+        active_reqs: Dict[str, InferenceRequest] = OrderedDict()
+
+        for rid, p in enumerate(prompts):
+            prompt_tokens = torch.randint(1, self.vocab_size - 2, (len(p) + 1,)).tolist()  # +bos
+            prompt_tokens[0] = self.mock_tokenizer.bos  # ensure BOS
+
+            self.mock_tokenizer.tokenize.return_value = torch.randn(
+                self.batch_size, self.vocab_size
+            ).cuda()
+
+            active_reqs[str(rid)] = InferenceRequest(
+                request_id=str(rid),
+                prompt=p,
+                prompt_tokens=prompt_tokens,
+                sampling_params=SamplingParams(
+                    num_tokens_to_generate=num_tokens_to_generate,
+                    top_k=1,
+                    top_p=0.0,
+                    temperature=0.0,
+                    return_log_probs=True,
+                    top_n_logprobs=5,
+                    return_prompt_top_n_logprobs=return_prompt_top_n_logprobs,
+                ),
+                arrival_time=time.time(),
+                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+            )
+
+        completed = self.text_generation_controller.generate_all_output_tokens_static_batch(
+            active_reqs
+        )
+
+        for request_id, request in completed.items():
+            prompt_log_probs = request.prompt_log_probs
+            generated_log_probs = request.generated_log_probs
+            prompt_top_n_logprobs = request.prompt_top_n_logprobs
+            generated_top_n_logprobs = request.generated_top_n_logprobs
+            generated_tokens = request.generated_tokens
+
+            assert len(prompt_log_probs) == len(request.prompt_tokens) - 1, (
+                f"{request_id}: Expected {len(request.prompt_tokens)-1} prompt log probs, "
+                f"got {len(prompt_log_probs)}"
+            )
+            assert len(generated_log_probs) == request.generated_length, (
+                f"{request_id}: Expected {request.generated_length} generated log probs, "
+                f"got {len(generated_log_probs)}"
+            )
+
+            assert (not return_prompt_top_n_logprobs and prompt_top_n_logprobs is None) or (
+                return_prompt_top_n_logprobs
+                and prompt_top_n_logprobs is not None
+                and len(prompt_top_n_logprobs) == len(prompt_log_probs)
+            )
+            assert len(generated_top_n_logprobs) == request.generated_length, (
+                f"{request_id}: Expected {request.generated_length} generated log probs, "
+                f"got {len(generated_top_n_logprobs)}"
+            )
+
+            # Verify that the generated log probs match what is returned
+            # in the top-N log probs dict
+            for k, log_probs in enumerate(generated_log_probs):
+                token_id = generated_tokens[k]
+                top_n = generated_top_n_logprobs[k]
+                token = self.mock_tokenizer.detokenize([token_id])
+
+                assert token in top_n, f"{request_id}: Generated token {token} missing in top‑N"
+                assert (
+                    pytest.approx(log_probs, rel=1e-6) == top_n[token]
+                ), f"{request_id}: mismatch @ generated token {k}: {log_probs} vs {top_n[token]}"
 
     def test_token_overflow(self):
         self.setup_model(torch.float32)

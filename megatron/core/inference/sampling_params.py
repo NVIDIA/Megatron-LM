@@ -22,6 +22,7 @@ class SamplingParams:
     return_segments: bool = False  # Whether to return individually detokenized tokens
     num_tokens_to_generate: int = 30
     top_n_logprobs: int = 0
+    return_prompt_top_n_logprobs: bool = False
 
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to sampling params

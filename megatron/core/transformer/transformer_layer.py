@@ -582,6 +582,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             self.config.mlp_chunks_for_prefill > 1
             and inference_context is not None
             and not inference_context.is_decode_only()
+            and not isinstance(self.mlp, IdentityOp)
         )
 
         if self.recompute_mlp:

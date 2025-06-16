@@ -41,7 +41,9 @@ class InferenceRequest:
     generated_segments: Optional[List[str]] = None
     generated_sequence_lengths: Optional[List[int]] = None
     generated_tokens: Optional[torch.Tensor] = None
+    prompt_log_probs: Optional[torch.Tensor] = None
     generated_log_probs: Optional[torch.Tensor] = None
+    prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
 
