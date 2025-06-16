@@ -16,6 +16,7 @@ try:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_unpermute,
+        te_general_gemm,
     )
 
     HAVE_TE = True
@@ -59,7 +60,7 @@ def switch_load_balancing_loss_func(
     if sequence_partition_group is not None:
         # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
         # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
-        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+        num_sub_sequence = sequence_partition_group.size()
         torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
 
     num_tokens = probs.shape[0] * num_sub_sequence
@@ -115,7 +116,7 @@ def sequence_load_balancing_loss_func(
     # or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full
     # sequence.
     if sequence_partition_group is not None:
-        num_sub_sequence = torch.distributed.get_world_size(sequence_partition_group)
+        num_sub_sequence = sequence_partition_group.size()
         seq_length *= num_sub_sequence
         probs_for_aux_loss = gather_from_sequence_parallel_region(
             probs_for_aux_loss, group=sequence_partition_group
@@ -854,6 +855,69 @@ def apply_random_logits(logits):
     Apply the RandomSTE function to the logits.
     """
     return RandomSTE.apply(logits)
+
+
+class RouterGatingLinearFunction(torch.autograd.Function):
+    """
+    Autograd function for router gating linear.
+    """
+
+    @staticmethod
+    def forward(ctx, inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+        """
+        Forward pass of the RouterGatingLinearFunction function.
+        """
+        ctx.save_for_backward(inp, weight)
+        ctx.router_dtype = router_dtype
+        ctx.input_dtype = inp.dtype
+        ctx.weight_dtype = weight.dtype
+        inp_shape = inp.shape
+        inp = inp.view(-1, inp_shape[-1])
+
+        if te_general_gemm is not None and router_dtype != torch.float64:
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
+            output = output[0]
+        else:
+            output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+
+        output = output.view(*inp_shape[:-1], -1)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward pass of the RouterGatingLinearFunction function.
+        """
+        inp, weight = ctx.saved_tensors
+        inp_shape = inp.shape
+        grad_shape = grad_output.shape
+        inp = inp.view(-1, inp_shape[-1])
+        grad_output = grad_output.view(-1, grad_shape[-1])
+
+        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+            grad_input = te_general_gemm(
+                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+            )
+            grad_weight = te_general_gemm(
+                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+            )
+            grad_input = grad_input[0].to(ctx.input_dtype)
+            grad_weight = grad_weight[0].to(ctx.weight_dtype)
+        else:
+            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+
+        grad_input = grad_input.view(*inp_shape)
+        return grad_input, grad_weight, None
+
+
+def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+    """
+    Customized linear layer for router gating.
+    This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
+    It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
+    """
+    return RouterGatingLinearFunction.apply(inp, weight, router_dtype)
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.

@@ -471,8 +471,8 @@ class MLASelfAttention(MultiLatentAttention):
             if self.config.q_lora_rank is not None:
                 # q_compressed: [num_tokens, q_lora_rank]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
-                q, _ = self.linear_q_up_proj(q_compressed)
                 q_compressed = self.q_layernorm(q_compressed)
+                q, _ = self.linear_q_up_proj(q_compressed)
             else:
                 # q_compressed: [num_tokens, hidden_size]
                 # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]

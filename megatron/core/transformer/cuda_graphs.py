@@ -164,11 +164,9 @@ class _CudagraphGlobalRecord:
                     runner.create_fwd_graph(args, kwargs, clone_inputs=False)
 
                     # The output of TransformerLayer is: (hidden_states, None)
-                    if isinstance(runner.fwd_graph_outputs, tuple):
-                        prev_fwd_hidden_state_output, _ = runner.fwd_graph_outputs
-                    # MambaLayer returns only hidden_states
-                    elif isinstance(runner.fwd_graph_outputs, torch.Tensor):
-                        prev_fwd_hidden_state_output = runner.fwd_graph_outputs
+                    # The output of MambaLayer is: (hidden_states,)
+                    # make sure to get the hidden states tensor from the tuple
+                    prev_fwd_hidden_state_output = runner.fwd_graph_outputs[0]
 
                 else:
                     # In vision models, encoder and decoder transformers have different
@@ -493,6 +491,8 @@ class _CudaGraphRunner(torch.nn.Module):
                     *self.fwd_graph_input_args, **self.fwd_graph_input_kwargs
                 )
             if self.training and torch.is_grad_enabled():
+                if isinstance(outputs, torch.Tensor):
+                    outputs = (outputs,)
                 outputs = self.get_tensors(outputs)
                 grad_inputs = torch.autograd.grad(
                     outputs=tuple(o for o in outputs if o.requires_grad),
@@ -512,6 +512,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 )
 
         # save cudagraph output buffer
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
         self.fwd_graph_outputs = outputs
         self.fwd_graph_output_surface = self.get_tensors(outputs)
 

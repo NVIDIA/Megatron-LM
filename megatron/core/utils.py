@@ -358,6 +358,34 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
     return tp_group
 
 
+def get_pg_size(group=None):
+    """Get world size for a distributed group.
+
+    Args:
+        group: Process group to get world size for. If None, uses default group.
+
+    Returns:
+        int: World size (1 if distributed not initialized or group is None, else group.size())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 1
+    return group.size()
+
+
+def get_pg_rank(group=None):
+    """Get rank for a distributed group.
+
+    Args:
+        group: Process group to get rank for. If None, uses default group.
+
+    Returns:
+        int: Rank (0 if distributed not initialized or group is None, else group.rank())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    return group.rank()
+
+
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
     """Get an attribute from a wrapped model.
     If return_model_obj is true, return the object that has the 'attr' attribute;
@@ -552,7 +580,7 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """If torch distributed is initialized, log only on rank
+    """If torch distributed is initialized, write log on only one rank
 
     Args:
         logger (logging.Logger): The logger to write the logs
@@ -643,8 +671,7 @@ def check_param_hashes_across_dp_replicas(
             continue
         local_param_hashes = torch.stack(local_param_hashes).cuda()
         all_param_hashes = [
-            torch.zeros_like(local_param_hashes)
-            for _ in range(torch.distributed.get_world_size(all_gather_group))
+            torch.zeros_like(local_param_hashes) for _ in range(all_gather_group.size())
         ]
         torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
 

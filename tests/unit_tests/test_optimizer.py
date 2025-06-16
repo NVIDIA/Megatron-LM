@@ -9,6 +9,7 @@ from torch.optim import SGD, Adam
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
 
@@ -118,6 +119,62 @@ def test_precision_aware_fused_adam():
             bytes_2 = p_2.data.view(torch.uint8)
             # Make sure bit-wise matched
             assert torch.all(bytes_1 == bytes_2)
+
+
+@pytest.mark.skipif(
+    not is_te_min_version("1.13.0"), reason="TE 1.13.0 is required for precision aware optimizer"
+)
+@pytest.mark.parametrize(
+    "exp_avg_dtype", [torch.float32, torch.float16, torch.bfloat16, torch.uint8]
+)
+@pytest.mark.parametrize(
+    "exp_avg_sq_dtype", [torch.float32, torch.float16, torch.bfloat16, torch.uint8]
+)
+def test_precision_aware_optimizer(exp_avg_dtype: str, exp_avg_sq_dtype: str):
+    # Skip because bf16 optimizer states are not supported before TE 2.3.0
+    if (
+        exp_avg_dtype == torch.bfloat16 or exp_avg_sq_dtype == torch.bfloat16
+    ) and not is_te_min_version("2.3.0"):
+        pytest.skip("bfloat16 for exp_avg_dtype/exp_avg_sq_dtype requires TE >= 2.3.0")
+
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+
+    # Setup: distributed, model, mock_args.
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    model.requires_grad_(True)
+    model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    for param in model.parameters():
+        assert param.requires_grad
+
+    optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        bf16=True,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        exp_avg_dtype=exp_avg_dtype,
+        exp_avg_sq_dtype=exp_avg_sq_dtype,
+    )
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Run a forward and backward pass
+    input = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
+    output = model(input)
+    loss = output.sum()
+    loss.backward()
+
+    # Step the optimizer
+    optim.step()
+
+    # Save and reload state dict
+    state_dict = optim.state_dict()
+    optim.load_state_dict(state_dict)
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])

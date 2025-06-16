@@ -11,6 +11,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, c
 import numpy as np
 import torch
 
+from ..utils import get_pg_rank, get_pg_size
 from .core import CheckpointingException
 from .dict_utils import nested_values
 from .mapping import ShardedStateDict, ShardedTensor, is_main_replica
@@ -199,7 +200,9 @@ def determine_main_replica_uniform_distribution(
         parallelization. Returns None if the process_group is trivial (1 rank)
 
     """
-    group_size = torch.distributed.get_world_size(group=parallelization_group)
+    if parallelization_group is None:
+        parallelization_group = torch.distributed.group.WORLD
+    group_size = get_pg_size(group=parallelization_group)
     if group_size <= 1:
         return
     local_shards = list(
@@ -209,7 +212,7 @@ def determine_main_replica_uniform_distribution(
     )
     local_shards_no_data = [ten.without_data() for ten in local_shards]
 
-    all_shards = [None] * torch.distributed.get_world_size(group=parallelization_group)
+    all_shards = [None] * get_pg_size(group=parallelization_group)
     torch.distributed.all_gather_object(
         all_shards, local_shards_no_data, group=parallelization_group
     )
@@ -285,8 +288,10 @@ def exchange_loaded_tensors_gather_rounds(
             needed by this rank to load a given state dict. Includes
             previously loaded tensors (from `loaded_tensors` input)
     """
+    if parallelization_group is None:
+        parallelization_group = torch.distributed.group.WORLD
     main_rank_for_shard, _, shard_to_metadata, all_ranks_for_shard = shard_distribution
-    local_rank = torch.distributed.get_rank(group=parallelization_group)
+    local_rank = get_pg_rank(group=parallelization_group)
 
     all_loaded_tensors = dict(loaded_tensors)
 
@@ -296,7 +301,7 @@ def exchange_loaded_tensors_gather_rounds(
         with debug_time(f"dtype_{dtype}"):
             # shards_by_rank maps rank to tensors loaded by this rank
             shards_by_rank: List[List[torch.Tensor]] = [
-                [] for _ in range(torch.distributed.get_world_size(group=parallelization_group))
+                [] for _ in range(get_pg_size(group=parallelization_group))
             ]
             for shard_id, rank in main_rank_for_shard.items():
                 if len(all_ranks_for_shard[shard_id]) == 1:
@@ -428,7 +433,7 @@ def exchange_loaded_objects_gather_object(
         Dict[_ShardId, Any]: dictionary mapping shard ids to objects needed by this rank to
          load a given state dict.
     """
-    all_loaded_objects_list = [None] * torch.distributed.get_world_size(group=None)
+    all_loaded_objects_list = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(all_loaded_objects_list, loaded_objects, group=None)
     all_loaded_objects_list = cast(List[Dict[_ShardId, Any]], all_loaded_objects_list)
     all_loaded_objects = reduce(lambda x, y: {**x, **y}, all_loaded_objects_list)

@@ -38,6 +38,7 @@ from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ class FullyParallelSaveStrategyWrapper(AsyncSaveShardedStrategy):
     ):
         super().__init__(strategy.backend, strategy.version)
         self.base_strategy = strategy
+        if parallelization_group is None:
+            parallelization_group = torch.distributed.group.WORLD
         self.parallelization_group = parallelization_group
         self.do_cache_distribution = do_cache_distribution
 
@@ -214,7 +217,7 @@ class FullyParallelLoadStrategyWrapper(LoadShardedStrategy):
 
         loaded_state_dict = {}
 
-        if torch.distributed.get_world_size(self.parallelization_group) <= 1:
+        if get_pg_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
 
         # Step 1 and 2: exchange load metadata and distribute the load
@@ -432,7 +435,9 @@ def distribute_main_replicas_with_precomputed_distribution(
     rank1: A: 1, B: 0, C: 1
     rank2: A: 1, B: 1, C: 0
     """
-    if torch.distributed.get_world_size(group=parallelization_group) <= 1:
+    if parallelization_group is None:
+        parallelization_group = torch.distributed.group.WORLD
+    if get_pg_size(group=parallelization_group) <= 1:
         return
     if precomputed_distribution is None:
         raise ValueError(
@@ -445,7 +450,7 @@ def distribute_main_replicas_with_precomputed_distribution(
         if isinstance(sh_base, ShardedTensor)
     )
 
-    rank_within_dp_group = torch.distributed.get_rank(parallelization_group)
+    rank_within_dp_group = get_pg_rank(group=parallelization_group)
     for sh_ten in local_shards:
         shard_id = _sharded_tensor_shard_id(sh_ten)
         if (

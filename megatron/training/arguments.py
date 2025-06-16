@@ -22,6 +22,7 @@ from megatron.core.models.retro.utils import (
 )
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
@@ -70,6 +71,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
+    parser = _add_sft_args(parser)
 
     return parser
 
@@ -372,7 +374,7 @@ def validate_args(args, defaults={}):
     if args.rank == 0:
         print('using world size: {}, data-parallel size: {}, '
               'context-parallel size: {}, '
-              'hierarchical context-parallel sizes: {}'
+              'hierarchical context-parallel sizes: {}, '
               'tensor-model-parallel size: {}, '
               'encoder-tensor-model-parallel size: {}, '
               'pipeline-model-parallel size: {}, '
@@ -471,20 +473,32 @@ def validate_args(args, defaults={}):
     assert args.global_batch_size > 0
 
     # Uneven virtual pipeline parallelism
-    assert args.num_layers_per_virtual_pipeline_stage is None or args.num_virtual_stages_per_pipeline_rank is None, \
-        '--num-layers-per-virtual-pipeline-stage and --num-virtual-stages-per-pipeline-rank cannot be set at the same time'
+    assert (
+        int(args.num_layers_per_virtual_pipeline_stage is not None)
+        + int(args.num_virtual_stages_per_pipeline_rank is not None)
+        + int(args.pipeline_model_parallel_layout is not None)
+    ) <= 1, (
+        'No more than one of the following arguments can be set at the same time: '
+        '--num-layers-per-virtual-pipeline-stage, --num-virtual-stages-per-pipeline-rank,'
+        '--pipeline-model-parallel-layout. '
+        f'{args.num_layers_per_virtual_pipeline_stage=}, '
+        f'{args.num_virtual_stages_per_pipeline_rank=}, '
+        f'{args.pipeline_model_parallel_layout=}.'
+    )
 
-    if args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None:
-        if args.overlap_p2p_comm:
-            assert args.pipeline_model_parallel_size > 1, \
-                'When interleaved schedule is used, pipeline-model-parallel size '\
-                'should be greater than 1'
-        else:
-            assert args.pipeline_model_parallel_size > 2, \
-                'When interleaved schedule is used and p2p communication overlap is disabled, '\
-                'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
-                'p2p sends and recvs between same 2 ranks per communication batch'
-
+    if args.pipeline_model_parallel_layout is not None:
+        # Parse the input flattened layout to a list and get the vpp size.
+        # We will validate the layout more carefully in the TransformerConfig constructor.
+        num_stages = PipelineParallelLayerLayout.get_num_stages_from_str(args.pipeline_model_parallel_layout)
+        assert num_stages % args.pipeline_model_parallel_size == 0, (
+            f"The length of pipeline_model_parallel_layout must be divisible"
+            f" by pipeline_model_parallel_size ({num_stages=},"
+            f" {args.pipeline_model_parallel_size=})"
+        )
+        args.virtual_pipeline_model_parallel_size = num_stages // args.pipeline_model_parallel_size
+        if args.virtual_pipeline_model_parallel_size == 1:
+            args.virtual_pipeline_model_parallel_size = None
+    elif args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None:
         if args.num_virtual_stages_per_pipeline_rank is None:
             assert args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None, \
                 'please use --num-virtual-stages-per-pipeline-rank to specify virtual pipeline parallel degree when enable uneven pipeline parallelism'
@@ -511,14 +525,6 @@ def validate_args(args, defaults={}):
             args.virtual_pipeline_model_parallel_size = args.num_virtual_stages_per_pipeline_rank
     else:
         args.virtual_pipeline_model_parallel_size = None
-        # Overlap P2P communication is disabled if not using the interleaved schedule.
-        args.overlap_p2p_comm = False
-        args.align_param_gather = False
-        # Only print warning if PP size > 1.
-        if args.rank == 0 and args.pipeline_model_parallel_size > 1:
-            print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
-                  'since non-interleaved schedule does not support overlapping p2p communication '
-                  'and aligned param AG')
 
         if args.decoder_first_pipeline_num_layers is None and args.decoder_last_pipeline_num_layers is None:
             # Divisibility check not applicable for T5 models which specify encoder_num_layers
@@ -534,6 +540,27 @@ def validate_args(args, defaults={}):
 
                 assert num_layers % args.transformer_pipeline_model_parallel_size == 0, \
                     'Number of layers should be divisible by the pipeline-model-parallel size'
+    
+    if args.virtual_pipeline_model_parallel_size is not None:
+        if args.overlap_p2p_comm:
+            assert args.pipeline_model_parallel_size > 1, \
+                'When interleaved schedule is used, pipeline-model-parallel size '\
+                'should be greater than 1'
+        else:
+            assert args.pipeline_model_parallel_size > 2, \
+                'When interleaved schedule is used and p2p communication overlap is disabled, '\
+                'pipeline-model-parallel size should be greater than 2 to avoid having multiple '\
+                'p2p sends and recvs between same 2 ranks per communication batch'
+    else:
+        # Overlap P2P communication is disabled if not using the interleaved schedule.
+        args.overlap_p2p_comm = False
+        args.align_param_gather = False
+        # Only print warning if PP size > 1.
+        if args.rank == 0 and args.pipeline_model_parallel_size > 1:
+            print('WARNING: Setting args.overlap_p2p_comm and args.align_param_gather to False '
+                'since non-interleaved schedule does not support overlapping p2p communication '
+                'and aligned param AG')
+
     if args.rank == 0:
         print(f"Number of virtual stages per pipeline stage: {args.virtual_pipeline_model_parallel_size}")
 
@@ -1052,12 +1079,6 @@ def validate_args(args, defaults={}):
             'delay_wgrad_compute is only supported with transformer_engine implementation'
         assert not args.overlap_grad_reduce, \
             'delay_wgrad_compute is not supported with overlap_grad_reduce'
-    
-    if args.fp8_recipe != "delayed":
-        assert not (args.fp8_param_gather and args.use_precision_aware_optimizer), (
-            "Currently only delayed scaling is supported to use precision-aware optimizer and fp8 "
-            "params at the same time."
-        )
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -1597,6 +1618,8 @@ def _add_logging_args(parser):
                        '      executed numerous times during each iteration. '
                        'Note that setting the level to 1 or 2 might '
                        'cause increase in iteration time.')
+    group.add_argument('--log-energy', action='store_true',
+                       help='If set, log energy consumption (in Joules)')
     group.add_argument('--no-barrier-with-level-1-timing', action='store_false',
                        help='If not set, use barrier with level 1 time '
                        'measurements. Note that this is up to the user '
@@ -2216,6 +2239,8 @@ def _add_mixed_precision_args(parser):
     group.add_argument('--disable-bf16-reduced-precision-matmul', action='store_true',
                        help='If True, sets torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False to '
                        'prevent matmul from using reduced precision accumulation when using BF16.')
+    group.add_argument('--reuse-grad-buf-for-mxfp8-param-ag', action='store_true',
+                       help='If True, reuse the grad buffer for MXFP8 parameter all-gather.')
 
     return parser
 
@@ -2244,6 +2269,14 @@ def _add_distributed_args(parser):
                        type=int, default=None,
                        help=('The number of transformer layers on the last pipeline stage of the decoder. '
                        'Default None is even split of transformer layers across all pipeline stages'))
+    group.add_argument('--pipeline-model-parallel-layout',
+                       type=str, default=None,
+                       help=('A string that describes a custom pipeline model parallel layout. '
+                       'e.g., "E|(t|)*3,m|m||L". E, L, t, m denotes embedding, loss, transformer '
+                       'decoder layer, and mtp layer, respectively. Stages are split by "|". '
+                       'Replicated stages or layers can be described with multiplication. '
+                       'Commas can be used cosmetically. '
+                       'Default None is not using this argument to set the layout.'))
     group.add_argument('--model-parallel-size', type=int, default=None,
                        help='Old model parallel argument, do not use. Use '
                        '--tensor-model-parallel-size instead.')
@@ -2429,7 +2462,8 @@ def _add_tokenizer_args(parser):
                                 'TikTokenizer',
                                 'MultimodalTokenizer',
                                 'NullTokenizer',
-                                'NullMultimodalTokenizer'],
+                                'NullMultimodalTokenizer',
+                                'SFTTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
                        help='Sentencepiece tokenizer model.')
@@ -2783,6 +2817,12 @@ def _add_moe_args(parser):
 
     group.add_argument('--moe-apply-probs-on-input', action='store_true',
                        help='Apply probs before mlp activation for moe routing.')
+    # MoE communication overlap arguments
+    group.add_argument('--delay-wgrad-compute', action='store_true',
+                       help='Delay the wgrad compute for batch-level overlapping')
+    group.add_argument('--moe-upcycling-granularity', type=int, default=1,
+                       help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
+                       'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
     return parser
 
 def _add_mla_args(parser):
@@ -2903,15 +2943,21 @@ def _add_experimental_args(parser):
     group.add_argument('--use-precision-aware-optimizer', action='store_true',
                        help='Use the precision-aware optimizer in TransformerEngine, which allows '
                        'setting the main params and optimizer states to lower precision, such as '
-                       'fp16 and fp8.')
+                       'fp16, bf16 and fp8.')
     group.add_argument('--main-grads-dtype', default='fp32', choices=['fp32', 'bf16'],
                        help='Dtype of main grads when enabling precision-aware-optimizer')
     group.add_argument('--main-params-dtype', default='fp32', choices=['fp32', 'fp16'],
                        help='Dtype of main params when enabling precision-aware-optimizer')
-    group.add_argument('--exp-avg-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
-                       help='Dtype of exp_avg when enabling precision-aware-optimizer')
-    group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
-                       help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+    group.add_argument('--exp-avg-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
+                       help='Dtype of exp_avg (1st moment in adam optimizer) when enabling '
+                            'precision-aware-optimizer. This dtype is used for storing the '
+                            'optimizer state in memory during training but does not affect '
+                            'the precision in the kernel computation.')
+    group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'bf16', 'fp8'],
+                       help='Dtype of exp_avg_sq (2nd moment in adam optimizer) when enabling '
+                            'precision-aware-optimizer. This dtype is used for storing the '
+                            'optimizer state in memory during training but does not affect '
+                            'the precision in the kernel computation.')
     return parser
 
 
@@ -2919,4 +2965,11 @@ def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
     group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
                        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
+    return parser
+
+def _add_sft_args(parser):
+    group = parser.add_argument_group(title='sft')
+    group.add_argument('--sft', action="store_true", help='Megatron SFT training')
+    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned", 
+                       help='SFT prompt format.')
     return parser

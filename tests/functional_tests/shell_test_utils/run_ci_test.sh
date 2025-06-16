@@ -227,6 +227,7 @@ for i in $(seq 1 $N_REPEAT); do
         pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
             --golden-values-path $GOLDEN_VALUES_PATH \
             --tensorboard-path $TENSORBOARD_PATH \
+            --train-iters $TRAIN_ITERS \
             --model-config-path ${TRAINING_PARAMS_PATH} \
             $ALLOW_NONDETERMINISTIC_ALGO_ARG
 

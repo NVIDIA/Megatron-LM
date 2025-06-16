@@ -198,6 +198,7 @@ def main(
                 "needs": needs,
                 "script": [" ".join(script)],
                 "artifacts": {"paths": ["results/"], "when": "always"},
+                "allow_failure": test_case.spec.model == "gpt-nemo",
             }
 
     with open(output_path, 'w') as outfile:

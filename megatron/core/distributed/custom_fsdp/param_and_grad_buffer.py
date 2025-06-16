@@ -656,8 +656,8 @@ class DataParallelBuffer:
         self.dtype = dtype if dtype else next(iter(_param_dtype))
         self.device = device
         self.data_parallel_group = data_parallel_group
-        self.dp_rank = torch.distributed.get_rank(group=self.data_parallel_group)
-        self.dp_world_size = torch.distributed.get_world_size(group=self.data_parallel_group)
+        self.dp_rank = self.data_parallel_group.rank()
+        self.dp_world_size = self.data_parallel_group.size()
         self.temporary_bucket_allocator = (
             temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
         )
@@ -1299,7 +1299,7 @@ class ParamAndGradBuffer:
                 if not group.is_expert_param
                 else self.expert_data_parallel_group
             )
-            group.data_parallel_world_size = torch.distributed.get_world_size(group=dp_group)
+            group.data_parallel_world_size = dp_group.size()
             gradient_scaling_factor = (
                 self.gradient_scaling_factor
                 if not group.is_expert_param

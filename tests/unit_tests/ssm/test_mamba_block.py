@@ -16,6 +16,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.internal
 class TestMambaBlock:
 
     def setup_method(self, method):

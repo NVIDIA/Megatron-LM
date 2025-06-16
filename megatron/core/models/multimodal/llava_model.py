@@ -157,7 +157,7 @@ class LLaVAModel(MegatronModule):
             if self.context_parallel_lm > 1:
                 self.cp_group = get_context_parallel_group() if cp_group is None else cp_group
                 assert (
-                    torch.distributed.get_world_size(self.cp_group) == self.context_parallel_lm
+                    self.cp_group.size() == self.context_parallel_lm
                 ), "CP Group size should match the Language Model CP size"
                 assert is_te_min_version(
                     "1.10.0"
@@ -211,10 +211,7 @@ class LLaVAModel(MegatronModule):
                     rope_scaling=language_rope_scaling,
                     rope_scaling_factor=language_rope_scaling_factor,
                     scatter_embedding_sequence_parallel=False,
-                )
-
-                self.share_embeddings_and_output_weights = (
-                    self.language_model.share_embeddings_and_output_weights
+                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
                 )
 
             self._language_max_sequence_length = language_max_sequence_length
@@ -253,7 +250,7 @@ class LLaVAModel(MegatronModule):
                     model_subtype=vision_transformer_config.vision_model_type,
                     add_class_token=add_class_token,
                 )
-            elif vision_transformer_config.vision_model_type in ("radio", "radio-g"):
+            elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
                 # TODO: should refactor into model code itself?
                 class_token_len = 0
                 max_img_h = 0
@@ -278,6 +275,13 @@ class LLaVAModel(MegatronModule):
 
                     ln_post_impl = TENorm
                     use_mask_token = True
+                elif vision_transformer_config.vision_model_type == "cradio-g":
+                    class_token_len = 8
+                    max_img_h = 2048
+                    max_img_w = 2048
+                    embedder_bias = False
+                    ln_post_impl = None
+                    use_mask_token = False
                 self.vision_model = RADIOViTModel(
                     vision_transformer_config,
                     vision_transformer_layer_spec,

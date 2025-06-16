@@ -16,6 +16,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import MegatronModule
@@ -43,7 +44,11 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
 
     if config.pipeline_model_parallel_size > 1:
 
-        if (
+        if config.pipeline_model_parallel_layout:
+            offset = config.pipeline_model_parallel_layout.get_layer_offset(
+                layer_type=LayerType.decoder, vp_stage=vp_stage
+            )
+        elif (
             config.num_layers_in_first_pipeline_stage is not None
             or config.num_layers_in_last_pipeline_stage is not None
         ):

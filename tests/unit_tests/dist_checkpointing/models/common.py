@@ -61,8 +61,12 @@ def common_test_parallel_reconfiguration_e2e(
     store_order="tp-dp-pp",
     src_tp_pp_kwargs=None,
     dst_tp_pp_kwargs=None,
+    src_model_init_kwargs=None,
+    dst_model_init_kwargs=None,
 ):
     """Test model saving and loading with different TP/PP"""
+    src_model_init_kwargs = src_model_init_kwargs or {}
+    dst_model_init_kwargs = dst_model_init_kwargs or {}
     Utils.initialize_model_parallel(*src_tp_pp, **(src_tp_pp_kwargs or {}), order=load_order)
     with TempNamedDir(
         tmp_path_dist_ckpt / 'test_gpt_model_reconfiguration_model_A'
@@ -75,6 +79,7 @@ def common_test_parallel_reconfiguration_e2e(
             src_layer_spec_fn,
             tensor_model_parallel_size=src_tp_pp[0],
             pipeline_model_parallel_size=src_tp_pp[1],
+            **src_model_init_kwargs,
         )
         save_strategy = get_default_save_sharded_strategy()
         if use_fpsl:
@@ -95,6 +100,7 @@ def common_test_parallel_reconfiguration_e2e(
             dst_layer_spec_fn,
             tensor_model_parallel_size=dest_tp_pp[0],
             pipeline_model_parallel_size=dest_tp_pp[1],
+            **dst_model_init_kwargs,
         )
         if use_fpsl:
             load_strategy = get_default_load_sharded_strategy(ckpt_dir_A)

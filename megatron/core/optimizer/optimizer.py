@@ -511,7 +511,11 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            self._copy_main_params_to_model_params()
+            (
+                self._copy_main_params_to_model_params()
+                if not self.config.reuse_grad_buf_for_mxfp8_param_ag
+                else self._copy_main_params_to_param_buffer()
+            )
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
@@ -1225,7 +1229,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
                 # Save checkpoint economically, only when DP rank = 0, state dict
                 # needs to be saved.
-                if torch.distributed.get_rank(optimizer.data_parallel_group) == 0:
+                if optimizer.data_parallel_group.rank() == 0:
                     states.append(state_dict)
                     save_states = True
                 else:
@@ -1253,7 +1257,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 continue
 
             # Lazy loading checkpoint, state dict is needed only when DP rank = 0.
-            if torch.distributed.get_rank(optimizer.data_parallel_group) == 0 and states is None:
+            if optimizer.data_parallel_group.rank() == 0 and states is None:
                 states = torch.load(filename)
 
             state_dict = states[idx] if states else None

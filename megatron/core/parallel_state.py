@@ -1514,7 +1514,7 @@ def get_tensor_model_parallel_world_size():
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-    return torch.distributed.get_world_size(group=get_tensor_model_parallel_group())
+    return get_tensor_model_parallel_group().size()
 
 
 def get_pipeline_model_parallel_world_size():
@@ -1530,9 +1530,9 @@ def get_pipeline_model_parallel_world_size():
         for group in _PIPELINE_GLOBAL_RANKS:
             sizes.append(len(group))
         assert all(x == sizes[0] for x in sizes)
-        return torch.distributed.get_world_size(group=pp_group[0])
+        return pp_group[0].size()
     else:
-        return torch.distributed.get_world_size(group=pp_group)
+        return pp_group.size()
 
 
 def set_tensor_model_parallel_rank(rank):
@@ -1558,7 +1558,7 @@ def get_tensor_model_parallel_rank():
     global _MPU_TENSOR_MODEL_PARALLEL_RANK
     if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
+    return get_tensor_model_parallel_group().rank()
 
 
 def get_pipeline_model_parallel_rank():
@@ -1576,9 +1576,9 @@ def get_pipeline_model_parallel_rank():
                 if r == rank:
                     indices.append(i)
         assert all(x == indices[0] for x in indices)
-        return torch.distributed.get_rank(group=pp_group[0])
+        return pp_group[0].rank()
     else:
-        return torch.distributed.get_rank(group=pp_group)
+        return pp_group.rank()
 
 
 def get_pipeline_model_parallel_split_rank():
@@ -1830,12 +1830,9 @@ def get_data_parallel_world_size(with_context_parallel=False, partial_data_paral
     if _MPU_DATA_PARALLEL_WORLD_SIZE is not None:
         return _MPU_DATA_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(
-            group=get_data_parallel_group(
-                with_context_parallel=with_context_parallel,
-                partial_data_parallel=partial_data_parallel,
-            )
-        )
+        return get_data_parallel_group(
+            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+        ).size()
     else:
         return 0
 
@@ -1852,12 +1849,9 @@ def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=Fa
     if _MPU_DATA_PARALLEL_RANK is not None:
         return _MPU_DATA_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(
-            group=get_data_parallel_group(
-                with_context_parallel=with_context_parallel,
-                partial_data_parallel=partial_data_parallel,
-            )
-        )
+        return get_data_parallel_group(
+            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+        ).rank()
     else:
         return 0
 
@@ -1865,7 +1859,7 @@ def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=Fa
 def get_context_parallel_world_size():
     """Return world size for the context parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(group=get_context_parallel_group())
+        return get_context_parallel_group().size()
     else:
         return 0
 
@@ -1873,7 +1867,7 @@ def get_context_parallel_world_size():
 def get_context_parallel_rank():
     """Return caller's rank in the context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_context_parallel_group())
+        return get_context_parallel_group().rank()
     else:
         return 0
 
@@ -1881,7 +1875,7 @@ def get_context_parallel_rank():
 def get_tensor_and_context_parallel_world_size():
     """Return world size for the tensor and context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(group=get_tensor_and_context_parallel_group())
+        return get_tensor_and_context_parallel_group().size()
     else:
         return 0
 
@@ -1889,7 +1883,7 @@ def get_tensor_and_context_parallel_world_size():
 def get_tensor_and_context_parallel_rank():
     """Return caller's rank in the joint tensor-model-parallel and context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_tensor_and_context_parallel_group())
+        return get_tensor_and_context_parallel_group().rank()
     else:
         return 0
 
@@ -1909,7 +1903,7 @@ def get_expert_model_parallel_world_size():
     if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(group=get_expert_model_parallel_group())
+        return get_expert_model_parallel_group().size()
     else:
         return 0
 
@@ -1925,7 +1919,7 @@ def get_expert_model_parallel_rank():
     if _MPU_EXPERT_MODEL_PARALLEL_RANK is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_expert_model_parallel_group())
+        return get_expert_model_parallel_group().rank()
     else:
         return 0
 
@@ -1954,7 +1948,7 @@ def get_expert_tensor_parallel_world_size():
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     else:
-        return torch.distributed.get_world_size(group=get_expert_tensor_parallel_group())
+        return get_expert_tensor_parallel_group().size()
 
 
 def set_expert_tensor_parallel_world_size(world_size):
@@ -1972,7 +1966,7 @@ def get_expert_tensor_parallel_rank():
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
     else:
-        return torch.distributed.get_rank(group=get_expert_tensor_parallel_group())
+        return get_expert_tensor_parallel_group().rank()
 
 
 def set_expert_tensor_parallel_rank(rank):
@@ -1993,9 +1987,7 @@ def get_expert_tensor_and_model_parallel_group(check_initialized=True):
 def get_expert_tensor_and_model_parallel_world_size():
     """Return world size for the expert model parallel group times expert tensor parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        world_size = torch.distributed.get_world_size(
-            group=get_expert_tensor_and_model_parallel_group()
-        )
+        world_size = get_expert_tensor_and_model_parallel_group().size()
         return world_size
     else:
         return 0
@@ -2004,7 +1996,7 @@ def get_expert_tensor_and_model_parallel_world_size():
 def get_expert_tensor_and_model_parallel_rank():
     """Return caller's rank in the joint tensor- and expert-model-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_expert_tensor_and_model_parallel_group())
+        return get_expert_tensor_and_model_parallel_group().rank()
     else:
         return 0
 
@@ -2061,11 +2053,9 @@ def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
 def get_expert_data_parallel_rank(partial_expert_data_parallel=False):
     """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(
-            group=get_expert_data_parallel_group(
-                partial_expert_data_parallel=partial_expert_data_parallel
-            )
-        )
+        return get_expert_data_parallel_group(
+            partial_expert_data_parallel=partial_expert_data_parallel
+        ).rank()
     else:
         return 0
 
@@ -2073,10 +2063,8 @@ def get_expert_data_parallel_rank(partial_expert_data_parallel=False):
 def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
     """Return world size for the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(
-            group=get_expert_data_parallel_group(
-                partial_expert_data_parallel=partial_expert_data_parallel
-            )
+        return get_expert_data_parallel_group(
+            partial_expert_data_parallel=partial_expert_data_parallel.size()
         )
     else:
         return 0
