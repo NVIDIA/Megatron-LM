@@ -1,10 +1,16 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
 
 import torch
 from torch.autograd import Variable
 
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallel
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -22,6 +28,23 @@ def stream_acquire_context(stream, event):
         yield
     finally:
         event.record(stream)
+
+
+class FakeScheduleNode:
+    """A placeholder node in the computation graph that simply passes through inputs and outputs.
+
+    This class is used as a no-op node in the scheduling system when a real computation node
+    is not needed but the interface must be maintained. It simply returns its inputs unchanged
+    in both forward and backward passes.
+    """
+
+    def forward(self, inputs):
+        """Passes through inputs unchanged in the forward pass."""
+        return inputs
+
+    def backward(self, outgrads):
+        """Passes through gradients unchanged in the backward pass."""
+        return outgrads
 
 
 class ScheduleNode:
@@ -164,3 +187,93 @@ class ScheduleNode:
         self.output = None
         del self.forward_func
         del self.backward_func
+
+
+class AbstractSchedulePlan(ABC):
+    """To use combined 1f1b, model must implement build_schedule_plan while take the same
+    signature as model forward but return an instance of AbstractSchedulePlan"""
+
+    @classmethod
+    @abstractmethod
+    def forward_backward(
+        cls,
+        f_schedule_plan,
+        b_schedule_plan,
+        grad=None,
+        pre_forward=None,
+        pre_backward=None,
+        post_forward=None,
+        post_backward=None,
+    ):
+        """forward_backward is the protocol between our schedule logic and model"""
+        ...
+
+
+_COMP_STREAM = None
+_COM_STREAM = None
+
+
+def set_streams(comp_stream=None, com_stream=None):
+    """Set the streams for communication and computation"""
+    global _COMP_STREAM
+    global _COM_STREAM
+    if _COMP_STREAM is not None:
+        return
+
+    if comp_stream is None:
+        comp_stream = torch.cuda.current_stream()
+    if com_stream is None:
+        com_stream = torch.cuda.Stream(device="cuda")
+
+    assert _COMP_STREAM is None
+    assert _COM_STREAM is None
+    _COMP_STREAM = comp_stream
+    _COM_STREAM = com_stream
+
+
+def get_comp_stream():
+    """Get the stream for computation"""
+    global _COMP_STREAM
+    return _COMP_STREAM
+
+
+def get_com_stream():
+    """Get the stream for communication"""
+    global _COM_STREAM
+    return _COM_STREAM
+
+
+class VppContextManager:
+    """A reusable context manager for switch vpp stage"""
+
+    def __init__(self, vpp_rank):
+        self.vpp_rank = vpp_rank
+
+    def __enter__(self):
+        self.origin_vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        parallel_state.set_virtual_pipeline_model_parallel_rank(self.vpp_rank)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)
+
+
+def unwrap_model(model):
+    """Unwrap_model DistributedDataParallel and Float16Module wrapped model
+    to return GPTModel instance
+    """
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, (DistributedDataParallel, Float16Module)):
+            model_module = model_module.module
+        assert isinstance(
+            model_module, GPTModel
+        ), "The final unwrapped model must be a GPTModel instance"
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model

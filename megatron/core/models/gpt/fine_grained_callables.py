@@ -1,13 +1,283 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import weakref
 from typing import Optional
 
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.pipeline_parallel.utils import ScheduleNode
+from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
+
+
+def weak_method(method):
+    """Creates a weak reference to a method to prevent circular references.
+
+    This function creates a weak reference to a method and returns a wrapper function
+    that calls the method when invoked. This helps prevent memory leaks from circular
+    references.
+    """
+    method_ref = weakref.WeakMethod(method)
+    del method
+
+    def wrapped_func(*args, **kwarg):
+        # nonlocal object_ref
+        return method_ref()(*args, **kwarg)
+
+    return wrapped_func
+
+
+def should_free_input(name, is_moe, is_deepep):
+    """Determine if the node should free its input memory.
+
+    Args:
+        name: Node name
+        is_moe: Whether it's a MoE model
+        is_deepep: Whether it's a DeepEP model
+
+    Returns:
+        bool: Whether to free input memory
+    """
+    # For dense layers [attn, fake, mlp, fake], mlp input is needed during backward pass
+    if not is_moe:
+        return False
+    # Define which nodes should free input memory
+    free_input_nodes = {
+        "mlp": True,  # Free input after MLP node usage
+        "combine": True,  # Free input after Combine node usage
+        "dispatch": not is_deepep,  # Free input after dispatch node usage in non-deepep mode
+    }
+
+    return free_input_nodes.get(name, False)
+
+
+class TransformerLayerState:
+    """State shared within a transformer layer.
+
+    This class holds state that is shared between different nodes
+    within a transformer layer.
+    """
+
+    pass
+
+
+class PreProcessNode(ScheduleNode):
+    """Node responsible for preprocessing operations in the model.
+
+    This node handles embedding and rotary positional embedding computations
+    before the main transformer layers.
+    """
+
+    def __init__(self, gpt_model, model_chunk_state, event, stream):
+        """Initializes a preprocessing node.
+
+        Args:
+            gpt_model: The GPT model instance.
+            model_chunk_state: State shared across the model chunk.
+            event: CUDA event for synchronization.
+            stream: CUDA stream for execution.
+        """
+        super().__init__(weak_method(self.forward_impl), stream, event, name="pre_process")
+        self.gpt_model = gpt_model
+        self.model_chunk_state = model_chunk_state
+
+    def forward_impl(self):
+        """Implements the forward pass for preprocessing.
+
+        This method handles:
+        1. Decoder embedding computation
+        2. Rotary positional embedding computation
+        3. Sequence length offset computation for flash decoding
+
+        Returns:
+            The processed decoder input tensor.
+        """
+        # Get decoder input
+        if not self.gpt_model.pre_process:
+            self.model_chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
+        # Run GPTModle._preprocess
+        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+            self.gpt_model._preprocess(
+                input_ids=self.model_chunk_state.input_ids,
+                position_ids=self.model_chunk_state.position_ids,
+                decoder_input=self.model_chunk_state.decoder_input,
+                packed_seq_params=self.model_chunk_state.packed_seq_params,
+            )
+        )
+
+        # Saved for later use
+        self.model_chunk_state.decoder_input = decoder_input
+        self.model_chunk_state.rotary_pos_emb = rotary_pos_emb
+        self.model_chunk_state.rotary_pos_cos = rotary_pos_cos
+        self.model_chunk_state.rotary_pos_sin = rotary_pos_sin
+        self.model_chunk_state.sequence_len_offset = sequence_len_offset
+        return decoder_input
+
+
+class PostProcessNode(ScheduleNode):
+    """Node responsible for postprocessing operations in the model.
+
+    This node handles final layer normalization and output layer computation
+    after the main transformer layers.
+    """
+
+    def __init__(self, gpt_model, model_chunk_state, event, stream):
+        """Initializes a postprocessing node.
+
+        Args:
+            gpt_model: The GPT model instance.
+            model_chunk_state: State shared across the model chunk.
+            event: CUDA event for synchronization.
+            stream: CUDA stream for execution.
+        """
+        super().__init__(weak_method(self.forward_impl), stream, event, name="post_process")
+        self.gpt_model = gpt_model
+        self.model_chunk_state = model_chunk_state
+
+    def forward_impl(self, hidden_states):
+        """Implements the forward pass for postprocessing.
+
+        This method handles:
+        1. Final layer normalization
+        2. Output layer computation
+        3. Loss computation if labels are provided
+
+        Args:
+            hidden_states: The hidden states from the transformer layers.
+
+        Returns:
+            The logits or loss depending on whether labels are provided.
+        """
+        labels = self.model_chunk_state.labels
+        # Final layer norm from Decoder
+        if self.gpt_model.decoder.final_layernorm is not None:
+            hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
+            # TENorm produces a "viewed" tensor. This will result in schedule.py's
+            # deallocate_output_tensor() throwing an error, so a viewless tensor is
+            # created to prevent this.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
+        # Run GPTModel._postprocess
+        loss = self.gpt_model._postprocess(
+            hidden_states=hidden_states,
+            input_ids=self.model_chunk_state.input_ids,
+            position_ids=self.model_chunk_state.position_ids,
+            labels=labels,
+            decoder_input=self.model_chunk_state.decoder_input,
+            rotary_pos_emb=self.model_chunk_state.rotary_pos_emb,
+            rotary_pos_cos=self.model_chunk_state.rotary_pos_cos,
+            rotary_pos_sin=self.model_chunk_state.rotary_pos_sin,
+            mtp_in_postprocess=False,
+            loss_mask=self.model_chunk_state.loss_mask,
+            attention_mask=self.model_chunk_state.attention_mask,
+            packed_seq_params=self.model_chunk_state.packed_seq_params,
+            sequence_len_offset=self.model_chunk_state.sequence_len_offset,
+            runtime_gather_output=self.model_chunk_state.runtime_gather_output,
+            extra_block_kwargs=self.model_chunk_state.extra_block_kwargs,
+        )
+
+        # For now, 1f1b only supports fp16 module
+        return float16_to_fp32(loss)
+
+
+class TransformerLayerNode(ScheduleNode):
+    """Base class for transformer layer computation nodes.
+
+    This class provides common functionality for different types of
+    transformer layer nodes (attention, MLP, etc.)
+    """
+
+    def __init__(
+        self,
+        stream,
+        event,
+        common_state,
+        chunk_state,
+        submodule,
+        name="default",
+        bwd_dw_callables=None,
+        extra_args={},
+    ):
+        """Initialize a transformer layer node.
+
+        Args:
+            stream (torch.cuda.Stream): CUDA stream for execution
+            event (torch.cuda.Event): Synchronization event
+            common_state (TransformerLayerState): State shared within a transformer layer
+            submodule (function): The submodule contain forward and dw function
+            it's the per_batch_state_context, o.w. nullcontext
+            name (str): Node name, also used to determine memory strategy
+            bwd_dw_callables (list): List of weight gradient functions for the layer.
+        """
+        # determine whether to free input memory
+        is_moe = extra_args.get("is_moe", False)
+        enable_deepep = extra_args.get("enable_deepep", False)
+        free_input = should_free_input(name, is_moe, enable_deepep)
+
+        super().__init__(
+            weak_method(self.forward_impl),
+            stream,
+            event,
+            weak_method(self.backward_impl),
+            free_input=free_input,
+            name=name,
+        )
+        self.common_state = common_state
+        self.chunk_state = chunk_state
+        self.submodule = submodule
+        self.detached = tuple()
+        self.before_detached = tuple()
+
+        # Create flags to indicate first and last layer
+        self.is_first_layer = extra_args.get("is_first_layer", False)
+        self.is_last_layer = extra_args.get("is_last_layer", False)
+
+        # Initialize list to store registered dw callables
+        self.bwd_dw_callables = []
+        if bwd_dw_callables is not None:
+            self.bwd_dw_callables = (
+                bwd_dw_callables if isinstance(bwd_dw_callables, list) else [bwd_dw_callables]
+            )
+
+    def detach(self, t):
+        """Detaches a tensor and stores it for backward computation."""
+        detached = make_viewless(t).detach()
+        detached.requires_grad = t.requires_grad
+        self.before_detached = self.before_detached + (t,)
+        self.detached = self.detached + (detached,)
+        return detached
+
+    def forward_impl(self, *args):
+        """Calls the submodule as the forward pass."""
+        return self.submodule(self, *args)
+
+    def backward_impl(self, outputs, output_grad):
+        """Implements the backward pass for the transformer layer node."""
+        detached_grad = tuple([e.grad for e in self.detached])
+        grads = output_grad + detached_grad
+        self.default_backward_func(outputs + self.before_detached, grads)
+        self._release_state()
+        # return grads for record stream
+        return grads
+
+    def backward_dw(self):
+        """Computes the weight gradients for the transformer layer node."""
+        with torch.cuda.nvtx.range(f"{self.name} wgrad"):
+            for module in self.bwd_dw_callables:
+                module.backward_dw()
+        self.bwd_dw_callables = None
+
+    def _release_state(self):
+        # Release reference as early as possible, this helps avoid memory leak.
+        self.before_detached = None
+        self.detached = None
+        self.common_state = None
+        self.chunk_state = None
+        self.submodule = None
 
 
 def build_transformer_layer_callables(layer: TransformerLayer):
