@@ -384,7 +384,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
 
         if layer.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of unpermuted probs
+            # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
         # release tensor reference after use
