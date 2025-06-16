@@ -572,10 +572,9 @@ class GPTModel(LanguageModule):
             loss_mask=loss_mask,
         )
 
-
     def __call__(self, *args, **kwargs):
         if self.config.overlap_moe_expert_parallel_comm and torch.is_grad_enabled():
-            # When overlap_moe_expert_parallel_comm is enabled, unless in evaluation, return 
+            # When overlap_moe_expert_parallel_comm is enabled, unless in evaluation, return
             # SchedulePlan instead, the actual scheduling is made in combined_1f1b.forward_backward_step.
             return self.build_schedule_plan(*args, **kwargs)
         return super(LanguageModule, self).__call__(*args, **kwargs)

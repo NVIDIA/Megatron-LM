@@ -414,7 +414,9 @@ def schedule_chunk_1f1b(
         for i in range(overlaped_layers, b_num_layers):
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
-            _, b_grad = schedule_layer_1f1b(None, b_layer, b_grad=b_grad, is_first_layer_in_bwd=(i == b_num_layers - 1))
+            _, b_grad = schedule_layer_1f1b(
+                None, b_layer, b_grad=b_grad, is_first_layer_in_bwd=(i == b_num_layers - 1)
+            )
             torch.cuda.nvtx.range_pop()
 
     with f_context:
