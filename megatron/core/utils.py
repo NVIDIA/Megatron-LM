@@ -734,7 +734,7 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     if hasattr(tensor, 'fully_shard_param_local_shard'):
         assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
-        replica_id = (*replica_id[:2], 0)
+        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
 
         sh_ten = ShardedTensor.from_rank_offsets_flat(
             key,
@@ -789,7 +789,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     if hasattr(tensor, 'fully_shard_param_local_shard'):
         assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
-        replica_id = (*replica_id[:2], 0)
+        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
 
         sh_ten = ShardedTensor.from_rank_offsets_flat(
             key,
