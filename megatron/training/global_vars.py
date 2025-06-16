@@ -196,11 +196,17 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(args.save, 'wandb')
+        wandb_config = vars(args)
+        if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
+            # Log the contents of the config for discovery of what the quantization
+            # settings were.
+            with open(wandb_config['kitchen_config_file'], "r") as f:
+                wandb_config['kitchen_config_file_contents'] = f.read()
         wandb_kwargs = {
             'dir': save_dir,
             'name': args.wandb_exp_name,
             'project': args.wandb_project,
-            'config': vars(args)}
+            'config': wandb_config}
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb

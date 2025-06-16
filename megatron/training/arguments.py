@@ -36,6 +36,10 @@ from megatron.training.activations import squared_relu
 from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0
 from megatron.core.msc_utils import MultiStorageClientFeature
 
+from megatron.core.quantization.utils import (
+    kitchen_quantization_recipe_config,
+    load_quantization_recipe,
+)
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -71,6 +75,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
+    parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
 
     return parser
@@ -331,7 +336,7 @@ def validate_args(args, defaults={}):
                 LocalCheckpointManager
         except ModuleNotFoundError as e:
             raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
-        
+
     # validate model config args from heterogeneous config (if provided).
     validate_model_config_args_from_heterogeneous_config(args)
 
@@ -1137,6 +1142,17 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
     if args.is_hybrid_model:
         kw_args['is_hybrid_model'] = args.is_hybrid_model
+
+    # handle quantization config
+    # NOTE: Kitchen arguments are only added to the namespace when
+    # Kitchen library is available.
+    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
+    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
+        kw_args['use_kitchen'] = True
+        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
+
 
     # Return config.
     return config_class(**kw_args)
@@ -2922,6 +2938,39 @@ def _add_msc_args(parser):
     group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
                        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
     return parser
+
+def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
+    """Add quant-specific arguments to the main parser
+
+    If kitchen isn't available, nothing to do here, return unchanged parser
+    """
+    try:
+        from megatron.core.extensions.kitchen import KitchenSpecProvider
+
+        have_kitchen = True
+    except (ImportError, ModuleNotFoundError):
+        have_kitchen = False
+
+    if have_kitchen:
+        group = parser.add_argument_group(title="kitchen")
+        recipe_or_config_group = group.add_mutually_exclusive_group(required=False)
+        recipe_or_config_group.add_argument(
+            '--kitchen-config-file',
+            type=str,
+            default=None,
+            help="Use the config .yaml file at the specified location to "
+            "configure kitchen quantization.",
+        )
+        recipe_or_config_group.add_argument(
+            '--kitchen-recipe-number',
+            type=int,
+            default=None,
+            help="Use a default kitchen recipe for all layers as defined by QAT_PARAMS index",
+        )
+        return parser
+
+    else:
+        return parser
 
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
