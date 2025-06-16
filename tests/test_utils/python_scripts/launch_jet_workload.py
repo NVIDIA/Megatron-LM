@@ -407,7 +407,7 @@ def main(
                 no_log = True
                 n_download_attempt += 1
                 break
-            
+
             n_download_attempt += 1
 
         if no_log:
