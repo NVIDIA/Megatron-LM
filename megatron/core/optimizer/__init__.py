@@ -515,6 +515,13 @@ def get_megatron_optimizer(
                 filter_fn=lambda g: True,
                 buffer_name='buffers',
             )
+            # Pass Gloo process groups into optimizer only if needed.
+            if use_gloo_process_groups:
+                data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(
+                    with_context_parallel=True, partial_data_parallel=True
+                )
+            else:
+                data_parallel_group_gloo = None
             optimizers.append(
                 _get_megatron_optimizer_based_on_param_groups(
                     config,
@@ -522,11 +529,12 @@ def get_megatron_optimizer(
                     param_groups=param_groups,
                     per_model_buffers=buffers,
                     model_parallel_group=mpu.get_model_parallel_group(),
-                    data_parallel_group=mpu.get_data_parallel_group(with_context_parallel=True),
-                    data_parallel_group_gloo=mpu.get_data_parallel_group_gloo(
-                        with_context_parallel=True
+                    data_parallel_group=mpu.get_data_parallel_group(
+                        with_context_parallel=True, partial_data_parallel=True
                     ),
+                    data_parallel_group_gloo=data_parallel_group_gloo,
                     data_parallel_group_idx=model_parallel_rank,
+                    distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 )
             )
             model_chunk_offset += 1
