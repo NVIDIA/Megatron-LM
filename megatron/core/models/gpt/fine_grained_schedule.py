@@ -256,7 +256,13 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
 
 
 def schedule_layer_1f1b(
-    f_layer, b_layer, f_input=None, b_grad=None, f_context=None, b_context=None
+    f_layer,
+    b_layer,
+    f_input=None,
+    b_grad=None,
+    f_context=None,
+    b_context=None,
+    is_first_layer_in_bwd=False,
 ):
     """Schedule one-forward-one-backward operations for a single layer.
 
@@ -314,7 +320,8 @@ def schedule_layer_1f1b(
             b_grad = b_layer.post_attn.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
 
-    if b_layer is not None:
+    # Delay the backward_dw of the first layer for overlapping with the p2p comm
+    if b_layer is not None and not is_first_layer_in_bwd:
         with b_context:
             b_layer.attn.backward_dw()
 
@@ -399,6 +406,7 @@ def schedule_chunk_1f1b(
             b_grad=b_grad,
             f_context=f_context,
             b_context=b_context,
+            is_first_layer_in_bwd=(i == b_num_layers - 1),
         )
         torch.cuda.nvtx.range_pop()
 
@@ -406,7 +414,7 @@ def schedule_chunk_1f1b(
         for i in range(overlaped_layers, b_num_layers):
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
-            _, b_grad = schedule_layer_1f1b(None, b_layer, b_grad=b_grad)
+            _, b_grad = schedule_layer_1f1b(None, b_layer, b_grad=b_grad, is_first_layer_in_bwd=(i == b_num_layers - 1))
             torch.cuda.nvtx.range_pop()
 
     with f_context:
@@ -430,6 +438,11 @@ def schedule_chunk_1f1b(
         with b_context as ctx:
             b_schedule_plan.wait_current_stream()
             post_backward(b_grad, ctx.vpp_rank)
+
+    # Delay the backward_dw of the first layer for overlapping with the p2p comm
+    if b_num_layers > 0:
+        with b_context:
+            b_schedule_plan.get_layer(0).attn.backward_dw()
 
     with f_context:
         if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
