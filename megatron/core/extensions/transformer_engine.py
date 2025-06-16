@@ -148,6 +148,11 @@ class TELinear(te.pytorch.Linear):
 
         extra_kwargs = _get_extra_te_kwargs(config)
 
+        if self.config.delay_wgrad_compute:
+            if is_te_min_version("2.3.0"):
+                extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+            else:
+                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
         if (
             self.config.tp_comm_overlap
             and tp_comm_buffer_name
@@ -295,6 +300,11 @@ class TELinear(te.pytorch.Linear):
         state_dict = self.state_dict(prefix='', keep_vars=True)
         return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
 
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
+
 
 class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     """
@@ -344,6 +354,12 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         extra_kwargs = _get_extra_te_kwargs(config)
         self.tp_size = tp_group.size()
         self.tp_rank = tp_group.rank()
+
+        if self.config.delay_wgrad_compute:
+            if is_te_min_version("2.3.0"):
+                extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+            else:
+                raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
 
         # Only Transformer-Engine version >= 0.11.0 supports `RMSNorm`
         if is_te_min_version("0.11.0"):
@@ -470,6 +486,11 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
         )
 
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
+
 
 class TEColumnParallelLinear(TELinear):
     """
@@ -553,6 +574,11 @@ class TEColumnParallelLinear(TELinear):
             f"{type(self).__name__}(in_features={self.in_features}, "
             f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
         )
+
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
 
 
 class TERowParallelLinear(TELinear):
@@ -638,6 +664,11 @@ class TERowParallelLinear(TELinear):
             f"{type(self).__name__}(in_features={self.in_features}, "
             f"out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})"
         )
+
+    def backward_dw(self):
+        """Compute weight gradients during the backward pass if delay_wgrad_compute is enabled."""
+        if self.config.delay_wgrad_compute:
+            super().backward_dw()
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -919,6 +950,15 @@ if is_te_min_version("1.9.0.dev0"):
             self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
 
             extra_kwargs = _get_extra_te_kwargs(config)
+
+            if self.config.delay_wgrad_compute:
+                if is_te_min_version("2.3.0"):
+                    extra_kwargs["delay_wgrad_compute"] = self.config.delay_wgrad_compute
+                else:
+                    raise RuntimeError(
+                        "Only TE with version >=2.3.0 supports delay_wgrad_compute now."
+                    )
+
             extra_kwargs["ub_name"] = tp_comm_buffer_name
 
             self.expert_parallel = self.config.expert_model_parallel_size > 1
@@ -1180,6 +1220,14 @@ if is_te_min_version("1.9.0.dev0"):
                     edp_replica_id = get_expert_data_parallel_rank()
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
+
+        def backward_dw(self):
+            """
+            Compute weight gradients during the backward pass
+            if delay_wgrad_compute is enabled.
+            """
+            if self.config.delay_wgrad_compute:
+                super().backward_dw()
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """
