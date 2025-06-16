@@ -195,16 +195,15 @@ class MoELayer(BaseMoELayer):
         combine step.
         """
         shared_expert_output = None
+        if self.use_shared_expert and not self.shared_expert_overlap:
+            # Compute the shared expert separately when not overlapped with communication.
+            shared_expert_output = self.shared_experts(residual)
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
         output = self.token_dispatcher.combine_preprocess(expert_output)
-
-        if self.use_shared_expert and not self.shared_expert_overlap:
-            # Compute the shared expert separately when not overlapped with communication.
-            shared_expert_output = self.shared_experts(residual)
 
         return output, shared_expert_output, mlp_bias
 
