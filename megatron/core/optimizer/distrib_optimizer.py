@@ -1080,13 +1080,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self,
         model_sharded_state_dict: ShardedStateDict,
         is_loading: bool = False,
-        sharding_type: str = 'fully_sharded_model_space',
+        sharding_type: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ):
         """
         Chooses between 3 param state sharding implementations as requested by `sharding_type`.
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
+        if sharding_type is not None:
+            logger.warning(
+                'DistributedOptimizer.sharded_state_dict parameter `sharding_type`'
+                ' is deprecated and will be removed.'
+                ' Use `metadata["distrib_optim_sharding_type"] instead`.'
+            )
+        else:
+            sharding_type = (metadata or {}).get(
+                'distrib_optim_sharding_type', 'fully_sharded_model_space'
+            )
+
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
             logger.warning(
                 '`fully_sharded_bucket_space` sharding for DistributedOptimizer'

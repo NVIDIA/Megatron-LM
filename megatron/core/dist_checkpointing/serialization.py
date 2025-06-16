@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 # flat state dict with sharded objects without any data
 CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
 
+_CONTENT_METADATA_KEY = 'content_metadata'
+
 
 def load(
     sharded_state_dict: ShardedStateDict,
@@ -267,23 +269,25 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
     return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
 
 
-#
-# def load_plain_tensors_and_objects(checkpoint_dir: str) -> StateDict:
-#     """Load checkpoint tensors and objects without any sharding and plain structure.
-#
-#     NOTE: state dict structure might be different than the one used for checkpoint saving.
-#     NOTE: common state dict is NOT included.
-#
-#     Args:
-#         checkpoint_dir (str): checkpoint directory to load the state dict from.
-#
-#     Returns:
-#         StateDict: complete checkpoint state dict without any sharding.
-#     """
-#     sharded_state_dict = load_tensors_metadata(checkpoint_dir)
-#     # Don't validate integrity because shards will be overlapped
-#     # if world_size > 1 (all processes load whole tensors)
-#     return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
+def load_content_metadata(
+    checkpoint_dir: Optional[str] = None, *, preloaded_state_dict: Optional[StateDict] = None
+) -> Optional[dict]:
+    """Load content metadata stored in the checkpoint with `save(..., content_metadata=...)`.
+
+    Args:
+        checkpoint_dir (str, optional): checkpoint directory to load the content metadata from.
+        preloaded_state_dict (StateDict, optional): if the state dict was already loaded,
+            can be provided to avoid double load from storage
+
+    Returns:
+        dict: checkpoint content metadata
+        None: in case there is no content metadata in the checkpoint
+    """
+    if preloaded_state_dict is None:
+        if checkpoint_dir is None:
+            raise ValueError('Both checkpoint_dir and loaded_state_dict cannot be None')
+        preloaded_state_dict = load_common_state_dict(checkpoint_dir)
+    return preloaded_state_dict.get(_CONTENT_METADATA_KEY)
 
 
 def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
@@ -302,6 +306,7 @@ def save(
     preprocess_common_before_consistancy_check: Optional[
         Callable[[CommonStateDict], StateDict]
     ] = None,
+    content_metadata: Optional[dict] = None,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -345,6 +350,8 @@ def save(
             A callable function that will preprocess the common state dict (i.e can be used  to
             remove keys that we expect to be different in the state dict). The function must not
             modify the original state dict
+        content_metadata (dict, optional): metadata to identify the checkpoint content.
+            Useful for framework specific versioning.
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -378,6 +385,9 @@ def save(
     if not isinstance(common_strategy, SaveCommonStrategy):
         assert isinstance(common_strategy, tuple), type(common_strategy)
         common_strategy = get_default_strategy(StrategyAction.SAVE_COMMON, *common_strategy)
+
+    if content_metadata is not None:
+        sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 
     sharded_state_dict, state_dict = save_preprocess(
         sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check

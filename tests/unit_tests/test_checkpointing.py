@@ -2,6 +2,8 @@
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
 from types import SimpleNamespace
+from typing import Optional
+from unittest import mock
 
 import pytest
 import torch
@@ -17,6 +19,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.training.checkpointing import (
     CheckpointType,
+    _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     get_checkpoint_tracker_filename,
     load_checkpoint,
@@ -35,12 +38,18 @@ class MockModel(MegatronModule):
         self.l = torch.nn.Linear(1, 2)
         torch.nn.init.ones_(self.l.weight)
         torch.nn.init.zeros_(self.l.bias)
+        self._called_metadata = []
+
+    def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
+        self._called_metadata.append(metadata)
+        return self.state_dict()
 
 
 class MockState:
     def __init__(self, state_dict):
         self._state_dict = state_dict
         self.is_stub_optimizer = False
+        self._called_metadata = []
 
     def state_dict(self, is_loading=False):
         return self._state_dict
@@ -53,6 +62,10 @@ class MockState:
 
     def load_parameter_state(self, *args, **kwargs):
         pass
+
+    def sharded_state_dict(self, *args, metadata: Optional[dict] = None, **kwargs):
+        self._called_metadata.append(metadata)
+        return self.state_dict()
 
 
 def create_checkpoint(load_path, ckpt_format):
@@ -95,6 +108,29 @@ def create_args():
     args.retro_add_retriever = False
     args.ckpt_convert_update_legacy_dist_opt_format = False
     args.ckpt_step = None
+
+    yield args
+
+
+@pytest.fixture
+def create_ckpt_load_args(create_args):
+    """Setup dummy args allowing checkpoint load."""
+    args = create_args
+    args.auto_detect_ckpt_format = False
+    args.consumed_train_samples = 0
+    args.skipped_train_samples = 0
+    args.consumed_valid_samples = 0
+    args.num_layers = 1
+    args.hidden_size = 2
+    args.num_attention_heads = 1
+    args.add_position_embedding = False
+    args.vocab_file = None
+    args.tensor_model_parallel_size = 1
+    args.pipeline_model_parallel_size = 1
+    args.ckpt_assume_constant_structure = False
+    args.ckpt_fully_parallel_save = False
+    args.ckpt_fully_parallel_load = False
+    args.dist_ckpt_strictness = 'assume_ok_unexpected'
 
     yield args
 
@@ -189,27 +225,17 @@ def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
-def test_load_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format):
+def test_load_checkpoint(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+):
     """Test load_checkpoint."""
-    args = create_args
+    args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
+    args.use_distributed_optimizer = ckpt_format != "torch_dcp"
+    args.use_dist_ckpt = ckpt_format != "torch"
 
     if ckpt_format == "torch_dcp" and not is_torch_min_version("2.4.0"):
         pytest.skip("torch_dcp requires torch >= 2.4.0")
-
-    args.use_distributed_optimizer = ckpt_format != "torch_dcp"
-    args.use_dist_ckpt = ckpt_format != "torch"
-    args.auto_detect_ckpt_format = False
-    args.consumed_train_samples = 0
-    args.skipped_train_samples = 0
-    args.consumed_valid_samples = 0
-    args.num_layers = 1
-    args.hidden_size = 2
-    args.num_attention_heads = 1
-    args.add_position_embedding = False
-    args.vocab_file = None
-    args.tensor_model_parallel_size = 1
-    args.pipeline_model_parallel_size = 1
 
     with TempNamedDir(tmp_path_dist_ckpt / "test_load_checkpoint", sync=True) as ckpt_dir:
         args.load = ckpt_dir
@@ -247,3 +273,59 @@ def test_load_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, c
 
         assert new_optimizer.state_dict() == optimizer.state_dict()
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+
+
+def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):
+    """Test distributed checkpoint versioning."""
+    args = create_ckpt_load_args
+    args.ckpt_format = 'torch_dist'
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = True
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_dist_checkpoint_versioning", sync=True
+    ) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        set_args(args)
+
+        # Create and save a checkpoint first.
+        iteration = 123
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        model = MockModel(config)
+
+        optimizer = MockState({"optimizer": "optimizer_state"})
+        opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+        num_fp_ops = 456
+
+        base_metadata = _build_sharded_state_dict_metadata(args)
+        first_job_mock_metadata = {**base_metadata, 'metadata_A': 42, 'metadata_B_soon_removed': 43}
+        with mock.patch(
+            'megatron.training.checkpointing._build_sharded_state_dict_metadata',
+            return_value=first_job_mock_metadata,
+        ):
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+
+        second_job_mock_metadata = {
+            **base_metadata,
+            'metadata_A': 'changed_default_value',
+            'metadata_C_new': {'nested': 'val'},
+        }
+        with mock.patch(
+            'megatron.training.checkpointing._build_sharded_state_dict_metadata',
+            return_value=second_job_mock_metadata,
+        ):
+            # Load checkpoint (into the same model, we don't check load correctness here)
+            load_checkpoint([model], optimizer, opt_param_scheduler, strict=True)
+            assert optimizer._called_metadata[-1] == first_job_mock_metadata
+
+            # Save the checkpoint again to check if the content metadata for the new checkpoint will be new
+            save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, num_fp_ops)
+            assert optimizer._called_metadata[-1] == second_job_mock_metadata
+
+        assert optimizer._called_metadata == model._called_metadata
+        assert optimizer._called_metadata == [
+            first_job_mock_metadata,
+            first_job_mock_metadata,
+            second_job_mock_metadata,
+        ]
