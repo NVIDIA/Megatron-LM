@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
 from megatron.core.enums import Fp8Recipe
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
@@ -353,6 +354,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers at the end of the model to keep in BF16 precision when
     first_last_layers_bf16 is True."""
 
+    use_kitchen: bool = False
+    """Use the kitchen extension for transformer quantization."""
+
     ####################
     # MoE related
     ####################
@@ -608,6 +612,12 @@ class TransformerConfig(ModelParallelConfig):
 
     hetereogenous_dist_checkpoint: bool = False
     """Whether to use heterogenous layers in distributed checkpoint."""
+
+    ####################
+    # Quantization
+    ####################
+    quant_recipe: Optional[RecipeConfig] = None
+    """Configuration of any quantization to be applied to the model"""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.

@@ -137,7 +137,8 @@ def model_provider(
                         args.qk_layernorm,
                         args.multi_latent_attention,
                         args.moe_use_legacy_grouped_gemm,
-                        qk_l2_norm=args.qk_l2_norm
+                        qk_l2_norm=args.qk_l2_norm,
+                        use_kitchen=config.use_kitchen,
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
@@ -147,6 +148,7 @@ def model_provider(
                         args.multi_latent_attention,
                         args.moe_use_legacy_grouped_gemm,
                         normalization=args.normalization,
+                        use_kitchen=config.use_kitchen,
                     )
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
