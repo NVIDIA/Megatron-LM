@@ -114,9 +114,14 @@ publish:test_release_pypi_test_wheel:
     - pip install -U --no-cache-dir pip
     - |
       if [[ "$PLATFORM" == "arm64" ]]; then
-        pip install --no-cache-dir wheelhouse/*cp311*aarch64.whl
+        for file in wheelhouse/*cp311*aarch64.whl; do
+          pip install --no-cache-dir "$file[dev,mlm]"
+        done
+        
       else
-        pip install --no-cache-dir wheelhouse/*cp311*x86_64.whl
+        for file in wheelhouse/*cp311*x86_64.whl; do
+          pip install --no-cache-dir "$file[dev,mlm]"
+        done
       fi
 
     - RELEASE_NUMBER=$(python -c "from megatron import core; print(core.__version__)")
