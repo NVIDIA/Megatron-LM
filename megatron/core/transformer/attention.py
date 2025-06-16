@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import NoReturn, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -966,6 +966,19 @@ class SelfAttention(Attention):
             self.run_realtime_tests()
 
         return query, key, value
+
+    def backward_dw(self) -> NoReturn:
+        """Execute weight update operations"""
+        self._backward_qkv_proj()
+        self._backward_output_proj()
+
+    def _backward_qkv_proj(self):
+        """Update weights for QKV projection layer"""
+        self.linear_qkv.backward_dw()
+
+    def _backward_output_proj(self):
+        """Update weights for output projection layer"""
+        self.linear_proj.backward_dw()
 
 
 class CrossAttention(Attention):
