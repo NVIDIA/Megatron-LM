@@ -35,7 +35,7 @@ DOCKER_BUILDKIT=1 docker build \
     --secret id=LOGGER_INDEX_URL \
     --secret id=EXPERIMENTAL_FLASH_ATTN \
     --target $STAGE \
-    -f $FILE \
+    -f docker/$FILE \
     -t ${IMAGE}:${CI_PIPELINE_ID} \
     --builder=container \
     --build-arg JET_API_VERSION=$JET_API_VERSION \
