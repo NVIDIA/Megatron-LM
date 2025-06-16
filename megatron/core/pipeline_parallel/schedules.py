@@ -23,6 +23,9 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+from .combined_1f1b import forward_backward_step
+from .utils import set_streams
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -181,6 +184,78 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
 
 
+def forward_step_calc_loss(
+    model,
+    output_tensor,
+    loss_func,
+    config,
+    vp_stage,
+    collect_non_loss_data,
+    num_microbatches,
+    forward_data_store,
+):
+    """Calculate the loss and number of tokens for forward_step()"""
+    model_vp_stage = getattr(model, "vp_stage", None)
+    if vp_stage is not None and model_vp_stage is not None:
+        assert (
+            vp_stage == model_vp_stage
+        ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
+    num_tokens = torch.tensor(0, dtype=torch.int)
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+        if not collect_non_loss_data:
+            outputs = loss_func(output_tensor)
+            if len(outputs) == 3:
+                output_tensor, num_tokens, loss_reduced = outputs
+                if not config.calculate_per_token_loss:
+                    output_tensor /= num_tokens
+                    output_tensor /= num_microbatches
+            else:
+                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
+                assert len(outputs) == 2
+                output_tensor, loss_reduced = outputs
+                output_tensor *= parallel_state.get_context_parallel_world_size()
+                output_tensor /= num_microbatches
+            forward_data_store.append(loss_reduced)
+        else:
+            data = loss_func(output_tensor, non_loss_data=True)
+            forward_data_store.append(data)
+
+    if config.timers is not None:
+        config.timers('forward-compute').stop()
+
+    # Set the loss scale for the auxiliary loss of the MoE layer.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
+    # explicitly.
+    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for Multi-Token Prediction (MTP) loss.
+    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MTPLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    return output_tensor, num_tokens
+
+
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -291,64 +366,16 @@ def forward_step(
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
-
-    model_vp_stage = getattr(model, "vp_stage", None)
-    if vp_stage is not None and model_vp_stage is not None:
-        assert (
-            vp_stage == model_vp_stage
-        ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
-    num_tokens = torch.tensor(0, dtype=torch.int)
-    if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
-        if not collect_non_loss_data:
-            outputs = loss_func(output_tensor)
-            if len(outputs) == 3:
-                output_tensor, num_tokens, loss_reduced = outputs
-                if not config.calculate_per_token_loss:
-                    output_tensor /= num_tokens
-                    output_tensor /= num_microbatches
-            else:
-                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
-                assert len(outputs) == 2
-                output_tensor, loss_reduced = outputs
-                output_tensor *= parallel_state.get_context_parallel_world_size()
-                output_tensor /= num_microbatches
-            forward_data_store.append(loss_reduced)
-        else:
-            data = loss_func(output_tensor, non_loss_data=True)
-            forward_data_store.append(data)
-
-    if config.timers is not None:
-        config.timers('forward-compute').stop()
-
-    # Set the loss scale for the auxiliary loss of the MoE layer.
-    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
-    # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
-
-    # Set the loss scale for Multi-Token Prediction (MTP) loss.
-    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MTPLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+    output_tensor, num_tokens = forward_step_calc_loss(
+        model,
+        output_tensor,
+        loss_func,
+        config,
+        vp_stage,
+        collect_non_loss_data,
+        num_microbatches,
+        forward_data_store,
+    )
 
     # If T5 model and in decoder stack, then send encoder_hidden_state
     # downstream as well.
@@ -495,44 +522,116 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-    with no_sync_func():
-        for i in range(num_microbatches - 1):
-            output_tensor, num_tokens = forward_step(
-                forward_step_func,
-                data_iterator,
-                model,
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                collect_non_loss_data,
-                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                current_microbatch=i,
-            )
-            total_num_tokens += num_tokens
-            if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
-    # Run computation for last microbatch out of context handler (want to
-    # synchronize gradients).
-    output_tensor, num_tokens = forward_step(
-        forward_step_func,
-        data_iterator,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        config,
-        collect_non_loss_data,
-        is_first_microbatch=check_first_val_step(
-            first_val_step, forward_only, num_microbatches == 1
-        ),
-        current_microbatch=num_microbatches - 1,
-    )
-    total_num_tokens += num_tokens
+    if config.overlap_moe_expert_parallel_comm and not forward_only:
+        f_context = contextlib.nullcontext()
+        b_context = contextlib.nullcontext()
+        set_streams()
+        # The forward step for the first microbatch is executed alone, no a2a overlapping
+        output_tensor, num_tokens, _ = forward_backward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            None,
+            input_tensor,
+            None,
+            None,
+            config,
+            f_context=f_context,
+            b_context=b_context,
+            collect_non_loss_data=collect_non_loss_data,
+            checkpoint_activations_microbatch=None,
+            is_first_microbatch=check_first_val_step(first_val_step, forward_only, True),
+            current_microbatch=0,
+        )
+        # The forward step is executed in parallel with the backward step of another microbatch
+        # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
+        # Vice versa.
+        with no_sync_func():
+            for i in range(num_microbatches - 1):
+                total_num_tokens += num_tokens
+                output_tensor, num_tokens, _ = forward_backward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    model,
+                    input_tensor,
+                    output_tensor,
+                    output_tensor_grad,
+                    config,
+                    f_context=f_context,
+                    b_context=b_context,
+                    collect_non_loss_data=collect_non_loss_data,
+                    checkpoint_activations_microbatch=None,
+                    is_first_microbatch=check_first_val_step(
+                        first_val_step, forward_only, (i + 1) == 0
+                    ),
+                    current_microbatch=(i + 1),
+                )
+        total_num_tokens += num_tokens
+        # The backward step for the last microbatch is executed alone, no a2a overlapping
+        output_tensor, num_tokens, _ = forward_backward_step(
+            forward_step_func,
+            data_iterator,
+            None,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            model,
+            input_tensor,
+            output_tensor,
+            output_tensor_grad,
+            config,
+            f_context=f_context,
+            b_context=b_context,
+        )
+    else:
+        with no_sync_func():
+            for i in range(num_microbatches - 1):
+                output_tensor, num_tokens = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                    current_microbatch=i,
+                )
+                total_num_tokens += num_tokens
+                if not forward_only:
+                    backward_step(
+                        input_tensor, output_tensor, output_tensor_grad, model_type, config
+                    )
+        # Run computation for last microbatch out of context handler (want to
+        # synchronize gradients).
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, num_microbatches == 1
+            ),
+            current_microbatch=num_microbatches - 1,
+        )
 
-    if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        total_num_tokens += num_tokens
+
+        if not forward_only:
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -592,7 +691,11 @@ def finish_embedding_wgrad_compute(config, embedding_module):
 
 
 def get_pp_rank_microbatches(
-    num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage, forward_only=False
+    num_microbatches,
+    num_model_chunks,
+    microbatch_group_size_per_vp_stage,
+    forward_only=False,
+    overlap_moe_expert_parallel_comm=False,
 ):
     """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -616,6 +719,10 @@ def get_pp_rank_microbatches(
             # immediately start with 1F1B).
             num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
             num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+            # When enabling overlap_moe_expert_parallel_comm, we need to add one more microbatch
+            # before 1f1b stages for a2a overlap.
+            if overlap_moe_expert_parallel_comm:
+                num_warmup_microbatches = num_warmup_microbatches + 1
     else:
         # forward_backward_no_pipelining
         num_warmup_microbatches = 1
