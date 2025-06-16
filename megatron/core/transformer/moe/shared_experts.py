@@ -166,7 +166,6 @@ class SharedExpertMLP(MLP):
                         intermediate_parallel,
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
-                        alpha=self.config.swiglu_alpha,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
