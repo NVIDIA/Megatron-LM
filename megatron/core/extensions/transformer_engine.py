@@ -1120,6 +1120,9 @@ if is_te_min_version("1.9.0.dev0"):
 
         def _decode_extra_state(self, state):
             if isinstance(state, torch.Tensor):
+                # No FP8 is indicated by an empty tensor we don't need to unpickle.
+                if state.numel() == 0:
+                    return
                 return pickle.loads(state.detach().cpu().numpy().tobytes())
             elif isinstance(state, io.BytesIO):
                 state.seek(0)
