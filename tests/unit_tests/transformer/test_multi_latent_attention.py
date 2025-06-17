@@ -56,7 +56,7 @@ class TestParallelMLAAttention:
             qk_pos_emb_head_dim=64,
             rope_type=rope_type,
             rotary_base=10000,
-            max_position_embeddings=32,
+            original_max_position_embeddings=32,
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
@@ -288,7 +288,7 @@ class TestSequenceParallelMLAAttention:
             v_head_dim=128,
             qk_pos_emb_head_dim=64,
             rotary_base=10000,
-            max_position_embeddings=64,
+            original_max_position_embeddings=64,
             tensor_model_parallel_size=self.tensor_parallel_size,
             sequence_parallel=True,
         )
@@ -345,7 +345,7 @@ class TestTensorParallelMLAAttention:
             v_head_dim=128,
             qk_pos_emb_head_dim=64,
             rotary_base=10000,
-            max_position_embeddings=64,
+            original_max_position_embeddings=64,
             tensor_model_parallel_size=self.tensor_parallel_size,
             sequence_parallel=False,
         )
@@ -406,7 +406,7 @@ class TestParallelMLAAttentionPrecision:
             qk_pos_emb_head_dim=64,
             rope_type=rope_type,
             rotary_base=10000,
-            max_position_embeddings=32,
+            original_max_position_embeddings=32,
             deterministic_mode=True,
             hidden_dropout=0.0,
             attention_dropout=0.0,
