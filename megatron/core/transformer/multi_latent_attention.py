@@ -589,12 +589,9 @@ class MLASelfAttention(MultiLatentAttention):
 
     def backward_dw(self) -> NoReturn:
         """Execute weight update operations"""
-        try:
-            self._backward_kv_proj()
-            self._backward_q_proj()
-            self._backward_output_proj()
-        except Exception as e:
-            raise RuntimeError(f"Error in MLASelfAttention backward_dw: {str(e)}")
+        self._backward_kv_proj()
+        self._backward_q_proj()
+        self._backward_output_proj()
 
     def _backward_kv_proj(self):
         """Update weights for KV projection layers"""
