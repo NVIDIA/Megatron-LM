@@ -956,6 +956,12 @@ def validate_args(args, defaults={}):
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
 
+    # MoE router check
+    if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
+        args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
+    if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
+        args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
+
     # Distributed checkpointing checks
     if args.use_dist_ckpt and args.use_legacy_models:
         raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
@@ -2740,8 +2746,8 @@ def _add_moe_args(parser):
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
-    group.add_argument('--moe-router-load-balancing-type', type=str,
-                       choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
+    group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
+                       choices=['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
     group.add_argument('--moe-router-dtype', type=str,
@@ -2783,7 +2789,7 @@ def _add_moe_args(parser):
                        'dropless training with FP8 precision when num_local_experts > 1. This is a more '
                        'efficient way to pad for FP8 which eliminates the explicit padding in the '
                        'GroupedMLP layer.')
-    group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
+    group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
                        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')

@@ -152,6 +152,44 @@ class TestTop2Router:
 
         self.router.config.moe_router_force_load_balancing = False
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("capacity_factor", [None, 1.0, 2.0])
+    @pytest.mark.parametrize("drop_policy", ["probs", "position"])
+    @pytest.mark.parametrize("pad_to_capacity", [True, False])
+    def test_token_dropping(self, capacity_factor, drop_policy, pad_to_capacity):
+        if capacity_factor is None and pad_to_capacity:
+            pytest.skip("Capacity factor is None, so no token dropping should be applied")
+
+        num_tokens = 32
+        self.router = self.router.cuda()
+        self.router.config.moe_expert_capacity_factor = capacity_factor
+        self.router.config.moe_token_drop_policy = drop_policy
+        self.router.config.moe_pad_expert_input_to_capacity = pad_to_capacity
+
+        hidden_states = torch.randn((num_tokens, self.router.config.hidden_size), device="cuda")
+        hidden_states.requires_grad = True
+        probs, routing_map = self.router(hidden_states)
+
+        if capacity_factor is not None:
+            if pad_to_capacity:
+                assert (
+                    routing_map.sum().item()
+                    == num_tokens * self.router.config.moe_router_topk * capacity_factor
+                )
+            else:
+                assert (
+                    routing_map.sum().item()
+                    <= num_tokens * self.router.config.moe_router_topk * capacity_factor
+                )
+        else:
+            assert routing_map.sum().item() == num_tokens * self.router.config.moe_router_topk
+
+        # restore the config
+        self.router.config.moe_expert_capacity_factor = None
+        self.router.config.moe_token_dropping_drop_policy = "probs"
+        self.router.config.moe_token_dropping_pad_to_capacity = False
+
 
 class TestGroupLimitedRouter:
     def setup_method(self, method):
