@@ -12,7 +12,11 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from dataloader_provider import train_valid_test_dataloaders_provider, is_first_or_last_stage
+from dataloader_provider import (
+    train_valid_test_dataloaders_provider,
+    is_first_or_last_stage,
+    get_batch_on_this_decoder_rank,
+)
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
@@ -25,6 +29,8 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     is_pipeline_last_stage,
+    get_pipeline_model_parallel_rank,
+    is_inside_decoder,
 )
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
 from megatron.training.utils import is_last_rank, get_batch_on_this_cp_rank
@@ -56,6 +62,23 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     torch.cuda.nvtx.range_push("get_data")
     if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
         data = next(data_iterator)
+        # For the case that encoder and decoder have different data parallel size,
+        # filter data in decoder's batch according to (DP rank) % (encoder DP world size) .
+        if (
+            args.encoder_data_parallel_size > 0
+            and args.data_parallel_size != args.encoder_data_parallel_size
+        ):
+            pp_rank = get_pipeline_model_parallel_rank()
+            if is_inside_decoder(pp_rank):
+                assert (
+                    data["cu_lengths"] is not None and data["cu_lengths"] == 0
+                    and data["max_lengths"] is not None and data["max_lengths"] == 0
+                ), (
+                    "If encoder and decoder have different DP world size, "
+                    "currently do not support variable length input."
+                )
+                keys_to_filter = ["tokens", "labels", "imgs", "num_tiles"]
+                data = get_batch_on_this_decoder_rank(data, keys_to_filter=keys_to_filter)
     else:
         data = None
 
