@@ -675,58 +675,77 @@ class _CudaGraphRunner(torch.nn.Module):
     def replay_graph_capture(self, is_first_microbatch, args, kwargs):
         """Replay the fwd cuda graph with autograd."""
 
-        assert self.matches_graph_inputs(
-            args, kwargs
-        ), "Tried replaying a cudagraph with different arguments than what if was created with!"
+        # Arguments passed to a cudagraph for replay must match the args in the captured graph.
+        #  Tensor arguments need to have the same shape, dtype, and device location.
+        #  All other arguments must have the exact same memory addresses for graph safety.
+        mismatch_errors = self.get_mismatch_errors(args, kwargs)
+        if mismatch_errors:
+            error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
+            raise AssertionError(error_msg)
 
         inp_tensors = self.get_tensors(args, kwargs)
         func_args = inp_tensors + tuple(self.parameters())
-
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
         out = list(out)
+
+        if torch.is_tensor(self.fwd_graph_outputs):
+            self.fwd_graph_outputs = [self.fwd_graph_outputs]
+
         return tuple(out.pop(0) if torch.is_tensor(o) else o for o in self.fwd_graph_outputs)
 
-    def matches_graph_inputs(self, args, kwargs):
-        """Check that the passed args, kwargs match with the arg, kwargs
-        the graph was created with."""
+    def get_mismatch_errors(self, args, kwargs):
+        """Return list of detailed errors for mismatched cudagraph args."""
+        errors = []
 
-        def check(val, ref):
+        def add_error(msg):
+            errors.append(f"  - {msg}")
 
-            _check_supported_type(val)
-            _check_supported_type(ref)
-
-            # check that the args are the same type
-            if not ((type(val) == type(ref)) or (is_dataclass(val) and is_dataclass(ref))):
+        def check(val, ref, context):
+            if type(val) != type(ref) and not (is_dataclass(val) and is_dataclass(ref)):
+                add_error(f"Type mismatch at {context}: {type(val)} vs {type(ref)}")
                 return False
 
-            # if tensors, check they have the same shape, device and type
-            # differing memory layout is allowed as 'copy_' is able interop different layouts
             if isinstance(ref, torch.Tensor):
-                return (
-                    val.shape == ref.shape and val.dtype == ref.dtype and val.device == ref.device
-                )
+                mismatches = []
+                if val.shape != ref.shape:
+                    mismatches.append(f"expected shape {val.shape} vs. {ref.shape}")
+                if val.dtype != ref.dtype:
+                    mismatches.append(f"expected dtype {val.dtype} vs. {ref.dtype}")
+                if val.device != ref.device:
+                    mismatches.append(f"expected device {val.device} vs. {ref.device}")
+                if mismatches:
+                    add_error(f"Tensor mismatch at {context}: {', '.join(mismatches)}")
 
-            # if dataclass, check args in fields are the same
             elif is_dataclass(ref):
                 for field in fields(ref):
-                    if not check(getattr(val, field.name), getattr(ref, field.name)):
-                        return False
-                return True
-            else:
-                return ref == val
+                    check(
+                        getattr(val, field.name),
+                        getattr(ref, field.name),
+                        f"{context}.{field.name}",
+                    )
+            elif val != ref:
+                add_error(f"Value mismatch at {context}: {val} vs {ref}")
 
+        # Check positional arguments
         if len(args) != len(self.fwd_graph_input_args):
-            return False
-        for arg, graph_arg in zip(args, self.fwd_graph_input_args):
-            if not check(arg, graph_arg):
-                return False
+            add_error(f"Argument count mismatch: {len(args)} vs {len(self.fwd_graph_input_args)}")
+        else:
+            for i, (arg, graph_arg) in enumerate(zip(args, self.fwd_graph_input_args)):
+                check(arg, graph_arg, f"args[{i}]")
 
-        if kwargs.keys() != self.fwd_graph_input_kwargs.keys():
-            return False
-        for k, v in self.fwd_graph_input_kwargs.items():
-            if not check(kwargs[k], v):
-                return False
-        return True
+        # Check keyword arguments
+        kwargs_keys = set(kwargs.keys())
+        graph_keys = set(self.fwd_graph_input_kwargs.keys())
+
+        if missing_keys := graph_keys - kwargs_keys:
+            add_error(f"Missing kwargs: {missing_keys}")
+        if extra_keys := kwargs_keys - graph_keys:
+            add_error(f"Unexpected kwargs: {extra_keys}")
+
+        for k in kwargs_keys & graph_keys:
+            check(kwargs[k], self.fwd_graph_input_kwargs[k], f"kwargs['{k}']")
+
+        return errors
 
     def zero_out_tensors(self, args, kwargs=None):
         """Replace all tensors inside arg, kwargs with zeroed copies."""
