@@ -605,7 +605,6 @@ class TransformerBlock(MegatronModule):
 
         return hidden_states
 
-
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
     ) -> ShardedStateDict:
