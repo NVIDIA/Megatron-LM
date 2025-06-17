@@ -33,7 +33,6 @@ MODEL_ARGS:
   # Model parallel
   --tensor-model-parallel-size: 4
   --pipeline-model-parallel-size: 1
-  --encoder-pipeline-model-parallel-size: 0
   # Data args
   --data-path: ${DATA_BLEND}
   --vocab-file: ${DATA_PATH}/bert-large-cased-vocab.txt
