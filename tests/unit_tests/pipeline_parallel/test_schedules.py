@@ -218,22 +218,6 @@ def test_forward_backward_func_with_interleaving(mocker):
         {'loss_reduced': rank},
     ]
 
-    model.model_type = ModelType.encoder_and_decoder
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step_func,
-        data_iterator=[range(0, 100), range(0, 100)],
-        model=[model, model],
-        num_microbatches=micro_batch_size,
-        seq_length=sequence_length,
-        micro_batch_size=micro_batch_size,
-        decoder_seq_length=sequence_length,
-        forward_only=True,
-    )
-
-    for i, j in zip(losses_reduced, loss_reduced_expected):
-        print(f"losses_reduced: {i} loss_reduced_expected: {j}")
-        assert i['loss_reduced'] == j['loss_reduced']
-
     model.model_type = ModelType.encoder_or_decoder
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
@@ -342,23 +326,6 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
         {'loss_reduced': rank},
         {'loss_reduced': rank},
     ]
-
-    model_a.model_type = ModelType.encoder_and_decoder
-    model_b.model_type = ModelType.encoder_and_decoder
-    losses_reduced = forward_backward_func(
-        forward_step_func=forward_step_func,
-        data_iterator=[range(0, 100), range(0, 100)],
-        model=[model_a, model_b],
-        num_microbatches=micro_batch_size,
-        seq_length=sequence_length,
-        micro_batch_size=micro_batch_size,
-        decoder_seq_length=sequence_length,
-        forward_only=True,
-    )
-
-    for i, j in zip(losses_reduced, loss_reduced_expected):
-        print(f"losses_reduced: {i} loss_reduced_expected: {j}")
-        assert i['loss_reduced'] == j['loss_reduced']
 
     model_a.model_type = ModelType.encoder_or_decoder
     model_b.model_type = ModelType.encoder_or_decoder

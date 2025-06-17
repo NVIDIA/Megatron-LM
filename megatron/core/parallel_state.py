@@ -590,10 +590,14 @@ def initialize_model_parallel(
             tp-dp-pp and tp-pp-dp orders.
 
         encoder_tensor_model_parallel_size (int, default = 0):
+            DEPRECATED (entire encoder pipeline parallelism will be removed in core_r0.14.0):
+            Use orthotope parallelism management instead.
             The number of GPUs to split individual tensors across in the encoder. If 0,
             then we use the default, decoder's tensor model parallel size.
 
         encoder_pipeline_model_parallel_size (int, default = 0):
+            DEPRECATED (entire encoder pipeline parallelism will be removed in core_r0.14.0):
+            Use orthotope parallelism management instead.
             The number of tensor parallel GPU groups to allocate to the encoder. As an example,
             if pipeline_model_parallel_size is 4 and encoder_pipeline_model_parallel_size is 2,
             then the encoder will use the first two pipeline stages for its layers, and the total
@@ -635,6 +639,26 @@ def initialize_model_parallel(
     ranks 8 to 15 belong to the second box.
 
     """
+
+    # Deprecation warning for encoder pipeline parallelism
+    if encoder_tensor_model_parallel_size != 0 or encoder_pipeline_model_parallel_size != 0:
+        warnings.warn(
+            "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+            " removed in core_r0.14.0. "
+            "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+            "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+            "parallel logic and infrastructure. "
+            "This functionality is being replaced by the new 'orthotope' parallelism management "
+            "system, which provides a more general and flexible approach to handling complex "
+            "parallelism configurations including encoder-decoder models. "
+            "Please refrain from building new features or dependencies on encoder pipeline "
+            "parallelism as this entire capability will not be supported in future releases. "
+            "For migration guidance and information on the orthotope system, please refer to the "
+            "Megatron-LM documentation (coming soon).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     if encoder_pipeline_model_parallel_size is None:
         encoder_pipeline_model_parallel_size = 0
 
@@ -1635,6 +1659,22 @@ def is_rank_in_position_embedding_group():
 def is_pipeline_stage_before_split(rank=None):
     """Return True if pipeline stage executes encoder block for a model
     with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1650,6 +1690,22 @@ def is_pipeline_stage_before_split(rank=None):
 def is_pipeline_stage_after_split(rank=None):
     """Return True if pipeline stage executes decoder block for a model
     with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1666,6 +1722,22 @@ def is_inside_encoder(rank=None) -> bool:
     """Return True if pipeline stage executes encoder block.
     This function implicitly assumes we have a model with both
     encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1688,6 +1760,22 @@ def is_inside_encoder(rank=None) -> bool:
 def is_inside_decoder(rank=None) -> bool:
     """Return True if pipeline stage executes decoder block for a model
     with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1702,6 +1790,22 @@ def is_inside_decoder(rank=None) -> bool:
 
 def get_pipeline_model_parallel_decoder_start() -> Optional[int]:
     """Return decoder start rank (if encoder pipeline parallelism is set)."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     global _PIPELINE_MODEL_PARALLEL_DECODER_START
     return _PIPELINE_MODEL_PARALLEL_DECODER_START
 
@@ -1710,6 +1814,22 @@ def is_pipeline_stage_at_split():
     """Return true if pipeline stage executes decoder block and next
     stage executes encoder block for a model with both encoder and
     decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     rank = get_pipeline_model_parallel_rank()
     return is_pipeline_stage_before_split(rank) and is_pipeline_stage_after_split(rank + 1)
 

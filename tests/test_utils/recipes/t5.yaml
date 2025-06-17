@@ -63,31 +63,12 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [t5_220m_mr_mcore_te_tp2_pp2_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [t5_220m_mr_mcore_te_tp2_pp2_resume_torch_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
   - test_case: [t5_220m_mr_mcore_te_tp4_pp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
   - test_case: [t5_220m_mr_mcore_te_tp4_pp1_resume_torch_dist_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [t5_220m_mr_mcore_tp2_pp2_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [nightly]
-  - test_case: [t5_220m_mr_mcore_tp2_pp2_resume_torch_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
@@ -132,8 +113,3 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_a100, dgx_h100]
-  - test_case: [t5_220m_mr_mcore_te_tp2_pp2_frozen_resume_torch_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
