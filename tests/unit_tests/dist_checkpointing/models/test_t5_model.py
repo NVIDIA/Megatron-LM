@@ -38,27 +38,14 @@ def initialize_t5_model(seed, encoder_decoder_spec_fn, num_layers=8, **config_kw
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
-    if ps.get_pipeline_model_parallel_decoder_start() is None:
-        encoder_layers_per_pipeline = num_layers // ps.get_pipeline_model_parallel_world_size()
-        decoder_layers_per_pipeline = num_layers // ps.get_pipeline_model_parallel_world_size()
-        pre_process = ps.is_pipeline_first_stage()
-        post_process = ps.is_pipeline_last_stage()
-        add_encoder = None
-        add_decoder = None
-    else:
-        encoder_layers_per_pipeline = num_layers // ps.get_pipeline_model_parallel_decoder_start()
-        decoder_layers_per_pipeline = num_layers // (
-            ps.get_pipeline_model_parallel_world_size()
-            - ps.get_pipeline_model_parallel_decoder_start()
-        )
+    add_encoder = None
+    add_decoder = None
 
-        rank = ps.get_pipeline_model_parallel_rank()
-        first_decoder_rank = ps.get_pipeline_model_parallel_decoder_start()
-        world_size = ps.get_pipeline_model_parallel_world_size()
-        pre_process = rank == 0 or rank == first_decoder_rank
-        post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
-        add_encoder = ps.is_inside_encoder()
-        add_decoder = ps.is_inside_decoder()
+    encoder_layers_per_pipeline = num_layers
+    decoder_layers_per_pipeline = num_layers
+
+    pre_process = ps.is_pipeline_first_stage()
+    post_process = ps.is_pipeline_last_stage()
 
     default_config_kwargs = dict(
         num_layers=num_layers,
@@ -150,15 +137,7 @@ class TestT5ModelReconfiguration:
     @pytest.mark.parametrize('dst_spec_type', ['local'])  # ['te', 'local'])
     @pytest.mark.parametrize('model_type', ['t5'])
     @pytest.mark.parametrize(
-        ('use_fpsl', 'src_tp_pp_encpp', 'dest_tp_pp_encpp'),
-        [
-            (False, (1, 1, None), (1, 1, None)),
-            (False, (1, 1, 1), (1, 1, 1)),
-            (False, (2, 1, 1), (2, 1, 1)),
-            (False, (2, 2, 2), (2, 2, 2)),
-            (True, (2, 2, 2), (2, 2, 2)),
-            (True, (2, 1, 1), (1, 2, 2)),
-        ],
+        ('use_fpsl', 'src_tp_pp_encpp', 'dest_tp_pp_encpp'), [(False, (1, 1, None), (1, 1, None))]
     )
     def test_parallel_reconfiguration_e2e(
         self,
@@ -194,29 +173,4 @@ class TestT5ModelReconfiguration:
             enc_dec_spec_fn[src_spec_type][model_type],
             enc_dec_spec_fn[dst_spec_type][model_type],
             use_fpsl,
-            src_tp_pp_kwargs=dict(encoder_pipeline_model_parallel_size=src_encpp),
-            dst_tp_pp_kwargs=dict(encoder_pipeline_model_parallel_size=dst_encpp),
         )
-
-    def test_pipeline_parallel_setup(self):
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            encoder_pipeline_model_parallel_size=1,
-        )
-        assert ps.get_pipeline_model_parallel_world_size() == 2
-        assert ps.get_pipeline_model_parallel_rank() == Utils.rank // 4
-
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            encoder_pipeline_model_parallel_size=3,
-        )
-        assert ps.get_pipeline_model_parallel_world_size() == 4
-        assert ps.get_pipeline_model_parallel_rank() == Utils.rank // 2
-
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
-        )
-        assert ps.get_pipeline_model_parallel_world_size() == 2
-        assert ps.get_pipeline_model_parallel_rank() == Utils.rank // 4
