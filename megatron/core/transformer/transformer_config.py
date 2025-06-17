@@ -1273,7 +1273,10 @@ class MLATransformerConfig(TransformerConfig):
     """Rotary scaling factor for the rotary embeddings, used by yarn."""
 
     max_position_embeddings: int = 4096
-    """Maximum position embeddings for the original model, used by yarn."""
+    """This arg is not used, will be deprecated."""
+
+    original_max_position_embeddings: int = 4096
+    """Original maximum position embeddings for the original model, used by yarn."""
 
     beta_fast: float = 32
     """Beta fast for YaRN RoPE, used by yarn."""
@@ -1291,3 +1294,17 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+        # TODO(boxiangw): Deprecate this check
+        if self.max_position_embeddings != 4096:
+            if self.original_max_position_embeddings == 4096:
+                # only override the original_max_position_embeddings if it is not set
+                self.original_max_position_embeddings = self.max_position_embeddings
+            self.max_position_embeddings = 4096
+            warnings.warn(
+                "MLA config max_position_embeddings is overridden by customer input, "
+                "please use the original_max_position_embeddings instead for YaRN!"
+                "max_position_embeddings will be deprecated in the future."
+                "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
+                "and assigned max_position_embeddings back to the original value."
+            )

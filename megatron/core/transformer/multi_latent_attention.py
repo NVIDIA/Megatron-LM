@@ -103,11 +103,12 @@ class MultiLatentAttention(Attention):
                 cp_group=self.model_comm_pgs.cp,
             )
         elif self.config.rope_type == "yarn":
+
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=self.config.rotary_base,
                 scaling_factor=self.config.rotary_scaling_factor,
-                original_max_position_embeddings=self.config.max_position_embeddings,
+                original_max_position_embeddings=self.config.original_max_position_embeddings,
                 beta_fast=self.config.beta_fast,
                 beta_slow=self.config.beta_slow,
                 mscale=self.config.mscale,
