@@ -510,7 +510,6 @@ class GPTModel(LanguageModule):
             return self.output_layer.weight
         return None
 
-
     def build_schedule_plan(
         self,
         input_ids: Tensor,
