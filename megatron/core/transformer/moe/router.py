@@ -218,7 +218,6 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mask of token to experts assignment.
         """
         if (self.config.moe_topk_router_fusion
-            and self.config.moe_router_pre_softmax == True
             and self.config.moe_expert_capacity_factor is None
             and is_experimental_enabled()):
             probs, routing_map, tokens_per_expert = fused_topk_softmax_without_capacity(
@@ -279,7 +278,6 @@ class TopKRouter(Router):
             routing_map (torch.Tensor): The mask of token to experts assignment.
         """
         if (self.config.moe_topk_router_fusion
-            and self.config.moe_router_pre_softmax == True
             and self.config.moe_expert_capacity_factor is None
             and is_experimental_enabled()):
             probs, routing_map, tokens_per_expert = fused_topk_softmax_without_capacity(

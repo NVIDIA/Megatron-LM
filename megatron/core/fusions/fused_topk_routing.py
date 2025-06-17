@@ -3,7 +3,7 @@
 import torch
 import triton
 import triton.language as tl
-
+from megatron.core.transformer.moe.moe_utils import topk_softmax_with_capacity
 
 @triton.jit
 def fused_topk_softmax_forward_kernel_with_group(
@@ -141,14 +141,15 @@ def fused_topk_softmax_forward_kernel_with_group(
         # Apply sigmoid first
         logits_fp32 = logits.to(tl.float32)
         logits_fp32 = tl.sigmoid(logits_fp32)
+        scores = logits_fp32.to(logits.dtype)
+        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
         if has_expert_bias:
             expert_bias = tl.load(expert_bias_ptr + expert_offs, mask=expert_mask)
-            logits_fp32 += expert_bias
-        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, logits_fp32, mask=expert_mask)
-        
-        # Then find topk
-        tl.store(group_view_temp_ptr + pid * num_experts + expert_offs, logits_fp32, mask=expert_mask)
-        
+            scores_for_routing = scores + expert_bias
+        else:
+            scores_for_routing = scores
+        # Then find topk 
+        tl.store(group_view_temp_ptr + pid * num_experts + expert_offs, scores_for_routing, mask=expert_mask)
         tl.debug_barrier()
 
         # Reshape scores into groups
@@ -202,7 +203,7 @@ def fused_topk_softmax_forward_kernel_with_group(
         score_mask = tl.load(group_mask_temp_ptr + pid * num_groups + expert_group_idx, mask=expert_mask)
 
         score_mask_bool = score_mask != 0
-        masked_scores = tl.where(score_mask_bool, logits_fp32, -float('inf'))
+        masked_scores = tl.where(score_mask_bool, scores_for_routing, -float('inf'))
 
         # Find topk experts
         data = masked_scores
@@ -285,12 +286,10 @@ def fused_topk_softmax_forward_kernel_without_group(
         for i in range(topk):
             max_val = tl.max(data, axis=0)
             max_idx = tl.argmax(data, axis=0)
-            tl.store(top_scores_ptr + pid * topk + i, max_val)
             tl.store(top_indices_ptr + pid * topk + i, max_idx)
             data = tl.where(expert_offs == max_idx, -float('inf'), data)
 
         tl.debug_barrier()
-        top_scores = tl.load(top_scores_ptr + pid * topk + topk_offs, mask=topk_mask)
         top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
         probs = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
 
@@ -299,24 +298,29 @@ def fused_topk_softmax_forward_kernel_without_group(
     elif score_function == "sigmoid":
         logits_fp32 = logits.to(tl.float32)
         logits_fp32 = tl.sigmoid(logits_fp32)
+        scores = logits_fp32.to(logits.dtype)
+        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
+        tl.debug_barrier()
+
         if has_expert_bias:
             expert_bias = tl.load(expert_bias_ptr + expert_offs, mask=expert_mask)
-            logits_fp32 += expert_bias
-        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, logits_fp32, mask=expert_mask)
-
+            scores_for_routing = scores + expert_bias
+            
+        else:
+            scores_for_routing = scores
+            
         # topk logits (num_experts -> topk)
-        data = logits_fp32
+        data = scores_for_routing
         for i in range(topk):
-            max_val = tl.max(data, axis=0)
             max_idx = tl.argmax(data, axis=0)
-            tl.store(top_scores_ptr + pid * topk + i, max_val)
             tl.store(top_indices_ptr + pid * topk + i, max_idx)
             data = tl.where(expert_offs == max_idx, -float('inf'), data)
 
         tl.debug_barrier()
-        top_scores = tl.load(top_scores_ptr + pid * topk + topk_offs, mask=topk_mask)
         top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
-        scores = top_scores.to(logits.dtype)
+        scores = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
+
+        tl.store(top_scores_ptr + pid * topk + topk_offs, scores, mask=topk_mask)
 
         # compute probs
         if topk > 1:
@@ -460,6 +464,9 @@ class TopkSoftmax(torch.autograd.Function):
         ctx.scaling_factor = scaling_factor if scaling_factor is not None else 0.0
         ctx.score_function = score_function
         ctx.use_pre_softmax = use_pre_softmax
+        
+        if score_function == "softmax":
+            assert use_pre_softmax == True, "use_pre_softmax must be True for softmax"
 
         # Get input dimensions
         num_tokens, num_experts = logits.shape
@@ -639,17 +646,34 @@ def fused_topk_softmax_without_capacity(
     Returns:
         Tuple of (routing probabilities, routing map, tokens per expert)
     """
-    return TopkSoftmax.apply(
-        logits,
-        topk,
-        capacity_factor,
-        pad_to_capacity,
-        drop_policy,
-        use_pre_softmax,
-        num_groups,
-        group_topk,
-        scaling_factor,
-        deterministic_mode,
-        score_function,
-        expert_bias,
-    )
+
+    if score_function == "softmax" and use_pre_softmax == False:
+        return topk_softmax_with_capacity(
+            logits,
+            topk,
+            capacity_factor,
+            pad_to_capacity,
+            drop_policy,
+            use_pre_softmax,
+            num_groups,
+            group_topk,
+            scaling_factor,
+            deterministic_mode,
+            score_function,
+            expert_bias,
+        )
+    else:
+        return TopkSoftmax.apply(
+            logits,
+            topk,
+            capacity_factor,
+            pad_to_capacity,
+            drop_policy,
+            use_pre_softmax,
+            num_groups,
+            group_topk,
+            scaling_factor,
+            deterministic_mode,
+            score_function,
+            expert_bias,
+        )
