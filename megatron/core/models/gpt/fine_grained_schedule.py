@@ -472,7 +472,6 @@ def build_model_chunk_schedule_plan(
     attention_mask: Tensor,
     decoder_input: Tensor = None,
     labels: Tensor = None,
-    inference_params=None,
     packed_seq_params=None,
     extra_block_kwargs=None,
     runtime_gather_output: Optional[bool] = None,
@@ -490,7 +489,6 @@ def build_model_chunk_schedule_plan(
         attention_mask: Attention mask.
         decoder_input: Decoder input tensor.
         labels: Labels for loss computation.
-        inference_params: Inference parameters.
         packed_seq_params: Parameters for packed sequences.
         extra_block_kwargs: Additional keyword arguments for blocks.
         runtime_gather_output: Whether to gather output at runtime.

@@ -10,7 +10,6 @@ from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference_params import InferenceParams
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -511,11 +510,6 @@ class GPTModel(LanguageModule):
             return self.output_layer.weight
         return None
 
-    def get_transformer_callables_by_layer(self, layer_number: int):
-        """
-        Get the callables for the layer at the given transformer layer number.
-        """
-        return self.decoder.get_layer_callables(layer_number)
 
     def build_schedule_plan(
         self,
@@ -524,10 +518,11 @@ class GPTModel(LanguageModule):
         attention_mask: Tensor,
         decoder_input: Tensor = None,
         labels: Tensor = None,
-        inference_params: InferenceParams = None,
+        inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
         extra_block_kwargs: dict = None,
         runtime_gather_output: Optional[bool] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
     ):
         """Builds a computation schedule plan for the model.
@@ -565,7 +560,6 @@ class GPTModel(LanguageModule):
             attention_mask,
             decoder_input=decoder_input,
             labels=labels,
-            inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             extra_block_kwargs=extra_block_kwargs,
             runtime_gather_output=runtime_gather_output,
