@@ -873,13 +873,8 @@ class TEGroupedMLP(MegatronModule):
         If an error occurs during execution, it is caught and re-raised with a
         descriptive message.
         """
-        try:
-            self.linear_fc2.backward_dw()
-            self.linear_fc1.backward_dw()
-        except Exception as e:
-            raise Exception(
-                f"Unknown error occurred during TEGroupedMLP backward_dw() execution: {str(e)}"
-            )
+        self.linear_fc2.backward_dw()
+        self.linear_fc1.backward_dw()
 
 
 class SequentialMLP(MegatronModule):
@@ -999,13 +994,8 @@ class SequentialMLP(MegatronModule):
 
     def backward_dw(self):
         """Backward pass for weight gradients in SequentialMLP."""
-        try:
-            for expert in self.local_experts:
-                expert.backward_dw()
-        except Exception as e:
-            raise Exception(
-                f"Unknown error occurred during SequentialMLP backward_dw() execution: {str(e)}"
-            )
+        for expert in self.local_experts:
+            expert.backward_dw()
 
     @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
