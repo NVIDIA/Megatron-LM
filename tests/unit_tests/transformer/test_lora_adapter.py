@@ -26,7 +26,8 @@ from tests.unit_tests.test_utilities import Utils
     "expert_tensor_parallel_size, tensor_model_parallel_size",
     [
         (1, 1),
-        (1, 2), 
+        # Every layer in TP mode leaks ~0.5GB of memory, resulting in 10GB of memory usage for 20 tests
+        # (1, 2),
         (2, 1),
         # EP2+TP2 requires sequence parallelism. LoraAdapter doesn't support sequence parallelism fully, thus the next line is commented out.
         # (2, 2),
