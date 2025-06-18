@@ -365,9 +365,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         node.common_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
-    def submodule_moe_forward(
-        node: ScheduleNode, dispatched_tokens: torch.Tensor
-    ):
+    def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
