@@ -58,176 +58,93 @@ def fused_topk_softmax_forward_kernel_with_group(
     # Load input logits
     logits = tl.load(logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
 
-    if score_function == "softmax":
-        # Apply softmax first
-        logits_fp32 = logits.to(tl.float32)
-        scores_fp32 = tl.softmax(logits_fp32)
-        scores = scores_fp32.to(logits.dtype)
-        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
-
-        # Then find topk
-        tl.store(group_view_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
-        
-        tl.debug_barrier()
-
-        # Reshape scores into groups
-        offs_m = tl.arange(0, BLOCK_SIZE_NUM_GROUPS)[:, None]
-        offs_n = tl.arange(0, BLOCK_SIZE_EXPERTS_PER_GROUP)[None, :]
-        indices = offs_m * experts_per_group + offs_n
-        mask = (offs_m < num_groups) & (offs_n < experts_per_group)
-        group_view = tl.load(group_view_temp_ptr + pid * num_experts + indices, mask=mask)
-
-        # Sort within each group
-        data = group_view
-        for i in range(topk_per_group):
-            max_idx = tl.argmax(data, axis=1)
-            max_val = tl.max(data, axis=1)
-            max_idx_reshaped = max_idx[:, None]
-            max_val_reshaped = max_val[:, None]
-            index = pid * num_groups * topk_per_group + offs_m * topk_per_group + i
-            tl.store(top_values_temp_ptr + index, max_val_reshaped)
-            data_mask = (offs_n == max_idx[:, None])
-            data = tl.where(data_mask, -float('inf'), data)
-
-        tl.debug_barrier()
-
-        # Calculate group scores
-        offs_n2 = tl.arange(0, BLOCK_SIZE_TOPK_PER_GROUP)[None, :]
-        top_values_offs = pid * num_groups * topk_per_group + offs_m * topk_per_group + offs_n2
-        top_values_mask = (offs_m < num_groups) & (offs_n2 < topk_per_group)
-        top_values = tl.load(top_values_temp_ptr + top_values_offs, mask=top_values_mask)
-
-        group_scores = tl.sum(top_values, axis=-1)
-
-        # Select top groups
-        data = group_scores
-        for i in range(group_topk):
-            max_idx = tl.argmax(data, axis=0)
-            tl.store(top_indices_temp2_ptr + pid * group_topk + i, max_idx)
-            data = tl.where(group_offs == max_idx, -float('inf'), data)
-
-        tl.debug_barrier()
-
-        group_idx = tl.load(top_indices_temp2_ptr + pid * group_topk + group_topk_offs, mask=group_topk_mask)
-        
-        # Create group mask
-        ones = tl.full([BLOCK_SIZE_GROUP_TOPK], 1, logits_ptr.dtype.element_ty)
-        tl.store(group_mask_temp_ptr + pid * num_groups + group_idx, ones, mask=group_topk_mask)
-
-        tl.debug_barrier()
-
-        # Apply group mask to scores
-        expert_group_idx = expert_offs // experts_per_group
-        score_mask = tl.load(group_mask_temp_ptr + pid * num_groups + expert_group_idx, mask=expert_mask)
-
-        score_mask_bool = score_mask != 0
-        masked_scores = tl.where(score_mask_bool, scores, -float('inf'))
-
-        # Find topk experts
-        data = masked_scores
-        for i in range(topk):
-            max_idx = tl.argmax(data, axis=0)
-            tl.store(top_indices_ptr + pid * topk + i, max_idx)
-            data = tl.where(expert_offs == max_idx, -float('inf'), data)
-
-        tl.debug_barrier()
-
-        top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
-        probs = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
-
-        tl.store(top_scores_ptr + pid * topk + topk_offs, probs, mask=topk_mask)
-
-    elif score_function == "sigmoid":
-        # Apply sigmoid first
-        logits_fp32 = logits.to(tl.float32)
-        logits_fp32 = tl.sigmoid(logits_fp32)
-        scores = logits_fp32.to(logits.dtype)
-        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
-        if has_expert_bias:
-            expert_bias = tl.load(expert_bias_ptr + expert_offs, mask=expert_mask)
-            scores_for_routing = scores + expert_bias
-        else:
-            scores_for_routing = scores
-        # Then find topk 
-        tl.store(group_view_temp_ptr + pid * num_experts + expert_offs, scores_for_routing, mask=expert_mask)
-        tl.debug_barrier()
-
-        # Reshape scores into groups
-        offs_m = tl.arange(0, BLOCK_SIZE_NUM_GROUPS)[:, None]
-        offs_n = tl.arange(0, BLOCK_SIZE_EXPERTS_PER_GROUP)[None, :]
-        indices = offs_m * experts_per_group + offs_n
-        mask = (offs_m < num_groups) & (offs_n < experts_per_group)
-        group_view = tl.load(group_view_temp_ptr + pid * num_experts + indices, mask=mask)
-
-        # Sort within each group
-        data = group_view
-        for i in range(topk_per_group):
-            max_idx = tl.argmax(data, axis=1)
-            max_val = tl.max(data, axis=1)
-            max_idx_reshaped = max_idx[:, None]
-            max_val_reshaped = max_val[:, None]
-            index = pid * num_groups * topk_per_group + offs_m * topk_per_group + i
-            tl.store(top_values_temp_ptr + index, max_val_reshaped)
-            data_mask = (offs_n == max_idx[:, None])
-            data = tl.where(data_mask, -float('inf'), data)
-
-        tl.debug_barrier()
-
-        # Calculate group scores
-        offs_n2 = tl.arange(0, BLOCK_SIZE_TOPK_PER_GROUP)[None, :]
-        top_values_offs = pid * num_groups * topk_per_group + offs_m * topk_per_group + offs_n2
-        top_values_mask = (offs_m < num_groups) & (offs_n2 < topk_per_group)
-        top_values = tl.load(top_values_temp_ptr + top_values_offs, mask=top_values_mask)
-
-        group_scores = tl.sum(top_values, axis=-1)
-
-        # Select top groups
-        data = group_scores
-        for i in range(group_topk):
-            max_idx = tl.argmax(data, axis=0)
-            tl.store(top_indices_temp2_ptr + pid * group_topk + i, max_idx)
-            data = tl.where(group_offs == max_idx, -float('inf'), data)
-
-        tl.debug_barrier()
-
-        group_idx = tl.load(top_indices_temp2_ptr + pid * group_topk + group_topk_offs, mask=group_topk_mask)
-        
-        # Create group mask
-        ones = tl.full([BLOCK_SIZE_GROUP_TOPK], 1, logits_ptr.dtype.element_ty)
-        tl.store(group_mask_temp_ptr + pid * num_groups + group_idx, ones, mask=group_topk_mask)
-
-        tl.debug_barrier()
-
-        # Apply group mask to scores
-        expert_group_idx = expert_offs // experts_per_group
-        score_mask = tl.load(group_mask_temp_ptr + pid * num_groups + expert_group_idx, mask=expert_mask)
-
-        score_mask_bool = score_mask != 0
-        masked_scores = tl.where(score_mask_bool, scores_for_routing, -float('inf'))
-
-        # Find topk experts
-        data = masked_scores
-        for i in range(topk):
-            max_idx = tl.argmax(data, axis=0)
-            tl.store(top_indices_ptr + pid * topk + i, max_idx)
-            data = tl.where(expert_offs == max_idx, -float('inf'), data)
-
-        tl.debug_barrier()
-
-        top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
-        top_scores = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
-
-        tl.store(top_scores_ptr + pid * topk + topk_offs, top_scores, mask=topk_mask)
-
-        # Normalize probabilities
-        if topk > 1:
-            sum_top_scores = tl.sum(top_scores, axis=0)
-            probs = top_scores / (sum_top_scores + 1e-20)
-        else:
-            probs = top_scores
-
+    # Apply sigmoid first
+    logits_fp32 = logits.to(tl.float32)
+    logits_fp32 = tl.sigmoid(logits_fp32)
+    scores = logits_fp32.to(logits.dtype)
+    tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
+    if has_expert_bias:
+        expert_bias = tl.load(expert_bias_ptr + expert_offs, mask=expert_mask)
+        scores_for_routing = scores + expert_bias
     else:
-        raise ValueError(f"Invalid score function: {score_function}")
+        scores_for_routing = scores
+    # Then find topk 
+    tl.store(group_view_temp_ptr + pid * num_experts + expert_offs, scores_for_routing, mask=expert_mask)
+    tl.debug_barrier()
+
+    # Reshape scores into groups
+    offs_m = tl.arange(0, BLOCK_SIZE_NUM_GROUPS)[:, None]
+    offs_n = tl.arange(0, BLOCK_SIZE_EXPERTS_PER_GROUP)[None, :]
+    indices = offs_m * experts_per_group + offs_n
+    mask = (offs_m < num_groups) & (offs_n < experts_per_group)
+    group_view = tl.load(group_view_temp_ptr + pid * num_experts + indices, mask=mask)
+
+    # Sort within each group
+    data = group_view
+    for i in range(topk_per_group):
+        max_idx = tl.argmax(data, axis=1)
+        max_val = tl.max(data, axis=1)
+        max_idx_reshaped = max_idx[:, None]
+        max_val_reshaped = max_val[:, None]
+        index = pid * num_groups * topk_per_group + offs_m * topk_per_group + i
+        tl.store(top_values_temp_ptr + index, max_val_reshaped)
+        data_mask = (offs_n == max_idx[:, None])
+        data = tl.where(data_mask, -float('inf'), data)
+
+    tl.debug_barrier()
+
+    # Calculate group scores
+    offs_n2 = tl.arange(0, BLOCK_SIZE_TOPK_PER_GROUP)[None, :]
+    top_values_offs = pid * num_groups * topk_per_group + offs_m * topk_per_group + offs_n2
+    top_values_mask = (offs_m < num_groups) & (offs_n2 < topk_per_group)
+    top_values = tl.load(top_values_temp_ptr + top_values_offs, mask=top_values_mask)
+
+    group_scores = tl.sum(top_values, axis=-1)
+
+    # Select top groups
+    data = group_scores
+    for i in range(group_topk):
+        max_idx = tl.argmax(data, axis=0)
+        tl.store(top_indices_temp2_ptr + pid * group_topk + i, max_idx)
+        data = tl.where(group_offs == max_idx, -float('inf'), data)
+
+    tl.debug_barrier()
+
+    group_idx = tl.load(top_indices_temp2_ptr + pid * group_topk + group_topk_offs, mask=group_topk_mask)
+    
+    # Create group mask
+    ones = tl.full([BLOCK_SIZE_GROUP_TOPK], 1, logits_ptr.dtype.element_ty)
+    tl.store(group_mask_temp_ptr + pid * num_groups + group_idx, ones, mask=group_topk_mask)
+
+    tl.debug_barrier()
+
+    # Apply group mask to scores
+    expert_group_idx = expert_offs // experts_per_group
+    score_mask = tl.load(group_mask_temp_ptr + pid * num_groups + expert_group_idx, mask=expert_mask)
+
+    score_mask_bool = score_mask != 0
+    masked_scores = tl.where(score_mask_bool, scores_for_routing, -float('inf'))
+
+    # Find topk experts
+    data = masked_scores
+    for i in range(topk):
+        max_idx = tl.argmax(data, axis=0)
+        tl.store(top_indices_ptr + pid * topk + i, max_idx)
+        data = tl.where(expert_offs == max_idx, -float('inf'), data)
+
+    tl.debug_barrier()
+
+    top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
+    top_scores = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
+
+    tl.store(top_scores_ptr + pid * topk + topk_offs, top_scores, mask=topk_mask)
+
+    # Normalize probabilities
+    if topk > 1:
+        sum_top_scores = tl.sum(top_scores, axis=0)
+        probs = top_scores / (sum_top_scores + 1e-20)
+    else:
+        probs = top_scores
 
     # Apply scaling factor if specified
     if scaling_factor != 0.0:
@@ -274,62 +191,39 @@ def fused_topk_softmax_forward_kernel_without_group(
     # Load input logits
     logits = tl.load(logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
 
-    if score_function == "softmax":
-        # Apply softmax first
-        logits_fp32 = logits.to(tl.float32)
-        scores_fp32 = tl.softmax(logits_fp32)
-        scores = scores_fp32.to(logits.dtype)
-        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
+    # Apply sigmoid first
+    logits_fp32 = logits.to(tl.float32)
+    logits_fp32 = tl.sigmoid(logits_fp32)
+    scores = logits_fp32.to(logits.dtype)
+    tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
+    tl.debug_barrier()
 
-        # Then find topk
-        data = scores
-        for i in range(topk):
-            max_val = tl.max(data, axis=0)
-            max_idx = tl.argmax(data, axis=0)
-            tl.store(top_indices_ptr + pid * topk + i, max_idx)
-            data = tl.where(expert_offs == max_idx, -float('inf'), data)
-
-        tl.debug_barrier()
-        top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
-        probs = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
-
-        tl.store(top_scores_ptr + pid * topk + topk_offs, probs, mask=topk_mask)
-
-    elif score_function == "sigmoid":
-        logits_fp32 = logits.to(tl.float32)
-        logits_fp32 = tl.sigmoid(logits_fp32)
-        scores = logits_fp32.to(logits.dtype)
-        tl.store(scores_temp_ptr + pid * num_experts + expert_offs, scores, mask=expert_mask)
-        tl.debug_barrier()
-
-        if has_expert_bias:
-            expert_bias = tl.load(expert_bias_ptr + expert_offs, mask=expert_mask)
-            scores_for_routing = scores + expert_bias
-            
-        else:
-            scores_for_routing = scores
-            
-        # topk logits (num_experts -> topk)
-        data = scores_for_routing
-        for i in range(topk):
-            max_idx = tl.argmax(data, axis=0)
-            tl.store(top_indices_ptr + pid * topk + i, max_idx)
-            data = tl.where(expert_offs == max_idx, -float('inf'), data)
-
-        tl.debug_barrier()
-        top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
-        scores = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
-
-        tl.store(top_scores_ptr + pid * topk + topk_offs, scores, mask=topk_mask)
-
-        # compute probs
-        if topk > 1:
-            sum_scores = tl.sum(scores) + 1e-20
-            probs = scores / sum_scores
-        else:
-            probs = scores
+    if has_expert_bias:
+        expert_bias = tl.load(expert_bias_ptr + expert_offs, mask=expert_mask)
+        scores_for_routing = scores + expert_bias
+        
     else:
-        raise ValueError(f"Invalid score function: {score_function}")
+        scores_for_routing = scores
+        
+    # topk logits (num_experts -> topk)
+    data = scores_for_routing
+    for i in range(topk):
+        max_idx = tl.argmax(data, axis=0)
+        tl.store(top_indices_ptr + pid * topk + i, max_idx)
+        data = tl.where(expert_offs == max_idx, -float('inf'), data)
+
+    tl.debug_barrier()
+    top_indices = tl.load(top_indices_ptr + pid * topk + topk_offs, mask=topk_mask)
+    scores = tl.load(scores_temp_ptr + pid * num_experts + top_indices, mask=topk_mask)
+
+    tl.store(top_scores_ptr + pid * topk + topk_offs, scores, mask=topk_mask)
+
+    # compute probs
+    if topk > 1:
+        sum_scores = tl.sum(scores) + 1e-20
+        probs = scores / sum_scores
+    else:
+        probs = scores
 
     # Apply scaling factor if specified
     if scaling_factor != 0.0:
@@ -353,7 +247,6 @@ def fused_topk_softmax_backward_kernel(
     num_experts: tl.constexpr,
     topk: tl.constexpr,
     scaling_factor: tl.constexpr,
-    score_function: tl.constexpr,
     BLOCK_SIZE_NUM_EXPERTS: tl.constexpr,
     BLOCK_SIZE_TOPK: tl.constexpr
 ):
@@ -377,44 +270,25 @@ def fused_topk_softmax_backward_kernel(
         grad_probs = grad_probs * scaling_factor
 
     # compute grad_scores
-    if score_function == "softmax":
+    if topk > 1:
+        top_scores = tl.load(top_scores_ptr + pid * topk + topk_offs, mask=topk_mask)
+        sum_top_scores = tl.sum(top_scores, -1) + 1e-20
+        grad_scores = (grad_probs * sum_top_scores - tl.sum((top_scores * grad_probs), -1)) / (sum_top_scores * sum_top_scores)
+    else:
         grad_scores = grad_probs
-        
-        # compute grad_logits(1)
-        tl.store(grad_logits_ptr + pid * num_experts + top_indices, grad_scores, mask=topk_mask)
 
-        # compute softmax
-        logits = tl.load(logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
-        logits_fp32 = logits.to(tl.float32)
-        scores_fp32 = tl.softmax(logits_fp32)
-        scores = scores_fp32.to(logits.dtype)
-        
-        # compute grad_logits(2)
-        tl.debug_barrier()
-        grad_logits = tl.load(grad_logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
-        sum_grad = tl.sum(scores * grad_logits, axis=0)
-        grad_logits = scores * (grad_logits - sum_grad)
+    # compute grad_logits(1)
+    tl.store(grad_logits_ptr + pid * num_experts + top_indices, grad_scores, mask=topk_mask)
 
-    elif score_function == "sigmoid":
-        if topk > 1:
-            top_scores = tl.load(top_scores_ptr + pid * topk + topk_offs, mask=topk_mask)
-            sum_top_scores = tl.sum(top_scores, -1) + 1e-20
-            grad_scores = (grad_probs * sum_top_scores - tl.sum((top_scores * grad_probs), -1)) / (sum_top_scores * sum_top_scores)
-        else:
-            grad_scores = grad_probs
+    # compute sig
+    logits = tl.load(logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
+    logits_fp32 = logits.to(tl.float32)
+    sig = tl.sigmoid(logits_fp32)
 
-        # compute grad_logits(1)
-        tl.store(grad_logits_ptr + pid * num_experts + top_indices, grad_scores, mask=topk_mask)
-
-        # compute sig
-        logits = tl.load(logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
-        logits_fp32 = logits.to(tl.float32)
-        sig = tl.sigmoid(logits_fp32)
-
-        # compute grad_logits(2)
-        tl.debug_barrier()
-        grad_logits = tl.load(grad_logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
-        grad_logits *= sig * (1 - sig)
+    # compute grad_logits(2)
+    tl.debug_barrier()
+    grad_logits = tl.load(grad_logits_ptr + pid * num_experts + expert_offs, mask=expert_mask)
+    grad_logits *= sig * (1 - sig)
 
     tl.store(grad_logits_ptr + pid * num_experts + expert_offs, grad_logits, mask=expert_mask)
 
@@ -604,7 +478,6 @@ class TopkSoftmax(torch.autograd.Function):
             num_experts,
             topk,
             scaling_factor,
-            score_function,
             BLOCK_SIZE_NUM_EXPERTS,
             BLOCK_SIZE_TOPK,
         )
@@ -647,7 +520,7 @@ def fused_topk_softmax_without_capacity(
         Tuple of (routing probabilities, routing map, tokens per expert)
     """
 
-    if score_function == "softmax" and use_pre_softmax == False:
+    if score_function == "softmax":
         return topk_softmax_with_capacity(
             logits,
             topk,

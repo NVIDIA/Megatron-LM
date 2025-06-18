@@ -28,7 +28,7 @@ class TestFusedTopkGating:
     @pytest.mark.parametrize("num_tokens", [2048, 4096])
     @pytest.mark.parametrize("num_experts", [32, 64])
     @pytest.mark.parametrize("topk", [6, 8])
-    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
+    @pytest.mark.parametrize("score_function", ["sigmoid"])
     @pytest.mark.parametrize("group_config", [
         (None, None),  
         (1, 1), 
@@ -71,7 +71,8 @@ class TestFusedTopkGating:
         
         scaling_factor = random.uniform(0.5, 2.0) if random.choice([True, False]) else None
 
-        use_pre_softmax = random.choice([True, False])
+        # For sigmoid, use_pre_softmax should be False
+        use_pre_softmax = False
         
         logits_pytorch = copy.deepcopy(logits)
         expert_bias_pytorch = copy.deepcopy(expert_bias) if expert_bias is not None else None
@@ -83,7 +84,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=use_pre_softmax,
+            use_pre_softmax=False,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -99,7 +100,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=use_pre_softmax,
+            use_pre_softmax=False,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -117,7 +118,7 @@ class TestFusedTopkGating:
     @pytest.mark.parametrize("num_tokens", [2048, 4096])
     @pytest.mark.parametrize("num_experts", [32, 64])
     @pytest.mark.parametrize("topk", [6, 8])
-    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
+    @pytest.mark.parametrize("score_function", ["sigmoid"])
     @pytest.mark.parametrize("group_config", [
         (None, None),  
         (1, 1),       
@@ -162,7 +163,8 @@ class TestFusedTopkGating:
         
         scaling_factor = random.uniform(0.5, 2.0) if random.choice([True, False]) else None
 
-        use_pre_softmax = random.choice([True, False])
+        # For sigmoid, use_pre_softmax should be False
+        use_pre_softmax = False
         
         logits_pytorch = copy.deepcopy(logits)
         expert_bias_pytorch = copy.deepcopy(expert_bias) if expert_bias is not None else None
@@ -174,7 +176,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=use_pre_softmax,
+            use_pre_softmax=False,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -190,7 +192,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=use_pre_softmax,
+            use_pre_softmax=False,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -238,12 +240,12 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=True,
+            use_pre_softmax=False,
             num_groups=None,
             group_topk=None,
             scaling_factor=None,
             deterministic_mode=False,
-            score_function="softmax",
+            score_function="sigmoid",
             expert_bias=None,
         )
         
@@ -254,12 +256,12 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=True,
+            use_pre_softmax=False,
             num_groups=None,
             group_topk=None,
             scaling_factor=None,
             deterministic_mode=False,
-            score_function="softmax",
+            score_function="sigmoid",
             expert_bias=None,
         )
         
@@ -283,12 +285,12 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=True,
+            use_pre_softmax=False,
             num_groups=None,
             group_topk=None,
             scaling_factor=None,
             deterministic_mode=False,
-            score_function="softmax",
+            score_function="sigmoid",
             expert_bias=None,
         )
         
@@ -298,7 +300,8 @@ class TestFusedTopkGating:
         
         # Verify probability sum is 1 (for each token)
         gates_sum = topk_masked_gates.sum(dim=1)
-        assert torch.allclose(gates_sum, torch.ones(num_tokens, device='cuda'), rtol=1e-6)
+        expected_sigmoid = torch.sigmoid(logits)
+        assert torch.allclose(topk_masked_gates, expected_sigmoid, rtol=1e-6)
 
     @pytest.mark.experimental
     def test_fused_topk_gating_with_scaling(self):
@@ -315,12 +318,12 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=True,
+            use_pre_softmax=False,
             num_groups=None,
             group_topk=None,
             scaling_factor=None,
             deterministic_mode=False,
-            score_function="softmax",
+            score_function="sigmoid",
             expert_bias=None,
         )
         
@@ -331,12 +334,12 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=True,
+            use_pre_softmax=False,
             num_groups=None,
             group_topk=None,
             scaling_factor=scaling_factor,
             deterministic_mode=False,
-            score_function="softmax",
+            score_function="sigmoid",
             expert_bias=None,
         )
         
@@ -348,8 +351,7 @@ class TestFusedTopkGating:
     @pytest.mark.parametrize("num_tokens", [2048, 4096])
     @pytest.mark.parametrize("num_experts", [32, 64])
     @pytest.mark.parametrize("topk", [6, 8])
-    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
-    @pytest.mark.parametrize("use_pre_softmax", [True, False])
+    @pytest.mark.parametrize("score_function", ["sigmoid"])
     @pytest.mark.parametrize("group_config", [
         (None, None),  
         (1, 1),       
@@ -360,7 +362,7 @@ class TestFusedTopkGating:
         (4, 3),       
         (4, 4),       
     ])
-    def test_fused_topk_gating_performance(self, num_tokens, num_experts, topk, score_function, use_pre_softmax, group_config):
+    def test_fused_topk_gating_performance(self, num_tokens, num_experts, topk, score_function, group_config):
         num_groups, group_topk = group_config
         
         # Skip invalid combinations
@@ -393,6 +395,9 @@ class TestFusedTopkGating:
             expert_bias.requires_grad = True
         
         scaling_factor = random.uniform(0.5, 2.0) if random.choice([True, False]) else None
+
+        # For sigmoid, use_pre_softmax should be False
+        use_pre_softmax = False
         
         logits_pytorch = copy.deepcopy(logits)
         expert_bias_pytorch = copy.deepcopy(expert_bias) if expert_bias is not None else None
@@ -496,9 +501,7 @@ class TestFusedTopkGating:
         # Measure fused version backward time
         fused_backward_time = 0
         for _ in range(100):
-            # 预先计算loss
             loss = (topk_masked_gates * topk_masked_gates_pytorch.detach()).sum()
-            # 只计时backward调用
             start_time.record()
             loss.backward(retain_graph=True)
             end_time.record()
@@ -514,9 +517,7 @@ class TestFusedTopkGating:
         # Measure PyTorch version backward time
         pytorch_backward_time = 0
         for _ in range(100):
-            # 预先计算loss
             loss_pytorch = (topk_masked_gates_pytorch * topk_masked_gates.detach()).sum()
-            # 只计时backward调用
             start_time.record()
             loss_pytorch.backward(retain_graph=True)
             end_time.record()
@@ -530,7 +531,9 @@ class TestFusedTopkGating:
         pytorch_backward_time /= 100
         
         # Print performance results
-        print(f"\nPerformance test results for {num_tokens}x{num_experts}, topk={topk}, score_function={score_function}, use_pre_softmax={use_pre_softmax}, num_groups={num_groups}, group_topk={group_topk}:")
+        expert_bias_info = "with expert_bias" if expert_bias is not None else "without expert_bias"
+        scaling_info = f"scaling_factor={scaling_factor:.2f}" if scaling_factor is not None else "no scaling"
+        print(f"\nPerformance test results for {num_tokens}x{num_experts}, topk={topk}, score_function={score_function}, use_pre_softmax={use_pre_softmax}, num_groups={num_groups}, group_topk={group_topk}, {expert_bias_info}, {scaling_info}:")
         print(f"Forward pass:")
         print(f"  Fused version: {fused_forward_time:.3f} ms")
         print(f"  PyTorch version: {pytorch_forward_time:.3f} ms")
