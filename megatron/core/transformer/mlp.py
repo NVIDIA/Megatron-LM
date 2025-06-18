@@ -311,7 +311,18 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
-            return torch.cat(sub_state_dict)
+            n = len(sub_state_dict)
+            m = sub_state_dict[0].shape[0]
+            k = sub_state_dict[0].shape[1]
+
+            # Merge everything into 0th tensor.
+            sub_state_dict[0].resize_([n*m, k])
+
+            for i in range(1, n):
+                sub_state_dict[0][i*m:, :] = sub_state_dict[i]
+                sub_state_dict[i].resize_([0, 0])
+
+            return sub_state_dict[0]
 
     return ShardedTensorFactory(
         original_sh_ten.key,
