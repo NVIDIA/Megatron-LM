@@ -16,6 +16,7 @@ from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
 from megatron.core.utils import log_single_rank
+from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
 
@@ -352,9 +353,14 @@ class GPTDataset(MegatronDataset):
         else:
             cache_hit = False
 
+        def is_dataset_built_on_rank():
+            return (
+                mpu.is_pipeline_first_stage() or mpu.is_pipeline_last_stage()
+            ) and mpu.get_tensor_model_parallel_rank() == 0
+            
         if not path_to_cache or (
             not cache_hit
-            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
+            and (not torch.distributed.is_initialized() or is_dataset_built_on_rank())
         ):
 
             log_single_rank(
