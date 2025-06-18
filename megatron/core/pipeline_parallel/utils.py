@@ -13,6 +13,13 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import make_viewless_tensor
 
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
+except ImportError:
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
+
 
 def make_viewless(e):
     """Make_viewless util func"""
@@ -258,17 +265,15 @@ class VppContextManager:
         parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)
 
 
-def unwrap_model(model):
-    """Unwrap_model DistributedDataParallel and Float16Module wrapped model
-    to return GPTModel instance
-    """
+def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
+    """Unwrap_model to return the final model instance"""
     return_list = True
     if not isinstance(model, list):
         model = [model]
         return_list = False
     unwrapped_model = []
     for model_module in model:
-        while isinstance(model_module, (DistributedDataParallel, Float16Module)):
+        while isinstance(model_module, module_instances):
             model_module = model_module.module
         assert isinstance(
             model_module, GPTModel
