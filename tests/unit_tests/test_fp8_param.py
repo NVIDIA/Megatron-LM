@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import os
 import sys
 
@@ -21,7 +22,7 @@ from megatron.training.global_vars import (
     set_args,
     set_global_variables,
 )
-from megatron.training.training import setup_model_and_optimizer
+from megatron.training.training import get_model, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -66,7 +67,9 @@ class TestFP8Param:
             rotary_percent=args.rotary_percent,
         )
 
-    def create_test_args(self, tp, recipe, sequence_length, micro_batch_size, **kwargs):
+    def create_test_args(
+        self, tp, recipe, sequence_length, micro_batch_size, inference=False, **kwargs
+    ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
@@ -89,7 +92,7 @@ class TestFP8Param:
         args.bf16 = True
         args.add_bias_linear = False
         args.swiglu = True
-        args.use_distributed_optimizer = True
+        args.use_distributed_optimizer = not inference
         args.fp8 = "e4m3"
         args.fp8_recipe = recipe
         args.fp8_param_gather = True
@@ -117,10 +120,10 @@ class TestFP8Param:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def run_test(self, tp_size, recipe, **kwargs):
+    def _run_test_helper(self, tp_size, recipe, inference: bool = False, **kwargs):
         """Test fp8_param with gpt_model."""
         args = self.create_test_args(
-            tp_size, recipe, self.seq_length, self.micro_batch_size, **kwargs
+            tp_size, recipe, self.seq_length, self.micro_batch_size, inference=inference, **kwargs
         )
 
         if recipe == "blockwise" and args.sequence_parallel:
@@ -134,15 +137,23 @@ class TestFP8Param:
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
         )
-        gpt_model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
-        )
+        if inference:
+            gpt_model = get_model(
+                self.model_provider, ModelType.encoder_or_decoder, wrap_with_ddp=False
+            )
+            gpt_model[0].eval()
+            optimizer = None
+        else:
+            gpt_model, optimizer, _ = setup_model_and_optimizer(
+                self.model_provider, ModelType.encoder_or_decoder
+            )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
         num_fp8_params = 0
         for _, param in gpt_model[0].named_parameters():
-            assert param.requires_grad
-            assert param.main_grad is not None
+            if not inference:
+                assert param.requires_grad
+                assert param.main_grad is not None
             if is_float8tensor(param):
                 num_fp8_params += 1
 
@@ -155,8 +166,9 @@ class TestFP8Param:
         assert num_fp8_params == 4 * fp8_layers
 
         for i in range(100):
-            gpt_model[0].zero_grad_buffer()
-            optimizer.zero_grad()
+            if not inference:
+                gpt_model[0].zero_grad_buffer()
+                optimizer.zero_grad()
 
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
@@ -171,6 +183,9 @@ class TestFP8Param:
             assert output.shape[0] == self.micro_batch_size
             assert output.shape[1] == self.seq_length
 
+            if inference:
+                continue
+
             # Verify gradients
             loss = output.mean()
             loss.backward()
@@ -179,6 +194,12 @@ class TestFP8Param:
 
             update_successful, _, _ = optimizer.step()
             assert update_successful
+
+    def run_test(self, tp_size, recipe, inference: bool = False, **kwargs):
+        """Test fp8_param with gpt_model."""
+        ctx = torch.inference_mode if inference else contextlib.nullcontext
+        with ctx():
+            self._run_test_helper(tp_size, recipe, inference=inference, **kwargs)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.parametrize("tp_size", [4])
@@ -190,6 +211,12 @@ class TestFP8Param:
     @pytest.mark.parametrize("tp_size", [4])
     def test_tensorwise_scaling(self, tp_size):
         self.run_test(tp_size=tp_size, recipe="tensorwise")
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
+    @pytest.mark.parametrize("tp_size", [4])
+    def test_tensorwise_scaling_inference(self, tp_size):
+        self.run_test(tp_size=tp_size, recipe="tensorwise", inference=True)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")

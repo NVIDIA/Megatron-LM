@@ -11,16 +11,15 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
-from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import TextGenerationController
-from megatron.core.transformer.module import MegatronModule
-from megatron.training import (
-    get_args,
-    get_model as _get_model,
-    get_tokenizer,
-    initialize_megatron,
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
 )
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
+from megatron.core.transformer.module import MegatronModule
+from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider
 
@@ -33,9 +32,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     add_common_inference_args(parser)
 
     group = parser.add_argument_group(title='Dynamic inference')
-    group.add_argument("--inference-ckpt-non-strict", action="store_true",
-                       help="Load checkpoint with `strict=False`.")
-    
+    group.add_argument(
+        "--inference-ckpt-non-strict",
+        action="store_true",
+        help="Load checkpoint with `strict=False`.",
+    )
 
     return parser
 
@@ -68,10 +69,7 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context(
-    requests: List[Request],
-    sampling_params: SamplingParams,
-):
+def get_inference_context(requests: List[Request], sampling_params: SamplingParams):
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
@@ -86,7 +84,9 @@ def get_inference_context(
         params_dtype=args.params_dtype,
         num_layers=args.num_layers,
         kv_channels=args.kv_channels,
-        num_attention_heads=args.num_query_groups if args.group_query_attention else args.num_attention_heads,
+        num_attention_heads=(
+            args.num_query_groups if args.group_query_attention else args.num_attention_heads
+        ),
         max_sequence_length=max_sequence_length,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
@@ -101,8 +101,7 @@ def get_inference_context(
 
 
 def get_inference_controller(
-    model: MegatronModule,
-    context: DynamicInferenceContext,
+    model: MegatronModule, context: DynamicInferenceContext
 ) -> TextGenerationController:
     """Buid text generation controller, which manages the model inference context.
 
@@ -122,9 +121,9 @@ def get_inference_controller(
 
     # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
     from megatron.core import parallel_state
+
     model.model_is_pipeline_parallel = not (
-        parallel_state.is_pipeline_first_stage() and
-        parallel_state.is_pipeline_last_stage()
+        parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
     )
 
     # Text generation controller.
@@ -134,9 +133,7 @@ def get_inference_controller(
 
 
 def run_inference(
-    requests: List[Request],
-    sampling_params: SamplingParams,
-    engine: DynamicInferenceEngine,
+    requests: List[Request], sampling_params: SamplingParams, engine: DynamicInferenceEngine
 ) -> None:
     """Add requests to engine and generate tokens.
 
@@ -204,24 +201,22 @@ def run_inference(
                 request.output_text = finished_request.generated_text
                 request.state = "finished"
                 num_requests_finished += 1
-            
+
             output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
-        if not (engine.has_unfinished_requests() or
-                num_requests_added < num_requests_total):
+        if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
     return step_times, add_times, output_times
 
 
-if __name__ == "__main__":
-
+@torch.inference_mode()
+def main():
     # Initialize Megatron.
     initialize_megatron(
         extra_args_provider=add_dynamic_inference_args,
-        args_defaults={'no_load_rng': True,
-                       'no_load_optim': True},
+        args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
 
     args = get_args()
@@ -243,32 +238,38 @@ if __name__ == "__main__":
     controller = get_inference_controller(model, context)
 
     # Inference engine.
-    engine = DynamicInferenceEngine(controller,
-                                    context,
-                                    termination_id=tokenizer.eod,
-                                    enable_cuda_graph=args.enable_cuda_graph,
-                                    random_seed=args.seed)
+    engine = DynamicInferenceEngine(
+        controller,
+        context,
+        termination_id=tokenizer.eod,
+        enable_cuda_graph=args.enable_cuda_graph,
+        random_seed=args.seed,
+    )
 
     # Print setup.
-    setup_prefix = "dynamic | cg %d | %s | bf %.0f, flw %.1f [r %d, t %d], gtd %.2f [r %d] ... reqs %d" % (
-        args.enable_cuda_graph,
-        (
-            f"<user prompts, n {len(args.prompts)}>"
-            if args.prompts else
-            "<auto prompts> %s, %d, %.1e, %.1e" % (
-                "(%s)" % " ".join(map(str, args.num_tokens_to_prompt)),
-                args.num_tokens_to_generate,
-                args.incoming_requests_duration,
-                args.incoming_requests_per_sec,
-            )
-        ),
-        args.inference_dynamic_batching_buffer_size_gb,
-        args.inference_dynamic_batching_buffer_overflow_factor,
-        context.max_requests,
-        context.max_tokens,
-        args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        context.gtd_request_count,
-        len(requests),
+    setup_prefix = (
+        "dynamic | cg %d | %s | bf %.0f, flw %.1f [r %d, t %d], gtd %.2f [r %d] ... reqs %d"
+        % (
+            args.enable_cuda_graph,
+            (
+                f"<user prompts, n {len(args.prompts)}>"
+                if args.prompts
+                else "<auto prompts> %s, %d, %.1e, %.1e"
+                % (
+                    "(%s)" % " ".join(map(str, args.num_tokens_to_prompt)),
+                    args.num_tokens_to_generate,
+                    args.incoming_requests_duration,
+                    args.incoming_requests_per_sec,
+                )
+            ),
+            args.inference_dynamic_batching_buffer_size_gb,
+            args.inference_dynamic_batching_buffer_overflow_factor,
+            context.max_requests,
+            context.max_tokens,
+            args.inference_dynamic_batching_buffer_guaranteed_fraction,
+            context.gtd_request_count,
+            len(requests),
+        )
     )
     print("~~~")
     print(setup_prefix)
@@ -297,24 +298,34 @@ if __name__ == "__main__":
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]
-            print(f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... %s" % request.output_text.replace("\n", "\\n"))
+            print(
+                f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... %s"
+                % request.output_text.replace("\n", "\\n")
+            )
 
     # Timing results.
     stats = torch.cuda.memory_stats()
     print("~~~")
-    print("%s ... mem %.1f/%.1f ... total time: %.3f ... step time: total %.3f [ p %.3f, d %.3f ], mean [ p %.3f, d %.3f ], count [ p %d, d %d ] ... add time: %.3f, output time: %.3f." % (
-        setup_prefix,
-        stats["allocated_bytes.all.peak"] / (1024**3),
-        stats["reserved_bytes.all.peak"] / (1024**3),
-        sum(step_times["prefill"]) + sum(step_times["decode"]) + sum(add_times),
-        sum(step_times["prefill"]) + sum(step_times["decode"]),
-        sum(step_times["prefill"]),
-        sum(step_times["decode"]),
-        sum(step_times["prefill"]) / len(step_times["prefill"]),
-        sum(step_times["decode"]) / len(step_times["decode"]),
-        len(step_times["prefill"]),
-        len(step_times["decode"]),
-        sum(add_times),
-        sum(output_times),
-    ))
+    print(
+        "%s ... mem %.1f/%.1f ... total time: %.3f ... step time: total %.3f [ p %.3f, d %.3f ], mean [ p %.3f, d %.3f ], count [ p %d, d %d ] ... add time: %.3f, output time: %.3f."
+        % (
+            setup_prefix,
+            stats["allocated_bytes.all.peak"] / (1024**3),
+            stats["reserved_bytes.all.peak"] / (1024**3),
+            sum(step_times["prefill"]) + sum(step_times["decode"]) + sum(add_times),
+            sum(step_times["prefill"]) + sum(step_times["decode"]),
+            sum(step_times["prefill"]),
+            sum(step_times["decode"]),
+            sum(step_times["prefill"]) / len(step_times["prefill"]),
+            sum(step_times["decode"]) / len(step_times["decode"]),
+            len(step_times["prefill"]),
+            len(step_times["decode"]),
+            sum(add_times),
+            sum(output_times),
+        )
+    )
     print("~~~")
+
+
+if __name__ == "__main__":
+    main()
