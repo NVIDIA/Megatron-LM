@@ -344,14 +344,20 @@ class MegatronOptimizer(ABC):
         """
         # Define groups order that is needed in the current optimizer (coming from runtime)
         needed_groups = [
-            tuple(g[key] for key in param_group_identifier_keys) for g in current_groups
+            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
+            for g in current_groups
         ]
 
         # Keep state_dict param group order since groups are LocalNonpersistentObject
         # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
         loaded_groups_map = {
-            tuple(group[key] for key in param_group_identifier_keys): group
+            tuple(
+                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
+                group[key] if key in group else group[f"pre_{key}"]
+                for key in param_group_identifier_keys
+            ): group
             for group in state_dict_groups
         }
 
