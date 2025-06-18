@@ -121,6 +121,7 @@ def add_text_generate_args(parser):
     return parser
 
 
+@torch.inference_mode()
 def main(model_provider: str = "gpt"):
     """Runs the text generation server with the specified model provider."""
     initialize_megatron(

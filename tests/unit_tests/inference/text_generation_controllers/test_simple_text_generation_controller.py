@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 import torch
+from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts import StaticInferenceContext
@@ -36,15 +37,15 @@ from tests.unit_tests.test_utilities import Utils
 
 class TestTextGenerationController:
 
-    def setup_model(self, dtype, symmetric_ar_type=None):
+    def setup_model(self, dtype, symmetric_ar_type=None, fp8: bool = False):
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 12
         self.vocab_size = 100
-        self.sequence_length = 64
+        self.sequence_length = 60 if fp8 else 64  # Test padding for fp8
         transformer_config = TransformerConfig(
             num_layers=4,
             hidden_size=self.hidden_size,
@@ -53,6 +54,9 @@ class TestTextGenerationController:
             attention_backend=AttnBackend.local,
             params_dtype=dtype,
             symmetric_ar_type=symmetric_ar_type,
+            fp8="hybrid" if fp8 else None,
+            fp8_recipe="tensorwise" if fp8 else None,
+            fp8_param=fp8,
         )
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
@@ -73,7 +77,7 @@ class TestTextGenerationController:
             hidden_size=self.hidden_size,
             inference_batch_times_seqlen_threshold=-1,
             inference_max_seq_length=2048,
-            inference_max_requests=self.batch_size,
+            inference_max_requests=16 if fp8 else self.batch_size,
             fp32_residual_connection=False,
             params_dtype=dtype,
             padded_vocab_size=self.vocab_size,
@@ -196,8 +200,18 @@ class TestTextGenerationController:
             ),
         ],
     )
-    def test_generate_all_output_tokens_static_batch(self, dtype, symmetric_ar_type):
-        self.setup_model(dtype, symmetric_ar_type)
+    @pytest.mark.parametrize("fp8", [False, True])
+    def test_generate_all_output_tokens_static_batch(self, dtype, symmetric_ar_type, fp8):
+        if fp8:
+            fp8_available, reason_for_no_fp8 = check_fp8_support()
+            if not fp8_available:
+                pytest.skip(reason_for_no_fp8)
+            elif not is_te_min_version("2.2.0"):
+                pytest.skip(reason="TE 2.2.0 is required")
+            elif dtype != torch.bfloat16:
+                pytest.skip("Only testing fp8 inference with bf16 params")
+
+        self.setup_model(dtype, symmetric_ar_type, fp8)
         self.mock_tokenizer.vocab_size = self.vocab_size
         self.mock_tokenizer.eod = self.vocab_size - 1
         self.mock_tokenizer.detokenize.side_effect = lambda x, skip_special_tokens=False: ' '.join(

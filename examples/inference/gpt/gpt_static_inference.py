@@ -131,6 +131,7 @@ async def generate(
     return results
 
 
+@torch.inference_mode()
 def main():
     """Main program."""
 

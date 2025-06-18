@@ -385,6 +385,7 @@ if HAVE_TE:
             We return nullcontext() when: a) not using fp8 to train, b) layer_no is a layer
             that needs to be trained in bf16.
         """
+
         num_bf16_layers_at_start = (
             config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
         )
@@ -478,7 +479,7 @@ if HAVE_TE:
                 if "preserve_high_precision_init_val" in (
                     inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
                 ):
-                    context_args["preserve_high_precision_init_val"] = True
+                    context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
                 fp8_context = transformer_engine.pytorch.fp8_model_init(**context_args)
 
             # First / last layer in bf16 isn't supported with delayed scaling since it

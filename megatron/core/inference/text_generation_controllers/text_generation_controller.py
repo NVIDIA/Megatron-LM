@@ -27,6 +27,16 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.utils import get_model_config
 
+try:
+
+    from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+
+    HAVE_TE = True
+
+except ImportError:
+
+    HAVE_TE = False
+
 
 class TextGenerationController:
     """The text generation controller (the main sampling loop)
@@ -345,6 +355,7 @@ class TextGenerationController:
         batch_prompt_tokens_list: List[List[int]],
         padded_batch_size: int,
         padded_sequence_length: int,
+        fp8_padding: Optional[Fp8Padding] = None,
     ) -> torch.Tensor:
         """Method to pad input prompts
 
@@ -354,10 +365,13 @@ class TextGenerationController:
             batch_prompt_tokens_list (List[List[int]]): A list containing the prompt tokens
             padded_batch_size (int): The maximum number of requests for this batch
             padded_sequence_length (int): The maximum number of input + output tokens for this batch
+            fp8_padding (Fp8Padding): An optional Fp8Padding module
 
         Returns:
             torch.Tensor: A torch tensor of shape [padded_batch_size, padded_sequence_length]
         """
+        batch_size = len(batch_prompt_tokens_list)
+
         # Pad existing tokens to maximum sequence length
         for prompt_tokens in batch_prompt_tokens_list:
             padding_size = padded_sequence_length - len(prompt_tokens)
@@ -372,7 +386,30 @@ class TextGenerationController:
 
         tokens = torch.tensor(padded_prompt_tokens_list, device=torch.cuda.current_device())
 
+        if fp8_padding is not None:
+            tokens, _ = fp8_padding(tokens, [batch_size])
+
         return tokens
+
+    def unpad_input_prompt_tokens(
+        self,
+        padded_batch_prompt_tokens: torch.Tensor,
+        original_batch_size: int,
+        fp8_unpadding: Optional[Fp8Unpadding] = None,
+    ):
+        """Truncates the given input tensor back to the original prompt size before padding.
+
+        Args:
+            padded_batch_prompt_tokens (torch.Tensor): The padded tokens tensor
+            original_batch_size (int): The original batch size before padding
+            fp8_unpadding (Fp8UnPadding): An optional Fp8UnpaddingPadding module
+        """
+        if fp8_unpadding is not None:
+            padded_batch_prompt_tokens = fp8_unpadding(
+                padded_batch_prompt_tokens, [original_batch_size]
+            )
+
+        return padded_batch_prompt_tokens[:original_batch_size]
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(
@@ -540,6 +577,8 @@ class TextGenerationController:
         # For batch inference the sampling params are the same for all request
         sampling_params: SamplingParams = list(active_requests.values())[0].sampling_params
 
+        model_config = get_model_config(self.inference_wrapped_model.model)
+
         # Verify that if echo mode is requested we do not generate any new tokens
         echo = getattr(sampling_params, "echo", False)
         assert (
@@ -549,7 +588,21 @@ class TextGenerationController:
             sampling_params.add_attributes({"echo": True})
 
         # Check whether CUDA graphs are enabled
-        enable_cuda_graph = get_model_config(self.inference_wrapped_model.model).enable_cuda_graph
+        enable_cuda_graph = model_config.enable_cuda_graph
+
+        # Check whether inference will be in FP8
+        fp8 = model_config.fp8
+
+        if fp8:
+            assert HAVE_TE, "FP8 requires TE."
+            # Only a single GEMM is necessary here because we expect non-grouped GEMMs for
+            # generic models. MoE models will handle padding separately in the expert layer.
+            num_gemms = 1
+            self.fp8_padding = Fp8Padding(num_gemms)
+            self.fp8_unpadding = Fp8Unpadding(num_gemms)
+        else:
+            self.fp8_padding = None
+            self.fp8_unpadding = None
 
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
@@ -561,10 +614,15 @@ class TextGenerationController:
             self.inference_wrapped_model.inference_wrapper_config.inference_max_seq_length
         )
         padded_batch_size = inference_max_batch_size if enable_cuda_graph else batch_size
+        if padded_batch_size > inference_max_batch_size:
+            raise ValueError(
+                f"Padded batch size {padded_batch_size} > max batch size {inference_max_batch_size}"
+            )
         padded_batch_prompt_tokens = self.pad_input_prompt_tokens(
             batch_prompt_tokens_list,
             padded_batch_size=padded_batch_size,
             padded_sequence_length=max_sequence_length,
+            fp8_padding=self.fp8_padding,
         )
 
         # Verify that output sequence length is within configured limit
@@ -630,9 +688,7 @@ class TextGenerationController:
 
             # If using symmetric kernels and we are using using nccl
             # for prefill turn off symmetric kernels
-            symmetric_ar_type = get_model_config(
-                self.inference_wrapped_model.model
-            ).symmetric_ar_type
+            symmetric_ar_type = model_config.symmetric_ar_type
             nccl_all_reduce_for_prefill = (
                 self.inference_wrapped_model.inference_wrapper_config.nccl_all_reduce_for_prefill
             )
@@ -674,15 +730,16 @@ class TextGenerationController:
                     inference_input_for_context_window
                 )
 
-                if enable_cuda_graph:
-                    # Undo padding up to maximum batch size if necessary
-                    batch_prompt_tokens = padded_batch_prompt_tokens[:batch_size]
-                    if is_pipeline_last_stage(self.pp_group):
-                        logits = logits[:batch_size]
+                # Undo padding if necessary
+                batch_prompt_tokens = self.unpad_input_prompt_tokens(
+                    padded_batch_prompt_tokens, batch_size, self.fp8_unpadding
+                )
+                assert batch_prompt_tokens.shape[0] == batch_size, batch_prompt_tokens.shape[0]
+                if is_pipeline_last_stage(self.pp_group):
+                    logits = logits[:batch_size]
 
+                if enable_cuda_graph:
                     create_cudagraphs()
-                else:
-                    batch_prompt_tokens = padded_batch_prompt_tokens
 
                 if self.model_is_pipeline_parallel:
                     context_length = context_end_position - context_start_position
