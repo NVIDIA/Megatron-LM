@@ -8,10 +8,11 @@ import torch
 from torch.autograd import Variable
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import make_viewless_tensor
+from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
