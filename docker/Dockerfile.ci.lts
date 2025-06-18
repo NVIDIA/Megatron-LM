@@ -70,7 +70,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     --mount=type=secret,id=LOGGER_INDEX_URL bash -ex <<"EOF"
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
-    uv pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS
-    uv pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL
+    uv pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS "setuptools<80.0.0"
+    uv pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL "setuptools<80.0.0"
 EOF
 ###

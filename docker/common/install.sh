@@ -64,11 +64,12 @@ uv sync \
 # only for dev
 if [ "$ENVIRONMENT" = "dev" ]; then
     uv pip install --no-cache-dir --no-deps $TE_WHEEL \
-        "nvidia-modelopt[torch]>=0.29.0"
+        "nvidia-modelopt[torch]>=0.29.0" "setuptools<80.0.0"
 fi
 
 # Install heavy optional deps like mamba, causalconv1d, groupedgemm
 uv pip install --no-cache-dir \
     $MAMBA_WHEEL \
     $CAUSALCONV1D_WHEEL \
-    $GROUPEDGEMM_WHEEL
+    $GROUPEDGEMM_WHEEL \
+    "setuptools<80.0.0"
