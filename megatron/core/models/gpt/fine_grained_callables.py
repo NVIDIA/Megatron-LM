@@ -361,25 +361,28 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # backward graph from connecting to attn submodule
             token_dispatcher._comm_manager.token_probs = probs
 
-        return layer.mlp.dispatch(local_tokens, probs)
+        dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
+        node.common_state.dispatched_probs = node.detach(dispatched_probs)
+        return dispatched_tokens
 
     def submodule_moe_forward(
-        node: ScheduleNode, dispatched_tokens: torch.Tensor, probs: torch.Tensor
+        node: ScheduleNode, dispatched_tokens: torch.Tensor
     ):
         """
         Run forward pass for computations between dispatch and combine:
             post dispatch->experts->combine preprocess
         """
         shared_expert_output = None
+        dispatched_probs = node.common_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
-            token_dispatcher._comm_manager.dispatched_probs = probs
+            token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
         pre_mlp_layernorm_output = getattr(node.common_state, 'pre_mlp_layernorm_output', None)
         expert_output, shared_expert_output, mlp_bias = layer.mlp.experts_compute(
-            dispatched_tokens, probs, pre_mlp_layernorm_output
+            dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
         )
 
         if layer.recompute_pre_mlp_layernorm:
@@ -388,6 +391,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
         # release tensor reference after use
+        node.common_state.dispatched_probs = None
         node.common_state.pre_mlp_layernorm_output = None
         if shared_expert_output is None:
             # Return only expert_output, since shared_expert_output causes backward on None
