@@ -10,10 +10,10 @@ from torch import Tensor
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.fine_grained_callables import (
-    TransformerLayerState,
     PostProcessNode,
     PreProcessNode,
     TransformerLayerNode,
+    TransformerLayerState,
     build_layer_callables,
 )
 from megatron.core.pipeline_parallel.utils import (
