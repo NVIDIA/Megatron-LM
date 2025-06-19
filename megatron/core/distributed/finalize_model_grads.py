@@ -198,6 +198,7 @@ def _reset_global_aux_loss_tracker(model: List[torch.nn.Module]):
             if hasattr(module, 'reset_global_aux_loss_tracker'):
                 module.reset_global_aux_loss_tracker()
 
+
 def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
     """
     Update the expert bias of the router for a global batch.
