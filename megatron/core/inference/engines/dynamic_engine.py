@@ -173,11 +173,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if result is not None:
             request_ids, finished_request_ids, sample = result
             self.finished_request_count += finished_request_ids.numel()
+            finished_request_id_set = set(finished_request_ids.tolist())
 
             for request_id, token in zip(request_ids.tolist(), sample.tolist()):
                 request: DynamicInferenceRequest = self.requests[request_id]
                 request.generated_tokens.append(token)
-                if request_id in finished_request_ids:
+                if request_id in finished_request_id_set:
                     request.status = Status.COMPLETED
                     finished_request = self.requests.pop(request_id)
                     finished_request.generated_length = len(finished_request.generated_tokens)
