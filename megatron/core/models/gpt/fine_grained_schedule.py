@@ -10,6 +10,7 @@ from torch import Tensor
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.fine_grained_callables import (
+    TransformerLayerState,
     PostProcessNode,
     PreProcessNode,
     TransformerLayerNode,
@@ -56,6 +57,7 @@ class LayerSchedulePlan:
             comp_stream (torch.cuda.Stream): CUDA stream for computation.
             com_stream (torch.cuda.Stream): CUDA stream for communication.
         """
+        self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
         self.event = event
@@ -87,6 +89,7 @@ class LayerSchedulePlan:
             return TransformerLayerNode(
                 stream,
                 event,
+                self.layer_state,
                 self.chunk_state,
                 module,
                 name=name,
