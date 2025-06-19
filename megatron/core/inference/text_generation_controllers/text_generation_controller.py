@@ -467,7 +467,8 @@ class TextGenerationController:
         finished_request_ids = context.request_ids[finished_idxs]
 
         # Update requests.
-        context.update_requests(active_request_mask, new_sample)
+        # New sample gets updated in update_requests, so we pass in a clone
+        context.update_requests(active_request_mask, new_sample.clone())
 
         return current_request_ids, finished_request_ids, new_sample
 

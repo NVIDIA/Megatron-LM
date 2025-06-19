@@ -845,6 +845,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             kv_chunks_asigned = self.request_to_kv_chunk_ids[finished_idxs]
             non_zero_values_in_kv_memory = kv_chunks_asigned[kv_chunks_asigned != -1]
             self.chunk_allocator.release_memory_chunks(non_zero_values_in_kv_memory)
+            self.request_to_kv_chunk_ids[finished_idxs].fill_(-1)
 
             if active_request_count > 0:
                 finished_idxs_on_left = (
