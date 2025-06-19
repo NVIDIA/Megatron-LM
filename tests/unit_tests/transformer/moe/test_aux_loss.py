@@ -292,7 +292,7 @@ class TestRouterAuxLoss:
         scores_second_batch, _ = aux_loss_router(hidden_states[:, 1:, :])
 
         # setting grad to 0 to only backward aux loss
-        (scores_first_batch+scores_second_batch).backward(torch.zeros_like(scores_first_batch))
+        (scores_first_batch + scores_second_batch).backward(torch.zeros_like(scores_first_batch))
 
         grad1 = aux_loss_router.weight.grad.clone()
 
@@ -300,7 +300,7 @@ class TestRouterAuxLoss:
         seq_aux_loss_router.weight.grad = None
         scores2, routing_map2 = seq_aux_loss_router(hidden_states)
         # setting grad to 0 to only backward aux loss
-        scores2.backward(torch.zeros_like(scores2)) 
+        scores2.backward(torch.zeros_like(scores2))
         grad2 = seq_aux_loss_router.weight.grad.clone() * 2
 
         aux_loss = tracker["load_balancing_loss"]["values"][0] / 2
@@ -310,7 +310,6 @@ class TestRouterAuxLoss:
 
         torch.testing.assert_close(aux_loss, seq_aux_loss)
         torch.testing.assert_close(grad1, grad2)
-
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
