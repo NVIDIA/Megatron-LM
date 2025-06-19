@@ -167,7 +167,9 @@ class TestTop2Router:
         self.router.config.moe_token_drop_policy = drop_policy
         self.router.config.moe_pad_expert_input_to_capacity = pad_to_capacity
 
-        hidden_states = torch.randn((num_tokens, self.router.config.hidden_size), device="cuda")
+        hidden_states = torch.randn(
+            (num_tokens, self.router.config.hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
         hidden_states.requires_grad = True
         probs, routing_map = self.router(hidden_states)
 

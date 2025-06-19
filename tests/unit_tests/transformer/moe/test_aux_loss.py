@@ -217,7 +217,7 @@ class TestRouterAuxLoss:
         model_parallel_cuda_manual_seed(42)
 
         # Test that with batch_size=1, aux_loss and seq_aux_loss should be the same
-        router1 = self.new_router(
+        aux_loss_router = self.new_router(
             moe_router_load_balancing_type="aux_loss",
             moe_aux_loss_coeff=1.0,
             moe_router_dtype="fp64",
@@ -225,7 +225,7 @@ class TestRouterAuxLoss:
             expert_tensor_parallel_size=ep_size,
             context_parallel_size=cp_size,
         ).cuda()
-        router2 = self.new_router(
+        seq_aux_loss_router = self.new_router(
             moe_router_load_balancing_type="seq_aux_loss",
             moe_aux_loss_coeff=1.0,
             moe_router_dtype="fp64",
@@ -236,7 +236,7 @@ class TestRouterAuxLoss:
 
         # Set identical weights for fair comparison
         with torch.no_grad():
-            router2.weight.copy_(router1.weight)
+            seq_aux_loss_router.weight.copy_(aux_loss_router.weight)
 
         ### MBS=1 case: results should be identical ###
         clear_aux_losses_tracker()
@@ -244,108 +244,73 @@ class TestRouterAuxLoss:
         batch_size = 1
         with get_cuda_rng_tracker().fork():
             hidden_states = torch.randn(
-                (seq_len, batch_size, router1.config.hidden_size),
+                (seq_len, batch_size, aux_loss_router.config.hidden_size),
                 device=torch.device("cuda"),
                 dtype=torch.bfloat16,
             )
 
         # Forward pass for aux_loss router
-        router1.weight.grad = None
-        scores1, routing_map1 = router1(hidden_states)
+        aux_loss_router.weight.grad = None
+        scores1, routing_map1 = aux_loss_router(hidden_states)
         loss1 = scores1.sum()
         loss1.backward()
-        grad1 = router1.weight.grad.clone()
+        grad1 = aux_loss_router.weight.grad.clone()
 
         # Forward pass for seq_aux_loss router
-        router2.weight.grad = None
-        scores2, routing_map2 = router2(hidden_states)
+        seq_aux_loss_router.weight.grad = None
+        scores2, routing_map2 = seq_aux_loss_router(hidden_states)
         loss2 = scores2.sum()
         loss2.backward()
-        grad2 = router2.weight.grad.clone()
+        grad2 = seq_aux_loss_router.weight.grad.clone()
 
         # For batch_size=1, they should produce the same results
         tracker = get_moe_layer_wise_logging_tracker()
         aux_loss = tracker["load_balancing_loss"]["values"][0]
         seq_aux_loss = tracker["seq_load_balancing_loss"]["values"][0]
 
-        reduce_from_tensor_model_parallel_region(aux_loss, router1.tp_cp_group)
-        reduce_from_tensor_model_parallel_region(seq_aux_loss, router1.tp_cp_group)
+        reduce_from_tensor_model_parallel_region(aux_loss, aux_loss_router.tp_cp_group)
+        reduce_from_tensor_model_parallel_region(seq_aux_loss, aux_loss_router.tp_cp_group)
 
         assert torch.equal(routing_map1, routing_map2)
         assert torch.equal(grad1, grad2)
         assert torch.equal(scores1, scores2)
         assert aux_loss == seq_aux_loss, f"aux_loss: {aux_loss}, seq_aux_loss: {seq_aux_loss}"
 
-        ### MBS=2 case: results should be different ###
+        ### MBS=2 case ###
         clear_aux_losses_tracker()
         batch_size = 2
         with get_cuda_rng_tracker().fork():
             hidden_states = torch.randn(
-                (seq_len, batch_size, router1.config.hidden_size),
+                (seq_len, batch_size, aux_loss_router.config.hidden_size),
                 device=torch.device("cuda"),
                 dtype=torch.bfloat16,
             )
 
         # Forward pass for aux_loss router
-        router1.weight.grad = None
-        scores1, routing_map1 = router1(hidden_states)
-        loss1 = scores1.sum()
-        loss1.backward()
-        grad1 = router1.weight.grad.clone()
+        aux_loss_router.weight.grad = None
+        scores_first_batch, _ = aux_loss_router(hidden_states[:, 0:1, :])
+        scores_second_batch, _ = aux_loss_router(hidden_states[:, 1:, :])
+
+        # setting grad to 0 to only backward aux loss
+        (scores_first_batch+scores_second_batch).backward(torch.zeros_like(scores_first_batch))
+
+        grad1 = aux_loss_router.weight.grad.clone()
 
         # Forward pass for seq_aux_loss router
-        router2.weight.grad = None
-        scores2, routing_map2 = router2(hidden_states)
-        loss2 = scores2.sum()
-        loss2.backward()
-        grad2 = router2.weight.grad.clone()
+        seq_aux_loss_router.weight.grad = None
+        scores2, routing_map2 = seq_aux_loss_router(hidden_states)
+        # setting grad to 0 to only backward aux loss
+        scores2.backward(torch.zeros_like(scores2)) 
+        grad2 = seq_aux_loss_router.weight.grad.clone() * 2
 
-        aux_loss = tracker["load_balancing_loss"]["values"][0]
+        aux_loss = tracker["load_balancing_loss"]["values"][0] / 2
         seq_aux_loss = tracker["seq_load_balancing_loss"]["values"][0]
-        reduce_from_tensor_model_parallel_region(aux_loss, router1.tp_cp_group)
-        reduce_from_tensor_model_parallel_region(seq_aux_loss, router1.tp_cp_group)
+        reduce_from_tensor_model_parallel_region(aux_loss, aux_loss_router.tp_cp_group)
+        reduce_from_tensor_model_parallel_region(seq_aux_loss, aux_loss_router.tp_cp_group)
 
-        assert not torch.equal(grad1, grad2)
-        assert not torch.equal(
-            aux_loss, seq_aux_loss
-        ), f"aux_loss: {aux_loss}, seq_aux_loss: {seq_aux_loss}"
+        torch.testing.assert_close(aux_loss, seq_aux_loss)
+        torch.testing.assert_close(grad1, grad2)
 
-        ### MBS=2 with repeated hidden_states case: results should be the same###
-        clear_aux_losses_tracker()
-        with get_cuda_rng_tracker().fork():
-            hidden_states = (
-                torch.randn(
-                    (seq_len, 1, router1.config.hidden_size),
-                    device=torch.device("cuda"),
-                    dtype=torch.bfloat16,
-                )
-                .repeat(1, 2, 1)
-                .contiguous()
-            )
-
-        # Forward pass for aux_loss router
-        router1.weight.grad = None
-        scores1, routing_map1 = router1(hidden_states)
-        loss1 = scores1.sum()
-        loss1.backward()
-        grad1 = router1.weight.grad.clone()
-
-        # Forward pass for seq_aux_loss router
-        router2.weight.grad = None
-        scores2, routing_map2 = router2(hidden_states)
-        loss2 = scores2.sum()
-        loss2.backward()
-        grad2 = router2.weight.grad.clone()
-
-        aux_loss = tracker["load_balancing_loss"]["values"][0]
-        seq_aux_loss = tracker["seq_load_balancing_loss"]["values"][0]
-        reduce_from_tensor_model_parallel_region(aux_loss, router1.tp_cp_group)
-        reduce_from_tensor_model_parallel_region(seq_aux_loss, router1.tp_cp_group)
-
-        assert torch.equal(grad1, grad2)
-        assert torch.equal(
-            aux_loss, seq_aux_loss
-        ), f"aux_loss: {aux_loss}, seq_aux_loss: {seq_aux_loss}"
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
