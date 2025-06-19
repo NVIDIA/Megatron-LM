@@ -249,6 +249,9 @@ class TransformerConfig(ModelParallelConfig):
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
 
+    use_fused_weighted_squared_relu: bool = True
+    """If True, uses fused weighted squared relu kernel when using MoE."""
+
     ####################
     # activation recomputation
     ####################

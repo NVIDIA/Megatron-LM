@@ -32,7 +32,7 @@ from megatron.core.utils import (
     get_torch_version,
     is_torch_min_version,
 )
-from megatron.training.activations import squared_relu
+from megatron.core.activations import squared_relu
 from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0
 from megatron.core.msc_utils import MultiStorageClientFeature
 
@@ -1887,6 +1887,9 @@ def _add_training_args(parser):
                        help='Disable bias and swiglu fusion, the fusion is '
                        'available only when using megatron-core.',
                        dest='bias_swiglu_fusion')
+    group.add_argument('--use-fused-weighted-squared-relu', action='store_true',
+                       help='Use fused weighted squared relu when using MoE.',
+                       dest='use_fused_weighted_squared_relu')
     group.add_argument('--no-bias-dropout-fusion', action='store_false',
                        help='Disable bias and dropout fusion.',
                        dest='bias_dropout_fusion')
