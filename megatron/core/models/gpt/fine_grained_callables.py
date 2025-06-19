@@ -202,6 +202,7 @@ class TransformerLayerNode(ScheduleNode):
         self,
         stream,
         event,
+        layer_state,
         chunk_state,
         submodule,
         name="default",
@@ -213,6 +214,7 @@ class TransformerLayerNode(ScheduleNode):
         Args:
             stream (torch.cuda.Stream): CUDA stream for execution
             event (torch.cuda.Event): Synchronization event
+            layer_state (TransformerLayerState): State shared within a layer
             chunk_state (TransformerChunkState): State shared within a chunk
             submodule (function): The submodule contain forward and dw function
             it's the per_batch_state_context, o.w. nullcontext
@@ -233,7 +235,7 @@ class TransformerLayerNode(ScheduleNode):
             free_input=free_input,
             name=name,
         )
-        self.layer_state = TransformerLayerState()
+        self.layer_state = layer_state
         self.chunk_state = chunk_state
         self.submodule = submodule
         self.detached = tuple()
@@ -323,7 +325,6 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
             rotary_pos_cos=node.chunk_state.rotary_pos_cos,
             rotary_pos_sin=node.chunk_state.rotary_pos_sin,
-            attention_bias=node.chunk_state.attention_bias,
             packed_seq_params=node.chunk_state.packed_seq_params,
             sequence_len_offset=node.chunk_state.sequence_len_offset,
         )
