@@ -45,6 +45,13 @@ try:
 except ImportError:
     _grad_accum_fusion_available = False
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'tensor_model_parallel': False,
     'partition_dim': -1,
@@ -434,7 +441,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         tp_group,
     ):
         """Forward."""
+        if gradient_accumulation_fusion and hasattr(weight, "main_grad"):
+            main_grad = weight.main_grad
+        else:
+            main_grad = None
         ctx.save_for_backward(input, weight)
+        # We can't save main_grad in save_for_backward as this module would be
+        # reused across layers like MTP logits. So, to prevent in-place modification
+        # checks we save the tensor in ctx.
+        ctx.main_grad = main_grad
         ctx.use_bias = bias is not None
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.allreduce_dgrad = allreduce_dgrad
@@ -463,11 +478,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward."""
         input, weight = ctx.saved_tensors
+        main_grad = ctx.main_grad
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
         handle = None
         tp_group = ctx.tp_group
+
+        if ctx.gradient_accumulation_fusion:
+            weight.main_grad = main_grad
 
         wgrad_compute = True
         if grad_output_buffer is not None:
@@ -931,12 +950,6 @@ class ColumnParallelLinear(torch.nn.Module):
                     f"not {expected_shape} as expected"
                 )
 
-        if self.config._cpu_offloading_context is not None:
-            if self.config._cpu_offloading_context.inside_context is True:
-                assert (
-                    self.config.cpu_offloading is False
-                ), "CPU Offloading cannot be enabled while using non-TE modules"
-
         bias = self.bias if not self.skip_bias_add else None
 
         if (
@@ -963,6 +976,15 @@ class ColumnParallelLinear(torch.nn.Module):
             self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
 
         allreduce_dgrad = False if self.explicit_expert_comm else self.allreduce_dgrad
+
+        if self.config._cpu_offloading_context is not None:
+            if self.config._cpu_offloading_context.inside_context is True:
+                if not HAVE_TE:
+                    assert (
+                        self.config.cpu_offloading is False
+                    ), "CPU Offloading cannot be enabled while TE is not present"
+                else:
+                    input_parallel.activation_offloading = self.config.cpu_offloading_activations
 
         output_parallel = self._forward_impl(
             input=input_parallel,
@@ -1182,12 +1204,6 @@ class RowParallelLinear(torch.nn.Module):
             - bias
         """
 
-        if self.config._cpu_offloading_context is not None:
-            if self.config._cpu_offloading_context.inside_context is True:
-                assert (
-                    self.config.cpu_offloading is False
-                ), "CPU Offloading cannot be enabled while using non-TE modules"
-
         # Set up backprop all-reduce.
         if self.input_is_parallel:
             input_parallel = input_
@@ -1201,6 +1217,15 @@ class RowParallelLinear(torch.nn.Module):
             self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
 
         allreduce_dgrad = False
+
+        if self.config._cpu_offloading_context is not None:
+            if self.config._cpu_offloading_context.inside_context is True:
+                if not HAVE_TE:
+                    assert (
+                        self.config.cpu_offloading is False
+                    ), "CPU Offloading cannot be enabled while TE is not present"
+                else:
+                    input_parallel.activation_offloading = self.config.cpu_offloading_activations
 
         output_parallel = self._forward_impl(
             input=input_parallel,
