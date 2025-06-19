@@ -32,7 +32,7 @@ fp8_available, reason_for_no_fp8 = check_fp8_support()
 class TestFP8Param:
 
     def setup_method(self, method):
-        self.seq_length = 32
+        self.seq_length = 512
         self.micro_batch_size = 2
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
 
@@ -76,7 +76,7 @@ class TestFP8Param:
         args.vocal_size = 128800
         args.hidden_size = 128
         args.num_attention_heads = 8
-        args.max_position_embeddings = 256
+        args.max_position_embeddings = 512
         args.micro_batch_size = micro_batch_size
         args.create_attention_mask_in_dataloader = True
         args.seq_length = sequence_length
@@ -122,6 +122,12 @@ class TestFP8Param:
         args = self.create_test_args(
             tp_size, recipe, self.seq_length, self.micro_batch_size, **kwargs
         )
+
+        if recipe == "blockwise" and args.sequence_parallel:
+            assert (
+                tp_size * 128 <= self.seq_length
+            ), "Blockwise recipe and sequence parallelism requires tp_size * 128 <= seq_length"
+
         set_args(args)
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
