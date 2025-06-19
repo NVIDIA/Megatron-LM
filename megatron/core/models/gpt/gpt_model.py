@@ -537,14 +537,16 @@ class GPTModel(LanguageModule):
             attention_mask (Tensor): Attention mask.
             decoder_input (Tensor, optional): Decoder input tensor. Defaults to None.
             labels (Tensor, optional): Labels for loss computation. Defaults to None.
-            inference_params (InferenceParams, optional):
-                Parameters for inference. Defaults to None.
+            inference_context (BaseInferenceContext, optional):
+                Inference context. Defaults to None.
             packed_seq_params (PackedSeqParams, optional):
                 Parameters for packed sequences. Defaults to None.
             extra_block_kwargs (dict, optional):
                 Additional keyword arguments for blocks. Defaults to None.
             runtime_gather_output (Optional[bool], optional):
                 Whether to gather output at runtime. Defaults to None.
+            inference_params (InferenceParams, optional):
+                Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
 
         Returns:
