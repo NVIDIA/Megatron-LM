@@ -118,6 +118,10 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
 
         self.inference_context.reset()
+        max_batch_size = self.inference_wrapper_config.inference_max_requests
+        max_sequence_length = self.inference_wrapper_config.inference_max_seq_length
+        from megatron.core.inference.contexts import StaticInferenceContext
+        self.inference_context = StaticInferenceContext(max_batch_size, max_sequence_length)
 
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
