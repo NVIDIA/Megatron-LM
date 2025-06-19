@@ -40,14 +40,21 @@ def should_free_input(name, is_moe, is_deepep):
     Returns:
         bool: Whether to free input memory
     """
-    # For dense layers [attn, fake, mlp, fake], mlp input is needed during backward pass
+    # For dense layers [attn, fake, mlp, fake], the input is needed during backward pass
     if not is_moe:
         return False
     # Define which nodes should free input memory
+    # Since we split the computing graph into multiple nodes, we can manually control
+    # when and how to free the input memory.
+    # The input and output of A2A are not needed anymore after the forward pass,
+    # so we can free the input memory after the forward pass.
     free_input_nodes = {
-        "mlp": True,  # Free input after MLP node usage
-        "combine": True,  # Free input after Combine node usage
-        "dispatch": not is_deepep,  # Free input after dispatch node usage in non-deepep mode
+        "mlp": True,
+        "combine": True,
+        # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
+        # and it's not needed anymore after the forward pass
+        # For deepep mode, they are both needed in backward pass, so they cannot be freed.
+        "dispatch": not is_deepep,
     }
 
     return free_input_nodes.get(name, False)
@@ -70,18 +77,18 @@ class PreProcessNode(ScheduleNode):
     before the main transformer layers.
     """
 
-    def __init__(self, gpt_model, model_chunk_state, event, stream):
+    def __init__(self, gpt_model, chunk_state, event, stream):
         """Initializes a preprocessing node.
 
         Args:
             gpt_model: The GPT model instance.
-            model_chunk_state: State shared across the model chunk.
+            chunk_state (TransformerChunkState): State shared within a chunk
             event: CUDA event for synchronization.
             stream: CUDA stream for execution.
         """
         super().__init__(weak_method(self.forward_impl), stream, event, name="pre_process")
         self.gpt_model = gpt_model
-        self.model_chunk_state = model_chunk_state
+        self.chunk_state = chunk_state
 
     def forward_impl(self):
         """Implements the forward pass for preprocessing.
@@ -96,23 +103,23 @@ class PreProcessNode(ScheduleNode):
         """
         # Get decoder input
         if not self.gpt_model.pre_process:
-            self.model_chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
+            self.chunk_state.decoder_input = self.gpt_model.decoder.input_tensor
         # Run GPTModle._preprocess
         decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
             self.gpt_model._preprocess(
-                input_ids=self.model_chunk_state.input_ids,
-                position_ids=self.model_chunk_state.position_ids,
-                decoder_input=self.model_chunk_state.decoder_input,
-                packed_seq_params=self.model_chunk_state.packed_seq_params,
+                input_ids=self.chunk_state.input_ids,
+                position_ids=self.chunk_state.position_ids,
+                decoder_input=self.chunk_state.decoder_input,
+                packed_seq_params=self.chunk_state.packed_seq_params,
             )
         )
 
         # Saved for later use
-        self.model_chunk_state.decoder_input = decoder_input
-        self.model_chunk_state.rotary_pos_emb = rotary_pos_emb
-        self.model_chunk_state.rotary_pos_cos = rotary_pos_cos
-        self.model_chunk_state.rotary_pos_sin = rotary_pos_sin
-        self.model_chunk_state.sequence_len_offset = sequence_len_offset
+        self.chunk_state.decoder_input = decoder_input
+        self.chunk_state.rotary_pos_emb = rotary_pos_emb
+        self.chunk_state.rotary_pos_cos = rotary_pos_cos
+        self.chunk_state.rotary_pos_sin = rotary_pos_sin
+        self.chunk_state.sequence_len_offset = sequence_len_offset
         return decoder_input
 
 
@@ -123,18 +130,18 @@ class PostProcessNode(ScheduleNode):
     after the main transformer layers.
     """
 
-    def __init__(self, gpt_model, model_chunk_state, event, stream):
+    def __init__(self, gpt_model, chunk_state, event, stream):
         """Initializes a postprocessing node.
 
         Args:
             gpt_model: The GPT model instance.
-            model_chunk_state: State shared across the model chunk.
+            chunk_state (TransformerChunkState): State shared within a chunk
             event: CUDA event for synchronization.
             stream: CUDA stream for execution.
         """
         super().__init__(weak_method(self.forward_impl), stream, event, name="post_process")
         self.gpt_model = gpt_model
-        self.model_chunk_state = model_chunk_state
+        self.chunk_state = chunk_state
 
     def forward_impl(self, hidden_states):
         """Implements the forward pass for postprocessing.
@@ -150,7 +157,7 @@ class PostProcessNode(ScheduleNode):
         Returns:
             The logits or loss depending on whether labels are provided.
         """
-        labels = self.model_chunk_state.labels
+        labels = self.chunk_state.labels
         # Final layer norm from Decoder
         if self.gpt_model.decoder.final_layernorm is not None:
             hidden_states = self.gpt_model.decoder.final_layernorm(hidden_states)
@@ -164,20 +171,20 @@ class PostProcessNode(ScheduleNode):
         # Run GPTModel._postprocess
         loss = self.gpt_model._postprocess(
             hidden_states=hidden_states,
-            input_ids=self.model_chunk_state.input_ids,
-            position_ids=self.model_chunk_state.position_ids,
+            input_ids=self.chunk_state.input_ids,
+            position_ids=self.chunk_state.position_ids,
             labels=labels,
-            decoder_input=self.model_chunk_state.decoder_input,
-            rotary_pos_emb=self.model_chunk_state.rotary_pos_emb,
-            rotary_pos_cos=self.model_chunk_state.rotary_pos_cos,
-            rotary_pos_sin=self.model_chunk_state.rotary_pos_sin,
+            decoder_input=self.chunk_state.decoder_input,
+            rotary_pos_emb=self.chunk_state.rotary_pos_emb,
+            rotary_pos_cos=self.chunk_state.rotary_pos_cos,
+            rotary_pos_sin=self.chunk_state.rotary_pos_sin,
             mtp_in_postprocess=False,
-            loss_mask=self.model_chunk_state.loss_mask,
-            attention_mask=self.model_chunk_state.attention_mask,
-            packed_seq_params=self.model_chunk_state.packed_seq_params,
-            sequence_len_offset=self.model_chunk_state.sequence_len_offset,
-            runtime_gather_output=self.model_chunk_state.runtime_gather_output,
-            extra_block_kwargs=self.model_chunk_state.extra_block_kwargs,
+            loss_mask=self.chunk_state.loss_mask,
+            attention_mask=self.chunk_state.attention_mask,
+            packed_seq_params=self.chunk_state.packed_seq_params,
+            sequence_len_offset=self.chunk_state.sequence_len_offset,
+            runtime_gather_output=self.chunk_state.runtime_gather_output,
+            extra_block_kwargs=self.chunk_state.extra_block_kwargs,
         )
 
         # For now, 1f1b only supports fp16 module
@@ -195,7 +202,6 @@ class TransformerLayerNode(ScheduleNode):
         self,
         stream,
         event,
-        common_state,
         chunk_state,
         submodule,
         name="default",
@@ -207,11 +213,12 @@ class TransformerLayerNode(ScheduleNode):
         Args:
             stream (torch.cuda.Stream): CUDA stream for execution
             event (torch.cuda.Event): Synchronization event
-            common_state (TransformerLayerState): State shared within a transformer layer
+            chunk_state (TransformerChunkState): State shared within a chunk
             submodule (function): The submodule contain forward and dw function
             it's the per_batch_state_context, o.w. nullcontext
             name (str): Node name, also used to determine memory strategy
             bwd_dw_callables (list): List of weight gradient functions for the layer.
+            extra_args (dict): Extra arguments for the node: is_moe, enable_deepep.
         """
         # determine whether to free input memory
         is_moe = extra_args.get("is_moe", False)
@@ -226,15 +233,11 @@ class TransformerLayerNode(ScheduleNode):
             free_input=free_input,
             name=name,
         )
-        self.common_state = common_state
+        self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.submodule = submodule
         self.detached = tuple()
         self.before_detached = tuple()
-
-        # Create flags to indicate first and last layer
-        self.is_first_layer = extra_args.get("is_first_layer", False)
-        self.is_last_layer = extra_args.get("is_last_layer", False)
 
         # Initialize list to store registered dw callables
         self.bwd_dw_callables = []
@@ -275,7 +278,7 @@ class TransformerLayerNode(ScheduleNode):
         # Release reference as early as possible, this helps avoid memory leak.
         self.before_detached = None
         self.detached = None
-        self.common_state = None
+        self.layer_state = None
         self.chunk_state = None
         self.submodule = None
 
@@ -342,10 +345,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         local_tokens, probs, _ = layer.mlp.router_and_preprocess(pre_mlp_layernorm_output)
 
         # Detach here for mlp_bda residual connection
-        node.common_state.residual = node.detach(hidden_states)
+        node.layer_state.residual = node.detach(hidden_states)
         if layer.mlp.use_shared_expert and not layer.mlp.shared_expert_overlap:
             # Detach here for shared expert connection
-            node.common_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
+            node.layer_state.pre_mlp_layernorm_output = node.detach(pre_mlp_layernorm_output)
 
         return local_tokens, probs
 
@@ -362,7 +365,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             token_dispatcher._comm_manager.token_probs = probs
 
         dispatched_tokens, dispatched_probs = layer.mlp.dispatch(local_tokens, probs)
-        node.common_state.dispatched_probs = node.detach(dispatched_probs)
+        node.layer_state.dispatched_probs = node.detach(dispatched_probs)
         return dispatched_tokens
 
     def submodule_moe_forward(node: ScheduleNode, dispatched_tokens: torch.Tensor):
@@ -371,14 +374,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             post dispatch->experts->combine preprocess
         """
         shared_expert_output = None
-        dispatched_probs = node.common_state.dispatched_probs
+        dispatched_probs = node.layer_state.dispatched_probs
         token_dispatcher = layer.mlp.token_dispatcher
         if enable_deepep:
             # update dispatched_probs to be detached version, prevents
             # backward graph from connecting to dispatch submodule
             token_dispatcher._comm_manager.dispatched_probs = dispatched_probs
 
-        pre_mlp_layernorm_output = getattr(node.common_state, 'pre_mlp_layernorm_output', None)
+        pre_mlp_layernorm_output = getattr(node.layer_state, 'pre_mlp_layernorm_output', None)
         expert_output, shared_expert_output, mlp_bias = layer.mlp.experts_compute(
             dispatched_tokens, dispatched_probs, pre_mlp_layernorm_output
         )
@@ -389,8 +392,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
         # release tensor reference after use
-        node.common_state.dispatched_probs = None
-        node.common_state.pre_mlp_layernorm_output = None
+        node.layer_state.dispatched_probs = None
+        node.layer_state.pre_mlp_layernorm_output = None
         if shared_expert_output is None:
             # Return only expert_output, since shared_expert_output causes backward on None
             return expert_output
@@ -409,7 +412,7 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         # microbatch. If `mlp_bda` were to run first, it would compete for SM resources
         # with another microbatch's computation and expose the communication.
         """
-        residual = node.common_state.residual
+        residual = node.layer_state.residual
 
         output = layer.mlp.combine(output, shared_expert_output)
         mlp_output_with_bias = (output, None)
@@ -423,10 +426,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         )
 
         # Need to record residual to comm stream, since it's created on comp stream
-        node.common_state.residual.record_stream(torch.cuda.current_stream())
+        node.layer_state.residual.record_stream(torch.cuda.current_stream())
 
         # release tensor reference after use
-        node.common_state.residual = None
+        node.layer_state.residual = None
         return output
 
     def mlp_wrapper(node: ScheduleNode, *args, **kwargs):
