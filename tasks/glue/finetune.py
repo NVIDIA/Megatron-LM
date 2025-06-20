@@ -2,13 +2,13 @@
 
 """GLUE finetuning/evaluation."""
 
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_tokenizer
-from megatron.model.classification import Classification
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_tokenizer
+from megatron.legacy.model.classification import Classification
 from tasks.eval_utils import accuracy_func_provider
 from tasks.finetune_utils import finetune
-from megatron.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args
 
 
 def glue_classification(num_classes, Dataset,

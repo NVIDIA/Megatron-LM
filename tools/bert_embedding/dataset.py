@@ -1,10 +1,9 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 import numpy as np
 import torch
 
-from megatron import get_args, get_tokenizer
-from megatron.data.bert_dataset import build_training_sample
+from megatron.training import get_args, get_tokenizer
 
 
 class BertEmbeddingDataset(torch.utils.data.Dataset):
@@ -18,23 +17,24 @@ class BertEmbeddingDataset(torch.utils.data.Dataset):
 
         # Dataset, tokenizer.
         self.text_dataset = text_dataset
-        self.bert_tokenizer = get_tokenizer()
-
-        # Params to store.
         self.max_seq_length = max_seq_length
-        self.seed = args.seed
-        self.masked_lm_prob = args.mask_prob
-
-        # Vocab stuff.
-        self.vocab_id_list = list(self.bert_tokenizer.inv_vocab.keys())
-        self.vocab_id_to_token_dict = self.bert_tokenizer.inv_vocab
-        self.cls_id = self.bert_tokenizer.cls
-        self.sep_id = self.bert_tokenizer.sep
-        self.mask_id = self.bert_tokenizer.mask
-        self.pad_id = self.bert_tokenizer.pad
+        self.bert_tokenizer = get_tokenizer()
 
     def __len__(self):
         return len(self.text_dataset)
+
+    @classmethod
+    def build_sample(cls, tokenizer, token_ids):
+        get_constant_array = lambda c : np.full((len(token_ids) + 2,), c, "int64")
+        return {
+            "text" : np.array([ tokenizer.cls, *token_ids, tokenizer.sep ], dtype="int64"),
+            "types" : get_constant_array(0),
+            "labels" : get_constant_array(-1),
+            "is_random" : 0,
+            "loss_mask" : get_constant_array(0),
+            "padding_mask" : get_constant_array(1),
+            "truncated" : 0,
+        }
 
     def __getitem__(self, idx):
 
@@ -49,20 +49,7 @@ class BertEmbeddingDataset(torch.utils.data.Dataset):
         if not bert_token_ids:
             bert_token_ids = [ self.bert_tokenizer.pad_id ] # hack when empty seq
 
-        # Note that this rng state should be numpy and not python since
-        # python randint is inclusive whereas the numpy one is exclusive.
-        # We % 2**32 since numpy requres the seed to be between 0 and 2**32 - 1
-        np_rng = np.random.RandomState(seed=((self.seed + idx) % 2**32))
+        # Bert sample.
+        sample = self.build_sample(self.bert_tokenizer, bert_token_ids)
 
-        # Build sample.
-        sample = build_training_sample([bert_token_ids],
-                                       len(bert_token_ids),
-                                       len(bert_token_ids) + 2, # for cls+sep
-                                       self.vocab_id_list,
-                                       self.vocab_id_to_token_dict,
-                                       self.cls_id, self.sep_id,
-                                       self.mask_id, self.pad_id,
-                                       self.masked_lm_prob, np_rng,
-                                       binary_head=False)
-        sample["seq_length"] = len(sample["text"])
         return sample

@@ -1,0 +1,364 @@
+.test_rules:
+  rules:
+    - if: $PUBLISH == "yes"
+      when: never
+    - when: on_success
+  stage: test
+
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+wait_for_resources:
+  extends: [.test_rules]
+  needs:
+    - test:linting_formatting
+    - test:linting_copyright
+    - job: test:linting_secret_detection
+      optional: true
+    - test:build_image
+  image: python:3.10
+  timeout: 7 days
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - pip install --no-cache-dir python-gitlab click
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export NUM_CONCURRENT_JOBS
+    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
+  rules:
+    - if: $CI_MERGE_REQUEST_LABELS =~ /fast-track/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: on_success
+    - when: never
+
+test:unit_tests_configure:
+  extends: [.test_rules]
+  needs:
+    - test:build_image
+    - job: wait_for_resources
+      optional: true
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  before_script:
+    - git rm -r tests/test_utils/local_recipes || true
+    - git submodule add --force https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/ADLR/megatron-lm-convergence-tests.git tests/test_utils/local_recipes
+    - ls tests/test_utils/local_recipes
+  script:
+    - env
+    - set -x
+    - |
+      A100_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo $CLUSTER_A100 || echo $DEFAULT_A100_CLUSTER)
+      H100_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo $CLUSTER_H100 || echo $DEFAULT_H100_CLUSTER)
+    - |
+      ARGS=(
+        "--scope unit-tests"
+        "--n-repeat ${UNIT_TEST_REPEAT}"
+        "--time-limit $(( UNIT_TEST_TIMEOUT * 60 ))"
+        "--test-cases all"
+        "--cluster dgxh100_coreweave"
+        "--platform dgx_h100"
+        "--partition batch_short,batch"
+        "--container-image ${UTILITY_IMAGE}"
+        "--container-tag ${CI_PIPELINE_ID}"
+        "--dependent-job test:unit_tests_configure"
+        "--slurm-account ${CI_SLURM_ACCOUNT}"
+        "--no-enable-warmup"
+      )
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "lts" \
+        --tag "legacy" \
+        --output-path "unit-test-job-lts-legacy.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "lts" \
+        --tag "latest" \
+        --output-path "unit-test-job-lts-latest.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "dev" \
+        --tag "legacy" \
+        --output-path "unit-test-job-dev-legacy.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${ARGS[@]} \
+        --environment "dev" \
+        --tag "latest" \
+        --output-path "unit-test-job-dev-latest.yaml"
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+  artifacts:
+    paths:
+      - unit-test-job-dev-legacy.yaml
+      - unit-test-job-dev-latest.yaml
+      - unit-test-job-lts-legacy.yaml
+      - unit-test-job-lts-latest.yaml
+      - tests/test_utils/local_recipes
+
+.unit_tests_run:
+  needs:
+    - test:linting_formatting
+    - test:linting_copyright
+    - job: test:linting_secret_detection
+      optional: true
+    - test:unit_tests_configure
+    - test:build_image
+  extends: [.test_rules]
+  trigger:
+    include:
+      - artifact: unit-test-job-$ENVIRONMENT-$TAG.yaml
+        job: test:unit_tests_configure
+    strategy: depend
+  variables:
+    RO_API_TOKEN: $PAT
+    CONTAINER_TAG: $CI_PIPELINE_ID
+    CI_MCORE_LTS_IMAGE: $CI_MCORE_LTS_IMAGE
+    GITLAB_ENDPOINT: $GITLAB_ENDPOINT
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    MCORE_MR_COMMIT: $MCORE_MR_COMMIT
+    MCORE_BACKWARDS_COMMIT: $MCORE_BACKWARDS_COMMIT
+
+  inherit:
+    variables: true
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+
+test:unit_tests_pyt(DEV)_mcore(legacy):
+  extends: [.unit_tests_run]
+  variables:
+    ENVIRONMENT: dev
+    TAG: legacy
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+
+test:unit_tests_pyt(LTS)_mcore(legacy):
+  extends: [.unit_tests_run]
+  variables:
+    ENVIRONMENT: lts
+    TAG: legacy
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+
+test:unit_tests_pyt(DEV)_mcore(latest):
+  extends: [.unit_tests_run]
+  variables:
+    ENVIRONMENT: dev
+    TAG: latest
+
+test:unit_tests_pyt(LTS)_mcore(latest):
+  extends: [.unit_tests_run]
+  variables:
+    ENVIRONMENT: lts
+    TAG: latest
+
+test:unit_tests_notify:
+  extends: [.test_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  needs:
+    - test:unit_tests_pyt(DEV)_mcore(latest)
+    - test:unit_tests_pyt(LTS)_mcore(latest)
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - export WEBHOOK_URL=${MCORE_NOTIFICATION_HOOK}
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export TAG_TEAM=$([[ "$CI_COMMIT_BRANCH" == "main" ]] && echo "1" || "0")
+    - export TEAM_SLUG=$SLACK_ADMIN
+    - |
+      python tests/test_utils/python_scripts/notify.py \
+        --pipeline-id "${CI_PIPELINE_ID}" \
+        --check-for unit-tests \
+        --pipeline-context "unit-tests-extended" \
+        --pipeline-created-at "${CI_PIPELINE_CREATED_AT}"
+  artifacts:
+    when: always
+    paths:
+      - scripts
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule" && $CI_COMMIT_BRANCH == "ci-unit-test-extended"
+      when: always
+    - when: never
+
+test:linting_docs_build:
+  extends: [.test_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  needs: [test:build_image]
+  script:
+    - cd ..
+    - rm -rf documentation && git clone https://gitlab-ci-token:${CI_JOB_TOKEN}@${GITLAB_ENDPOINT}/nemo-megatron-core-tme/documentation.git
+    - mv megatron-lm/ documentation/
+    - cd documentation/
+    - ./repo docs
+
+test:linting_formatting:
+  extends: [.test_rules]
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  needs: [test:build_image]
+  variables:
+    GIT_STRATEGY: "clone"
+  script:
+    - |
+      if [[ "$CI_PIPELINE_SOURCE" != "merge_request_event" ]]; then
+        exit 0
+      fi
+    - set +e
+    - git fetch origin main:main
+    - |
+      if [[ "$CI_MERGE_REQUEST_PROJECT_PATH" == "$CI_MERGE_REQUEST_SOURCE_PROJECT_PATH" ]]; then 
+        bash tools/autoformat.sh
+        set -e
+        git fetch origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+        git checkout $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+        git config --global user.email "mcore-bot@nvidia.com"
+        git config --global user.name "Mcore Bot"
+        git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+        git add -A .
+        git commit -m "chore: Format files" || true
+        git push -u origin $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME
+      fi
+    - env
+    - BASE_REF="$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" CHECK_ONLY=true SKIP_DOCS=$([[ "$CI_MERGE_REQUEST_LABELS" == *"Skip docs"* ]] && echo "true" || echo "false") bash tools/autoformat.sh
+
+test:linting_copyright:
+  extends: [.test_rules]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  needs: [test:build_image]
+  script:
+    - git fetch origin main
+    - bash tools/copyright.sh
+
+# Override from template
+secret_detection:
+  rules:
+    - when: never
+
+# Inherit and modify template
+test:linting_secret_detection:
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  extends: [".secret-analyzer"]
+  needs: [test:build_image]
+  variables:
+    GIT_DEPTH: 0
+    SECRET_DETECTION_LOG_OPTIONS: ${CI_MERGE_REQUEST_DIFF_BASE_SHA}..${CI_COMMIT_SHA}
+  allow_failure: false
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - when: never
+  script:
+    - apk add jq
+    - /analyzer run
+    - |
+      if [[ $(cat gl-secret-detection-report.json | jq '.vulnerabilities | length > 0') == true ]]; then
+        echo "Atleast one vulnerability has been found"
+        cat gl-secret-detection-report.json | jq '.'
+        exit 1
+      fi
+
+test:unit_tests_x_coverage_report:
+  extends: [.test_rules]
+  needs:
+    - job: test:unit_tests_pyt(DEV)_mcore(latest)
+    - job: test:unit_tests_pyt(LTS)_mcore(latest)
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - python tests/test_utils/python_scripts/download_coverage_results.py --pipeline-id ${CI_PIPELINE_ID}
+    - coverage combine --keep $(ls coverage_results/*/coverage_report)
+    - coverage report
+    - coverage xml
+  coverage: "/TOTAL.+ ([0-9]{1,3}%)/"
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+  rules:
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success

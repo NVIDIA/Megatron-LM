@@ -7,3 +7,8 @@ build
 slurm*
 logs
 .vscode
+local/
+.gitmodules
+wandb/
+onelogger.log
+onelogger.err

@@ -16,16 +16,19 @@ import numpy as np
 import multiprocessing
 try:
     import nltk
+    from nltk.tokenize.punkt import PunktLanguageVars
     nltk_available = True
 except ImportError:
+    PunktLanguageVars = object  # Fallback to the built-in object class
     nltk_available = False
 
-from megatron.tokenizer import build_tokenizer
-from megatron.data import indexed_dataset
+from megatron.training.tokenizer import build_tokenizer
+from megatron.training.arguments import _add_tokenizer_args
+from megatron.core.datasets import indexed_dataset
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
-class CustomLanguageVars(nltk.tokenize.punkt.PunktLanguageVars):
+class CustomLanguageVars(PunktLanguageVars):
 
     _period_context_fmt = r"""
         \S*                          # some word material
@@ -53,8 +56,13 @@ class Encoder(object):
             if not nltk_available:
                 print("NLTK is not available to split sentences.")
                 exit()
-            library = "tokenizers/punkt/{}.pickle".format(self.args.lang)
-            splitter = nltk.load(library)
+            if os.environ.get("NLTK_DATA"):
+                library = os.path.join(os.environ.get("NLTK_DATA"), "tokenizers", "punkt", f"{self.args.lang}.pickle")
+                url = f"file:{library}"
+            else:
+                library = os.path.join("tokenizers", "punkt", f"{self.args.lang}.pickle")
+                url = f"nltk:{library}"
+            splitter = nltk.load(url)
             if self.args.keep_newlines:
                 # this prevents punkt from eating newlines after sentences
                 Encoder.splitter = nltk.tokenize.punkt.PunktSentenceTokenizer(
@@ -160,7 +168,7 @@ class Partition(object):
                                                           key, level)
             output_idx_files[key] = "{}_{}_{}.idx".format(output_prefix,
                                                           key, level)
-            builders[key] = indexed_dataset.MMapIndexedDatasetBuilder(
+            builders[key] = indexed_dataset.IndexedDatasetBuilder(
                 output_bin_files[key],
                 dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
             )
@@ -172,7 +180,7 @@ class Partition(object):
         for i, (doc, sentence_lens, bytes_processed) in enumerate(encoded_docs, start=1):
             total_bytes_processed += bytes_processed
             for key in doc.keys():
-                builders[key].add_doc(doc[key], sentence_lens[key])
+                builders[key].add_document(doc[key], sentence_lens[key])
             self.print_processing_stats(i, proc_start, total_bytes_processed)
 
         fin.close()
@@ -181,6 +189,7 @@ class Partition(object):
 
 def get_args():
     parser = argparse.ArgumentParser()
+    parser = _add_tokenizer_args(parser)
     group = parser.add_argument_group(title='input data')
     group.add_argument('--input', type=str, required=True,
                        help='Path to input JSON')
@@ -190,21 +199,7 @@ def get_args():
                        help='Split documents into sentences.')
     group.add_argument('--keep-newlines', action='store_true',
                        help='Keep newlines between sentences when splitting.')
-
-    group = parser.add_argument_group(title='tokenizer')
-    group.add_argument('--tokenizer-type', type=str, required=True,
-                       choices=['BertWordPieceLowerCase','BertWordPieceCase',
-                                'GPT2BPETokenizer', 'SentencePieceTokenizer',
-                                'GPTSentencePieceTokenizer', 'NullTokenizer'],
-                       help='What type of tokenizer to use.')
-    group.add_argument('--tokenizer-model', type=str, default=None,
-                       help='YTTM tokenizer model.')
-    group.add_argument('--vocab-file', type=str, default=None,
-                       help='Path to the vocab file')
-    group.add_argument('--vocab-size', default=786,
-                       help='size of vocab for use with NullTokenizer')
-    group.add_argument('--merge-file', type=str, default=None,
-                       help='Path to the BPE merge file (if necessary).')
+    group = parser.add_argument_group(title='tokenization process')
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',
@@ -212,7 +207,6 @@ def get_args():
     group = parser.add_argument_group(title='output data')
     group.add_argument('--output-prefix', type=str, required=True,
                        help='Path to binary output file without suffix')
-
     group = parser.add_argument_group(title='runtime')
     group.add_argument('--workers', type=int, required=True,
                        help=('Number of worker processes to launch.'
@@ -264,7 +258,7 @@ def main():
 
     if args.split_sentences:
         if nltk_available:
-            nltk.download("punkt", quiet=True)
+            nltk.download("punkt", quiet=True, download_dir=os.environ.get("NLTK_DATA"))
         else:
             raise Exception(
                 "nltk library required for sentence splitting is not available.")
@@ -384,7 +378,7 @@ def main():
                                                       key, level)
         output_idx_files[key] = "{}_{}_{}.idx".format(args.output_prefix,
                                                       key, level)
-        builders[key] = indexed_dataset.MMapIndexedDatasetBuilder(
+        builders[key] = indexed_dataset.IndexedDatasetBuilder(
             output_bin_files[key],
             dtype=indexed_dataset.DType.optimal_dtype(tokenizer.vocab_size),
         )
@@ -393,7 +387,7 @@ def main():
             parition_output_prefix = name['output_prefix']
             full_partition_output_prefix = "{}_{}_{}".format(parition_output_prefix,
                                                              key, level)
-            builders[key].merge_file_(full_partition_output_prefix)
+            builders[key].add_index(full_partition_output_prefix)
         builders[key].finalize(output_idx_files[key])
 
 

@@ -7,7 +7,7 @@ from abc import abstractmethod
 
 from torch.utils.data import Dataset
 
-from megatron import print_rank_0
+from megatron.training import print_rank_0
 from tasks.data_utils import build_sample
 from tasks.data_utils import build_tokens_types_paddings_from_text
 

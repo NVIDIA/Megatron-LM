@@ -1,0 +1,4 @@
+include megatron/core/requirements.txt
+include megatron/core/README.md
+include megatron/core/package_info.py
+recursive-include requirements *

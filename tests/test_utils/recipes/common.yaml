@@ -1,0 +1,53 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: common
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 8
+  platforms: dgx_a100
+  script_setup: |
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    torchrun \
+      --log-dir {assets_dir}/logs/1 \
+      --tee "0:3,7:3" \
+      --redirects "3" \
+      --nproc_per_node 8 \
+      -m tests.functional_tests.test_cases.common.{test_case}
+
+products:
+  - test_case: [ckpt_converter]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+      - environment: [lts]
+        scope: [nightly]
+        platforms: [dgx_a100]

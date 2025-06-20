@@ -1,0 +1,115 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: t5
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 8
+  platforms: dgx_a100
+  artifacts:
+    /workspace/data/t5_data: text/the_pile/t5_shard00
+    /workspace/checkpoints/t5_220m_mr_mcore_te_tp2_pp2_frozen_resume_torch_dgx_a100_1N8G_dev: model/mcore_t5/t5_220m_mr_mcore_te_tp2_pp2_frozen_resume_torch_{platforms}_1N8G_dev/28359448
+  script_setup: |
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/megatron-lm
+
+    NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
+
+    ARGUMENTS=(
+        "DATA_PATH=/workspace/data/t5_data"
+        "DATA_CACHE_PATH=/workspace/data/cache"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
+        "TRAINING_SCRIPT_PATH=pretrain_t5.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "N_REPEAT={n_repeat}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [t5_11b_mr_mcore_tp4_pp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [t5_220m_mr_mcore_te_tp4_pp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [t5_220m_mr_mcore_te_tp4_pp1_resume_torch_dist_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [t5_220m_mr_mcore_tp4_pp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [t5_220m_mr_mcore_tp4_pp1_resume_torch_dist_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp1_pp1_vp1_resume_torch]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+  - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+  - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_te_tp2_pp1_vp1_sequence_parallel]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+  - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_vp1]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+  - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_tp1_pp1_vp1_resume_torch]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]
+  - test_case: [t5_220m_nightly_dgx_a100_1N8G_mcore_tp2_pp1_vp1]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_a100, dgx_h100]

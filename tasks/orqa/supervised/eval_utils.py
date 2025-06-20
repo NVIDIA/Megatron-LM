@@ -9,9 +9,9 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from megatron import get_args, print_rank_0
+from megatron.training import get_args, print_rank_0
 from megatron.core import mpu
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import average_losses_across_data_parallel_group
 from tasks.finetune_utils import build_data_loader
 
 def task_collate_fn(batch_data):

@@ -16,18 +16,16 @@ import time
 
 import torch
 try:
-    import nltk
-    nltk_available = True
+    from nltk.tokenize.punkt import PunktLanguageVars
 except ImportError:
-    nltk_available = False
+    PunktLanguageVars = object  # Fallback to the built-in object class
 
-from megatron.tokenizer import build_tokenizer
-from megatron.data import indexed_dataset
-from megatron.data.indexed_dataset import MMapIndexedDatasetBuilder
+from megatron.training.tokenizer import build_tokenizer
+from megatron.core.datasets.indexed_dataset import IndexedDatasetBuilder
 
 
 # https://stackoverflow.com/questions/33139531/preserve-empty-lines-with-nltks-punkt-tokenizer
-class CustomLanguageVars(nltk.tokenize.punkt.PunktLanguageVars):
+class CustomLanguageVars(PunktLanguageVars):
 
     _period_context_fmt = r"""
         \S*                          # some word material
@@ -52,7 +50,7 @@ class Encoder(object):
         Encoder.tokenizer = build_tokenizer(self.args)
 
     def encode(self, input_pair):
-        json_line, img_file = input_pair
+        json_line, img_path = input_pair
         data = json.loads(json_line)
         key = "text"
         text = data[key]
@@ -63,7 +61,7 @@ class Encoder(object):
             current_length = len(sentence_ids)
             sentence_ids.extend([Encoder.tokenizer.eod for _ in range(max(0,pad_len-current_length))])
 
-        with open(img_file[:-1], "rb") as tf:
+        with open(img_path, "rb") as tf:
             xs = bytearray(tf.read())
             img_pad = (4 - len(xs) % 4) % 4
             xs.extend([0 for _ in range(img_pad)])
@@ -131,18 +129,18 @@ def main():
     tokenizer = build_tokenizer(args)
     pool = multiprocessing.Pool(args.workers, initializer=encoder.initializer)
 
-    fin = open(args.input + ".json", 'r', encoding='utf-8')
-    img_files = open(args.input_image)
+    fin = open(args.input, 'r', encoding='utf-8')
+    img_paths = [os.path.join(args.input_image, basename) for basename in os.listdir(args.input_image)]
 
-    encoded_docs = pool.imap(encoder.encode, zip(fin, img_files), 25)
+    encoded_docs = pool.imap(encoder.encode, zip(fin, img_paths), 25)
 
     print(f"Vocab size: {tokenizer.vocab_size}")
     print(f"Output prefix: {args.output_prefix}")
     
-    output_bin_files = "{}_mmdata.bin".format(args.output_prefix)
-    output_idx_files = "{}_mmdata.idx".format(args.output_prefix)
+    output_bin_files = "{}.bin".format(args.output_prefix)
+    output_idx_files = "{}.idx".format(args.output_prefix)
 
-    builders = MMapIndexedDatasetBuilder(output_bin_files, dtype=np.int32, multimodal=True)
+    builders = IndexedDatasetBuilder(output_bin_files, dtype=np.int32, multimodal=True)
 
     startup_end = time.time()
     proc_start = time.time()

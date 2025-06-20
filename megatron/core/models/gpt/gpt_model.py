@@ -1,52 +1,81 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import logging
-from typing import Literal, Optional
+from collections import OrderedDict
+from typing import Dict, Literal, Optional
 
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.rotary_pos_embedding import RotaryEmbedding
-from megatron.core.models.gpt.gpt_embedding import GPTEmbedding
-from megatron.core.transformer.enums import AttnMaskType, ModelType
-from megatron.core.transformer.module import MegatronModule
+from megatron.core import tensor_parallel
+from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+    MultimodalRotaryEmbedding,
+    RotaryEmbedding,
+)
+from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    tie_output_layer_state_dict,
+    tie_word_embeddings_state_dict,
+)
+from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 
-class GPTModel(MegatronModule):
-    """Transformer language model.
+class GPTModel(LanguageModule):
+    """GPT Transformer language model.
 
-    Arguments:
-        config (TransformerConfig): transformer config
-
-        vocab_size (int): vocabulary size
-
-        max_sequence_length (int): maximum size of sequence. This is used for positional embedding
-
-        pre_process (bool): Include embedding layer (used with pipeline parallelism)
-        post_process (bool): Include an output layer (used with pipeline parallelism)
-
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks
-
-        share_embeddings_and_output_weights (bool): When True, input embeddings and output logit weights are
-            shared. Defaults to False.
-
-        position_embedding_type (string): Position embedding type. Options ['learned_absolute', 'rope'].
-            Defaults is 'learned_absolute'.
-
-        rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
-            Defaults to 1.0 (100%). Ignored unless position_embedding_type is 'rope'.
-
-        seq_len_interpolation_factor (float): scale of linearly interpolating RoPE for longer sequences.
+    Args:
+        config (TransformerConfig):
+            Transformer config
+        transformer_layer_spec (ModuleSpec):
+            Specifies module to use for transformer layers
+        vocab_size (int):
+            Vocabulary size
+        max_sequence_length (int):
+            maximum size of sequence. This is used for positional embedding
+        pre_process (bool, optional):
+            Include embedding layer (used with pipeline parallelism). Defaults to True.
+        post_process (bool, optional):
+            Include an output layer (used with pipeline parallelism). Defaults to True.
+        fp16_lm_cross_entropy (bool, optional):
+            Defaults to False.
+        parallel_output (bool, optional):
+            Do not gather the outputs, keep them split across tensor
+            parallel ranks. Defaults to True.
+        share_embeddings_and_output_weights (bool, optional):
+            When True, input embeddings and output logit weights are shared. Defaults to False.
+        position_embedding_type (Literal[learned_absolute,rope], optional):
+            Position embedding type.. Defaults to 'learned_absolute'.
+        rotary_percent (float, optional):
+            Percent of rotary dimension to use for rotary position embeddings.
+            Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
+        rotary_base (int, optional):
+            Base period for rotary position embeddings. Ignored unless
+            position_embedding_type is 'rope'.
+            Defaults to 10000.
+        rope_scaling (bool, optional): Toggle RoPE scaling.
+        rope_scaling_factor (float): RoPE scaling factor. Default 8.
+        scatter_embedding_sequence_parallel (bool, optional):
+            Whether embeddings should be scattered across sequence parallel
+            region or not. Defaults to True.
+        seq_len_interpolation_factor (Optional[float], optional):
+            scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
     """
 
     def __init__(
         self,
         config: TransformerConfig,
+        transformer_layer_spec: ModuleSpec,
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
@@ -54,13 +83,24 @@ class GPTModel(MegatronModule):
         fp16_lm_cross_entropy: bool = False,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        position_embedding_type: Literal['learned_absolute', 'rope'] = 'learned_absolute',
+        position_embedding_type: Literal[
+            'learned_absolute', 'rope', 'mrope', 'none'
+        ] = 'learned_absolute',
         rotary_percent: float = 1.0,
+        rotary_base: int = 10000,
+        rope_scaling: bool = False,
+        rope_scaling_factor: float = 8.0,
+        scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
-    ):
-        super(GPTModel, self).__init__(config=config)
+        mtp_block_spec: Optional[ModuleSpec] = None,
+        vp_stage: Optional[int] = None,
+    ) -> None:
+        super().__init__(config=config)
 
-        self.config: TransformerConfig = config
+        if has_config_logger_enabled(config):
+            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
+        self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
@@ -68,41 +108,98 @@ class GPTModel(MegatronModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
-        self.position_embedding_type = position_embedding_type
+        self.vp_stage = vp_stage
+
+        if hasattr(self.config, 'position_embedding_type'):
+            self.position_embedding_type = self.config.position_embedding_type
+        else:
+            self.position_embedding_type = position_embedding_type
 
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
 
-        # Embeddings.
-        if self.pre_process:
-            self.embedding = GPTEmbedding(
+        # These 4 attributes are needed for TensorRT-LLM export.
+        self.max_position_embeddings = max_sequence_length
+        self.rotary_percent = rotary_percent
+
+        if hasattr(self.config, 'rotary_base'):
+            self.rotary_base = self.config.rotary_base
+        else:
+            self.rotary_base = rotary_base
+        self.rotary_scaling = rope_scaling
+        self.mtp_block_spec = mtp_block_spec
+        self.mtp_process = mtp_block_spec is not None
+
+        if self.pre_process or self.mtp_process:
+            self.embedding = LanguageModelEmbedding(
                 config=self.config,
                 vocab_size=self.vocab_size,
                 max_sequence_length=self.max_sequence_length,
-                add_position_embedding=(self.position_embedding_type == 'learned_absolute'),
+                position_embedding_type=position_embedding_type,
+                scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
             )
 
-        # Rotary Position Embeddings
-        if self.position_embedding_type == 'rope':
-            rotary_dim = self.config.kv_channels
-            if rotary_percent < 1.0:
-                rotary_dim = int(rotary_dim * rotary_percent)
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                rope_scaling=rope_scaling,
+                rope_scaling_factor=rope_scaling_factor,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
 
-            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, seq_len_interpolation_factor)
-        else:
-            self.rotary_pos_emb = None
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            self.rotary_pos_emb = MultimodalRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+            )
+            self.mrope_section = self.config.mrope_section
+            assert (
+                self.mrope_section is not None
+            ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+
+        # Cache for RoPE tensors which do not change between iterations.
+        self.rotary_pos_emb_cache = {}
 
         # Transformer.
         self.decoder = TransformerBlock(
             config=self.config,
-            self_attn_mask_type=AttnMaskType.causal,
+            spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            vp_stage=vp_stage,
         )
 
+        if self.mtp_process:
+            self.mtp = MultiTokenPredictionBlock(
+                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage
+            )
+
         # Output
-        if post_process:
+        if self.post_process or self.mtp_process:
+
+            if self.config.defer_embedding_wgrad_compute:
+                # The embedding activation buffer preserves a reference to the input activations
+                # of the final embedding projection layer GEMM. It will hold the activations for
+                # all the micro-batches of a global batch for the last pipeline stage. Once we are
+                # done with all the back props for all the microbatches for the last pipeline stage,
+                # it will be in the pipeline flush stage. During this pipeline flush we use the
+                # input activations stored in embedding activation buffer and gradient outputs
+                # stored in gradient buffer to calculate the weight gradients for the embedding
+                # final linear layer.
+                self.embedding_activation_buffer = []
+                self.grad_output_buffer = []
+            else:
+                self.embedding_activation_buffer = None
+                self.grad_output_buffer = None
+
             self.output_layer = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
                 self.vocab_size,
@@ -113,31 +210,52 @@ class GPTModel(MegatronModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
+                embedding_activation_buffer=self.embedding_activation_buffer,
+                grad_output_buffer=self.grad_output_buffer,
             )
 
-        if self.share_embeddings_and_output_weights and (self.pre_process or self.post_process):
-            self.initialize_last_stage_with_word_embeddings()
+        if self.pre_process or self.post_process:
+            self.setup_embeddings_and_output_layer()
 
-    def set_input_tensor(self, input_tensor):
-        """ See megatron.model.transformer.set_input_tensor()"""
+        if has_config_logger_enabled(self.config):
+            log_config_to_disk(
+                self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
+            )
+        for name, module in self.named_modules():
+            if hasattr(module, 'finish_init'):
+                quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
+                module.finish_init(quant_config)
 
+    def set_input_tensor(self, input_tensor: Tensor) -> None:
+        """Sets input tensor to the model.
+
+        See megatron.model.transformer.set_input_tensor()
+
+        Args:
+            input_tensor (Tensor): Sets the input tensor for the model.
+        """
         # This is usually handled in schedules.py but some inference code still
         # gives us non-lists or None
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt'
+        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def forward(
+    def _preprocess(
         self,
         input_ids: Tensor,
         position_ids: Tensor,
-        attention_mask: Tensor,
         decoder_input: Tensor = None,
-        labels: Tensor = None,
-        inference_params=None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
     ):
+        """Preprocesses inputs for the transformer decoder.
+
+        Applies embeddings to input tokens, or uses `decoder_input` from a previous
+        pipeline stage. Also sets up rotary positional embeddings.
+        """
+
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
@@ -151,158 +269,299 @@ class GPTModel(MegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
-        # Rotary positional embeddings
+        # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
-        if self.rotary_pos_emb is not None:
-            if inference_params is not None:
-                rotary_seq_len = inference_params.max_sequence_length
+        rotary_pos_cos = None
+        rotary_pos_sin = None
+        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+            if not self.training and self.config.flash_decode and inference_context:
+                assert (
+                    inference_context.is_static_batching()
+                ), "GPTModel currently only supports static inference batching."
+                # Flash decoding uses precomputed cos and sin for RoPE
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
+                    inference_context.max_sequence_length,
+                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                )
             else:
-                if self.decoder.input_tensor is not None:
-                    rotary_seq_len = self.decoder.input_tensor.size(0)
-                else:
-                    rotary_seq_len = decoder_input.size(0)
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+                )
+                rotary_pos_emb = self.rotary_pos_emb(
+                    rotary_seq_len,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
+                )
+        elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
+            if self.training or not self.config.flash_decode:
+                rotary_pos_emb = self.rotary_pos_emb(position_ids, self.mrope_section)
+            else:
+                # Flash decoding uses precomputed cos and sin for RoPE
+                raise NotImplementedError(
+                    "Flash decoding uses precomputed cos and sin for RoPE, not implmented in "
+                    "MultimodalRotaryEmbedding yet."
+                )
 
-                # Decoder input is split along sequence dimension, but RoPE is applied in tensor parallel region
-                if self.config.sequence_parallel:
-                    rotary_seq_len *= self.config.tensor_model_parallel_size
+        if (
+            (self.config.enable_cuda_graph or self.config.flash_decode)
+            and rotary_pos_cos is not None
+            and inference_context
+            and inference_context.is_static_batching()
+            and not self.training
+        ):
+            current_batch_size = input_ids.shape[0]
+            sequence_len_offset = torch.tensor(
+                [inference_context.sequence_len_offset] * current_batch_size,
+                dtype=torch.int32,
+                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
+            )
+        else:
+            sequence_len_offset = None
 
-            rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
+        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
+        # reference held by this caller function, enabling early garbage collection for
+        # inference. Skip wrapping if decoder_input is logged after decoder completion.
+        if (
+            inference_context is not None
+            and not self.training
+            and not has_config_logger_enabled(self.config)
+        ):
+            decoder_input = WrappedTensor(decoder_input)
+
+        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Forward function of the GPT Model This function passes the input tensors
+        through the embedding layer, and then the decoeder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+            self._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+        )
 
         # Run decoder.
         hidden_states = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
-            inference_params=inference_params,
+            inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            **(extra_block_kwargs or {}),
         )
 
-        if not self.post_process:
-            return hidden_states
+        return self._postprocess(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mtp_in_postprocess=self.mtp_process,
+            loss_mask=loss_mask,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            runtime_gather_output=runtime_gather_output,
+            extra_block_kwargs=extra_block_kwargs,
+            inference_context=inference_context,
+        )
 
+    def _postprocess(
+        self,
+        hidden_states,
+        input_ids,
+        position_ids,
+        labels,
+        rotary_pos_emb,
+        rotary_pos_cos,
+        rotary_pos_sin,
+        mtp_in_postprocess=None,
+        loss_mask=None,
+        decoder_input=None,
+        attention_mask=None,
+        inference_params=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        runtime_gather_output=None,
+        extra_block_kwargs=None,
+        inference_context=None,
+    ):
+        """Postprocesses decoder hidden states to generate logits or compute loss.
+
+        Applies Multi-Token Prediction if enabled, generates output logits through
+        the output layer, and computes language model loss when labels are provided.
+        """
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        logits, _ = self.output_layer(hidden_states, weight=output_weight)
+
+        if mtp_in_postprocess:
+            hidden_states = self.mtp(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                embedding=self.embedding,
+                output_layer=self.output_layer,
+                output_weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                compute_language_model_loss=self.compute_language_model_loss,
+                **(extra_block_kwargs or {}),
+            )
+
+        if not self.post_process:
+            return hidden_states
+
+        if (
+            not self.training
+            and inference_context is not None
+            and inference_context.materialize_only_last_token_logits
+        ):
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
+                # state ([B, H]) → unsqueeze back to [1, B, H]
+                # (so that the output layer, which expects S×B×H, receives only the final token)
+                hidden_states = inference_context.last_token_logits(
+                    hidden_states.squeeze(1).unsqueeze(0)
+                ).unsqueeze(1)
+        logits, _ = self.output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+
+        if has_config_logger_enabled(self.config):
+            payload = OrderedDict(
+                {
+                    'input_ids': input_ids,
+                    'position_ids': position_ids,
+                    'attention_mask': attention_mask,
+                    'decoder_input': decoder_input,
+                    'logits': logits,
+                }
+            )
+            log_config_to_disk(self.config, payload, prefix='input_and_logits')
 
         if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        # [b s] => [s b]
-        labels = labels.transpose(0, 1).contiguous()
-        loss = tensor_parallel.vocab_parallel_cross_entropy(logits.float(), labels)
+        loss = self.compute_language_model_loss(labels, logits)
 
-        # [s b] => [b, s]
-        loss = loss.transpose(0, 1).contiguous()
         return loss
 
-    def shared_embedding_or_output_weight(self):
-        if self.pre_process:
+    def shared_embedding_or_output_weight(self) -> Tensor:
+        """Gets the embedding weight or output logit weights when share input embedding and
+        output weights set to True or when use Multi-Token Prediction (MTP) feature.
+
+        Returns:
+            Tensor: During pre processing or MTP process it returns the input embeddings weight.
+            Otherwise, during post processing it returns the final output layers weight.
+        """
+        if self.pre_process or self.mtp_process:
+            # Multi-Token Prediction (MTP) need both embedding layer and output layer.
+            # So there will be both embedding layer and output layer in the mtp process stage.
+            # In this case, if share_embeddings_and_output_weights is True, the shared weights
+            # will be stored in embedding layer, and output layer will not have any weight.
+            assert hasattr(
+                self, 'embedding'
+            ), f"embedding is needed in this pipeline stage, but it is not initialized."
             return self.embedding.word_embeddings.weight
         elif self.post_process:
             return self.output_layer.weight
         return None
 
-    def initialize_last_stage_with_word_embeddings(self):
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
+    ) -> ShardedStateDict:
+        """Sharded state dict implementation for GPTModel backward-compatibility.
 
-        # This function just initializes the word embeddings in the final stage
-        # when we are using pipeline parallelism and sharing word
-        # embeddings. Nothing to do if we aren't sharing weights or aren't using
-        # pipeline parallelism.
-        if not self.share_embeddings_and_output_weights or (self.pre_process and self.post_process):
-            return
+        Removing extra state.
+        Tie word embeddings and output layer in mtp process stage.
 
-        if self.post_process and not self.pre_process:
-            assert not parallel_state.is_pipeline_first_stage()
-            # set word_embeddings weights to 0 here, then copy first
-            # stage's weights using all_reduce below.
-            self.output_layer.weight.data.fill_(0)
-            self.output_layer.weight.shared = True
+        Args:
+            prefix (str): Module name prefix.
+            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
+            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
 
-        # Parameters are shared between the word embeddings layers, and the
-        # heads at the end of the model. In a pipelined setup with more than
-        # one stage, the initial embedding layer and the head are on different
-        # workers, so we do the following:
-        # 1. Create a second copy of word_embeddings on the last stage, with
-        #    initial parameters of 0.0.
-        # 2. Do an all-reduce between the first and last stage to ensure that
-        #    the two copies of word_embeddings start off with the same
-        #    parameter values.
-        # 3. In the training loop, before an all-reduce between the grads of
-        #    the two word_embeddings layers to ensure that every applied weight
-        #    update is the same on both stages.
+        Returns:
+            ShardedStateDict: sharded state dict for the GPTModel
+        """
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
 
-        # Ensure that first and last stages have the same initial parameter
-        # values.
-        if torch.distributed.is_initialized():
-            if parallel_state.is_rank_in_embedding_group():
-                weight = self.shared_embedding_or_output_weight()
-                torch.distributed.all_reduce(
-                    weight.data, group=parallel_state.get_embedding_group()
+        # Old GPT checkpoints only stored the output layer weight key. So we remove the
+        # _extra_state key but check that it doesn't contain any data anyway
+        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
+        assert not (
+            output_extra_state and output_extra_state.data
+        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
+
+        # Multi-Token Prediction (MTP) need both embedding layer and output layer in
+        # mtp process stage.
+        # If MTP is not placed in the pre processing stage, we need to maintain a copy of
+        # embedding layer in the mtp process stage and tie it to the embedding in the pre
+        # processing stage.
+        # Also, if MTP is not placed in the post processing stage, we need to maintain a copy
+        # of output layer in the mtp process stage and tie it to the output layer in the post
+        # processing stage.
+        if self.mtp_process and not self.pre_process:
+            emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
+            emb_weight = self.embedding.word_embeddings.weight
+            tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
+        if self.mtp_process and not self.post_process:
+            # We only need to tie the output layer weight if share_embeddings_and_output_weights
+            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
+            # will be stored in embedding layer, and output layer will not have any weight.
+            if not self.share_embeddings_and_output_weights:
+                output_layer_weight_key = f'{prefix}output_layer.weight'
+                output_layer_weight = self.output_layer.weight
+                tie_output_layer_state_dict(
+                    sharded_state_dict, output_layer_weight, output_layer_weight_key
                 )
-
-        elif not getattr(GPTModel, "embedding_warning_printed", False):
-            logging.getLogger(__name__).warning(
-                "Distributed processes aren't initialized, so the output layer "
-                "is not initialized with weights from the word embeddings. "
-                "If you are just manipulating a model this is fine, but "
-                "this needs to be handled manually. If you are training "
-                "something is definitely wrong."
-            )
-            GPTModel.embedding_warning_printed = True
-
-    def sharded_state_dict(self, prefix=''):
-        sharded_state_dict = {}
-
-        if self.pre_process:
-            embedding_prefix = f'{prefix}embedding.'
-            embedding_sharded_state_dict = self.embedding.sharded_state_dict(
-                prefix=embedding_prefix
-            )
-            sharded_state_dict.update(embedding_sharded_state_dict)
-
-        decoder_prefix = f'{prefix}decoder.'
-        decoder_sharded_state_dict = self.decoder.sharded_state_dict(prefix=decoder_prefix)
-        sharded_state_dict.update(decoder_sharded_state_dict)
-
-        if self.post_process:
-            output_layer_prefix = f'{prefix}output_layer.'
-            output_layer_key = f'{output_layer_prefix}weight'
-            if self.share_embeddings_and_output_weights:
-                if not self.pre_process:
-                    # when sharing embeddings with last stage, we need to use the weights from the first stage
-                    # on pipeline first rank, word embeddings are saved to {prefix}embedding.word_embeddings.weight
-                    tensor = self.shared_embedding_or_output_weight()
-                    first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'
-                    dp_rank = parallel_state.get_data_parallel_rank()
-                    dp_size = parallel_state.get_data_parallel_world_size()
-                    last_stage_word_emb_replica_id = (
-                        dp_rank + dp_size
-                    )  # copy of first stage embedding
-
-                    sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                        tensor=tensor,
-                        key=first_stage_word_emb_key,
-                        replica_id=last_stage_word_emb_replica_id,
-                        allow_shape_mismatch=True,
-                    )
-
-                    sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
-
-            else:
-                output_layer_state_dict = self.output_layer.state_dict(
-                    prefix=output_layer_prefix, keep_vars=True
-                )
-                output_layer_tensor = output_layer_state_dict[output_layer_key]
-                # independent output layer
-                sharded_output_layer_tensor = make_tp_sharded_tensor_for_checkpoint(
-                    tensor=output_layer_tensor,
-                    key=output_layer_key,
-                    replica_id=parallel_state.get_data_parallel_rank(),
-                    allow_shape_mismatch=True,
-                )
-
-                sharded_state_dict[output_layer_key] = sharded_output_layer_tensor
 
         return sharded_state_dict

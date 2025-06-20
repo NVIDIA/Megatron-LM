@@ -1,0 +1,58 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+TEST_TYPE: 'release'
+MODEL_ARGS:
+  # T5 model args
+  --encoder-num-layers: 12
+  --decoder-num-layers: 12
+  --hidden-size: 768
+  --num-attention-heads: 12
+  --kv-channels: 64
+  --ffn-hidden-size: 3072
+  --encoder-seq-length: 512
+  --decoder-seq-length: 128
+  --max-position-embeddings: 512
+  --init-method-std: 0.015
+  --attention-backend: unfused
+  # Training args
+  --micro-batch-size: 32
+  --global-batch-size: 512
+  --train-iters: 100000
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --bf16: true
+  --lr: 0.0001
+  --lr-decay-style: linear
+  --min-lr: 1.0e-5
+  --lr-warmup-fraction: .01
+  --distributed-backend: nccl
+  # Transformer Engine args
+  --use-mcore-models: true
+  --transformer-impl: transformer_engine
+  # Model parallel
+  --tensor-model-parallel-size: 4
+  --pipeline-model-parallel-size: 1
+  # Data args
+  --data-path: ${DATA_BLEND}
+  --vocab-file: ${DATA_PATH}/bert-large-cased-vocab.txt
+  --tokenizer-type: BertWordPieceCase
+  --split: 99982,9,9
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --vocab-extra-ids: 100
+  # EVAL_AND_LOGGING_ARGS
+  --log-interval: 100
+  --save-interval: 2000
+  --eval-interval: 1000
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --eval-iters: 10
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --timing-log-level: 2
+  --wandb-project: megatron-core-release-runs
+  --wandb-exp-name: ${WANDB_EXPERIMENT}

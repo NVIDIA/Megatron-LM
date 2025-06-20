@@ -1,0 +1,91 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: gpt-nemo
+  build: mcore-nemo
+  nodes: 1
+  gpus: 8
+  platforms: dgx_a100
+  time_limit: 1800
+  scope:
+  script_setup: |
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/NeMo
+
+    ARGUMENTS=(
+        "DATA_PATH='-'"
+        "DATA_CACHE_PATH='-'"
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/{name}"
+        "TRAINING_SCRIPT_PATH=\"nemo llm pretrain -y --factory {nemo_model}\""
+        "TRAINING_PARAMS_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=/opt/megatron-lm/tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "N_REPEAT={n_repeat}"
+    )
+
+    bash /opt/megatron-lm/tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [llama3-nemo_8b_mr_mbs1_gbs8_mcore_te_8experts_tp2_ep2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+        nemo_model: [llama3_8b]
+  - test_case: [llama3-nemo_8b_mr_mbs4_gbs64_mcore_te_tp1_pp1_cp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+        nemo_model: [llama3_8b]
+  - test_case: [mixtral-nemo_8x7b_mr_mbs1_gbs8_mcore_te_tp2_pp1_ep2_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+        nemo_model: [mixtral_8x7b]
+  - test_case: [gemma2-nemo_2b_mr_mbs1_gbs8_mcore_te_tp4_pp1_cp1_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+        nemo_model: [gemma2_2b]
+  - test_case: [bert-nemo_340m_mr_mbs2_gbs32_mcore_te_tp2_pp2_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+        nemo_model: [bert_340m]
+  - test_case: [t5-nemo_220m_mr_mbs4_gbs64_te_tp1_pp1_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+        nemo_model: [t5_220m]

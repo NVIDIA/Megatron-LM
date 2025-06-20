@@ -1,0 +1,76 @@
+# syntax=docker/dockerfile:1.3-labs
+
+ARG FROM_IMAGE_NAME
+ARG WHEEL_DIR=/workspace/wheels
+
+FROM $FROM_IMAGE_NAME as build_mamba
+WORKDIR /opt
+ARG WHEEL_DIR
+RUN MAMBA_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/state-spaces/mamba.git@v2.0.3 -w $WHEEL_DIR
+
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as build_causalconv1d
+WORKDIR /opt
+ARG WHEEL_DIR
+RUN CAUSAL_CONV1D_FORCE_BUILD=TRUE pip3 wheel -v git+https://github.com/Dao-AILab/causal-conv1d.git@v1.2.2.post1 -w $WHEEL_DIR
+
+FROM $FROM_IMAGE_NAME as build_groupedgemm
+WORKDIR /opt
+ARG WHEEL_DIR
+RUN pip3 wheel -v git+https://github.com/fanshiqing/grouped_gemm@v1.1.2 -w $WHEEL_DIR
+
+FROM ${FROM_IMAGE_NAME} as build_experimental_flash_attention
+WORKDIR /opt
+ARG WHEEL_DIR
+ARG EXPERIMENTAL_FLASH_ATTN_VERSION=c0f04c0b6c747914d95205867d86dd19c027d01d
+RUN --mount=type=secret,id=EXPERIMENTAL_FLASH_ATTN bash -ex <<"EOF"
+    EXPERIMENTAL_FLASH_ATTN=$(cat /run/secrets/EXPERIMENTAL_FLASH_ATTN) 
+    pip uninstall -y ninja
+    pip install --no-cache-dir ninja
+    MAX_JOBS=4 pip wheel --no-cache-dir -v $EXPERIMENTAL_FLASH_ATTN@${EXPERIMENTAL_FLASH_ATTN_VERSION} -w $WHEEL_DIR
+EOF
+
+ARG FROM_IMAGE_NAME
+FROM $FROM_IMAGE_NAME as main
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN bash -ex <<"EOF"
+    apt-get update
+    apt-get install -y --no-install-recommends gettext python3-venv
+    apt-get clean
+    python -m venv /opt/jet
+    wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+    chmod a+x /usr/local/bin/yq
+EOF
+
+ARG UV_VERSION=0.7.2
+ENV PATH="/root/.local/bin:$PATH"
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV UV_LINK_MODE=copy
+
+ARG WHEEL_DIR
+COPY README.md pyproject.toml uv.lock /workspace/
+COPY megatron/core/__init__.py /workspace/megatron/core/
+COPY megatron/core/package_info.py /workspace/megatron/core/
+COPY docker/common/ /workspace/docker/common/
+COPY --from=build_mamba $WHEEL_DIR/*.whl $WHEEL_DIR/
+COPY --from=build_causalconv1d $WHEEL_DIR/*.whl $WHEEL_DIR/
+COPY --from=build_groupedgemm $WHEEL_DIR/*.whl $WHEEL_DIR/
+RUN bash docker/common/install.sh --input-wheel-dir $WHEEL_DIR/ --environment lts
+
+ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
+
+##### For NVIDIANS only #####
+FROM main as jet
+ARG JET_API_VERSION
+ENV PATH="$PATH:/opt/jet/bin"
+RUN --mount=type=secret,id=JET_INDEX_URLS \
+    --mount=type=secret,id=LOGGER_INDEX_URL bash -ex <<"EOF"
+    JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
+    LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
+    uv pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS "setuptools<80.0.0"
+    uv pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL "setuptools<80.0.0"
+EOF
+###

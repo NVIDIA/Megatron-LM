@@ -5,10 +5,12 @@ import os
 import sys
 import tempfile
 
+import nltk
+import pytest
 import requests
 
-from megatron.data.indexed_dataset import MMapIndexedDataset
-from megatron.tokenizer.gpt2_tokenization import (
+from megatron.core.datasets.indexed_dataset import IndexedDataset
+from megatron.training.tokenizer.gpt2_tokenization import (
     PRETRAINED_MERGES_ARCHIVE_MAP,
     PRETRAINED_VOCAB_ARCHIVE_MAP,
 )
@@ -20,6 +22,12 @@ from tools.preprocess_data import main as build_main
 __HUGGINGFACE_BERT_BASE_UNCASED_VOCAB = (
     "https://huggingface.co/bert-base-uncased/raw/main/vocab.txt"
 )
+
+__LOCAL_BERT_VOCAB = "/home/gitlab-runner/data/bert_data/vocab.txt"
+
+__LOCAL_GPT2_MERGE = "/home/gitlab-runner/data/gpt3_data/gpt2-merges.txt"
+
+__LOCAL_GPT2_VOCAB = "/home/gitlab-runner/data/gpt3_data/gpt2-vocab.json"
 
 
 def dummy_jsonl(odir):
@@ -61,6 +69,10 @@ def merge_datasets(idir):
 
 
 def do_test_preprocess_data(temp_dir, extra_args=[]):
+    # set the default nltk data path
+    os.environ["NLTK_DATA"] = os.path.join(temp_dir, "nltk_data")
+    nltk.data.path.append(os.environ["NLTK_DATA"])
+
     path_to_raws = os.path.join(temp_dir, "sample_raws")
     path_to_data = os.path.join(temp_dir, "sample_data")
     os.mkdir(path_to_raws)
@@ -70,14 +82,12 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     dummy_jsonl(path_to_raws)
 
     # build the datasets
-    build_datasets(
-        path_to_raws, path_to_data, extra_args=extra_args,
-    )
+    build_datasets(path_to_raws, path_to_data, extra_args=extra_args)
 
     # merge the datasets
     merge_datasets(path_to_data)
 
-    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None,] + extra_args
+    sys.argv = [sys.argv[0], "--input", None, "--output-prefix", None] + extra_args
     encoder = Encoder(build_args())
     encoder.initializer()
 
@@ -87,10 +97,10 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
                 return getattr(encoder.tokenizer, option)(toks)
             except:
                 continue
-        raise RuntimeError(f"{type(encoder.tokenizer)} tokenizer cannot `decode` or `detokenize`.")
+        raise RuntimeError(f"{type(encoder.tokenizer)} tokenizer cannot decode or detokenize")
 
     merged_index = 0
-    merged_dataset = MMapIndexedDataset(os.path.join(path_to_data, "merge"))
+    merged_dataset = IndexedDataset(os.path.join(path_to_data, "merge"))
 
     # sorted to ensure ordering matches merged dataset
     basenames = sorted(
@@ -109,18 +119,18 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
         realpath_doc = os.path.join(path_to_data, basename.split(".")[-2])
 
         dataset_index = 0
-        dataset = MMapIndexedDataset(realpath_doc)
+        dataset = IndexedDataset(realpath_doc)
 
-        merged_doc_idx = merged_dataset.doc_idx[
-            merged_doc_index_index : merged_doc_index_index + len(dataset.doc_idx)
+        merged_doc_idx = merged_dataset.document_indices[
+            merged_doc_index_index : merged_doc_index_index + len(dataset.document_indices)
         ]
         merged_doc_idx = merged_doc_idx - merged_doc_idx[0]
 
         assert (
-            dataset.doc_idx == merged_doc_idx
+            dataset.document_indices == merged_doc_idx
         ).all(), f"ERROR: {basename.split('_')[:-2]}: merged dataset document indices mismatch"
 
-        merged_doc_index_index += len(dataset.doc_idx) - 1
+        merged_doc_index_index += len(dataset.document_indices) - 1
 
         with open(realpath_raw, "rt") as reader:
             for json_line in reader:
@@ -155,22 +165,26 @@ def do_test_preprocess_data(temp_dir, extra_args=[]):
     print("INFO: Success!")
 
 
+def gpt2_vocab(odir):
+    if os.path.exists(__LOCAL_GPT2_VOCAB):
+        return __LOCAL_GPT2_VOCAB
+    path = os.path.join(odir, "vocab.json")
+    with open(path, "wb") as writer:
+        writer.write(requests.get(PRETRAINED_VOCAB_ARCHIVE_MAP['gpt2']).content)
+    return path
+
+
+def gpt2_merge(odir):
+    if os.path.exists(__LOCAL_GPT2_MERGE):
+        return __LOCAL_GPT2_MERGE
+    path = os.path.join(odir, "merge.txt")
+    with open(path, "wb") as writer:
+        writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
+    return path
+
+
 def test_preprocess_data_gpt():
     with tempfile.TemporaryDirectory() as temp_dir:
-
-        # grab gpt2_vocab.json
-        def gpt2_vocab(odir):
-            path = os.path.join(odir, "vocab.json")
-            with open(path, "wb") as writer:
-                writer.write(requests.get(PRETRAINED_VOCAB_ARCHIVE_MAP['gpt2']).content)
-            return path
-
-        # grab gpt2_merge.txt
-        def gpt2_merge(odir):
-            path = os.path.join(odir, "merge.txt")
-            with open(path, "wb") as writer:
-                writer.write(requests.get(PRETRAINED_MERGES_ARCHIVE_MAP['gpt2']).content)
-            return path
 
         # gpt specific args
         gpt_args = [
@@ -190,15 +204,19 @@ def test_preprocess_data_gpt():
         do_test_preprocess_data(temp_dir, extra_args=gpt_args)
 
 
+def bert_vocab(odir):
+    if os.path.exists(__LOCAL_BERT_VOCAB):
+        return __LOCAL_BERT_VOCAB
+    path = os.path.join(odir, "vocab.txt")
+    with open(path, "wb") as writer:
+        writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
+    return path
+
+
+@pytest.mark.flaky
+@pytest.mark.flaky_in_dev
 def test_preprocess_data_bert():
     with tempfile.TemporaryDirectory() as temp_dir:
-
-        # grab gpt2_vocab.json
-        def bert_vocab(odir):
-            path = os.path.join(odir, "vocab.txt")
-            with open(path, "wb") as writer:
-                writer.write(requests.get(__HUGGINGFACE_BERT_BASE_UNCASED_VOCAB).content)
-            return path
 
         # bert specific args
         bert_args = [

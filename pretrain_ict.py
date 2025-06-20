@@ -9,16 +9,16 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from megatron import get_args
-from megatron import print_rank_0
-from megatron import get_timers
+from megatron.training import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_timers
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.data.biencoder_dataset_utils import get_ict_batch
-from megatron.data.dataset_utils import build_train_valid_test_datasets
-from megatron.model.biencoder_model import biencoder_model_provider
+from megatron.legacy.data.biencoder_dataset_utils import get_ict_batch
+from megatron.legacy.data.dataset_utils import build_train_valid_test_datasets
+from megatron.legacy.model.biencoder_model import biencoder_model_provider
 from megatron.training import pretrain
-from megatron.utils import average_losses_across_data_parallel_group
+from megatron.training.utils import average_losses_across_data_parallel_group
 
 
 def pretrain_ict_model_provider(pre_process=True, post_process=True):
@@ -36,8 +36,8 @@ def pretrain_ict_model_provider(pre_process=True, post_process=True):
 def get_group_world_size_rank():
 
     group = mpu.get_data_parallel_group()
-    rank = torch.distributed.get_rank(group=group)
-    world_size = torch.distributed.get_world_size(group=group)
+    rank = group.rank()
+    world_size = group.size()
 
     return group, rank, world_size
 
@@ -150,7 +150,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         masked_lm_prob=args.mask_prob,
         short_seq_prob=args.short_seq_prob,
         seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
         binary_head=False,
         dataset_type='ict')
     print_rank_0("> finished creating BERT ICT datasets ...")
@@ -159,6 +158,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
+    print_rank_0("WARNING : This script is DEPRECATED. Will be removed in mcore release 0.9")
     pretrain(train_valid_test_datasets_provider,
              pretrain_ict_model_provider,
              ModelType.encoder_or_decoder,

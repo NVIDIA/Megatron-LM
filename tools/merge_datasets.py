@@ -7,9 +7,9 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
 )
 
-from megatron.data.indexed_dataset import (
-    MMapIndexedDataset,
-    MMapIndexedDatasetBuilder,
+from megatron.core.datasets.indexed_dataset import (
+    IndexedDataset,
+    IndexedDatasetBuilder,
     get_bin_path,
     get_idx_path,
 )
@@ -32,6 +32,13 @@ def get_args():
         type=str,
         required=True,
         help="Path to binary output file without suffix",
+    )
+
+    group = parser.add_argument_group(title="miscellaneous")
+    group.add_argument(
+        "--multimodal",
+        action="store_true",
+        help="Whether the datasets are assumed to be multimodal"
     )
 
     args = parser.parse_args()
@@ -70,13 +77,13 @@ def main():
     builder = None
     for prefix in sorted(prefixes):
         if builder is None:
-            dataset = MMapIndexedDataset(os.path.join(args.input, prefix))
-            builder = MMapIndexedDatasetBuilder(
-                get_bin_path(args.output_prefix), dtype=dataset._index.dtype
+            dataset = IndexedDataset(os.path.join(args.input, prefix), multimodal=args.multimodal)
+            builder = IndexedDatasetBuilder(
+                get_bin_path(args.output_prefix), dtype=dataset.index.dtype, multimodal=args.multimodal
             )
             del dataset
 
-        builder.merge_file_(os.path.join(args.input, prefix))
+        builder.add_index(os.path.join(args.input, prefix))
 
     builder.finalize(get_idx_path(args.output_prefix))
 

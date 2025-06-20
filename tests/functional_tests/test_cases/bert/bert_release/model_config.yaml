@@ -1,0 +1,54 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+  SKIP_PYTEST: 1
+TEST_TYPE: "release"
+MODEL_ARGS:
+  # Bert model args
+  --num-layers: 24
+  --hidden-size: 1024
+  --num-attention-heads: 16
+  --seq-length: 512
+  --max-position-embeddings: 512
+  # Training args
+  --micro-batch-size: 4
+  --global-batch-size: 32
+  --train-iters: 20000
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --fp16: true
+  --lr: 0.0001
+  --lr-decay-style: linear
+  --min-lr: 1.0e-5
+  --lr-warmup-fraction: .01
+  --bert-no-binary-head: true
+  # Model parallel
+  --tensor-model-parallel-size: 8
+  --pipeline-model-parallel-size: 8
+  # Data args
+  --data-path: ${DATA_BLEND}
+  --vocab-file: ${DATA_PATH}/vocab.txt
+  --split: 949,50,1
+  --data-cache-path: ${DATA_CACHE_PATH}
+  # EVAL_AND_LOGGING_ARGS
+  --log-interval: 100
+  --save-interval: 2000
+  --eval-interval: 1000
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --eval-iters: 10
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --log-timers-to-tensorboard: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-params-norm: true
+  --log-validation-ppl-to-tensorboard: true
+  --wandb-project: megatron-core-release-runs
+  --wandb-exp-name: ${WANDB_EXPERIMENT}
+  --attention-backend: unfused
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"

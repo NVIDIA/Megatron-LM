@@ -1,0 +1,85 @@
+# syntax=docker/dockerfile:1.3-labs
+
+ARG FROM_IMAGE_NAME
+ARG WHEEL_DIR=/workspace/wheels
+
+FROM ${FROM_IMAGE_NAME} as mcore_image
+ENV PIP_CONSTRAINT=""
+RUN pip install -U pip
+
+FROM mcore_image as build_te
+ARG TE_COMMIT=bee4649c15a79ffcb9689ca7c0c963f5febaa28a
+ARG WHEEL_DIR
+WORKDIR /opt
+COPY patches/nemo_2.3.0_te.patch /opt
+RUN bash -ex <<"EOF"
+    git clone https://github.com/NVIDIA/TransformerEngine.git
+    cd TransformerEngine 
+    git fetch origin ${TE_COMMIT} 
+    git checkout ${TE_COMMIT}
+    patch -p1 </opt/nemo_2.3.0_te.patch
+    git submodule init && git submodule update
+    rm /opt/nemo_2.3.0_te.patch
+    pip3 wheel --no-cache-dir -v -w $WHEEL_DIR .
+    ls -al $WHEEL_DIR
+EOF
+
+FROM mcore_image as build_mamba
+ARG WHEEL_DIR
+WORKDIR /workspace
+COPY docker docker/
+RUN bash docker/common/build_mamba.sh --output-wheel-dir $WHEEL_DIR
+
+FROM mcore_image as build_causalconv1d
+ARG WHEEL_DIR
+WORKDIR /workspace
+COPY docker docker/
+RUN bash docker/common/build_causalconv1d.sh --output-wheel-dir $WHEEL_DIR
+
+FROM mcore_image as build_groupedgemm
+ARG WHEEL_DIR
+WORKDIR /workspace
+COPY docker docker/
+RUN bash docker/common/build_groupedgemm.sh --output-wheel-dir $WHEEL_DIR
+
+FROM mcore_image as main
+ENV DEBIAN_FRONTEND=noninteractive
+RUN bash -ex <<"EOF"
+    apt-get update
+    apt-get install -y --no-install-recommends gettext python3-venv
+    apt-get clean
+    python -m venv /opt/jet
+    wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+    chmod a+x /usr/local/bin/yq
+EOF
+
+ARG UV_VERSION=0.7.2
+ENV PATH="/root/.local/bin:$PATH"
+RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV UV_LINK_MODE=copy
+
+ARG WHEEL_DIR
+COPY README.md pyproject.toml uv.lock /workspace/
+COPY megatron/core/__init__.py /workspace/megatron/core/
+COPY megatron/core/package_info.py /workspace/megatron/core/
+COPY docker/common/ /workspace/docker/common/
+COPY --from=build_te $WHEEL_DIR/*.whl $WHEEL_DIR/
+COPY --from=build_mamba $WHEEL_DIR/*.whl $WHEEL_DIR/
+COPY --from=build_causalconv1d $WHEEL_DIR/*.whl $WHEEL_DIR/
+COPY --from=build_groupedgemm $WHEEL_DIR/*.whl $WHEEL_DIR/
+RUN bash docker/common/install.sh --input-wheel-dir $WHEEL_DIR/ --environment dev
+
+##### For NVIDIANS only #####
+FROM main as jet
+ARG JET_API_VERSION
+ENV PATH="$PATH:/opt/jet/bin"
+RUN --mount=type=secret,id=JET_INDEX_URLS \
+    --mount=type=secret,id=LOGGER_INDEX_URL bash -ex <<"EOF"
+    JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
+    LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
+    uv pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS "setuptools<80.0.0"
+    uv pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL "setuptools<80.0.0"
+EOF
+###

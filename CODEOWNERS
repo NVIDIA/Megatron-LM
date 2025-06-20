@@ -1,0 +1,76 @@
+# Core
+[Core-ADLR] @mcore-reviewers/core-adlr
+megatron/core/ 
+
+[Core-NeMo] @mcore-reviewers/core-nemo
+megatron/core/ 
+
+^[Core-MLPerf] @mcore-reviewers/mlperf
+megatron/core/
+
+# Models
+[BERT] @mcore-reviewers/bert
+megatron/core/models/bert/
+
+[GPT] @mcore-reviewers/gpt
+megatron/core/models/gpt/
+
+[Retro] @mcore-reviewers/retro
+megatron/core/models/retro/
+
+[Multimodal] @mcore-reviewers/multi-modal
+megatron/core/models/multimodal/
+
+[T5] @mcore-reviewers/t5
+megatron/core/models/t5/
+
+[Hybrid-mamba] @mcore-reviewers/hybrid-mamba
+megatron/core/models/mamba/
+
+# Distributed Checkpointing
+[Distributed Checkpointing] @mcore-reviewers/dist-checkpointing
+megatron/core/dist_checkpointing/
+
+# Distributed Optimizer
+[Distributed Optimizer] @mcore-reviewers/dist-optimizer
+megatron/core/optimizer/distrib_optimizer/ 
+
+# Quantization and Inference (QAT)
+[Quantization and Inference (QAT)] @mcore-reviewers/quantization-and-inference
+megatron/core/inference/modelopt_support
+
+# Datasets
+[Datasets] @mcore-reviewers/datasets
+megatron/core/datasets/
+
+# Parallelism
+[Pipeline Parallelism] @mcore-reviewers/pipeline-parallelism
+megatron/core/pipeline_parallel/
+
+# Transformer
+[Transformer] @mcore-reviewers/transformer
+megatron/core/transformer/
+
+[MoE-ADLR] @mcore-reviewers/moe-adlr
+megatron/core/transformer/moe/
+
+[MoE-Moe] @mcore-reviewers/moe-moe
+megatron/core/transformer/moe/
+
+# Inference
+[Inference] @mcore-reviewers/inference
+megatron/core/inference/
+
+# Parallel State
+[ParallelState] @mcore-reviewers/parallelstate
+megatron/core/parallel_state.py
+
+[CI][1] @mcore-reviewers/ci
+.gitlab/
+.github/
+.gitlab-ci.yml
+Dockerfile.ci.lts
+Dockerfile.ci.dev
+tests/
+megatron/core/transformer/transformer_block.py
+megatron/core/transformer/transformer_layer.py

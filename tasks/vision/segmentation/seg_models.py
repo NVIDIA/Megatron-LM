@@ -4,10 +4,10 @@ import einops
 import torch
 import apex
 import torch.nn.functional as F
-from megatron import get_args
-from megatron.model.module import MegatronModule
-from megatron.model.vision.vit_backbone import VitBackbone, VitMlpHead
-from megatron.model.vision.mit_backbone import mit_b3, mit_b5
+from megatron.training import get_args
+from megatron.legacy.model.module import MegatronModule
+from megatron.legacy.model.vision.vit_backbone import VitBackbone, VitMlpHead
+from megatron.legacy.model.vision.mit_backbone import mit_b3, mit_b5
 from tasks.vision.segmentation.seg_heads import SetrSegmentationHead, SegformerSegmentationHead
 
 
@@ -36,7 +36,7 @@ class SetrSegmentationModel(MegatronModule):
         )
 
     def set_input_tensor(self, input_tensor):
-        """See megatron.model.transformer.set_input_tensor()"""
+        """See megatron.legacy.model.transformer.set_input_tensor()"""
         pass
 
     def forward(self, input):
@@ -68,7 +68,7 @@ class SegformerSegmentationModel(MegatronModule):
         )
 
     def set_input_tensor(self, input_tensor):
-        """See megatron.model.transformer.set_input_tensor()"""
+        """See megatron.legacy.model.transformer.set_input_tensor()"""
         pass
 
     def forward(self, input):

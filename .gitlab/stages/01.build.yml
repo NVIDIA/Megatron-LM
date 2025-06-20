@@ -1,0 +1,71 @@
+.build_rules:
+  rules:
+    - when: on_success
+  stage: test
+
+.build_image:
+  extends: [.build_rules, .dind_rules]
+  stage: build
+  tags:
+    - arch/amd64
+    - origin/jet-fleet
+    - env/prod
+    - ${TAG}
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  timeout: 180m
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: 1
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    TAG: purpose/builder-large
+    STAGE: jet
+    MCORE_BACKWARDS_REF: core_r0.13.0
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 90Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 90Gi
+    # KUBERNETES_SERVICE_CPU_REQUEST: 60
+    # KUBERNETES_SERVICE_CPU_LIMIT: 60
+  script:
+    - eval PUBLISH_COMMIT=$PUBLISH_COMMIT
+    - apk add bash curl git
+    - export TE_GIT_REF=$TE_GIT_REF
+    - bash .gitlab/scripts/build.sh
+
+    - git fetch origin $MCORE_BACKWARDS_REF
+    - MCORE_BACKWARDS_COMMIT=$(git rev-parse FETCH_HEAD)
+
+    - echo "MCORE_MR_COMMIT=$CI_COMMIT_SHA" | tee -a build.env
+    - echo "MCORE_BACKWARDS_COMMIT=$MCORE_BACKWARDS_COMMIT" | tee -a build.env
+    - cat build.env
+  retry:
+    max: 2
+  artifacts:
+    reports:
+      dotenv: build.env
+
+test:build_image:
+  extends: [.build_image]
+  parallel:
+    matrix:
+      - IMAGE: CI_MCORE_LTS_IMAGE
+        FILE: Dockerfile.ci.lts
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:24.01-py3
+      - IMAGE: CI_MCORE_DEV_IMAGE
+        FILE: Dockerfile.ci.dev
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:25.03-py3
+      - IMAGE: UTILITY_IMAGE
+        FILE: Dockerfile.linting
+        BASE_IMAGE: python:3.10
+
+test:build_nemo_image:
+  extends: [.build_image]
+  variables:
+    IMAGE: CI_NEMO_IMAGE
+    FILE: Dockerfile.ci.nemo
+    BASE_IMAGE: nvcr.io/nvidian/nemo:nightly
+  rules:
+    - if: $FUNCTIONAL_TEST == "yes" || $INTEGRATION_TEST == "yes" || $CI_COMMIT_BRANCH == "ci-rebuild-mcore-nemo-image"
+      when: on_success

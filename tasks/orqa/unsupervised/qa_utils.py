@@ -146,7 +146,7 @@ def regex_match(text, pattern):
             pattern,
             flags=re.IGNORECASE + re.UNICODE + re.MULTILINE,
         )
-    except BaseException:
+    except Exception:
         return False
     return pattern.search(text) is not None
 

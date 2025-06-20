@@ -12,8 +12,8 @@ import numpy as np
 import torchvision.transforms as T
 from torchvision import datasets
 from torch.utils.data import Dataset
-from megatron import print_rank_0
-from megatron import get_args
+from megatron.training import print_rank_0
+from megatron.training import get_args
 from PIL import Image, ImageOps, ImageEnhance
 import torchvision.transforms as torch_tr
 

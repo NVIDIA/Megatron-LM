@@ -1,0 +1,101 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}_{tag}"
+  model: unit-tests
+  nodes: 1
+  build: mcore-pyt-{environment}
+  gpus: 8
+  platforms: dgx_h100
+  script_setup: |
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    bash /opt/megatron-lm/.gitlab/scripts/fetch-legacy-suite.sh \
+      --backwards-commit $MCORE_BACKWARDS_COMMIT \
+      --repo $MCORE_REPO
+
+  script: |-
+    ls
+
+    TAG={tag}
+    ENVIRONMENT={environment}
+    BUCKET="{test_case}"
+    UNIT_TEST_REPEAT={n_repeat}
+    UNIT_TEST_TIMEOUT=10
+
+    if [[ "$TAG" == "latest" ]]; then
+        TEST_PATH="/opt/megatron-lm"
+    else
+        TEST_PATH="/opt/megatron-lm-legacy/"
+    fi
+
+
+    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+      --tag $TAG \
+      --environment $ENVIRONMENT \
+      --bucket $BUCKET \
+      --unit-test-repeat $UNIT_TEST_REPEAT \
+      --unit-test-timeout $UNIT_TEST_TIMEOUT \
+      --log-dir {assets_dir}/logs/1/
+
+    ls -al 
+    cp $TEST_PATH/.coverage_0 {assets_dir}/coverage_report
+    cp $TEST_PATH/coverage.xml {assets_dir}
+
+products:
+  - test_case: [tests/unit_tests/data/]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/dist_checkpointing/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/dist_checkpointing/models/]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/moe]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]

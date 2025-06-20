@@ -8,8 +8,8 @@ from functools import partial
 
 import torch
 
-from megatron import get_args
-from megatron import print_rank_last, is_last_rank
+from megatron.training import get_args
+from megatron.training import print_rank_last, is_last_rank
 from megatron.core import mpu
 from megatron.schedules import get_forward_backward_func
 from tasks.finetune_utils import build_data_loader
@@ -111,7 +111,7 @@ def calculate_correct_answers(name, model, dataloader,
     def correct_answers_forward_step(batch, model):
         try:
             batch_ = next(batch)
-        except BaseException:
+        except Exception:
             batch_ = batch
         tokens, types, labels, attention_mask = process_batch(batch_)
 
@@ -159,7 +159,7 @@ def calculate_correct_answers(name, model, dataloader,
 
     # Reduce.
     if mpu.is_pipeline_last_stage():
-        unreduced = torch.cuda.LongTensor([correct, total])
+        unreduced = torch.tensor([correct, total], dtype=torch.long, device='cuda')
         torch.distributed.all_reduce(unreduced,
                                      group=mpu.get_data_parallel_group())
 

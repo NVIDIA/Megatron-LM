@@ -1,0 +1,100 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: bert
+  nodes: 1
+  build: mcore-pyt-{environment}
+  gpus: 8
+  platforms: dgx_a100
+  time_limit:
+  n_repeat:
+  artifacts:
+    /workspace/data/bert_data: text/the_pile/bert_shard00
+    /workspace/checkpoints/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G_dev: model/mcore_bert/bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_{platforms}_1N8G_dev/28359448
+  script_setup: |
+    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    # Checkout backwards-ref
+    cd /opt
+    rm -rf /opt/megatron-lm-legacy; mkdir megatron-lm-legacy; cd megatron-lm-legacy
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin $MCORE_BACKWARDS_COMMIT
+    git checkout $MCORE_BACKWARDS_COMMIT
+    git rev-parse HEAD
+    rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+  script: |-
+    ls
+    cd /opt/megatron-lm
+    NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
+    ARGUMENTS=(
+        "DATA_PATH=/workspace/data/bert_data"
+        "DATA_CACHE_PATH=/workspace/data/cache" 
+        "OUTPUT_PATH={assets_dir}"
+        "TENSORBOARD_PATH={assets_dir}/tensorboard"
+        "CHECKPOINT_SAVE_PATH={artifacts_dir}/checkpoints"
+        "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/$NAME"
+        "TRAINING_SCRIPT_PATH=pretrain_bert.py"
+        "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
+        "N_REPEAT={n_repeat}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+    )
+
+    bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
+
+products:
+  - test_case: [bert_mr_mcore_tp2_pp2_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [bert_mr_mcore_tp2_pp2_local_spec_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [bert_mr_mcore_tp2_pp2_resume_torch_dist_local_spec_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp2]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_h100]
+  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp1_pp4_vp2]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_h100]
+  - test_case: [bert_nightly_dgx_a100_1N8G_mcore_tp4_pp1]
+    products:
+      - environment: [dev]
+        scope: [nightly]
+        platforms: [dgx_h100]
+  - test_case: [bert_mr_mcore_tp2_pp2_frozen_resume_torch_dist_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
