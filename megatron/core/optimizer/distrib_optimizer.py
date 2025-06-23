@@ -2164,9 +2164,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # communication calls here. If overlapping all-gather for parameters, the following
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
+            is_expert_optimizer = self.data_parallel_group == mpu.get_expert_data_parallel_group()
             if not self.ddp_config.overlap_param_gather:
                 for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                    model_chunk.start_param_sync(expert_param_sync=is_expert_optimizer)
         if timers is not None:
             timers('params-all-gather').stop()
 
