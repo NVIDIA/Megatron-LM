@@ -40,6 +40,7 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
 from .optimizer_config import OptimizerConfig
+from megatron.core import mpu
 
 logger = getLogger(__name__)
 
