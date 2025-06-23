@@ -176,7 +176,7 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         if (
             self.is_kernel_available(mask, *input.size())
-            and not isinstance(self.softmax_fn, SoftmaxOne)
+            and self.softmax_denominator_weight is None
         ):
             return self.forward_fused_softmax(input, mask)
         else:
