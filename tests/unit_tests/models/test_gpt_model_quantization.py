@@ -16,13 +16,7 @@ except ImportError:
     HAVE_TE = False
 
 try:
-    from megatron.core.extensions.kitchen import (
-        KitchenColumnParallelGroupedLinear,
-        KitchenColumnParallelLinear,
-        KitchenLayerNormColumnParallelLinear,
-        KitchenRowParallelGroupedLinear,
-        KitchenRowParallelLinear,
-    )
+    import nvidia_kitchen
 
     HAVE_KITCHEN = True
 except ImportError:
@@ -34,7 +28,6 @@ except ImportError:
     not HAVE_TE, reason="Transformer Engine required for using kitchen backend with TE layers."
 )
 class TestGPTModelKitchenQuantizationConfig:
-
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
