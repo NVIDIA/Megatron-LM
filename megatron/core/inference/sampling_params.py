@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -23,6 +24,7 @@ class SamplingParams:
     num_tokens_to_generate: int = 30
     top_n_logprobs: int = 0
     return_prompt_top_n_logprobs: bool = False
+    token_callback: Callable[[int], None] | None = None
 
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to sampling params
