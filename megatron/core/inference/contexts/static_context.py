@@ -73,6 +73,7 @@ class StaticInferenceContext(BaseInferenceContext):
         """Resets the inference state for a new batch."""
         self.sequence_len_offset = 0
         self.batch_size_offset = 0
+        self.key_value_memory_dict = {}
         self.enable_prefill_mode()
 
     def __str__(self):
