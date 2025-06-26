@@ -548,6 +548,19 @@ def _get_mtp_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
+def _regenerate_position_ids(tensor):
+    tensor = tensor.clone()
+    for i in range(tensor.size(0)):
+        row = tensor[i]
+        zero_mask = (row == 0)
+        if zero_mask.any():
+            first_zero_idx = torch.argmax(zero_mask.int()).item()
+            tensor[i, :first_zero_idx] = torch.arange(first_zero_idx)
+        else:
+            tensor = tensor - 1
+    return tensor
+
+
 class MultiTokenPredictionBlock(MegatronModule):
     """The implementation for Multi-Token Prediction (MTP) which extends
     the prediction scope to multiple future tokens at each position.
@@ -641,6 +654,8 @@ class MultiTokenPredictionBlock(MegatronModule):
         for layer_number in range(len(self.layers)):
             # Calc logits for the current Multi-Token Prediction (MTP) layers.
             input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+            position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
+            position_ids = _regenerate_position_ids(position_ids)
             # embedding
             decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
             # norm, linear projection and transformer
