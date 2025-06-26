@@ -6,13 +6,14 @@ import pytest
 import torch
 from packaging import version
 
-from megatron.core import parallel_state
+import megatron.core.parallel_state as parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -216,13 +217,16 @@ class TestSelfAttention:
         )
         model_parallel_cuda_manual_seed(123)
 
-        # Create device mesh for TP and CP groups
-        device_mesh = torch.distributed.init_device_mesh(
-            "cuda", (tp_size, cp_size), mesh_dim_names=("tp", "cp")
-        )
-        # Get TP and CP process groups from device mesh
-        tp_group = device_mesh.get_group(mesh_dim="tp")
-        cp_group = device_mesh.get_group(mesh_dim="cp")
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dimensions cp, tp (reversed from device mesh order)
+        grid = HyperCommGrid([cp_size, tp_size], ["cp", "tp"])
+
+        # Get TP and CP process groups from HyperCommGrid
+        tp_group = grid.create_pg("tp")
+        cp_group = grid.create_pg("cp")
 
         model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
 

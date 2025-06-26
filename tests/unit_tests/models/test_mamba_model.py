@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core import parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
@@ -148,14 +148,17 @@ class TestMambaModel:
 
         # Create device mesh for custom process groups
         assert torch.distributed.get_world_size() == 8, "Test requires 8 GPUs"
-        from torch.distributed import DeviceMesh
 
-        mesh = torch.distributed.init_device_mesh(
-            "cuda", (pp_size, cp_size, tp_size), mesh_dim_names=["pp", "cp", "tp"]
-        )
-        pp_group = mesh.get_group(mesh_dim="pp")
-        cp_group = mesh.get_group(mesh_dim="cp")
-        tp_group = mesh.get_group(mesh_dim="tp")
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dimensions tp, cp, pp (reversed from device mesh order)
+        grid = HyperCommGrid([tp_size, cp_size, pp_size], ["tp", "cp", "pp"])
+
+        pp_group = grid.create_pg("pp")
+        cp_group = grid.create_pg("cp")
+        tp_group = grid.create_pg("tp")
 
         # Create model with custom process groups
         from megatron.core.process_groups_config import ModelCommProcessGroups
