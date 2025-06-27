@@ -17,23 +17,6 @@ from .dict_utils import nested_values
 from .mapping import ShardedStateDict, ShardedTensor, is_main_replica
 from .utils import _sharded_tensor_shard_id, _ShardId, debug_time
 
-# TODO: remove TE references once the TE bug is fixed
-# Check if Transformer Engine has Float8Tensor class
-HAVE_TE_FLOAT8TENSOR = False
-try:
-    from transformer_engine.pytorch.float8_tensor import Float8Tensor
-
-    HAVE_TE_FLOAT8TENSOR = True
-except (ImportError, ModuleNotFoundError):
-    # Float8Tensor not found
-    pass
-
-
-def is_float8tensor(tensor: torch.Tensor) -> bool:
-    """Check if a tensor is a Transformer Engine Float8Tensor"""
-    return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -347,6 +330,8 @@ def exchange_loaded_tensors_gather_rounds(
                         # It's ok to keep the nominal dtype after exchange, because TE will handle
                         # this during state dict load.
                         # TODO: remove it once the bug is fixed
+                        from ..fp8_utils import is_float8tensor  # Avoid circular import
+
                         if is_float8tensor(local_ten):
                             try:
                                 local_ten = local_ten.from_float8()
@@ -508,6 +493,8 @@ def exchange_loaded_tensors_broadcast(
         # It's ok to keep the nominal dtype after exchange, because TE will handle
         # this during state dict load.
         # TODO: remove it once the bug is fixed
+        from ..fp8_utils import is_float8tensor  # Avoid circular import
+
         if is_float8tensor(local_ten):
             try:
                 local_ten = local_ten.from_float8()

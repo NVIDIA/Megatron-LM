@@ -239,12 +239,20 @@ class MegatronOptimizer(ABC):
         return self.get_loss_scale() * loss
 
     @abstractmethod
-    def reload_model_params(self):
+    def reload_model_params(self, state_dict=None):
         """Refreshes any internal state from the current model parameters.
         Call whenever the parameters are changed outside of the optimizer.
         For example, when we load a model from a checkpoint  without loading
         the optimizer, the model parameters are updated but for fp16 optimizer
-        with main parameters, the main parameters need to also be updated."""
+        with main parameters, the main parameters need to also be updated.
+
+        Args:
+            state_dict (dict, optional): When it is not None, we use the params
+                from the input state_dict to initialize the main params, instead
+                of using the model params for initialization. This is useful when
+                the precision of the model params is lower than that of the params
+                from the state dict, as it allows the main params to be more accurate.
+        """
         pass
 
     @abstractmethod
@@ -434,9 +442,9 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             return self._scale_one
         return self.grad_scaler.scale
 
-    def reload_model_params(self):
+    def reload_model_params(self, state_dict=None):
         if self.param_groups:
-            self._copy_model_params_to_main_params()
+            self._copy_model_params_to_main_params(state_dict=state_dict)
 
     def _unscale_main_grads_and_check_for_nan(self):
 
@@ -720,7 +728,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
         )
 
-    def _copy_model_params_to_main_params(self):
+    def _copy_model_params_to_main_params(self, state_dict=None):
+        assert state_dict is None, "Initialize main params from state dict is not supported"
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
         _multi_tensor_copy_this_to_that(
@@ -934,7 +943,7 @@ class FP32Optimizer(MegatronOptimizer):
         # No overflow for FP32 optimizer.
         return success, grad_norm, num_zeros_in_grad
 
-    def reload_model_params(self):
+    def reload_model_params(self, state_dict=None):
         pass
 
     def state_dict(self):
@@ -1083,9 +1092,40 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             return torch.tensor([1.0], dtype=torch.float32, device=torch.cuda.current_device())
 
-    def reload_model_params(self):
-        for optimizer in self.chained_optimizers:
-            optimizer.reload_model_params()
+    def _split_state_dict(self, state_dict):
+        """Split the state dict into sub-state dicts according to the chunks of each sub-optimizer
+        in this chained optimizer.
+
+        For example, assume there are two sub-optimizers in total: the first has 1 model chunk, and
+        the second has 7 model chunks. The state dict contains model0 ~ model7. This function splits
+        the state dict into two sub-state dicts: the first contains model0, and the second contains
+        model1 ~ model7 (but renamed as model0 ~ model6).
+        """
+        state_dicts = [None] * len(self.chained_optimizers)
+        if state_dict is not None:
+            if len(self.model_chunks) == 1:
+                state_dicts[0] = state_dict
+            else:
+                # Split state_dict if needed
+                prefix = "model" if "model0" in state_dict.keys() else "model_"
+                offset = 0
+                for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
+                    if hasattr(optimizer, "model_chunks"):
+                        d = {}
+                        for chunk_idx in range(len(optimizer.model_chunks)):
+                            assert (
+                                f"{prefix}{offset}" in state_dict
+                            ), f"Wrong state_dict format, cannot find '{prefix}{offset}'"
+                            d[f"{prefix}{chunk_idx}"] = state_dict[f"{prefix}{offset}"]
+                            offset += 1
+                        if len(d) > 0:
+                            state_dicts[optimizer_idx] = d
+        return state_dicts
+
+    def reload_model_params(self, state_dict=None):
+        state_dicts = self._split_state_dict(state_dict)
+        for idx, optimizer in enumerate(self.chained_optimizers):
+            optimizer.reload_model_params(state_dict=state_dicts[idx])
 
     def state_dict(self):
         if len(self.chained_optimizers) == 1:

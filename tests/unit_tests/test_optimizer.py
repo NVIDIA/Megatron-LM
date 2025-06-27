@@ -217,3 +217,61 @@ def test_optim_sharded_state_dict(use_distributed_optimizer: bool, precision: st
             'common_step' not in sharded_state_dict['optimizer']['state']
             or sharded_state_dict['optimizer']['state']['common_step'] is not None
         ), "Found 'optimizer.state.common_step=None' in sharded state dict."
+
+
+def test_optimizer_reload_model_params():
+    world = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    _init_distributed(world, rank)
+    Utils.initialize_model_parallel()
+
+    model = Net().bfloat16().cuda()
+    # Initial values of model params are 1.
+    for param in model.parameters():
+        param.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+    )
+    optimizer_config = OptimizerConfig(optimizer='adam', bf16=True, use_distributed_optimizer=True)
+    optim = get_megatron_optimizer(optimizer_config, [model])
+
+    # Set all model params to 2.
+    for param in model.parameters():
+        param.data.fill_(2.0)
+
+    # Although model params are 2 now, but we haven't called reload_model_params() yet, so
+    # main_params should be 1.
+    for group in optim.param_groups:
+        for main_param in group['params']:
+            assert main_param.dtype == torch.float32
+            torch.testing.assert_close(
+                main_param, torch.empty_like(main_param).fill_(1.0), atol=0, rtol=0
+            )
+
+    # Copy model params to main_params, so main_params should be 2 now.
+    optim.reload_model_params()
+    for group in optim.param_groups:
+        for main_param in group['params']:
+            assert main_param.dtype == torch.float32
+            torch.testing.assert_close(
+                main_param, torch.empty_like(main_param).fill_(2.0), atol=0, rtol=0
+            )
+
+    # Create a new state_dict with all params set to 3.
+    state_dict = model.state_dict()
+    new_state_dict = {}
+    for name, param in state_dict.items():
+        new_state_dict[name] = torch.empty_like(param).fill_(3.0)
+
+    # Initialize main_params with the new state_dict, so main_params should be 3 now, but model
+    # params should still be 2.
+    optim.reload_model_params(new_state_dict)
+    for param in model.parameters():
+        torch.testing.assert_close(param, torch.empty_like(param).fill_(2.0), atol=0, rtol=0)
+    for group in optim.param_groups:
+        for main_param in group['params']:
+            assert main_param.dtype == torch.float32
+            torch.testing.assert_close(
+                main_param, torch.empty_like(main_param).fill_(3.0), atol=0, rtol=0
+            )

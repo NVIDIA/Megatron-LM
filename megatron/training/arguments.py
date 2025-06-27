@@ -1024,6 +1024,9 @@ def validate_args(args, defaults={}):
         print('--dist-ckpt-format is deprecated and has no effect.'
               ' Use --ckpt-format to select the checkpoint format.')
 
+    if args.load_main_params_from_ckpt:
+        assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
+
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
         assert args.pipeline_model_parallel_size > 1, \
@@ -2094,6 +2097,8 @@ def _add_checkpointing_args(parser):
                        help='Directory containing a model checkpoint.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
+    group.add_argument('--load-main-params-from-ckpt', action='store_true', default=None,
+                       help='Load main parameters from checkpoint directly.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
     group.add_argument('--non-persistent-save-interval', type=int, default=None,
