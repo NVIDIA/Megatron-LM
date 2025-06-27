@@ -1190,20 +1190,6 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
-def fix_fp8_params_lose_precision_when_loading_dist_ckpt(state_dict):
-    """
-    When "--fp8-param-gather" and "--use-dist-ckpt" are both enabled, the state dict read from
-    dist-checkpoint loses precision (the weights read from checkpoint go through the process of
-    bf16/fp16 -> fp8 -> bf16/fp16). This function is implemented to solve this problem.
-    When "--fp8-param-gather" is disabled, this function doesn't modify anything.
-    """
-    for key in state_dict.keys():
-        if key.startswith('model'):
-            for _, sharded_tensor in state_dict[key].items():
-                if is_float8tensor(sharded_tensor.data):
-                    sharded_tensor.data = dequantize_fp8_tensor(sharded_tensor.data).cpu()
-
-
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
                     checkpointing_context=None, skip_load_to_model_and_opt=False):
     """Load a model checkpoint and return the iteration.
@@ -1375,9 +1361,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optim_sd_kwargs=optim_sd_kwargs, model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state
             )
-
-        # When "--fp8-param-gather" is disabled, this function doesn't modify anything.
-        fix_fp8_params_lose_precision_when_loading_dist_ckpt(load_kwargs['sharded_state_dict'])
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
@@ -1499,7 +1482,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             raise e
     else:
         if (args.fp16 or args.bf16) and optimizer is not None:
-            optimizer.reload_model_params()
+            if args.load_main_params_from_ckpt:
+                optimizer.reload_model_params(state_dict=state_dict)
+            else:
+                optimizer.reload_model_params()
 
     # rerun state
     try:
