@@ -314,6 +314,7 @@ class TopKRouter(Router):
             self.layer_number,
             self.config.num_layers,
             reduce_group=sequence_partition_group,
+            is_full_recompute=(self.config.recompute_granularity == "full")
         )
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
@@ -355,7 +356,8 @@ class TopKRouter(Router):
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
             save_to_aux_losses_tracker(
-                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers
+                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers,
+                is_full_recompute=(self.config.recompute_granularity == "full")
             )
         return logits
 
