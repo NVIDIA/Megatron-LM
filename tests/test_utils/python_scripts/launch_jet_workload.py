@@ -218,14 +218,6 @@ def parse_failed_job(logs: List[str]) -> Optional[bool]:
     return False
 
 
-def parse_finished_training(logs: List[str]) -> Optional[bool]:
-    for log_row in logs[::-1]:
-        match = re.search(r"after training is done", log_row)
-        if match is not None:
-            return True
-    return False
-
-
 def telemetrics_and_exit(
     success: bool, test_case: str, environment: str, pipeline_id: int, is_integration_test: bool
 ):
@@ -407,7 +399,7 @@ def main(
                 no_log = True
                 n_download_attempt += 1
                 break
-            
+
             n_download_attempt += 1
 
         if no_log:
@@ -476,6 +468,7 @@ def main(
                 or "Segmentation fault" in concat_allranks_logs
                 or "found NaN in local forward loss calculation" in concat_allranks_logs
                 or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+                or "double free or corruption" in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
@@ -494,13 +487,19 @@ def main(
                 is_integration_test=enable_lightweight_mode,
             )
 
-        if parse_failed_job(logs=mainrank_log):
-            n_attempts += 1
-            continue
+        if test_type == "release":
+            if (
+                "StopIteration" in concat_allranks_logs
+                or "after training is done" in concat_allranks_logs
+            ):
+                logger.info("Release training finished")
+                sys.exit(0)
 
-        if parse_finished_training(logs=mainrank_log):
-            sys.exit(int(not success))  # invert for exit 0
-        n_iteration += 1
+            if parse_failed_job(logs=mainrank_log):
+                n_attempts += 1
+                continue
+
+            n_iteration += 1
 
     telemetrics_and_exit(
         success=False,

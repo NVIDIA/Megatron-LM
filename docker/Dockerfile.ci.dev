@@ -44,21 +44,22 @@ RUN bash docker/common/build_groupedgemm.sh --output-wheel-dir $WHEEL_DIR
 
 FROM mcore_image as main
 ENV DEBIAN_FRONTEND=noninteractive
+ARG UV_VERSION=0.7.2
+ARG YQ_VERSION=4.44.1
+ENV PATH="/root/.local/bin:$PATH"
+ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+ENV UV_LINK_MODE=copy
+
 RUN bash -ex <<"EOF"
     apt-get update
     apt-get install -y --no-install-recommends gettext python3-venv
     apt-get clean
     python -m venv /opt/jet
-    wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq
+    wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64 -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
+    curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
 EOF
-
-ARG UV_VERSION=0.7.2
-ENV PATH="/root/.local/bin:$PATH"
-RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
-ENV UV_PROJECT_ENVIRONMENT=/opt/venv
-ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
-ENV UV_LINK_MODE=copy
 
 ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
@@ -69,7 +70,13 @@ COPY --from=build_te $WHEEL_DIR/*.whl $WHEEL_DIR/
 COPY --from=build_mamba $WHEEL_DIR/*.whl $WHEEL_DIR/
 COPY --from=build_causalconv1d $WHEEL_DIR/*.whl $WHEEL_DIR/
 COPY --from=build_groupedgemm $WHEEL_DIR/*.whl $WHEEL_DIR/
-RUN bash docker/common/install.sh --input-wheel-dir $WHEEL_DIR/ --environment dev
+RUN bash -ex <<"EOF"
+    uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
+    
+    uv sync --extra dev --extra mlm --link-mode copy --locked
+
+    bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment dev
+EOF
 
 ##### For NVIDIANS only #####
 FROM main as jet
