@@ -299,6 +299,8 @@ def load_args_from_checkpoint(args, model_size):
     args.norm_epsilon = model_args["rms_norm_eps"]
     args.iteration = 1 # '0', 'release' don't work
     args.position_embedding_type = "rope"
+    if "head_dim" in model_args:
+        args.kv_channels = model_args["head_dim"]
     args.swiglu = True
     args.normalization = "RMSNorm"
     args.add_bias_linear = False
