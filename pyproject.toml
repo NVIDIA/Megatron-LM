@@ -73,6 +73,7 @@ dev = [
     "transformers",
     "multi-storage-client",
     "setuptools<80.0.0",
+    "nvidia-modelopt[torch]",
 ]
 
 lts = [

@@ -97,6 +97,7 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
   --bf16: true
+  --dist-ckpt-strictness: log_all # backward compatibility for TE changes
 METRICS:
   - "iteration-time"
   - "lm loss"
