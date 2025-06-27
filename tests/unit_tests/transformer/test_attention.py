@@ -14,6 +14,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -75,6 +76,7 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
+    @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
     def test_fused_rope_gpu_forward(self):
         self.parallel_attention.config.apply_rope_fusion = True
         config = self.parallel_attention.config
