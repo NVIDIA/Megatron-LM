@@ -74,6 +74,7 @@ dev = [
     "multi-storage-client",
     "setuptools<80.0.0",
     "nvidia-modelopt[torch]",
+    "megatron-energon[av_decode]<7",
 ]
 
 lts = [
