@@ -780,17 +780,23 @@ def pretrain(
 
         print_datetime('after training is done')
 
+        # Only save checkpoint if needed (i.e., checkpoint hasn't already been
+        # saved and some training iterations have been run since checkpoint was
+        # loaded).
         if args.save and iteration != 0 and iteration % args.save_interval != 0:
-            save_checkpoint(
-                iteration,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                num_floating_point_operations_so_far,
-                checkpointing_context,
-                train_data_iterator=train_data_iterator,
-                preprocess_common_state_dict_fn=preprocess_common_state_dict,
-            )
+            if iteration == args.loaded_iteration:
+                print_rank_0(f"checkpoint for iteration {iteration} already saved, skipping...")
+            else:
+                save_checkpoint(
+                    iteration,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    num_floating_point_operations_so_far,
+                    checkpointing_context,
+                    train_data_iterator=train_data_iterator,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                )
 
         one_logger and one_logger.log_metrics(
             {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
@@ -1208,6 +1214,8 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        # Keep track of the iteration of the checkpoint just loaded.
+        args.loaded_iteration = args.iteration
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
