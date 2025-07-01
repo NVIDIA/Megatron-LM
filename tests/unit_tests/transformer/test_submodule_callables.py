@@ -82,10 +82,10 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
         local_tokens, probs = post_attn(node, hidden_states)
 
         # dispatch fwd
-        dispatched_tokens, probs = dispatch(node, local_tokens, probs)
+        dispatched_tokens = dispatch(node, local_tokens, probs)
 
         # moe fwd
-        expert_outputs = moe(node, dispatched_tokens, probs)
+        expert_outputs = moe(node, dispatched_tokens)
         if model.mlp.use_shared_expert:
             expert_output, shared_expert_output = expert_outputs
         else:
