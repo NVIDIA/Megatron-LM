@@ -50,11 +50,11 @@ def should_free_input(name, is_moe, is_deepep):
     # so we can free the input memory after the forward pass.
     free_input_nodes = {
         "mlp": True,
-        "combine": True,
+        "moe_combine": True,
         # For non-deepep mode, the input is the un-dispatched tokens and probs before dispatch A2A
         # and it's not needed anymore after the forward pass
         # For deepep mode, they are both needed in backward pass, so they cannot be freed.
-        "dispatch": not is_deepep,
+        "moe_dispatch": not is_deepep,
     }
 
     return free_input_nodes.get(name, False)

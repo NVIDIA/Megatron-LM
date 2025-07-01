@@ -39,23 +39,38 @@ class LayerSchedulePlan:
 
     This class organizes the computation nodes for a transformer layer,
     including attention, post attention, MLP, dispatch, and combine nodes.
+
+    layer (LayerSchedulePlan)
+    ├── attn (TransformerLayerNode): attention module
+    ├── post_attn (TransformerLayerNode): layernorm -> router -> dispatch preprocess
+    ├── moe_dispatch (TransformerLayerNode): dispatch All2All
+    ├── mlp (TransformerLayerNode): mlp module
+    ├── moe_combine (TransformerLayerNode): combine All2All
+    └── post_process (PostProcessNode): post process
     """
 
     attn = None
-    dispatch = None
+    post_attn = None
+    moe_dispatch = None
     mlp = None
-    combine = None
-    mtp_post_process = None
+    moe_combine = None
+    post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, com_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
 
         Args:
-            layer (TransformerLayer): The transformer/mtp layer to schedule.
-            event (torch.cuda.Event): CUDA event for synchronization.
-            chunk_state (ModelChunkState): State shared across the model chunk.
+            layer (TransformerLayer):
+                split a transformer layer into multiple nodes for fine-grained scheduling.
+            event (torch.cuda.Event):
+                record CUDA event across multiple nodes on different streams for synchronization.
+            chunk_state (ModelChunkState): model state shared in the model chunk.
             comp_stream (torch.cuda.Stream): CUDA stream for computation.
             com_stream (torch.cuda.Stream): CUDA stream for communication.
+            extra_args (dict): extra arguments for the layer.
+
+        The event and chunk_state are binded to the ModelChunkSchedulePlan
+        and shared across all layers in the model chunk.
         """
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
@@ -100,9 +115,9 @@ class LayerSchedulePlan:
         (
             attn_module,
             post_attn_module,
-            dispatch_module,
+            moe_dispatch_module,
             mlp_module,
-            combine_module,
+            moe_combine_module,
             post_process_module,
         ) = fwd_callables
 
@@ -112,12 +127,12 @@ class LayerSchedulePlan:
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
             self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
-            self.dispatch = create_node(com_stream, dispatch_module, "dispatch")
-            self.combine = create_node(com_stream, combine_module, "combine")
+            self.moe_dispatch = create_node(com_stream, moe_dispatch_module, "moe_dispatch")
+            self.moe_combine = create_node(com_stream, moe_combine_module, "moe_combine")
         else:
             self.post_attn = FakeScheduleNode()
-            self.dispatch = FakeScheduleNode()
-            self.combine = FakeScheduleNode()
+            self.moe_dispatch = FakeScheduleNode()
+            self.moe_combine = FakeScheduleNode()
 
         self.post_process = FakeScheduleNode()
 
@@ -140,6 +155,14 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
 
     This class organizes the computation nodes for a model chunk,
     including preprocessing, transformer layers, and postprocessing.
+
+    ModelChunkSchedulePlan
+    ├── pre_process: PreProcessNode
+    ├── layers: List[LayerSchedulePlan]
+    │   ├── layer[0]: LayerSchedulePlan
+    │   ├── layer[1]: LayerSchedulePlan
+    │   └── ...
+    └── post_process: PostProcessNode
     """
 
     def __init__(self):
@@ -149,7 +172,6 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         self._post_process = None
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
-        self._mtp_layers = []
         self._event = torch.cuda.Event()
 
     @classmethod
@@ -262,7 +284,7 @@ def schedule_layer_1f1b(
     b_grad=None,
     f_context=None,
     b_context=None,
-    is_first_layer_in_bwd=False,
+    is_last_layer_in_bwd=False,
 ):
     """Schedule one-forward-one-backward operations for a single layer.
 
@@ -276,6 +298,7 @@ def schedule_layer_1f1b(
         b_grad (Tensor): Gradient for backward computation
         f_context (VppContextManager or None): The VppContextManager for the forward pass.
         b_context (VppContextManager or None): The VppContextManager for the backward pass
+        is_last_layer_in_bwd (bool): Whether the current layer is the last layer in the backward pass.
 
     Returns:
         Functions or values for next iteration's computation
@@ -286,7 +309,7 @@ def schedule_layer_1f1b(
     if b_layer is not None:
         with b_context:
             b_grad = b_layer.post_process.backward(b_grad)
-            b_grad = b_layer.combine.backward(b_grad)
+            b_grad = b_layer.moe_combine.backward(b_grad)
 
     if f_layer is not None:
         with f_context and f_layer.get_fp8_context():
@@ -299,12 +322,12 @@ def schedule_layer_1f1b(
 
     if f_layer is not None:
         with f_context and f_layer.get_fp8_context():
-            f_input = f_layer.dispatch.forward(f_input)
+            f_input = f_layer.moe_dispatch.forward(f_input)
 
     if b_layer is not None:
         with b_context:
             b_layer.mlp.backward_dw()
-            b_grad = b_layer.dispatch.backward(b_grad)
+            b_grad = b_layer.moe_dispatch.backward(b_grad)
 
     if f_layer is not None:
         with f_context and f_layer.get_fp8_context():
@@ -312,7 +335,7 @@ def schedule_layer_1f1b(
 
     if f_layer is not None:
         with f_context and f_layer.get_fp8_context():
-            f_input = f_layer.combine.forward(f_input)
+            f_input = f_layer.moe_combine.forward(f_input)
             f_input = f_layer.post_process.forward(f_input)
 
     if b_layer is not None:
@@ -320,8 +343,9 @@ def schedule_layer_1f1b(
             b_grad = b_layer.post_attn.backward(b_grad)
             b_grad = b_layer.attn.backward(b_grad)
 
-    # Delay the backward_dw of the first layer for overlapping with the p2p comm
-    if b_layer is not None and not is_first_layer_in_bwd:
+    # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+    # for overlapping with the p2p comm
+    if b_layer is not None and not is_last_layer_in_bwd:
         with b_context:
             b_layer.attn.backward_dw()
 
@@ -339,21 +363,31 @@ def schedule_chunk_1f1b(
     post_forward=None,
     post_backward=None,
 ):
-    """Schedules one-forward-one-backward operations for a model chunk.
+    """Model level 1f1b fine-grained schedule.
 
-    This function interleaves forward and backward operations across multiple layers
+    This function schedules the forward and backward passes for a model chunk,
+    which interleaves forward and backward operations across multiple layers
     to maximize parallelism and efficiency.
 
+    Assume there are 4 layers in the given model chunk:  
+    Phase 0: p2p_comm_sync -> forward_preprocess -> p2p_comm_sync -> backward_postprocess
+    Phase 1: forward_layer[0] + backward_layer[3], overlapped execution by schedule_layer_1f1b
+    Phase 2: forward_layer[1] + backward_layer[2], overlapped execution by schedule_layer_1f1b
+    Phase 3: forward_layer[2] + backward_layer[1], overlapped execution by schedule_layer_1f1b
+    Phase 4: forward_layer[3] + backward_layer[0], overlapped execution by schedule_layer_1f1b
+    Phase 5: send_forward_recv_backward -> send_backward_recv_forward
+    Phase 6: backward_dw of the first layer -> forward_postprocess -> backward_preprocess
+
     Args:
-        f_schedule_plan: Forward schedule plan.
-        b_schedule_plan: Backward schedule plan.
-        b_grad: Gradient for backward computation.
-        f_context: Context for forward computation.
-        b_context: Context for backward computation.
-        pre_forward: Callback for preprocessing in forward pass.
-        pre_backward: Callback for preprocessing in backward pass.
-        post_forward: Callback for postprocessing in forward pass.
-        post_backward: Callback for postprocessing in backward pass.
+        f_schedule_plan (ModelChunkSchedulePlan): The forward schedule plan
+        b_schedule_plan (ModelChunkSchedulePlan): The backward schedule plan
+        b_grad (Tensor or None): The gradient of the loss function
+        f_context (VppContextManager or None): The VppContextManager for the forward pass
+        b_context (VppContextManager or None): The VppContextManager for the backward pass
+        pre_forward (callable or None): The function to call before the forward pass
+        pre_backward (callable or None): The function to call before the backward pass
+        post_forward (callable or None): The function to call after the forward pass
+        post_backward (callable or None): The function to call after the backward pass
     Returns:
         The output of the forward pass.
     """
@@ -406,19 +440,21 @@ def schedule_chunk_1f1b(
             b_grad=b_grad,
             f_context=f_context,
             b_context=b_context,
-            is_first_layer_in_bwd=(i == b_num_layers - 1),
+            is_last_layer_in_bwd=(i == b_num_layers - 1),
         )
         torch.cuda.nvtx.range_pop()
 
+    # backward pass for the remaining layers
     with b_context:
         for i in range(overlaped_layers, b_num_layers):
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
             _, b_grad = schedule_layer_1f1b(
-                None, b_layer, b_grad=b_grad, is_first_layer_in_bwd=(i == b_num_layers - 1)
+                None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
             )
             torch.cuda.nvtx.range_pop()
 
+    # forward pass for the remaining layers
     with f_context:
         for i in range(overlaped_layers, f_num_layers):
             f_layer = f_schedule_plan.get_layer(i)
@@ -441,7 +477,8 @@ def schedule_chunk_1f1b(
             b_schedule_plan.wait_current_stream()
             post_backward(b_grad, ctx.vpp_rank)
 
-    # Delay the backward_dw of the first layer for overlapping with the p2p comm
+    # Delay the last attn_dw in backward pass (attn_dw of the first layer)
+    # for overlapping with the p2p comm
     if b_num_layers > 0:
         with b_context:
             b_schedule_plan.get_layer(0).attn.backward_dw()
