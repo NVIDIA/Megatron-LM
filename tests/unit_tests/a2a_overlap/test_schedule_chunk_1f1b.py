@@ -4,9 +4,9 @@ import gc
 import pytest
 import torch
 
+from megatron.core.models.gpt.fine_grained_schedule import schedule_chunk_1f1b
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.fine_grained_schedule import schedule_chunk_1f1b
 from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version

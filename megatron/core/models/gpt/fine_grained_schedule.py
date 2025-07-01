@@ -298,7 +298,8 @@ def schedule_layer_1f1b(
         b_grad (Tensor): Gradient for backward computation
         f_context (VppContextManager or None): The VppContextManager for the forward pass.
         b_context (VppContextManager or None): The VppContextManager for the backward pass
-        is_last_layer_in_bwd (bool): Whether the current layer is the last layer in the backward pass.
+        is_last_layer_in_bwd (bool):
+            Whether the current layer is the last layer in the backward pass.
 
     Returns:
         Functions or values for next iteration's computation
@@ -369,7 +370,7 @@ def schedule_chunk_1f1b(
     which interleaves forward and backward operations across multiple layers
     to maximize parallelism and efficiency.
 
-    Assume there are 4 layers in the given model chunk:  
+    Assume there are 4 layers in the given model chunk:
     Phase 0: p2p_comm_sync -> forward_preprocess -> p2p_comm_sync -> backward_postprocess
     Phase 1: forward_layer[0] + backward_layer[3], overlapped execution by schedule_layer_1f1b
     Phase 2: forward_layer[1] + backward_layer[2], overlapped execution by schedule_layer_1f1b
