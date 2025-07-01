@@ -28,7 +28,7 @@ class TestFusedTopkGating:
     @pytest.mark.parametrize("num_tokens", [2048, 4096])
     @pytest.mark.parametrize("num_experts", [32, 64])
     @pytest.mark.parametrize("topk", [6, 8])
-    @pytest.mark.parametrize("score_function", ["sigmoid"])
+    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
     @pytest.mark.parametrize("group_config", [
         (None, None),  
         (1, 1), 
@@ -73,6 +73,10 @@ class TestFusedTopkGating:
 
         # For sigmoid, use_pre_softmax should be False
         use_pre_softmax = False
+        if score_function == "softmax":
+            use_pre_softmax =  random.choice([True, False])
+        else:
+            use_pre_softmax = False
         
         logits_pytorch = copy.deepcopy(logits)
         expert_bias_pytorch = copy.deepcopy(expert_bias) if expert_bias is not None else None
@@ -84,7 +88,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=False,
+            use_pre_softmax=use_pre_softmax,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -100,7 +104,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=False,
+            use_pre_softmax=use_pre_softmax,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -118,7 +122,7 @@ class TestFusedTopkGating:
     @pytest.mark.parametrize("num_tokens", [2048, 4096])
     @pytest.mark.parametrize("num_experts", [32, 64])
     @pytest.mark.parametrize("topk", [6, 8])
-    @pytest.mark.parametrize("score_function", ["sigmoid"])
+    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
     @pytest.mark.parametrize("group_config", [
         (None, None),  
         (1, 1),       
@@ -164,7 +168,10 @@ class TestFusedTopkGating:
         scaling_factor = random.uniform(0.5, 2.0) if random.choice([True, False]) else None
 
         # For sigmoid, use_pre_softmax should be False
-        use_pre_softmax = False
+        if score_function == "softmax":
+            use_pre_softmax =  random.choice([True, False])
+        else:
+            use_pre_softmax = False
         
         logits_pytorch = copy.deepcopy(logits)
         expert_bias_pytorch = copy.deepcopy(expert_bias) if expert_bias is not None else None
@@ -176,7 +183,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=False,
+            use_pre_softmax=use_pre_softmax,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -192,7 +199,7 @@ class TestFusedTopkGating:
             capacity_factor=None,
             pad_to_capacity=False,
             drop_policy=None,
-            use_pre_softmax=False,
+            use_pre_softmax=use_pre_softmax,
             num_groups=num_groups,
             group_topk=group_topk,
             scaling_factor=scaling_factor,
@@ -351,7 +358,7 @@ class TestFusedTopkGating:
     @pytest.mark.parametrize("num_tokens", [2048, 4096])
     @pytest.mark.parametrize("num_experts", [32, 64])
     @pytest.mark.parametrize("topk", [6, 8])
-    @pytest.mark.parametrize("score_function", ["sigmoid"])
+    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
     @pytest.mark.parametrize("group_config", [
         (None, None),  
         (1, 1),       
@@ -397,7 +404,10 @@ class TestFusedTopkGating:
         scaling_factor = random.uniform(0.5, 2.0) if random.choice([True, False]) else None
 
         # For sigmoid, use_pre_softmax should be False
-        use_pre_softmax = False
+        if score_function == "softmax":
+            use_pre_softmax =  random.choice([True, False])
+        else:
+            use_pre_softmax = False
         
         logits_pytorch = copy.deepcopy(logits)
         expert_bias_pytorch = copy.deepcopy(expert_bias) if expert_bias is not None else None
