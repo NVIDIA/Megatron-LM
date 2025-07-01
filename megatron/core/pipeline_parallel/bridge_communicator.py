@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Literal, Tuple
 
 import torch
+import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
@@ -58,6 +59,20 @@ class BridgeCommunicator:
         
         self.build_comm_schedule()
 
+    def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
+        """
+        Get the leader rank for a given grid and direction.
+        """
+        leader_ranks = []
+        dp_groups = grid._gen_rank_enum([x for x in grid.dim_names if x != "dp"])
+        if is_src:
+            # Add rank from last pp stage
+            leader_ranks.extend(group[-1] for group in dp_groups)
+        else:
+            # Add rank from first pp stage
+            leader_ranks.extend(group[0] for group in dp_groups)
+        return leader_ranks
+
     def build_comm_schedule(self):
         """
         Get src/dest tp leaders and populate comm_map for each rank.
@@ -66,37 +81,82 @@ class BridgeCommunicator:
         which ranks need to send/receive data and builds the communication
         schedule accordingly.
         """
+        src_tp_leaders = self.get_leader_rank(self.src_grid, is_src=True)
+        dest_tp_leaders = self.get_leader_rank(self.dest_grid, is_src=False)
+        # Ensure that the number of leaders can be evenly divided
+        src_count = len(src_tp_leaders)
+        dest_count = len(dest_tp_leaders)
+        
+        if src_count % dest_count != 0 and dest_count % src_count != 0:
+            raise ValueError(
+                f"Source TP leaders count ({src_count}) and destination TP leaders count "
+                f"({dest_count}) must be evenly divisible. One must be a multiple of the other."
+            )
+        # Get all ranks in source and destination grids
+        src_all_ranks = list(range(self.src_grid.rank_offset, 
+                                  self.src_grid.rank_offset + self.src_grid.size))
+        dest_all_ranks = list(range(self.dest_grid.rank_offset, 
+                                   self.dest_grid.rank_offset + self.dest_grid.size))
+        # Combine all ranks from both grids
+        all_ranks = src_all_ranks + dest_all_ranks
         
         # Initialize all ranks as NOOP by default
-        
-        # TODO: Implement the actual logic to determine src/dest tp leaders
-        # and populate the communication schedule based on the grid configurations
-        
-        # Example placeholder logic - this needs to be implemented based on 
-        # the actual grid topology and parallelism mappings
-        
-        # Example: if current rank is a source leader
-        # src_leader_rank = self._get_src_leader_rank()
-        # dest_leader_rank = self._get_dest_leader_rank()
-        
-        # if current_rank == src_leader_rank:
-        #     self.comm_map[current_rank] = RankCommInfo(
-        #         role='SENDER',
-        #         sends=[SendOp(
-        #             destination_rank=dest_leader_rank, 
-        #             batch_slice=slice(None), 
-        #             send_shape=(1,)  # placeholder
-        #         )]
-        #     )
-        
-        # elif current_rank == dest_leader_rank:
-        #     self.comm_map[current_rank] = RankCommInfo(
-        #         role='RECEIVER',
-        #         receives=[RecvOp(
-        #             source_rank=src_leader_rank, 
-        #             recv_shape=(1,)  # placeholder
-        #         )]
-        #     )
+        for rank in all_ranks:
+            self.comm_map[rank] = RankCommInfo(role='NOOP')
+       
+        scale_factor = src_count / dest_count
+        if scale_factor > 1:
+            # Fan-in: multiple source leaders send to fewer destination leaders
+            scale_factor = int(scale_factor)
+            for i, dest_rank in enumerate(dest_tp_leaders):
+                # Each destination rank receives from scale_factor source ranks
+                src_ranks = src_tp_leaders[i * scale_factor:(i + 1) * scale_factor]
+                
+                # Set up senders
+                for src_rank in src_ranks:
+                    self.comm_map[src_rank] = RankCommInfo(
+                        role='SENDER',
+                        sends=[SendOp(
+                            destination_rank=dest_rank,
+                            batch_slice=slice(None),
+                            send_shape=(1,)  # placeholder
+                        )]
+                    )
+                
+                # Set up receiver
+                self.comm_map[dest_rank] = RankCommInfo(
+                    role='RECEIVER',
+                    receives=[RecvOp(
+                        source_rank=src_rank,
+                        recv_shape=(1,)  # placeholder
+                    ) for src_rank in src_ranks]
+                )
+        else:
+            # Fan-out: fewer source leaders send to more destination leaders
+            scale_factor = int(dest_count / src_count)
+            for i, src_rank in enumerate(src_tp_leaders):
+                # Each source rank sends to scale_factor destination ranks
+                dest_ranks = dest_tp_leaders[i * scale_factor:(i + 1) * scale_factor]
+                
+                # Set up sender
+                self.comm_map[src_rank] = RankCommInfo(
+                    role='SENDER',
+                    sends=[SendOp(
+                        destination_rank=dest_rank,
+                        batch_slice=slice(None),
+                        send_shape=(1,)  # placeholder
+                    ) for dest_rank in dest_ranks]
+                )
+                
+                # Set up receivers
+                for dest_rank in dest_ranks:
+                    self.comm_map[dest_rank] = RankCommInfo(
+                        role='RECEIVER',
+                        receives=[RecvOp(
+                            source_rank=src_rank,
+                            recv_shape=(1,)  # placeholder
+                        )]
+                    )
 
     def send_forward(self, tensor_to_send: torch.Tensor):
         """
