@@ -15,53 +15,6 @@ from megatron.core.utils import get_attr_wrapped_model
 Shape = Union[List[int], torch.Size]
 
 
-def schedule_chunk_1f1b(
-    f_schedule_plan,
-    b_schedule_plan,
-    b_grad=None,
-    f_context=None,
-    b_context=None,
-    pre_forward=None,
-    pre_backward=None,
-    post_forward=None,
-    post_backward=None,
-):
-    """Model level 1f1b fine-grained schedule
-
-    This function schedules the forward and backward passes for a chunk of the model.
-    It takes in the forward schedule plan, backward schedule plan, gradient, and optional
-    context managers for the forward and backward passes.
-
-    Args:
-        f_schedule_plan (subclass of AbstractSchedulePlan): The forward schedule plan
-        b_schedule_plan (subclass of AbstractSchedulePlan): The backward schedule plan
-        grad (Tensor or None): The gradient of the loss function
-        f_context (VppContextManager or None): The VppContextManager for the forward pass
-        b_context (VppContextManager or None): The VppContextManager for the backward pass
-        pre_forward (callable or None): The function to call before the forward pass
-        pre_backward (callable or None): The function to call before the backward pass
-        post_forward (callable or None): The function to call after the forward pass
-        post_backward (callable or None): The function to call after the backward pass
-
-    Returns:
-        The output of the forward pass
-    """
-
-    # Calls fine_grained_schedule.py::ModelChunkSchedulePlan.forward_backward(),
-    # which calls fine_grained_schedule.py::schedule_chunk_1f1b()
-    return type(f_schedule_plan or b_schedule_plan).forward_backward(
-        f_schedule_plan,
-        b_schedule_plan,
-        b_grad=b_grad,
-        f_context=f_context,
-        b_context=b_context,
-        pre_forward=pre_forward,
-        pre_backward=pre_backward,
-        post_forward=post_forward,
-        post_backward=post_backward,
-    )
-
-
 def forward_backward_step(
     forward_step_func,
     data_iterator,
@@ -206,11 +159,12 @@ def forward_backward_step(
 
     b_grad = b_output_tensor_grad[0] if b_model else None
     with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
-        # schedule forward and backward
-        output_tensor = schedule_chunk_1f1b(
+        # Calls fine_grained_schedule.py::ModelChunkSchedulePlan.forward_backward(),
+        # which calls fine_grained_schedule.py::schedule_chunk_1f1b()
+        output_tensor = type(f_schedule_plan or b_schedule_plan).forward_backward(
             f_schedule_plan,
             b_schedule_plan,
-            b_grad,
+            b_grad=b_grad,
             f_context=f_context,
             b_context=b_context,
             pre_forward=pre_forward,
