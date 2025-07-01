@@ -73,7 +73,7 @@ dev = [
     "transformers",
     "multi-storage-client",
     "setuptools<80.0.0",
-    "nvidia-modelopt[torch]",
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
     "megatron-energon[av_decode]<7",
 ]
 
