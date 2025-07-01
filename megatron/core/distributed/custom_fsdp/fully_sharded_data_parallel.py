@@ -114,6 +114,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         self.module = module
+        self.vp_stage = None
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
