@@ -30,9 +30,6 @@ def run_model_ref_with_capture(model, input_tensors, iterations):
     Returns:
         dict: A dictionary containing model outputs and parameter gradients.
     """
-    for module in model.modules():
-        if hasattr(module, 'fuse_wgrad_accumulation'):
-            module.fuse_wgrad_accumulation = False
 
     output_tensors = []
     for i in range(iterations):
@@ -62,9 +59,6 @@ def run_model_submodules_with_capture(model, input_tensors, microbatches):
 
     for i in range(len(input_tensors)):
         input_tensors[i] = input_tensors[i].clone()
-    for module in model.modules():
-        if hasattr(module, 'fuse_wgrad_accumulation'):
-            module.fuse_wgrad_accumulation = False
 
     output_tensors = []
     # get callables
