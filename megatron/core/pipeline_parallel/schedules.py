@@ -23,7 +23,7 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
-from .combined_1f1b import forward_backward_step
+from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining
 from .utils import VppContextManager, set_streams
 
 # Types
@@ -524,72 +524,21 @@ def forward_backward_no_pipelining(
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
-        f_context = contextlib.nullcontext()
-        b_context = contextlib.nullcontext()
-        set_streams()
-        # The forward step for the first microbatch is executed alone, no a2a overlapping
-        output_tensor, num_tokens, _ = forward_backward_step(
+        forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
             forward_step_func,
             data_iterator,
             model,
             num_microbatches,
             input_tensor,
-            forward_data_store,
-            None,
-            input_tensor,
-            None,
-            None,
-            config,
-            f_context=f_context,
-            b_context=b_context,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=None,
-            is_first_microbatch=check_first_val_step(first_val_step, forward_only, True),
-            current_microbatch=0,
-        )
-        # The forward step is executed in parallel with the backward step of another microbatch
-        # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
-        # Vice versa.
-        with no_sync_func():
-            for i in range(num_microbatches - 1):
-                total_num_tokens += num_tokens
-                output_tensor, num_tokens, _ = forward_backward_step(
-                    forward_step_func,
-                    data_iterator,
-                    model,
-                    num_microbatches,
-                    input_tensor,
-                    forward_data_store,
-                    model,
-                    input_tensor,
-                    output_tensor,
-                    output_tensor_grad,
-                    config,
-                    f_context=f_context,
-                    b_context=b_context,
-                    collect_non_loss_data=collect_non_loss_data,
-                    checkpoint_activations_microbatch=None,
-                    is_first_microbatch=check_first_val_step(
-                        first_val_step, forward_only, (i + 1) == 0
-                    ),
-                    current_microbatch=(i + 1),
-                )
-        total_num_tokens += num_tokens
-        # The backward step for the last microbatch is executed alone, no a2a overlapping
-        output_tensor, num_tokens, _ = forward_backward_step(
-            forward_step_func,
-            data_iterator,
-            None,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            model,
-            input_tensor,
-            output_tensor,
             output_tensor_grad,
+            forward_data_store,
             config,
-            f_context=f_context,
-            b_context=b_context,
+            collect_non_loss_data,
+            first_val_step,
+            forward_only,
+            no_sync_func,
+            total_num_tokens,
+            partial(check_first_val_step, first_val_step, forward_only),
         )
     else:
         with no_sync_func():
