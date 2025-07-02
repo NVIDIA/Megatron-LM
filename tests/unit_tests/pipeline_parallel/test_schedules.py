@@ -47,6 +47,64 @@ def test_deallocate_output_tensor():
     assert out.nelement() == 6
 
 
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize(
+    "pipeline_model_parallel_size,microbatch_group_size_per_vp_stage",
+    [(1, 1), (2, 2), (2, 4), (4, 4), (4, 5), (8, 9), (8, 11)],
+)
+@pytest.mark.parametrize("num_microbatches", [8, 32])
+@pytest.mark.parametrize("virtual_pipeline_model_parallel_size", [None, 2, 4, 8])
+def test_get_pipeline_parallel_order(
+    pipeline_model_parallel_size,
+    virtual_pipeline_model_parallel_size,
+    num_microbatches,
+    microbatch_group_size_per_vp_stage,
+):
+    if pipeline_model_parallel_size == 1 and virtual_pipeline_model_parallel_size is not None:
+        return
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=pipeline_model_parallel_size,
+        virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+    )
+    num_model_chunks = (
+        virtual_pipeline_model_parallel_size
+        if virtual_pipeline_model_parallel_size is not None
+        else 1
+    )
+
+    _, _, num_warmup_microbatches, _ = schedule.get_pp_rank_microbatches(
+        num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage, False
+    )
+    schedule_table = schedule.get_schedule_table(
+        num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage
+    )
+    order = schedule.convert_schedule_table_to_order(
+        num_warmup_microbatches, num_model_chunks, schedule_table
+    )
+
+    assert max(order) == num_model_chunks
+    assert len(order) == num_microbatches * num_model_chunks * 2
+    order_cnt = {}
+    accumulated_order = 0
+    for o in order:
+        order_cnt[o] = order_cnt.get(o, 0) + 1
+        if o < 0:
+            assert -o in order_cnt and order_cnt[-o] >= order_cnt[o]
+        elif -o in order_cnt:
+            assert order_cnt[-o] < order_cnt[o]
+        accumulated_order += o
+        assert accumulated_order >= 0
+    assert accumulated_order == 0
+    assert 0 not in order_cnt
+    for k, v in order_cnt.items():
+        assert -k in order_cnt and order_cnt[-k] == v
+
+    Utils.destroy_model_parallel()
+
+
 def test_forward_backward_func_without_pipeline_parallel(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
