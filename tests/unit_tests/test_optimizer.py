@@ -6,12 +6,29 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import SGD, Adam
 
+# FP8 recipe will be used to test precision-aware-optimizer.
+from transformer_engine.pytorch.fp8 import fp8_autocast
+
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import ChainedOptimizer, OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.test_utils import _deinit_distributed, _init_distributed
+
+try:
+    # Check if FP8 block scaling is available.
+    from transformer_engine.pytorch.fp8 import check_fp8_block_scaling_support
+
+    fp8_block_scaling_available, reason_for_no_fp8_block_scaling = check_fp8_block_scaling_support()
+    from transformer_engine.common.recipe import Float8BlockScaling, Format
+except:
+    fp8_block_scaling_available = False
+    reason_for_no_fp8_block_scaling = "FP8 block scaled GEMM requires Hopper and CUDA >= 12.9."
+    try:
+        from transformer_engine.common.recipe import DelayedScaling
+    except:
+        delayed_scaling_available = False
 
 
 class Net(nn.Module):
@@ -124,18 +141,34 @@ def test_precision_aware_fused_adam():
 @pytest.mark.skipif(
     not is_te_min_version("1.13.0"), reason="TE 1.13.0 is required for precision aware optimizer"
 )
+@pytest.mark.parametrize("precision", ['bf16', 'fp8'])
+@pytest.mark.parametrize("main_params_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("main_grads_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
-    "exp_avg_dtype", [torch.float32, torch.float16, torch.bfloat16, torch.uint8]
+    # use the same dtype for exp_avg and exp_avg_sq to reduce the number of tests
+    "moment_dtype",
+    [torch.float32, torch.float16, torch.bfloat16, torch.uint8],
 )
-@pytest.mark.parametrize(
-    "exp_avg_sq_dtype", [torch.float32, torch.float16, torch.bfloat16, torch.uint8]
-)
-def test_precision_aware_optimizer(exp_avg_dtype: str, exp_avg_sq_dtype: str):
+def test_precision_aware_optimizer(
+    precision: str,
+    main_params_dtype: torch.dtype,
+    main_grads_dtype: torch.dtype,
+    moment_dtype: torch.dtype,
+):
     # Skip because bf16 optimizer states are not supported before TE 2.3.0
-    if (
-        exp_avg_dtype == torch.bfloat16 or exp_avg_sq_dtype == torch.bfloat16
-    ) and not is_te_min_version("2.3.0"):
-        pytest.skip("bfloat16 for exp_avg_dtype/exp_avg_sq_dtype requires TE >= 2.3.0")
+    if (moment_dtype == torch.bfloat16) and not is_te_min_version("2.3.0"):
+        pytest.skip("bfloat16 for moment_dtype requires TE >= 2.3.0")
+
+    if precision == 'fp8':
+        if not fp8_block_scaling_available:
+            fp8_recipe = "delayed"
+            fp8_recipe_settings = DelayedScaling()
+        else:
+            fp8_recipe = "blockwise"
+            fp8_recipe_settings = Float8BlockScaling(fp8_format=Format.E4M3)
+    else:
+        fp8_recipe = None
+        fp8_recipe_settings = None
 
     world = int(os.getenv('WORLD_SIZE', '1'))
     rank = int(os.getenv('RANK', '0'))
@@ -143,38 +176,95 @@ def test_precision_aware_optimizer(exp_avg_dtype: str, exp_avg_sq_dtype: str):
     # Setup: distributed, model, mock_args.
     _init_distributed(world, rank)
     Utils.initialize_model_parallel()
-    model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
-    model.requires_grad_(True)
-    model.weight.data.fill_(1.0)
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
-    model = DistributedDataParallel(
-        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
-    )
-    for param in model.parameters():
-        assert param.requires_grad
 
-    optimizer_config = OptimizerConfig(
+    # First create baseline model with float32 optimizer states
+    baseline_model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    baseline_model.requires_grad_(True)
+    baseline_model.weight.data.fill_(1.0)
+    baseline_ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    baseline_model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), baseline_ddp_config, baseline_model
+    )
+    baseline_optimizer_config = OptimizerConfig(
         optimizer='adam',
+        lr=0.01,
         bf16=True,
         use_distributed_optimizer=True,
-        use_precision_aware_optimizer=True,
-        exp_avg_dtype=exp_avg_dtype,
-        exp_avg_sq_dtype=exp_avg_sq_dtype,
+        use_precision_aware_optimizer=False,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=torch.float32,
+        exp_avg_dtype=torch.float32,
+        exp_avg_sq_dtype=torch.float32,
     )
-    optim = get_megatron_optimizer(optimizer_config, [model])
+    baseline_optim = get_megatron_optimizer(baseline_optimizer_config, [baseline_model])
 
-    # Run a forward and backward pass
+    # Create test model with specified dtypes for optimizer states
+    test_model = torch.nn.Linear(100, 100, bias=False, dtype=torch.bfloat16, device='cuda')
+    test_model.requires_grad_(True)
+    test_model.weight.data.fill_(1.0)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
+    test_model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, test_model
+    )
+    test_optimizer_config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        bf16=True,
+        fp8_recipe=fp8_recipe,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        main_params_dtype=main_params_dtype,
+        main_grads_dtype=main_grads_dtype,
+        exp_avg_dtype=moment_dtype,
+        exp_avg_sq_dtype=moment_dtype,
+    )
+    test_optim = get_megatron_optimizer(test_optimizer_config, [test_model])
+
+    # Use same input for both models
     input = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
-    output = model(input)
-    loss = output.sum()
-    loss.backward()
 
-    # Step the optimizer
-    optim.step()
+    # Run model
+    def run_model(model, input, optim, fp8_recipe, fp8_recipe_settings):
+        if not fp8_recipe:
+            output = model(input)
+        else:
+            with fp8_autocast(enabled=True, fp8_recipe=fp8_recipe_settings):
+                output = model(input)
+        loss = output.sum()
+        loss.backward()
+        optim.step()
+        return loss.item(), optim.get_grad_norm()
 
-    # Save and reload state dict
-    state_dict = optim.state_dict()
-    optim.load_state_dict(state_dict)
+    # Run baseline model and test model
+    baseline_loss, baseline_grad_norm = run_model(
+        baseline_model, input, baseline_optim, fp8_recipe, fp8_recipe_settings
+    )
+    test_loss, test_grad_norm = run_model(
+        test_model, input, test_optim, fp8_recipe, fp8_recipe_settings
+    )
+
+    rtol = 1e-3  # relative tolerance
+    atol = 1e-5  # absolute tolerance
+
+    # Compare grad norms - allow small difference due to precision
+    rel_diff = abs(test_grad_norm - baseline_grad_norm) / (
+        abs(baseline_grad_norm) + 1e-7  # avoid div by 0
+    )
+    abs_diff = abs(test_grad_norm - baseline_grad_norm)
+    assert (
+        rel_diff <= rtol or abs_diff <= atol
+    ), f"Grad norm mismatch: baseline={baseline_grad_norm}, test={test_grad_norm}, rel_diff={rel_diff}, abs_diff={abs_diff}"
+
+    # Compare losses - allow small difference due to precision
+    loss_rel_diff = abs(test_loss - baseline_loss) / (abs(baseline_loss) + 1e-7)
+    loss_abs_diff = abs(test_loss - baseline_loss)
+    assert (
+        loss_rel_diff <= rtol or loss_abs_diff <= atol
+    ), f"Loss mismatch: baseline={baseline_loss}, test={test_loss}, rel_diff={loss_rel_diff}, abs_diff={loss_abs_diff}"
+
+    # Save and reload state dict for the test model
+    state_dict = test_optim.state_dict()
+    test_optim.load_state_dict(state_dict)
 
 
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
