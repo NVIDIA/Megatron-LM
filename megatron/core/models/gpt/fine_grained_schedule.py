@@ -307,46 +307,6 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         if model.post_process:
             self._post_process = PostProcessNode(model, self._model_chunk_state, self._event, comp_stream)
 
-    @classmethod
-    def forward_backward(
-        cls,
-        f_schedule_plan,
-        b_schedule_plan,
-        b_grad=None,
-        f_context=None,
-        b_context=None,
-        pre_forward=None,
-        pre_backward=None,
-        post_forward=None,
-        post_backward=None,
-    ):
-        """Schedules forward and backward passes for model chunks.
-
-        Args:
-            f_schedule_plan (ModelChunkSchedulePlan): Forward schedule plan.
-            b_schedule_plan (ModelChunkSchedulePlan): Backward schedule plan.
-            grad (Tensor): Gradient for backward computation.
-            f_context (VppContextManager or None): The VppContextManager for the forward pass.
-            b_context (VppContextManager or None): The VppContextManager for the backward pass
-            pre_forward (Callable): Callback for preprocessing in forward pass.
-            pre_backward (Callable): Callback for preprocessing in backward pass.
-            post_forward (Callable): Callback for postprocessing in forward pass.
-            post_backward (Callable): Callback for postprocessing in backward pass.
-        Returns:
-            The output of the forward pass.
-        """
-        return schedule_chunk_1f1b(
-            f_schedule_plan,
-            b_schedule_plan,
-            b_grad=b_grad,
-            f_context=f_context,
-            b_context=b_context,
-            pre_forward=pre_forward,
-            pre_backward=pre_backward,
-            post_forward=post_forward,
-            post_backward=post_backward,
-        )
-
     @property
     def event(self):
         """Gets the CUDA event for synchronization."""

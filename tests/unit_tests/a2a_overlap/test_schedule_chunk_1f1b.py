@@ -4,7 +4,7 @@ import gc
 import pytest
 import torch
 
-from megatron.core.models.gpt.fine_grained_schedule import schedule_chunk_1f1b
+from megatron.core.models.gpt.fine_grained_schedule import ModelChunkSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import set_streams
@@ -133,15 +133,15 @@ class TestA2AOverlap:
                     ), "pre_process should be released after backward"
                     schedule_plans[0] = gpt_models[0].build_schedule_plan(**datas[0])
                     schedule_plans[1] = gpt_models[1].build_schedule_plan(**datas[1])
-                f_input_0 = schedule_chunk_1f1b(schedule_plans[0], None)
+                f_input_0 = ModelChunkSchedulePlan.run(schedule_plans[0], None)
                 capture_0["outputs"].append(f_input_0)
                 # overlap
-                f_input_1 = schedule_chunk_1f1b(
+                f_input_1 = ModelChunkSchedulePlan.run(
                     schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)
                 )
                 capture_1["outputs"].append(f_input_1)
                 # last backward
-                schedule_chunk_1f1b(None, schedule_plans[1], b_grad=torch.ones_like(f_input_1))
+                ModelChunkSchedulePlan.run(None, schedule_plans[1], b_grad=torch.ones_like(f_input_1))
             for i in range(len(gpt_models)):
                 for name, param in gpt_models[i].named_parameters():
                     a2a_captures[i][name] = param.grad
