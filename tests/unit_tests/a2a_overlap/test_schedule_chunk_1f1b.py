@@ -141,7 +141,9 @@ class TestA2AOverlap:
                 )
                 capture_1["outputs"].append(f_input_1)
                 # last backward
-                ModelChunkSchedulePlan.run(None, schedule_plans[1], b_grad=torch.ones_like(f_input_1))
+                ModelChunkSchedulePlan.run(
+                    None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)
+                )
             for i in range(len(gpt_models)):
                 for name, param in gpt_models[i].named_parameters():
                     a2a_captures[i][name] = param.grad

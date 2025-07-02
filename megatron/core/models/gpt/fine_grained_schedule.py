@@ -148,7 +148,7 @@ class LayerSchedulePlan:
             if use_inner_fp8_context
             else nullcontext()
         )
-    
+
     @classmethod
     def run(
         cls,
@@ -301,11 +301,15 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         # build layer schedule plan for each layer
         for layer_idx in range(transformer_num_layers):
             layer = model.decoder._get_layer(layer_idx)
-            layer_plan = LayerSchedulePlan(layer, self._event, self._model_chunk_state, comp_stream, com_stream)
+            layer_plan = LayerSchedulePlan(
+                layer, self._event, self._model_chunk_state, comp_stream, com_stream
+            )
             self._transformer_layers.append(layer_plan)
         # build post process
         if model.post_process:
-            self._post_process = PostProcessNode(model, self._model_chunk_state, self._event, comp_stream)
+            self._post_process = PostProcessNode(
+                model, self._model_chunk_state, self._event, comp_stream
+            )
 
     @property
     def event(self):
@@ -509,4 +513,3 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.release_state()
 
         return f_input
-
