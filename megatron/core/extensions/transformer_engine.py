@@ -1559,8 +1559,10 @@ except ImportError:
     get_cpu_offload_context = None  # type: ignore[assignment, misc]
 
 try:
-
-    from transformer_engine.pytorch.attention import apply_rotary_pos_emb
+    if is_te_min_version("2.3.0.dev0"):
+        from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
+    else:
+        from transformer_engine.pytorch.attention import apply_rotary_pos_emb
 
     def fused_apply_rotary_pos_emb(
         t: torch.Tensor,
@@ -1580,7 +1582,11 @@ try:
         else:
             if interleaved:
                 raise ValueError("Only TE >= 2.3.0.dev0 supports interleaved fused RoPE.")
-            return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
+
+            if is_te_min_version("1.4.0.dev0"):
+                return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
+            else:
+                raise ValueError("Only TE >= 1.4.0.dev0 supports fused RoPE.")
 
     def fused_apply_rotary_pos_emb_thd(
         t: torch.Tensor,
