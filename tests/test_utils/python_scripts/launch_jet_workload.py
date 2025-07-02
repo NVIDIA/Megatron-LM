@@ -469,6 +469,7 @@ def main(
                 or "found NaN in local forward loss calculation" in concat_allranks_logs
                 or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
                 or "double free or corruption" in concat_allranks_logs
+                or "Call to CUDA function failed." in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
