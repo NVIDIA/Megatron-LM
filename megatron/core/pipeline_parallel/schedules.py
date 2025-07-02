@@ -23,7 +23,7 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
-from .combined_1f1b import forward_backward_step
+from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining, combined_forward_backward_step
 from .utils import VppContextManager, set_streams
 
 # Types
@@ -1280,7 +1280,7 @@ def forward_backward_pipelining_with_interleaving(
                 )
 
         # Call combined forward and backward step to overlap the communication and computation
-        output_tensor, num_tokens, input_tensor_grad = forward_backward_step(
+        output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
             forward_step_func,
             data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
             model[f_model_chunk_id] if f_model_chunk_id is not None else None,
