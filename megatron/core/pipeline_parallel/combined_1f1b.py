@@ -8,11 +8,17 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode, unwrap_model, set_streams
+from megatron.core.pipeline_parallel.utils import (
+    AbstractSchedulePlan,
+    ScheduleNode,
+    set_streams,
+    unwrap_model,
+)
 from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
+
 
 def combined_1f1b_schedule_for_no_pipelining(
     forward_step_func,
@@ -31,7 +37,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     check_first_val_step,
 ):
     """Scheduler for 1f1b with no pipelining.
-    
+
     This function is used to schedule the forward steps of one microbatch
     and the backward steps of another microbatch.
     The forward step is executed in parallel with the backward step of another microbatch.
@@ -111,6 +117,7 @@ def combined_1f1b_schedule_for_no_pipelining(
         b_context=b_context,
     )
     return forward_data_store, total_num_tokens
+
 
 def combined_forward_backward_step(
     forward_step_func,
@@ -214,7 +221,8 @@ def combined_forward_backward_step(
             # which is used to be (forward_output_tensor, loss_function).
             with context_manager:  # autocast context
                 f_schedule_plan, loss_func = forward_step_func(
-                    data_iterator, unwrap_model(f_model), return_schedule_plan=True)
+                    data_iterator, unwrap_model(f_model), return_schedule_plan=True
+                )
                 assert isinstance(
                     f_schedule_plan, AbstractSchedulePlan
                 ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"

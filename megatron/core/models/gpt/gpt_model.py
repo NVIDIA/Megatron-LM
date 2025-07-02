@@ -564,7 +564,7 @@ class GPTModel(LanguageModule):
             packed_seq_params,
             extra_block_kwargs,
             runtime_gather_output,
-            loss_mask
+            loss_mask,
         )
 
     def sharded_state_dict(
