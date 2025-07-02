@@ -588,9 +588,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         else:
             onelogger_finalize_fn()
 
-    # Additional callback for wandb (last rank)
+    # Additional callback for wandb
+    # The wandb artifact requires the tracker file to be present, so we need to ensure
+    # that rank 0 has already saved it before proceeding with wandb operations
     if not torch.distributed.is_initialized() \
-       or is_last_rank():
+            or torch.distributed.get_rank() == 0:
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(checkpoint_name, get_checkpoint_tracker_filename(save_dir), save_dir, iteration)
         if args.async_save:
