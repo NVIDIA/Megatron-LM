@@ -9,10 +9,10 @@ from torch.autograd import Variable
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import make_viewless_tensor
-from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -203,7 +203,7 @@ class AbstractSchedulePlan(ABC):
 
     @classmethod
     @abstractmethod
-    def forward_backward(
+    def run(
         cls,
         f_schedule_plan,
         b_schedule_plan,
@@ -225,7 +225,7 @@ def set_streams(comp_stream=None, com_stream=None):
     """Set the streams for communication and computation"""
     global _COMP_STREAM
     global _COM_STREAM
-    if _COMP_STREAM is not None:
+    if _COMP_STREAM is not None and _COM_STREAM is not None:
         return
 
     if comp_stream is None:

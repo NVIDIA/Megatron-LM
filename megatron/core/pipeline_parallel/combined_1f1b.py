@@ -8,14 +8,118 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode, unwrap_model
+from megatron.core.pipeline_parallel.utils import (
+    AbstractSchedulePlan,
+    ScheduleNode,
+    set_streams,
+    unwrap_model,
+)
 from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
 
 
-def forward_backward_step(
+def combined_1f1b_schedule_for_no_pipelining(
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches,
+    input_tensor,
+    output_tensor_grad,
+    forward_data_store,
+    config,
+    collect_non_loss_data,
+    first_val_step,
+    forward_only,
+    no_sync_func,
+    total_num_tokens,
+    check_first_val_step,
+):
+    """Scheduler for 1f1b with no pipelining.
+
+    This function is used to schedule the forward steps of one microbatch
+    and the backward steps of another microbatch.
+    The forward step is executed in parallel with the backward step of another microbatch.
+    EP A2A in forward step is hidden by the attention/mlp computation in the backward step.
+    Vice versa.
+    Assuming we have 4 microbatches, the schedule is as follows:
+    Phases 0: 1st microbatch forward
+    Phases 1: 1st microbatch backward + 2nd microbatch forward
+    Phases 2: 2nd microbatch backward + 3rd microbatch forward
+    Phases 3: 3rd microbatch backward + 4th microbatch forward
+    Phases 4: 4th microbatch backward
+    """
+
+    f_context = contextlib.nullcontext()
+    b_context = contextlib.nullcontext()
+    set_streams()
+    # The forward step for the first microbatch is executed alone, no a2a overlapping
+    output_tensor, num_tokens, _ = combined_forward_backward_step(
+        forward_step_func,
+        data_iterator,
+        model,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        None,
+        input_tensor,
+        None,
+        None,
+        config,
+        f_context=f_context,
+        b_context=b_context,
+        collect_non_loss_data=collect_non_loss_data,
+        checkpoint_activations_microbatch=None,
+        is_first_microbatch=check_first_val_step(True),
+        current_microbatch=0,
+    )
+    # The forward step is executed in parallel with the backward step of another microbatch
+    # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
+    # Vice versa.
+    with no_sync_func():
+        for i in range(num_microbatches - 1):
+            total_num_tokens += num_tokens
+            output_tensor, num_tokens, _ = combined_forward_backward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                model,
+                input_tensor,
+                output_tensor,
+                output_tensor_grad,
+                config,
+                f_context=f_context,
+                b_context=b_context,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=None,
+                is_first_microbatch=check_first_val_step((i + 1) == 0),
+                current_microbatch=(i + 1),
+            )
+    total_num_tokens += num_tokens
+    # The backward step for the last microbatch is executed alone, no a2a overlapping
+    output_tensor, num_tokens, _ = combined_forward_backward_step(
+        forward_step_func,
+        data_iterator,
+        None,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        model,
+        input_tensor,
+        output_tensor,
+        output_tensor_grad,
+        config,
+        f_context=f_context,
+        b_context=b_context,
+    )
+    return forward_data_store, total_num_tokens
+
+
+def combined_forward_backward_step(
     forward_step_func,
     data_iterator,
     f_model,
@@ -39,7 +143,7 @@ def forward_backward_step(
     current_microbatch=None,
     encoder_decoder_xattn=False,
 ):
-    """Merged forward and backward step for overlap_moe_expert_parallel_comm.
+    """Merged forward and backward step for combined 1f1b scheduler.
 
     Args:
         Need to accept the argument of both forward_step() and backward_step().
@@ -109,21 +213,25 @@ def forward_backward_step(
             set_input_tensor = get_attr_wrapped_model(f_model, "set_input_tensor")
             set_input_tensor(input_tensor)
 
+    # build the schedule plan and get loss function for forward step
+    if f_model is not None:
+        with f_context:
             # GPTModel.build_schedule_plan(model_forward_inputs) is called in the forward_step_func.
             # The return value becomes (forward_schedule_plan, loss_function),
             # which is used to be (forward_output_tensor, loss_function).
             with context_manager:  # autocast context
-                f_schedule_plan, loss_func = forward_step_func(data_iterator, unwrap_model(f_model))
+                f_schedule_plan, loss_func = forward_step_func(
+                    data_iterator, unwrap_model(f_model), return_schedule_plan=True
+                )
                 assert isinstance(
                     f_schedule_plan, AbstractSchedulePlan
                 ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
 
-    # backward preprocess
+    # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
     b_schedule_plan = None
     if b_model is not None:
         # Retain the grad on the input_tensor.
-        # The same as the backward_step()
         if not isinstance(b_input_tensor, list):
             b_input_tensor = [b_input_tensor]
             unwrap_input_tensor_grad = True
@@ -159,9 +267,8 @@ def forward_backward_step(
 
     b_grad = b_output_tensor_grad[0] if b_model else None
     with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
-        # Calls fine_grained_schedule.py::ModelChunkSchedulePlan.forward_backward(),
-        # which calls fine_grained_schedule.py::schedule_chunk_1f1b()
-        output_tensor = type(f_schedule_plan or b_schedule_plan).forward_backward(
+        # For GPT models, it calls fine_grained_schedule.py::ModelChunkSchedulePlan.run(),
+        output_tensor = type(f_schedule_plan or b_schedule_plan).run(
             f_schedule_plan,
             b_schedule_plan,
             b_grad=b_grad,

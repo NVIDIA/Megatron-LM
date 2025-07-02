@@ -552,28 +552,20 @@ class GPTModel(LanguageModule):
         Returns:
             ModelChunkSchedulePlan: The model chunk schedule plan.
         """
-        from .fine_grained_schedule import build_model_chunk_schedule_plan
+        from .fine_grained_schedule import ModelChunkSchedulePlan
 
-        return build_model_chunk_schedule_plan(
+        return ModelChunkSchedulePlan(
             self,
             input_ids,
             position_ids,
             attention_mask,
-            decoder_input=decoder_input,
-            labels=labels,
-            packed_seq_params=packed_seq_params,
-            extra_block_kwargs=extra_block_kwargs,
-            runtime_gather_output=runtime_gather_output,
-            loss_mask=loss_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            extra_block_kwargs,
+            runtime_gather_output,
+            loss_mask,
         )
-
-    def __call__(self, *args, **kwargs):
-        if self.config.overlap_moe_expert_parallel_comm and torch.is_grad_enabled():
-            # When overlap_moe_expert_parallel_comm is enabled, unless in evaluation, return
-            # SchedulePlan instead, the actual scheduling is made in
-            # combined_1f1b.forward_backward_step.
-            return self.build_schedule_plan(*args, **kwargs)
-        return super(LanguageModule, self).__call__(*args, **kwargs)
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
