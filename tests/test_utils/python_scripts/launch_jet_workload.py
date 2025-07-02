@@ -407,7 +407,7 @@ def main(
                 no_log = True
                 n_download_attempt += 1
                 break
-            
+
             n_download_attempt += 1
 
         if no_log:
@@ -476,6 +476,8 @@ def main(
                 or "Segmentation fault" in concat_allranks_logs
                 or "found NaN in local forward loss calculation" in concat_allranks_logs
                 or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+                or "double free or corruption" in concat_allranks_logs
+                or "Call to CUDA function failed." in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1
