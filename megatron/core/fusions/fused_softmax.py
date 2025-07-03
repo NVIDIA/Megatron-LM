@@ -115,8 +115,7 @@ class SoftmaxOne(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if isinstance(self.denominator_offset, torch.Tensor) and self.denominator_offset.dim() == 1:
             self.denominator_offset.data = self.denominator_offset[None, :, None, None]
-
-        qk = torch.cat([x, self.denominator_offset.expand(-1, -1, x.size(2), -1)], dim=-1)
+        qk = torch.cat([x, self.denominator_offset.expand(x.size(0), -1, x.size(2), -1)], dim=-1)
         ret = torch.softmax(qk, dim=-1)[..., :-1]
         return ret
 
