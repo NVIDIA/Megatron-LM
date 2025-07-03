@@ -80,7 +80,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             unique_identifiers, indent=4, default=lambda obj: obj.unique_identifiers
         )
         self.unique_description_hash = hashlib.md5(
-            self.unique_description.encode("utf-8")
+            self.unique_description.encode("utf-8"), usedforsecurity=False
         ).hexdigest()
 
         self.dataset_index, self.dataset_sample_index = self._build_indices()
