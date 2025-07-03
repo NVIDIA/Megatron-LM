@@ -110,14 +110,9 @@ class LayerSchedulePlan:
                 extra_args=extra_args,
             )
 
-        (
-            attn_module,
-            post_attn_module,
-            moe_dispatch_module,
-            mlp_module,
-            moe_combine_module,
-            _,
-        ) = fwd_callables
+        (attn_module, post_attn_module, moe_dispatch_module, mlp_module, moe_combine_module, _) = (
+            fwd_callables
+        )
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
