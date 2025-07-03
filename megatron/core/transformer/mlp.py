@@ -176,7 +176,6 @@ class MLP(MegatronModule):
                     else:
                         return self.config.activation_func(x[0]) * x[1]
 
-
                 intermediate_parallel = glu(intermediate_parallel)
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
@@ -195,7 +194,7 @@ class MLP(MegatronModule):
         if per_token_scale is not None:
             # if this MLP is an expert, and bias is required, we add the bias to output directly
             # without doing bda later.
-            output += output_bias[None, :]
+            output += output_bias.unsqueeze(0) * per_token_scale.unsqueeze(-1)
             output_bias = None
 
         return output, output_bias
