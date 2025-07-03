@@ -46,7 +46,6 @@ class LayerSchedulePlan:
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
-    └── post_process (PostProcessNode): post process
     """
 
     attn = None
@@ -54,7 +53,6 @@ class LayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
-    post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, com_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
@@ -85,7 +83,7 @@ class LayerSchedulePlan:
     def _build_callable_nodes(self, event, comp_stream, com_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, post_attn, mlp, dispatch, combine, and post_process.
+            attn, post_attn, mlp, moe_dispatch and moe_combine.
         """
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -118,7 +116,7 @@ class LayerSchedulePlan:
             moe_dispatch_module,
             mlp_module,
             moe_combine_module,
-            post_process_module,
+            _,
         ) = fwd_callables
 
         # Create nodes for different operations in the layer
@@ -133,8 +131,6 @@ class LayerSchedulePlan:
             self.post_attn = FakeScheduleNode()
             self.moe_dispatch = FakeScheduleNode()
             self.moe_combine = FakeScheduleNode()
-
-        self.post_process = FakeScheduleNode()
 
     def get_fp8_context(self):
         """
@@ -183,7 +179,6 @@ class LayerSchedulePlan:
 
         if b_layer is not None:
             with b_context:
-                b_grad = b_layer.post_process.backward(b_grad)
                 b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -211,7 +206,6 @@ class LayerSchedulePlan:
         if f_layer is not None:
             with f_context and f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
-                f_input = f_layer.post_process.forward(f_input)
 
         if b_layer is not None:
             with b_context:
@@ -419,29 +413,20 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         if b_schedule_plan:
             b_schedule_plan.record_current_stream()
             assert b_grad is not None
-
             if pre_backward is not None:
-                # If the post_process node is FakeScheduleNode, it means the last node of
-                # the backward pass is combine node, which is running in the communication stream.
-                if isinstance(b_schedule_plan.post_process, FakeScheduleNode):
-                    stream = get_com_stream()
-                else:
-                    stream = get_comp_stream()
-                with torch.cuda.stream(stream):
-                    b_schedule_plan.wait_current_stream()
-                    with b_context as ctx:  # virtual pipeline parallel context
-                        pre_backward(ctx.vpp_rank)
-                    b_schedule_plan.record_current_stream()
+                with b_context as ctx:
+                    pre_backward(ctx.vpp_rank)
+                b_schedule_plan.record_current_stream()
 
             if b_schedule_plan.post_process is not None:
                 with b_context:  # virtual pipeline parallel context
                     b_grad = b_schedule_plan.post_process.backward(b_grad)
-                    # b_schedule_plan.post_process.backward_dw()
 
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
         overlaped_layers = min(f_num_layers, b_num_layers)
 
+        # combined forward and backward pass for overlaped layers
         for i in range(overlaped_layers):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
@@ -477,14 +462,14 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
 
         if f_schedule_plan is not None and post_forward is not None:
             with f_context as ctx:
-                # The last submodule is running in the communication stream,
+                # post_forward()/send_forward_recv_forward() is running in the communication stream,
                 # so the p2p comm could be overlapped with the attn backward
                 with torch.cuda.stream(get_com_stream()):
                     f_schedule_plan.wait_current_stream()
                     post_forward(f_input, ctx.vpp_rank)
 
-        # pp grad send / receive, overlapped with attn dw of cur micro-batch
-        # and forward attn of next micro-batch
+        # post_backward()/send_backward_recv_backward() is running in the computation stream,
+        # so the p2p comm could be overlapped with the wgrad of attn backward
         if b_schedule_plan is not None and post_backward is not None:
             with b_context as ctx:
                 b_schedule_plan.wait_current_stream()
@@ -496,9 +481,11 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
             with b_context:
                 b_schedule_plan.get_layer(0).attn.backward_dw()
 
+        # post process forward
         with f_context:
             if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
                 f_input = f_schedule_plan.post_process.forward(f_input)
+        # pre process backward
         with b_context:
             if b_schedule_plan is not None:
                 b_schedule_plan.pre_process.backward(b_grad)
