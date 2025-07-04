@@ -64,6 +64,7 @@ class DynamicInferenceRequest(InferenceRequest):
 
     """
 
+    request_id: int
     generated_tokens: List[int] = field(default_factory=list)
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None

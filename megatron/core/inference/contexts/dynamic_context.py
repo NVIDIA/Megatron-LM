@@ -368,6 +368,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Maximum sequence length for active requests."""
         return self.request_output_lengths[self.paused_request_count : self.total_request_count]
 
+    def get_active_request_count(self):
+        """Returns the current number of active requests."""
+        active_sequence_lengths = self.get_active_sequence_lengths()
+        max_sequence_lengths = self.get_max_sequence_lengths()
+        active_requests_mask = torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        active_request_count = (active_requests_mask == 1).sum().item()
+        return active_request_count
+
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
 
