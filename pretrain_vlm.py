@@ -1,30 +1,44 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 """Pretrain vision language model."""
+import warnings
 from copy import deepcopy
 from functools import partial
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.multimodal_dataset import MockMultimodalDataset, MultimodalDatasetConfig
+from megatron.core import mpu, parallel_state, tensor_parallel
+from megatron.core.datasets.blended_megatron_dataset_builder import (
+    BlendedMegatronDatasetBuilder,
+)
+from megatron.core.datasets.multimodal_dataset import (
+    MockMultimodalDataset,
+    MultimodalDatasetConfig,
+)
 from megatron.core.enums import ModelType
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.models.multimodal.llava_model import LLaVAModel, DEFAULT_IMAGE_TOKEN_INDEX
-from megatron.core.models.multimodal.llava_spec import (
-    decoder_model_with_transformer_engine_default_spec,
-    decoder_model_with_local_default_spec,
-)
-from megatron.core.models.vision.vit_layer_specs import (
-    get_vit_layer_with_transformer_engine_spec,
-    get_vit_layer_with_local_spec,
-)
-from megatron.core.transformer.spec_utils import import_module
-from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core import mpu
 from megatron.core.models.multimodal import context_parallel
+from megatron.core.models.multimodal.llava_model import (
+    DEFAULT_IMAGE_TOKEN_INDEX,
+    LLaVAModel,
+)
+from megatron.core.models.multimodal.llava_spec import (
+    decoder_model_with_local_default_spec,
+    decoder_model_with_transformer_engine_default_spec,
+)
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.models.vision.vit_layer_specs import (
+    get_vit_layer_with_local_spec,
+    get_vit_layer_with_transformer_engine_spec,
+)
+from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training import (
+    get_args,
+    get_timers,
+    get_tokenizer,
+    pretrain,
+    print_rank_0,
+)
+from megatron.training.arguments import core_transformer_config_from_args
 from pretrain_gpt import loss_func
 
 
