@@ -5,6 +5,7 @@ from typing import Dict, List, Literal, Tuple
 
 import torch
 import torch.distributed as dist
+import einops
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
@@ -189,8 +190,15 @@ class BridgeCommunicator:
             gathered_tensors = [torch.zeros_like(tensor_to_send) for _ in range(dp_size)]
             dist.gather(tensor_to_send, gather_list=gathered_tensors, dst=self.dp_leader_local_rank, group=self.dp_pg)
             
-            # Concatenate gathered tensors along batch dimension (assuming dim 0 is batch)
-            aggregated_tensor = torch.cat(gathered_tensors, dim=0)
+            # Get DP group ranks for tensor reconstruction
+            dp_group_ranks = dist.get_process_group_ranks(self.dp_pg)
+            
+            # Determine which grid this rank belongs to
+            current_grid = self.src_grid if self.current_rank in range(self.src_grid.rank_offset, 
+                                                                      self.src_grid.rank_offset + self.src_grid.size) else self.dest_grid
+            
+            # Reconstruct tensor properly handling TP/CP dimensions
+            aggregated_tensor = self._reconstruct_tensor_from_gathered(gathered_tensors, dp_group_ranks, current_grid)
             
             # Send splits to destination ranks
             num_sends = len(rank_info.sends)
@@ -261,3 +269,76 @@ class BridgeCommunicator:
             torch.Tensor: The received activation tensor
         """
         pass
+
+    def _reconstruct_tensor_from_gathered(self, gathered_tensors: List[torch.Tensor], 
+                                         dp_group_ranks: List[int], 
+                                         grid: HyperCommGrid) -> torch.Tensor:
+        """
+        Reconstruct tensor using the grid's native rank enumeration logic.
+        """
+        # Get all non-DP dimensions that were split
+        non_dp_dims = [dim for dim in grid.dim_names if dim != "dp"]
+        
+        if not non_dp_dims:
+            # Pure data parallelism - concatenate along batch
+            return gathered_tensors[0]
+        
+        # Create rank enumeration for non-DP dimensions
+        rank_enum = grid._gen_rank_enum(non_dp_dims)
+        
+        # Find which enumeration group our DP group belongs to
+        dp_group_set = set(dp_group_ranks)
+        matching_enum_group = None
+        for enum_group in rank_enum:
+            if dp_group_set.issubset(set(enum_group)):
+                matching_enum_group = enum_group
+                break
+        
+        if not matching_enum_group:
+            raise ValueError("No matching enumeration group found")
+        
+        # Create mapping from rank to tensor and order by enumeration
+        rank_to_tensor = dict(zip(dp_group_ranks, gathered_tensors))
+        ordered_tensors = [rank_to_tensor[rank] for rank in matching_enum_group if rank in rank_to_tensor]
+        
+        if not ordered_tensors:
+            raise ValueError("No tensors found for the given ranks")
+        
+        # Simple concatenation approach based on grid dimensions
+        return self._concatenate_by_grid_dims(ordered_tensors, grid, non_dp_dims)
+
+    def _concatenate_by_grid_dims(self, tensors: List[torch.Tensor], 
+                                 grid: HyperCommGrid, 
+                                 non_dp_dims: List[str]) -> torch.Tensor:
+        """
+        Concatenate tensors based on grid dimensions using a simpler approach.
+        """
+        if len(tensors) == 1:
+            return tensors[0]
+        
+        # Map parallelism types to tensor dimensions
+        dim_mapping = {'tp': -1, 'cp': 1, 'ep': -1}  # TP/EP: hidden dim, CP: sequence dim
+        
+        # Get grid shape for reconstruction
+        grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
+        
+        # Reshape tensor list to match grid structure
+        current_tensors = tensors
+        
+        # Process each grid dimension
+        for (dim_name, dim_size) in zip(non_dp_dims, grid_shape):
+            if dim_name in dim_mapping:
+                tensor_dim = dim_mapping[dim_name]
+                # Group tensors for this dimension and concatenate
+                grouped_tensors = []
+                group_size = len(current_tensors) // dim_size
+                
+                for group_idx in range(group_size):
+                    group_start = group_idx * dim_size
+                    group_end = group_start + dim_size
+                    group = current_tensors[group_start:group_end]
+                    grouped_tensors.append(torch.cat(group, dim=tensor_dim))
+                
+                current_tensors = grouped_tensors
+        
+        return current_tensors[0] if len(current_tensors) == 1 else torch.cat(current_tensors, dim=0)
