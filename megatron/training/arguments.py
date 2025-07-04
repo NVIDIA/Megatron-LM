@@ -349,38 +349,11 @@ def validate_args(args, defaults={}):
             "legacy model format only supports the 'torch' checkpoint format."
     update_use_dist_ckpt(args)
 
-    # Deprecation warning for encoder pipeline parallelism
-    if args.encoder_pipeline_model_parallel_size > 0 or args.encoder_tensor_model_parallel_size > 0:
-        warnings.warn(
-            "Encoder-specific pipeline parallelism functionality is deprecated and will be removed in core_r0.14.0. "
-            "This includes the parameters 'encoder_tensor_model_parallel_size' and 'encoder_pipeline_model_parallel_size', "
-            "as well as all associated encoder pipeline parallel logic and infrastructure. "
-            "This functionality is being replaced by the new 'orthotope' parallelism management system, which provides "
-            "a more general and flexible approach to handling complex parallelism configurations including encoder-decoder models. "
-            "Please refrain from building new features or dependencies on encoder pipeline parallelism as this entire "
-            "capability will not be supported in future releases. For migration guidance and information on the orthotope "
-            "system, please refer to the Megatron-LM documentation.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-
-    if args.encoder_pipeline_model_parallel_size == 0 and args.num_experts == 0:
-        assert args.encoder_tensor_model_parallel_size == args.tensor_model_parallel_size,  "If non-MOE encoder shares first decoder pipeline rank it must have the same TP as the decoder."
-
-    if args.encoder_tensor_model_parallel_size > 0:
-        assert args.num_attention_heads % args.encoder_tensor_model_parallel_size == 0
-        assert args.encoder_tensor_model_parallel_size <= args.tensor_model_parallel_size, "We do not support encoders with more TP than the decoder."
-
-    if args.encoder_pipeline_model_parallel_size > 0 and args.encoder_tensor_model_parallel_size == 0:
-        args.encoder_tensor_model_parallel_size = args.tensor_model_parallel_size
-
-    encoder_model_size = args.encoder_tensor_model_parallel_size * args.encoder_pipeline_model_parallel_size * args.context_parallel_size
-    decoder_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
-    total_model_size = encoder_model_size + decoder_model_size
+    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
 
     # Total model size.
     assert args.world_size % total_model_size == 0, (
-        f"world size ({args.world_size}) is not divisible by total_model_size ({encoder_model_size=} + {decoder_model_size=})"
+        f"world size ({args.world_size}) is not divisible by total_model_size ({total_model_size=})"
     )
 
     if args.attention_backend == AttnBackend.local:
@@ -389,6 +362,7 @@ def validate_args(args, defaults={}):
     # Pipeline model parallel size.
     args.transformer_pipeline_model_parallel_size = args.pipeline_model_parallel_size
 
+    total_model_size = args.tensor_model_parallel_size * args.pipeline_model_parallel_size * args.context_parallel_size
     args.data_parallel_size = args.world_size // total_model_size
 
     if args.rank == 0:
@@ -396,24 +370,14 @@ def validate_args(args, defaults={}):
               'context-parallel size: {}, '
               'hierarchical context-parallel sizes: {}, '
               'tensor-model-parallel size: {}, '
-              'encoder-tensor-model-parallel size: {}, '
-              'pipeline-model-parallel size: {}, '
-              'encoder-pipeline-model-parallel size: {}'.format(
+              'pipeline-model-parallel size: {}'.format(
                   args.world_size, args.data_parallel_size,
                   args.context_parallel_size,
                   args.hierarchical_context_parallel_sizes,
                   args.tensor_model_parallel_size,
-                  args.encoder_tensor_model_parallel_size,
-                  args.pipeline_model_parallel_size,
-                  args.encoder_pipeline_model_parallel_size), flush=True)
+                  args.pipeline_model_parallel_size), flush=True)
 
     # Checks.
-
-    # Backwards compatibility.
-    if args.pipeline_model_parallel_split_rank is not None:
-        args.encoder_pipeline_model_parallel_size = args.pipeline_model_parallel_split_rank
-        args.pipeline_model_parallel_size -= args.encoder_pipeline_model_parallel_size
-        assert args.pipeline_model_parallel_size > 0
 
     if args.hierarchical_context_parallel_sizes:
         from numpy import prod
@@ -963,9 +927,9 @@ def validate_args(args, defaults={}):
     # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
     if args.ckpt_format == "torch_dcp":
         assert args.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
-        assert args.tensor_model_parallel_size <= 1 and args.encoder_tensor_model_parallel_size <= 1, \
+        assert args.tensor_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron tensor parallelism."
-        assert args.pipeline_model_parallel_size <= 1 and args.encoder_pipeline_model_parallel_size <= 1, \
+        assert args.pipeline_model_parallel_size <= 1, \
             "--ckpt-format torch_dcp is not tested with megatron pipeline parallelism."
 
     # Data blend checks
@@ -2247,19 +2211,8 @@ def _add_distributed_args(parser):
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
-    group.add_argument('--encoder-tensor-model-parallel-size', type=int, default=0,
-                       help='DEPRECATED (will be removed in core_r0.14.0): Use orthotope parallelism management instead. '
-                       'Degree of tensor model parallelism for the encoder.')
     group.add_argument('--pipeline-model-parallel-size', type=int, default=1,
                        help='Degree of pipeline model parallelism.')
-    group.add_argument('--encoder-pipeline-model-parallel-size', type=int, default=0,
-                       help='DEPRECATED (will be removed in core_r0.14.0): Use orthotope parallelism management instead. '
-                           'Degree of pipeline model parallelism in the encoder. This is '
-                             'independent of the amount of pipeline in the decoder.')
-    group.add_argument('--pipeline-model-parallel-split-rank',
-                       type=int, default=None,
-                       help=('Rank where encoder and decoder should be split. '
-                             'Deprecated; use --encoder-pipeline-model-parallel-size instead.'))
     group.add_argument('--decoder-first-pipeline-num-layers',
                        type=int, default=None,
                        help=('The number of transformer layers on the first pipeline stage of the decoder. '
