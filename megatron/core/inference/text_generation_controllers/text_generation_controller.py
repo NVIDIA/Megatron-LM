@@ -494,7 +494,6 @@ class TextGenerationController:
         max_sequence_lengths = context.get_max_sequence_lengths()
 
         # Request finished if termination_id or length >= max_sequence_length.
-
         active_request_mask = (new_sample != termination_id).byte() & torch.less(
             active_sequence_lengths, max_sequence_lengths
         ).byte()

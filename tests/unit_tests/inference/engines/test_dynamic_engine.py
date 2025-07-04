@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
 import random
 import types
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     TokenOverflowError,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.inference_request import Status
+from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
@@ -61,7 +62,7 @@ class Request:
 
 
 @dataclass
-class TestConfig:
+class DynamicEngineTestConfig:
     """Test configuration args."""
 
     set_rounder(4)
@@ -97,10 +98,10 @@ class TestConfig:
 
 
 @dataclass
-class TestEnv:
+class DynamicEngineTestEnv:
     """Test environment, including requests and engine."""
 
-    config: TestConfig
+    config: DynamicEngineTestConfig
     sampling_params: SamplingParams
     requests: List[Request]
     engine: DynamicInferenceEngine
@@ -136,7 +137,10 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _build_inference_context(
-        cls, test_config: TestConfig, transformer_config: TransformerConfig, requests: List[Request]
+        cls,
+        test_config: DynamicEngineTestConfig,
+        transformer_config: TransformerConfig,
+        requests: List[Request],
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -253,7 +257,7 @@ class TestDynamicInferenceEngine:
         )
 
         # Test env.
-        env = TestEnv(
+        env = DynamicEngineTestEnv(
             config=test_config, sampling_params=sampling_params, requests=requests, engine=engine
         )
 
@@ -285,7 +289,7 @@ class TestDynamicInferenceEngine:
     def _run_test(cls, **test_config_kwargs):
 
         # Test environment.
-        test_config = TestConfig(**test_config_kwargs)
+        test_config = DynamicEngineTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
 
         # Add requests to engine.
@@ -388,7 +392,7 @@ class TestDynamicInferenceEngine:
     )
     def test_token_overflow(self) -> None:
         """Test token overflow."""
-        test_config = TestConfig(context_max_tokens_override=8)
+        test_config = DynamicEngineTestConfig(context_max_tokens_override=8)
         env = self._build_test_env(test_config)
         env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
         assert list(env.engine.waiting_request_ids) == [0]
@@ -398,11 +402,11 @@ class TestDynamicInferenceEngine:
     )
     def test_chunk_overflow(self) -> None:
         """Test token overflow."""
-        env = self._build_test_env(TestConfig())
+        env = self._build_test_env(DynamicEngineTestConfig())
         context = env.engine.context
         chunk_size_bytes = context.chunk_size_bytes
         buffer_size_gb = (chunk_size_bytes + 1) / 1024**3
-        test_config = TestConfig(context_buffer_size_gb=buffer_size_gb)
+        test_config = DynamicEngineTestConfig(context_buffer_size_gb=buffer_size_gb)
         env = self._build_test_env(test_config)
         env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
         assert list(env.engine.waiting_request_ids) == [0]
@@ -427,7 +431,9 @@ class TestDynamicInferenceEngine:
     def test_generate_function(self) -> None:
         """Test the generate function that processes multiple prompts at once."""
         # Set up test environment
-        test_config = TestConfig(num_requests=4, max_prompt_length=8, max_output_length=4)
+        test_config = DynamicEngineTestConfig(
+            num_requests=4, max_prompt_length=8, max_output_length=4
+        )
         env = self._build_test_env(test_config)
 
         # Create string prompts (just mock strings, since the test environment mocks the tokenizer)
@@ -454,3 +460,48 @@ class TestDynamicInferenceEngine:
             # Verify each request has generated tokens
             assert len(request.generated_tokens) > 0, f"Request {i} should have generated tokens"
             assert request.status == Status.COMPLETED, f"Request {i} should be completed"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_run_engine(self):
+        """
+        Test asynchronously adding and waiting for requests while the engine is
+        running continuously.
+        """
+        # Test environment.
+        test_config = DynamicEngineTestConfig(use_fixed_output_lengths=True)
+        env = self._build_test_env(test_config)
+
+        engine_task = asyncio.create_task(
+            env.engine.run_engine(sampling_params=env.sampling_params, verbose=False)
+        )
+
+        request_completion_futures: Dict[int, asyncio.Future[DynamicInferenceRequest]] = {}
+
+        # Add requests to engine.
+        for request_id in tqdm(range(len(env.requests)), "add requests"):
+
+            # Add request.
+            num_tokens_to_generate = env.requests[request_id].num_tokens_to_generate
+            request_completion_futures[request_id] = env.engine.add_request(
+                request_id,
+                env.requests[request_id].prompt,
+                num_tokens_to_generate=num_tokens_to_generate,
+            )
+            env.requests[request_id].state = "pending"
+
+        # Wait for all requests to complete.
+        await asyncio.gather(*request_completion_futures.values())
+
+        # Verify that all request outputs were set.
+        for request_id, fut in request_completion_futures.items():
+            num_tokens_to_generate = env.requests[request_id].num_tokens_to_generate
+            result = fut.result()
+            assert result.generated_length == num_tokens_to_generate, (
+                f"Request {request_id} expected to generate {num_tokens_to_generate} "
+                f"tokens but generated {result.generated_length}"
+            )
+
+        engine_task.cancel()
