@@ -851,9 +851,10 @@ def validate_args(args, defaults={}):
         elif args.overlap_moe_expert_parallel_comm:
             warnings.warn("Try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
                          "Using tensor/context model parallelism requires setting the environment "
-                         "variable CUDA_DEVICE_MAX_CONNECTIONS to 1. "
+                         "variable CUDA_DEVICE_MAX_CONNECTIONS to 1 to maximize the performance. "
                          "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
-                         "for better parallelization.")
+                         "for better parallelization. If you want to use both, you can set CUDA_DEVICE_MAX_CONNECTIONS to 1 or 32, "
+                         "which depends on which parallelization you want to prioritize.")
         else:
             assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
@@ -1038,46 +1039,6 @@ def validate_args(args, defaults={}):
             "as the hybrid device optimizer reuses the code path of this flag."
         )
 
-    if args.overlap_moe_expert_parallel_comm:
-        # Basic requirements for overlap_moe_expert_parallel_comm
-        if args.pipeline_model_parallel_size > 1:
-            assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
-                'overlap_moe_expert_parallel_comm is only supported with interleaved pipeline model parallelism when pp > 1.'
-        # Expert model parallelism requirements
-        assert args.expert_model_parallel_size > 1, \
-            'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
-        assert args.moe_token_dispatcher_type in ['alltoall', 'flex'], \
-            'overlap_moe_expert_parallel_comm is only supported with alltoall/flex token dispatcher'
-        
-        # Disable recomputation as it conflicts with overlap_moe_expert_parallel_comm's memory management
-        assert args.recompute_granularity != 'full', \
-            'recompute_granularity must not be full when overlap_moe_expert_parallel_comm is enabled'
-        assert args.recompute_method is None, \
-            'recompute_method must be None when overlap_moe_expert_parallel_comm is enabled'
-        assert args.recompute_num_layers is None, \
-            'recompute_num_layers must be None when overlap_moe_expert_parallel_comm is enabled'
-        
-        # Check if bf16 or fp16 is used
-        assert args.bf16 or args.fp16, \
-            'Currently, overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
-        
-        # Disable shared expert overlap as it conflicts with ep_a2a
-        assert not args.moe_shared_expert_overlap, \
-            'moe_shared_expert_overlap is not supported when overlap_moe_expert_parallel_comm is enabled'
-        assert args.mtp_num_layers is None, \
-            '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
-            
-    # Check delay_wgrad_compute compatibility
-    if args.delay_wgrad_compute:
-        assert args.overlap_moe_expert_parallel_comm, \
-            'delay_wgrad_compute is only supported when overlap_moe_expert_parallel_comm is enabled'
-        assert not args.moe_use_legacy_grouped_gemm, \
-            'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
-        assert args.transformer_impl == 'transformer_engine', \
-            'delay_wgrad_compute is only supported with transformer_engine implementation'
-        assert not args.overlap_grad_reduce, \
-            'delay_wgrad_compute is not supported with overlap_grad_reduce'
-
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
     if args.replication:
@@ -1086,6 +1047,12 @@ def validate_args(args, defaults={}):
     elif args.replication_jump:
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
+
+    if args.delay_wgrad_compute:
+        assert args.transformer_impl == 'transformer_engine', \
+            "Delaying wgrad compute is only supported with transformer_engine implementation"
+        assert not args.overlap_grad_reduce, \
+            "Delaying wgrad compute is not supported with overlap_grad_reduce"
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
