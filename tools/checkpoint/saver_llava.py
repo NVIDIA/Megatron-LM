@@ -153,6 +153,7 @@ class MegatronCheckpointSaverLLaVA(MegatronCheckpointSaverBase):
         margs.allow_missing_vision_projection_checkpoint = getattr(self.md.checkpoint_args, "allow_missing_vision_projection_checkpoint", False)
         margs.freeze_LM = getattr(self.md.checkpoint_args, "freeze_LM", False)
         margs.freeze_ViT = getattr(self.md.checkpoint_args, "freeze_ViT", False)
+        margs.encoder_tensor_model_parallel_size = getattr(self.md.checkpoint_args, "encoder_tensor_model_parallel_size", 0)
         margs.force_system_message = getattr(self.md.checkpoint_args, "force_system_message", False)
         margs.image_tag_type = getattr(self.md.checkpoint_args, "image_tag_type", "")
         margs.num_frames = getattr(self.md.checkpoint_args, "num_frames", 8)

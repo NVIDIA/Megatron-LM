@@ -987,6 +987,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             mpu.get_pipeline_model_parallel_world_size() > 1
             and args.virtual_pipeline_model_parallel_size is not None
         ):
+            if model_type == ModelType.encoder_and_decoder:
+                assert (
+                    args.encoder_pipeline_model_parallel_size == 0
+                ), "Interleaved schedule not supported for model with encoder on separate PP rank"
             model = []
             for i in range(args.virtual_pipeline_model_parallel_size):
                 # Set pre_process and post_process only after virtual rank is set.
@@ -1000,7 +1004,25 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         else:
             pre_process = mpu.is_pipeline_first_stage()
             post_process = mpu.is_pipeline_last_stage()
-            model = model_provider_func(pre_process=pre_process, post_process=post_process)
+            add_encoder = True
+            add_decoder = True
+            if model_type == ModelType.encoder_and_decoder:
+                if mpu.get_pipeline_model_parallel_world_size() > 1:
+                    rank = mpu.get_pipeline_model_parallel_rank()
+                    first_decoder_rank = args.encoder_pipeline_model_parallel_size
+                    world_size = mpu.get_pipeline_model_parallel_world_size()
+                    pre_process = rank == 0 or rank == first_decoder_rank
+                    post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
+                    add_encoder = mpu.is_inside_encoder(rank)
+                    add_decoder = mpu.is_inside_decoder(rank)
+                model = model_provider_func(
+                    pre_process=pre_process,
+                    post_process=post_process,
+                    add_encoder=add_encoder,
+                    add_decoder=add_decoder,
+                )
+            else:
+                model = model_provider_func(pre_process=pre_process, post_process=post_process)
             model.model_type = model_type
         return model
 

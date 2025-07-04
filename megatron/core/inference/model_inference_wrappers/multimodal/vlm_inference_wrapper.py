@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
@@ -47,10 +48,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # has part of the LM decoder. In this case, the current stage should only receive
         # vision embeddings.
         if pp_rank > 0:
-            self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
+            self._recv_only_vision_embeds = (
+                parallel_state.is_inside_encoder(pp_rank - 1)
+                and (not parallel_state.is_inside_decoder(pp_rank - 1))
+                and parallel_state.is_inside_decoder()
+            )
 
         # Checks if the current stage only has a vision encoder
-        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
+        self._encoder_only = (
+            parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
+        )
 
     def prep_inference_input(
         self,

@@ -82,6 +82,12 @@ def validate_yaml(args, defaults={}):
                   args.model_parallel.context_parallel_size,
                   args.model_parallel.tensor_model_parallel_size,
                   args.model_parallel.pipeline_model_parallel_size), flush=True)
+    if args.model_parallel.pipeline_model_parallel_size > 1:
+        if args.model_parallel.pipeline_model_parallel_split_rank is not None:
+            assert args.model_parallel.pipeline_model_parallel_split_rank < \
+                    args.model_parallel.pipeline_model_parallel_size, 'split rank needs'\
+                    ' to be less than pipeline model parallel size ({})'.format(
+                            args.model_parallel.pipeline_model_parallel_size)
 
     if args.model_parallel.tp_comm_overlap:
         assert args.model_parallel.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'

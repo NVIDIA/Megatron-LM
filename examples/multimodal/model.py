@@ -33,6 +33,24 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
+    
+    # Deprecation warning for encoder pipeline parallelism
+    if args.encoder_pipeline_model_parallel_size > 0 or args.encoder_tensor_model_parallel_size > 0:
+        warnings.warn(
+            "Encoder-specific pipeline parallelism functionality is deprecated and will be removed in core_r0.14.0. "
+            "This includes the parameters 'encoder_tensor_model_parallel_size' and 'encoder_pipeline_model_parallel_size', "
+            "as well as all associated encoder pipeline parallel logic and infrastructure. "
+            "This functionality is being replaced by the new 'orthotope' parallelism management system, which provides "
+            "a more general and flexible approach to handling complex parallelism configurations including encoder-decoder models. "
+            "Please refrain from building new features or dependencies on encoder pipeline parallelism as this entire "
+            "capability will not be supported in future releases. For migration guidance and information on the orthotope "
+            "system, please refer to the Megatron-LM documentation.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    
+    assert args.encoder_pipeline_model_parallel_size <= 1, "LLaVA does not support pp>1 for encoder on it's own pipeline rank"
+
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
@@ -110,6 +128,8 @@ def model_provider(
         vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
     )
     if vision_model_type.startswith("hf://"):
+        assert args.encoder_tensor_model_parallel_size < 2, "Huggingface vision encoders do not support --encoder-tensor-model-parallel-size > 1"
+        assert args.encoder_pipeline_model_parallel_size == 0, "Huggingface vision encoders do not support --encoder-pipeline-model-parallel-size > 0"
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
@@ -148,8 +168,21 @@ def model_provider(
         vision_projection_config, language_config.hidden_size
     )
 
+    # --encoder-pipeline-model-parallel-size 1 will enable a separate pipeline stage for the vision model.
+    if args.encoder_pipeline_model_parallel_size > 0:
+        assert (
+            args.encoder_pipeline_model_parallel_size == 1
+        ), "vision model and projection can only live on 1 pipeline stage."
+
+        if args.encoder_tensor_model_parallel_size > 0:
+            vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
+            vision_projection_config.tensor_model_parallel_size = (
+                args.encoder_tensor_model_parallel_size
+            )
+
     # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
-    vision_config.pipeline_model_parallel_size = 1
+    # 0 is not a valid for the config value, hence max(1, ).
+    vision_config.pipeline_model_parallel_size = max(1, args.encoder_pipeline_model_parallel_size)
     vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
 
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.

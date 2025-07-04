@@ -476,8 +476,15 @@ class VLMForwardStep(ForwardStep):
         self._num_img_embeddings = num_img_embeddings
         self.decoder_seq_length = decoder_seq_length
 
-        self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
-        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
+        self._recv_only_vision_embeds = False
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
+        # In this case, the current stage should only receive vision embeddings.
+        if pp_rank > 0:
+            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
+
+        # Checks if the current stage only has a vision encoder
+        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -851,7 +858,7 @@ def eval_tasks():
                               parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
