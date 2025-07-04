@@ -454,7 +454,7 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
-            if is_flaky_failure(concat_allranks_logs):
+            if not success and is_flaky_failure(concat_allranks_logs):
                 logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
