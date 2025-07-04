@@ -269,7 +269,10 @@ class TestDynamicInferenceEngine:
     def _run_step(cls, env):
         set_rounder(4)
         # Step inference engine (i.e., generate one token per request).
-        finished_requests, step_time = env.engine.step(env.sampling_params, verbose=False)
+        result = env.engine.step(env.sampling_params, verbose=False)
+        if len(result) == 3:
+            result = result[1:]
+        finished_requests = result[0]
 
         # Nothing done?
         if len(finished_requests) == 0:
