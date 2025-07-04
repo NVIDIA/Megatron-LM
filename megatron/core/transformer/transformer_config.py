@@ -1190,38 +1190,48 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.overlap_moe_expert_parallel_comm:
             # Basic requirements for overlap_moe_expert_parallel_comm
-            assert self.pipeline_model_parallel_size == 1, \
-                '(Temporary) overlap_moe_expert_parallel_comm is not supported when PP>1.'
+            assert (
+                self.pipeline_model_parallel_size == 1
+            ), '(Temporary) overlap_moe_expert_parallel_comm is not supported when PP>1.'
             # Expert model parallelism requirements
-            assert self.expert_model_parallel_size > 1, \
-                'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
-            assert self.moe_token_dispatcher_type in ['alltoall', 'flex'], \
-                'overlap_moe_expert_parallel_comm is only supported with alltoall/flex token dispatcher'
+            assert (
+                self.expert_model_parallel_size > 1
+            ), 'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
+            assert self.moe_token_dispatcher_type in [
+                'alltoall',
+                'flex',
+            ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
 
-            # Disable recomputation as it conflicts with overlap_moe_expert_parallel_comm's memory management
-            assert self.recompute_granularity != 'full', \
-                'recompute_granularity must not be full when overlap_moe_expert_parallel_comm is enabled'
-            assert self.recompute_method is None, \
-                'recompute_method must be None when overlap_moe_expert_parallel_comm is enabled'
-            assert self.recompute_num_layers is None, \
-                'recompute_num_layers must be None when overlap_moe_expert_parallel_comm is enabled'
+            assert (
+                self.recompute_granularity != 'full'
+            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.recompute_method is None
+            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.recompute_num_layers is None
+            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
 
             # Check if bf16 or fp16 is used
-            assert self.bf16 or self.fp16, \
-                'Currently, overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
+            assert (
+                self.bf16 or self.fp16
+            ), 'overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
 
-            # Disable shared expert overlap as it conflicts with ep_a2a
-            assert not self.moe_shared_expert_overlap, \
-                'moe_shared_expert_overlap is not supported when overlap_moe_expert_parallel_comm is enabled'
-            assert self.mtp_num_layers is None, \
-                '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
+            assert (
+                not self.moe_shared_expert_overlap
+            ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.mtp_num_layers is None
+            ), '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:
-            assert self.overlap_moe_expert_parallel_comm, \
-                'delay_wgrad_compute is only supported when overlap_moe_expert_parallel_comm is enabled'
-            assert not self.moe_use_legacy_grouped_gemm, \
-                'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+            assert (
+                self.overlap_moe_expert_parallel_comm
+            ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
+            assert (
+                not self.moe_use_legacy_grouped_gemm
+            ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
 
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
