@@ -1,6 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from packaging.version import Version
+try:
+    from packaging.version import Version
+except ImportError:
+    pass
 
 from .distributed_data_parallel import DistributedDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig

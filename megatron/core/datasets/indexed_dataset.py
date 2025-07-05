@@ -17,12 +17,13 @@ from itertools import accumulate
 from types import TracebackType
 from typing import List, Optional, Tuple, Type, Union
 
+import numpy
+
 try:
     import boto3
 except ModuleNotFoundError:
     pass
 
-import numpy
 import torch
 
 from megatron.core.datasets.object_storage_utils import S3Config  # pylint: disable=unused-import
@@ -204,7 +205,7 @@ class _IndexWriter(object):
 
         # the mode per sequence
         if sequence_modes is not None:
-            self.idx_writer.write(numpy.array(sequence_modes, dtype=numpy.int8).tobytes(order='C'))
+            self.idx_writer.write(numpy.array(sequence_modes, dtype=numpy.int8).tobytes(order="C"))
 
     def _sequence_pointers(self, sequence_lengths: List[int]) -> List[int]:
         """Build the sequence pointers per the sequence lengths and dtype size
@@ -234,7 +235,6 @@ class _IndexReader(object):
     """
 
     def __init__(self, idx_path: str, multimodal: bool) -> None:
-
         log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} from {idx_path}")
 
         with open(idx_path, "rb") as stream:
@@ -435,11 +435,11 @@ class _FileBinReader(_BinReader):
         sequence = numpy.empty(count, dtype=dtype)
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
-            with msc.open(self._bin_path, mode='rb', buffering=0) as bin_buffer_file:
+            with msc.open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
                 bin_buffer_file.seek(offset)
                 bin_buffer_file.readinto(sequence)
         else:
-            with open(self._bin_path, mode='rb', buffering=0) as bin_buffer_file:
+            with open(self._bin_path, mode="rb", buffering=0) as bin_buffer_file:
                 bin_buffer_file.seek(offset)
                 bin_buffer_file.readinto(sequence)
         return sequence
@@ -520,8 +520,8 @@ class _S3BinReader(_BinReader):
             Bucket=self._s3_bucket,
             Key=self._s3_key,
             # Subtract 1, because the end of Range is inclusive.
-            Range=f'bytes={bytes_start}-{bytes_end-1}',
-        )['Body'].read()
+            Range=f"bytes={bytes_start}-{bytes_end - 1}",
+        )["Body"].read()
         self._cache_bytes_start = bytes_start
         self._cache_bytes_end = bytes_end
         return numpy.frombuffer(self._extract_from_cache(offset, size), dtype=dtype)
@@ -551,7 +551,7 @@ class _MultiStorageClientBinReader(_BinReader):
 
 
 # Map of object storage access to the corresponding bin reader
-OBJECT_STORAGE_BIN_READERS = {'s3': _S3BinReader, 'msc': _MultiStorageClientBinReader}
+OBJECT_STORAGE_BIN_READERS = {"s3": _S3BinReader, "msc": _MultiStorageClientBinReader}
 
 
 class IndexedDataset(torch.utils.data.Dataset):

@@ -28,13 +28,11 @@ from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.utils import get_model_config
 
 try:
-
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
     HAVE_TE = True
 
 except ImportError:
-
     HAVE_TE = False
 
 
@@ -196,8 +194,8 @@ class TextGenerationController:
                 and indices as the top k elements. None if sampling params top_n_logprobs is 0.
         """
 
-        if kwargs.get('common_inference_params'):
-            sampling_params = kwargs['common_inference_params']
+        if kwargs.get("common_inference_params"):
+            sampling_params = kwargs["common_inference_params"]
 
         top_p = sampling_params.top_p
         top_k = sampling_params.top_k
@@ -205,13 +203,13 @@ class TextGenerationController:
 
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (top_k > 0 and top_p > 0.0), 'Cannot have top-p and top-k both greater than zero'
-        assert top_p <= 1.0, 'top-p should be in (0,1]'
+        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
+        assert top_p <= 1.0, "top-p should be in (0,1]"
 
         def modify_logits_for_top_k_filtering(logits, top_k):
             """Set the logits for none top-k values to -inf."""
             filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits.masked_fill_(filter_, float('-Inf'))
+            logits.masked_fill_(filter_, float("-Inf"))
 
         def modify_logits_for_top_p_filtering(logits, top_p):
             """Set the logits for none top-p values to -inf."""
@@ -231,7 +229,7 @@ class TextGenerationController:
 
             # Fill in the filtered part
             filter_ = filter_.scatter(1, sorted_indices, filter_)
-            logits.masked_fill_(filter_, float('-Inf'))
+            logits.masked_fill_(filter_, float("-Inf"))
 
         if sampling_params.top_n_logprobs > 0:
             # NOTE : This thing can also be clubbed with where we compute log probs
@@ -288,9 +286,9 @@ class TextGenerationController:
             if temperature != 1.0:
                 last_token_logits.div_(temperature)
             if top_k > 1:
-                assert top_k <= last_token_logits.size(1), 'top-k is larger than logit size.'
+                assert top_k <= last_token_logits.size(1), "top-k is larger than logit size."
                 if vocab_size:
-                    assert top_k < vocab_size, 'top-k is larger than vocab size.'
+                    assert top_k < vocab_size, "top-k is larger than vocab size."
                 modify_logits_for_top_k_filtering(last_token_logits, top_k)
 
             elif top_p > 0.0:
@@ -355,7 +353,7 @@ class TextGenerationController:
         batch_prompt_tokens_list: List[List[int]],
         padded_batch_size: int,
         padded_sequence_length: int,
-        fp8_padding: Optional[Fp8Padding] = None,
+        fp8_padding: Optional["Fp8Padding"] = None,
     ) -> torch.Tensor:
         """Method to pad input prompts
 
@@ -395,7 +393,7 @@ class TextGenerationController:
         self,
         padded_batch_prompt_tokens: torch.Tensor,
         original_batch_size: int,
-        fp8_unpadding: Optional[Fp8Unpadding] = None,
+        fp8_unpadding: Optional["Fp8Unpadding"] = None,
     ):
         """Truncates the given input tensor back to the original prompt size before padding.
 
@@ -674,7 +672,6 @@ class TextGenerationController:
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
         with torch.inference_mode():
-
             self.inference_wrapped_model.prep_model_for_inference()
 
             inference_input: Dict[str, Any] = self.prep_inference_input(

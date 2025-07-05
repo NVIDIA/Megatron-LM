@@ -18,6 +18,11 @@ wait_for_resources:
     - test:build_image
   image: python:3.10
   timeout: 7 days
+  variables:
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 32Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 8
+    KUBERNETES_SERVICE_CPU_LIMIT: 12
   tags:
     - arch/amd64
     - env/prod
@@ -362,3 +367,38 @@ test:unit_tests_x_coverage_report:
       when: on_success
     - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
       when: on_success
+
+test:safe_imports:
+  extends: [.test_rules]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/builder-large
+    - team/megatron
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  variables:
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 32Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 8
+    KUBERNETES_SERVICE_CPU_LIMIT: 12
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  needs: [test:build_image]
+  script:
+    - env
+    - pip install -e .
+    - python .gitlab/scripts/check_imports.py --package-name megatron.core
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+  retry:
+    max: 2

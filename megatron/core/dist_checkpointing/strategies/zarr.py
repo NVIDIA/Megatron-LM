@@ -1,6 +1,7 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Strategies using Zarr as an underlying format. """
+"""Strategies using Zarr as an underlying format."""
+
 import logging
 import os
 from functools import partial
@@ -10,7 +11,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import zarr
 
 from ..core import CheckpointingException
 from ..dict_utils import dict_list_map_inplace, nested_values
@@ -24,18 +24,29 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+try:
+    import zarr
+
+    HAVE_ZARR = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    zarr = MagicMock()
+    HAVE_ZARR = False
+
+
 numpy_to_torch_dtype_dict = {
-    np.dtype('bool'): torch.bool,
-    np.dtype('uint8'): torch.uint8,
-    np.dtype('int8'): torch.int8,
-    np.dtype('int16'): torch.int16,
-    np.dtype('int32'): torch.int32,
-    np.dtype('int64'): torch.int64,
-    np.dtype('float16'): torch.float16,
-    np.dtype('float32'): torch.float32,
-    np.dtype('float64'): torch.float64,
-    np.dtype('complex64'): torch.complex64,
-    np.dtype('complex128'): torch.complex128,
+    np.dtype("bool"): torch.bool,
+    np.dtype("uint8"): torch.uint8,
+    np.dtype("int8"): torch.int8,
+    np.dtype("int16"): torch.int16,
+    np.dtype("int32"): torch.int32,
+    np.dtype("int64"): torch.int64,
+    np.dtype("float16"): torch.float16,
+    np.dtype("float32"): torch.float32,
+    np.dtype("float64"): torch.float64,
+    np.dtype("complex64"): torch.complex64,
+    np.dtype("complex128"): torch.complex128,
 }
 
 torch_to_numpy_dtype_dict = {v: k for k, v in numpy_to_torch_dtype_dict.items()}
@@ -46,8 +57,8 @@ try:
     import tensorstore  # pylint: disable=unused-import
 
     HAS_BFLOAT16 = True
-    numpy_to_torch_dtype_dict[np.dtype('bfloat16')] = torch.bfloat16
-    torch_to_numpy_dtype_dict[torch.bfloat16] = np.dtype('bfloat16')
+    numpy_to_torch_dtype_dict[np.dtype("bfloat16")] = torch.bfloat16
+    torch_to_numpy_dtype_dict[torch.bfloat16] = np.dtype("bfloat16")
 except ImportError:
     HAS_BFLOAT16 = False
 
@@ -57,7 +68,7 @@ logger = getLogger(__name__)
 def register_default_zarr_strategies():
     """Register default strategies related to Zarr backend."""
     register_default_strategy(
-        StrategyAction.SAVE_SHARDED, 'zarr', 1, ZarrSaveShardedStrategy('zarr', 1)
+        StrategyAction.SAVE_SHARDED, "zarr", 1, ZarrSaveShardedStrategy("zarr", 1)
     )
 
 
@@ -67,8 +78,8 @@ class ZarrSaveShardedStrategy(SaveShardedStrategy):
     def __init__(self, backend: str, version: int):
         super().__init__(backend, version)
         logger.warning(
-            f'`zarr` distributed checkpoint backend is deprecated.'
-            ' Please switch to PyTorch Distributed format (`torch_dist`).'
+            f"`zarr` distributed checkpoint backend is deprecated."
+            " Please switch to PyTorch Distributed format (`torch_dist`)."
         )
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
@@ -98,6 +109,9 @@ def _create_or_open_zarr_arrays(
             that will be saved to checkpoint
         checkpoint_dir (Path): checkpoint in which the arrays will be created
     """
+    if not HAVE_ZARR:
+        raise RuntimeError("zarr is required, please install it with `pip install zarr`")
+
     arrays = []
     for ten in sharded_tensors:
         arr = _create_zarr_array(ten, checkpoint_dir) if _should_create_array(ten) else None
@@ -115,10 +129,10 @@ def _create_or_open_zarr_arrays(
             continue
         open_kwargs = {}
         if ten.flattened_range is not None:
-            open_kwargs['synchronizer'] = zarr.ProcessSynchronizer(
-                str(checkpoint_dir / f'{ten.key}.sync')
+            open_kwargs["synchronizer"] = zarr.ProcessSynchronizer(
+                str(checkpoint_dir / f"{ten.key}.sync")
             )
-        arrays[arr_idx] = _open_zarr_array_verbose(checkpoint_dir / ten.key, 'r+', **open_kwargs)
+        arrays[arr_idx] = _open_zarr_array_verbose(checkpoint_dir / ten.key, "r+", **open_kwargs)
     return arrays
 
 
@@ -140,7 +154,7 @@ def _save_to_existing_array(sharded_tensor: ShardedTensor, arr: Optional[zarr.Ar
     if x.dtype == torch.bfloat16:
         x = x.float()
         x = x.numpy()
-        x = x.astype('bfloat16')
+        x = x.astype("bfloat16")
     else:
         x = x.numpy()
 
@@ -162,16 +176,16 @@ def _create_zarr_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
             fill_value=None,
             write_empty_chunks=True,
         )
-        logger.debug(f'Created a new Zarr array at {checkpoint_dir / sharded_tensor.key}')
+        logger.debug(f"Created a new Zarr array at {checkpoint_dir / sharded_tensor.key}")
     except zarr.errors.ContainsArrayError as e:
         raise CheckpointingException(
-            f'Array {checkpoint_dir / sharded_tensor.key} already exists'
+            f"Array {checkpoint_dir / sharded_tensor.key} already exists"
         ) from e
 
-    if HAS_BFLOAT16 and np_dtype == np.dtype('bfloat16'):
+    if HAS_BFLOAT16 and np_dtype == np.dtype("bfloat16"):
         arr._dtype = np_dtype
-        zarray = arr.store['.zarray']
-        arr.store['.zarray'] = zarray.replace(b'<V2', b'bfloat16')
+        zarray = arr.store[".zarray"]
+        arr.store[".zarray"] = zarray.replace(b"<V2", b"bfloat16")
     return arr
 
 
@@ -189,7 +203,7 @@ class ZarrLoadShardedStrategy(LoadShardedStrategy):
 
     def load_tensors_metadata(self, checkpoint_dir: Union[str, Path]):
         def get_zarr_shape_dtype(path):
-            arr = zarr.open(path, 'r')
+            arr = zarr.open(path, "r")
             return arr.shape, arr.dtype
 
         if isinstance(checkpoint_dir, str):
@@ -206,13 +220,13 @@ class ZarrLoadShardedStrategy(LoadShardedStrategy):
 
 def _load_from_array(sharded_tensor: ShardedTensor, checkpoint_dir: Path):
     assert isinstance(sharded_tensor, ShardedTensor), type(sharded_tensor)
-    arr = _open_zarr_array_verbose(checkpoint_dir / sharded_tensor.key, 'r')
+    arr = _open_zarr_array_verbose(checkpoint_dir / sharded_tensor.key, "r")
 
     if not sharded_tensor.allow_shape_mismatch and sharded_tensor.global_shape != arr.shape:
         _msg = (
-            f'Global shape mismatch for loaded ({arr.shape})'
-            f' and expected ({sharded_tensor.global_shape}) tensor'
-            f' for key {sharded_tensor.key}'
+            f"Global shape mismatch for loaded ({arr.shape})"
+            f" and expected ({sharded_tensor.global_shape}) tensor"
+            f" for key {sharded_tensor.key}"
         )
         raise CheckpointingException(_msg)
 
@@ -225,20 +239,20 @@ def _open_zarr_array_verbose(path: Path, mode: str, **open_kwargs):
         return zarr.open(str(path), mode, **open_kwargs)
     except zarr.errors.PathNotFoundError as e:
         ckpt_dir = path.parent
-        err_msg = f'Array {path} not found'
+        err_msg = f"Array {path} not found"
         if ckpt_dir.exists():
             ckpt_files = [f.name for f in ckpt_dir.iterdir()]
-            logger.debug(f'{err_msg}. Checkpoint directory {ckpt_dir} content: {ckpt_files}')
+            logger.debug(f"{err_msg}. Checkpoint directory {ckpt_dir} content: {ckpt_files}")
         else:
-            err_msg += f'. Checkpoint directory {ckpt_dir} does not exist.'
+            err_msg += f". Checkpoint directory {ckpt_dir} does not exist."
         raise CheckpointingException(err_msg) from e
 
 
 def postprocess_numpy_array(loaded_array, sharded_tensor, apply_flattened_range=True):
     """Turn numpy array to torch tensor."""
     x = loaded_array
-    if HAS_BFLOAT16 and x.dtype == np.dtype('bfloat16'):
-        x = x.astype(np.dtype('float32'))
+    if HAS_BFLOAT16 and x.dtype == np.dtype("bfloat16"):
+        x = x.astype(np.dtype("float32"))
         x = torch.from_numpy(x)
         x = x.bfloat16()
     else:
@@ -249,9 +263,9 @@ def postprocess_numpy_array(loaded_array, sharded_tensor, apply_flattened_range=
             x = pad_to_expected_shape(x, sharded_tensor)
         else:
             _msg = (
-                f'Local shape mismatch for loaded ({x.shape})'
-                f' and expected ({sharded_tensor.local_shape}) tensor'
-                f' for key {sharded_tensor.key}'
+                f"Local shape mismatch for loaded ({x.shape})"
+                f" and expected ({sharded_tensor.local_shape}) tensor"
+                f" for key {sharded_tensor.key}"
             )
             raise CheckpointingException(_msg)
 
@@ -281,24 +295,24 @@ def pad_to_expected_shape(x: torch.Tensor, expected_sharded_ten: ShardedTensor):
             pad_args.extend((0, 0))
         elif x_sh > exp_sh:
             assert False, (
-                f'Expected shape ({exp_sh}) smaller than actual ({x_sh})'
-                f' for {repr(expected_sharded_ten)}'
+                f"Expected shape ({exp_sh}) smaller than actual ({x_sh})"
+                f" for {repr(expected_sharded_ten)}"
             )
         else:
             pad_args.extend((0, exp_sh - x_sh))
     # TODO: behavior control with envvar is for testing purposes only, remove it
-    if not int(os.environ.get('DIST_CKPT_PAD_REPLICATE', 0)):
+    if not int(os.environ.get("DIST_CKPT_PAD_REPLICATE", 0)):
         return torch.nn.functional.pad(x, pad_args)
 
     # unsqueeze and squeeze to get shapes supported by cudnn
-    print(f'Replicating last row for {expected_sharded_ten.key}')
+    print(f"Replicating last row for {expected_sharded_ten.key}")
     if x.dtype == torch.bfloat16:
         return (
-            torch.nn.functional.pad(x.float().unsqueeze(0), pad_args, mode='replicate')
+            torch.nn.functional.pad(x.float().unsqueeze(0), pad_args, mode="replicate")
             .squeeze(0)
             .bfloat16()
         )
-    return torch.nn.functional.pad(x.unsqueeze(0), pad_args, mode='replicate').squeeze(0)
+    return torch.nn.functional.pad(x.unsqueeze(0), pad_args, mode="replicate").squeeze(0)
 
 
 def load_zarr_based_sharded_metadata(
@@ -311,9 +325,10 @@ def load_zarr_based_sharded_metadata(
         get_shape_dtype_fn (str -> ((int, ...), np.dtype)): a function returning
             an array shape and dtype for a given Zarr array path
     """
+
     sharded_state_dict = {}
     for subdir in checkpoint_dir.iterdir():
-        if not subdir.is_dir() or not (subdir / '.zarray').exists():
+        if not subdir.is_dir() or not (subdir / ".zarray").exists():
             continue
         key = subdir.name
         arr_shape, arr_dtype = get_shape_dtype_fn(str(subdir))
