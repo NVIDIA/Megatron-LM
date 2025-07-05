@@ -1564,7 +1564,8 @@ except ImportError:
     get_cpu_offload_context = None  # type: ignore[assignment, misc]
 
 try:
-    if is_te_min_version("2.3.0.dev0"):
+
+    if is_te_min_version("2.3.0"):
         from transformer_engine.pytorch.attention.rope import apply_rotary_pos_emb
     else:
         from transformer_engine.pytorch.attention import apply_rotary_pos_emb
@@ -1580,14 +1581,13 @@ try:
             warnings.warn(
                 "transpose_output_memory is not supported by TE's fused RoPE and will be ignored."
             )
-        if is_te_min_version("2.3.0.dev0"):
+        if is_te_min_version("2.3.0"):
             return apply_rotary_pos_emb(
                 t, freqs, tensor_format="sbhd", interleaved=interleaved, fused=True
             )
         else:
             if interleaved:
-                raise ValueError("Only TE >= 2.3.0.dev0 supports interleaved fused RoPE.")
-
+                raise ValueError("Only TE >= 2.3.0 supports interleaved fused RoPE.")
             if is_te_min_version("1.4.0.dev0"):
                 return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
             else:
