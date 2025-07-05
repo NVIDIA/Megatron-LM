@@ -5,7 +5,6 @@ from typing import Dict, List, Literal, Tuple
 
 import torch
 import torch.distributed as dist
-import einops
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
@@ -101,9 +100,9 @@ class BridgeCommunicator:
                                    self.dest_grid.rank_offset + self.dest_grid.size))
         # Create DP process group for current rank
         if self.current_rank in src_all_ranks:
-            self.dp_pg = self.src_grid.create_pg(["dp"])
+            self.dp_pg = self.src_grid.create_pg([x for x in self.src_grid.dim_names if x != "dp"])
         else:
-            self.dp_pg = self.dest_grid.create_pg(["dp"])
+            self.dp_pg = self.dest_grid.create_pg([x for x in self.dest_grid.dim_names if x != "dp"])
         # Combine all ranks from both grids
         all_ranks = src_all_ranks + dest_all_ranks
         
@@ -280,7 +279,6 @@ class BridgeCommunicator:
         non_dp_dims = [dim for dim in grid.dim_names if dim != "dp"]
         
         if not non_dp_dims:
-            # Pure data parallelism - concatenate along batch
             return gathered_tensors[0]
         
         # Create rank enumeration for non-DP dimensions
