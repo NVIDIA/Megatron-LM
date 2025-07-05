@@ -54,9 +54,13 @@ class TestBridgeCommunicator:
 
         grid1 = create_hypercomm_grid(offset=0, dp=2, tp=2, cp=1)
         grid2 = create_hypercomm_grid(offset=4, dp=2, tp=2, cp=1)
+        if dist.get_rank() < 4:
+            source_grid = grid1
+        else:
+            source_grid = grid2
         bridge_communicator = BridgeCommunicator(grid1, grid2)
         tp_cp_group_ranks = dist.get_process_group_ranks(bridge_communicator.dp_pg)
         device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu')
         gathered_tensors = [torch.randn(3, 128, 256, device=device) for _ in range(len(tp_cp_group_ranks))]
-        aggregated_tensor = bridge_communicator._reconstruct_tensor_from_gathered(gathered_tensors, grid1)
+        aggregated_tensor = bridge_communicator._reconstruct_tensor_from_gathered(gathered_tensors, source_grid)
         assert aggregated_tensor.shape == (3, 128, 512), f"Expected aggregated tensor shape (3, 128, 512), got {aggregated_tensor.shape}"
