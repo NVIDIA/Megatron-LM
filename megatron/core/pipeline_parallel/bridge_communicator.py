@@ -197,7 +197,7 @@ class BridgeCommunicator:
                                                                       self.src_grid.rank_offset + self.src_grid.size) else self.dest_grid
             
             # Reconstruct tensor properly handling TP/CP dimensions
-            aggregated_tensor = self._reconstruct_tensor_from_gathered(gathered_tensors, dp_group_ranks, current_grid)
+            aggregated_tensor = self._reconstruct_tensor_from_gathered(gathered_tensors, current_grid)
             
             # Send splits to destination ranks
             num_sends = len(rank_info.sends)
@@ -270,7 +270,6 @@ class BridgeCommunicator:
         pass
 
     def _reconstruct_tensor_from_gathered(self, gathered_tensors: List[torch.Tensor], 
-                                         dp_group_ranks: List[int], 
                                          grid: HyperCommGrid) -> torch.Tensor:
         """
         Reconstruct tensor using the grid's native rank enumeration logic.
@@ -283,7 +282,7 @@ class BridgeCommunicator:
         
         # Create rank enumeration for non-DP dimensions
         rank_enum = grid._gen_rank_enum(non_dp_dims)
-        
+        dp_group_ranks = dist.get_process_group_ranks(self.dp_pg)
         # Find which enumeration group our DP group belongs to
         dp_group_set = set(dp_group_ranks)
         matching_enum_group = None
