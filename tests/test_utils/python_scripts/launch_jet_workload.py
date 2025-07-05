@@ -271,7 +271,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
         or "double free or corruption" in concat_allranks_logs
         or "Call to CUDA function failed." in concat_allranks_logs
-        or "CUDA error: initialization error" in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
     )
 
 

@@ -98,6 +98,7 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
+  --exit-interval: 200
 METRICS:
   - "iteration-time"
   - "lm loss"
