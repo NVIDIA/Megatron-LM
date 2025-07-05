@@ -11,11 +11,17 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 HAVE_APEX_OR_TE = True
+USING_TE_OPTIMIZER = False
+USING_APEX_OPTIMIZER = False
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+
+    USING_TE_OPTIMIZER = True
 except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
+
+        USING_APEX_OPTIMIZER = True
     except ImportError:
         from torch.optim import AdamW as Adam
 
@@ -38,7 +44,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
+from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
@@ -623,6 +629,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert len(steps) == 1, f"steps: {optimizer.state}"
                     step = steps[0]
                     break
+        elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
+            # Extract 'step', for TE FusedAdam support.
+            steps = list(
+                set(
+                    [
+                        g["step"]
+                        for g in inner_state_dict["param_groups"]
+                        if len(g["params"]) > 0 and "step" in g
+                    ]
+                )
+            )
+            assert len(steps) <= 1, f"steps: {steps}"
+            step = steps[0] if len(steps) == 1 else None
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
@@ -631,7 +650,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if not HAVE_APEX_OR_TE:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
-            elif isinstance(self.optimizer, HybridDeviceOptimizer) and step is not None:
+            elif (
+                USING_TE_OPTIMIZER
+                or USING_APEX_OPTIMIZER
+                or isinstance(self.optimizer, HybridDeviceOptimizer)
+            ) and step is not None:
+                # TE FusedAdam will not accumulate step for empty param groups, so we need to
+                # align the step across param groups.
                 param_group["step"] = int(step)
 
         # Grad scaler state.
@@ -692,11 +717,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   contains an integer ordering of parameters within each group, and
         #   the ordering of parameters within its flattened parameter state
         #   list.
+        def make_needed_groups(param_group):
+            needed_groups = []
+            for key in param_group_identifier_keys:
+                # NeMo changes these variable names from `lr_mult` and `wd_mult`
+                # to `pre_lr_mult` and `pre_wd_mult`, so we need to check both.
+                if key in param_group:
+                    pass
+                elif f"pre_{key}" in param_group:
+                    key = f"pre_{key}"
+                else:
+                    raise ValueError(
+                        f"Key {key} (or pre_{key}) not found in param_group {param_group}."
+                    )
+                needed_groups.append(param_group[key])
+            needed_groups = tuple(needed_groups)
+            return needed_groups
+
+        param_groups_map = {}
+        for param_group in state_dict["optimizer"]["param_groups"]:
+            needed_groups = make_needed_groups(param_group)
+            param_groups_map[needed_groups] = param_group
         inner_state_dict = self.optimizer.state_dict()
-        state_dict_param_groups = [
-            {**group, "params": list(inner_state_dict["param_groups"][idx]["params"])}
-            for idx, group in enumerate(state_dict["optimizer"]["param_groups"])
-        ]
+        state_dict_param_groups = []
+        for inner_param_group in inner_state_dict["param_groups"]:
+            needed_groups = make_needed_groups(inner_param_group)
+            state_dict_param_groups.append(
+                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+            )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
