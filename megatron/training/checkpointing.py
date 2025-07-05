@@ -1426,19 +1426,27 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
+    def load_model_state_dict(module, state_dict, strict: bool):
+        """Helper function to load state dict with fallback for missing extra states."""
+        try:
+            module.load_state_dict(state_dict, strict=strict)
+        except Exception as e:
+            if strict:
+                # Fallback support for backward compatibility breaking changes in TransformerEngine
+                load_return = module.load_state_dict(state_dict, strict=False)
+                print(f"load_return: {load_return}")
     # Model.
     strict = False if args.retro_add_retriever else strict
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
-            ddp_model[0].load_state_dict(state_dict['model'], strict=strict)
+            load_model_state_dict(ddp_model[0], state_dict['model'], strict)
         else:
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.
                 # It means that this is an empty stage.
                 if 'model%d' % i not in state_dict:
                     continue
-                ddp_model[i].load_state_dict(state_dict['model%d' % i], strict=strict)
-
+                load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
