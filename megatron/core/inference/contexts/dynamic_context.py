@@ -5,7 +5,6 @@ import warnings
 from typing import Optional, Tuple
 
 import torch
-from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
@@ -17,33 +16,40 @@ from megatron.core.utils import divide as core_divide
 from .base_context import BaseInferenceContext
 from .dynamic_chunk_allocator import ChunkAllocator
 
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except:
+    HAVE_PACKAGING = False
+
 
 class ContextOverflowError(Exception):
-    '''Base exception for when a new request would not fit.'''
+    """Base exception for when a new request would not fit."""
 
     pass
 
 
 class RequestOverflowError(ContextOverflowError):
-    '''Adding request would overflow max request count.'''
+    """Adding request would overflow max request count."""
 
     pass
 
 
 class TokenOverflowError(ContextOverflowError):
-    '''Adding request would overflow max token count.'''
+    """Adding request would overflow max token count."""
 
     pass
 
 
 class MaxSequenceLengthOverflowError(ContextOverflowError):
-    '''Adding request would overflow max sequence length.'''
+    """Adding request would overflow max sequence length."""
 
     pass
 
 
 class ChunkOverflowError(ContextOverflowError):
-    '''Adding request would overflow available memory chunks.'''
+    """Adding request would overflow available memory chunks."""
 
     pass
 
@@ -118,7 +124,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
     ):
-
         super().__init__(materialize_only_last_token_logits=True)
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
@@ -307,6 +312,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     @classmethod
     def round_up_tokens(cls, value):
         """Round up to nearest multiple of `TOKEN_ROUNDER` (above)."""
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "`packaging` is required for this functionality, please install it with `pip install packaging`"
+            )
         if PkgVersion(mcore_version) < PkgVersion("0.13"):
             return cls.round_up(value)
         return cls.TOKEN_ROUNDER * int(math.ceil(int(value) / cls.TOKEN_ROUNDER))
@@ -314,6 +323,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     @classmethod
     def round_up_requests(cls, value):
         """Round up to nearest multiple of `REQUEST_ROUNDER` (above)."""
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "`packaging` is required for this functionality, please install it with `pip install packaging`"
+            )
         if PkgVersion(mcore_version) < PkgVersion("0.13"):
             return cls.round_up(value)
         return cls.REQUEST_ROUNDER * int(math.ceil(int(value) / cls.REQUEST_ROUNDER))
@@ -981,7 +994,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.paused_request_count : (self.paused_request_count + resume_request_count)
                 ]
                 == 0
-            ), 'The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. '
+            ), "The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. "
 
             chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
             row_idx = torch.arange(

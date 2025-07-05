@@ -57,8 +57,9 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 def _get_layer_norm(config: AttentionConfig | MLPConfig, use_te: bool, normalization: str):
@@ -151,13 +152,13 @@ def _get_sharded_state_dict_keys_map(block_config: TransformerBlockConfig, use_t
     mapping = {}
     if not use_te:
         if block_config.attention.num_query_groups is not None:
-            mapping.update({'input_layernorm.': 'self_attention.linear_qkv.layer_norm_'})
+            mapping.update({"input_layernorm.": "self_attention.linear_qkv.layer_norm_"})
         if block_config.attention.replace_with_linear:
-            mapping.update({'input_layernorm.': 'self_attention.layer_norm_'})
+            mapping.update({"input_layernorm.": "self_attention.layer_norm_"})
         if block_config.mlp.ffn_hidden_size is not None:
-            mapping.update({'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_'})
+            mapping.update({"pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_"})
         if block_config.mlp.replace_with_linear:
-            mapping.update({'pre_mlp_layernorm.': 'mlp.layer_norm_'})
+            mapping.update({"pre_mlp_layernorm.": "mlp.layer_norm_"})
     return mapping
 
 

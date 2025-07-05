@@ -6,7 +6,6 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from packaging.version import Version as PkgVersion
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -21,6 +20,13 @@ from ..utils import (
     is_torch_min_version,
     scaled_init_method_normal,
 )
+
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
 
 
 @dataclass
@@ -495,7 +501,7 @@ class TransformerConfig(ModelParallelConfig):
     the expert capacity length, effective only after the moe_expert_capacity_factor is set. The
     default setting is False."""
 
-    moe_token_drop_policy: str = 'probs'
+    moe_token_drop_policy: str = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
     the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
     be dropped.
@@ -630,7 +636,7 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         if self.fp16 and self.bf16:
             raise ValueError(
-                f'Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True.'
+                f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
             )
 
         # Apply BF16 matmul precision setting if needed
@@ -696,10 +702,10 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError('num_moe_experts must be non None to use expert-parallel.')
+            raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
-            raise ValueError('num_moe_experts must be non-negative.')
+            raise ValueError("num_moe_experts must be non-negative.")
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
@@ -723,15 +729,15 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
-                    f'moe_shared_expert_intermediate_size must be '
-                    f'num_shared_experts * ffn_size_of_each_shared_expert, '
-                    f'but got {self.moe_shared_expert_intermediate_size}'
+                    f"moe_shared_expert_intermediate_size must be "
+                    f"num_shared_experts * ffn_size_of_each_shared_expert, "
+                    f"but got {self.moe_shared_expert_intermediate_size}"
                 )
             if self.moe_shared_expert_overlap and self.moe_token_dispatcher_type not in [
                 "alltoall"
             ]:
                 raise ValueError(
-                    f'moe_shared_expert_overlap only works with alltoall token dispatcher.'
+                    f"moe_shared_expert_overlap only works with alltoall token dispatcher."
                 )
 
         if self.moe_expert_capacity_factor is not None:
@@ -739,81 +745,81 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_expert_capacity_factor = None
             if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
                 raise ValueError(
-                    'moe_expert_capacity_factor only works with aux_loss or none load balancing'
+                    "moe_expert_capacity_factor only works with aux_loss or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:
             if self.moe_expert_capacity_factor is None:
                 raise ValueError(
-                    'moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity'
+                    "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
 
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
         ):
             raise ValueError(
-                f'CPU offloading can be done only for layers less than {self.num_layers}'
+                f"CPU offloading can be done only for layers less than {self.num_layers}"
             )
 
         if self.cpu_offloading and self.pipeline_model_parallel_size > 1:
             raise ValueError(
-                'Currently there is no support for Pipeline parallelism with CPU offloading'
+                "Currently there is no support for Pipeline parallelism with CPU offloading"
             )
 
         if self.cpu_offloading and self.recompute_granularity is not None:
             raise ValueError(
-                'CPU offloading does not work when activation recomputation is enabled'
+                "CPU offloading does not work when activation recomputation is enabled"
             )
 
         if self.recompute_granularity is not None:
-            if self.recompute_granularity not in ['full', 'selective']:
+            if self.recompute_granularity not in ["full", "selective"]:
                 raise ValueError(
                     f'When using recompute_granuarlity: {self.recompute_granularity} must be "full"'
                     'or "selective".'
                 )
 
             if self.recompute_method is not None:
-                if self.recompute_method not in ['block', 'uniform']:
+                if self.recompute_method not in ["block", "uniform"]:
                     raise ValueError(
                         f'recompute_method: {self.recompute_method} must be "block" or "uniform".'
                     )
-            elif self.recompute_granularity != 'selective':
+            elif self.recompute_granularity != "selective":
                 raise ValueError(
-                    f'Using recompute_granularity: {self.recompute_granularity} so '
+                    f"Using recompute_granularity: {self.recompute_granularity} so "
                     'recompute_method must be "block" or "uniform"'
                 )
 
-            if self.recompute_granularity != 'selective' and self.recompute_num_layers is None:
+            if self.recompute_granularity != "selective" and self.recompute_num_layers is None:
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} '
-                    'recompute_num_layers must be between '
-                    '1 and num_layers_per_pipeline_rank: '
-                    f'{self.num_layers // self.pipeline_model_parallel_size}'
+                    f"When using recompute_granularity: {self.recompute_granularity} "
+                    "recompute_num_layers must be between "
+                    "1 and num_layers_per_pipeline_rank: "
+                    f"{self.num_layers // self.pipeline_model_parallel_size}"
                 )
             elif (
-                self.recompute_granularity == 'selective' and self.recompute_num_layers is not None
+                self.recompute_granularity == "selective" and self.recompute_num_layers is not None
             ):
                 raise ValueError(
-                    f'When using recompute_granularity: {self.recompute_granularity} '
-                    'recompute_num_layers must be None.'
+                    f"When using recompute_granularity: {self.recompute_granularity} "
+                    "recompute_num_layers must be None."
                 )
 
             if self.distribute_saved_activations and self.sequence_parallel:
                 raise ValueError(
-                    f'distribute_saved_activations: {self.distribute_saved_activations} must be '
-                    f'false when sequence parallel is enabled: {self.sequence_parallel}'
+                    f"distribute_saved_activations: {self.distribute_saved_activations} must be "
+                    f"false when sequence parallel is enabled: {self.sequence_parallel}"
                 )
 
         if self.recompute_modules is None:
-            self.recompute_modules = ['core_attn']
+            self.recompute_modules = ["core_attn"]
 
-        if self.recompute_granularity == 'selective':
+        if self.recompute_granularity == "selective":
             if len(self.recompute_modules) > 0:
                 allowed_modules = {"core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe"}
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
-                    f'Invalid choices for recompute_modules: {invalid_modules}. '
-                    f'Allowed modules are: {allowed_modules}'
+                    f"Invalid choices for recompute_modules: {invalid_modules}. "
+                    f"Allowed modules are: {allowed_modules}"
                 )
 
             if "moe_act" in self.recompute_modules and not self.moe_grouped_gemm:
@@ -844,11 +850,11 @@ class TransformerConfig(ModelParallelConfig):
                 "--moe-layer-recompute is deprecated. "
                 "Use --recompute-granularity selective --recompute-modules moe_layer instead."
             )
-            if self.recompute_granularity == 'full':
+            if self.recompute_granularity == "full":
                 raise ValueError(
                     "Do not set --moe-layer-recompute with full recompute granularity. "
                 )
-            self.recompute_granularity = 'selective'
+            self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
@@ -859,9 +865,9 @@ class TransformerConfig(ModelParallelConfig):
             self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
         ):
             raise ValueError(
-                'num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage cannot be'
-                'set at the same time with account_for_embedding_in_pipeline_split'
-                'and account_for_loss_in_pipeline_split'
+                "num_layers_in_first_pipeline_stage and num_layers_in_last_pipeline_stage cannot be"
+                "set at the same time with account_for_embedding_in_pipeline_split"
+                "and account_for_loss_in_pipeline_split"
             )
 
         # PP layout
@@ -925,7 +931,7 @@ class TransformerConfig(ModelParallelConfig):
 
             if self.num_layers_in_first_pipeline_stage is not None:
                 if self.num_layers_in_first_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_first_pipeline_stage must be larger than 0')
+                    raise ValueError("num_layers_in_first_pipeline_stage must be larger than 0")
 
                 if self.virtual_pipeline_model_parallel_size is not None:
                     if (
@@ -934,17 +940,17 @@ class TransformerConfig(ModelParallelConfig):
                         != 0
                     ):
                         raise ValueError(
-                            f'number of layers at first stage: '
-                            f'{self.num_layers_in_first_pipeline_stage}'
-                            f'must be divisible by virtual pipeline'
-                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                            f"number of layers at first stage: "
+                            f"{self.num_layers_in_first_pipeline_stage}"
+                            f"must be divisible by virtual pipeline"
+                            f"parallel degree {self.virtual_pipeline_model_parallel_size}"
                         )
                 num_layers -= self.num_layers_in_first_pipeline_stage
                 pipeline_parallel_size -= 1
 
             if self.num_layers_in_last_pipeline_stage is not None:
                 if self.num_layers_in_last_pipeline_stage <= 0:
-                    raise ValueError('num_layers_in_last_pipeline_stage must be larger than 0')
+                    raise ValueError("num_layers_in_last_pipeline_stage must be larger than 0")
 
                 if self.virtual_pipeline_model_parallel_size is not None:
                     if (
@@ -953,10 +959,10 @@ class TransformerConfig(ModelParallelConfig):
                         != 0
                     ):
                         raise ValueError(
-                            f'number of layers at last stage: '
-                            f'{self.num_layers_in_last_pipeline_stage}'
-                            f'must be divisible by virtual pipeline'
-                            f'parallel degree {self.virtual_pipeline_model_parallel_size}'
+                            f"number of layers at last stage: "
+                            f"{self.num_layers_in_last_pipeline_stage}"
+                            f"must be divisible by virtual pipeline"
+                            f"parallel degree {self.virtual_pipeline_model_parallel_size}"
                         )
                 num_layers -= self.num_layers_in_last_pipeline_stage
                 pipeline_parallel_size -= 1
@@ -965,8 +971,8 @@ class TransformerConfig(ModelParallelConfig):
             # PP stages, check number of layers at middle stage is divisible by middle PP size.
             if pipeline_parallel_size and not num_layers % pipeline_parallel_size == 0:
                 raise ValueError(
-                    f'number of layers at middle stage: {num_layers} must be divisible by'
-                    f'the middle pipeline model parallel size {pipeline_parallel_size}'
+                    f"number of layers at middle stage: {num_layers} must be divisible by"
+                    f"the middle pipeline model parallel size {pipeline_parallel_size}"
                 )
 
             # If there are middle PP stages, check number of layers
@@ -979,9 +985,9 @@ class TransformerConfig(ModelParallelConfig):
                     == 0
                 ):
                     raise ValueError(
-                        f'number of layers on each middle pipeline rank:'
-                        f'{num_layers_per_middle_pipeline_rank} must be divisible by virtual'
-                        f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
+                        f"number of layers on each middle pipeline rank:"
+                        f"{num_layers_per_middle_pipeline_rank} must be divisible by virtual"
+                        f"pipeline parallel degree {self.virtual_pipeline_model_parallel_size}"
                     )
 
         elif (
@@ -998,8 +1004,8 @@ class TransformerConfig(ModelParallelConfig):
 
                 if not num_layers % self.pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'number of middle layers: {num_layers} must be divisible by '
-                        f'middle pipeline_model_parallel_size {self.pipeline_model_parallel_size}'
+                        f"number of middle layers: {num_layers} must be divisible by "
+                        f"middle pipeline_model_parallel_size {self.pipeline_model_parallel_size}"
                     )
             else:
                 num_layers = self.num_layers
@@ -1011,11 +1017,11 @@ class TransformerConfig(ModelParallelConfig):
 
                 if not num_layers % self.pipeline_model_parallel_size == 0:
                     raise ValueError(
-                        f'num_layers: {num_layers} after enable'
-                        f'account_for_embedding_in_pipeline_split or '
-                        f'account_for_loss_in_pipeline_split must be divisible'
-                        f'by pipeline_model_parallel_size '
-                        f'{self.pipeline_model_parallel_size}'
+                        f"num_layers: {num_layers} after enable"
+                        f"account_for_embedding_in_pipeline_split or "
+                        f"account_for_loss_in_pipeline_split must be divisible"
+                        f"by pipeline_model_parallel_size "
+                        f"{self.pipeline_model_parallel_size}"
                     )
 
                 num_layers_per_pipeline_rank = num_layers // self.pipeline_model_parallel_size
@@ -1024,11 +1030,11 @@ class TransformerConfig(ModelParallelConfig):
                     == 0
                 ):
                     raise ValueError(
-                        f'number of layers on each pipeline rank: {num_layers_per_pipeline_rank}'
-                        f'(after enable account_for_embedding_in_pipeline_split or '
-                        f'account_for_loss_in_pipeline_split) must be divisible by'
-                        f'virtual_pipeline_model_parallel_size'
-                        f'{self.virtual_pipeline_model_parallel_size}'
+                        f"number of layers on each pipeline rank: {num_layers_per_pipeline_rank}"
+                        f"(after enable account_for_embedding_in_pipeline_split or "
+                        f"account_for_loss_in_pipeline_split) must be divisible by"
+                        f"virtual_pipeline_model_parallel_size"
+                        f"{self.virtual_pipeline_model_parallel_size}"
                     )
 
         if self.apply_query_key_layer_scaling:
@@ -1126,9 +1132,9 @@ class TransformerConfig(ModelParallelConfig):
 
         if (
             self.moe_router_topk == 1
-            and self.moe_router_score_function == 'softmax'
+            and self.moe_router_score_function == "softmax"
             and not self.moe_router_pre_softmax
-            and self.moe_router_load_balancing_type != 'sinkhorn'
+            and self.moe_router_load_balancing_type != "sinkhorn"
         ):
             # Requires applying softmax before selecting the top-k when k is 1,
             # since softmax on a [num_tokens, 1] would yield a zero gradient.
@@ -1167,7 +1173,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.recompute_granularity:
                 raise ValueError("CUDA graphs not supported with activation recomputation.")
 
-        if self.moe_token_dispatcher_type in ['allgather']:
+        if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
@@ -1218,13 +1224,17 @@ class TransformerConfig(ModelParallelConfig):
                 "Consider enabling moe_router_dtype for better numerical stability."
             )
         if self.symmetric_ar_type is not None:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
             assert is_torch_min_version("2.7.0a0"), "Must have at least torch version 2.7 or higher"
             assert is_te_min_version("2.3.0") or get_te_version() == PkgVersion(
                 "2.3.0.dev0+39c0e70"
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
 
         if self.no_rope_freq:
-            assert not self.flash_decode, 'flash_decode cannot be used with no_rope.'
+            assert not self.flash_decode, "flash_decode cannot be used with no_rope."
             if isinstance(self.no_rope_freq, int):
                 assert self.num_layers % self.no_rope_freq == 0, (
                     f"no_rope_freq={self.no_rope_freq} should be "

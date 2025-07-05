@@ -355,7 +355,6 @@ class MaskedWordPieceDataset(MegatronDataset):
         numpy_random_state.shuffle(candidate_ngrams)
 
         if self.config.masking_do_permutation:
-
             n_swappings = n_maskings
 
             permuted_indices = set()
@@ -417,7 +416,7 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         masked_spans = sorted(masked_spans, key=lambda x: x[0][0])
 
-        return masked_token_ids, masked_positions, masked_labels, boundaries, masked_spans
+        return (masked_token_ids, masked_positions, masked_labels, boundaries, masked_spans)
 
     @abstractmethod
     def _get_token_mask(self, numpy_random_state: numpy.random.RandomState) -> Optional[int]:

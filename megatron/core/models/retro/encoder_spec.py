@@ -46,6 +46,7 @@ except ImportError:
 
     warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 def get_retro_encoder_layer_te_spec() -> ModuleSpec:

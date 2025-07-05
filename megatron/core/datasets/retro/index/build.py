@@ -13,14 +13,12 @@ import shutil
 
 import numpy as np
 import torch
-from tqdm import tqdm
 
 from megatron.core.datasets.retro.config import RetroPreprocessingConfig
 from megatron.core.datasets.retro.db.utils import (
     get_merged_sampled_dataset,
     get_merged_train_dataset,
 )
-from megatron.core.datasets.retro.external_libs import h5py
 from megatron.core.datasets.retro.utils import GPTToTextDataset
 
 from .factory import IndexFactory
@@ -30,6 +28,20 @@ from .utils import (
     get_training_data_merged_path,
     get_training_data_root_dir,
 )
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
 
 ##################################################
 # Train index.
@@ -63,6 +75,11 @@ def get_block_nload(block_path: str, load_fraction: float) -> int:
     Returns:
         Number of block samples to load.
     """
+    if not HAVE_H5PY:
+        raise ImportError(
+            "h5py is required to use the merge_embedding_blocks function. Please install h5py."
+        )
+
     with h5py.File(block_path) as fi:
         return int(load_fraction * fi["data"].shape[0])
 
@@ -77,6 +94,16 @@ def merge_embedding_blocks(config: RetroPreprocessingConfig) -> None:
     Args:
         config (RetroPreprocessingConfig): Retro preprocessing config.
     """
+
+    if not HAVE_TQDM:
+        raise ImportError(
+            "tqdm is required to use the merge_embedding_blocks function. Please install tqdm."
+        )
+
+    if not HAVE_H5PY:
+        raise ImportError(
+            "h5py is required to use the merge_embedding_blocks function. Please install h5py."
+        )
 
     if torch.distributed.get_rank() != 0:
         return
@@ -102,7 +129,6 @@ def merge_embedding_blocks(config: RetroPreprocessingConfig) -> None:
             )
         ):
             with h5py.File(block_path) as fi:
-
                 nload = get_block_nload(block_path, load_fraction)
                 block = np.array(fi["data"][:nload], copy=False)
 
@@ -189,7 +215,6 @@ def _train_index(config: RetroPreprocessingConfig) -> None:
 
     # Check if trained index already exists.
     if not os.path.isfile(get_empty_index_path(config)):
-
         # Embed training chunks.
         embed_training_chunks(config)
 
@@ -237,7 +262,8 @@ def get_text_dataset_for_adding(config: RetroPreprocessingConfig) -> GPTToTextDa
         config (RetroPreprocessingConfig): Retro preprocessing config.
 
     Returns:
-        The text dataset that consists of tokens converted from the 'train' chunk database. These are the chunks used for retrieval by the pretraining 'train' dataset.
+        The text dataset that consists of tokens converted from the 'train' chunk database.
+        These are the chunks used for retrieval by the pretraining 'train' dataset.
     """
     gpt_dataset = get_merged_train_dataset(
         project_dir=config.retro_project_dir,

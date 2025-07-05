@@ -229,6 +229,11 @@ pre:check_status_of_main:
   extends: [.pre_rules]
   image: python:3.10
   timeout: 7 days
+  variables:
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 32Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 8
+    KUBERNETES_SERVICE_CPU_LIMIT: 12
   tags:
     - arch/amd64
     - env/prod

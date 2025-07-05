@@ -60,8 +60,9 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 def get_gpt_layer_with_transformer_engine_spec(
@@ -96,7 +97,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_with_transformer_engine_spec" has been deprecated'
-            ' and will be removed soon. Please update your code accordingly.'
+            " and will be removed soon. Please update your code accordingly."
         )
 
     if use_kitchen:
@@ -177,12 +178,12 @@ def get_gpt_layer_with_transformer_engine_spec(
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map={
-                    'mlp.0.weight': 'mlp.linear_fc1.layer_norm_weight',
-                    'mlp.0.bias': 'mlp.linear_fc1.layer_norm_bias',
-                    'mlp.1.basic_ops.0.weight': 'mlp.linear_fc1.weight',
-                    'mlp.1.basic_ops.1.bias': 'mlp.linear_fc1.bias',
-                    'mlp.3.basic_ops.0.weight': 'mlp.linear_fc2.weight',
-                    'mlp.3.basic_ops.1.bias': 'mlp.linear_fc2.bias',
+                    "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                    "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+                    "mlp.1.basic_ops.0.weight": "mlp.linear_fc1.weight",
+                    "mlp.1.basic_ops.1.bias": "mlp.linear_fc1.bias",
+                    "mlp.3.basic_ops.0.weight": "mlp.linear_fc2.weight",
+                    "mlp.3.basic_ops.1.bias": "mlp.linear_fc2.bias",
                 },
             ),
         )
@@ -231,7 +232,7 @@ def get_gpt_layer_local_spec(
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "get_gpt_layer_local_spec" has been deprecated'
-            ' and will be removed soon. Please update your code accordingly.'
+            " and will be removed soon. Please update your code accordingly."
         )
 
     mlp = get_mlp_module_spec_for_backend(
@@ -293,8 +294,8 @@ def get_gpt_layer_local_spec(
                 mlp=mlp,
                 mlp_bda=get_bias_dropout_add,
                 sharded_state_dict_keys_map={
-                    'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
-                    'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
+                    "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+                    "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
                 },
             ),
         )
@@ -333,16 +334,16 @@ def get_mlp_module_spec(
     if fp8 is not None:
         warnings.warn(
             'The fp8 argument in "_get_mlp_module_spec" has been deprecated'
-            ' and will be removed soon. Please update your code accordingly.'
+            " and will be removed soon. Please update your code accordingly."
         )
     if use_te_op_fuser:
         if not is_te_min_version("1.13.0"):
             raise ValueError(
-                'Transformer Engine operation-based API requires Transformer Engine 1.13+'
+                "Transformer Engine operation-based API requires Transformer Engine 1.13+"
             )
         if num_experts is not None:
             raise ValueError(
-                'Transformer Engine operation-based API does not support mixture-of-experts'
+                "Transformer Engine operation-based API does not support mixture-of-experts"
             )
 
     return get_mlp_module_spec_for_backend(
