@@ -60,6 +60,7 @@ class T5InferenceWrapper(AbstractModelInferenceWrapper):
         Returns:
             A dict with all the inference input needed for the batch.
         """
+
         # get max_sequence_length
         max_sequence_length = get_attr_wrapped_model(self.model, "max_sequence_length")
 

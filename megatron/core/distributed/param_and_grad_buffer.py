@@ -25,11 +25,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
@@ -296,7 +299,7 @@ class _ParamAndGradBucketGroup:
         """
         assert (
             self.grad_reduce_handle is None
-        ), 'Should not have multiple communication calls outstanding at once'
+        ), "Should not have multiple communication calls outstanding at once"
 
         if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
             self.check_grads(
@@ -371,12 +374,14 @@ class _ParamAndGradBucketGroup:
             self.ddp_config.use_distributed_optimizer
             and self.ddp_config.num_distributed_optimizer_instances > 1
         ):
-
             assert self.inter_distributed_optimizer_instance_group is not None
             # Create a new coalescing manager for the inter-instance all-reduce.
-            with stream_context, _coalescing_manager(
-                self.inter_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
+            with (
+                stream_context,
+                _coalescing_manager(
+                    self.inter_distributed_optimizer_instance_group, async_ops=async_op
+                ) as cm,
+            ):
                 for bucket in self.buckets:
                     local_data_view = shard_buffer(
                         bucket.grad_data, self.intra_distributed_optimizer_instance_size
@@ -419,8 +424,8 @@ class _ParamAndGradBucketGroup:
             torch.cuda.default_stream().wait_stream(self.communication_stream)
             return
         assert self.grad_reduce_handle is not None, (
-            f'Communication call has not been issued for this bucket '
-            f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
+            f"Communication call has not been issued for this bucket "
+            f"({len(self.params_with_grad)}/{len(self.params)} params have grad available)"
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
@@ -435,10 +440,10 @@ class _ParamAndGradBucketGroup:
         """
         assert (
             self.ddp_config.overlap_grad_reduce
-        ), 'register_grad_ready() should only be called when overlap_grad_reduce is True'
+        ), "register_grad_ready() should only be called when overlap_grad_reduce is True"
         if self.is_last_microbatch:
-            assert param in self.param_to_bucket, 'Param is not in the bucket group'
-            assert param not in self.params_with_grad, 'Cannot set grad twice'
+            assert param in self.param_to_bucket, "Param is not in the bucket group"
+            assert param not in self.params_with_grad, "Cannot set grad twice"
             self.params_with_grad.add(param)
             # If all params in bucket group have grads available, issue communication call.
             if len(self.params_with_grad) == len(self.params):
@@ -729,19 +734,19 @@ class _ParamAndGradBuffer:
         # Log buckets for all PP stages.
         log_strs = []
         log_strs.append(
-            f'Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}'
+            f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
         )
         for index, bucket in enumerate(self.buckets):
             numel = 0
             for param in bucket.params:
                 numel += param.data.nelement()
             log_strs.append(
-                f"Params for bucket {index+1} ({numel} elements, "
+                f"Params for bucket {index + 1} ({numel} elements, "
                 f"{bucket.grad_data.nelement()} padded size):"
             )
             for param in bucket.params:
-                log_strs.append(f'\t{param_to_name[param]}')
-        log_on_each_pipeline_stage(logger, logging.INFO, '\n'.join(log_strs))
+                log_strs.append(f"\t{param_to_name[param]}")
+        log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
@@ -753,7 +758,7 @@ class _ParamAndGradBuffer:
         `start_index`.
         """
         end_index = start_index + shape.numel()
-        assert end_index <= self.numel, 'Requested tensor is out of buffer range'
+        assert end_index <= self.numel, "Requested tensor is out of buffer range"
         if buffer_type == BufferType.PARAM:
             assert self.param_data is not None
             buffer_tensor = self.param_data[start_index:end_index]

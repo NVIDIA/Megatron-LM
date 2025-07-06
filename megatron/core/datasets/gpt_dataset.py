@@ -19,6 +19,7 @@ from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
+
 _PAD_TOKEN_ID = -1
 
 
@@ -356,7 +357,6 @@ class GPTDataset(MegatronDataset):
             not cache_hit
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)
         ):
-
             log_single_rank(
                 logger,
                 logging.INFO,
@@ -494,7 +494,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the document index from {os.path.basename(path_to_document_index)}",
         )
         t_beg = time.time()
-        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode='r')
+        document_index = numpy.load(path_to_document_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -504,7 +504,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the sample index from {os.path.basename(path_to_sample_index)}",
         )
         t_beg = time.time()
-        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode='r')
+        sample_index = numpy.load(path_to_sample_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -514,7 +514,7 @@ class GPTDataset(MegatronDataset):
             f"\tLoad the shuffle index from {os.path.basename(path_to_shuffle_index)}",
         )
         t_beg = time.time()
-        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode='r')
+        shuffle_index = numpy.load(path_to_shuffle_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -575,6 +575,7 @@ def _build_document_index(
     Returns:
         numpy.ndarray: The document index
     """
+
     if not separate_final_epoch or num_epochs == 1:
         document_index = numpy.mgrid[0:num_epochs, 0 : len(documents)][1]
         document_index[:] = documents
@@ -604,6 +605,7 @@ def _build_shuffle_index(
     Returns:
         numpy.ndarray: The shuffle index
     """
+
     dtype_ = numpy.uint32
     if total_size >= (numpy.iinfo(numpy.uint32).max - 1):
         dtype_ = numpy.int64

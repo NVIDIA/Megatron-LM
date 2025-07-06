@@ -6,7 +6,6 @@ from collections import OrderedDict
 from typing import AsyncGenerator, Dict, List, Optional, Union
 
 import torch
-from tqdm import tqdm
 
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
@@ -16,6 +15,16 @@ from megatron.core.inference.scheduler import Scheduler
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    tqdm = MagicMock()
+    HAVE_TQDM = False
 
 
 class StaticInferenceEngine(AbstractEngine):
@@ -196,6 +205,13 @@ class StaticInferenceEngine(AbstractEngine):
                 to enable dynamic batching. Mainly used with an inference server.
                 Defaults to False.
         """
+
+        if not HAVE_TQDM:
+            raise ImportError(
+                "tqdm is required for StaticInferenceEngine, "
+                "please install it with `pip install tqdm`"
+            )
+
         prev_num_requests_pending = self.scheduler.num_requests_pending()
         tbar = tqdm(desc="static requests", total=prev_num_requests_pending)
         while self.scheduler.have_requests_pending():

@@ -14,23 +14,24 @@ separately. The following high-level checks are supported:
       `--no-retro-index-delete-added-codes` must be used.)
 """
 
-import typing
-
 import numpy as np
 import torch
 from torch.utils.data import Subset
 
 from megatron.core.datasets.retro.config import RetroPreprocessingConfig
-from megatron.core.datasets.retro.external_libs import h5py
-from megatron.core.datasets.retro.utils import (
-    GPTToTextDataset,
-    get_blocks_by_rank,
-    log_retro_rank_0,
-)
+from megatron.core.datasets.retro.utils import get_blocks_by_rank, log_retro_rank_0
 
 from .build import get_text_dataset_for_adding, get_text_dataset_for_training
 from .factory import IndexFactory
 from .utils import get_added_codes_dir, get_training_data_block_dir
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
+
 
 ##################################################
 # Validate trained index.
@@ -49,6 +50,12 @@ def validate_training_embeddings(config: RetroPreprocessingConfig) -> None:
         config (RetroPreprocessingConfig): Retro preprocessing config.
     """
 
+    if not HAVE_H5PY:
+        raise ImportError(
+            "h5py is required to use the validate_training_embeddings function. "
+            "Please install h5py."
+        )
+
     # Training text dataset.
     text_dataset = get_text_dataset_for_training(config)
 
@@ -66,11 +73,9 @@ def validate_training_embeddings(config: RetroPreprocessingConfig) -> None:
     # Embed & validate blocks.
     embedder = config.retro_bert_embedders.mem
     for block_idx, block in enumerate(blocks.existing):
-
         # Missing block lists are extended with None to have equal-length
         # lists. Skip the Nones.
         if block is not None:
-
             # Progress. (*note*: move world progress to here.)
             log_retro_rank_0(
                 "embed training block %d / %d ... %s."
@@ -142,9 +147,7 @@ def validate_added_encodings(config: RetroPreprocessingConfig) -> None:
     # Encode and validate blocks.
     embedder = config.retro_bert_embedders.mem
     for block_idx, block in enumerate(blocks.existing):
-
         if block is not None:
-
             # Progress.
             log_retro_rank_0(
                 "encode block %d / %d ... %s." % (block_idx, len(blocks.existing), block["path"])
