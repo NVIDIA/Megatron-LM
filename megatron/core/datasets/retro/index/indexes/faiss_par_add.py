@@ -13,12 +13,9 @@ import shutil
 from typing import Tuple
 
 import numpy as np
-import psutil
 import torch
-from tqdm import tqdm
 
 from megatron.core.datasets.retro.config import Embedder, RetroPreprocessingConfig
-from megatron.core.datasets.retro.external_libs import faiss, h5py
 from megatron.core.datasets.retro.index.utils import get_added_code_paths, get_added_codes_dir
 from megatron.core.datasets.retro.utils import (
     GPTToTextDataset,
@@ -28,6 +25,34 @@ from megatron.core.datasets.retro.utils import (
 )
 
 from .faiss_base import FaissBaseIndex
+
+try:
+    import psutil
+
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
+
+try:
+    import faiss
+
+    HAVE_FAISS = True
+except ImportError:
+    HAVE_FAISS = False
 
 
 class FaissParallelAddIndex(FaissBaseIndex):
@@ -39,7 +64,7 @@ class FaissParallelAddIndex(FaissBaseIndex):
     """
 
     def encode_block(
-        self, index: faiss.Index, embedder: Embedder, text_dataset: GPTToTextDataset, block: dict
+        self, index: "faiss.Index", embedder: Embedder, text_dataset: GPTToTextDataset, block: dict
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Encode sub-dataset block, to be later added to index.
 
@@ -72,7 +97,9 @@ class FaissParallelAddIndex(FaissBaseIndex):
 
         Args:
             config (RetroPreprocessingConfig): Retro preprocessing config.
-            block (dict): Range information specifying the start/end indices within the encoded text dataset. Here, the 'path' item is used for writing the encodings to storage.
+            block (dict): Range information specifying the start/end indices within
+                the encoded text dataset. Here, the 'path' item is used for writing
+                the encodings to storage.
             codes (np.ndarray): Block of encodings to be saved to storage.
         """
         # Save neighbors.
@@ -113,9 +140,7 @@ class FaissParallelAddIndex(FaissBaseIndex):
 
         # Encode each block.
         for block_index, block in enumerate(blocks.missing):
-
             if block is not None:
-
                 # Progress.
                 log_retro_rank_0(
                     "encode block %d / %d ... %s."
@@ -136,6 +161,26 @@ class FaissParallelAddIndex(FaissBaseIndex):
         Args:
             config (RetroPreprocessingConfig): Retro preprocessing config.
         """
+
+        if not HAVE_PSUTIL:
+            raise ImportError(
+                "psutil is required to use the FaissParallelAddIndex class. Please install psutil."
+            )
+
+        if not HAVE_TQDM:
+            raise ImportError(
+                "tqdm is required to use the FaissParallelAddIndex class. Please install tqdm."
+            )
+
+        if not HAVE_FAISS:
+            raise ImportError(
+                "faiss is required to use the FaissParallelAddIndex class. Please install faiss."
+            )
+
+        if not HAVE_H5PY:
+            raise ImportError(
+                "h5py is required to use the FaissParallelAddIndex class. Please install h5py."
+            )
 
         if torch.distributed.get_rank() != 0:
             return
@@ -159,7 +204,6 @@ class FaissParallelAddIndex(FaissBaseIndex):
                 % (psutil.virtual_memory()[3] / 1024**3, psutil.virtual_memory()[2])
             )
             with h5py.File(code_path) as f:
-
                 nload = int(config.retro_index_add_load_fraction * f["data"].shape[0])
                 offset = int(os.path.basename(code_path).split("-")[0])
                 xids = np.arange(offset, offset + nload)
@@ -192,7 +236,8 @@ class FaissParallelAddIndex(FaissBaseIndex):
 
         Args:
             config (RetroPreprocessingConfig): Retro preprocessing config.
-            text_dataset (GPTToTextDataset): Text dataset that will be embedded and added to the index.
+            text_dataset (GPTToTextDataset): Text dataset that will be embedded
+                and added to the index.
         """
 
         # Encode chunks.

@@ -5,9 +5,7 @@ from dataclasses import dataclass, fields
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
-import nvidia_kitchen
 import torch
-from nvidia_kitchen.config import QLinearParams, get_qlinear_params_from_qat_params
 
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -32,6 +30,18 @@ from megatron.core.utils import get_tensor_model_parallel_group_if_none
 
 # Parsing constant
 _KITCHEN_CONFIG_TYPE_KEY = "kitchen_config_type"
+try:
+    import nvidia_kitchen
+    from nvidia_kitchen.config import QLinearParams, get_qlinear_params_from_qat_params
+
+    HAVE_KITCHEN = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    HAVE_KITCHEN = False
+    nvidia_kitchen = MagicMock()
+    QLinearParams = MagicMock()
+    get_qlinear_params_from_qat_params = MagicMock()
 
 
 class KitchenConfigType(Enum):
@@ -49,7 +59,7 @@ class QLinearParamsConfigSchema:
     recipe_idx: int
 
     @classmethod
-    def parse_config_dict(cls, config_dict: Dict[Any, Any]) -> 'QLinearParamsConfigSchema':
+    def parse_config_dict(cls, config_dict: Dict[Any, Any]) -> "QLinearParamsConfigSchema":
         """
         Parse config dictionary and return a schema instance.
 
@@ -120,6 +130,12 @@ class KitchenQuantizationParams:
     @staticmethod
     def parse_from_config(quant_config: QuantizationConfig) -> "KitchenQuantizationParams":
         """Parses quantization config for a layer or throw an error."""
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
+
         assert (
             quant_config is not None
         ), "Kitchen extension expects a quantization config for linear layers."
@@ -189,6 +205,11 @@ class KitchenLinear(nvidia_kitchen.Linear):
         is_expert: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
         self.config = config
 
         # Kitchen returns a zero length Tensor when bias=False and
@@ -200,7 +221,7 @@ class KitchenLinear(nvidia_kitchen.Linear):
         self.is_first_microbatch = True
         self.disable_parameter_transpose_cache = self.config.disable_parameter_transpose_cache
         if skip_weight_param_allocation:
-            raise ValueError('Kitchen linear layers do not support skip_weight_param_allocation')
+            raise ValueError("Kitchen linear layers do not support skip_weight_param_allocation")
 
         # Save params for finish_init
         self.stashed_input_size = input_size
@@ -302,14 +323,14 @@ class KitchenLinear(nvidia_kitchen.Linear):
         for param in self.parameters():
             if is_expert:
                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, 'allreduce', not self.expert_parallel)
+                setattr(param, "allreduce", not self.expert_parallel)
             else:
                 # Reduce the gradient on DP group
-                setattr(param, 'allreduce', True)
+                setattr(param, "allreduce", True)
                 if parallel_mode == "duplicated":
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
-                    setattr(param, 'sequence_parallel', self.config.sequence_parallel)
+                    setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
         del self.stashed_input_size
         del self.stashed_output_size
@@ -338,7 +359,7 @@ class KitchenLinear(nvidia_kitchen.Linear):
             return out
         return out, None
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Replicate cross TP/DP."""
 
         # Provide the dist-ckpt support when KitchenLinear is directly used
@@ -346,7 +367,7 @@ class KitchenLinear(nvidia_kitchen.Linear):
         assert (
             self.parallel_mode is None
         ), "KitchenLinear sharded_state_dict can only be used with duplicated parallel mode"
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
 
 
@@ -372,8 +393,14 @@ class KitchenColumnParallelLinear(KitchenLinear):
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
+
         if gather_output:
-            raise ValueError('Kitchen linear layers do not support gather_output = True')
+            raise ValueError("Kitchen linear layers do not support gather_output = True")
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         world_size = tp_group.size()
         rank = tp_group.rank()
@@ -396,11 +423,11 @@ class KitchenColumnParallelLinear(KitchenLinear):
         if config.use_cpu_initialization:
             raise ValueError("Kitchen extension doesn't support use_cpu_initialization.")
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
         )
 
     def __repr__(self):
@@ -431,6 +458,12 @@ class KitchenRowParallelLinear(KitchenLinear):
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
+
         if not input_is_parallel:
             raise ValueError("Kitchen linear layers do not support input_is_parallel = False")
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
@@ -453,11 +486,11 @@ class KitchenRowParallelLinear(KitchenLinear):
         if config.use_cpu_initialization:
             raise ValueError("Kitchen extension does not support use_cpu_initialization.")
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 1}, sharded_offsets
+            state_dict, prefix, {"weight": 1}, sharded_offsets
         )
 
     def __repr__(self):
@@ -492,6 +525,11 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
 
         self.config = config
 
@@ -578,7 +616,7 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
         )
 
         for param in self.parameters():
-            setattr(param, 'allreduce', not (is_expert and self.expert_parallel))
+            setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
         def merge_extra_states(
             self,
@@ -608,8 +646,8 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
                 return
             state_list = [state_dict.pop(f"{prefix}_extra_state")] + state_list
             state_list = [self._decode_extra_state(state) for state in state_list]
-            extra_fp8_variables = state_list[0]['extra_fp8_variables']
-            extra_fp8_variables['num_gemms'] = self.num_gemms
+            extra_fp8_variables = state_list[0]["extra_fp8_variables"]
+            extra_fp8_variables["num_gemms"] = self.num_gemms
             extra_state = {"extra_fp8_variables": extra_fp8_variables}
             state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
@@ -665,28 +703,28 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
         return [state] * self.num_gemms
 
     def _sharded_state_dict_grouped(
-        self, tp_axis_map, prefix='', sharded_offsets=(), metadata=None
+        self, tp_axis_map, prefix="", sharded_offsets=(), metadata=None
     ):
         """
         prefix should be module_name to make keys identical to sequetial ones.
         """
         assert self.init_finished
         sharded_state_dict = {}
-        full_state_dict = self.state_dict(prefix='', keep_vars=True)
+        full_state_dict = self.state_dict(prefix="", keep_vars=True)
         num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
         local_expert_indices_offset = get_expert_model_parallel_rank() * self.num_gemms
         ep_axis = len(sharded_offsets)
-        extra_states = self._split_extra_state(full_state_dict['_extra_state'])
+        extra_states = self._split_extra_state(full_state_dict["_extra_state"])
         for gemm_idx in range(self.num_gemms):
             state_dict = {
-                f'{gemm_idx}.weight': full_state_dict[f'weight{gemm_idx}'],
-                f'{gemm_idx}._extra_state': extra_states[gemm_idx],
+                f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
+                f"{gemm_idx}._extra_state": extra_states[gemm_idx],
             }
             if self.use_bias:
-                state_dict[f'{gemm_idx}.bias'] = full_state_dict[f'bias{gemm_idx}']
+                state_dict[f"{gemm_idx}.bias"] = full_state_dict[f"bias{gemm_idx}"]
             sub_sd = make_sharded_tensors_for_checkpoint(
                 state_dict,
-                '',
+                "",
                 tp_axis_map,
                 (
                     *sharded_offsets,
@@ -694,23 +732,23 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
                 ),
             )
             # Remove expert layers indexing from sharded keys
-            replace_prefix_for_sharding(sub_sd, f'{gemm_idx}.', prefix)
+            replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", prefix)
             sharded_state_dict.update(
                 {
-                    f'{prefix}weight{gemm_idx}': sub_sd[f'{gemm_idx}.weight'],
-                    f'{prefix}_extra_state{"" if gemm_idx == 0 else gemm_idx}': sub_sd[
-                        f'{gemm_idx}._extra_state'
+                    f"{prefix}weight{gemm_idx}": sub_sd[f"{gemm_idx}.weight"],
+                    f"{prefix}_extra_state{'' if gemm_idx == 0 else gemm_idx}": sub_sd[
+                        f"{gemm_idx}._extra_state"
                     ],
                 }
             )
             if self.use_bias:
-                sharded_state_dict[f'{prefix}bias{gemm_idx}'] = sub_sd[f'{gemm_idx}.bias']
+                sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
         # Adjust replica ids - replication along DP modulo EP
         for k, sh_ten in sharded_state_dict.items():
             replica_id = sh_ten.replica_id
             assert (
                 len(replica_id) == 3
-            ), f'Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}'
+            ), f"Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}"
             if getattr(sh_ten, "is_data_parallel_fully_shard", False):
                 edp_replica_id = 0
             else:
@@ -740,6 +778,12 @@ class KitchenColumnParallelGroupedLinear(KitchenGroupedLinear):
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
+
         super().__init__(
             num_gemms=num_gemms,
             input_size=input_size,
@@ -755,14 +799,14 @@ class KitchenColumnParallelGroupedLinear(KitchenGroupedLinear):
             tp_group=tp_group,
         )
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """
         For each gemm, sharding along axis 0, bias sharded.
         Assume sharded_offsets[-1] is the expert parallel offset.
         """
         tp_axis_map = {}
         for gemm_idx in range(self.num_gemms):
-            tp_axis_map.update({f'{gemm_idx}.weight': 0, f'{gemm_idx}.bias': 0})
+            tp_axis_map.update({f"{gemm_idx}.weight": 0, f"{gemm_idx}.bias": 0})
         return super()._sharded_state_dict_grouped(tp_axis_map, prefix, sharded_offsets, metadata)
 
 
@@ -787,6 +831,12 @@ class KitchenRowParallelGroupedLinear(KitchenGroupedLinear):
         layer_number: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
+
         super().__init__(
             num_gemms=num_gemms,
             input_size=input_size,
@@ -802,12 +852,12 @@ class KitchenRowParallelGroupedLinear(KitchenGroupedLinear):
             tp_group=tp_group,
         )
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """
         For each gemm, sharding along axis 1, bias not sharded.
         Assume sharded_offsets[-1] is the expert parallel offset.
         """
-        tp_axis_map = {f'{gemm_idx}.weight': 1 for gemm_idx in range(self.num_gemms)}
+        tp_axis_map = {f"{gemm_idx}.weight": 1 for gemm_idx in range(self.num_gemms)}
         return super()._sharded_state_dict_grouped(tp_axis_map, prefix, sharded_offsets, metadata)
 
 
@@ -833,16 +883,22 @@ class KitchenLayerNormColumnParallelLinear(nvidia_kitchen.LayerNormLinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
+
         self.config = config
 
         if gather_output:
-            raise ValueError('Kitchen linear layers do not support gather_output = True')
+            raise ValueError("Kitchen linear layers do not support gather_output = True")
 
         if is_expert:
-            raise ValueError('Kitchen linear layers do not yet support MoE')
+            raise ValueError("Kitchen linear layers do not yet support MoE")
 
         if skip_weight_param_allocation:
-            raise ValueError('Kitchen linear layers do not support skip_weight_param_allocation')
+            raise ValueError("Kitchen linear layers do not support skip_weight_param_allocation")
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         # Kitchen returns a zero length Tensor when bias=False and
@@ -950,12 +1006,12 @@ class KitchenLayerNormColumnParallelLinear(nvidia_kitchen.LayerNormLinear):
             return out
         return out, None
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
         assert self.init_finished
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
         )
 
     def __repr__(self):
@@ -969,6 +1025,12 @@ class KitchenSpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
     def __init__(self, fallback: BackendSpecProvider):
+        if not HAVE_KITCHEN:
+            raise ImportError(
+                "Kitchen extension requires the nvidia_kitchen package. "
+                "Please install it with `pip install nvidia-kitchen`."
+            )
+
         self.fallback = fallback
 
     def column_parallel_linear(self) -> type:
@@ -1016,8 +1078,8 @@ class KitchenSpecProvider(BackendSpecProvider):
             )
         elif moe_use_grouped_gemm:
             warnings.warn(
-                'The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. '
-                'Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP.'
+                "The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. "
+                "Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP."
             )
             return GroupedMLP, None
         else:

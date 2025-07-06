@@ -694,6 +694,7 @@ wheels = [
 name = "megatron-core"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy" },
     { name = "torch", marker = "sys_platform == 'never' or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
 ]
 
@@ -701,7 +702,6 @@ dependencies = [
 dev = [
     { name = "einops" },
     { name = "multi-storage-client" },
-    { name = "numpy" },
     { name = "nvtx" },
     { name = "setuptools" },
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-dev') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
@@ -711,7 +711,6 @@ dev = [
 ]
 lts = [
     { name = "einops" },
-    { name = "numpy" },
     { name = "nvtx" },
     { name = "setuptools" },
     { name = "tensorstore", version = "0.1.74", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.13' and extra == 'extra-13-megatron-core-lts') or (extra == 'extra-13-megatron-core-dev' and extra == 'extra-13-megatron-core-lts')" },
@@ -754,8 +753,7 @@ requires-dist = [
     { name = "einops", marker = "extra == 'lts'" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
     { name = "multi-storage-client", marker = "extra == 'dev'" },
-    { name = "numpy", marker = "extra == 'dev'", specifier = "<2.0.0" },
-    { name = "numpy", marker = "extra == 'lts'", specifier = "<2.0.0" },
+    { name = "numpy", specifier = "<2.0.0" },
     { name = "nvtx", marker = "extra == 'dev'" },
     { name = "nvtx", marker = "extra == 'lts'" },
     { name = "sentencepiece", marker = "extra == 'mlm'" },

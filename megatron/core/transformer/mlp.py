@@ -100,7 +100,7 @@ class MLP(MegatronModule):
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
             is_expert=is_expert,
-            tp_comm_buffer_name='fc1',
+            tp_comm_buffer_name="fc1",
             tp_group=tp_group,
         )
 
@@ -116,7 +116,7 @@ class MLP(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
+            tp_comm_buffer_name="fc2",
             tp_group=tp_group,
         )
 
@@ -191,14 +191,14 @@ class MLP(MegatronModule):
 
     # pylint: disable=missing-function-docstring
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
-            if self.config.gated_linear_unit and name == 'linear_fc1':
+            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+            if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
-                    if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
+                    if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
                         sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict

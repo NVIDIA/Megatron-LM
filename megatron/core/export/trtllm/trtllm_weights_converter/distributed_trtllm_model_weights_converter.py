@@ -3,7 +3,6 @@
 from typing import Optional
 
 import torch
-from tqdm import tqdm
 
 from megatron.core import parallel_state
 from megatron.core.export.data_type import DataType
@@ -12,6 +11,13 @@ from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_pre
 from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
 from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
 
 
 def str_dtype_to_torch(dtype: DataType):
@@ -75,11 +81,11 @@ class DistributedTRTLLMModelWeightsConverter:
 
     def _add_to_trtllm_model_weights(self, val: torch.Tensor, layer_name: str):
         assert torch.is_tensor(val), f"Expected a tensor for {layer_name} but got {type(val)}"
-        scale_key = '.'.join(layer_name.split('.')[:-1]) + '.weights_scaling_factor'
+        scale_key = ".".join(layer_name.split(".")[:-1]) + ".weights_scaling_factor"
         storage = self.storage_type
         if scale_key in self.scales and layer_name.endswith("weight"):
             storage = torch.float8_e4m3fn
-            val = val * self.scales[scale_key]['weight_multiplier'].to(val.device)
+            val = val * self.scales[scale_key]["weight_multiplier"].to(val.device)
 
         val = val.to(storage)
         val = val.detach().contiguous()
@@ -119,7 +125,7 @@ class DistributedTRTLLMModelWeightsConverter:
             if (
                 self.transformer_config.layernorm_zero_centered_gamma
                 and self.transformer_config.normalization == "LayerNorm"
-                and 'layernorm.weight' in layer_name
+                and "layernorm.weight" in layer_name
             ):
                 val = val + 1.0
 
@@ -274,6 +280,11 @@ class DistributedTRTLLMModelWeightsConverter:
                     model_state_dict[layer_name] = model_state_dict[layer_name] + 1.0
             self._convert_non_transformer_layer(
                 model_state_dict=model_state_dict, layer_name=layer_name
+            )
+
+        if not HAVE_TQDM:
+            raise ImportError(
+                "tqdm is required for DistributedTRTLLMModelWeightsConverter, please install it with `pip install tqdm`"
             )
 
         for layer_name, value in tqdm(

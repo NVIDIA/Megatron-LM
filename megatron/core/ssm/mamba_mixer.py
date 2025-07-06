@@ -48,13 +48,20 @@ try:
         mamba_chunk_scan_combined,
         mamba_split_conv1d_scan_combined,
     )
+
+    HAVE_MAMBA_SSM = True
 except ImportError:
-    raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
+    from unittest.mock import MagicMock
+
+    RMSNormGated = MagicMock()
+    HAVE_MAMBA_SSM = False
 
 try:
     from einops import rearrange, repeat
+
+    HAVE_EINOPS = True
 except ImportError:
-    raise ImportError("einops is required by the Mamba model but cannot be imported")
+    HAVE_EINOPS = False
 
 
 logger = logging.getLogger(__name__)
@@ -65,11 +72,11 @@ class ExtendedRMSNorm(RMSNormGated):
     RMSNormGated with sharded state dict.
     """
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0}, sharded_offsets
         )
 
 
@@ -142,6 +149,14 @@ class MambaMixer(MegatronModule):
         ngroups=None,
         model_comm_pgs: ModelCommProcessGroups = None,
     ):
+        if not HAVE_MAMBA_SSM:
+            raise ImportError(
+                "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
+            )
+
+        if not HAVE_EINOPS:
+            raise ImportError("einops is required by the Mamba model but cannot be imported")
+
         super().__init__(config)
         self.config = config
         self.d_model = d_model
@@ -238,7 +253,7 @@ class MambaMixer(MegatronModule):
             bias=bias,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name='fc1',
+            tp_comm_buffer_name="fc1",
             tp_group=self.model_comm_pgs.tp,
         )
 
@@ -266,8 +281,8 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
-            setattr(self.conv1d.weight, 'tensor_model_parallel', True)
-            setattr(self.conv1d.bias, 'tensor_model_parallel', True)
+            setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.bias, "tensor_model_parallel", True)
 
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
@@ -296,7 +311,7 @@ class MambaMixer(MegatronModule):
             # put wd on dt_bias because of the check
             # name.endswith("bias") in param_grouping.py
             self.dt_bias._no_weight_decay = True
-            setattr(self.dt_bias, 'tensor_model_parallel', True)
+            setattr(self.dt_bias, "tensor_model_parallel", True)
 
             # A parameter
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
@@ -306,7 +321,7 @@ class MambaMixer(MegatronModule):
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
             self.A_log._no_weight_decay = True
-            setattr(self.A_log, 'tensor_model_parallel', True)
+            setattr(self.A_log, "tensor_model_parallel", True)
 
         # D "skip" parameter
         self.D = nn.Parameter(
@@ -316,7 +331,7 @@ class MambaMixer(MegatronModule):
             )
         )  # Keep in fp32
         self.D._no_weight_decay = True
-        setattr(self.D, 'tensor_model_parallel', True)
+        setattr(self.D, "tensor_model_parallel", True)
 
         if self.rmsnorm:
             assert RMSNormGated is not None
@@ -341,7 +356,7 @@ class MambaMixer(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
-            tp_comm_buffer_name='fc2',
+            tp_comm_buffer_name="fc2",
             tp_group=self.model_comm_pgs.tp,
         )
 
@@ -607,7 +622,7 @@ class MambaMixer(MegatronModule):
                 dt = F.softplus(dt + dt_bias.to(dtype=dt.dtype))
                 dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
 
-                dB_x = torch.einsum('bd,bdn,bd->bdn', dt, B, x)
+                dB_x = torch.einsum("bd,bdn,bd->bdn", dt, B, x)
                 ssm_state.copy_(
                     ssm_state * rearrange(dA, "b (h p) n -> b h p n", p=self.headdim)
                     + rearrange(dB_x, "b (h p) n -> b h p n", p=self.headdim)
@@ -726,33 +741,33 @@ class MambaMixer(MegatronModule):
                 ssm_state.zero_()
         return conv_state, ssm_state
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         sharded_state_dict = {}
         # Parameters
-        self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
             tensor_parallel_layers_axis_map={
-                'A_log': 0,
-                'dt_bias': 0,
-                'D': 0,
+                "A_log": 0,
+                "dt_bias": 0,
+                "D": 0,
             },  # parameters sharded across TP
             sharded_offsets=sharded_offsets,
         )
         # Submodules
         for name, module in self.named_children():
-            if name == 'conv1d':
+            if name == "conv1d":
                 # Add TP sharding for Conv1d
-                module_sd = module.state_dict(prefix='', keep_vars=True)
+                module_sd = module.state_dict(prefix="", keep_vars=True)
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd, f'{prefix}{name}.', {f'weight': 0, f'bias': 0}, sharded_offsets
+                    module_sd, f"{prefix}{name}.", {f"weight": 0, f"bias": 0}, sharded_offsets
                 )
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f'{prefix}{name}.', sharded_offsets, metadata
+                    module, f"{prefix}{name}.", sharded_offsets, metadata
                 )
 
             sharded_state_dict.update(module_sharded_sd)
@@ -764,13 +779,13 @@ class MambaMixer(MegatronModule):
             + 2 * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp
         )
-        assert sharded_state_dict[f'{prefix}in_proj.weight'].data.size(0) == in_proj_dim, (
+        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
             in_proj_dim,
-            sharded_state_dict[f'{prefix}in_proj.weight'],
+            sharded_state_dict[f"{prefix}in_proj.weight"],
         )
 
-        sharded_state_dict[f'{prefix}in_proj.weight'] = _split_tensor_factory(
-            sharded_state_dict[f'{prefix}in_proj.weight'],
+        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+            sharded_state_dict[f"{prefix}in_proj.weight"],
             [
                 self.d_inner_local_tp,
                 self.d_inner_local_tp,
@@ -778,29 +793,29 @@ class MambaMixer(MegatronModule):
                 self.ngroups_local_tp * self.d_state,
                 self.nheads_local_tp,
             ],
-            ['z', 'x', 'B', 'C', 'dt'],
+            ["z", "x", "B", "C", "dt"],
             0,
         )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
-        assert sharded_state_dict[f'{prefix}conv1d.weight'].data.size(0) == conv_dim, (
+        assert sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == conv_dim, (
             conv_dim,
-            sharded_state_dict[f'{prefix}conv1d.weight'],
+            sharded_state_dict[f"{prefix}conv1d.weight"],
         )
-        assert sharded_state_dict[f'{prefix}conv1d.bias'].data.size(0) == conv_dim, (
+        assert sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == conv_dim, (
             conv_dim,
-            sharded_state_dict[f'{prefix}conv1d.bias'],
+            sharded_state_dict[f"{prefix}conv1d.bias"],
         )
 
-        for conv_layer_name in ['conv1d.weight', 'conv1d.bias']:
-            sharded_state_dict[f'{prefix}{conv_layer_name}'] = _split_tensor_factory(
-                sharded_state_dict[f'{prefix}{conv_layer_name}'],
+        for conv_layer_name in ["conv1d.weight", "conv1d.bias"]:
+            sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
+                sharded_state_dict[f"{prefix}{conv_layer_name}"],
                 [
                     self.d_inner_local_tp,
                     self.ngroups_local_tp * self.d_state,
                     self.ngroups_local_tp * self.d_state,
                 ],
-                ['x', 'B', 'C'],
+                ["x", "B", "C"],
                 0,
             )
 
@@ -816,14 +831,14 @@ def _split_tensor_factory(
 
     if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
         raise ValueError(
-            f'Split sections must cover the whole dimension size, '
-            f'got {split_sections=} vs dimensions size '
-            f'{orig_sh_ten_no_data.local_shape[split_dim]}'
+            f"Split sections must cover the whole dimension size, "
+            f"got {split_sections=} vs dimensions size "
+            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
         )
 
     assert not isinstance(
         split_sections, int
-    ), 'Splitting into predefined section sizes is supported (`split_sections` must be a list)'
+    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
     assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
 
     @torch.no_grad()
@@ -844,7 +859,7 @@ def _split_tensor_factory(
         for split_size, split_name in zip(split_sections, split_names):
             split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
             for sh_ten in split_chunks:
-                sh_ten.key = f'{sh_ten.key}.{split_name}'
+                sh_ten.key = f"{sh_ten.key}.{split_name}"
             chunk_sh_tens.extend(split_chunks)
             split_start += split_size
 

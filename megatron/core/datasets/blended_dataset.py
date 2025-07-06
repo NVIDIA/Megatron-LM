@@ -103,6 +103,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         Returns:
             Tuple[numpy.ndarray, numpy.ndarray]: The dataset index and the dataset sample index
         """
+
         path_to_cache = self.config.path_to_cache
 
         if path_to_cache:
@@ -192,7 +193,7 @@ class BlendedDataset(torch.utils.data.Dataset):
             logger, logging.INFO, f"\tLoad the dataset index from {path_to_dataset_index}"
         )
         t_beg = time.time()
-        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode='r')
+        dataset_index = numpy.load(path_to_dataset_index, allow_pickle=True, mmap_mode="r")
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")
 
@@ -203,7 +204,7 @@ class BlendedDataset(torch.utils.data.Dataset):
         )
         t_beg = time.time()
         dataset_sample_index = numpy.load(
-            path_to_dataset_sample_index, allow_pickle=True, mmap_mode='r'
+            path_to_dataset_sample_index, allow_pickle=True, mmap_mode="r"
         )
         t_end = time.time()
         log_single_rank(logger, logging.DEBUG, f"\t> time elapsed: {t_end - t_beg:4f} seconds")

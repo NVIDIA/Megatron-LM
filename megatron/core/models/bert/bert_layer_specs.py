@@ -30,11 +30,11 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 def get_bert_layer_with_transformer_engine_spec():
@@ -75,7 +75,7 @@ def get_bert_layer_with_transformer_engine_spec():
 
 
 def __getattr__(name):
-    if name == 'bert_layer_with_transformer_engine_spec':
+    if name == "bert_layer_with_transformer_engine_spec":
         warnings.warn(
             """Attribute bert_layer_specs.bert_layer_with_transformer_engine_spec is on a
             deprecation track and will be removed in future releases. Please migrate to
@@ -109,8 +109,8 @@ bert_layer_local_spec = ModuleSpec(
         ),
         mlp_bda=get_bias_dropout_add,
         sharded_state_dict_keys_map={
-            'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
-            'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
+            "input_layernorm.": "self_attention.linear_qkv.layer_norm_",
+            "pre_mlp_layernorm.": "mlp.linear_fc1.layer_norm_",
         },
     ),
 )
