@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Tuple
+from typing import Dict, List, Literal, Tuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -180,6 +180,8 @@ class BridgeCommunicator:
         rank_info = self.comm_map.get(self.current_rank)
         if not rank_info:
             return
+        
+        self._communicate_shapes(tensor_to_send_next=tensor_to_send)
             
         # Get DP group information
         dp_size = dist.get_world_size(self.dp_pg)
@@ -187,11 +189,7 @@ class BridgeCommunicator:
         if rank_info.role == 'SENDER':
             # Current rank is a sender - gather tensors from all ranks in DP group
             gathered_tensors = [torch.zeros_like(tensor_to_send) for _ in range(dp_size)]
-            dist.gather(tensor_to_send, gather_list=gathered_tensors, dst=self.dp_leader_local_rank, group=self.dp_pg)
-            
-            # Get DP group ranks for tensor reconstruction
-            dp_group_ranks = dist.get_process_group_ranks(self.dp_pg)
-            
+            dist.gather(tensor_to_send, gather_list=gathered_tensors, dst=self.dp_leader_local_rank, group=self.dp_pg)          
             # Determine which grid this rank belongs to
             current_grid = self.src_grid if self.current_rank in range(self.src_grid.rank_offset, 
                                                                       self.src_grid.rank_offset + self.src_grid.size) else self.dest_grid
@@ -214,16 +212,21 @@ class BridgeCommunicator:
         elif rank_info.role == 'NOOP':
             dist.gather(tensor_to_send, gather_list=None, dst=self.dp_leader_local_rank, group=self.dp_pg)
                 
-    def receive_forward(self) -> torch.Tensor:
+    def receive_forward(self, tensor_shape: Optional[Tuple[int, ...]] = None, 
+                       dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """
         Receive forward activation tensor.
         
+        Args:
+            tensor_shape: Expected tensor shape (None if using shape communication)
+            dtype: Expected tensor dtype
+            
         Returns:
             torch.Tensor: The received activation tensor
         """
         pass
 
-    def send_backward(self, grad_tensor: torch.Tensor):
+    def send_backward(self, grad_tensor: torch.Tensor, variable_seq_lengths: bool = False):
         """
         Send backward gradient tensor.
         
@@ -234,35 +237,48 @@ class BridgeCommunicator:
         """
         pass
 
-    def receive_backward(self) -> torch.Tensor:
+    def receive_backward(self, tensor_shape: Optional[Tuple[int, ...]] = None,
+                        dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """
         Receive backward gradient tensor.
         
         Note: Gradient receivers are activation 'SENDERS'
         
-        Returns:
-            torch.Tensor: The received gradient tensor
-        """
-        pass
-
-    def send_forward_recv_backward(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Combined operation: send forward activation and receive backward gradient.
-        
         Args:
-            input_tensor: The tensor to send forward
+            tensor_shape: Expected gradient tensor shape
+            dtype: Expected tensor dtype
             
         Returns:
             torch.Tensor: The received gradient tensor
         """
         pass
 
-    def send_backward_recv_forward(self, grad_tensor: torch.Tensor) -> torch.Tensor:
+    def send_forward_recv_backward(self, input_tensor: torch.Tensor,
+                                  grad_shape: Optional[Tuple[int, ...]] = None,
+                                  dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        """
+        Combined operation: send forward activation and receive backward gradient.
+        
+        Args:
+            input_tensor: The tensor to send forward
+            grad_shape: Expected gradient tensor shape
+            dtype: Expected tensor dtype
+            
+        Returns:
+            torch.Tensor: The received gradient tensor
+        """
+        pass
+
+    def send_backward_recv_forward(self, grad_tensor: torch.Tensor,
+                                  forward_shape: Optional[Tuple[int, ...]] = None,
+                                  dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """
         Combined operation: send backward gradient and receive forward activation.
         
         Args:
             grad_tensor: The gradient tensor to send backward
+            forward_shape: Expected forward tensor shape
+            dtype: Expected tensor dtype
             
         Returns:
             torch.Tensor: The received activation tensor
@@ -339,3 +355,116 @@ class BridgeCommunicator:
                 current_tensors = grouped_tensors
         
         return current_tensors[0] if len(current_tensors) == 1 else torch.cat(current_tensors, dim=0)
+
+    def _communicate_shapes(self, 
+                           tensor_to_send_next: Optional[torch.Tensor] = None,
+                           recv_next: bool = False,
+                           recv_prev: bool = False,
+                           tensor_to_send_prev: Optional[torch.Tensor] = None) -> Tuple[List[Tuple[int, ...]], List[Tuple[int, ...]]]:
+        """
+        Communicate tensor shapes between sender and receiver ranks in the bridge.
+        This is used to communicate tensor shapes before actual tensor communication
+        when dealing with variable sequence lengths or dynamic shapes.
+        
+        Args:
+            tensor_to_send_next: The tensor to send to the next rank (None if not sending)
+            tensor_to_send_prev: The tensor to send to the previous rank (None if not sending)
+            recv_next: Whether to receive from the next rank (None if not receiving)
+            recv_prev: Whether to receive from the previous rank (None if not receiving)
+            
+        Returns:
+            Tuple containing:
+            - List of forward shapes that will be received (empty if not a receiver)
+            - List of gradient shapes that will be received (empty if not expecting gradients)
+        """
+        rank_info = self.comm_map.get(self.current_rank)
+        if not rank_info or rank_info.role == 'NOOP':
+            return [], []
+        
+        recv_forward_shapes = []
+        recv_grad_shapes = []
+        
+        # Collect all P2P operations for batch execution
+        ops = []
+        recv_forward_shape_tensors = []
+        recv_grad_shape_tensors = []
+        
+        if rank_info.role == 'SENDER':
+            # Prepare send operations for forward shapes
+            if tensor_to_send_next is not None:
+                send_shape = tensor_to_send_next.shape
+                send_shape_tensor = torch.tensor(
+                    send_shape, device=torch.cuda.current_device(), dtype=torch.int64
+                )
+                
+                # Add send operations for each destination
+                for send_op in rank_info.sends:
+                    ops.append(torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        send_shape_tensor,
+                        send_op.destination_rank
+                    ))
+                
+                # If expecting gradients back, prepare receive operations
+                if recv_next is not None:
+                    for send_op in rank_info.sends:
+                        grad_shape_tensor = torch.empty(
+                            (3), device=torch.cuda.current_device(), dtype=torch.int64
+                        )
+                        recv_grad_shape_tensors.append(grad_shape_tensor)
+                        ops.append(torch.distributed.P2POp(
+                            torch.distributed.irecv,
+                            grad_shape_tensor,
+                            send_op.destination_rank
+                        ))
+                        
+        elif rank_info.role == 'RECEIVER':
+            # Prepare receive operations for forward shapes
+            if recv_prev is not None:
+                for recv_op in rank_info.receives:
+                    forward_shape_tensor = torch.empty(
+                        (3), device=torch.cuda.current_device(), dtype=torch.int64
+                    )
+                recv_forward_shape_tensors.append(forward_shape_tensor)
+                ops.append(torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    forward_shape_tensor,
+                    recv_op.source_rank
+                ))
+            
+            # If we need to send gradient shapes back, prepare send operations
+            if tensor_to_send_prev is not None:
+                grad_shape = tensor_to_send_prev.shape
+                grad_shape_tensor = torch.tensor(
+                    grad_shape, device=torch.cuda.current_device(), dtype=torch.int64
+                )
+                
+                for recv_op in rank_info.receives:
+                    ops.append(torch.distributed.P2POp(
+                        torch.distributed.isend,
+                        grad_shape_tensor,
+                        recv_op.source_rank
+                    ))
+        
+        # Execute all operations in a single batch
+        if len(ops) > 0:
+            reqs = torch.distributed.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+        
+        # To protect against race condition when using batch_isend_irecv()
+        # Following the pattern from the original p2p communication code
+        torch.cuda.synchronize()
+        
+        # Extract shapes from received tensors
+        if rank_info.role == 'RECEIVER':
+            for forward_shape_tensor in recv_forward_shape_tensors:
+                shape = forward_shape_tensor.tolist()
+                recv_forward_shapes.append(tuple(shape))
+        
+        if rank_info.role == 'SENDER' and tensor_to_send_prev is not None:
+            for grad_shape_tensor in recv_grad_shape_tensors:
+                shape = grad_shape_tensor.tolist()
+                recv_grad_shapes.append(tuple(shape))
+        
+        return recv_forward_shapes, recv_grad_shapes
