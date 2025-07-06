@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Tuple, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -34,9 +34,7 @@ class RankCommInfo:
 
 
 class BridgeCommunicator:
-    """
-    Facilitates communication of activations and gradients between two modules 
-    with its own parallel mapping (TP/DP/PP/CP).
+    """Facilitates communication of activations and gradients between two modules with its own parallel mapping (TP/DP/PP/CP).
     
     The role of BridgeCommunicator:
     - Initializes the communicator between a pair of source and destination grids
@@ -46,8 +44,7 @@ class BridgeCommunicator:
     """
     
     def __init__(self, src_grid: HyperCommGrid, dest_grid: HyperCommGrid):
-        """
-        Initialize the bridge communicator between source and destination grids.
+        """Initialize the bridge communicator between source and destination grids.
         
         Args:
             src_grid: Source HyperCommGrid
@@ -61,9 +58,7 @@ class BridgeCommunicator:
         self.build_comm_schedule()
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
-        """
-        Get the leader rank for a given grid and direction.
-        """
+        """Get the leader rank for a given grid and direction."""
         leader_ranks = []
         dp_groups = grid._gen_rank_enum([x for x in grid.dim_names if x != "dp"])
         if is_src:
@@ -75,8 +70,7 @@ class BridgeCommunicator:
         return leader_ranks
 
     def build_comm_schedule(self):
-        """
-        Get src/dest tp leaders and populate comm_map for each rank.
+        """Get src/dest tp leaders and populate comm_map for each rank.
         
         This method analyzes the source and destination grids to determine
         which ranks need to send/receive data and builds the communication
@@ -170,8 +164,7 @@ class BridgeCommunicator:
                 self.dp_leader_local_rank = local_rank
 
     def send_forward(self, tensor_to_send: torch.Tensor):
-        """
-        Send forward activation tensor.
+        """Send forward activation tensor.
         
         Args:
             tensor_to_send: The tensor to send to the destination grid
@@ -214,8 +207,7 @@ class BridgeCommunicator:
                 
     def receive_forward(self, tensor_shape: Optional[Tuple[int, ...]] = None, 
                        dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """
-        Receive forward activation tensor.
+        """Receive forward activation tensor.
         
         Args:
             tensor_shape: Expected tensor shape (None if using shape communication)
@@ -227,8 +219,7 @@ class BridgeCommunicator:
         pass
 
     def send_backward(self, grad_tensor: torch.Tensor, variable_seq_lengths: bool = False):
-        """
-        Send backward gradient tensor.
+        """Send backward gradient tensor.
         
         Note: Gradient senders are activation 'RECEIVERS'
         
@@ -239,8 +230,7 @@ class BridgeCommunicator:
 
     def receive_backward(self, tensor_shape: Optional[Tuple[int, ...]] = None,
                         dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """
-        Receive backward gradient tensor.
+        """Receive backward gradient tensor.
         
         Note: Gradient receivers are activation 'SENDERS'
         
@@ -256,8 +246,7 @@ class BridgeCommunicator:
     def send_forward_recv_backward(self, input_tensor: torch.Tensor,
                                   grad_shape: Optional[Tuple[int, ...]] = None,
                                   dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """
-        Combined operation: send forward activation and receive backward gradient.
+        """Combined operation: send forward activation and receive backward gradient.
         
         Args:
             input_tensor: The tensor to send forward
@@ -272,8 +261,7 @@ class BridgeCommunicator:
     def send_backward_recv_forward(self, grad_tensor: torch.Tensor,
                                   forward_shape: Optional[Tuple[int, ...]] = None,
                                   dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-        """
-        Combined operation: send backward gradient and receive forward activation.
+        """Combined operation: send backward gradient and receive forward activation.
         
         Args:
             grad_tensor: The gradient tensor to send backward
@@ -287,8 +275,7 @@ class BridgeCommunicator:
 
     def _reconstruct_tensor_from_gathered(self, gathered_tensors: List[torch.Tensor], 
                                          grid: HyperCommGrid) -> torch.Tensor:
-        """
-        Reconstruct tensor using the grid's native rank enumeration logic.
+        """Reconstruct tensor using the grid's native rank enumeration logic.
         """
         # Get all non-DP dimensions that were split
         non_dp_dims = [dim for dim in grid.dim_names if dim != "dp"]
@@ -323,9 +310,7 @@ class BridgeCommunicator:
     def _concatenate_by_grid_dims(self, tensors: List[torch.Tensor], 
                                  grid: HyperCommGrid, 
                                  non_dp_dims: List[str]) -> torch.Tensor:
-        """
-        Concatenate tensors based on grid dimensions using a simpler approach.
-        """
+        """Concatenate tensors based on grid dimensions using a simpler approach."""
         if len(tensors) == 1:
             return tensors[0]
         
@@ -361,8 +346,8 @@ class BridgeCommunicator:
                            recv_next: bool = False,
                            recv_prev: bool = False,
                            tensor_to_send_prev: Optional[torch.Tensor] = None) -> Tuple[List[Tuple[int, ...]], List[Tuple[int, ...]]]:
-        """
-        Communicate tensor shapes between sender and receiver ranks in the bridge.
+        """Communicate tensor shapes between sender and receiver ranks in the bridge.
+        
         This is used to communicate tensor shapes before actual tensor communication
         when dealing with variable sequence lengths or dynamic shapes.
         
