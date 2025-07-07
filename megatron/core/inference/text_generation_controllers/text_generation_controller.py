@@ -314,6 +314,7 @@ class TextGenerationController:
         current_context_end_position: int,
         is_generation_done_tensor: torch.Tensor,
         generated_sequence_lengths: torch.Tensor,
+        termination_id: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Checks which prompts have reached an end condition
 
@@ -339,10 +340,12 @@ class TextGenerationController:
             Tuple[torch.Tensor, torch.Tensor]: Returns the boolean
                 is_generation_done_tensor and the generated_sequence_lengths after updating it
         """
+        if termination_id is None:
+            termination_id = self.tokenizer.eod
         latest_samples = updated_prompts_tokens[:, current_context_end_position]
         # Make sure we are checking eod criterion only for prompts that have started generating
         # (i.e) We only look at the generated tokenns and not the input tokens.
-        reached_eod = (latest_samples == self.tokenizer.eod) & generation_started
+        reached_eod = (latest_samples == termination_id) & generation_started
         is_generation_done_tensor = is_generation_done_tensor | reached_eod
         # We increment generated sequence lengths when that prompt has not hit the
         # EOD and generation has started
@@ -656,6 +659,10 @@ class TextGenerationController:
         # to nearest power of 2
         vocab_size = self.inference_wrapped_model.inference_wrapper_config.padded_vocab_size
 
+        # Check whether early termination is enabled
+        no_early_termination = getattr(sampling_params, "no_early_termination", False)
+        termination_id = -1 if no_early_termination else self.tokenizer.eod
+
         streaming_enabled = active_streams is not None and len(active_streams) > 0
         if streaming_enabled:
             # Start a separate thread for streaming tokens to avoid blocking the
@@ -819,6 +826,7 @@ class TextGenerationController:
                             current_context_end_position=context_end_position,
                             is_generation_done_tensor=is_generation_done_tensor,
                             generated_sequence_lengths=generated_sequence_lengths,
+                            termination_id=termination_id,
                         )
                     )
 

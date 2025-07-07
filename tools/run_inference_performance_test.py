@@ -331,6 +331,7 @@ def main():
         top_n_logprobs=args.top_n_logprobs,
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
+    sampling_params.add_attributes({"no_early_termination": True})
 
     requests = []
     if args.num_input_tokens is not None:
@@ -360,10 +361,10 @@ def main():
 
     if args.enable_cuda_graph:
         print(f"Running warmup for CUDA graphs...")
+        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
+        warmup_sampling_params.add_attributes({"no_early_termination": True})
         if args.engine_type == "static":
-            inference_engine.generate(
-                prompts=None, inference_requests=requests, sampling_params=sampling_params
-            )
+            inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
         elif args.engine_type == "dynamic":
             generate_dynamic(args, requests, inference_engine, sampling_params)
 
