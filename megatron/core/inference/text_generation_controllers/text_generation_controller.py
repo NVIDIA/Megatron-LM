@@ -34,6 +34,8 @@ try:
 
 except ImportError:
     HAVE_TE = False
+    Fp8Padding = None
+    Fp8Unpadding = None
 
 
 class TextGenerationController:
