@@ -23,7 +23,7 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
-from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining
+from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining, combined_forward_backward_step
 from .utils import VppContextManager, set_streams
 
 # Types
