@@ -217,7 +217,7 @@ class _IndexWriter(object):
             List[int]: The pointer to the beginning of each sequence
         """
         itemsize = DType.size(self.dtype)
-        curr_ptr = 0
+        curr_ptr = numpy.int64(0)
         list_ptr = []
         for length in sequence_lengths:
             list_ptr.append(curr_ptr)
