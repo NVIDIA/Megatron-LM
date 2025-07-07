@@ -144,7 +144,7 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if self.config.use_precision_aware_optimizer:
+            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
                 grad = param.grad
@@ -208,7 +208,10 @@ class MegatronOptimizer(ABC):
 
         if params:
             clip_grad_by_total_norm_fp32(
-                params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
+                params,
+                clip_grad,
+                grad_norm,
+                self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             )
         return grad_norm
 
@@ -218,7 +221,7 @@ class MegatronOptimizer(ABC):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            use_decoupled_grad=self.config.use_precision_aware_optimizer,
+            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
         )
 
     @abstractmethod
@@ -1230,7 +1233,7 @@ class ChainedOptimizer(MegatronOptimizer):
             return count_zeros_fp32(
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-                use_decoupled_grad=self.config.use_precision_aware_optimizer,
+                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             )
         else:
             num_zeros_in_grad = 0
@@ -1258,7 +1261,9 @@ class ChainedOptimizer(MegatronOptimizer):
                     optimizer.get_parameters(),
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
-                    use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
+                    use_decoupled_grad=(
+                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    ),
                 )
 
         # Count the zeros in the grads.

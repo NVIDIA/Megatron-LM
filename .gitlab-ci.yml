@@ -1,7 +1,7 @@
 .merge_train_rule: &merge_train_rule
   UNIT_TEST: "yes"
   UNIT_TEST_REPEAT: 1
-  UNIT_TEST_TIMEOUT: 20
+  UNIT_TEST_TIMEOUT: 30
   INTEGRATION_TEST: "yes"
   INTEGRATION_TEST_SCOPE: mr
   FUNCTIONAL_TEST: "yes"
@@ -51,7 +51,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 20
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         CLUSTER_A100: ""
@@ -71,7 +71,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 20
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: nightly
@@ -87,7 +87,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 20
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: weekly
@@ -103,7 +103,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 20
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
         FUNCTIONAL_TEST_SCOPE: mr
@@ -118,7 +118,7 @@ workflow:
       variables:
         UNIT_TEST: "yes"
         UNIT_TEST_REPEAT: 1
-        UNIT_TEST_TIMEOUT: 20
+        UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
         PUBLISH: "no"

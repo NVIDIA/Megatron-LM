@@ -18,9 +18,9 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 
 class BackendSpecProvider(Protocol):
@@ -102,8 +102,8 @@ class LocalSpecProvider(BackendSpecProvider):
         """Which module and submodules to use for grouped mlp"""
         if moe_use_grouped_gemm:
             warnings.warn(
-                'The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. '
-                'Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP.'
+                "The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. "
+                "Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP."
             )
             return GroupedMLP, None
         else:

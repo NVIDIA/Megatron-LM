@@ -8,11 +8,17 @@ from datetime import timedelta
 from functools import partial
 from typing import Callable, List, Optional
 
-import einops
 import numpy as np
 import torch
 
 from .utils import GlobalMemoryBuffer, is_torch_min_version
+
+try:
+    import einops
+
+    HAVE_EINOPS = True
+except ImportError:
+    HAVE_EINOPS = False
 
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
@@ -140,18 +146,18 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         # cga_cluster_size = 4, max_ctas = 32, min_ctas = 1
         # Default values may differ between GPU generations and NCCL versions.
         nccl_options = torch.distributed.ProcessGroupNCCL.Options(
-            is_high_priority_stream=nccl_comm_cfgs[pg_name].get('is_high_priority_stream', False)
+            is_high_priority_stream=nccl_comm_cfgs[pg_name].get("is_high_priority_stream", False)
         )
-        if 'cga_cluster_size' in nccl_comm_cfgs[pg_name]:
-            nccl_options.config.cga_cluster_size = nccl_comm_cfgs[pg_name]['cga_cluster_size']
-        if 'max_ctas' in nccl_comm_cfgs[pg_name]:
-            nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name]['max_ctas']
-        if 'min_ctas' in nccl_comm_cfgs[pg_name]:
-            nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name]['min_ctas']
-        if 'net_name' in nccl_comm_cfgs[pg_name]:
-            nccl_options.config.net_name = nccl_comm_cfgs[pg_name]['net_name']
+        if "cga_cluster_size" in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.cga_cluster_size = nccl_comm_cfgs[pg_name]["cga_cluster_size"]
+        if "max_ctas" in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.max_ctas = nccl_comm_cfgs[pg_name]["max_ctas"]
+        if "min_ctas" in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.min_ctas = nccl_comm_cfgs[pg_name]["min_ctas"]
+        if "net_name" in nccl_comm_cfgs[pg_name]:
+            nccl_options.config.net_name = nccl_comm_cfgs[pg_name]["net_name"]
             # verify net_name value
-            if nccl_options.config.net_name.lower() not in ['ib', 'socket']:
+            if nccl_options.config.net_name.lower() not in ["ib", "socket"]:
                 raise RuntimeError(
                     f"net_name ({nccl_options.config.net_name}) is not supported."
                     f"Accepted values: 'IB' or 'socket'."
@@ -171,15 +177,15 @@ def create_group(
 ):
     """Creates a ProcessGroup."""
     kwargs = {
-        'ranks': ranks,
-        'timeout': timeout,
-        'backend': backend,
-        'pg_options': pg_options,
-        'use_local_synchronization': use_local_synchronization,
-        'group_desc': group_desc,
+        "ranks": ranks,
+        "timeout": timeout,
+        "backend": backend,
+        "pg_options": pg_options,
+        "use_local_synchronization": use_local_synchronization,
+        "group_desc": group_desc,
     }
-    if not is_torch_min_version('2.4.0'):
-        kwargs.pop('group_desc')
+    if not is_torch_min_version("2.4.0"):
+        kwargs.pop("group_desc")
         if timeout is None:
             # Old version (e.g. v2.1.2) sets default_pg_timeout as default value to timeout
             # in function signature, then check tiemout value type.
@@ -187,7 +193,7 @@ def create_group(
             # is None, torch will give value according to the backend, then check type.
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
-            kwargs.pop('timeout')
+            kwargs.pop("timeout")
     return torch.distributed.new_group(**kwargs)
 
 
@@ -322,6 +328,9 @@ def create_hierarchical_groups(
             [g0, g4, g8, g12], [g1, g5, g9, g13], [g2, g6, g10, g14], [g3, g7, g11, g15]
     """
 
+    if not HAVE_EINOPS:
+        raise ImportError("einops is not installed. Please install it with `pip install einops`.")
+
     hierarchical_groups = []
     hierarchical_groups_gloo = []
     if not isinstance(pg_options, list):
@@ -339,15 +348,15 @@ def create_hierarchical_groups(
                 sub_ranks,
                 timeout=timeout,
                 pg_options=pg_options[level],
-                group_desc=f'HIERARCHICAL_{group_desc}_L{level}',
+                group_desc=f"HIERARCHICAL_{group_desc}_L{level}",
             )
             if create_gloo_process_groups:
                 sub_group_gloo = create_group(
                     sub_ranks,
                     timeout=timeout,
-                    backend='gloo',
+                    backend="gloo",
                     pg_options=pg_options[level],
-                    group_desc=f'HIERARCHICAL_{group_desc}_GLOO_L{level}',
+                    group_desc=f"HIERARCHICAL_{group_desc}_GLOO_L{level}",
                 )
             else:
                 sub_group_gloo = None
@@ -395,12 +404,12 @@ class RankGenerator(object):
                     f"specified the order ({self.order})."
                 )
             elif name not in order:
-                order = order + '-' + name
+                order = order + "-" + name
 
         self.order = order
         self.ordered_size = []
 
-        for token in order.split('-'):
+        for token in order.split("-"):
             self.ordered_size.append(self.name_to_size[token])
 
     def get_mask(self, order: str, token: str):
@@ -411,8 +420,8 @@ class RankGenerator(object):
             token (str): The specific parallelism types to include in the mask,
                          separated by hyphens (e.g., 'tp-dp').
         """
-        ordered_token = order.split('-')
-        token_list = token.split('-')
+        ordered_token = order.split("-")
+        token_list = token.split("-")
         mask = [False] * len(ordered_token)
         for t in token_list:
             mask[ordered_token.index(t)] = True
@@ -742,7 +751,7 @@ def initialize_model_parallel(
     # Set is_high_priority_stream flag to the nccl_comm_cfgs if it is in high_priority_stream_groups
     high_priority_stream_groups = high_priority_stream_groups or []
     for pg_name in high_priority_stream_groups:
-        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ('is_high_priority_stream', True))
+        overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
     if encoder_world_size > 0:
         encoder_rank_generator = RankGenerator(
@@ -866,12 +875,12 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GLOBAL_RANKS_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
-    assert _DATA_PARALLEL_GROUP is None, 'data parallel group is already initialized'
+    assert _DATA_PARALLEL_GROUP is None, "data parallel group is already initialized"
 
     assert (
         data_parallel_size * context_parallel_size
     ) % num_distributed_optimizer_instances == 0, (
-        'Data parallel size should be divisible by partial DistOpt shard factor'
+        "Data parallel size should be divisible by partial DistOpt shard factor"
     )
     intra_partial_data_parallel_size = (
         data_parallel_size * context_parallel_size
@@ -888,7 +897,7 @@ def initialize_model_parallel(
                 ranks_with_cp,
                 timeout=timeout,
                 backend="gloo",
-                group_desc='DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                group_desc="DATA_PARALLEL_GROUP_WITH_CP_GLOO",
             )
         else:
             group_with_cp_gloo = None
@@ -915,15 +924,15 @@ def initialize_model_parallel(
                 intra_partial_dp_group_with_cp = create_group(
                     intra_partial_dp_ranks_with_cp,
                     timeout=timeout,
-                    pg_options=get_nccl_options('intra_dp_cp', nccl_comm_cfgs),
-                    group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP',
+                    pg_options=get_nccl_options("intra_dp_cp", nccl_comm_cfgs),
+                    group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP",
                 )
                 if create_gloo_process_groups:
                     intra_partial_dp_group_with_cp_gloo = create_group(
                         intra_partial_dp_ranks_with_cp,
                         timeout=timeout,
                         backend="gloo",
-                        group_desc='INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO',
+                        group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO",
                     )
                 else:
                     intra_partial_dp_group_with_cp_gloo = None
@@ -959,7 +968,7 @@ def initialize_model_parallel(
     for ranks in generator_wrapper('dp'):
         if create_gloo_process_groups:
             group_gloo = create_group(
-                ranks, timeout=timeout, backend="gloo", group_desc='DATA_PARALLEL_GROUP_GLOO'
+                ranks, timeout=timeout, backend="gloo", group_desc="DATA_PARALLEL_GROUP_GLOO"
             )
         else:
             group_gloo = None
@@ -998,9 +1007,9 @@ def initialize_model_parallel(
                 ranks,
                 hierarchical_context_parallel_sizes,
                 create_gloo_process_groups=False,
-                pg_options=get_nccl_options('hcp', nccl_comm_cfgs),
+                pg_options=get_nccl_options("hcp", nccl_comm_cfgs),
                 timeout=timeout,
-                group_desc='CONTEXT_PARALLEL_GROUP',
+                group_desc="CONTEXT_PARALLEL_GROUP",
             )
             if rank in ranks:
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
@@ -1045,14 +1054,14 @@ def initialize_model_parallel(
     global _PIPELINE_GLOBAL_RANKS
     assert (
         _PIPELINE_MODEL_PARALLEL_GROUP is None
-    ), 'pipeline model parallel group is already initialized'
+    ), "pipeline model parallel group is already initialized"
     global _EMBEDDING_GROUP
     global _EMBEDDING_GLOBAL_RANKS
-    assert _EMBEDDING_GROUP is None, 'embedding group is already initialized'
+    assert _EMBEDDING_GROUP is None, "embedding group is already initialized"
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
-    assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
-    if pipeline_model_parallel_comm_backend == 'ucc':
+    assert _POSITION_EMBEDDING_GROUP is None, "position embedding group is already initialized"
+    if pipeline_model_parallel_comm_backend == "ucc":
         # The UCC backend provides two key benefits:
         # 1) Achieves better bandwidth utilization than NCCL when using InfiniBand links.
         # 2) Does not use GPU SM resources (Zero-SM), mitigating performance interference
@@ -1065,12 +1074,12 @@ def initialize_model_parallel(
         # 2) When the critical-path pipeline stage has substantial PP-communication overlap.
         #    - E.g., Uneven pipeline parallelism.
         #    - It may provide better performance due to zero SM resource usage.
-        if 'CUDA_DEVICE_MAX_CONNECTIONS' in os.environ:
+        if "CUDA_DEVICE_MAX_CONNECTIONS" in os.environ:
             # UCC backend requires CUDA_DEVICE_MAX_CONNECTIONS variable to be larger than 1,
             # to gurantee the overlapped UCC communications. If this environment variable is set to 1,
             # all the UCC communication will be serialized.
             assert (
-                os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] != '1'
+                os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] != "1"
             ), "UCC-backend requires CUDA_DEVICE_MAX_CONNECTIONS > 1"
 
         # Setting up required environment variables for ucc backend
@@ -1086,29 +1095,29 @@ def initialize_model_parallel(
         # "UCC_CL_BASIC_TLS" controls which Transport Layers are used by
         # the Basic Collective libraray
 
-        os.environ['TORCH_UCC_BLOCKING_WAIT'] = (
-            os.environ['TORCH_UCC_BLOCKING_WAIT']
+        os.environ["TORCH_UCC_BLOCKING_WAIT"] = (
+            os.environ["TORCH_UCC_BLOCKING_WAIT"]
             if "TORCH_UCC_BLOCKING_WAIT" in os.environ
-            else 'none'
+            else "none"
         )
-        os.environ['UCC_EC_CUDA_STREAM_TASK_MODE'] = (
-            os.environ['UCC_EC_CUDA_STREAM_TASK_MODE']
+        os.environ["UCC_EC_CUDA_STREAM_TASK_MODE"] = (
+            os.environ["UCC_EC_CUDA_STREAM_TASK_MODE"]
             if "UCC_EC_CUDA_STREAM_TASK_MODE" in os.environ
-            else 'driver'
+            else "driver"
         )
-        os.environ['UCX_TLS'] = (
-            os.environ['UCX_TLS'] if "UCX_TLS" in os.environ else 'ib,cuda_copy'
+        os.environ["UCX_TLS"] = (
+            os.environ["UCX_TLS"] if "UCX_TLS" in os.environ else "ib,cuda_copy"
         )  # cuda_ipc (i.e., NVLink-enablement) will be later supported
-        os.environ['NSYS_UCP_COMM_PARAMS'] = '1'
-        os.environ['UCX_RNDV_THRESH'] = '0'
-        os.environ['UCX_NET_DEVICES'] = 'all'
-        os.environ['UCC_CL_BASIC_TLS'] = '^sharp,nccl'
+        os.environ["NSYS_UCP_COMM_PARAMS"] = "1"
+        os.environ["UCX_RNDV_THRESH"] = "0"
+        os.environ["UCX_NET_DEVICES"] = "all"
+        os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
     for ranks in generator_wrapper('pp'):
         assert (
             pipeline_model_parallel_comm_backend == None
-            or pipeline_model_parallel_comm_backend == 'nccl'
-            or pipeline_model_parallel_comm_backend == 'ucc'
+            or pipeline_model_parallel_comm_backend == "nccl"
+            or pipeline_model_parallel_comm_backend == "ucc"
         ), f'"{pipeline_model_parallel_comm_backend}" backend for PP communication is currently not supported'
 
         if rank in ranks:
@@ -1265,25 +1274,25 @@ def initialize_model_parallel(
 
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
-    assert _EXPERT_DATA_PARALLEL_GROUP is None, 'Expert data group is already initialized'
+    assert _EXPERT_DATA_PARALLEL_GROUP is None, "Expert data group is already initialized"
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
-    assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, 'Expert data group-gloo is already initialized'
+    assert _EXPERT_DATA_PARALLEL_GROUP_GLOO is None, "Expert data group-gloo is already initialized"
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     assert (
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
-    ), 'Intra partial expert data group is already initialized'
+    ), "Intra partial expert data group is already initialized"
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
     assert (
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is None
-    ), 'Intra partial expert data group-gloo is already initialized'
+    ), "Intra partial expert data group-gloo is already initialized"
     global _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     assert (
         _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is None
-    ), 'Inter partial expert data group is already initialized'
+    ), "Inter partial expert data group is already initialized"
 
     assert (
         expert_data_parallel_size % num_distributed_optimizer_instances == 0
-    ), 'Expert data parallel size should be divisible by partial DistOpt shard factor'
+    ), "Expert data parallel size should be divisible by partial DistOpt shard factor"
     intra_partial_expert_data_parallel_size = (
         expert_data_parallel_size // num_distributed_optimizer_instances
     )
@@ -1291,7 +1300,7 @@ def initialize_model_parallel(
     for ranks in generator_wrapper('dp', is_expert=True):
         if create_gloo_process_groups:
             group_gloo = create_group(
-                ranks, backend="gloo", group_desc='EXPERT_DATA_PARALLEL_GROUP_GLOO'
+                ranks, backend="gloo", group_desc="EXPERT_DATA_PARALLEL_GROUP_GLOO"
             )
         else:
             group_gloo = None
@@ -1315,11 +1324,11 @@ def initialize_model_parallel(
                 [intra_partial_expert_data_parallel_size, num_distributed_optimizer_instances],
                 create_gloo_process_groups=create_gloo_process_groups,
                 pg_options=[
-                    get_nccl_options('intra_ep_dp', nccl_comm_cfgs),
-                    get_nccl_options('inter_ep_dp', nccl_comm_cfgs),
+                    get_nccl_options("intra_ep_dp", nccl_comm_cfgs),
+                    get_nccl_options("inter_ep_dp", nccl_comm_cfgs),
                 ],
                 timeout=timeout,
-                group_desc='EXPERT_DATA_PARALLEL_GROUP',
+                group_desc="EXPERT_DATA_PARALLEL_GROUP",
             )
             if rank in ranks:
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0]
@@ -1334,7 +1343,7 @@ def initialize_model_parallel(
     global _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     assert (
         _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is None
-    ), 'Intra distributed optimizer instance group is already initialized'
+    ), "Intra distributed optimizer instance group is already initialized"
 
     model_parallel_group_id = 0
     intra_dist_opt_ranks = []
@@ -1389,7 +1398,7 @@ def model_parallel_is_initialized():
 def get_model_parallel_group(check_initialized=True):
     """Get the model-parallel group the caller rank belongs to."""
     if check_initialized:
-        assert _MODEL_PARALLEL_GROUP is not None, 'model parallel group is not initialized'
+        assert _MODEL_PARALLEL_GROUP is not None, "model parallel group is not initialized"
     return _MODEL_PARALLEL_GROUP
 
 
@@ -1398,7 +1407,7 @@ def get_tensor_model_parallel_group(check_initialized=True):
     if check_initialized:
         assert (
             _TENSOR_MODEL_PARALLEL_GROUP is not None
-        ), 'tensor model parallel group is not initialized'
+        ), "tensor model parallel group is not initialized"
     return _TENSOR_MODEL_PARALLEL_GROUP
 
 
@@ -1407,7 +1416,7 @@ def get_pipeline_model_parallel_group(check_initialized=True):
     if check_initialized:
         assert (
             _PIPELINE_MODEL_PARALLEL_GROUP is not None
-        ), 'pipeline_model parallel group is not initialized'
+        ), "pipeline_model parallel group is not initialized"
     return _PIPELINE_MODEL_PARALLEL_GROUP
 
 
@@ -1417,15 +1426,15 @@ def get_data_parallel_group(with_context_parallel=False, partial_data_parallel=F
         if partial_data_parallel:
             assert (
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP is not None
-            ), 'Intra partial data parallel group is not initialized'
+            ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP is not None
-        ), 'data parallel group with context parallel combined is not initialized'
+        ), "data parallel group with context parallel combined is not initialized"
         return _DATA_PARALLEL_GROUP_WITH_CP
     else:
-        assert _DATA_PARALLEL_GROUP is not None, 'data parallel group is not initialized'
-        assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
+        assert _DATA_PARALLEL_GROUP is not None, "data parallel group is not initialized"
+        assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP
 
 
@@ -1435,22 +1444,22 @@ def get_data_parallel_group_gloo(with_context_parallel=False, partial_data_paral
         if partial_data_parallel:
             assert (
                 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-            ), 'Intra partial data parallel group is not initialized'
+            ), "Intra partial data parallel group is not initialized"
             return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
         assert (
             _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-        ), 'data parallel group-gloo with context parallel combined is not initialized'
+        ), "data parallel group-gloo with context parallel combined is not initialized"
         return _DATA_PARALLEL_GROUP_WITH_CP_GLOO
     else:
-        assert _DATA_PARALLEL_GROUP_GLOO is not None, 'data parallel group-gloo is not initialized'
-        assert partial_data_parallel == False, 'Partial DP for Optimizer needs to include CP'
+        assert _DATA_PARALLEL_GROUP_GLOO is not None, "data parallel group-gloo is not initialized"
+        assert partial_data_parallel == False, "Partial DP for Optimizer needs to include CP"
         return _DATA_PARALLEL_GROUP_GLOO
 
 
 def get_context_parallel_group(check_initialized=True):
     """Get the context-parallel group the caller rank belongs to."""
     if check_initialized:
-        assert _CONTEXT_PARALLEL_GROUP is not None, 'context parallel group is not initialized'
+        assert _CONTEXT_PARALLEL_GROUP is not None, "context parallel group is not initialized"
     return _CONTEXT_PARALLEL_GROUP
 
 
@@ -1459,7 +1468,7 @@ def get_context_parallel_global_ranks(check_initialized=True):
     if check_initialized:
         assert (
             _CONTEXT_PARALLEL_GLOBAL_RANKS is not None
-        ), 'context parallel group is not initialized'
+        ), "context parallel group is not initialized"
     return _CONTEXT_PARALLEL_GLOBAL_RANKS
 
 
@@ -1473,14 +1482,14 @@ def get_hierarchical_context_parallel_groups(check_initialized=True):
 def get_embedding_group(check_initialized=True):
     """Get the embedding group the caller rank belongs to."""
     if check_initialized:
-        assert _EMBEDDING_GROUP is not None, 'embedding group is not initialized'
+        assert _EMBEDDING_GROUP is not None, "embedding group is not initialized"
     return _EMBEDDING_GROUP
 
 
 def get_position_embedding_group(check_initialized=True):
     """Get the position embedding group the caller rank belongs to."""
     if check_initialized:
-        assert _POSITION_EMBEDDING_GROUP is not None, 'position embedding group is not initialized'
+        assert _POSITION_EMBEDDING_GROUP is not None, "position embedding group is not initialized"
     return _POSITION_EMBEDDING_GROUP
 
 
@@ -1490,23 +1499,23 @@ def get_amax_reduction_group(with_context_parallel=False, tp_only_amax_red=False
         if not tp_only_amax_red:
             assert (
                 _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
-            ), 'FP8 amax reduction group is not initialized'
+            ), "FP8 amax reduction group is not initialized"
             return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
         else:
             assert (
                 _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
-            ), 'FP8 amax reduction group is not initialized'
+            ), "FP8 amax reduction group is not initialized"
             return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
     else:
         if not tp_only_amax_red:
             assert (
                 _TENSOR_AND_DATA_PARALLEL_GROUP is not None
-            ), 'FP8 amax reduction group is not initialized'
+            ), "FP8 amax reduction group is not initialized"
             return _TENSOR_AND_DATA_PARALLEL_GROUP
         else:
             assert (
                 _TENSOR_MODEL_PARALLEL_GROUP is not None
-            ), 'FP8 amax reduction group is not initialized'
+            ), "FP8 amax reduction group is not initialized"
             return _TENSOR_MODEL_PARALLEL_GROUP
 
 
@@ -1515,12 +1524,12 @@ def get_tensor_and_data_parallel_group(with_context_parallel=False):
     if with_context_parallel:
         assert (
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
-        ), 'tensor and data parallel group is not initialized'
+        ), "tensor and data parallel group is not initialized"
         return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     else:
         assert (
             _TENSOR_AND_DATA_PARALLEL_GROUP is not None
-        ), 'tensor and data parallel group is not initialized'
+        ), "tensor and data parallel group is not initialized"
         return _TENSOR_AND_DATA_PARALLEL_GROUP
 
 
@@ -1529,7 +1538,7 @@ def get_tensor_and_context_parallel_group(check_initialized=True):
     if check_initialized:
         assert (
             _TENSOR_AND_CONTEXT_PARALLEL_GROUP is not None
-        ), 'tensor and context parallel group is not initialized'
+        ), "tensor and context parallel group is not initialized"
     return _TENSOR_AND_CONTEXT_PARALLEL_GROUP
 
 
@@ -2032,7 +2041,7 @@ def get_expert_model_parallel_group(check_initialized=True):
     if check_initialized:
         assert (
             _EXPERT_MODEL_PARALLEL_GROUP is not None
-        ), 'expert model parallel group is not initialized'
+        ), "expert model parallel group is not initialized"
     return _EXPERT_MODEL_PARALLEL_GROUP
 
 
@@ -2073,7 +2082,7 @@ def get_expert_tensor_parallel_group(check_initialized=True):
     if check_initialized:
         assert (
             _EXPERT_TENSOR_PARALLEL_GROUP is not None
-        ), 'Expert tensor parallel group is not initialized'
+        ), "Expert tensor parallel group is not initialized"
     return _EXPERT_TENSOR_PARALLEL_GROUP
 
 
@@ -2118,7 +2127,7 @@ def get_expert_tensor_and_model_parallel_group(check_initialized=True):
     if check_initialized:
         assert (
             _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is not None
-        ), 'Expert tensor and model parallel group is not initialized'
+        ), "Expert tensor and model parallel group is not initialized"
     return _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP
 
 
@@ -2144,7 +2153,7 @@ def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
     if check_initialized:
         assert (
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
-        ), 'Expert tensor-model-pipeline parallel group is not initialized'
+        ), "Expert tensor-model-pipeline parallel group is not initialized"
     return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
 
 
@@ -2154,13 +2163,13 @@ def get_expert_data_parallel_group(check_initialized=True, partial_expert_data_p
         if check_initialized:
             assert (
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None
-            ), 'Intra partial expert data parallel group is not initialized'
+            ), "Intra partial expert data parallel group is not initialized"
         return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     else:
         if check_initialized:
             assert (
                 _EXPERT_DATA_PARALLEL_GROUP is not None
-            ), 'Expert data parallel group is not initialized'
+            ), "Expert data parallel group is not initialized"
         return _EXPERT_DATA_PARALLEL_GROUP
 
 
@@ -2179,12 +2188,12 @@ def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
     if partial_expert_data_parallel:
         assert (
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        ), 'Intra partial expert data parallel group-gloo is not initialized'
+        ), "Intra partial expert data parallel group-gloo is not initialized"
         return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
     else:
         assert (
             _EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
-        ), 'Expert data parallel group-gloo is not initialized'
+        ), "Expert data parallel group-gloo is not initialized"
         return _EXPERT_DATA_PARALLEL_GROUP_GLOO
 
 
@@ -2212,7 +2221,7 @@ def get_intra_distributed_optimizer_instance_group():
     """Get the group of all GPUs in a distributed optimizer instance."""
     assert (
         _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP is not None
-    ), 'Intra distributed optimizer instance group is not initialized'
+    ), "Intra distributed optimizer instance group is not initialized"
     return _INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
 
 
@@ -2222,8 +2231,8 @@ def get_inter_distributed_optimizer_instance_group():
     inter_partial_expert_data_parallel_group, and return it at here.
     """
     assert _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None, (
-        'Attention and MLP/Expert share same inter distributed optimize instance group, '
-        'which has not been initialized'
+        "Attention and MLP/Expert share same inter distributed optimize instance group, "
+        "which has not been initialized"
     )
     return _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
 
@@ -2234,13 +2243,13 @@ def get_inter_distributed_optimizer_instance_group():
 def _set_global_memory_buffer():
     """Initialize global buffer."""
     global _GLOBAL_MEMORY_BUFFER
-    assert _GLOBAL_MEMORY_BUFFER is None, 'global memory buffer is already initialized'
+    assert _GLOBAL_MEMORY_BUFFER is None, "global memory buffer is already initialized"
     _GLOBAL_MEMORY_BUFFER = GlobalMemoryBuffer()
 
 
 def get_global_memory_buffer():
     """Return the global GlobalMemoryBuffer object"""
-    assert _GLOBAL_MEMORY_BUFFER is not None, 'global memory buffer is not initialized'
+    assert _GLOBAL_MEMORY_BUFFER is not None, "global memory buffer is not initialized"
     return _GLOBAL_MEMORY_BUFFER
 
 
@@ -2260,7 +2269,7 @@ def get_all_ranks():
         get_pipeline_model_parallel_rank(),
         get_expert_model_parallel_rank(),
     ]
-    return '_'.join(map(lambda x: str(x or 0), ranks))
+    return "_".join(map(lambda x: str(x or 0), ranks))
 
 
 def destroy_model_parallel():

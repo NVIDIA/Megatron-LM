@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions used throughout Megatron core"""
+
 import array
 import functools
 import hashlib
@@ -15,7 +16,7 @@ import threading
 import time
 import traceback
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from functools import lru_cache, reduce, wraps
@@ -24,7 +25,6 @@ from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import torch
-from packaging.version import Version as PkgVersion
 
 from megatron.core import config
 from megatron.core.package_info import __version__ as mcore_version
@@ -41,6 +41,13 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 
 try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
+
+try:
     import nvtx
 
     HAVE_NVTX = True
@@ -54,9 +61,24 @@ try:
     _torch_version = PkgVersion(torch.__version__)
 except Exception:
     # This is a WAR for building docs, where torch is not actually imported
-    _torch_version = PkgVersion("0.0.0")
+    _torch_version = PkgVersion("0.0.0") if HAVE_PACKAGING else "0.0.0"
 _te_version = None
 _fa_version = None
+
+
+@contextmanager
+def null_decorator(*args, **kwargs):
+    """
+    No-op decorator.
+    """
+    if len(kwargs) == 0 and len(args) == 1 and callable(args[0]):
+        return args[0]
+    else:
+
+        def inner(func):
+            return func
+
+        return inner
 
 
 class ExperimentalNotEnabledError(Exception):
@@ -95,6 +117,10 @@ def experimental_fn(introduced_with_version: str):
         Returns:
             Callable: The callee function.
         """
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "packaging is not installed. Please install it with `pip install packaging`."
+            )
         if (
             PkgVersion(introduced_with_version).minor + max_lifetime
             < PkgVersion(mcore_version).minor
@@ -106,7 +132,6 @@ def experimental_fn(introduced_with_version: str):
 
         @wraps(func)
         def wrapped_func(*args, **kwargs):
-
             if config.is_experimental_enabled() is not True:
                 raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
 
@@ -151,6 +176,11 @@ def experimental_cls(introduced_with_version: str):
         Returns:
             Callable: The callee function.
         """
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "packaging is not installed. Please install it with `pip install packaging`."
+            )
+
         if (
             PkgVersion(introduced_with_version).minor + max_lifetime
             < PkgVersion(mcore_version).minor
@@ -161,7 +191,6 @@ def experimental_cls(introduced_with_version: str):
             )
 
         def wrapped_func(cls):
-
             def guard(super: super, attr: str):
                 """Pass-through to callee attribute if experimental flag is enabled.
 
@@ -237,10 +266,15 @@ def experimental_cls(introduced_with_version: str):
 def get_torch_version():
     """Get pytorch version from __version__; if not available use pip's. Use caching."""
 
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
     def get_torch_version_str():
         import torch
 
-        if hasattr(torch, '__version__'):
+        if hasattr(torch, "__version__"):
             return str(torch.__version__)
         else:
             return version("torch")
@@ -253,23 +287,39 @@ def get_torch_version():
 
 def get_te_version():
     """Get TE version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
+    try:
+        import transformer_engine as te
+
+        HAVE_TE = True
+    except ImportError:
+        HAVE_TE = False
 
     def get_te_version_str():
         import transformer_engine as te
 
-        if hasattr(te, '__version__'):
+        if hasattr(te, "__version__"):
             return str(te.__version__)
         else:
             return version("transformer-engine")
 
     global _te_version
-    if _te_version is None:
+    if _te_version is None and HAVE_TE:
         _te_version = PkgVersion(get_te_version_str())
     return _te_version
 
 
 def is_te_min_version(version, check_equality=True):
     """Check if minimum version of `transformer-engine` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
+
     if check_equality:
         return get_te_version() >= PkgVersion(version)
     return get_te_version() > PkgVersion(version)
@@ -284,6 +334,10 @@ def get_torch_version():
 
 def is_torch_min_version(version, check_equality=True):
     """Check if minimum version of `torch` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
     if check_equality:
         return get_torch_version() >= PkgVersion(version)
     return get_torch_version() > PkgVersion(version)
@@ -291,11 +345,15 @@ def is_torch_min_version(version, check_equality=True):
 
 def get_fa_version():
     """Get Flash attention version from __version__; if not available use pip's. Use caching."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
 
     def get_fa_version_str():
         import flash_attn as fa
 
-        if hasattr(fa, '__version__'):
+        if hasattr(fa, "__version__"):
             return str(fa.__version__)
         else:
             return version("flash-attn")
@@ -308,6 +366,10 @@ def get_fa_version():
 
 def is_fa_min_version(version, check_equality=True):
     """Check if minimum version of `flash-attn` is installed."""
+    if not HAVE_PACKAGING:
+        raise ImportError(
+            "packaging is not installed. Please install it with `pip install packaging`."
+        )
     if check_equality:
         return get_fa_version() >= PkgVersion(version)
     return get_fa_version() > PkgVersion(version)
@@ -416,20 +478,20 @@ def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False)
 
 def get_model_type(model):
     """Returns model_type attribute"""
-    return get_attr_wrapped_model(model, 'model_type')
+    return get_attr_wrapped_model(model, "model_type")
 
 
 def get_model_xattn(model):
     """Returns whether the model has the xattn_needed attribute"""
     try:
-        return get_attr_wrapped_model(model, 'xattn_needed')
+        return get_attr_wrapped_model(model, "xattn_needed")
     except RuntimeError:
         return False
 
 
 def get_model_config(model):
     """Returns the config attribute, allowed to return None"""
-    return get_attr_wrapped_model(model, 'config', allow_none=False)
+    return get_attr_wrapped_model(model, "config", allow_none=False)
 
 
 class GlobalMemoryBuffer:
@@ -646,11 +708,11 @@ def check_param_hashes_across_dp_replicas(
         for param_name, param in model_chunk.named_parameters():
             param_hash = torch.frombuffer(
                 array.array(
-                    'B', hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
+                    "B", hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
                 ),
                 dtype=torch.uint8,
             )
-            if getattr(param, 'allreduce', True):
+            if getattr(param, "allreduce", True):
                 non_expert_params.append((model_chunk_id, param_name, param))
                 local_non_expert_param_hashes.append(param_hash)
             else:
@@ -732,8 +794,8 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
-    if hasattr(tensor, 'fully_shard_param_local_shard'):
-        assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
+    if hasattr(tensor, "fully_shard_param_local_shard"):
+        assert len(replica_id) == 3, f"Expected replica_id format (PP, TP, DP), got: {replica_id}"
         replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
 
         sh_ten = ShardedTensor.from_rank_offsets_flat(
@@ -751,7 +813,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             prepend_axis_num=prepend_axis_num,
             **kwargs,
         )
-        setattr(sh_ten, 'is_data_parallel_fully_shard', True)
+        setattr(sh_ten, "is_data_parallel_fully_shard", True)
         return sh_ten
 
     return ShardedTensor.from_rank_offsets(
@@ -787,8 +849,8 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     if replica_id is None:
         replica_id = (0, parallel_state.get_tensor_model_parallel_rank(), dp_replica_id)
 
-    if hasattr(tensor, 'fully_shard_param_local_shard'):
-        assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
+    if hasattr(tensor, "fully_shard_param_local_shard"):
+        assert len(replica_id) == 3, f"Expected replica_id format (PP, TP, DP), got: {replica_id}"
         replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
 
         sh_ten = ShardedTensor.from_rank_offsets_flat(
@@ -801,7 +863,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
             prepend_axis_num=prepend_axis_num,
             **kwargs,
         )
-        setattr(sh_ten, 'is_data_parallel_fully_shard', True)
+        setattr(sh_ten, "is_data_parallel_fully_shard", True)
         return sh_ten
 
     return ShardedTensor.from_rank_offsets(
@@ -868,9 +930,12 @@ def prepare_input_tensors_for_wgrad_compute(grad_output, all_gathered_input):
     return grad_output, all_gathered_input
 
 
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+except Exception:
     dist_all_gather_func = torch.distributed._all_gather_base
 
 
@@ -914,7 +979,6 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
     input = None
 
     def wgrad_compute(all_gathered_input, grad_output, weight):
-
         grad_output, all_gathered_input = prepare_input_tensors_for_wgrad_compute(
             grad_output, all_gathered_input
         )
@@ -976,7 +1040,7 @@ def local_multi_tensor_l2_norm(chunk_size, noop_flag, tensor_lists, per_tensor, 
     """
     l2 = [[(torch.norm(tensor)) for tensor in tensor_list] for tensor_list in tensor_lists]
     l2_reduced = torch.norm(torch.tensor(l2))
-    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device='cuda')
+    l2_cuda = torch.tensor([float(l2_reduced)], dtype=torch.float, device="cuda")
     return l2_cuda, None
 
 
@@ -1441,7 +1505,7 @@ class StragglerDetector:
                     line = f"^^^^ Top    {self.mmcnt} Ranks with highest Etpt(TF):"
                     shift = self.world - self.mmcnt
                     for i in range(self.mmcnt):
-                        line += f" {o_dt.aflops[i+shift]},"
+                        line += f" {o_dt.aflops[i + shift]},"
                     logger.info(line)
                 ret = True
 
@@ -1779,7 +1843,7 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
         cp_rank = parallel_state.get_context_parallel_rank()
         for key, val in batch.items():
             if val is not None:
-                seq_dim = 1 if key != 'attention_mask' else 2
+                seq_dim = 1 if key != "attention_mask" else 2
                 val = val.view(
                     *val.shape[0:seq_dim],
                     2 * cp_size,

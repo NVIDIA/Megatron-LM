@@ -20,7 +20,6 @@ class MegatronTokenizer(ABC):
     """
 
     def __init__(self, *tokenizer_paths: str, **tokenizer_options: Any):
-
         self.unique_identifiers = OrderedDict()
         self.unique_identifiers["class"] = type(self).__name__
         self.unique_identifiers["tokenizer_path"] = list(tokenizer_paths)

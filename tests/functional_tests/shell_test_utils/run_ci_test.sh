@@ -209,7 +209,7 @@ for i in $(seq 1 $N_REPEAT); do
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} == 1 ]]; then
         echo Skipping Pytest checks.
-        exit 0
+        exit ${TRAINING_EXIT_CODE}
     fi
 
     if [[ ! " ${TEST_TYPES[*]} " =~ " ${TEST_TYPE} " ]]; then

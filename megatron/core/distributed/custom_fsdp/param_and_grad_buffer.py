@@ -2067,7 +2067,7 @@ class GradReducePipeline:
                         # new empty is important for memory safety, when using
                         # TORCH_NCCL_AVOID_RECORD_STREAMS=1.
                         # For reference: https://dev-discuss.pytorch.org/t/fsdp-cudacachingallocator-an-outsider-newb-perspective/1486
-                        if not self.buffer.ddp_config.nccl_ub:
+                        if not self.buffer.ddp_config.fsdp_double_buffer:
                             grad_shard = torch.empty_like(grad_shard)
                         torch.distributed.reduce_scatter_tensor(
                             output=grad_shard,
