@@ -6,12 +6,12 @@ from typing import Callable, Optional
 
 import torch
 
-from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
     apply_random_logits,
+    router_gating_linear,
     save_to_aux_losses_tracker,
     sequence_load_balancing_loss_func,
     sinkhorn,
@@ -79,7 +79,7 @@ class Router(ABC, MegatronModule):
             router_dtype = torch.float32
         elif self.config.moe_router_dtype == 'fp64':
             router_dtype = torch.float64
-        logits = torch.nn.functional.linear(input.to(router_dtype), self.weight.to(router_dtype))
+        logits = router_gating_linear(input, self.weight, router_dtype)
         return logits
 
     @abstractmethod
@@ -186,7 +186,7 @@ class TopKRouter(Router):
         scores = logits * map
         return scores, map
 
-    def compute_routing_scores_for_aux_loss(self, logits: torch.Tensor) -> torch.Tensor:
+    def compute_routing_scores_for_aux_loss(self, logits: torch.Tensor):
         """Compute routing scores based on the score function.
 
         Args:
@@ -199,12 +199,14 @@ class TopKRouter(Router):
             scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
         elif self.score_function == "sigmoid":
             scores = torch.sigmoid(logits)
-            scores = (
-                scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.topk > 1 else scores
-            )
+            scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
         else:
             raise ValueError(f"Invalid score_function: {self.score_function}")
-        return scores
+
+        _, top_indices = torch.topk(scores, k=self.topk, dim=1)
+        topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+
+        return scores, topk_map
 
     def aux_loss_load_balancing(self, logits: torch.Tensor):
         """Apply auxiliary loss-based load balancing to the logits tensor.
@@ -234,11 +236,11 @@ class TopKRouter(Router):
         if self.training and torch.is_grad_enabled():
             # Apply auxiliary load balancing loss
             # Skip auxiliary loss calculations when using torch.no_grad() or checkpointing.
-            scores = self.compute_routing_scores_for_aux_loss(logits)
+            scores, loss_routing_map = self.compute_routing_scores_for_aux_loss(logits)
             aux_loss_func = partial(
                 switch_load_balancing_loss_func,
                 probs=scores,
-                tokens_per_expert=tokens_per_expert,
+                tokens_per_expert=loss_routing_map.sum(dim=0),
                 topk=self.topk,
             )
             probs = self.apply_load_balancing_loss(
@@ -276,11 +278,11 @@ class TopKRouter(Router):
 
         if self.training and torch.is_grad_enabled():
             # Apply sequence-auxiliary load balancing loss
-            scores = self.compute_routing_scores_for_aux_loss(logits)
+            scores, loss_routing_map = self.compute_routing_scores_for_aux_loss(logits)
             aux_loss_func = partial(
                 sequence_load_balancing_loss_func,
                 probs=scores,
-                routing_map=routing_map,
+                routing_map=loss_routing_map,
                 batch_size=bsz,
                 seq_length=seq_length,
                 topk=self.topk,
@@ -300,10 +302,7 @@ class TopKRouter(Router):
             return activation
 
         sequence_partition_group = None
-        if self.config.moe_token_dispatcher_type == "alltoall_seq":
-            sequence_partition_group = self.cp_group
-            moe_aux_loss_coeff /= self.tp_group.size()
-        elif self.tp_cp_group.size() > 1:
+        if self.tp_cp_group.size() > 1:
             sequence_partition_group = self.tp_cp_group
 
         aux_loss = load_balancing_loss_func(
@@ -397,10 +396,6 @@ class TopKRouter(Router):
 
         # Apply Z-Loss
         logits = self.apply_z_loss(logits)
-
-        if self.config.moe_token_dispatcher_type == "alltoall_seq":
-            # Gather the logits from the TP region
-            logits = gather_from_sequence_parallel_region(logits, self.tp_group)
 
         if self.routing_type == "sinkhorn":
             scores, routing_map = self.sinkhorn_load_balancing(logits)

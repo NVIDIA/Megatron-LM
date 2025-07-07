@@ -140,17 +140,17 @@ def test_nvtx_range(msg, suffix):
         util.nvtx_range_pop(msg, suffix)
 
     # Test with NVTX disabled
-    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '0'}):
-        _call_nvtx_range()
-        assert execution_tracker['ranges']
+    util.configure_nvtx_profiling(False)
+    _call_nvtx_range()
+    assert execution_tracker['ranges']
 
     # Reset tracker
     execution_tracker['ranges'] = False
 
     # Test with NVTX enabled
-    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '1'}):
-        _call_nvtx_range()
-        assert execution_tracker['ranges']
+    util.configure_nvtx_profiling(True)
+    _call_nvtx_range()
+    assert execution_tracker['ranges']
 
 @pytest.mark.skipif(not util.HAVE_NVTX, reason="NVTX module not available")
 def test_nvtx_decorator():
@@ -167,19 +167,19 @@ def test_nvtx_decorator():
         execution_tracker['decorated_with_message'] = True
 
     # Test with NVTX disabled
-    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '0'}):
-        nvtx_decorated_function()
-        nvtx_decorated_function_with_message()
-        assert all(execution_tracker.values())
+    util.configure_nvtx_profiling(False)
+    nvtx_decorated_function()
+    nvtx_decorated_function_with_message()
+    assert all(execution_tracker.values())
 
     # Reset tracker
     execution_tracker = {'decorated': False, 'decorated_with_message': False}
 
     # Test with NVTX enabled
-    with patch.dict('os.environ', {'MEGATRON_NVTX_ENABLED': '1'}):
-        nvtx_decorated_function()
-        nvtx_decorated_function_with_message()
-        assert all(execution_tracker.values())
+    util.configure_nvtx_profiling(True)
+    nvtx_decorated_function()
+    nvtx_decorated_function_with_message()
+    assert all(execution_tracker.values())
 
 
 @pytest.mark.flaky_in_dev

@@ -10,7 +10,9 @@ import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 
 from megatron.core.enums import Fp8Recipe
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -50,6 +52,32 @@ class TransformerConfig(ModelParallelConfig):
     num_layers_in_last_pipeline_stage: Optional[int] = None
     """Number of transformer layers on last pipeline stage.
     None implies equal layer division across PP ranks."""
+
+    pipeline_model_parallel_layout: Optional[Union[str, list, PipelineParallelLayerLayout]] = None
+    """Custom definition of the pipeline parallel partitioning.
+    Support type:
+    - str: e.g., 'Et*3|(tt|)*29,m|L'. Stages are split by '|', replicated stages or layers
+    can be described with multiplication. Commas can be used cosmetically.
+    - list: e.g., [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']].
+    - PipelineParallelLayerLayout: a PipelineParallelLayerLayout object.
+    If given either a string or a list, it will be transferred into a PipelineParallelLayerLayout
+    in post init. Let i = a * pp_size + b, then layout[i] gives a list of the layers 
+    in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ..., 
+    vpp(i)pp(j), vpp(i)pp(j+1), ..., vpp(-1)pp(-2), vpp(-1)pp(-1).
+    In the inner lists of layers, 'embedding' or 'E' denotes the embedding layer, 'loss' or 'L'
+    denotes the loss function, and 'decoder' or 't' denotes the transformer decoder layer.
+    Examples:
+        [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']]:
+        pp = 2, vpp = None
+        pp rank 0 holds: embedding, decoder
+        pp rank 1 holds: decoder*3, loss
+        'E|(tt|)*2,(t|)*4,mL':
+        pp = 2, vpp = 4
+        vpp rank 0 pp rank 0 holds: embedding
+        vpp rank 0 pp rank 1~2 holds: decoder*2
+        vpp rank 0 pp rank 3 holds: decoder
+        vpp rank 1 pp rank 0~2 holds: decoder
+        vpp rank 1 pp rank 3 holds: mtp, loss"""
 
     account_for_embedding_in_pipeline_split: bool = False
     """If set, the embedding layer will be treated as a standard transformer
@@ -156,6 +184,9 @@ class TransformerConfig(ModelParallelConfig):
     no_rope=4 means RoPE is applied for 3 layers, then skipped for 1 layer, repeating this pattern.
     A list of integers: Defines a custom pattern where 1 means skip RoPE and 0 means apply RoPE.
     For example, [0,1,1,0] means: apply RoPE, skip RoPE, skip RoPE, apply RoPE."""
+
+    moe_deepep_num_sms: int = 20
+    """Number of SMs to use for DeepEP."""
 
     ####################
     # initialization
@@ -327,6 +358,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of layers at the end of the model to keep in BF16 precision when
     first_last_layers_bf16 is True."""
 
+    use_kitchen: bool = False
+    """Use the kitchen extension for transformer quantization."""
+
     ####################
     # MoE related
     ####################
@@ -362,6 +396,11 @@ class TransformerConfig(ModelParallelConfig):
     """Number of EP ranks to consider for each token in group-limited routing,
     DEPRECATED and replaced by moe_router_num_groups and moe_router_group_topk.
     """
+
+    moe_router_padding_for_fp8: Optional[bool] = False
+    """Whether to pad the routing_map to make sure the number of tokens each expert received
+    is a multiple of 16/32 for FP8 precision. This can remove the explicit padding in the
+    GroupedMLP layer."""
 
     moe_router_num_groups: Optional[int] = None
     """Number of groups to divide experts into for group-limited routing.
@@ -578,6 +617,12 @@ class TransformerConfig(ModelParallelConfig):
     hetereogenous_dist_checkpoint: bool = False
     """Whether to use heterogenous layers in distributed checkpoint."""
 
+    ####################
+    # Quantization
+    ####################
+    quant_recipe: Optional[RecipeConfig] = None
+    """Configuration of any quantization to be applied to the model"""
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -663,9 +708,6 @@ class TransformerConfig(ModelParallelConfig):
                         f"between 0 and number of layers per pipeline stage "
                         f"({max_bf16_layers_per_pipeline_stage})."
                     )
-
-            if self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param:
-                raise ValueError("MXFP8 currently does not support fp8_param.")
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
@@ -842,7 +884,59 @@ class TransformerConfig(ModelParallelConfig):
                 'and account_for_loss_in_pipeline_split'
             )
 
-        if (
+        # PP layout
+        if self.pipeline_model_parallel_layout is not None:
+            # If pipeline layout is set, we will check the conflicts
+            # with other pipeline layout arguments.
+            any_conflict = (
+                self.num_layers_in_first_pipeline_stage is not None
+                or self.num_layers_in_last_pipeline_stage is not None
+                or self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            )
+            if any_conflict:
+                raise ValueError(
+                    "pipeline_model_parallel_layout cannot be set"
+                    " with other pipeline layout arguments."
+                    f" {self.num_layers_in_first_pipeline_stage=},"
+                    f" {self.num_layers_in_last_pipeline_stage=},"
+                    f" {self.account_for_embedding_in_pipeline_split=},"
+                    f" {self.account_for_loss_in_pipeline_split=}."
+                )
+
+            # Transfer pipeline_model_parallel_layout from str or list to
+            # PipelineParallelLayerLayout
+            if isinstance(self.pipeline_model_parallel_layout, str):
+                self.pipeline_model_parallel_layout = PipelineParallelLayerLayout.from_str(
+                    layout=self.pipeline_model_parallel_layout,
+                    pipeline_model_parallel_size=self.pipeline_model_parallel_size,
+                )
+            elif isinstance(self.pipeline_model_parallel_layout, list):
+                # Since list is not hashable, the initialization will not be cached.
+                self.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
+                    layout=self.pipeline_model_parallel_layout,
+                    pipeline_model_parallel_size=self.pipeline_model_parallel_size,
+                )
+
+            # Check whether the input VPP size conflicts with the PP layout
+            detected_vpp_size = (
+                self.pipeline_model_parallel_layout.virtual_pipeline_model_parallel_size
+            )
+            if self.virtual_pipeline_model_parallel_size is not None:
+                assert self.virtual_pipeline_model_parallel_size == detected_vpp_size, (
+                    f"virtual_pipeline_model_parallel_size conflicts with"
+                    f" pipeline_model_parallel_layout,"
+                    f" ({self.virtual_pipeline_model_parallel_size=}, "
+                    f" {detected_vpp_size=})"
+                )
+            elif detected_vpp_size > 1:
+                self.virtual_pipeline_model_parallel_size = detected_vpp_size
+
+            # Check whether the layout is valid.
+            self.pipeline_model_parallel_layout.validate_layer_layout(num_layers=self.num_layers)
+
+        # Uneven PP
+        elif (
             self.num_layers_in_first_pipeline_stage is not None
             or self.num_layers_in_last_pipeline_stage is not None
         ):
@@ -887,13 +981,17 @@ class TransformerConfig(ModelParallelConfig):
                 num_layers -= self.num_layers_in_last_pipeline_stage
                 pipeline_parallel_size -= 1
 
-            if not num_layers % pipeline_parallel_size == 0:
+            # Here pipeline_parallel_size is the number of middle PP stages. If there are middle
+            # PP stages, check number of layers at middle stage is divisible by middle PP size.
+            if pipeline_parallel_size and not num_layers % pipeline_parallel_size == 0:
                 raise ValueError(
                     f'number of layers at middle stage: {num_layers} must be divisible by'
                     f'the middle pipeline model parallel size {pipeline_parallel_size}'
                 )
 
-            if self.virtual_pipeline_model_parallel_size is not None:
+            # If there are middle PP stages, check number of layers
+            # on each middle PP rank is divisible by VPP size.
+            if pipeline_parallel_size and self.virtual_pipeline_model_parallel_size is not None:
                 num_layers_per_middle_pipeline_rank = num_layers // pipeline_parallel_size
                 if (
                     not num_layers_per_middle_pipeline_rank
@@ -906,7 +1004,9 @@ class TransformerConfig(ModelParallelConfig):
                         f'pipeline parallel degree {self.virtual_pipeline_model_parallel_size}'
                     )
 
-        if self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split:
+        elif (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
             if self.virtual_pipeline_model_parallel_size is None:
                 num_layers = self.num_layers
 
@@ -1014,14 +1114,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None:
             assert not self.add_bias_linear, "Bias is not supported for MoE"
 
-        if self.moe_token_dispatcher_type == "alltoall_seq":
-            if self.tensor_model_parallel_size != self.expert_tensor_parallel_size:
-                raise ValueError(
-                    "alltoall_seq dispatcher not support different TP size for MoE and Dense layer."
-                )
-            if self.moe_permute_fusion:
-                raise ValueError("alltoall_seq dispatcher does not support permute fusion.")
-
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(
                 "Expert bias for aux-loss-free routing only supports sigmoid score function."
@@ -1040,6 +1132,16 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Only transformer-engine>=1.11.0 supports FP8 grouped gemm, "
                     f"but your version is {get_te_version()}."
+                )
+
+        if self.moe_router_padding_for_fp8:
+            if self.fp8 is None:
+                raise ValueError("fp8 must be specified when moe_router_padding_for_fp8 is True.")
+
+            if self.moe_token_dispatcher_type in ["allgather", "alltoall_seq"]:
+                raise ValueError(
+                    "allgather and alltoall_seq dispatcher does not support "
+                    "moe_router_padding_for_fp8."
                 )
 
         if (
@@ -1085,7 +1187,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.recompute_granularity:
                 raise ValueError("CUDA graphs not supported with activation recomputation.")
 
-        if self.moe_token_dispatcher_type in ['allgather', 'alltoall_seq']:
+        if self.moe_token_dispatcher_type in ['allgather']:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
@@ -1201,7 +1303,10 @@ class MLATransformerConfig(TransformerConfig):
     """Rotary scaling factor for the rotary embeddings, used by yarn."""
 
     max_position_embeddings: int = 4096
-    """Maximum position embeddings for the original model, used by yarn."""
+    """This arg is not used, will be deprecated."""
+
+    original_max_position_embeddings: int = 4096
+    """Original maximum position embeddings for the original model, used by yarn."""
 
     beta_fast: float = 32
     """Beta fast for YaRN RoPE, used by yarn."""
@@ -1219,3 +1324,17 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+        # TODO(boxiangw): Deprecate this check
+        if self.max_position_embeddings != 4096:
+            if self.original_max_position_embeddings == 4096:
+                # only override the original_max_position_embeddings if it is not set
+                self.original_max_position_embeddings = self.max_position_embeddings
+            self.max_position_embeddings = 4096
+            warnings.warn(
+                "MLA config max_position_embeddings is overridden by customer input, "
+                "please use the original_max_position_embeddings instead for YaRN!"
+                "max_position_embeddings will be deprecated in the future."
+                "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
+                "and assigned max_position_embeddings back to the original value."
+            )

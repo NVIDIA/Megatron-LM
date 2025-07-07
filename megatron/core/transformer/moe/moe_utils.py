@@ -18,11 +18,15 @@ try:
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
         fused_unpermute,
+        te_general_gemm,
     )
-
-    HAVE_TE = True
 except ImportError:
-    HAVE_TE = False
+    fused_permute = None
+    fused_permute_with_probs = None
+    fused_sort_chunks_by_index = None
+    fused_sort_chunks_by_index_with_probs = None
+    fused_unpermute = None
+    te_general_gemm = None
 
 
 # MOE logging
@@ -118,7 +122,6 @@ def sequence_load_balancing_loss_func(
     # sequence.
     if sequence_partition_group is not None:
         num_sub_sequence = sequence_partition_group.size()
-        
         seq_length *= num_sub_sequence
         probs_for_aux_loss = gather_from_sequence_parallel_region(
             probs_for_aux_loss, group=sequence_partition_group
@@ -264,7 +267,7 @@ def permute(
                                        in each column.
     """
     if fused and probs is None:
-        if not HAVE_TE or fused_permute is None:
+        if fused_permute is None:
             raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
         permuted_input, sorted_indices = fused_permute(
             tokens, routing_map, num_out_tokens=num_out_tokens
@@ -272,7 +275,7 @@ def permute(
         return permuted_input, None, sorted_indices
 
     if fused and probs is not None:
-        if not HAVE_TE or fused_permute_with_probs is None:
+        if fused_permute_with_probs is None:
             raise ValueError(
                 "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
             )
@@ -356,7 +359,7 @@ def unpermute(
         torch.Tensor: The tokens restored to their original order.
     """
     if fused:
-        if not HAVE_TE or fused_unpermute is None:
+        if fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
         return fused_unpermute(
             permuted_tokens, sorted_indices, merging_probs=probs, restore_shape=restore_shape
@@ -409,14 +412,14 @@ def sort_chunks_by_idxs(
 ):
     """Split and sort the input tensor based on the split_sizes and sorted indices."""
     if fused and probs is None:
-        if not HAVE_TE or fused_sort_chunks_by_index is None:
+        if fused_sort_chunks_by_index is None:
             raise ValueError(
                 "fused_sort_chunks_by_index is not available. Please install TE >= 2.1.0."
             )
         return fused_sort_chunks_by_index(input, split_sizes, sorted_idxs), None
 
     if fused and probs is not None:
-        if not HAVE_TE or fused_sort_chunks_by_index_with_probs is None:
+        if fused_sort_chunks_by_index_with_probs is None:
             raise ValueError(
                 "fused_sort_chunks_by_index_with_probs is not available. "
                 "Please install TE >= 2.1.0."
@@ -491,6 +494,41 @@ def group_limited_topk(
     return probs, top_indices
 
 
+def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tensor:
+    """Pad the routing map to ensure each expert has a multiple of pad_multiple tokens.
+
+    This function ensures that each expert has a number of tokens that is a multiple of
+    pad_multiple by converting some 0s to 1s in the routing map. The padding is done by
+    selecting the first N zero elements in each row, where N is the number needed to reach
+    the next multiple of pad_multiple.
+
+    Args:
+        routing_map (torch.Tensor): A boolean or integer tensor of shape [num_tokens,
+            num_experts] indicating which tokens are routed to which experts.
+        pad_multiple (int): The multiple to pad each expert's token count to.
+
+    Returns:
+        torch.Tensor: The padded routing map of shape [num_tokens, num_experts].
+    """
+    # Transpose to [num_experts, num_tokens] for easier row-wise operations
+    routing_map = routing_map.transpose(0, 1)  # [num_experts, num_tokens]
+
+    # Calculate how many tokens need to be padded for each expert
+    num_ones = routing_map.sum(dim=1)
+    num_to_pad = (-num_ones) % pad_multiple
+
+    # Find the positions of zeros in each row and their ranks
+    is_zero = routing_map == 0
+    zero_ranks = torch.cumsum(is_zero.int(), dim=1)
+
+    # Create mask for elements that need to be padded (converted from 0 to 1)
+    mask = zero_ranks <= num_to_pad.unsqueeze(1)
+    routing_map[mask] = 1
+
+    routing_map = routing_map.transpose(0, 1)
+    return routing_map
+
+
 def topk_softmax_with_capacity(
     logits: torch.Tensor,
     topk: int,
@@ -523,7 +561,6 @@ def topk_softmax_with_capacity(
         deterministic_mode (bool): Deprecated.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
-
     Returns:
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             - routing_probs (torch.Tensor): A tensor of shape [num_tokens, num_experts] containing
@@ -822,6 +859,69 @@ def apply_random_logits(logits):
     Apply the RandomSTE function to the logits.
     """
     return RandomSTE.apply(logits)
+
+
+class RouterGatingLinearFunction(torch.autograd.Function):
+    """
+    Autograd function for router gating linear.
+    """
+
+    @staticmethod
+    def forward(ctx, inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+        """
+        Forward pass of the RouterGatingLinearFunction function.
+        """
+        ctx.save_for_backward(inp, weight)
+        ctx.router_dtype = router_dtype
+        ctx.input_dtype = inp.dtype
+        ctx.weight_dtype = weight.dtype
+        inp_shape = inp.shape
+        inp = inp.view(-1, inp_shape[-1])
+
+        if te_general_gemm is not None and router_dtype != torch.float64:
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
+            output = output[0]
+        else:
+            output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+
+        output = output.view(*inp_shape[:-1], -1)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """
+        Backward pass of the RouterGatingLinearFunction function.
+        """
+        inp, weight = ctx.saved_tensors
+        inp_shape = inp.shape
+        grad_shape = grad_output.shape
+        inp = inp.view(-1, inp_shape[-1])
+        grad_output = grad_output.view(-1, grad_shape[-1])
+
+        if te_general_gemm is not None and ctx.router_dtype != torch.float64:
+            grad_input = te_general_gemm(
+                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
+            )
+            grad_weight = te_general_gemm(
+                inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
+            )
+            grad_input = grad_input[0].to(ctx.input_dtype)
+            grad_weight = grad_weight[0].to(ctx.weight_dtype)
+        else:
+            grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
+            grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
+
+        grad_input = grad_input.view(*inp_shape)
+        return grad_input, grad_weight, None
+
+
+def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+    """
+    Customized linear layer for router gating.
+    This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
+    It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
+    """
+    return RouterGatingLinearFunction.apply(inp, weight, router_dtype)
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.

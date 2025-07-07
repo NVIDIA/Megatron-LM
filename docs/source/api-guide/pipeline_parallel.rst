@@ -10,6 +10,8 @@ for the point-to-point communication that is needed between pipeline stages.
 Submodules
 ----------
 
+.. mdinclude:: pipeline_parallel_layout.md
+
 pipeline\_parallel.p2p\_communication module
 --------------------------------------------
 

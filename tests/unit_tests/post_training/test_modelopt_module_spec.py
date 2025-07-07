@@ -141,7 +141,7 @@ class TestModelOptMLAMoE(TestModelOptGPTModel):
             qk_layernorm=True,
             use_cpu_initialization=True,
         )
-        default_spec = get_gpt_decoder_block_spec(transformer_config, use_transformer_engine=True)
+        default_spec = get_gpt_decoder_block_spec(transformer_config, use_transformer_engine=HAVE_TE)
         self.default_model = GPTModel(
             config=transformer_config,
             transformer_layer_spec=default_spec,
@@ -181,7 +181,7 @@ class TestModelOptLlama4MoE(TestModelOptGPTModel):
             use_cpu_initialization=True,
         )
         default_spec = get_gpt_decoder_block_spec(
-            transformer_config, use_transformer_engine=True, qk_l2_norm=True
+            transformer_config, use_transformer_engine=HAVE_TE, qk_l2_norm=True
         )
         self.default_model = GPTModel(
             config=transformer_config,

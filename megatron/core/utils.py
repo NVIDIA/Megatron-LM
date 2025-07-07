@@ -111,8 +111,8 @@ def experimental_fn(introduced_with_version: str):
         @wraps(func)
         def wrapped_func(*args, **kwargs):
 
-            if config.ENABLE_EXPERIMENTAL is not True:
-                raise ExperimentalNotEnabledError(f"Flag {config.ENABLE_EXPERIMENTAL} not enabled.")
+            if config.is_experimental_enabled() is not True:
+                raise ExperimentalNotEnabledError(f"Flag config.ENABLE_EXPERIMENTAL not enabled.")
 
             logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
 
@@ -180,11 +180,11 @@ def experimental_cls(introduced_with_version: str):
                     Attribute of callee.
                 """
                 if attr == "is_experimental":
-                    return config.ENABLE_EXPERIMENTAL
+                    return config.is_experimental_enabled()
 
-                if config.ENABLE_EXPERIMENTAL is not True:
+                if config.is_experimental_enabled() is not True:
                     raise ExperimentalNotEnabledError(
-                        f"Flag {config.ENABLE_EXPERIMENTAL} not enabled."
+                        f"Flag config.ENABLE_EXPERIMENTAL not enabled."
                     )
 
                 logger.info("Setting ENABLE_EXPERIMENTAL=True will run experimental code.")
@@ -370,6 +370,34 @@ def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_ini
                 check_initialized=check_initialized
             )
     return tp_group
+
+
+def get_pg_size(group=None):
+    """Get world size for a distributed group.
+
+    Args:
+        group: Process group to get world size for. If None, uses default group.
+
+    Returns:
+        int: World size (1 if distributed not initialized or group is None, else group.size())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 1
+    return group.size()
+
+
+def get_pg_rank(group=None):
+    """Get rank for a distributed group.
+
+    Args:
+        group: Process group to get rank for. If None, uses default group.
+
+    Returns:
+        int: Rank (0 if distributed not initialized or group is None, else group.rank())
+    """
+    if not torch.distributed.is_initialized() or group is None:
+        return 0
+    return group.rank()
 
 
 def get_attr_wrapped_model(model, attr, allow_none=True, return_model_obj=False):
@@ -562,7 +590,7 @@ def scaled_init_method_normal(sigma, num_layers, multiplier=2.0):
 
 
 def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
-    """If torch distributed is initialized, log only on rank
+    """If torch distributed is initialized, write log on only one rank
 
     Args:
         logger (logging.Logger): The logger to write the logs
@@ -658,8 +686,7 @@ def check_param_hashes_across_dp_replicas(
 
         local_param_hashes = torch.stack(local_param_hashes).to(device=get_current_device()) if not xm else torch.stack(local_param_hashes).cpu()
         all_param_hashes = [
-            torch.zeros_like(local_param_hashes)
-            for _ in range(torch.distributed.get_world_size(all_gather_group))
+            torch.zeros_like(local_param_hashes) for _ in range(all_gather_group.size())
         ]
         torch.distributed.all_gather(all_param_hashes, local_param_hashes, group=all_gather_group)
 
@@ -722,7 +749,7 @@ def make_tp_sharded_tensor_for_checkpoint(
 
     if hasattr(tensor, 'fully_shard_param_local_shard'):
         assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
-        replica_id = (*replica_id[:2], 0)
+        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
 
         sh_ten = ShardedTensor.from_rank_offsets_flat(
             key,
@@ -777,7 +804,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     if hasattr(tensor, 'fully_shard_param_local_shard'):
         assert len(replica_id) == 3, f'Expected replica_id format (PP, TP, DP), got: {replica_id}'
-        replica_id = (*replica_id[:2], 0)
+        replica_id = (*replica_id[:2], tensor.fsdp_instance_id)
 
         sh_ten = ShardedTensor.from_rank_offsets_flat(
             key,
@@ -1840,48 +1867,6 @@ def configure_nvtx_profiling(enabled: bool) -> None:
     _nvtx_enabled = enabled
 
 
-def _nvtx_range_push(msg: str) -> None:
-    """Push NVTX range onto stack, if NVTX range profiling is enabled.
-
-    Args:
-        msg (str): Message to associate with range
-
-    Note:
-        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
-    """
-    if not _nvtx_enabled:
-        return
-    _nvtx_range_messages.append(msg)
-    torch.cuda.nvtx.range_push(msg)
-
-
-def _nvtx_range_pop(msg: Optional[str] = None) -> None:
-    """Pop NVTX range from stack, if NVTX range profiling is enabled.
-
-    Args:
-        msg (str, optional): Message associated with range
-
-    Note:
-        Set `MEGATRON_NVTX_ENABLED=1` in the environment to enable NVTX range profiling.
-    """
-    # Return immediately if NVTX range profiling is not enabled
-    if not _nvtx_enabled:
-        return
-
-    # Update list of NVTX range messages and check for consistency
-    if not _nvtx_range_messages:
-        raise RuntimeError("Attempted to pop NVTX range from empty stack")
-    last_msg = _nvtx_range_messages.pop()
-    if msg is not None and msg != last_msg:
-        raise ValueError(
-            f"Attempted to pop NVTX range from stack with msg={msg}, "
-            f"but last range has msg={last_msg}"
-        )
-
-    # Pop NVTX range
-    torch.cuda.nvtx.range_pop()
-
-
 def _nvtx_range_get_func_path():
     """Get the path of a function. Assumes being called from nvtx_range_push/pop.
 
@@ -1903,12 +1888,19 @@ def nvtx_range_push(msg=None, suffix=None) -> None:
         msg (str, optional): Message to associate with range
         suffix (str, optional): Suffix to append to the message
     """
+    if not _nvtx_enabled:
+        return
+
     if msg is None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
 
-    _nvtx_range_push(msg)
+    # Track messages to ensure consistency when popping
+    _nvtx_range_messages.append(msg)
+
+    # Push NVTX range
+    torch.cuda.nvtx.range_push(msg)
 
 
 def nvtx_range_pop(msg=None, suffix=None) -> None:
@@ -1918,12 +1910,26 @@ def nvtx_range_pop(msg=None, suffix=None) -> None:
         msg (str, optional): Message to associate with range
         suffix (str, optional): Suffix to append to the message
     """
+    if not _nvtx_enabled:
+        return
+
     if msg is None:
         msg = _nvtx_range_get_func_path()
     if suffix is not None:
         msg = f"{msg}.{suffix}"
 
-    _nvtx_range_pop(msg)
+    # Update list of NVTX range messages and check for consistency
+    if not _nvtx_range_messages:
+        raise RuntimeError("Attempted to pop NVTX range from empty stack")
+    last_msg = _nvtx_range_messages.pop()
+    if msg is not None and msg != last_msg:
+        raise ValueError(
+            f"Attempted to pop NVTX range from stack with msg={msg}, "
+            f"but last range has msg={last_msg}"
+        )
+
+    # Pop NVTX range
+    torch.cuda.nvtx.range_pop()
 
 
 @lru_cache(maxsize=None)

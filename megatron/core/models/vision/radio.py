@@ -90,7 +90,11 @@ class RADIOViTModel(VisionModule):
         self.class_token_len = class_token_len
         if self.add_class_token:
             self.class_token = nn.Parameter(
-                torch.randn(self.class_token_len, self.visual_hidden_size)
+                torch.randn(
+                    self.class_token_len,
+                    self.visual_hidden_size,
+                    dtype=transformer_config.params_dtype,
+                )
             )
 
         self.seq_length = (img_h // self.patch_dim) * (img_w // self.patch_dim) + (
@@ -99,7 +103,13 @@ class RADIOViTModel(VisionModule):
 
         pos_scale = self.visual_hidden_size**-0.5
         self.position_embeddings = nn.Parameter(
-            torch.randn(1, self.max_num_patches, self.visual_hidden_size) * pos_scale
+            torch.randn(
+                1,
+                self.max_num_patches,
+                self.visual_hidden_size,
+                dtype=transformer_config.params_dtype,
+            )
+            * pos_scale
         )
         self.pos_dropout = pos_dropout
         self.has_cpe = has_cpe

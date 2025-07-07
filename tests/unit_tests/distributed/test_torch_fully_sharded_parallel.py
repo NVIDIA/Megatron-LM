@@ -51,7 +51,7 @@ def init_model_parallel():
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
 
-#@pytest.mark.skipif(xm, reason="XLA FSDP requires FP 32")
+@pytest.mark.skipif(xm, reason="XLA not supported for this test")
 def test_fsdp2_constructor(init_model_parallel):
     """Test the FSDP2 constructor."""
     if not is_torch_min_version("2.4.0"):
@@ -81,6 +81,7 @@ def test_fsdp2_constructor(init_model_parallel):
         # Conv2d is not in the list of submodules to wrap.
         assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
 
+@pytest.mark.skipif(xm, reason="XLA not supported for this test")
 def test_fsdp2_constructor_with_process_group(init_model_parallel):
     """Test the FSDP2 constructor with explicit process group parameter."""
     if not is_torch_min_version("2.4.0"):

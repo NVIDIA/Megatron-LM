@@ -33,6 +33,22 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
+    
+    # Deprecation warning for encoder pipeline parallelism
+    if args.encoder_pipeline_model_parallel_size > 0 or args.encoder_tensor_model_parallel_size > 0:
+        warnings.warn(
+            "Encoder-specific pipeline parallelism functionality is deprecated and will be removed in core_r0.14.0. "
+            "This includes the parameters 'encoder_tensor_model_parallel_size' and 'encoder_pipeline_model_parallel_size', "
+            "as well as all associated encoder pipeline parallel logic and infrastructure. "
+            "This functionality is being replaced by the new 'orthotope' parallelism management system, which provides "
+            "a more general and flexible approach to handling complex parallelism configurations including encoder-decoder models. "
+            "Please refrain from building new features or dependencies on encoder pipeline parallelism as this entire "
+            "capability will not be supported in future releases. For migration guidance and information on the orthotope "
+            "system, please refer to the Megatron-LM documentation.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    
     assert args.encoder_pipeline_model_parallel_size <= 1, "LLaVA does not support pp>1 for encoder on it's own pipeline rank"
 
     use_te = args.use_te
@@ -117,7 +133,7 @@ def model_provider(
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
-    if vision_model_type in ["clip", "siglip", "radio"]:
+    if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
         if use_te:
             vision_transformer_layer_spec = get_layer_spec_te(
                 is_vit=True

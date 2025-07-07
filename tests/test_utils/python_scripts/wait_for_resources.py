@@ -6,6 +6,7 @@ import time
 
 import click
 import gitlab
+import requests
 
 PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 GITLAB_ENDPOINT = os.getenv("GITLAB_ENDPOINT")
@@ -48,8 +49,17 @@ def main(pipeline_id):
     pipeline = get_gitlab_handle().projects.get(PROJECT_ID).pipelines.get(pipeline_id)
     logger.info(f"Job concurrency: {NUM_CONCURRENT_JOBS}")
 
-    while ci_is_busy(pipeline):
-        time.sleep(60)
+    while True:
+        try:
+            is_busy = ci_is_busy(pipeline)
+            if not is_busy:
+                break
+            time.sleep(60)
+
+        except requests.exceptions.ConnectionError as e:
+            logger.info(f"Network error. Retrying... {e}")
+            time.sleep(15)
+            continue
 
 
 if __name__ == "__main__":

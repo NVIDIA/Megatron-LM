@@ -52,6 +52,7 @@ class MegatronCompletions(Resource):
             "prompts": prompts,
             "tokens_to_generate": int(req["max_tokens"]),
             "temperature": float(req.get("temperature", 1.0)),
+            "top_k_sampling": int(req.get("top_k", 0)),
             "top_p_sampling": float(req.get("top_p", 1.0)),
             "return_topk_logprobs": int(req.get("logprobs", 0)),
             "echo": bool(req.get("echo", False)),
@@ -93,23 +94,37 @@ class MegatronCompletions(Resource):
         with LOCK:
             send_do_generate()
 
-            result = generate_and_post_process(
-                self.engine.text_generation_controller.inference_wrapped_model.model,
-                self.engine.text_generation_controller.inference_wrapped_model.inference_context,
-                add_BOS=False,
-                use_eod_token_for_early_termination=True,
-                stop_on_double_eol=True,
-                stop_on_eol=False,
-                prevent_newline_after_colon=False,
-                **local_kwargs,
+            temperature = local_kwargs["temperature"]
+            top_k = local_kwargs["top_k_sampling"]
+            top_p = local_kwargs["top_p_sampling"]
+            tokens_to_generate = local_kwargs["tokens_to_generate"]
+            logprobs = local_kwargs["return_output_log_probs"]
+            top_n_logprobs = local_kwargs["return_topk_logprobs"]
+            response_dict = run_mcore_engine(
+                self.engine,
+                prompts,
+                temperature,
+                top_k,
+                top_p,
+                logprobs,
+                tokens_to_generate,
+                top_n_logprobs=top_n_logprobs,
+                echo=echo,
             )
+            result = [
+                response_dict["text"],
+                response_dict["segments"],
+                response_dict.get("logprobs", None),
+                response_dict["tokens"],
+            ]
+            result.append(response_dict.get("top_n_logprobs", None))
 
         prompts_plus_generations, prompts_plus_generations_segments = result[:2]
         output_log_probs, tokens = result[2:4]
+        logprobs_topk = result[4]
 
-        logprobs_topk, logprobs_topk_indices = None, None
-        if len(result) > 4:
-            logprobs_topk, logprobs_topk_indices = result[4]
+        if top_n_logprobs > 0:
+            assert logprobs_topk is not None
 
         if "debug_fname" in req:
             torch.save(
@@ -121,28 +136,11 @@ class MegatronCompletions(Resource):
                     "output_log_probs": output_log_probs,
                     "tokens": tokens,
                     "logprobs_topk": logprobs_topk,
-                    "logprobs_topk_indices": logprobs_topk_indices,
                 },
                 f"completions_result_{req['debug_fname']}.pt",
             )
 
         batch_size = len(tokens)
-        ret_topk_logprobs = [[None] for _ in range(batch_size)]
-        if local_kwargs["return_topk_logprobs"] > 0:
-            assert echo, "echo=False not supported when return_topk_logprobs > 0"
-            logprobs_topk_indices = logprobs_topk_indices.cpu().numpy().tolist()
-            logprobs_topk = logprobs_topk.cpu().numpy().tolist()
-
-            for batch_idx, segmented_response in enumerate(prompts_plus_generations_segments):
-                for t, _ in enumerate(segmented_response):
-                    ret_topk_logprobs[batch_idx].append(
-                        {
-                            tokenizer.detokenize([tk]): tk_ll
-                            for tk, tk_ll in zip(
-                                logprobs_topk_indices[batch_idx][t], logprobs_topk[batch_idx][t]
-                            )
-                        }
-                    )
 
         results = []
         for batch_idx, (prompt_plus_generation, prompt) in enumerate(
@@ -161,7 +159,9 @@ class MegatronCompletions(Resource):
                 for suffix in stop_until
                 if suffix and suffix in prompt_plus_generation
             ]
-            str_trunc_end_idx = min(filter(lambda x: x != -1, trunc_idxs), default=len(prompt_plus_generation))
+            str_trunc_end_idx = min(
+                filter(lambda x: x != -1, trunc_idxs), default=len(prompt_plus_generation)
+            )
             truncated_generation = prompt_plus_generation[str_trunc_start_idx:str_trunc_end_idx]
 
             # TODO(sasatheesh): handle cases where truncated_generation is not a full token
@@ -169,9 +169,12 @@ class MegatronCompletions(Resource):
 
             truncated_generation_logprobs = output_log_probs[batch_idx][tok_idx_start:tok_idx_end]
             truncated_generation_tokens = tokens[batch_idx][tok_idx_start:tok_idx_end]
-            truncated_generation_topk_logprobs = ret_topk_logprobs[batch_idx][
-                tok_idx_start:tok_idx_end
-            ]
+            truncated_generation_topk_logprobs = (
+                logprobs_topk[batch_idx][tok_idx_start:tok_idx_end]
+                if logprobs_topk is not None
+                else None
+            )
+
             truncated_generation_tok_offsets = tok_offsets[tok_idx_start:tok_idx_end]
 
             results.append(
@@ -180,9 +183,11 @@ class MegatronCompletions(Resource):
                     "text": truncated_generation,
                     "logprobs": {
                         "token_logprobs": [None] + truncated_generation_logprobs,
-                        "tokens": [tokenizer.detokenize([tk]) for tk in truncated_generation_tokens],
+                        "tokens": [
+                            tokenizer.detokenize([tk]) for tk in truncated_generation_tokens
+                        ],
                         "text_offset": truncated_generation_tok_offsets,
-                        "top_logprobs": truncated_generation_topk_logprobs,
+                        "top_logprobs": [None] + truncated_generation_topk_logprobs if truncated_generation_topk_logprobs is not None else None,
                     },
                 }
             )

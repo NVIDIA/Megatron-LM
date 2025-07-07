@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import traceback
 import torch
 
 from megatron.core.device_utils import get_current_device, get_current_device_type, get_xla_model

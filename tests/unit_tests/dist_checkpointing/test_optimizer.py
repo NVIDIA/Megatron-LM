@@ -2,7 +2,6 @@
 from copy import deepcopy
 from functools import partial
 from time import sleep
-import traceback
 from unittest import mock
 
 import pytest

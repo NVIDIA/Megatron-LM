@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""Pretrain GPT."""
+"""Pretrain and SFT GPT."""
 
 from functools import partial
 from typing import List, Optional, Tuple, Union
@@ -40,6 +40,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
 )
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+from megatron.training.datasets.sft_dataset import SFTDataset
 
 import megatron.legacy.model  # isort: skip
 
@@ -56,7 +57,13 @@ except ImportError:
 
 stimer = StragglerDetector()
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
 
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+    
 def model_provider(
     pre_process=True, post_process=True, vp_stage: Optional[int] = None
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
@@ -77,7 +84,7 @@ def model_provider(
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
         return model_provider_modelopt(pre_process, post_process)
 
-    use_te = args.transformer_impl == "transformer_engine"
+    use_te = (args.transformer_impl == "transformer_engine") and HAVE_TE
 
     if args.record_memory_history and torch.cuda.is_available():
         torch.cuda.memory._record_memory_history(True,
@@ -135,7 +142,8 @@ def model_provider(
                         args.qk_layernorm,
                         args.multi_latent_attention,
                         args.moe_use_legacy_grouped_gemm,
-                        qk_l2_norm=args.qk_l2_norm
+                        qk_l2_norm=args.qk_l2_norm,
+                        use_kitchen=config.use_kitchen,
                     )
                 else:
                     transformer_layer_spec = get_gpt_layer_local_spec(
@@ -145,11 +153,12 @@ def model_provider(
                         args.multi_latent_attention,
                         args.moe_use_legacy_grouped_gemm,
                         normalization=args.normalization,
+                        use_kitchen=config.use_kitchen,
                     )
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, transformer_layer_spec, use_transformer_engine=use_te
+                config, transformer_layer_spec, use_transformer_engine=use_te, vp_stage=vp_stage
             )
 
         model = GPTModel(
@@ -330,10 +339,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.mock_data:
-        dataset_type = MockGPTDataset
+    if args.sft:
+        dataset_type = SFTDataset
     else:
-        dataset_type = GPTDataset
+        if args.mock_data:
+            dataset_type = MockGPTDataset
+        else:
+            dataset_type = GPTDataset
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 

@@ -166,7 +166,7 @@ def get_retro_decoder_block_spec(
     retro_layer_numbers = list(range(retro_layer_start, num_layers + 1, 3))
 
     # Layer specs.
-    gpt_layer_spec = (
+    gpt_te_spec = (
         get_gpt_layer_with_transformer_engine_spec()
         if use_transformer_engine
         else get_gpt_layer_local_spec()
@@ -188,7 +188,7 @@ def get_retro_decoder_block_spec(
         elif layer_number in retro_layer_numbers:
             layer_specs.append(retro_layer_spec)
         else:
-            layer_specs.append(gpt_layer_spec)
+            layer_specs.append(gpt_te_spec)
 
     # Block spec.
     block_spec = TransformerBlockSubmodules(layer_specs=layer_specs)

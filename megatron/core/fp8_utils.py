@@ -8,6 +8,7 @@ import torch
 from packaging.version import Version as PkgVersion
 
 from megatron.core.device_utils import get_current_device
+from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_te_version, is_te_min_version
 
@@ -35,6 +36,16 @@ except (ImportError, ModuleNotFoundError):
     # FP8 tensor class not found
     pass
 
+# Check if Transformer Engine has MXFP8Tensor class
+HAVE_TE_MXFP8TENSOR = False
+try:
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    HAVE_TE_MXFP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    # MXFP8Tensor not found
+    pass
+
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine Float8Tensor.
@@ -48,12 +59,25 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
     return HAVE_TE_FP8_TENSOR_CLASS and isinstance(tensor, FP8_TENSOR_CLASS)
 
 
+def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine MXFP8Tensor"""
+    return HAVE_TE_MXFP8TENSOR and isinstance(tensor, MXFP8Tensor)
+
+
 def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
     """Dequantize a fp8 tensor to a higher precision tensor."""
     if is_te_min_version("2.0"):
         return fp8_tensor.dequantize()
     else:
         return fp8_tensor.from_float8()
+
+
+def get_fp8_align_size(fp8_recipe: Fp8Recipe) -> int:
+    """Get the alignment size required for fp8 GEMM."""
+    if fp8_recipe == Fp8Recipe.mxfp8:
+        return 32
+    else:
+        return 16
 
 
 """
@@ -344,7 +368,6 @@ def correct_amax_history_if_needed(model: List[torch.nn.Module]):
 
 if HAVE_TE:
     from megatron.core import parallel_state
-    from megatron.core.enums import Fp8Recipe
     from megatron.core.extensions.transformer_engine import TEDelayedScaling
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
@@ -362,6 +385,7 @@ if HAVE_TE:
             We return nullcontext() when: a) not using fp8 to train, b) layer_no is a layer
             that needs to be trained in bf16.
         """
+
         num_bf16_layers_at_start = (
             config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
         )
@@ -455,7 +479,7 @@ if HAVE_TE:
                 if "preserve_high_precision_init_val" in (
                     inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
                 ):
-                    context_args["preserve_high_precision_init_val"] = True
+                    context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
                 fp8_context = transformer_engine.pytorch.fp8_model_init(**context_args)
 
             # First / last layer in bf16 isn't supported with delayed scaling since it

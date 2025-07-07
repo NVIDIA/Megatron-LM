@@ -13,7 +13,6 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
-
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.device_utils import get_current_device, get_current_device_type
 
@@ -28,14 +27,16 @@ except ImportError:
 class TestParallelAttention:
 
     def setup_method(self, method):
-        Utils.initialize_model_parallel(1,1)
+        Utils.initialize_model_parallel(1, 1)
         model_parallel_device_manual_seed(123)
-        self.transformer_config = TransformerConfig(num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True)
-        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
-        self.parallel_attention = SelfAttention(self.transformer_config,
-                                                transformer_layer_spec.submodules.self_attention.submodules,
-                                                layer_number=1)
-
+        self.transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+        )
+        self.parallel_attention = SelfAttention(
+            self.transformer_config,
+            get_gpt_layer_with_transformer_engine_spec().submodules.self_attention.submodules,
+            layer_number=1,
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -45,7 +46,7 @@ class TestParallelAttention:
         assert self.parallel_attention.layer_number == 1
 
         num_weights = sum([p.numel() for p in self.parallel_attention.parameters()])
-        assert num_weights == 648
+        assert num_weights == 66304
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -60,8 +61,10 @@ class TestParallelAttention:
         self.parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
-        hidden_states = hidden_states.to(device=get_current_device())
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+        )
+        hidden_states = hidden_states.to(get_current_device())
 
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).to(get_current_device())
 
@@ -82,8 +85,10 @@ class TestParallelAttention:
         self.parallel_attention.to(device=get_current_device())
 
         # [sequence length, batch size, hidden size]
-        hidden_states = torch.ones((sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size))
-        hidden_states = hidden_states.to(device=get_current_device())
+        hidden_states = torch.ones(
+            (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+        )
+        hidden_states = hidden_states.to(get_current_device())
 
         attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).to(get_current_device())
         rotary_pos_emb = torch.ones(
@@ -118,7 +123,8 @@ class TestParallelAttention:
 
         # [sequence length, batch size, hidden size]
         hidden_states = torch.ones(
-            (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size)
+            (sequence_length, micro_batch_size, checkpointed_parallel_attention.config.hidden_size),
+            dtype=torch.bfloat16,
         )
         hidden_states = hidden_states.to(device=get_current_device())
 
@@ -143,8 +149,13 @@ class TestSelfAttention:
         Utils.destroy_model_parallel()
 
     def run_self_attention(self, model_comm_pgs):
+        tensor_model_parallel_size = torch.distributed.get_world_size(model_comm_pgs.tp)
         self.transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=128, num_attention_heads=4, use_cpu_initialization=False
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            use_cpu_initialization=False,
         )
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec() if HAVE_TE else get_gpt_layer_local_spec()
         self.self_attention = SelfAttention(
@@ -177,7 +188,6 @@ class TestSelfAttention:
         assert bias.shape[0] == config.hidden_size
 
     @pytest.mark.internal
-    @pytest.mark.flaky
     def test_self_attention_mpu(self):
 
         tp_size = 4
@@ -200,7 +210,6 @@ class TestSelfAttention:
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
-    @pytest.mark.flaky
     @pytest.mark.internal
     def test_self_attention_independent_pg_smoke(self):
 
@@ -213,7 +222,7 @@ class TestSelfAttention:
 
         # Create device mesh for TP and CP groups
         device_mesh = torch.distributed.init_device_mesh(
-            get_current_device_type(), (tp_size, cp_size), mesh_dim_names=("tp", "cp")
+            "cuda", (tp_size, cp_size), mesh_dim_names=("tp", "cp")
         )
         # Get TP and CP process groups from device mesh
         tp_group = device_mesh.get_group(mesh_dim="tp")

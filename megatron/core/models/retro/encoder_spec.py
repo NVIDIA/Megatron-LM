@@ -147,7 +147,7 @@ def get_retro_encoder_block_spec(
     retro_layer_numbers = [1]
 
     # Layer specs.
-    gpt_layer_spec = (
+    gpt_te_spec = (
         get_gpt_layer_with_transformer_engine_spec()
         if use_transformer_engine
         else get_gpt_layer_local_spec()
@@ -158,7 +158,7 @@ def get_retro_encoder_block_spec(
         else get_retro_encoder_layer_local_spec
     )
     retro_layer_spec = get_retro_encoder_layer_spec()
-    for spec in (gpt_layer_spec, retro_layer_spec):
+    for spec in (gpt_te_spec, retro_layer_spec):
         spec.params["hidden_dropout"] = config.retro_encoder_hidden_dropout
         spec.submodules.self_attention.params["attn_mask_type"] = AttnMaskType.padding
         spec.submodules.self_attention.submodules.core_attention = ModuleSpec(
@@ -171,7 +171,7 @@ def get_retro_encoder_block_spec(
         if layer_number in retro_layer_numbers:
             layer_specs.append(retro_layer_spec)
         else:
-            layer_specs.append(gpt_layer_spec)
+            layer_specs.append(gpt_te_spec)
 
     # Block spec.
     block_spec = TransformerBlockSubmodules(layer_specs=layer_specs)

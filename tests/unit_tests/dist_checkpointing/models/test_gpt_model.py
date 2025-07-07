@@ -4,9 +4,9 @@ import pytest
 import torch
 
 from megatron.core import parallel_state as ps
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec as gpt_local_spec
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
+    get_gpt_layer_local_spec as gpt_local_spec
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,7 +24,11 @@ try:
 except ImportError:
     HAVE_TE = False
 
-def initialize_gpt_model(seed, layer_spec_fn=gpt_te_spec if HAVE_TE else gpt_local_spec, vocab_size=128, **config_kwargs):
+def initialize_gpt_model(
+    seed, 
+    layer_spec_fn=gpt_te_spec if HAVE_TE else gpt_local_spec, 
+    vocab_size=128, 
+    **config_kwargs):
     torch.manual_seed(seed)
     model_parallel_device_manual_seed(seed)
 

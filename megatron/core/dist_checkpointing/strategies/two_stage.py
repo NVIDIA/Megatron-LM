@@ -108,7 +108,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         self.dp_group_ranks = tuple(
             sorted(torch.distributed.get_process_group_ranks(data_parallel_group))
         )
-        self.dp_group_rank = torch.distributed.get_rank(self.data_parallel_group_orig)
+        self.dp_group_rank = self.data_parallel_group_orig.rank()
         self.global_rank = torch.distributed.get_rank()
 
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
@@ -162,7 +162,7 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
             gloo_pg = torch.distributed.new_group(ranks=group_ranks, backend='gloo')
             if self.global_rank in group_ranks:
                 self.data_parallel_group = gloo_pg
-                assert self.dp_group_rank == torch.distributed.get_rank(self.data_parallel_group)
+                assert self.dp_group_rank == self.data_parallel_group.rank()
 
     def check_backend_compatibility(self, loaded_version):
         pass  # TODO
@@ -187,11 +187,12 @@ class TwoStageDataParallelLoadShardedStrategy(LoadShardedStrategy):
         xm = get_xla_model()
         if xm:
             assert self.data_parallel_group_gloo is not None
-            all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group_gloo)
+            all_meta = [None] * self.data_parallel_group_gloo.size()
             torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group_gloo)
         else:
-            all_meta = [None] * torch.distributed.get_world_size(group=self.data_parallel_group)
+            all_meta = [None] * self.data_parallel_group.size()
             torch.distributed.all_gather_object(all_meta, local_meta, group=self.data_parallel_group)
+        
         all_meta = list(chain.from_iterable(all_meta))
         all_tensors_sorted = self.deduplicate_chunks(all_meta)
         return all_tensors_sorted

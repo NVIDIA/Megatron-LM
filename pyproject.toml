@@ -1,17 +1,25 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 [build-system]
-requires = [
-    "setuptools",
-    "pybind11",
-]
+requires = ["setuptools<80.0.0", "pybind11"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["megatron.core", "megatron.core.*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "megatron.core.package_info.__version__" }
+readme = { file = "README.md", content-type = "text/markdown" }
 
 [project]
 name = "megatron-core"
-dynamic = ["dependencies", "version"]
+dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
-readme = "README.md"
-license = {file = "LICENSE"}
+requires-python = ">=3.10"
+license = { text = "Apache 2.0" }
+dependencies = ["torch"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -53,12 +61,69 @@ classifiers = [
 Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM/megatron/core"
 
+[project.optional-dependencies]
+mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb"]
+
+dev = [
+    "tqdm",
+    "einops",
+    "tensorstore!=0.1.46,!=0.1.72",
+    "nvtx",
+    "numpy<2.0.0",
+    "transformers",
+    "multi-storage-client",
+    "setuptools<80.0.0",
+]
+
+lts = [
+    "tqdm",
+    "einops",
+    "tensorstore!=0.1.46,!=0.1.72",
+    "nvtx",
+    "numpy<2.0.0",
+    "transformers",
+    "zarr",
+    "setuptools<80.0.0",
+]
+
+[dependency-groups]
+test = [
+    "nltk",
+    "wrapt",
+    "pytest",
+    "pytest-mock",
+    "pytest-cov",
+    "pytest-random-order",
+]
+
+build = [
+    "setuptools<80.0.0",
+    "packaging",
+    "hatchling",
+    "pybind11",
+    "Cython>=3.0.0",
+]
+linting = ["ruff~=0.9.0"]
+
+[tool.uv]
+default-groups = ["linting", "build", "test"]
+
+link-mode = "copy"
+conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
+# We don't want to install torch, torchvision, and triton 
+# because they are already installed in the base image.
+override-dependencies = [
+    "torch; sys_platform == 'never'",
+    "torchvision; sys_platform == 'never'",
+    "triton; sys_platform == 'never'",
+]
+
 [tool.isort]
-profile = "black"  # black-compatible
-line_length = 100  # should match black parameters
-py_version = 310  # python 3.8 as a target version
-known_first_party = ["megatron"]  # FIRSTPARTY section
-known_third_party = ["transformer_engine"]  # THIRDPARTY section
+profile = "black"                                                          # black-compatible
+line_length = 100                                                          # should match black parameters
+py_version = 310                                                           # python 3.8 as a target version
+known_first_party = ["megatron"]                                           # FIRSTPARTY section
+known_third_party = ["transformer_engine"]                                 # THIRDPARTY section
 sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
 default_section = "THIRDPARTY"
 extend_skip = ["setup.py"]
@@ -68,5 +133,59 @@ line_length = 100
 skip_string_normalization = true
 # recongized by future versions, disallows to reformat code with incompatible versions
 # Matches NeMO version so people working on both codebases don't need two different version of black installed
-required_version = "24"  
+required_version = "24"
 skip_magic_trailing_comma = true
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.venv
+  | build
+)/
+'''
+
+[tool.pytest.ini_options]
+addopts = "--durations=15 -s -rA -x"
+testpaths = ["tests"]
+python_files = "test_*.py"
+markers = [
+    "internal = mark a test as a test to private/internal functions.",
+    "flaky = mark flaky tests for LTS environment",
+    "flaky_in_dev = mark flaky tests for DEV environment",
+]
+
+[tool.coverage.run]
+data_file = ".coverage_$LOCAL_RANK"
+concurrency = ["thread", "multiprocessing"]
+omit = [
+    "/tmp/*",
+    "/workspace/tests/*",
+    "/usr/local/lib/python3.12/dist-packages/*",
+]
+relative_files = true
+
+[tool.coverage.paths]
+source = ["/opt/megatron-lm/"]
+
+[tool.ruff.lint]
+# Enable all `pydocstyle` rules, limiting to those that adhere to the
+# Google convention via `convention = "google"`, below.
+select = ["D", "F"]
+
+# - On top of the Google convention, disable `D417`, which requires
+#   documentation for every function parameter.
+# - F841: local variable assigned but never used (exluced to favor readability)
+# TODO: Remove D10 once we are about to release to get all the docstrings written
+ignore = ["D417", "D10", "F841"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# Section to exclude errors for different file types
+[tool.ruff.per-file-ignores]
+# Ignore all directories named `tests`.
+"tests/**" = ["D"]
+# Ignore all files that end in `_test.py`.
+"*_test.py" = ["D"]
+# Ignore F401 (import but unused) in __init__.py
+"__init__.py" = ["F401"]

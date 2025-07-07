@@ -8,7 +8,7 @@ from megatron.training.utils import print_rank_last
 
 
 def _get_wandb_artifact_tracker_filename(save_dir: str) -> Path:
-    """Wandb artifact tracker file rescords the latest artifact wandb entity and project"""
+    """Wandb artifact tracker file records the latest artifact wandb entity and project"""
     return Path(save_dir) / "latest_wandb_artifact_path.txt"
 
 

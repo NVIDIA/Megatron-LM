@@ -22,6 +22,13 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_block import TransformerBlock
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+    
 @pytest.mark.skip(reason="upstream issues")
 class TestRetroAttention:
 
@@ -90,7 +97,7 @@ class TestRetroAttention:
     def test_constructor(self):
 
         config = self.get_config()
-        modules = self.get_modules(config, use_transformer_engine=True, use_gpu=False)
+        modules = self.get_modules(config, use_transformer_engine=HAVE_TE, use_gpu=False)
 
         assert isinstance(modules.decoder_attn, RetroDecoderCrossAttention)
         assert isinstance(modules.decoder_bda, RetroDecoderBiasDropoutAdd)

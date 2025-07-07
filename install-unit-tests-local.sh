@@ -26,4 +26,6 @@ pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git@87
 pip3 install multi-storage-client==0.20.3
 pip3 install pybind11==2.13.6
 pip3 install transformers==4.47.1
+pip3 install boto3==1.38.45
+pip3 install absl-py==2.1.0
 

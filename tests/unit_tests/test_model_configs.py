@@ -8,7 +8,7 @@ YAML_DIR = pathlib.Path(__file__).parent / ".." / "functional_tests" / "test_cas
 
 def get_yaml_files(directory):
     """Retrieve all YAML files from the specified directory."""
-    return list([file for file in directory.rglob("*.yaml") if file is not None])
+    return list([file for file in directory.rglob("model_config.yaml") if file is not None])
 
 
 def load_yaml(file_path):

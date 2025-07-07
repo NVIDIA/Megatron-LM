@@ -312,6 +312,9 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
+    delay_wgrad_compute: bool = False
+    """If true, delay the wgrad compute for better overlapping in combined 1F1B."""
+
     ###################
     # CPU Offloading
     ###################

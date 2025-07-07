@@ -405,7 +405,10 @@ def main(
             except Exception as e:
                 logger.error(e)
                 no_log = True
+                n_download_attempt += 1
                 break
+            
+            n_download_attempt += 1
 
         if no_log:
             logger.error("Did not find any logs to download, retry.")
@@ -472,6 +475,7 @@ def main(
                 or "torch.distributed.DistNetworkError" in concat_allranks_logs
                 or "Segmentation fault" in concat_allranks_logs
                 or "found NaN in local forward loss calculation" in concat_allranks_logs
+                or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
             ):
                 logger.error("Detected NCCL failure, attempt restart.")
                 n_attempts += 1

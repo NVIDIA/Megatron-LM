@@ -1,15 +1,16 @@
+import traceback
 import pytest
 import torch
 
 from megatron.core import ModelParallelConfig, parallel_state
-from megatron.core.device_utils import get_current_device
+from megatron.core.device_utils import get_current_device, get_xla_model
 from megatron.core.distributed.finalize_model_grads import _allreduce_conditional_embedding_grads
 from tests.unit_tests.test_utilities import Utils
 
-rank = Utils.rank
+xm = get_xla_model()
 
+@pytest.mark.skipif(xm, reason="Test not supported for XLA")
 def test_allreduce_conditional_embedding_grads():
-
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=4)
 
     # For virtual pipeline parallelism.

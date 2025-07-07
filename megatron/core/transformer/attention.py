@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import NoReturn, Optional, Tuple, Union
 
 from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
@@ -615,16 +615,16 @@ class Attention(MegatronModule, ABC):
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
 
+        in_decode_mode = (
+            inference_context is not None
+            and inference_context.is_decode_only()
+            and not self.training
+        )
+
         # This branch only runs in the decode phase of flash decoding and returns after the linear
         # projection. This conditional is not used in the prefill phase or non-flash-decoding cases.
         nvtx_range_push(suffix="adjust_key_value")
-        if (
-            self.config.flash_decode
-            and inference_context is not None
-            and inference_context.is_decode_only()
-            and not self.training
-            and rotary_pos_cos is not None
-        ):
+        if in_decode_mode and self.config.flash_decode:
             assert self.layer_number in inference_context.key_value_memory_dict
             assert inference_context.sequence_len_offset is not None
             inference_key_memory, inference_value_memory = inference_context.key_value_memory_dict[
@@ -645,6 +645,13 @@ class Attention(MegatronModule, ABC):
             context_layer = out.view(out.size(0), out.size(1), -1)
             output, bias = self.linear_proj(context_layer)
             return output, bias
+
+        if (
+            in_decode_mode
+            and self.config.enable_cuda_graph
+            and inference_context.is_static_batching()
+        ):
+            raise ValueError(f"CUDA graphs must use flash decode with static batching!")
 
         query, key, value, rotary_pos_emb, attn_mask_type, block_table = (
             self._adjust_key_value_for_inference(
@@ -973,6 +980,19 @@ class SelfAttention(Attention):
             self.run_realtime_tests()
 
         return query, key, value
+
+    def backward_dw(self) -> NoReturn:
+        """Execute weight update operations"""
+        self._backward_qkv_proj()
+        self._backward_output_proj()
+
+    def _backward_qkv_proj(self):
+        """Update weights for QKV projection layer"""
+        self.linear_qkv.backward_dw()
+
+    def _backward_output_proj(self):
+        """Update weights for output projection layer"""
+        self.linear_proj.backward_dw()
 
 
 class CrossAttention(Attention):

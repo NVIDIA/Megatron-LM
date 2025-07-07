@@ -26,6 +26,13 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
 
 # pylint: disable=missing-class-docstring
 @dataclass
@@ -147,6 +154,9 @@ class MLP(MegatronModule):
                         intermediate_parallel,
                         bias_parallel,
                         self.config.activation_func_fp8_input_store,
+                        self.config.cpu_offloading
+                        and self.config.cpu_offloading_activations
+                        and HAVE_TE,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")

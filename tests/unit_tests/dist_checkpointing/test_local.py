@@ -80,12 +80,10 @@ class TestLocalCheckpointing:
     @pytest.mark.parametrize(('use_torch_fsdp2'), [True, False])
     def test_sharded_tensors(self, tp, pp, use_torch_fsdp2):
         Utils.initialize_model_parallel(tp, pp)
-        num_floating_point_operations_so_far = 0
         dist_opt = xm is None
         model, optimizer = setup_model_and_optimizer(1, tp, pp, dist_opt=dist_opt)
         opt_param_scheduler = None
         rng_state = None
-        use_dist_ckpt = True
         iteration = None
         optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space')
         mock_args = SimpleNamespace()
@@ -100,7 +98,6 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            use_dist_ckpt=use_dist_ckpt,
             iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )
@@ -142,7 +139,6 @@ class TestLocalCheckpointing:
             optimizer,
             opt_param_scheduler,
             rng_state,
-            use_dist_ckpt=use_dist_ckpt,
             iteration=iteration,
             optim_sd_kwargs=optim_sd_kwargs,
         )

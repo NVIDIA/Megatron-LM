@@ -139,7 +139,7 @@ def test_grad_sync(
 ):
     use_distributed_optimizer = use_distributed_optimizer and xm is None
     average_in_collective = average_in_collective and xm is None
-    
+
     Utils.initialize_model_parallel(
         expert_model_parallel_size=ep_size,
         expert_tensor_parallel_size=etp_size,

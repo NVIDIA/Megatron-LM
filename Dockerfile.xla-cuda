@@ -29,4 +29,6 @@ RUN cd /nvidia-resiliency-ext-x && sed -e '/cupti_build\.py/ s/^/#/' -i pyprojec
 RUN cd /nvidia-resiliency-ext-x && pip3 install -e .
 RUN pip3 install multi-storage-client==0.20.3
 RUN pip3 install transformers==4.47.1 
+RUN pip3 install boto3==1.38.45
+RUN pip3 install absl-py==2.1.0
 WORKDIR /megatron

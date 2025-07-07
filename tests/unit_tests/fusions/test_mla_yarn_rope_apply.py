@@ -61,10 +61,10 @@ def _test_fused_apply_mla_rope_for_q(input_format):
         sin = (torch.sin(freqs) * mscale).to(dtype)
 
         pytorch_fwd_input = torch.randn(
-            (seqlen, batch_size, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+            (seqlen, batch_size, num_heads, q_dim + emb_dim), dtype=dtype, device=get_current_device()
         )
         pytorch_bwd_input = torch.randn(
-            (seqlen, batch_size, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+            (seqlen, batch_size, num_heads, q_dim + emb_dim), dtype=dtype, device=get_current_device()
         )
     else:
         cu_seqlens = [0, 27, 54, 99, 128]
@@ -72,17 +72,17 @@ def _test_fused_apply_mla_rope_for_q(input_format):
         max_seqlen = 0
         for i in range(len(cu_seqlens) - 1):
             max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=get_current_device())
         yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
         freqs, mscale = yarn_rope(max_seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
 
         pytorch_fwd_input = torch.randn(
-            (total_seqlen, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+            (total_seqlen, num_heads, q_dim + emb_dim), dtype=dtype, device=get_current_device()
         )
         pytorch_bwd_input = torch.randn(
-            (total_seqlen, num_heads, q_dim + emb_dim), dtype=dtype, device='cuda'
+            (total_seqlen, num_heads, q_dim + emb_dim), dtype=dtype, device=get_current_device()
         )
 
     pytorch_fwd_input.requires_grad_(True)
@@ -141,16 +141,16 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         sin = (torch.sin(freqs) * mscale).to(dtype)
 
         pytorch_fwd_kv_input = torch.randn(
-            (seqlen, batch_size, num_heads, k_dim + v_dim), dtype=dtype, device='cuda'
+            (seqlen, batch_size, num_heads, k_dim + v_dim), dtype=dtype, device=get_current_device()
         )
         pytorch_fwd_emb_input = torch.randn(
-            (seqlen, batch_size, 1, emb_dim), dtype=dtype, device='cuda'
+            (seqlen, batch_size, 1, emb_dim), dtype=dtype, device=get_current_device()
         )
         pytorch_bwd_k_input = torch.randn(
-            (seqlen, batch_size, num_heads, k_dim + emb_dim), dtype=dtype, device='cuda'
+            (seqlen, batch_size, num_heads, k_dim + emb_dim), dtype=dtype, device=get_current_device()
         )
         pytorch_bwd_v_input = torch.randn(
-            (seqlen, batch_size, num_heads, v_dim), dtype=dtype, device='cuda'
+            (seqlen, batch_size, num_heads, v_dim), dtype=dtype, device=get_current_device()
         )
     else:
         cu_seqlens = [0, 27, 54, 99, 128]
@@ -158,21 +158,21 @@ def _test_fused_apply_mla_rope_for_kv(input_format):
         max_seqlen = 0
         for i in range(len(cu_seqlens) - 1):
             max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device=get_current_device())
         yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
         freqs, mscale = yarn_rope(max_seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
 
         pytorch_fwd_kv_input = torch.randn(
-            (total_seqlen, num_heads, k_dim + v_dim), dtype=dtype, device='cuda'
+            (total_seqlen, num_heads, k_dim + v_dim), dtype=dtype, device=get_current_device()
         )
-        pytorch_fwd_emb_input = torch.randn((total_seqlen, 1, emb_dim), dtype=dtype, device='cuda')
+        pytorch_fwd_emb_input = torch.randn((total_seqlen, 1, emb_dim), dtype=dtype, device=get_current_device())
         pytorch_bwd_k_input = torch.randn(
-            (total_seqlen, num_heads, k_dim + emb_dim), dtype=dtype, device='cuda'
+            (total_seqlen, num_heads, k_dim + emb_dim), dtype=dtype, device=get_current_device()
         )
         pytorch_bwd_v_input = torch.randn(
-            (total_seqlen, num_heads, v_dim), dtype=dtype, device='cuda'
+            (total_seqlen, num_heads, v_dim), dtype=dtype, device=get_current_device()
         )
 
     pytorch_fwd_kv_input.requires_grad_(True)

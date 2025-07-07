@@ -183,7 +183,7 @@ class MambaStack(MegatronModule):
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
                         layer_number=i + 1 + pp_layer_offset,
-                        tp_group=model_comm_pgs.tp,
+                        model_comm_pgs=model_comm_pgs,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
                     # Transformer layers apply their own pp_layer_offset
@@ -300,10 +300,6 @@ class MambaStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        # Update the inference parameters with the current batch size in case it is variable
-        if inference_context and not self.training:
-            inference_context.current_batch_size = hidden_states.size(1)
-
         if inference_context:
             assert (
                 inference_context.is_static_batching()
@@ -320,8 +316,9 @@ class MambaStack(MegatronModule):
             and inference_context.is_static_batching()
             and not self.training
         ):
+            current_batch_size = hidden_states.shape[1]
             sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * inference_context.current_batch_size,
+                [inference_context.sequence_len_offset] * current_batch_size,
                 dtype=torch.int32,
                 device=get_current_device(),
             )

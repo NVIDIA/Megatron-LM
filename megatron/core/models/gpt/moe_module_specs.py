@@ -1,23 +1,15 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
 from typing import Optional
 
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.utils import get_te_version, is_te_min_version
 
 try:
-    from megatron.core.extensions.transformer_engine import (
-        TEColumnParallelGroupedLinear,
-        TEColumnParallelLinear,
-        TERowParallelGroupedLinear,
-        TERowParallelLinear,
-    )
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
     HAVE_TE = True
 except ImportError:
@@ -31,43 +23,36 @@ def get_moe_module_spec(
     moe_use_legacy_grouped_gemm: Optional[bool] = False,
 ) -> ModuleSpec:
     """Helper function to get module spec for MoE"""
-    assert num_experts is not None
-
-    mlp = MLPSubmodules(
-        linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
-        linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+    if use_te is not None and use_te:
+        backend: BackendSpecProvider = TESpecProvider()
+    else:
+        backend = LocalSpecProvider()
+    return get_moe_module_spec_for_backend(
+        backend=backend,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
     )
 
-    # experts spec
-    if moe_grouped_gemm:
-        ## use GroupedMLP
-        if use_te and TEColumnParallelGroupedLinear is not None and not moe_use_legacy_grouped_gemm:
-            ## use TEGroupedLinear
-            expert_module = TEGroupedMLP
-            expert_submodule = MLPSubmodules(
-                linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
-            )
-        else:
-            ## use legacy GroupedMLP
-            expert_module = GroupedMLP
-            expert_submodule = None
-            warnings.warn(
-                'The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. '
-                'Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP.'
-            )
-    else:
-        ## use SequentialMLP
-        expert_module = SequentialMLP
-        if use_te and not is_te_min_version("1.7.0.dev0"):
-            warnings.warn(
-                "Only transformer-engine>=1.7.0 supports MoE experts, "
-                f"but your version is {get_te_version()}. Use local linear implementation instead."
-            )
-            expert_submodule = MLPSubmodules(
-                linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
-            )
-        else:
-            expert_submodule = mlp
+
+def get_moe_module_spec_for_backend(
+    backend: BackendSpecProvider,
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    moe_use_legacy_grouped_gemm: Optional[bool] = False,
+) -> ModuleSpec:
+    """Helper function to get module spec for MoE"""
+    assert num_experts is not None
+
+    linear_fc1 = backend.column_parallel_linear()
+    linear_fc2 = backend.row_parallel_linear()
+
+    mlp = MLPSubmodules(linear_fc1=linear_fc1, linear_fc2=linear_fc2)
+
+    expert_module, expert_submodule = backend.grouped_mlp_modules(
+        moe_grouped_gemm is not None and moe_grouped_gemm,
+        moe_use_legacy_grouped_gemm is not None and moe_use_legacy_grouped_gemm,
+    )
 
     experts = ModuleSpec(module=expert_module, submodules=expert_submodule)
 

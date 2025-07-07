@@ -17,45 +17,53 @@ This guide provides an example for Megatron Core for running model inference.
 
 <br>
 
-#### 1. Quick Start
-This example runs batch inference on a GPT model trained using Megatron Core. The entrypoint is [simple_gpt_batch_inference.py](./gpt/gpt_batch_inference.py)
+#### 1. Quickstart
+This example runs statically-batched inference on a model trained using Megatron Core. The entrypoint is [gpt_static_inference.py](./gpt/gpt_static_inference.py). A similar workflow can be adapted for [gpt_dynamic_inference.py](./gpt/gpt_dynamic_inference.py).
 
 <br>
 
 ##### 1.1 Code Walkthrough 
 ***STEP 1 - Initialize model parallel and other default arguments***
-The micro batch size is set as 1 as it is not used in tensor-parallelism only, and for pipeline-parallel models it is calculated at runtime. 
+The micro batch size defaults to 1. It is not used in tensor-parallelism only, and for pipeline-parallel models it is calculated at runtime. 
 ```python
+# Initialize Megatron model using the same model provider from training.
     initialize_megatron(
         args_defaults={'no_load_rng': True, 'no_load_optim': True, 'micro_batch_size': 1}
     )
 ```
 
 ***STEP 2 - Load the model using the model_provider_function***
-NOTE: The model provider function supports both MCore and Legacy models. 
+The model provider function supports both MCore and Legacy models. 
 
 ```python
+    # Load the model checkpoint
     model = get_model(model_provider, wrap_with_ddp=False)
     load_checkpoint(model, None, None)
+    model.eval()
     model = model[0]
 ```
 
 ***STEP 3 - Choose an engine***
-Text generation requires an inference engine, which includes a scheduler. The default engine is the [Megatron Core engine](../../megatron/core/inference/engine/mcore_engine.py) with a simple [text generation controller](../../megatron/core/inference/text_generation_controllers/text_generation_controller.py). TRTLLMEngine will be supported in the future.
+Text generation requires an inference engine, which includes a scheduler. The default engine is the [Megatron Core engine](../../megatron/core/inference/engine/mcore_engine.py) with a [text generation controller](../../megatron/core/inference/text_generation_controllers/text_generation_controller.py). TRTLLMEngine will be supported in the future.
 ```python
+    # Create an inference wrapper to setup the model.
     inference_wrapped_model = GPTInferenceWrapper(model, args)
+    
+    # Define a sampling loop.
     text_generation_controller = TextGenerationController(
         inference_wrapped_model=inference_wrapped_model, 
         tokenizer=tokenizer
     )
-    inference_backend = MCoreEngine(
-        text_generation_controller=text_generation_controller, max_batch_size=args.max_batch_size
-    )
+    
+    # Create a static or dynamic inference engine.
+    inference_engine = StaticInferenceEngine(
+        text_generation_controller=text_generation_controller, 
+        max_batch_size=args.max_batch_size
+)
 ```
 
 ***STEP 4 - Run text generation***
-The [SamplingParams](../../megatron/core/inference/sampling_params.py) contains suggested defaults. Customize this to change top_p, top_k, number of tokens to generate etc. 
-*Note: The result is returned as a list of [InferenceRequests](../../megatron/core/inference/inference_request.py)*
+The [SamplingParams](../../megatron/core/inference/sampling_params.py) class uses suggested defaults. Customize this to change top_p, top_k, number of tokens to generate, etc. The result is returned as a list of [InferenceRequests](../../megatron/core/inference/inference_request.py).
 ```python
     results: List[InferenceRequest] = inference_engine.generate(
         prompts=args.prompts, sampling_params=sampling_params
@@ -76,12 +84,12 @@ The [SamplingParams](../../megatron/core/inference/sampling_params.py) contains 
 <br>
 
 ##### 1.2 Running The Code
-An example run script is shown below. Set the tokenizer paths, inference params, and other settings appropriately. 
+An example Slurm script is shown below. Set the tokenizer paths, inference params, and other settings appropriately. 
 
-For a quick recap on sampling parameters, refer to [this blog](https://ivibudh.medium.com/a-guide-to-controlling-llm-model-output-exploring-top-k-top-p-and-temperature-parameters-ed6a31313910).
+For a recap on sampling parameters, refer to [this blog](https://ivibudh.medium.com/a-guide-to-controlling-llm-model-output-exploring-top-k-top-p-and-temperature-parameters-ed6a31313910).
 
 ```
-# In a slurm cluster (You could also use docker)
+# Slurm cluster settings 
 ACCOUNT=<account>
 MLM_PATH=/path/to/megatron-lm
 GPT_CKPT=/path/to/gpt/ckpt
@@ -121,20 +129,20 @@ INFERENCE_SPECIFIC_ARGS=(
     --max-batch-size 4
 )
 
-torchrun --nproc-per-node=4 examples/inference/gpt/simple_gpt_batch_inference.py \
+torchrun --nproc-per-node=4 examples/inference/gpt/gpt_static_inference.py \
     ${TOKENIZER_ARGS[@]} \
     ${MODEL_ARGS[@]} \
     ${INFERENCE_SPECIFIC_ARGS[@]} \
     --prompts "prompt one " "sample prompt two" "sample prompt 3"
 
-NOTE: Other parameters which can be customized for inference are :-
+NOTE: Other parameters which can be customized for inference:
 --temperature (Sampling temperature)
 --top_k (top_k sampling)
 --top_p (top_p sampling)
 --num-tokens-to-generate (Number of tokens to generate for each prompt)
---inference-batch-times-seqlen-threshold (During inference, if batch-size times sequence-length is smaller than this threshold then we will not use pipelining, otherwise we will.')
+--inference-batch-times-seqlen-threshold (During inference, if batch-size times sequence-length is smaller than this threshold then we will not use microbatched pipelining.')
 --use-dist-ckpt (If using dist checkpoint format for the model)
---use-legacy-models (If using legacy gpt model instead of mcore gpt model)
+--use-legacy-models (If using legacy models instead of MCore models)
 
 ```
 
@@ -143,7 +151,7 @@ NOTE: Other parameters which can be customized for inference are :-
 
 
 #### 2. Control Flow in the MCore Backend
-An example of inference with static batching is provided in [gpt_batch_inference.py](./gpt/gpt_batch_inference.py).
+An example of inference with static batching is provided in [gpt_static_inference.py](./gpt/gpt_static_inference.py).
 * [mcore_engine](../../megatron/core/inference/engines/mcore_engine.py) **generate()** function is called with the input prompts.
 * The `Scheduler` in the engine will add these prompts to the [active requests] pool (../../megatron/core/inference/inference_request.py) until max batch size is hit. Remaining requests will be added to the waiting requests pool. 
 * The engine will run until all requests (waiting + active) are completed. 
@@ -164,10 +172,10 @@ An example of inference with static batching is provided in [gpt_batch_inference
 
 The inference pipeline supports three levels of customization:
 
-* **Inference engine** - The MCore Engine is currently supported. Change this to add a new backend.
-* **Text generation controller** - The main sampling loop. This can be customized to support alternative tokenization, detokenization, or to implement a new sampling strategy.
+* **Inference engine** - The MCore Engine supports static and dynamic batching. Modify this to add a new backend.
+* **Text generation controller** - The main sampling loop. Customize this to support alternative tokenization or implement a new sampling strategy.
 * **Inference Wrapped Model** - Change this to support a new model.
-* **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature, or other sampling parameters.
+* **Modify Inference Parameters** - Change this to update top_p, top_k, number of tokens to be generated, temperature, and other sampling parameters.
 
 <br>
 
@@ -263,7 +271,7 @@ Refer to [gpt_inference_wrapper.py](../../megatron/core/inference/model_inferenc
 <br>
 
 ##### 3.3. Modify Inference Parameters
-We use  [common inference params](../../megatron/core/inference/sampling_params.py) for text generation. Customize this if you want to change top_p, top_k, number of tokens to generate etc. If you want to add other attributes that you would use in the inference loop, you can do that as shown below
+We use  [common inference params](../../megatron/core/inference/sampling_params.py) for text generation. Customize this to change `top_p`, `top_k`, number of tokens to generate etc. Other attributes can be added for the inference loop as shown below.
 
 ```
 from megatron.core.inference.sampling_params import SamplingParams
@@ -275,8 +283,7 @@ c.add_attributes({'min_length':4, 'eod_id':153})
 <br>
 
 #### 4. Future work
-The following features are planned for the future releases. 
-* Dynamic batching 
-* Paged Attention
+The following features are planned for future releases.
 * TRTLLM Engine support
-* Support for multimodal inference
+* Continuous batching optimizations
+* Speculative decoding

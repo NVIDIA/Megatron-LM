@@ -1,5 +1,10 @@
 # Changelog
 
+## NVIDIA Megatron Core 0.13.0
+
+- Hybrid Model
+  - Add context parallel support for models with Mamba layers
+
 ## NVIDIA Megatron Core 0.12.0
 
 - Add FP8 recipe selection to arguments (--fp8-recipe, --first-last-layers-bf16, --num-layers-at-start-in-bf16, --num-layers-at-end-in-bf16)

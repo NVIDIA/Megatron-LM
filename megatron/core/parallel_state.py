@@ -601,10 +601,14 @@ def initialize_model_parallel(
             tp-dp-pp and tp-pp-dp orders.
 
         encoder_tensor_model_parallel_size (int, default = 0):
+            DEPRECATED (entire encoder pipeline parallelism will be removed in core_r0.14.0):
+            Use orthotope parallelism management instead.
             The number of GPUs to split individual tensors across in the encoder. If 0,
             then we use the default, decoder's tensor model parallel size.
 
         encoder_pipeline_model_parallel_size (int, default = 0):
+            DEPRECATED (entire encoder pipeline parallelism will be removed in core_r0.14.0):
+            Use orthotope parallelism management instead.
             The number of tensor parallel GPU groups to allocate to the encoder. As an example,
             if pipeline_model_parallel_size is 4 and encoder_pipeline_model_parallel_size is 2,
             then the encoder will use the first two pipeline stages for its layers, and the total
@@ -647,6 +651,26 @@ def initialize_model_parallel(
 
     """
     assert create_gloo_process_groups or  xm is None, "XLA requires create_gloo_process_groups=True"
+
+    # Deprecation warning for encoder pipeline parallelism
+    if encoder_tensor_model_parallel_size != 0 or encoder_pipeline_model_parallel_size != 0:
+        warnings.warn(
+            "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+            " removed in core_r0.14.0. "
+            "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+            "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+            "parallel logic and infrastructure. "
+            "This functionality is being replaced by the new 'orthotope' parallelism management "
+            "system, which provides a more general and flexible approach to handling complex "
+            "parallelism configurations including encoder-decoder models. "
+            "Please refrain from building new features or dependencies on encoder pipeline "
+            "parallelism as this entire capability will not be supported in future releases. "
+            "For migration guidance and information on the orthotope system, please refer to the "
+            "Megatron-LM documentation (coming soon).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     if encoder_pipeline_model_parallel_size is None:
         encoder_pipeline_model_parallel_size = 0
 
@@ -1534,7 +1558,7 @@ def get_tensor_model_parallel_world_size():
     global _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-    return torch.distributed.get_world_size(group=get_tensor_model_parallel_group())
+    return get_tensor_model_parallel_group().size()
 
 
 def get_pipeline_model_parallel_world_size():
@@ -1550,9 +1574,9 @@ def get_pipeline_model_parallel_world_size():
         for group in _PIPELINE_GLOBAL_RANKS:
             sizes.append(len(group))
         assert all(x == sizes[0] for x in sizes)
-        return torch.distributed.get_world_size(group=pp_group[0])
+        return pp_group[0].size()
     else:
-        return torch.distributed.get_world_size(group=pp_group)
+        return pp_group.size()
 
 
 def set_tensor_model_parallel_rank(rank):
@@ -1578,7 +1602,7 @@ def get_tensor_model_parallel_rank():
     global _MPU_TENSOR_MODEL_PARALLEL_RANK
     if _MPU_TENSOR_MODEL_PARALLEL_RANK is not None:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_tensor_model_parallel_group())
+    return get_tensor_model_parallel_group().rank()
 
 
 def get_pipeline_model_parallel_rank():
@@ -1596,9 +1620,9 @@ def get_pipeline_model_parallel_rank():
                 if r == rank:
                     indices.append(i)
         assert all(x == indices[0] for x in indices)
-        return torch.distributed.get_rank(group=pp_group[0])
+        return pp_group[0].rank()
     else:
-        return torch.distributed.get_rank(group=pp_group)
+        return pp_group.rank()
 
 
 def get_pipeline_model_parallel_split_rank():
@@ -1655,6 +1679,22 @@ def is_rank_in_position_embedding_group():
 def is_pipeline_stage_before_split(rank=None):
     """Return True if pipeline stage executes encoder block for a model
     with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1670,6 +1710,22 @@ def is_pipeline_stage_before_split(rank=None):
 def is_pipeline_stage_after_split(rank=None):
     """Return True if pipeline stage executes decoder block for a model
     with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1686,6 +1742,22 @@ def is_inside_encoder(rank=None) -> bool:
     """Return True if pipeline stage executes encoder block.
     This function implicitly assumes we have a model with both
     encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1708,6 +1780,22 @@ def is_inside_encoder(rank=None) -> bool:
 def is_inside_decoder(rank=None) -> bool:
     """Return True if pipeline stage executes decoder block for a model
     with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if get_pipeline_model_parallel_world_size() == 1:
         return True
     if rank is None:
@@ -1722,6 +1810,22 @@ def is_inside_decoder(rank=None) -> bool:
 
 def get_pipeline_model_parallel_decoder_start() -> Optional[int]:
     """Return decoder start rank (if encoder pipeline parallelism is set)."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     global _PIPELINE_MODEL_PARALLEL_DECODER_START
     return _PIPELINE_MODEL_PARALLEL_DECODER_START
 
@@ -1730,6 +1834,22 @@ def is_pipeline_stage_at_split():
     """Return true if pipeline stage executes decoder block and next
     stage executes encoder block for a model with both encoder and
     decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     rank = get_pipeline_model_parallel_rank()
     return is_pipeline_stage_before_split(rank) and is_pipeline_stage_after_split(rank + 1)
 
@@ -1850,12 +1970,9 @@ def get_data_parallel_world_size(with_context_parallel=False, partial_data_paral
     if _MPU_DATA_PARALLEL_WORLD_SIZE is not None:
         return _MPU_DATA_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(
-            group=get_data_parallel_group(
-                with_context_parallel=with_context_parallel,
-                partial_data_parallel=partial_data_parallel,
-            )
-        )
+        return get_data_parallel_group(
+            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+        ).size()
     else:
         return 0
 
@@ -1872,12 +1989,9 @@ def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=Fa
     if _MPU_DATA_PARALLEL_RANK is not None:
         return _MPU_DATA_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(
-            group=get_data_parallel_group(
-                with_context_parallel=with_context_parallel,
-                partial_data_parallel=partial_data_parallel,
-            )
-        )
+        return get_data_parallel_group(
+            with_context_parallel=with_context_parallel, partial_data_parallel=partial_data_parallel
+        ).rank()
     else:
         return 0
 
@@ -1885,7 +1999,7 @@ def get_data_parallel_rank(with_context_parallel=False, partial_data_parallel=Fa
 def get_context_parallel_world_size():
     """Return world size for the context parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(group=get_context_parallel_group())
+        return get_context_parallel_group().size()
     else:
         return 0
 
@@ -1893,7 +2007,7 @@ def get_context_parallel_world_size():
 def get_context_parallel_rank():
     """Return caller's rank in the context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_context_parallel_group())
+        return get_context_parallel_group().rank()
     else:
         return 0
 
@@ -1901,7 +2015,7 @@ def get_context_parallel_rank():
 def get_tensor_and_context_parallel_world_size():
     """Return world size for the tensor and context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(group=get_tensor_and_context_parallel_group())
+        return get_tensor_and_context_parallel_group().size()
     else:
         return 0
 
@@ -1909,7 +2023,7 @@ def get_tensor_and_context_parallel_world_size():
 def get_tensor_and_context_parallel_rank():
     """Return caller's rank in the joint tensor-model-parallel and context-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_tensor_and_context_parallel_group())
+        return get_tensor_and_context_parallel_group().rank()
     else:
         return 0
 
@@ -1929,7 +2043,7 @@ def get_expert_model_parallel_world_size():
     if _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(group=get_expert_model_parallel_group())
+        return get_expert_model_parallel_group().size()
     else:
         return 0
 
@@ -1945,7 +2059,7 @@ def get_expert_model_parallel_rank():
     if _MPU_EXPERT_MODEL_PARALLEL_RANK is not None:
         return _MPU_EXPERT_MODEL_PARALLEL_RANK
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_expert_model_parallel_group())
+        return get_expert_model_parallel_group().rank()
     else:
         return 0
 
@@ -1974,7 +2088,7 @@ def get_expert_tensor_parallel_world_size():
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
     else:
-        return torch.distributed.get_world_size(group=get_expert_tensor_parallel_group())
+        return get_expert_tensor_parallel_group().size()
 
 
 def set_expert_tensor_parallel_world_size(world_size):
@@ -1992,7 +2106,7 @@ def get_expert_tensor_parallel_rank():
     if not _EXPERT_TENSOR_PARALLEL_GROUP:
         return _MPU_TENSOR_MODEL_PARALLEL_RANK
     else:
-        return torch.distributed.get_rank(group=get_expert_tensor_parallel_group())
+        return get_expert_tensor_parallel_group().rank()
 
 
 def set_expert_tensor_parallel_rank(rank):
@@ -2013,9 +2127,7 @@ def get_expert_tensor_and_model_parallel_group(check_initialized=True):
 def get_expert_tensor_and_model_parallel_world_size():
     """Return world size for the expert model parallel group times expert tensor parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        world_size = torch.distributed.get_world_size(
-            group=get_expert_tensor_and_model_parallel_group()
-        )
+        world_size = get_expert_tensor_and_model_parallel_group().size()
         return world_size
     else:
         return 0
@@ -2024,7 +2136,7 @@ def get_expert_tensor_and_model_parallel_world_size():
 def get_expert_tensor_and_model_parallel_rank():
     """Return caller's rank in the joint tensor- and expert-model-parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(group=get_expert_tensor_and_model_parallel_group())
+        return get_expert_tensor_and_model_parallel_group().rank()
     else:
         return 0
 
@@ -2081,11 +2193,9 @@ def get_expert_data_parallel_group_gloo(partial_expert_data_parallel=False):
 def get_expert_data_parallel_rank(partial_expert_data_parallel=False):
     """Return caller's rank in the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(
-            group=get_expert_data_parallel_group(
-                partial_expert_data_parallel=partial_expert_data_parallel
-            )
-        )
+        return get_expert_data_parallel_group(
+            partial_expert_data_parallel=partial_expert_data_parallel
+        ).rank()
     else:
         return 0
 
@@ -2093,11 +2203,9 @@ def get_expert_data_parallel_rank(partial_expert_data_parallel=False):
 def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
     """Return world size for the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(
-            group=get_expert_data_parallel_group(
-                partial_expert_data_parallel=partial_expert_data_parallel
-            )
-        )
+        return get_expert_data_parallel_group(
+            partial_expert_data_parallel=partial_expert_data_parallel
+        ).size()
     else:
         return 0
 
