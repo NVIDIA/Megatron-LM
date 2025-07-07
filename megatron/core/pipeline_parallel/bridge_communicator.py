@@ -55,19 +55,65 @@ class BridgeCommunicator:
         self.current_rank = dist.get_rank()
         self.comm_map: Dict[int, RankCommInfo] = {}
         
-        self.build_comm_schedule()
+        # self.build_comm_schedule()
+
+        self.activation_gather_ranks, self.activation_gather_pg = self._create_activation_gather_scatter_pg(self.src_grid, is_src=True)
+        # self.activation_scatter_ranks, self.activation_scatter_pg = self._create_activation_gather_scatter_pg(self.dest_grid, is_src=False)
+        
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
         """Get the leader rank for a given grid and direction."""
         leader_ranks = []
-        dp_groups = grid._gen_rank_enum([x for x in grid.dim_names if x != "dp"])
+        # grid.gen_rank_enum(["tp", "cp", "pp"]) # vary tp & cp, freeze dp
+        # returns a list of sublists, each sublist is a group of ranks that have different tp & cp & pp, same dp
+        per_dp_replica_ranks = grid._gen_rank_enum([x for x in grid.dim_names if x != "dp"])
         if is_src:
             # Add rank from last pp stage
-            leader_ranks.extend(group[-1] for group in dp_groups)
+            leader_ranks.extend(group[-1] for group in per_dp_replica_ranks)
         else:
             # Add rank from first pp stage
-            leader_ranks.extend(group[0] for group in dp_groups)
+            leader_ranks.extend(group[0] for group in per_dp_replica_ranks)
         return leader_ranks
+
+    def _create_activation_gather_scatter_pg(self, grid: HyperCommGrid, is_src: bool):
+   
+        current_rank  = dist.get_rank()
+        pp_group_ranks = dist.get_process_group_ranks(grid.get_pg(['pp']))
+
+        activation_comm_ranks = []
+        activation_comm_pg = None
+
+        # on the src grid, all tp-cp ranks of last pp stage and dp replica that current rank belongs to
+        # participtes in the activation gather
+        # on the dest grid, all tp-cp ranks of first pp stage and dp replica that current rank belongs to
+        # participtes in the activation scatter
+
+        if is_src and not current_rank == pp_group_ranks[-1]:
+            # if current rank belongs to src grid. If not belongs to last pp stage, return empty ranks and pg
+            return activation_comm_ranks, activation_comm_pg
+
+        if not is_src and not current_rank == pp_group_ranks[0]:
+            # if current rank belongs to dest grid. If not belongs to first pp stage, return empty ranks and pg
+            return activation_comm_ranks, activation_comm_pg  
+
+        all_tpcp_group_ranks = grid._gen_rank_enum(['tp', 'cp'])
+        for each_group_ranks in all_tpcp_group_ranks:
+            if current_rank in each_group_ranks:
+                activation_comm_ranks = each_group_ranks
+                break
+
+        activation_comm_pg = dist.new_group(ranks=activation_comm_ranks)
+        # activation_comm_pg = grid.get_pg(['tp', 'cp'])
+
+        if current_rank == 0:
+            breakpoint()
+        dist.barrier()
+
+        return activation_comm_ranks, activation_comm_pg
+
+
+
+    
 
     def build_comm_schedule(self):
         """Get src/dest tp leaders and populate comm_map for each rank.
@@ -92,12 +138,7 @@ class BridgeCommunicator:
                                   self.src_grid.rank_offset + self.src_grid.size))
         dest_all_ranks = list(range(self.dest_grid.rank_offset, 
                                    self.dest_grid.rank_offset + self.dest_grid.size))
-        # Create DP process group for current rank
-        if self.current_rank in src_all_ranks:
-            self.dp_pg = self.src_grid.create_pg([x for x in self.src_grid.dim_names if x != "dp"])
-        else:
-            self.dp_pg = self.dest_grid.create_pg([x for x in self.dest_grid.dim_names if x != "dp"])
-        # Combine all ranks from both grids
+       
         all_ranks = src_all_ranks + dest_all_ranks
         
         # Initialize all ranks as NOOP by default
@@ -158,10 +199,14 @@ class BridgeCommunicator:
                         )]
                     )
         # Get the local rank (within the DP group) of the leader rank.
-        dp_group_global_ranks = dist.get_process_group_ranks(self.dp_pg)
-        for local_rank, global_rank in enumerate(dp_group_global_ranks):
-            if global_rank in self.comm_map and self.comm_map[global_rank].role == 'SENDER':
-                self.dp_leader_local_rank = local_rank
+        # dp_group_global_ranks = dist.get_process_group_ranks(self.dp_pg)
+        # for local_rank, global_rank in enumerate(dp_group_global_ranks):
+        #     if global_rank in self.comm_map and self.comm_map[global_rank].role == 'SENDER':
+        #         self.dp_leader_local_rank = local_rank
+
+        if dist.get_rank() == 0:
+            breakpoint()
+        dist.barrier()
 
     def send_forward(self, tensor_to_send: torch.Tensor):
         """Send forward activation tensor.
@@ -275,8 +320,7 @@ class BridgeCommunicator:
 
     def _reconstruct_tensor_from_gathered(self, gathered_tensors: List[torch.Tensor], 
                                          grid: HyperCommGrid) -> torch.Tensor:
-        """Reconstruct tensor using the grid's native rank enumeration logic.
-        """
+        """Reconstruct tensor using the grid's native rank enumeration logic."""
         # Get all non-DP dimensions that were split
         non_dp_dims = [dim for dim in grid.dim_names if dim != "dp"]
         
@@ -315,6 +359,7 @@ class BridgeCommunicator:
             return tensors[0]
         
         # Map parallelism types to tensor dimensions
+        # TODO: should we infer the dims order from the grid?
         dim_mapping = {'tp': -1, 'cp': 1, 'ep': -1}  # TP/EP: hidden dim, CP: sequence dim
         
         # Get grid shape for reconstruction
