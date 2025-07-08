@@ -72,6 +72,8 @@ dev = [
     "transformers",
     "multi-storage-client",
     "setuptools<80.0.0",
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "megatron-energon[av_decode]<7",
 ]
 
 lts = [
@@ -92,6 +94,7 @@ test = [
     "pytest-mock",
     "pytest-cov",
     "pytest-random-order",
+    "pytest-asyncio",
 ]
 
 build = [
@@ -147,9 +150,9 @@ addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
-    "internal = mark a test as a test to private/internal functions.",
-    "flaky = mark flaky tests for LTS environment",
-    "flaky_in_dev = mark flaky tests for DEV environment",
+    "internal: mark a test as a test to private/internal functions.",
+    "flaky: mark flaky tests for LTS environment",
+    "flaky_in_dev: mark flaky tests for DEV environment",
 ]
 
 [tool.coverage.run]

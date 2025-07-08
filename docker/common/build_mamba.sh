@@ -40,7 +40,7 @@ fi
 # Create a temporary directory
 TEMP_DIR=$(mktemp -d)
 echo "Working in temporary directory: ${TEMP_DIR}"
-python3 -m venv "${TEMP_DIR}/venv"
+python3 -m venv "${TEMP_DIR}/venv" --system-site-packages
 source "${TEMP_DIR}/venv/bin/activate"
 
 # Ensure cleanup on script exit

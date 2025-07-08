@@ -46,6 +46,7 @@ MODEL_ARGS:
   --wandb-project: megatron-core-release-runs
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --attention-backend: unfused
+  --exit-interval: 20000
 METRICS:
   - "iteration-time"
   - "lm loss"

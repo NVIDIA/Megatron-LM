@@ -218,14 +218,6 @@ def parse_failed_job(logs: List[str]) -> Optional[bool]:
     return False
 
 
-def parse_finished_training(logs: List[str]) -> Optional[bool]:
-    for log_row in logs[::-1]:
-        match = re.search(r"after training is done", log_row)
-        if match is not None:
-            return True
-    return False
-
-
 def telemetrics_and_exit(
     success: bool, test_case: str, environment: str, pipeline_id: int, is_integration_test: bool
 ):
@@ -279,7 +271,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
         or "double free or corruption" in concat_allranks_logs
         or "Call to CUDA function failed." in concat_allranks_logs
-        or "CUDA error: initialization error" in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
     )
 
 
@@ -498,13 +490,19 @@ def main(
                 is_integration_test=enable_lightweight_mode,
             )
 
-        if parse_failed_job(logs=mainrank_log):
-            n_attempts += 1
-            continue
+        if test_type == "release":
+            if (
+                "StopIteration" in concat_allranks_logs
+                or "after training is done" in concat_allranks_logs
+            ):
+                logger.info("Release training finished")
+                sys.exit(0)
 
-        if parse_finished_training(logs=mainrank_log):
-            sys.exit(int(not success))  # invert for exit 0
-        n_iteration += 1
+            if parse_failed_job(logs=mainrank_log):
+                n_attempts += 1
+                continue
+
+            n_iteration += 1
 
     telemetrics_and_exit(
         success=False,

@@ -43,23 +43,6 @@ CAUSALCONV1D_WHEEL=$(ls $INPUT_WHEEL_DIR/causal_conv1d*.whl) || true
 GROUPEDGEMM_WHEEL=$(ls $INPUT_WHEEL_DIR/grouped_gemm*.whl) || true
 [ -z "$GROUPEDGEMM_WHEEL" ] && GROUPEDGEMM_WHEEL=$(bash docker/common/build_groupedgemm.sh --output-wheel-dir $INPUT_WHEEL_DIR | tail -n 1)
 
-# Set up venv
-uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
-source ${UV_PROJECT_ENVIRONMENT}/bin/activate
-
-# Install build dependencies
-if [ "$ENVIRONMENT" = "dev" ]; then
-    ARGS=(--extra dev)
-else
-    ARGS=(--extra lts)
-fi
-
-uv sync \
-    --link-mode copy \
-    --locked \
-    --extra mlm \
-    "${ARGS[@]}"
-
 # Override deps that are already present in the base image
 # only for dev
 if [ "$ENVIRONMENT" = "dev" ]; then
