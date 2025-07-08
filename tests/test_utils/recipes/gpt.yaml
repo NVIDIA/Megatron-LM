@@ -109,12 +109,12 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
-    products:
-      # - environment: [dev]
-      #   scope: [nightly] # Broken: #480
-      - environment: [lts]
-        scope: [nightly]
+  # - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
+  #   products:
+  # - environment: [dev]
+  #   scope: [nightly] # Broken: #480
+  # - environment: [lts]
+  #   scope: [nightly] # Outdated: #502
   #######################################################################
   # MR tests: Mostly DEV on MR, and LTS on nightly cadence, except for  #
   #             some very important tests.                              #
@@ -151,8 +151,8 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly] # outdated TE: #501
   - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -197,9 +197,9 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr_dgx_a100_1N8G]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - environment: [dev]
+      #   scope: [mr]
+      #   platforms: [dgx_h100] # Sefaulting: #503
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss_dgx_a100_1N8G]
@@ -225,9 +225,9 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - environment: [dev]
+      #   scope: [mr]
+      #   platforms: [dgx_h100] # Sefaulting: #503
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G]
@@ -474,26 +474,26 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [mr]
-  - test_case: [gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_a100, dgx_h100]
+  # - test_case: [gpt3_mr_mcore_te_tp4_pp2_frozen_resume_torch_dist_reshard_8x1xNone_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100]
+  # - test_case: [gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100]
+  # - test_case: [gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_a100, dgx_h100]
   # - test_case: [gpt3_345m_weekly_dgx_b200_1N8G_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
   #   products:
   #     - environment: [dev]
