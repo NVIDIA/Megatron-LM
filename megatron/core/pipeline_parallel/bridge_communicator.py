@@ -358,22 +358,28 @@ class BridgeCommunicator:
             print('*' * 100)
             # Send each tensor in scatter_list to corresponding ranks in activation_scatter_pg
             scatter_ranks = dist.get_process_group_ranks(self.activation_scatter_pg)
-            
+
             # Collect all send requests for parallel execution
             send_requests = []
-            
+
             for i, tensor_chunk in enumerate(scatter_list):
                 target_rank = scatter_ranks[i]
-                if target_rank != self.current_rank:  
+                if target_rank != self.current_rank:
                     # Use asynchronous send for parallel execution
-                    req = dist.isend(tensor_chunk, dst=target_rank, group=self.activation_scatter_pg)
+                    req = dist.isend(
+                        tensor_chunk, dst=target_rank, group=self.activation_scatter_pg
+                    )
                     send_requests.append(req)
-                    print(f"rank {self.current_rank} initiated send of tensor chunk {i} to rank {target_rank} shape {tensor_chunk.shape}")
+                    print(
+                        f"rank {self.current_rank} initiated send of tensor chunk {i} to rank {target_rank} shape {tensor_chunk.shape}"
+                    )
                 else:
                     # If sending to self, just copy the tensor
                     received_tensor = tensor_chunk.clone()
-                    print(f"rank {self.current_rank} kept tensor chunk {i} for self, shape {tensor_chunk.shape}")
-            
+                    print(
+                        f"rank {self.current_rank} kept tensor chunk {i} for self, shape {tensor_chunk.shape}"
+                    )
+
             # Wait for all sends to complete
             for req in send_requests:
                 req.wait()
@@ -388,8 +394,12 @@ class BridgeCommunicator:
             received_tensor = torch.empty(
                 tuple(scatter_shape), device=torch.cuda.current_device(), dtype=dtype
             )
-            dist.recv(received_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg)
-            print(f"rank {self.current_rank} received tensor from leader rank {self.dest_local_leader_rank} shape {received_tensor.shape}")
+            dist.recv(
+                received_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
+            )
+            print(
+                f"rank {self.current_rank} received tensor from leader rank {self.dest_local_leader_rank} shape {received_tensor.shape}"
+            )
 
     def send_backward(self, grad_tensor: torch.Tensor, variable_seq_lengths: bool = False):
         """Send backward gradient tensor.
