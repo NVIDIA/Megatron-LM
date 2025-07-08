@@ -332,7 +332,9 @@ class BridgeCommunicator:
             ), f"Rank {self.current_rank} is not the leader rank"
             # p2p call to receive the tensor
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_prev=True)
-            print(f"rank {self.current_rank} received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}")
+            print(
+                f"rank {self.current_rank} received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
+            )
             received_tensors_list = []
             for i, each_receive_op in enumerate(rank_info.receives):
                 tensor_to_recv = torch.empty(
@@ -568,7 +570,9 @@ class BridgeCommunicator:
 
         recv_forward_shapes = []
         recv_grad_shapes = []
-        print(f"rank {self.current_rank} is a {rank_info.role} and is running the shape communication")
+        print(
+            f"rank {self.current_rank} is a {rank_info.role} and is running the shape communication"
+        )
         # Collect all P2P operations for batch execution
         ops = []
         recv_forward_shape_tensors = []
@@ -582,10 +586,14 @@ class BridgeCommunicator:
                 send_shape_tensor = torch.tensor(
                     send_shape, device=torch.cuda.current_device(), dtype=torch.int64
                 )
-                print(f"rank {self.current_rank} is a sender and is sending forward shapes {send_shape_tensor}")
+                print(
+                    f"rank {self.current_rank} is a sender and is sending forward shapes {send_shape_tensor}"
+                )
                 # Add send operations for each destination
                 for send_op in rank_info.sends:
-                    print(f"rank {self.current_rank} is a sender and is sending forward shapes to rank {send_op.destination_rank}")
+                    print(
+                        f"rank {self.current_rank} is a sender and is sending forward shapes to rank {send_op.destination_rank}"
+                    )
                     ops.append(
                         torch.distributed.P2POp(
                             torch.distributed.isend, send_shape_tensor, send_op.destination_rank
@@ -610,7 +618,9 @@ class BridgeCommunicator:
             print(f"rank {self.current_rank} is a receiver and is receiving forward shapes")
             if recv_prev:
                 for recv_op in rank_info.receives:
-                    print(f"rank {self.current_rank} is a receiver and is receiving forward shapes from rank {recv_op.source_rank}")
+                    print(
+                        f"rank {self.current_rank} is a receiver and is receiving forward shapes from rank {recv_op.source_rank}"
+                    )
                     forward_shape_tensor = torch.empty(
                         (3), device=torch.cuda.current_device(), dtype=torch.int64
                     )
@@ -636,7 +646,9 @@ class BridgeCommunicator:
                     )
 
         # Execute all operations in a single batch
-        print(f"rank {self.current_rank} is a {rank_info.role} and is executing {len(ops)} operations")
+        print(
+            f"rank {self.current_rank} is a {rank_info.role} and is executing {len(ops)} operations"
+        )
         if len(ops) > 0:
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
