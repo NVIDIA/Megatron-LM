@@ -188,6 +188,7 @@ publish:test_release_version_bump:
     - |
       CMD=$(
         cat <<'EOF'
+          git fetch origin $PUBLISH_VERSION_BUMP_BRANCH && \
           git switch $PUBLISH_VERSION_BUMP_BRANCH && \
           git add megatron/core/package_info.py && \
           git commit -m "chore: Version bump" && \
