@@ -280,6 +280,8 @@ class BridgeCommunicator:
 
             # TODO: ykarnati -  naive concat for now - FIXME
             aggregated_tensor = torch.cat(gathered_tensors, dim=0)
+            print(f"rank {self.current_rank} gathered tensor shape {aggregated_tensor.shape}")
+            self._communicate_shapes(tensor_to_send_next=aggregated_tensor)
             # Send splits to destination ranks
             num_sends = len(rank_info.sends)
             if num_sends > 0:
@@ -329,11 +331,12 @@ class BridgeCommunicator:
                 self.current_rank == self.dest_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
             # p2p call to receive the tensor
-
+            recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(recv_prev=True)
+            print(f"rank {self.current_rank} received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}")
             received_tensors_list = []
-            for each_receive_op in rank_info.receives:
+            for i, each_receive_op in enumerate(rank_info.receives):
                 tensor_to_recv = torch.empty(
-                    tensor_shape, device=torch.cuda.current_device(), dtype=dtype
+                    recv_forward_shapes[i], device=torch.cuda.current_device(), dtype=dtype
                 )
                 dist.recv(tensor_to_recv, src=each_receive_op.source_rank)
                 print(
@@ -565,7 +568,7 @@ class BridgeCommunicator:
 
         recv_forward_shapes = []
         recv_grad_shapes = []
-
+        print(f"rank {self.current_rank} is a {rank_info.role} and is running the shape communication")
         # Collect all P2P operations for batch execution
         ops = []
         recv_forward_shape_tensors = []
@@ -573,14 +576,16 @@ class BridgeCommunicator:
 
         if rank_info.role == 'SENDER':
             # Prepare send operations for forward shapes
+            print(f"rank {self.current_rank} is a sender and is sending forward shapes")
             if tensor_to_send_next is not None:
                 send_shape = tensor_to_send_next.shape
                 send_shape_tensor = torch.tensor(
                     send_shape, device=torch.cuda.current_device(), dtype=torch.int64
                 )
-
+                print(f"rank {self.current_rank} is a sender and is sending forward shapes {send_shape_tensor}")
                 # Add send operations for each destination
                 for send_op in rank_info.sends:
+                    print(f"rank {self.current_rank} is a sender and is sending forward shapes to rank {send_op.destination_rank}")
                     ops.append(
                         torch.distributed.P2POp(
                             torch.distributed.isend, send_shape_tensor, send_op.destination_rank
@@ -588,7 +593,7 @@ class BridgeCommunicator:
                     )
 
                 # If expecting gradients back, prepare receive operations
-                if recv_next is not None:
+                if recv_next:
                     for send_op in rank_info.sends:
                         grad_shape_tensor = torch.empty(
                             (3), device=torch.cuda.current_device(), dtype=torch.int64
@@ -602,17 +607,19 @@ class BridgeCommunicator:
 
         elif rank_info.role == 'RECEIVER':
             # Prepare receive operations for forward shapes
-            if recv_prev is not None:
+            print(f"rank {self.current_rank} is a receiver and is receiving forward shapes")
+            if recv_prev:
                 for recv_op in rank_info.receives:
+                    print(f"rank {self.current_rank} is a receiver and is receiving forward shapes from rank {recv_op.source_rank}")
                     forward_shape_tensor = torch.empty(
                         (3), device=torch.cuda.current_device(), dtype=torch.int64
                     )
-                recv_forward_shape_tensors.append(forward_shape_tensor)
-                ops.append(
-                    torch.distributed.P2POp(
-                        torch.distributed.irecv, forward_shape_tensor, recv_op.source_rank
+                    recv_forward_shape_tensors.append(forward_shape_tensor)
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, forward_shape_tensor, recv_op.source_rank
+                        )
                     )
-                )
 
             # If we need to send gradient shapes back, prepare send operations
             if tensor_to_send_prev is not None:
@@ -629,6 +636,7 @@ class BridgeCommunicator:
                     )
 
         # Execute all operations in a single batch
+        print(f"rank {self.current_rank} is a {rank_info.role} and is executing {len(ops)} operations")
         if len(ops) > 0:
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
@@ -644,7 +652,7 @@ class BridgeCommunicator:
                 shape = forward_shape_tensor.tolist()
                 recv_forward_shapes.append(tuple(shape))
 
-        if rank_info.role == 'SENDER' and tensor_to_send_prev is not None:
+        if rank_info.role == 'SENDER' and tensor_to_send_prev:
             for grad_shape_tensor in recv_grad_shape_tensors:
                 shape = grad_shape_tensor.tolist()
                 recv_grad_shapes.append(tuple(shape))
