@@ -263,7 +263,6 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         # self._communicate_shapes(tensor_to_send_next=tensor_to_send)
-
         if rank_info.role == 'SENDER':
             # Current rank is a sender - gather tensors from all ranks in activation_gather_group
             assert (
@@ -281,7 +280,6 @@ class BridgeCommunicator:
 
             # TODO: ykarnati -  naive concat for now - FIXME
             aggregated_tensor = torch.cat(gathered_tensors, dim=0)
-
             # Send splits to destination ranks
             num_sends = len(rank_info.sends)
             if num_sends > 0:
@@ -358,13 +356,27 @@ class BridgeCommunicator:
                 f"rank {self.current_rank} scatter list shape {[x.shape for x in scatter_list]} doing the scatter in rank group {dist.get_process_group_ranks(self.activation_scatter_pg)}"
             )
             print('*' * 100)
-            dist.scatter(
-                received_tensor,
-                scatter_list=scatter_list,
-                src=self.dest_local_leader_rank,
-                group=self.activation_scatter_pg,
-            )
-            print(f"current rank {self.current_rank} received tensor shape {received_tensor.shape}")
+            # Send each tensor in scatter_list to corresponding ranks in activation_scatter_pg
+            scatter_ranks = dist.get_process_group_ranks(self.activation_scatter_pg)
+            
+            # Collect all send requests for parallel execution
+            send_requests = []
+            
+            for i, tensor_chunk in enumerate(scatter_list):
+                target_rank = scatter_ranks[i]
+                if target_rank != self.current_rank:  
+                    # Use asynchronous send for parallel execution
+                    req = dist.isend(tensor_chunk, dst=target_rank, group=self.activation_scatter_pg)
+                    send_requests.append(req)
+                    print(f"rank {self.current_rank} initiated send of tensor chunk {i} to rank {target_rank} shape {tensor_chunk.shape}")
+                else:
+                    # If sending to self, just copy the tensor
+                    received_tensor = tensor_chunk.clone()
+                    print(f"rank {self.current_rank} kept tensor chunk {i} for self, shape {tensor_chunk.shape}")
+            
+            # Wait for all sends to complete
+            for req in send_requests:
+                req.wait()
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
             # TODO: ykarnati - naive scatter for now - FIXME
@@ -376,16 +388,8 @@ class BridgeCommunicator:
             received_tensor = torch.empty(
                 tuple(scatter_shape), device=torch.cuda.current_device(), dtype=dtype
             )
-            print(
-                f"rank {self.current_rank} doing the scatter with received tensor shape {received_tensor.shape} in rank group {dist.get_process_group_ranks(self.activation_scatter_pg)}"
-            )
-            dist.scatter(
-                received_tensor,
-                scatter_list=None,
-                src=self.dest_local_leader_rank,
-                group=self.activation_scatter_pg,
-            )
-            print(f"current rank {self.current_rank} received tensor shape {received_tensor.shape}")
+            dist.recv(received_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg)
+            print(f"rank {self.current_rank} received tensor from leader rank {self.dest_local_leader_rank} shape {received_tensor.shape}")
 
     def send_backward(self, grad_tensor: torch.Tensor, variable_seq_lengths: bool = False):
         """Send backward gradient tensor.
