@@ -121,6 +121,7 @@ model_parallel:
   no_sync_func: null
   grad_sync_func: null
   param_sync_func: null
+  pipeline_model_parallel_split_rank: null
 
   # CPU Offloading
   cpu_offloading: False

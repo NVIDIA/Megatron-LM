@@ -5,6 +5,7 @@
 import os
 import warnings
 from datetime import timedelta
+from functools import partial
 from typing import Callable, List, Optional
 
 import numpy as np
@@ -67,6 +68,9 @@ _MPU_EXPERT_TENSOR_PARALLEL_RANK = None
 
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = None
 _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = None
+_PIPELINE_MODEL_PARALLEL_SPLIT_RANK = None
+
+_PIPELINE_MODEL_PARALLEL_DECODER_START = None
 
 # These values enable us to change the mpu sizes on the fly.
 _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = None
@@ -442,19 +446,28 @@ class RankGenerator(object):
         return ranks
 
 
-def default_embedding_ranks(pp_ranks):
+def default_embedding_ranks(pp_ranks, split_rank=None):
     """Return the default ranks that constitute the stages on which the word embeddings live.
-    For most models, these are the first and last pipeline stages."""
+    For most models, these are the first and last pipeline stages.
+
+    We also support the deprecated split rank argument for backwards compatibility."""
     if len(pp_ranks) == 1:
         return [pp_ranks[0]]
+    elif split_rank is not None and pp_ranks[split_rank] not in (pp_ranks[0], pp_ranks[-1]):
+        return [pp_ranks[0], pp_ranks[split_rank], pp_ranks[-1]]
     else:
         return [pp_ranks[0], pp_ranks[-1]]
 
 
-def default_position_embedding_ranks(pp_ranks):
+def default_position_embedding_ranks(pp_ranks, split_rank=None):
     """Return the default ranks that constitute the stages on which the position embeddings live.
-    For most models, this is only the first pipeline stage."""
-    return [pp_ranks[0]]
+    For most models, this is only the first pipeline stage.
+
+    We also support the deprecated split rank argument for backwards compatibility."""
+    if split_rank is not None and pp_ranks[0] != pp_ranks[split_rank]:
+        return [pp_ranks[0], pp_ranks[split_rank]]
+    else:
+        return [pp_ranks[0]]
 
 
 def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
@@ -464,11 +477,11 @@ def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
     nccl_comm_cfgs[pg_name][key_value_pair[0]] = key_value_pair[1]
 
 
-# pylint: disable=C0301
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
     virtual_pipeline_model_parallel_size: Optional[int] = None,
+    pipeline_model_parallel_split_rank: Optional[int] = None,
     pipeline_model_parallel_comm_backend: Optional[str] = None,
     use_sharp: bool = False,
     context_parallel_size: int = 1,
@@ -479,11 +492,14 @@ def initialize_model_parallel(
     nccl_communicator_config_path: Optional[str] = None,
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
+    encoder_tensor_model_parallel_size: int = 0,
+    encoder_pipeline_model_parallel_size: Optional[int] = 0,
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
 ) -> None:
+    # pylint: disable=line-too-long
     """Initialize model data parallel groups.
 
     Args:
@@ -511,6 +527,16 @@ def initialize_model_parallel(
             GPU 1: [3, 4] [11, 12]
             GPU 2: [5, 6] [13, 14]
             GPU 3: [7, 8] [15, 16]
+
+        pipeline_model_parallel_split_rank (int, optional):
+            DEPRECATED. For models with both an encoder and decoder, the rank in
+            pipeline to switch between encoder and decoder (i.e. the
+            first rank of the decoder). This allows the user to set
+            the pipeline parallel size of the encoder and decoder
+            independently. For example, if
+            pipeline_model_parallel_size is 8 and
+            pipeline_model_parallel_split_rank is 3, then ranks 0-2
+            will be the encoder and ranks 3-7 will be the decoder.
 
         pipeline_model_parallel_comm_backend (str, optional):
             The backend to use for pipeline parallel communication.
@@ -572,6 +598,20 @@ def initialize_model_parallel(
             The rank initialization order of parallelism. Now we support
             tp-dp-pp and tp-pp-dp orders.
 
+        encoder_tensor_model_parallel_size (int, default = 0):
+            DEPRECATED (entire encoder pipeline parallelism will be removed in core_r0.14.0):
+            Use orthotope parallelism management instead.
+            The number of GPUs to split individual tensors across in the encoder. If 0,
+            then we use the default, decoder's tensor model parallel size.
+
+        encoder_pipeline_model_parallel_size (int, default = 0):
+            DEPRECATED (entire encoder pipeline parallelism will be removed in core_r0.14.0):
+            Use orthotope parallelism management instead.
+            The number of tensor parallel GPU groups to allocate to the encoder. As an example,
+            if pipeline_model_parallel_size is 4 and encoder_pipeline_model_parallel_size is 2,
+            then the encoder will use the first two pipeline stages for its layers, and the total
+            amount of pipelineing is 6.
+
         get_embedding_ranks (Callable[[List[int], Optional[int]], List[int]], optional, default=None):
             A function that takes in a list of ranks for a pipeline group and returns
             those ranks that should have embeddings.
@@ -606,24 +646,78 @@ def initialize_model_parallel(
     are on the same DGX box. For example if we are using 2 DGX-1 boxes
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
+
     """
 
+    # Deprecation warning for encoder pipeline parallelism
+    if encoder_tensor_model_parallel_size != 0 or encoder_pipeline_model_parallel_size != 0:
+        warnings.warn(
+            "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+            " removed in core_r0.14.0. "
+            "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+            "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+            "parallel logic and infrastructure. "
+            "This functionality is being replaced by the new 'orthotope' parallelism management "
+            "system, which provides a more general and flexible approach to handling complex "
+            "parallelism configurations including encoder-decoder models. "
+            "Please refrain from building new features or dependencies on encoder pipeline "
+            "parallelism as this entire capability will not be supported in future releases. "
+            "For migration guidance and information on the orthotope system, please refer to the "
+            "Megatron-LM documentation (coming soon).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    if encoder_pipeline_model_parallel_size is None:
+        encoder_pipeline_model_parallel_size = 0
+
+    if encoder_tensor_model_parallel_size == 0 and encoder_pipeline_model_parallel_size > 0:
+        encoder_tensor_model_parallel_size = tensor_model_parallel_size
+
     if get_embedding_ranks is None:
-        get_embedding_ranks = default_embedding_ranks
+        get_embedding_ranks = partial(
+            default_embedding_ranks, split_rank=pipeline_model_parallel_split_rank
+        )
 
     if get_position_embedding_ranks is None:
-        get_position_embedding_ranks = default_position_embedding_ranks
+        get_position_embedding_ranks = partial(
+            default_position_embedding_ranks, split_rank=pipeline_model_parallel_split_rank
+        )
+
+    if encoder_pipeline_model_parallel_size > 0:
+        global _PIPELINE_MODEL_PARALLEL_DECODER_START
+        _PIPELINE_MODEL_PARALLEL_DECODER_START = encoder_pipeline_model_parallel_size
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
 
-    model_size = tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
+    if encoder_tensor_model_parallel_size > 0:
+        assert (
+            encoder_tensor_model_parallel_size <= tensor_model_parallel_size
+        ), "We do not support encoders with more TP than the decoder."
 
-    if world_size % model_size != 0:
-        raise RuntimeError(f"world_size ({world_size}) is not divisible by {model_size}")
+    encoder_model_size = (
+        encoder_tensor_model_parallel_size
+        * encoder_pipeline_model_parallel_size
+        * context_parallel_size
+    )
+    decoder_model_size = (
+        tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
+    )
+    total_model_size = encoder_model_size + decoder_model_size
 
-    data_parallel_size: int = world_size // model_size
+    if world_size % total_model_size != 0:
+        raise RuntimeError(f"world_size ({world_size}) is not divisible by {total_model_size}")
+
+    data_parallel_size: int = world_size // total_model_size
+
+    encoder_world_size = encoder_model_size * data_parallel_size
+    decoder_world_size = decoder_model_size * data_parallel_size
+
+    assert (
+        encoder_world_size + decoder_world_size == world_size
+    ), f"{encoder_world_size=} + {decoder_world_size=} != {world_size=}"
 
     if virtual_pipeline_model_parallel_size is not None:
         if not pipeline_model_parallel_size > 1:
@@ -634,6 +728,10 @@ def initialize_model_parallel(
         global _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size
+
+    if pipeline_model_parallel_split_rank is not None:
+        global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+        _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank
 
     rank = torch.distributed.get_rank()
 
@@ -655,6 +753,19 @@ def initialize_model_parallel(
     for pg_name in high_priority_stream_groups:
         overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, ("is_high_priority_stream", True))
 
+    if encoder_world_size > 0:
+        encoder_rank_generator = RankGenerator(
+            tp=encoder_tensor_model_parallel_size,
+            ep=1,
+            dp=data_parallel_size,
+            pp=encoder_pipeline_model_parallel_size,
+            cp=context_parallel_size,
+            order=order,
+            rank_offset=0,
+        )
+    else:
+        encoder_rank_generator = None
+
     decoder_rank_generator = RankGenerator(
         tp=tensor_model_parallel_size,
         ep=1,
@@ -662,7 +773,7 @@ def initialize_model_parallel(
         pp=pipeline_model_parallel_size,
         cp=context_parallel_size,
         order=order,
-        rank_offset=0,
+        rank_offset=encoder_world_size,
     )
 
     # Build expert rank generator
@@ -671,10 +782,10 @@ def initialize_model_parallel(
     expert_tensor_model_pipeline_parallel_size = (
         expert_tensor_parallel_size * expert_model_parallel_size * pipeline_model_parallel_size
     )
-    expert_data_parallel_size = world_size // expert_tensor_model_pipeline_parallel_size
-    if world_size % expert_tensor_model_pipeline_parallel_size != 0:
+    expert_data_parallel_size = decoder_world_size // expert_tensor_model_pipeline_parallel_size
+    if decoder_world_size % expert_tensor_model_pipeline_parallel_size != 0:
         raise RuntimeError(
-            f"world_size ({world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({expert_tensor_model_pipeline_parallel_size})"
+            f"decoder world_size ({decoder_world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({expert_tensor_model_pipeline_parallel_size})"
         )
 
     # TODO: support expert specific ordering
@@ -685,7 +796,7 @@ def initialize_model_parallel(
         pp=pipeline_model_parallel_size,
         cp=1,
         order=order,
-        rank_offset=0,
+        rank_offset=encoder_world_size,
     )
 
     assert (
@@ -698,6 +809,60 @@ def initialize_model_parallel(
         "pp"
     ), f"Pipeline parallel groups are expected to be the same for Non-Expert and Expert part, \
     but got {decoder_rank_generator.get_ranks('pp')} and {expert_decoder_rank_generator.get_ranks('pp')}"
+
+    def generator_wrapper(group_type, is_expert=False, **kwargs):
+        """The `RankGenerator` class produces a hyper-rectangle for a given set of
+        tensor, pipeline, data, expert, and context parallelism. If we have an encoder,
+        in addition to the default decoder, we essentially instantiate two `RankGenerator`
+        classes to construct the parallelism for each module separately, and we then have
+        to stitch them together for the right groups. For now, this means pp and tp-pp.
+
+        Let's say we have a total of 6 GPUs denoted by g0 ... g5.
+        For encoder_tp=1, encoder_pp=1, decoder_tp=2, decoder_pp=1, dp=2,
+        g0, g1 belong to encoder and g2, ..., g5 belong to decoder.
+        The present function will create with "tp-dp-pp":
+        3 data-parallel groups: [g0, g1], [g2, g4], [g3, g5]
+        4 tensor model-parallel groups: [g0], [g1], [g2, g3], [g4, g5]
+        4 pipeline model-parallel groups: [g0, g2], [g0, g3], [g1, g4], [g1, g5]
+        """
+        if is_expert:
+            d_ranks = expert_decoder_rank_generator.get_ranks(group_type, **kwargs)
+        else:
+            d_ranks = decoder_rank_generator.get_ranks(group_type, **kwargs)
+
+        if encoder_rank_generator is None:
+            for x in d_ranks:
+                yield x
+            return
+        e_ranks = encoder_rank_generator.get_ranks(group_type, **kwargs)
+        if group_type == 'pp':
+            # Map one encoder tp rank to several decoder tp ranks, because
+            # encoder tp and decoder tp won't be the same size.
+            # Assign this way to avoid getting the DP ranks mixed up with the PP ranks.
+            # For example, if e_ranks = [0,1,2] and d_ranks = [3,4,5,6]
+            # Should yield [0,3], [0,4], [1,5], [2,6]
+            rep = len(d_ranks) // len(e_ranks)
+            remain = len(d_ranks) % len(e_ranks)
+            e_ind = 0
+            e_rep = rep + int(e_ind < remain)
+            for i, y in enumerate(d_ranks):
+                x = e_ranks[e_ind]
+                e_rep -= 1
+                if e_rep == 0:
+                    e_ind += 1
+                    e_rep = rep + int(e_ind < remain)
+                yield x + y
+        elif group_type == 'tp-pp':
+            # For this group, we can just return the concatenated
+            # groups together, because their sizes are the same.
+            assert len(e_ranks) == len(d_ranks)
+            for x, y in zip(e_ranks, d_ranks):
+                yield x + y
+        else:
+            for x in e_ranks:
+                yield x
+            for x in d_ranks:
+                yield x
 
     timeout = timedelta(minutes=distributed_timeout_minutes)
 
@@ -726,7 +891,7 @@ def initialize_model_parallel(
     # is eligible for using the NCCL COLLNET feature.
     # Therefore, dp-cp group, which potentially requires SHARP-enablement,
     # need to be created before all the other groups
-    for ranks_with_cp in decoder_rank_generator.get_ranks('dp-cp'):
+    for ranks_with_cp in generator_wrapper('dp-cp'):
         group_with_cp = create_group(
             ranks_with_cp,
             timeout=timeout,
@@ -799,7 +964,7 @@ def initialize_model_parallel(
         # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
         os.environ["NCCL_COLLNET_ENABLE"] = "0"
 
-    for ranks in decoder_rank_generator.get_ranks('dp'):
+    for ranks in generator_wrapper('dp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -821,7 +986,7 @@ def initialize_model_parallel(
     global _CONTEXT_PARALLEL_GROUP
     global _CONTEXT_PARALLEL_GLOBAL_RANKS
     assert _CONTEXT_PARALLEL_GROUP is None, 'context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('cp'):
+    for ranks in generator_wrapper('cp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -850,7 +1015,7 @@ def initialize_model_parallel(
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-pp'):
+    for ranks in generator_wrapper('tp-pp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -867,7 +1032,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_MODEL_PARALLEL_GROUP is None
     ), 'tensor model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp'):
+    for ranks in generator_wrapper('tp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -943,7 +1108,7 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
-    for ranks in decoder_rank_generator.get_ranks('pp'):
+    for ranks in generator_wrapper('pp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1000,7 +1165,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_DATA_PARALLEL_GROUP is None
     ), 'Tensor + data parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-dp-cp'):
+    for ranks in generator_wrapper('tp-dp-cp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1009,7 +1174,7 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
-    for ranks in decoder_rank_generator.get_ranks('tp-dp'):
+    for ranks in generator_wrapper('tp-dp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1023,7 +1188,7 @@ def initialize_model_parallel(
     assert (
         _TENSOR_AND_CONTEXT_PARALLEL_GROUP is None
     ), 'Tensor + context parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-cp'):
+    for ranks in generator_wrapper('tp-cp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1037,7 +1202,7 @@ def initialize_model_parallel(
     # Build the expert model parallel group
     global _EXPERT_MODEL_PARALLEL_GROUP
     assert _EXPERT_MODEL_PARALLEL_GROUP is None, 'Expert parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('ep'):
+    for ranks in generator_wrapper('ep', is_expert=True):
         group = create_group(
             ranks,
             pg_options=get_nccl_options("ep", nccl_comm_cfgs),
@@ -1051,7 +1216,7 @@ def initialize_model_parallel(
     assert (
         _EXPERT_TENSOR_PARALLEL_GROUP is None
     ), 'Expert tensor model parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp'):
+    for ranks in generator_wrapper('tp', is_expert=True):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1066,7 +1231,7 @@ def initialize_model_parallel(
     assert (
         _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP is None
     ), 'Expert tensor + model parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep'):
+    for ranks in generator_wrapper('tp-ep', is_expert=True):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1081,7 +1246,7 @@ def initialize_model_parallel(
     assert (
         _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is None
     ), 'The expert_tensor_model_pipeline parallel group is already initialized'
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
+    for ranks in generator_wrapper('tp-ep-pp', is_expert=True):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1116,7 +1281,7 @@ def initialize_model_parallel(
         expert_data_parallel_size // num_distributed_optimizer_instances
     )
 
-    for ranks in expert_decoder_rank_generator.get_ranks('dp'):
+    for ranks in generator_wrapper('dp', is_expert=True):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1165,7 +1330,7 @@ def initialize_model_parallel(
 
     model_parallel_group_id = 0
     intra_dist_opt_ranks = []
-    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-pp'):
+    for ranks in generator_wrapper('tp-ep-pp', is_expert=True):
         model_parallel_group_id += 1
         intra_dist_opt_ranks.extend(ranks)
         if model_parallel_group_id % intra_partial_expert_data_parallel_size == 0:
@@ -1390,7 +1555,17 @@ def get_pipeline_model_parallel_world_size():
     global _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
     if _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_WORLD_SIZE
-    return get_pipeline_model_parallel_group().size()
+
+    pp_group = get_pipeline_model_parallel_group()
+    if isinstance(pp_group, list):
+        # Implicit assumption that each PP group is the same size.
+        sizes = []
+        for group in _PIPELINE_GLOBAL_RANKS:
+            sizes.append(len(group))
+        assert all(x == sizes[0] for x in sizes)
+        return pp_group[0].size()
+    else:
+        return pp_group.size()
 
 
 def set_tensor_model_parallel_rank(rank):
@@ -1403,6 +1578,12 @@ def set_pipeline_model_parallel_rank(rank):
     """Set pipeline-model-parallel rank."""
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     _MPU_PIPELINE_MODEL_PARALLEL_RANK = rank
+
+
+def set_pipeline_model_parallel_split_rank(rank):
+    """Set pipeline-model-parallel split rank. DEPRECATED."""
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = rank
 
 
 def get_tensor_model_parallel_rank():
@@ -1418,7 +1599,25 @@ def get_pipeline_model_parallel_rank():
     global _MPU_PIPELINE_MODEL_PARALLEL_RANK
     if _MPU_PIPELINE_MODEL_PARALLEL_RANK is not None:
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
-    return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
+    rank = torch.distributed.get_rank()
+    pp_group = get_pipeline_model_parallel_group()
+    if isinstance(pp_group, list):
+        # Assume that if the caller exist in multiple PP groups, then it has the same index.
+        indices = []
+        for group in _PIPELINE_GLOBAL_RANKS:
+            for i, r in enumerate(group):
+                if r == rank:
+                    indices.append(i)
+        assert all(x == indices[0] for x in indices)
+        return pp_group[0].rank()
+    else:
+        return pp_group.rank()
+
+
+def get_pipeline_model_parallel_split_rank():
+    """Return pipeline-model-parallel split rank."""
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    return _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
 
 
 def is_pipeline_first_stage(ignore_virtual=True, vp_stage=None):
@@ -1464,6 +1663,184 @@ def is_rank_in_position_embedding_group():
     rank = torch.distributed.get_rank()
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     return _POSITION_EMBEDDING_GLOBAL_RANKS is not None and rank in _POSITION_EMBEDDING_GLOBAL_RANKS
+
+
+def is_pipeline_stage_before_split(rank=None):
+    """Return True if pipeline stage executes encoder block for a model
+    with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
+        return True
+    if rank < _PIPELINE_MODEL_PARALLEL_SPLIT_RANK:
+        return True
+    return False
+
+
+def is_pipeline_stage_after_split(rank=None):
+    """Return True if pipeline stage executes decoder block for a model
+    with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
+    if _PIPELINE_MODEL_PARALLEL_SPLIT_RANK is None:
+        return True
+    if rank >= _PIPELINE_MODEL_PARALLEL_SPLIT_RANK:
+        return True
+    return False
+
+
+def is_inside_encoder(rank=None) -> bool:
+    """Return True if pipeline stage executes encoder block.
+    This function implicitly assumes we have a model with both
+    encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    # _PIPELINE_MODEL_PARALLEL_DECODER_START == None means that the
+    # encoder shares the first pipeline rank with the decoder
+    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None and rank == 0:
+        return True
+    # _PIPELINE_MODEL_PARALLEL_DECODER_START != None means that the
+    # encoder is on it's own pipeline ranks before the decoder
+    if (
+        _PIPELINE_MODEL_PARALLEL_DECODER_START is not None
+        and rank < _PIPELINE_MODEL_PARALLEL_DECODER_START
+    ):
+        return True
+    return False
+
+
+def is_inside_decoder(rank=None) -> bool:
+    """Return True if pipeline stage executes decoder block for a model
+    with both encoder and decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    if get_pipeline_model_parallel_world_size() == 1:
+        return True
+    if rank is None:
+        rank = get_pipeline_model_parallel_rank()
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    if _PIPELINE_MODEL_PARALLEL_DECODER_START is None:
+        return True
+    if rank >= _PIPELINE_MODEL_PARALLEL_DECODER_START:
+        return True
+    return False
+
+
+def get_pipeline_model_parallel_decoder_start() -> Optional[int]:
+    """Return decoder start rank (if encoder pipeline parallelism is set)."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    return _PIPELINE_MODEL_PARALLEL_DECODER_START
+
+
+def is_pipeline_stage_at_split():
+    """Return true if pipeline stage executes decoder block and next
+    stage executes encoder block for a model with both encoder and
+    decoder."""
+    warnings.warn(
+        "Encoder-specific pipeline parallelism functionality is deprecated and will be"
+        " removed in core_r0.14.0. "
+        "This includes the parameters 'encoder_tensor_model_parallel_size' and "
+        "'encoder_pipeline_model_parallel_size', as well as all associated encoder pipeline "
+        "parallel logic and infrastructure. "
+        "This functionality is being replaced by the new 'orthotope' parallelism management "
+        "system, which provides a more general and flexible approach to handling complex "
+        "parallelism configurations including encoder-decoder models. "
+        "Please refrain from building new features or dependencies on encoder pipeline "
+        "parallelism as this entire capability will not be supported in future releases. "
+        "For migration guidance and information on the orthotope system, please refer to the "
+        "Megatron-LM documentation (coming soon).",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    rank = get_pipeline_model_parallel_rank()
+    return is_pipeline_stage_before_split(rank) and is_pipeline_stage_after_split(rank + 1)
 
 
 def get_virtual_pipeline_model_parallel_rank():
@@ -1521,30 +1898,59 @@ def get_data_parallel_src_rank(with_context_parallel=False):
 def get_pipeline_model_parallel_first_rank():
     """Return the global rank of the first stage in the current rank's pipeline."""
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
-    return _PIPELINE_GLOBAL_RANKS[0]
+    if isinstance(_PIPELINE_GLOBAL_RANKS[0], list):
+        # I assume the first rank is the same for all pp groups right now.
+        for rank_group in _PIPELINE_GLOBAL_RANKS:
+            assert rank_group[0] == _PIPELINE_GLOBAL_RANKS[0][0]
+        return _PIPELINE_GLOBAL_RANKS[0][0]
+    else:
+        return _PIPELINE_GLOBAL_RANKS[0]
 
 
 def get_pipeline_model_parallel_last_rank():
     """Return the global rank of the last stage in the current rank's pipeline."""
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     last_rank_local = get_pipeline_model_parallel_world_size() - 1
-    return _PIPELINE_GLOBAL_RANKS[last_rank_local]
+    if isinstance(_PIPELINE_GLOBAL_RANKS[0], list):
+        return [group[last_rank_local] for group in _PIPELINE_GLOBAL_RANKS]
+    else:
+        return _PIPELINE_GLOBAL_RANKS[last_rank_local]
 
 
 def get_pipeline_model_parallel_next_rank():
-    """Return the global rank that follows the caller in the pipeline."""
+    """Return the global rank that follows the caller in the pipeline, for each
+    pipeline-parallel group that the rank is part of.
+
+    If it is just part of one group, an int is returned, otherwise a list of ints.
+    """
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     rank_in_pipeline = get_pipeline_model_parallel_rank()
     world_size = get_pipeline_model_parallel_world_size()
-    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline + 1) % world_size]
+    if isinstance(_PIPELINE_GLOBAL_RANKS[0], list):
+        to_return = []
+        for group in _PIPELINE_GLOBAL_RANKS:
+            to_return.append(group[(rank_in_pipeline + 1) % world_size])
+        return to_return
+    else:
+        return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline + 1) % world_size]
 
 
 def get_pipeline_model_parallel_prev_rank():
-    """Return the global rank that precedes the caller in the pipeline."""
+    """Return the global rank that precedes the caller in the pipeline, for each
+    pipeline-parallel group that the rank is part of.
+
+    If it is just part of one group, an int is returned, otherwise a list of ints.
+    """
     assert _PIPELINE_GLOBAL_RANKS is not None, "Pipeline parallel group is not initialized"
     rank_in_pipeline = get_pipeline_model_parallel_rank()
     world_size = get_pipeline_model_parallel_world_size()
-    return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
+    if isinstance(_PIPELINE_GLOBAL_RANKS[0], list):
+        to_return = []
+        for group in _PIPELINE_GLOBAL_RANKS:
+            to_return.append(group[(rank_in_pipeline - 1) % world_size])
+        return to_return
+    else:
+        return _PIPELINE_GLOBAL_RANKS[(rank_in_pipeline - 1) % world_size]
 
 
 def get_data_parallel_world_size(with_context_parallel=False, partial_data_parallel=False):
@@ -1858,6 +2264,9 @@ def destroy_model_parallel():
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
+
+    global _PIPELINE_MODEL_PARALLEL_DECODER_START
+    _PIPELINE_MODEL_PARALLEL_DECODER_START = None
 
     global _DATA_PARALLEL_GROUP
     _DATA_PARALLEL_GROUP = None

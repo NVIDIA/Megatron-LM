@@ -286,6 +286,11 @@ class ModelParallelConfig:
        Defaults to 0, which means all micro-batches are deferred.
     """
 
+    pipeline_model_parallel_split_rank: Optional[int] = None
+    """If int, rank where encoder and decoder should be split in cases where the model has both an
+       encoder and decoder (e.g., T5). Ignored if None.
+    """
+
     overlap_p2p_comm_warmup_flush: bool = False
     """If true, overlap communication and computation in warm up and flush phase.
        Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
