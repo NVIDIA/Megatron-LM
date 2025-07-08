@@ -218,7 +218,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
-        ModelType.encoder_or_decoder,
+        ModelType.encoder_and_decoder,
         forward_step,
         args_defaults={},
         extra_args_provider=add_mimo_args,
