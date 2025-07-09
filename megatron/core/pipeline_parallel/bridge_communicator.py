@@ -262,7 +262,6 @@ class BridgeCommunicator:
 
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
-        # self._communicate_shapes(tensor_to_send_next=tensor_to_send)
         if rank_info.role == 'SENDER':
             # Current rank is a sender - gather tensors from all ranks in activation_gather_group
             assert (
@@ -278,8 +277,7 @@ class BridgeCommunicator:
                 group=self.activation_gather_pg,
             )
 
-            # TODO: ykarnati -  naive concat for now - FIXME
-            aggregated_tensor = torch.cat(gathered_tensors, dim=0)
+            aggregated_tensor = self._reconstruct_tensor_from_gathered(gathered_tensors, self.src_grid, self.activation_gather_pg, self.activation_gather_ranks)
             print(f"rank {self.current_rank} gathered tensor shape {aggregated_tensor.shape}")
             self._communicate_shapes(tensor_to_send_next=aggregated_tensor)
             # Send splits to destination ranks
@@ -346,19 +344,17 @@ class BridgeCommunicator:
                 )
                 received_tensors_list.append(tensor_to_recv)
 
-            # TODO: ykarnati - naive concat for now - FIXME
             aggregated_tensor = torch.cat(received_tensors_list, dim=0)
             print(
                 f"rank {self.current_rank} aggregated tensor shape {aggregated_tensor.shape} sum {aggregated_tensor.sum()}"
             )
 
-            scatter_list = list(
-                torch.chunk(aggregated_tensor, chunks=len(self.activation_scatter_ranks), dim=0)
-            )
-            received_tensor = torch.empty_like(scatter_list[0])
+            tensor_dict = self._decompose_tensor_by_grid_dims(aggregated_tensor, self.dest_grid, self.activation_scatter_ranks)
+
+            # received_tensor = torch.empty_like(scatter_list[0])
             print('*' * 100)
             print(
-                f"rank {self.current_rank} scatter list shape {[x.shape for x in scatter_list]} doing the scatter in rank group {dist.get_process_group_ranks(self.activation_scatter_pg)}"
+                f"rank {self.current_rank} scatter list shape {[x.shape for x in tensor_dict.values()]} doing the scatter in rank group {dist.get_process_group_ranks(self.activation_scatter_pg)}"
             )
             print('*' * 100)
             # Send each tensor in scatter_list to corresponding ranks in activation_scatter_pg
@@ -367,22 +363,21 @@ class BridgeCommunicator:
             # Collect all send requests for parallel execution
             send_requests = []
 
-            for i, tensor_chunk in enumerate(scatter_list):
-                target_rank = scatter_ranks[i]
-                if target_rank != self.current_rank:
+            for rank in scatter_ranks:
+                if rank != self.current_rank:
                     # Use asynchronous send for parallel execution
                     req = dist.isend(
-                        tensor_chunk, dst=target_rank, group=self.activation_scatter_pg
+                        tensor_dict[rank], dst=rank, group=self.activation_scatter_pg
                     )
                     send_requests.append(req)
                     print(
-                        f"rank {self.current_rank} initiated send of tensor chunk {i} to rank {target_rank} shape {tensor_chunk.shape}"
+                        f"rank {self.current_rank} initiated send of tensor chunk {i} to rank {rank} shape {tensor_dict[rank].shape}"
                     )
                 else:
                     # If sending to self, just copy the tensor
-                    received_tensor = tensor_chunk.clone()
+                    received_tensor = tensor_dict[rank].clone()
                     print(
-                        f"rank {self.current_rank} kept tensor chunk {i} for self, shape {tensor_chunk.shape}"
+                        f"rank {self.current_rank} kept tensor chunk {i} for self, shape {tensor_dict[rank].shape}"
                     )
 
             # Wait for all sends to complete
@@ -393,11 +388,9 @@ class BridgeCommunicator:
             # TODO: ykarnati - naive scatter for now - FIXME
             # we dont always evenly divide the tensor into chunks.
             # This is WRONG - just to test the comms
-            scatter_shape = list(tensor_shape)
-            scatter_shape[0] //= len(self.activation_scatter_ranks)
 
             received_tensor = torch.empty(
-                tuple(scatter_shape), device=torch.cuda.current_device(), dtype=dtype
+                tensor_shape, device=torch.cuda.current_device(), dtype=dtype
             )
             dist.recv(
                 received_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
@@ -469,38 +462,30 @@ class BridgeCommunicator:
         pass
 
     def _reconstruct_tensor_from_gathered(
-        self, gathered_tensors: List[torch.Tensor], grid: HyperCommGrid
+        self, gathered_tensors: List[torch.Tensor], grid: HyperCommGrid, curr_pg: dist.ProcessGroup, enum_group: List[int]
     ) -> torch.Tensor:
         """Reconstruct tensor using the grid's native rank enumeration logic."""
         # Get all non-DP dimensions that were split
         non_dp_dims = [dim for dim in grid.dim_names if dim != "dp"]
-
+        print("*" * 100)
+        print("Starting to reconstruct tensor from gathered tensors")
+        print(f"non_dp_dims: {non_dp_dims}")
+        print(f"enum_group: {enum_group}")
         if not non_dp_dims:
             return gathered_tensors[0]
 
-        # Create rank enumeration for non-DP dimensions
-        rank_enum = grid._gen_rank_enum(non_dp_dims)
-        dp_group_ranks = dist.get_process_group_ranks(self.dp_pg)
-        # Find which enumeration group our DP group belongs to
-        dp_group_set = set(dp_group_ranks)
-        matching_enum_group = None
-        for enum_group in rank_enum:
-            if dp_group_set.issubset(set(enum_group)):
-                matching_enum_group = enum_group
-                break
-
-        if not matching_enum_group:
-            raise ValueError("No matching enumeration group found")
-
+        curr_pg_ranks = dist.get_process_group_ranks(curr_pg)
+        print(f"curr_pg: {curr_pg_ranks}")
         # Create mapping from rank to tensor and order by enumeration
-        rank_to_tensor = dict(zip(dp_group_ranks, gathered_tensors))
+        # Tensors are gathered in the order of curr_pg_ranks
+        rank_to_tensor = dict(zip(curr_pg_ranks, gathered_tensors))
         ordered_tensors = [
-            rank_to_tensor[rank] for rank in matching_enum_group if rank in rank_to_tensor
+            rank_to_tensor[rank] for rank in enum_group if rank in rank_to_tensor
         ]
 
         if not ordered_tensors:
             raise ValueError("No tensors found for the given ranks")
-
+        
         # Simple concatenation approach based on grid dimensions
         return self._concatenate_by_grid_dims(ordered_tensors, grid, non_dp_dims)
 
@@ -512,31 +497,34 @@ class BridgeCommunicator:
             return tensors[0]
 
         # Map parallelism types to tensor dimensions
-        # TODO: should we infer the dims order from the grid?
         dim_mapping = {'tp': -1, 'cp': 1, 'ep': -1}  # TP/EP: hidden dim, CP: sequence dim
 
         # Get grid shape for reconstruction
         grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
-
+        print(f"grid_shape: {grid_shape}")
         # Reshape tensor list to match grid structure
         current_tensors = tensors
 
         # Process each grid dimension
         for dim_name, dim_size in zip(non_dp_dims, grid_shape):
+            print(f"Processing dim_name: {dim_name}, dim_size: {dim_size}")
             if dim_name in dim_mapping:
                 tensor_dim = dim_mapping[dim_name]
+                print(f"tensor_dim: {tensor_dim}")
                 # Group tensors for this dimension and concatenate
                 grouped_tensors = []
                 group_size = len(current_tensors) // dim_size
-
+                print(f"group_size: {group_size}")
                 for group_idx in range(group_size):
                     group_start = group_idx * dim_size
                     group_end = group_start + dim_size
+                    print(f"group_start: {group_start}, group_end: {group_end}")
                     group = current_tensors[group_start:group_end]
                     grouped_tensors.append(torch.cat(group, dim=tensor_dim))
 
                 current_tensors = grouped_tensors
-
+                print(f"current_tensors shape: {current_tensors[0].shape}")
+        print("*" * 100)
         return (
             current_tensors[0] if len(current_tensors) == 1 else torch.cat(current_tensors, dim=0)
         )
@@ -670,6 +658,81 @@ class BridgeCommunicator:
                 recv_grad_shapes.append(tuple(shape))
 
         return recv_forward_shapes, recv_grad_shapes
+    
+    def _decompose_tensor_by_grid_dims(self, aggregated_tensor: torch.Tensor,
+                                      grid: HyperCommGrid,
+                                      rank_enum: List[int]) -> Dict[int, torch.Tensor]:
+        """Decompose an aggregated tensor into smaller tensors based on grid dimensions.
+        
+        This is the inverse operation of _concatenate_by_grid_dims.
+        
+        Args:
+            aggregated_tensor: The tensor to decompose
+            grid: The HyperCommGrid defining the parallelism structure
+            
+        Returns:
+            List of tensors split according to the grid dimensions.
+            The tensors are returned in the same order as grid._gen_rank_enum(non_dp_dims).
+        """
+        print("*" * 100)
+        print("Starting to decompose tensor by grid dimensions")
+        # Get all non-DP dimensions that were split
+        non_dp_dims = [dim for dim in grid.dim_names if dim != "dp"]
+        print(f"non_dp_dims: {non_dp_dims}")
+        if not non_dp_dims:
+            return [aggregated_tensor]
+        
+        # Get the rank enumeration to determine the exact order we need
+        print(f"rank_enum: {rank_enum}")
+        
+        # Map parallelism types to tensor dimensions
+        dim_mapping = {'tp': -1, 'cp': 1, 'ep': -1}  # TP/EP: hidden dim, CP: sequence dim
+        
+        # Get grid shape for decomposition
+        grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
+        print(f"grid_shape: {grid_shape}")
+        
+        # Start with the aggregated tensor
+        current_tensors = [aggregated_tensor]
+        print(f"aggregated_tensor shape: {aggregated_tensor.shape}")
+        
+        # Process each grid dimension in reverse order (to undo concatenation)
+        for (dim_name, dim_size) in reversed(list(zip(non_dp_dims, grid_shape))):
+            print(f"Processing dim_name: {dim_name}, dim_size: {dim_size}")
+            if dim_name in dim_mapping:
+                tensor_dim = dim_mapping[dim_name]
+                print(f"tensor_dim: {tensor_dim}")
+                new_tensors = []
+                for tensor in current_tensors:
+                    print(f"Processing tensor of shape: {tensor.shape}")
+                    # Calculate split size for this dimension     
+                    total_size = tensor.size(tensor_dim)
+                    print(f"total_size: {total_size}")
+                    split_size = total_size // dim_size
+                    print(f"split_size: {split_size}")
+                    # Create split sizes list
+                    split_sizes = [split_size] * dim_size
+                    # Handle remainder if total_size is not evenly divisible
+                    remainder = total_size % dim_size
+                    for i in range(remainder):
+                        split_sizes[i] += 1
+                    
+                    # Split the tensor
+                    splits = torch.split(tensor, split_sizes, dim=tensor_dim)
+                    print(f"splits length: {len(splits)}")
+                    print(f"splits shapes: {[x.shape for x in splits]}")
+                    new_tensors.extend(splits)
+                
+                current_tensors = new_tensors
+                for i, tensor in enumerate(current_tensors):
+                    print(f"split {i} shape: {tensor.shape}")
+
+        # Tensors are in the order of rank_enum
+        # Return as a dictionary to ensure the correct tensor is selected for each rank
+        enum_order_tensor_dict = dict(zip(rank_enum, current_tensors))
+        print(f"enum_order_tensor_dict keys: {enum_order_tensor_dict.keys()}")
+        print("*" * 100)
+        return enum_order_tensor_dict
 
 
 if __name__ == "__main__":
@@ -711,13 +774,13 @@ if __name__ == "__main__":
     assert bridge_communicator.current_rank == dist.get_rank()
     # assert bridge_communicator.comm_map is not None
 
-    random_hidden_state = torch.randn(16, 256, 1024).cuda()  # (batch_size, seq_len, hidden_size)
+    random_hidden_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
     current_rank = dist.get_rank()
     if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
         bridge_communicator.send_forward(random_hidden_state)
     else:
         bridge_communicator.receive_forward(
-            tensor_shape=(64, 256, 1024), dtype=random_hidden_state.dtype
+            tensor_shape=(16, 128, 512), dtype=random_hidden_state.dtype
         )
         # recv fwd once we implement
 
