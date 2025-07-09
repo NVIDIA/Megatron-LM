@@ -5,6 +5,7 @@
 
 # Essentially re-written in entirety
 
+import gc
 import logging
 import os
 import shutil
@@ -905,6 +906,10 @@ class IndexedDatasetBuilder(object):
         if self.multimodal:
             assert index.sequence_modes is not None, "sequence_modes cannot not be None"
             self.sequence_modes.extend(index.sequence_modes)
+
+        # Free up memory to make space for new indices
+        del index
+        gc.collect()
 
         # Concatenate data
         with self._open(get_bin_path(path_prefix), "rb") as f:
