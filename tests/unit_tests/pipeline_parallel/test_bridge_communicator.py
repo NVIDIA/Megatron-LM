@@ -98,3 +98,27 @@ class TestBridgeCommunicator:
             128,
             512,
         ), f"Expected aggregated tensor shape (3, 128, 512), got {aggregated_tensor.shape}"
+
+    def test_send_backward_recv_backward(self):
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        world_size = dist.get_world_size()
+        if world_size != 8:
+            pytest.skip(f"This test requires 8 GPUs, but only {world_size} are available")
+
+        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
+        grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge_communicator = BridgeCommunicator(grid1, grid2)
+        assert bridge_communicator.src_grid == grid1
+        assert bridge_communicator.dest_grid == grid2
+        assert bridge_communicator.current_rank == dist.get_rank()
+
+        random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
+        if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
+            print(f"rank {dist.get_rank()} is in src grid")
+            bridge_communicator.receive_backward(tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype)
+        else:
+            print(f"rank {dist.get_rank()} is in dest grid")
+            bridge_communicator.send_backward(random_grad_state)
+            
