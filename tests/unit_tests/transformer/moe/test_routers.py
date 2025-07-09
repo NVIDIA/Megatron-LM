@@ -189,8 +189,8 @@ class TestTop2Router:
 
         # restore the config
         self.router.config.moe_expert_capacity_factor = None
-        self.router.config.moe_token_dropping_drop_policy = "probs"
-        self.router.config.moe_token_dropping_pad_to_capacity = False
+        self.router.config.moe_token_drop_policy = "probs"
+        self.router.config.moe_pad_expert_input_to_capacity = False
 
 
 class TestGroupLimitedRouter:
