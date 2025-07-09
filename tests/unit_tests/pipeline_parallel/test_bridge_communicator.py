@@ -117,8 +117,9 @@ class TestBridgeCommunicator:
         random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
             print(f"rank {dist.get_rank()} is in src grid")
-            bridge_communicator.receive_backward(tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype)
+            bridge_communicator.receive_backward(
+                tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype
+            )
         else:
             print(f"rank {dist.get_rank()} is in dest grid")
             bridge_communicator.send_backward(random_grad_state)
-            
