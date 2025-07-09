@@ -277,7 +277,12 @@ class BridgeCommunicator:
                 group=self.activation_gather_pg,
             )
 
-            aggregated_tensor = self._reconstruct_tensor_from_gathered(gathered_tensors, self.src_grid, self.activation_gather_pg, self.activation_gather_ranks)
+            aggregated_tensor = self._reconstruct_tensor_from_gathered(
+                gathered_tensors,
+                self.src_grid,
+                self.activation_gather_pg,
+                self.activation_gather_ranks,
+            )
             print(f"rank {self.current_rank} gathered tensor shape {aggregated_tensor.shape}")
             self._communicate_shapes(tensor_to_send_next=aggregated_tensor)
             # Send splits to destination ranks
@@ -349,7 +354,9 @@ class BridgeCommunicator:
                 f"rank {self.current_rank} aggregated tensor shape {aggregated_tensor.shape} sum {aggregated_tensor.sum()}"
             )
 
-            tensor_dict = self._decompose_tensor_by_grid_dims(aggregated_tensor, self.dest_grid, self.activation_scatter_ranks)
+            tensor_dict = self._decompose_tensor_by_grid_dims(
+                aggregated_tensor, self.dest_grid, self.activation_scatter_ranks
+            )
 
             # received_tensor = torch.empty_like(scatter_list[0])
             print('*' * 100)
@@ -366,9 +373,7 @@ class BridgeCommunicator:
             for rank in scatter_ranks:
                 if rank != self.current_rank:
                     # Use asynchronous send for parallel execution
-                    req = dist.isend(
-                        tensor_dict[rank], dst=rank, group=self.activation_scatter_pg
-                    )
+                    req = dist.isend(tensor_dict[rank], dst=rank, group=self.activation_scatter_pg)
                     send_requests.append(req)
                     print(
                         f"rank {self.current_rank} initiated send of tensor chunk {i} to rank {rank} shape {tensor_dict[rank].shape}"
@@ -462,7 +467,11 @@ class BridgeCommunicator:
         pass
 
     def _reconstruct_tensor_from_gathered(
-        self, gathered_tensors: List[torch.Tensor], grid: HyperCommGrid, curr_pg: dist.ProcessGroup, enum_group: List[int]
+        self,
+        gathered_tensors: List[torch.Tensor],
+        grid: HyperCommGrid,
+        curr_pg: dist.ProcessGroup,
+        enum_group: List[int],
     ) -> torch.Tensor:
         """Reconstruct tensor using the grid's native rank enumeration logic."""
         # Get all non-DP dimensions that were split
@@ -479,13 +488,11 @@ class BridgeCommunicator:
         # Create mapping from rank to tensor and order by enumeration
         # Tensors are gathered in the order of curr_pg_ranks
         rank_to_tensor = dict(zip(curr_pg_ranks, gathered_tensors))
-        ordered_tensors = [
-            rank_to_tensor[rank] for rank in enum_group if rank in rank_to_tensor
-        ]
+        ordered_tensors = [rank_to_tensor[rank] for rank in enum_group if rank in rank_to_tensor]
 
         if not ordered_tensors:
             raise ValueError("No tensors found for the given ranks")
-        
+
         # Simple concatenation approach based on grid dimensions
         return self._concatenate_by_grid_dims(ordered_tensors, grid, non_dp_dims)
 
@@ -658,18 +665,18 @@ class BridgeCommunicator:
                 recv_grad_shapes.append(tuple(shape))
 
         return recv_forward_shapes, recv_grad_shapes
-    
-    def _decompose_tensor_by_grid_dims(self, aggregated_tensor: torch.Tensor,
-                                      grid: HyperCommGrid,
-                                      rank_enum: List[int]) -> Dict[int, torch.Tensor]:
+
+    def _decompose_tensor_by_grid_dims(
+        self, aggregated_tensor: torch.Tensor, grid: HyperCommGrid, rank_enum: List[int]
+    ) -> Dict[int, torch.Tensor]:
         """Decompose an aggregated tensor into smaller tensors based on grid dimensions.
-        
+
         This is the inverse operation of _concatenate_by_grid_dims.
-        
+
         Args:
             aggregated_tensor: The tensor to decompose
             grid: The HyperCommGrid defining the parallelism structure
-            
+
         Returns:
             List of tensors split according to the grid dimensions.
             The tensors are returned in the same order as grid._gen_rank_enum(non_dp_dims).
@@ -681,23 +688,23 @@ class BridgeCommunicator:
         print(f"non_dp_dims: {non_dp_dims}")
         if not non_dp_dims:
             return [aggregated_tensor]
-        
+
         # Get the rank enumeration to determine the exact order we need
         print(f"rank_enum: {rank_enum}")
-        
+
         # Map parallelism types to tensor dimensions
         dim_mapping = {'tp': -1, 'cp': 1, 'ep': -1}  # TP/EP: hidden dim, CP: sequence dim
-        
+
         # Get grid shape for decomposition
         grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
         print(f"grid_shape: {grid_shape}")
-        
+
         # Start with the aggregated tensor
         current_tensors = [aggregated_tensor]
         print(f"aggregated_tensor shape: {aggregated_tensor.shape}")
-        
+
         # Process each grid dimension in reverse order (to undo concatenation)
-        for (dim_name, dim_size) in reversed(list(zip(non_dp_dims, grid_shape))):
+        for dim_name, dim_size in reversed(list(zip(non_dp_dims, grid_shape))):
             print(f"Processing dim_name: {dim_name}, dim_size: {dim_size}")
             if dim_name in dim_mapping:
                 tensor_dim = dim_mapping[dim_name]
@@ -705,7 +712,7 @@ class BridgeCommunicator:
                 new_tensors = []
                 for tensor in current_tensors:
                     print(f"Processing tensor of shape: {tensor.shape}")
-                    # Calculate split size for this dimension     
+                    # Calculate split size for this dimension
                     total_size = tensor.size(tensor_dim)
                     print(f"total_size: {total_size}")
                     split_size = total_size // dim_size
@@ -716,13 +723,13 @@ class BridgeCommunicator:
                     remainder = total_size % dim_size
                     for i in range(remainder):
                         split_sizes[i] += 1
-                    
+
                     # Split the tensor
                     splits = torch.split(tensor, split_sizes, dim=tensor_dim)
                     print(f"splits length: {len(splits)}")
                     print(f"splits shapes: {[x.shape for x in splits]}")
                     new_tensors.extend(splits)
-                
+
                 current_tensors = new_tensors
                 for i, tensor in enumerate(current_tensors):
                     print(f"split {i} shape: {tensor.shape}")
