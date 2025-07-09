@@ -977,9 +977,13 @@ class CudaGraphManager(torch.nn.Module):
                 runner = self.get_cudagraph_runner(megatron_module)
                 runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
-            elif self.training and torch.is_grad_enabled():
+            elif self.training:
                 # Training mode
                 runner = self.get_cudagraph_runner(megatron_module)
+                # check if a layer is frozen during training.
+                if not torch.is_grad_enabled():
+                    # If the layer is frozen, we need to set the runner to eval mode.
+                    runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
             else:
                 # No cudagraphs were found in training mode with grad disabled, so fallback to
