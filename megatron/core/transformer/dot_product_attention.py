@@ -217,7 +217,7 @@ class DotProductAttention(MegatronModule):
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        if self.scale_mask_softmax.softmax_denominator_weight is not None:
+        if self.config.attention_softmax_denominator_offset == "learnable":
             state_dict = self.scale_mask_softmax.state_dict()
         else:
             state_dict = {}

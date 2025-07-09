@@ -321,7 +321,7 @@ class GPTModel(LanguageModule):
         elif self.position_embedding_type == 'yarn':
             if self.training or not self.config.flash_decode:
                 rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                    inference_context, None, decoder_input, self.config, packed_seq_params
+                    inference_context, self.decoder, decoder_input, self.config, packed_seq_params
                 )
                 rotary_pos_emb, yarn_mscale = self.rotary_pos_emb(rotary_seq_len)
             else:
