@@ -1145,7 +1145,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.num_moe_experts is not None and self.add_bias_linear:
-            assert not self.moe_grouped_gemm, "Bias in Moe is only supported for SequentialMLP (moe_grouped_gemm=False)"
+            assert self.expert_tensor_parallel_size == 1, "Bias in Moe is only supported when ETP==1"
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(

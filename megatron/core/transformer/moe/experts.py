@@ -774,8 +774,8 @@ class TEGroupedMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
         assert (
-            config.add_bias_linear == False
-        ), "bias not supported in TEGroupedMLP yet, please set '--disable-bias-linear' instead."
+            config.bias_dropout_fusion == False
+        ), "bias_dropout_fusion is not supported in TEGroupedMLP yet"
 
         self.ep_group = model_comm_pgs.ep
 
@@ -824,6 +824,33 @@ class TEGroupedMLP(MegatronModule):
             assert HAVE_TE, "FP8 requires TE."
             self.fp8_padding = Fp8Padding(self.num_local_experts)
             self.fp8_unpadding = Fp8Unpadding(self.num_local_experts)
+
+    @staticmethod
+    def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs=None):
+        if bias_parallel is None:
+            return intermediate_parallel
+        shape = intermediate_parallel.shape
+        if permuted_probs is None:
+            return torch.cat(
+                [
+                    t + b
+                    for t, b in zip(
+                        torch.split(intermediate_parallel.view(-1, shape[-1]), tokens_per_expert),
+                        bias_parallel,
+                    )
+                ]
+            ).view(shape)
+        else:
+            return torch.cat(
+                [
+                    t + b * p
+                    for t, b, p in zip(
+                        torch.split(intermediate_parallel.view(-1, shape[-1]), tokens_per_expert),
+                        bias_parallel,
+                        torch.split(permuted_probs, tokens_per_expert),
+                    )
+                ]
+            ).view(shape)
 
     def forward(
         self,
@@ -881,24 +908,16 @@ class TEGroupedMLP(MegatronModule):
                 else:
                     raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
             else:
-                if bias_parallel is not None:
-                    shape = intermediate_parallel.shape
-                    intermediate_parallel = torch.cat(
-                        [
-                            t + b
-                            for t, b in zip(
-                                torch.split(
-                                    intermediate_parallel.view(-1, shape[-1]), tokens_per_expert
-                                ),
-                                bias_parallel,
-                            )
-                        ]
-                    ).view(shape)
+                intermediate_parallel = self._apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert)
                 if self.config.gated_linear_unit:
 
                     def glu(x):
                         x = torch.chunk(x, 2, dim=-1)
-                        return self.config.activation_func(x[0]) * x[1]
+                        if self.config.swiglu_alpha is not None:
+                            return self.config.activation_func(self.config.swiglu_alpha * x[0]) * (
+                                    x[1] + 1) / self.config.swiglu_alpha
+                        else:
+                            return self.config.activation_func(x[0]) * x[1]
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
@@ -924,6 +943,9 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if self.config.fp8:
             output = self.fp8_unpadding(output, actual_tokens_per_expert)
+
+        output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
+        output_bias = None
 
         return output, output_bias
 
