@@ -3,7 +3,6 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 import argparse
-from collections import OrderedDict
 from pretrain_gpt import model_provider as gpt_model_provider
 from pretrain_mamba import model_provider as mamba_model_provider
 import random
@@ -54,12 +53,7 @@ def add_text_generate_args(parser):
         default=False,
         help='Return the log probabilities of the final output tokens',
     )
-    group.add_argument(
-        "--top-n-logprobs",
-        type=int,
-        default=0,
-        help="Top-N logprobs"
-    )
+    group.add_argument("--top-n-logprobs", type=int, default=0, help="Top-N logprobs")
     group.add_argument(
         "--num-tokens-to-generate",
         type=int,
@@ -239,7 +233,6 @@ def generate_dynamic(
     sampling_params: SamplingParams,
 ):
     global REQUEST_ID
-    req_data = OrderedDict()
     for request in inference_requests:
         request_id = REQUEST_ID
         REQUEST_ID += 1
@@ -247,44 +240,23 @@ def generate_dynamic(
         inference_engine.add_request(
             request_id, prompt_tokens, num_tokens_to_generate=args.num_tokens_to_generate
         )
-        cur_time = time.perf_counter()
-        req_data[request_id] = {
-            "prompt_tokens": prompt_tokens,
-            "output_tokens": [],
-            "tpot": [],
-            "prev_time": cur_time,
-            "start_time": cur_time,
-        }
 
+    start_time = time.perf_counter()
+    all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result, _ = inference_engine.step(sampling_params, verbose=False)
-        if result is not None:
-            request_ids, finished_request_ids, sample = result
-
-            request_ids = request_ids.tolist()
-            sample = sample.tolist()
-
-            cur_time = time.perf_counter()
-            for req_id, token in zip(request_ids, sample):
-                req_data[req_id]["output_tokens"].append(token)
-                req_data[req_id]["tpot"].append(cur_time - req_data[req_id]["prev_time"])
-                req_data[req_id]["prev_time"] = cur_time
-                if req_id in finished_request_ids:
-                    req_data[req_id]["finish_time"] = time.perf_counter()
-                    latency = req_data[req_id]["finish_time"] - req_data[req_id]["start_time"]
-                    print(
-                        f"[{time.ctime()}] Request {req_id} finished in {latency} seconds and generated {len(req_data[req_id]['tpot'])} tokens"
-                    )
-
-    return [
-        InferenceRequest(
-            prompt="",
-            request_id=str(request_id),
-            prompt_tokens=data["prompt_tokens"],
-            generated_tokens=data["output_tokens"],
+        active_requests, finished_requests, step_time = inference_engine.step(
+            sampling_params, verbose=False
         )
-        for request_id, data in req_data.items()
-    ]
+        for request in finished_requests:
+            req_id = request.request_id
+            latency = time.perf_counter() - start_time
+            print(
+                f"[{time.ctime()}] Request {req_id} finished in {latency} seconds and "
+                f"generated {request.generated_length} tokens"
+            )
+        all_finished_requests.extend(finished_requests)
+
+    return all_finished_requests
 
 
 @torch.inference_mode()
@@ -405,6 +377,7 @@ def main():
                 'id': result.request_id,
                 'num_input_tokens': len(result.prompt_tokens),
                 'num_output_tokens': len(result.generated_tokens),
+                'tpot': result.tpot,
                 'latency': latency,
                 'memory_usage_GB': memory_allocated / (1024**3),
             }

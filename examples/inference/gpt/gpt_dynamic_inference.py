@@ -4,7 +4,7 @@ import torch
 from argparse import ArgumentParser
 from collections import defaultdict
 from tqdm import tqdm
-from typing import List
+from typing import Dict, List
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -23,7 +23,13 @@ from megatron.training import get_args, get_model as _get_model, get_tokenizer, 
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider
 
-from .utils import add_common_inference_args, build_requests, get_curr_time, Request
+from .utils import (
+    add_common_inference_args,
+    build_requests,
+    build_dynamic_engine_setup_prefix,
+    get_curr_time,
+    Request,
+)
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -134,7 +140,7 @@ def get_inference_controller(
 
 def run_inference(
     requests: List[Request], sampling_params: SamplingParams, engine: DynamicInferenceEngine
-) -> None:
+) -> List[Dict[str, float]]:
     """Add requests to engine and generate tokens.
 
     Args:
@@ -143,7 +149,7 @@ def run_inference(
         engine (DynamicInferenceEngine): Inference engine that manages generating tokens.
 
     Return:
-        None.
+        A dictionary of step times with `prefill` and `decode` keys.
     """
 
     # Initialize request arrival times.
@@ -170,7 +176,6 @@ def run_inference(
             if request.time_arrival > curr_time:
                 break
             try:
-
                 # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
                 engine.add_request(num_requests_added, request.prompt_text)
                 request.time_start = get_curr_time()
@@ -183,11 +188,10 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         is_decode_only = engine.context.is_decode_only()
-        finished_requests, step_time = engine.step(sampling_params, verbose=True)
+        active_requests, finished_requests, step_time = engine.step(sampling_params, verbose=True)
         step_id += 1
 
-        if len(finished_requests) > 0:
-            output_start = get_curr_time()
+        if len(active_requests) > 0 or len(finished_requests) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
@@ -202,13 +206,11 @@ def run_inference(
                 request.state = "finished"
                 num_requests_finished += 1
 
-            output_times.append(get_curr_time() - output_start)
-
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
-    return step_times, add_times, output_times
+    return step_times
 
 
 @torch.inference_mode()
@@ -246,39 +248,16 @@ def main():
         random_seed=args.seed,
     )
 
-    # Print setup.
-    setup_prefix = (
-        "dynamic | cg %d | %s | bf %.0f, flw %.1f [r %d, t %d], gtd %.2f [r %d] ... reqs %d"
-        % (
-            args.enable_cuda_graph,
-            (
-                f"<user prompts, n {len(args.prompts)}>"
-                if args.prompts
-                else "<auto prompts> %s, %d, %.1e, %.1e"
-                % (
-                    "(%s)" % " ".join(map(str, args.num_tokens_to_prompt)),
-                    args.num_tokens_to_generate,
-                    args.incoming_requests_duration,
-                    args.incoming_requests_per_sec,
-                )
-            ),
-            args.inference_dynamic_batching_buffer_size_gb,
-            args.inference_dynamic_batching_buffer_overflow_factor,
-            context.max_requests,
-            context.max_tokens,
-            args.inference_dynamic_batching_buffer_guaranteed_fraction,
-            context.gtd_request_count,
-            len(requests),
-        )
-    )
+    setup_prefix = build_dynamic_engine_setup_prefix(args, context, requests)
     print("~~~")
     print(setup_prefix)
     print("~~~")
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times = run_inference(requests, sampling_params, engine)
-    total_time = get_curr_time() - t
+    step_times = run_inference(requests, sampling_params, engine)
+    torch.cuda.synchronize()
+    step_total = get_curr_time() - t
 
     # Validate all requests finished.
     for request in requests:
@@ -306,23 +285,29 @@ def main():
     # Timing results.
     stats = torch.cuda.memory_stats()
     print("~~~")
+    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+
+    p_times = step_times["prefill"]
+    d_times = step_times["decode"]
+
+    p_total = sum(p_times)
+    d_total = sum(d_times)
+
+    p_count = len(p_times)
+    d_count = len(d_times)
+
+    p_mean = p_total / p_count
+    d_mean = d_total / d_count
+
     print(
-        "%s ... mem %.1f/%.1f ... total time: %.3f ... step time: total %.3f [ p %.3f, d %.3f ], mean [ p %.3f, d %.3f ], count [ p %d, d %d ] ... add time: %.3f, output time: %.3f."
-        % (
-            setup_prefix,
-            stats["allocated_bytes.all.peak"] / (1024**3),
-            stats["reserved_bytes.all.peak"] / (1024**3),
-            sum(step_times["prefill"]) + sum(step_times["decode"]) + sum(add_times),
-            sum(step_times["prefill"]) + sum(step_times["decode"]),
-            sum(step_times["prefill"]),
-            sum(step_times["decode"]),
-            sum(step_times["prefill"]) / len(step_times["prefill"]),
-            sum(step_times["decode"]) / len(step_times["decode"]),
-            len(step_times["prefill"]),
-            len(step_times["decode"]),
-            sum(add_times),
-            sum(output_times),
-        )
+        f"{setup_prefix} … "
+        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        f"total time: {step_total:.3f}s … "
+        f"step time: total {step_total:.3f}s "
+        f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+        f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+        f"count [ p {p_count}, d {d_count} ]."
     )
     print("~~~")
 
