@@ -147,7 +147,7 @@ pip install megatron-core[lts]
 For a version of Megatron-Core with minimal dependencies (only torch), run:
 
 ```bash
-pip install mnegatron-core
+pip install megatron-core
 ```
 
 For dependencies required by Megatron-LM, please run:
