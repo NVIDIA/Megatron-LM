@@ -868,6 +868,12 @@ def validate_args(args, defaults={}):
                 "settings for best performance. sequence parallelism requires setting the "
                 f"environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while {fsdp_impl} "
                 "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
+        elif args.overlap_moe_expert_parallel_comm:
+            warnings.warn("Try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
+                         "Using tensor/context model parallelism requires setting the environment "
+                         "variable CUDA_DEVICE_MAX_CONNECTIONS to 1. "
+                         "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
+                         "for better parallelization.")
         else:
             assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
@@ -1055,8 +1061,39 @@ def validate_args(args, defaults={}):
             "as the hybrid device optimizer reuses the code path of this flag."
         )
 
+    if args.overlap_moe_expert_parallel_comm:
+        # Basic requirements for overlap_moe_expert_parallel_comm
+        if args.pipeline_model_parallel_size > 1:
+            assert args.num_layers_per_virtual_pipeline_stage is not None or args.num_virtual_stages_per_pipeline_rank is not None, \
+                'overlap_moe_expert_parallel_comm is only supported with interleaved pipeline model parallelism when pp > 1.'
+        # Expert model parallelism requirements
+        assert args.expert_model_parallel_size > 1, \
+            'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
+        assert args.moe_token_dispatcher_type in ['alltoall', 'flex'], \
+            'overlap_moe_expert_parallel_comm is only supported with alltoall/flex token dispatcher'
+        
+        # Disable recomputation as it conflicts with overlap_moe_expert_parallel_comm's memory management
+        assert args.recompute_granularity != 'full', \
+            'recompute_granularity must not be full when overlap_moe_expert_parallel_comm is enabled'
+        assert args.recompute_method is None, \
+            'recompute_method must be None when overlap_moe_expert_parallel_comm is enabled'
+        assert args.recompute_num_layers is None, \
+            'recompute_num_layers must be None when overlap_moe_expert_parallel_comm is enabled'
+        
+        # Check if bf16 or fp16 is used
+        assert args.bf16 or args.fp16, \
+            'Currently, overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
+        
+        # Disable shared expert overlap as it conflicts with ep_a2a
+        assert not args.moe_shared_expert_overlap, \
+            'moe_shared_expert_overlap is not supported when overlap_moe_expert_parallel_comm is enabled'
+        assert args.mtp_num_layers is None, \
+            '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
+            
     # Check delay_wgrad_compute compatibility
     if args.delay_wgrad_compute:
+        assert args.overlap_moe_expert_parallel_comm, \
+            'delay_wgrad_compute is only supported when overlap_moe_expert_parallel_comm is enabled'
         assert not args.moe_use_legacy_grouped_gemm, \
             'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
         assert args.transformer_impl == 'transformer_engine', \
@@ -1633,7 +1670,7 @@ def _add_logging_args(parser):
                        help='Report to tensorboard interval.')
     group.add_argument('--tensorboard-queue-size', type=int, default=1000,
                        help='Size of the tensorboard queue for pending events '
-                       'and summaries before one of the ‘add’ calls forces a '
+                       'and summaries before one of the "add" calls forces a '
                        'flush to disk.')
     group.add_argument('--log-timers-to-tensorboard', action='store_true',
                        help='If set, write timers to tensorboard.')
@@ -2812,8 +2849,11 @@ def _add_moe_args(parser):
     group.add_argument('--moe-apply-probs-on-input', action='store_true',
                        help='Apply probs before mlp activation for moe routing.')
     # MoE communication overlap arguments
+    group.add_argument('--overlap-moe-expert-parallel-comm', action='store_true',
+                       help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')
     group.add_argument('--delay-wgrad-compute', action='store_true',
                        help='Delay the wgrad compute for batch-level overlapping')
+
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')

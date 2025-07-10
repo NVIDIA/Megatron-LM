@@ -35,7 +35,7 @@ class DummyNode:
     to transformer layers in a real model.
     """
 
-    common_state = DummyState()
+    layer_state = DummyState()
     chunk_state = DummyState()
 
     def detach(self, x):
