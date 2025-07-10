@@ -6,6 +6,9 @@ import torch
 from argparse import ArgumentParser, Namespace
 from typing import Any, List
 
+from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.contexts import DynamicInferenceContext
+
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """Common inference arguments."""
@@ -155,3 +158,64 @@ def build_requests(args: Namespace, tokenizer: Any) -> List[Request]:
         return get_user_requests(args, tokenizer)
     else:
         return get_auto_requests(args, tokenizer)
+
+
+def build_dynamic_engine_setup_prefix(
+    args: Namespace, context: DynamicInferenceContext, requests: List[DynamicInferenceRequest]
+):
+    """
+    Returns a compact, pipe-separated summary of the dynamic-batching setup.
+
+    Example output:
+
+    `dynamic | cg True | <auto prompts> (128 256), 512, 1.0e+00, 5.0e-01 | bf 4, 1.2 [r 1024, t 8192] | gtd 0.50 [r 512] | reqs 100` # pylint: disable=line-too-long
+
+    Args:
+        args (Namespace): Command-line arguments for this run.
+        context (DynamicInferenceContext): Stores limits such as `max_requests`,
+            `max_tokens`, and `gtd_request_count`.
+        requests (List[DynamicInferenceRequest]): List of inference requests.
+
+    Returns:
+        A configuration string for logging.
+    """
+    # Prompt description
+    if args.prompts:
+        prompts_str = f"<user prompts, n {len(args.prompts)}>"
+    else:
+        prompt_lengths = " ".join(map(str, args.num_tokens_to_prompt))
+        prompts_str = (
+            f"<auto prompts> "
+            f"({prompt_lengths}), "
+            f"{args.num_tokens_to_generate:d}, "
+            f"{args.incoming_requests_duration:.1e}, "
+            f"{args.incoming_requests_per_sec:.1e}"
+        )
+
+    # CUDA graph config
+    cg_str = f"cg {args.enable_cuda_graph}"
+
+    # Buffer limits config
+    flw = args.inference_dynamic_batching_buffer_overflow_factor
+    flw_str = "no overflow" if flw is None else f"{flw:.1f}"
+    buffer_limits_str = (
+        f"bf {args.inference_dynamic_batching_buffer_size_gb:.0f}, {flw_str} "
+        f"[r {context.max_requests}, t {context.max_tokens}]"
+    )
+
+    # Guaranteed request config
+    guaranteed_fraction_str = (
+        f"gtd {args.inference_dynamic_batching_buffer_guaranteed_fraction:.2f} "
+        f"[r {context.gtd_request_count}]"
+    )
+
+    parts = [
+        "dynamic",
+        cg_str,
+        prompts_str,
+        buffer_limits_str,
+        guaranteed_fraction_str,
+        f"reqs {len(requests)}",
+    ]
+
+    return " | ".join(parts)

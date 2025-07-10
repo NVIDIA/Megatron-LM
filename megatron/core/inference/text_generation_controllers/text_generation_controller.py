@@ -548,7 +548,7 @@ class TextGenerationController:
         active_requests: OrderedDict[str, InferenceRequest],
         active_streams: Optional[OrderedDict[str, AsyncStream]] = None,
     ) -> OrderedDict[str, InferenceRequest]:
-        """Utility to generate the all the output tokens and probabilities for the prompts .
+        """Utility to generate all the output tokens and probabilities for the prompts.
 
         This utility generates the output tokens for a static batch. It runs the forward steps till
         all prompts complete generation, updates the status of these requests to completed, adds
@@ -680,6 +680,11 @@ class TextGenerationController:
             streaming_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             stream_tokens = functools.partial(self.stream_tokens, sampling_params)
 
+        for request in active_requests.values():
+            # Initialize to a list to store a latency measurement for each generated token.
+            request.tpot = []
+        timing_events = []
+
         with torch.inference_mode():
             self.inference_wrapped_model.prep_model_for_inference()
 
@@ -703,7 +708,18 @@ class TextGenerationController:
             context_start_position = 0
             context_end_position = min_prompt_length_in_batch
 
+            # The initial iteration of this loop runs the prefill phase up to the shortest
+            # prompt length in the batch. Then every subsequent iterations runs a decode step.
+            # At least one new token will be generated in each iteration. The generated token
+            # will be ignored for requests which have prompt length > the current generated
+            # sequence length. Similarly, the generated token is ignored for requests which
+            # have maximum total sequence length < the current generated sequence length.
             while True:
+                # Add a timing event at the start of each iteration. The token generation
+                # time will be the elapsed time between consective timing events.
+                timing_events.append(torch.cuda.Event(enable_timing=True))
+                timing_events[-1].record()
+
                 # Pick the context window that we need to pass through the network.
                 inference_input_for_context_window: Dict[str, Any] = (
                     self.inference_wrapped_model.get_batch_for_context_window(
@@ -862,6 +878,10 @@ class TextGenerationController:
                 if context_end_position >= max_sequence_length:
                     break
 
+        # Add a final timing event to compute the latency of every loop iteration
+        timing_events.append(torch.cuda.Event(enable_timing=True))
+        timing_events[-1].record()
+
         # Close all streams
         if streaming_enabled:
             streaming_executor.shutdown()
@@ -880,6 +900,15 @@ class TextGenerationController:
             generated_sequence_lengths > sampling_params.num_tokens_to_generate
         ] = sampling_params.num_tokens_to_generate
 
+        timing_events[-1].synchronize()
+        tpot = torch.tensor(
+            [
+                timing_events[i].elapsed_time(timing_events[i + 1]) / 1e3
+                for i in range(len(timing_events) - 1)
+            ],
+            dtype=torch.float32,
+        )
+
         for idx, request in enumerate(active_requests.values()):
             input_prompt_length = int(prompt_lengths_in_batch[idx])
             # Shorter prompts might have generated more than required tokens. So we trim them down
@@ -894,6 +923,20 @@ class TextGenerationController:
             request.generated_sequence_lengths = generated_sequence_lengths.to(dtype=torch.int32)
             request.generated_length = required_sequence_length
             request.generated_tokens = required_result_tokens
+
+            # Record the decode latencies for only the generated tokens
+            request_tpot = tpot.clone()
+            # Sum up the latencies of the first prompt tokens if the
+            # request prompt length > minimum prompt length
+            spill_length = input_prompt_length - min_prompt_length_in_batch
+            if spill_length > 0:
+                spill_latency = request_tpot[:spill_length].sum()
+                request_tpot = torch.cat((spill_latency.unsqueeze(0), request_tpot[spill_length:]))
+
+            # Remove the extraneous latencies if the
+            # request sequence length < maximum sequence length
+            request_tpot = request_tpot[:required_sequence_length]
+            request.tpot = request_tpot.tolist()
 
             if output_log_probs is not None:
                 request.prompt_log_probs = output_log_probs[idx, : input_prompt_length - 1].tolist()

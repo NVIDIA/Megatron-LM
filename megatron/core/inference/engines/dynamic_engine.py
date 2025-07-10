@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
-import time
 from collections import deque
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -70,6 +69,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_counter = Counter()
         self.requests: Dict[int, DynamicInferenceRequest] = {}
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
+        self.step_start_event = torch.cuda.Event(enable_timing=True)
+        self.step_end_event = torch.cuda.Event(enable_timing=True)
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -176,19 +177,25 @@ class DynamicInferenceEngine(AbstractEngine):
         return self.request_completion_futures[request_id]
 
     def post_process_requests(
-        self, request_ids: torch.Tensor, finished_request_ids: torch.Tensor, sample: torch.Tensor
-    ) -> List[DynamicInferenceRequest]:
+        self,
+        request_ids: torch.Tensor,
+        finished_request_ids: torch.Tensor,
+        step_time: float,
+        sample: torch.Tensor,
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
 
         Args:
             request_ids (torch.Tensor): A list of request_ids
             finished_request_ids (torch.Tensor): A list of finished request ids
+            step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
 
         Returns:
-            A list of completed requests as `DynamicInferenceRequest` objects
+            A list of active requests and completed requests as `DynamicInferenceRequest` objects
         """
+        active_requests: List[DynamicInferenceRequest] = []
         finished_requests: List[DynamicInferenceRequest] = []
         finished_request_ids = set(finished_request_ids.tolist())
         self.finished_request_count += len(finished_request_ids)
@@ -196,6 +203,9 @@ class DynamicInferenceEngine(AbstractEngine):
         for request_id, token in zip(request_ids.tolist(), sample.tolist()):
             request: DynamicInferenceRequest = self.requests[request_id]
             request.generated_tokens.append(token)
+            if request.tpot is None:
+                request.tpot = []
+            request.tpot.append(step_time)
 
             if request_id in finished_request_ids:
                 request.generated_length = len(request.generated_tokens)
@@ -207,50 +217,67 @@ class DynamicInferenceEngine(AbstractEngine):
                     finished_request.generated_tokens
                 )
                 self.request_completion_futures[request_id].set_result(finished_request)
+            else:
+                active_requests.append(request)
 
-        return finished_requests
+        return active_requests, finished_requests
+
+    def schedule_waiting_requests(self):
+        """Tries to schedule any requests in the waiting pool."""
+        for waiting_request_id in self.waiting_request_ids.copy():
+            waiting_request: DynamicInferenceRequest = self.requests[waiting_request_id]
+            try:
+                self.context.add_request(
+                    waiting_request_id,
+                    waiting_request.prompt_tokens,
+                    waiting_request.sampling_params.num_tokens_to_generate,
+                )
+                self.waiting_request_ids.popleft()
+            except Exception as e:
+                break
 
     async def async_step(
         self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
-    ) -> Tuple[List[DynamicInferenceRequest], float]:
-        """Wrapper for controller.generate_output_tokens_dynamic_batch(), to
-        match vLLM API.
-
-        Uses `asyncio` for continuous generation which allows this
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
+        """
+        Wrapper for controller.generate_output_tokens_dynamic_batch(), to
+        match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
+
+        Args:
+            sampling_params (SamplingParams): The sampling parameters.
+            verbose (bool): Whether to run in verbose mode.
+
+        Returns:
+            A tuple comprised of:
+                1. Requests that ran in the last step and are still active.
+                2. Requests that ran in the last step and have now finished.
+                3. The step time in seconds.
         """
 
         # Generate tokens.
-        t = time.time()
         is_decode_only = self.context.is_decode_only()
+        self.step_start_event.record()
         result = self.controller.generate_output_tokens_dynamic_batch(
             sampling_params, self.termination_id
         )
-        step_time = time.time() - t
-
-        finished_requests: List[DynamicInferenceRequest] = []
+        self.step_end_event.record()
+        self.step_end_event.synchronize()
+        step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
 
         if result is not None:
             request_ids, finished_request_ids, sample = result
 
             # TODO: Move this to a background thread?
-            finished_requests.extend(
-                self.post_process_requests(request_ids, finished_request_ids, sample)
+            (active_requests, finished_requests) = self.post_process_requests(
+                request_ids, finished_request_ids, step_time, sample
             )
 
-            # Schedule waiting requests
             # TODO: Move this to a background thread?
-            for waiting_request_id in self.waiting_request_ids.copy():
-                waiting_request: DynamicInferenceRequest = self.requests[waiting_request_id]
-                try:
-                    self.context.add_request(
-                        waiting_request_id,
-                        waiting_request.prompt_tokens,
-                        waiting_request.sampling_params.num_tokens_to_generate,
-                    )
-                    self.waiting_request_ids.popleft()
-                except Exception as e:
-                    break
+            self.schedule_waiting_requests()
+        else:
+            active_requests: List[DynamicInferenceRequest] = []
+            finished_requests: List[DynamicInferenceRequest] = []
 
         # Print context state.
         if verbose:
@@ -278,9 +305,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             )
 
-        return finished_requests, step_time
+        return active_requests, finished_requests, step_time
 
-    def step(self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False):
+    def step(
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+    ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """Synchronous wrapper for `self.async_step`."""
         return self._loop.run_until_complete(
             self.async_step(sampling_params=sampling_params, verbose=verbose)
@@ -297,7 +326,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         finished_requests_list = []
         while self.has_unfinished_requests():
-            finished_requests, step_time = self.step(sampling_params)
+            active_requests, finished_requests, step_time = self.step(sampling_params)
             finished_requests_list.extend(finished_requests)
 
         return finished_requests_list

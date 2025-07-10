@@ -272,6 +272,11 @@ class TestTextGenerationController:
             assert len(request.prompt) + len(request.generated_text) == len(
                 request.text
             ), "Output text should include prompts and generations"
+            assert (
+                request.tpot is not None
+                and isinstance(request.tpot, list)
+                and len(request.tpot) == request.generated_length
+            )
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     def test_output_log_probs(self, dtype):
@@ -400,6 +405,11 @@ class TestTextGenerationController:
             assert len(generated_top_n_logprobs) == request.generated_length, (
                 f"{request_id}: Expected {request.generated_length} generated log probs, "
                 f"got {len(generated_top_n_logprobs)}"
+            )
+            assert (
+                request.tpot is not None
+                and isinstance(request.tpot, list)
+                and len(request.tpot) == request.generated_length
             )
 
             # Verify that the generated log probs match what is returned

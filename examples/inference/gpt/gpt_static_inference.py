@@ -205,6 +205,7 @@ def main():
                 'input_prompt': result.prompt,
                 'generated_text': result.generated_text,
                 'generated_tokens': result.generated_tokens,
+                'tpot': result.tpot,
                 'latency': latency,
             }
             if sampling_params.top_n_logprobs > 0:
