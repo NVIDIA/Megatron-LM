@@ -591,7 +591,173 @@ class BridgeCommunicator:
         Returns:
             torch.Tensor: The received gradient tensor
         """
-        pass
+        if not self.is_current_rank_in_grid(self.src_grid):
+            raise ValueError(
+                f"Rank {self.current_rank} is not in the source grid. send_forward_recv_backward is only allowed on src grid"
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+
+        if rank_info.role == 'SENDER':
+            # Current rank is a sender - gather tensors from all ranks in activation_gather_group
+            assert (
+                self.current_rank == self.src_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
+            print(f"rank {self.current_rank} is a sender rank. Running gather on {self.activation_gather_ranks}")
+            # Gather activations from all ranks in activation_gather_group
+            gathered_tensors = [
+                torch.zeros_like(input_tensor) for _ in range(len(self.activation_gather_ranks))
+            ]
+            dist.gather(
+                input_tensor,
+                gather_list=gathered_tensors,
+                dst=self.src_local_leader_rank,
+                group=self.activation_gather_pg,
+            )
+
+            # Reconstruct tensor from gathered activations
+            aggregated_tensor = self._reconstruct_tensor_from_gathered(
+                gathered_tensors,
+                self.src_grid,
+                self.activation_gather_pg,
+                self.activation_gather_ranks,
+            )
+            print(f"rank {self.current_rank} gathered tensor shape {aggregated_tensor.shape}")
+
+            # Communicate shapes for both directions (send forward, receive backward)
+            recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
+                tensor_to_send_next=aggregated_tensor, recv_next=True
+            )
+            print(f"rank {self.current_rank} received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}")
+
+            # Prepare simultaneous send/receive operations
+            num_sends = len(rank_info.sends)
+            if num_sends > 0:
+                # Prepare activation splits for sending
+                batch_size = aggregated_tensor.size(0)
+                split_size = batch_size // num_sends
+                activation_splits = []
+                for i in range(num_sends):
+                    start_idx = i * split_size
+                    end_idx = (i + 1) * split_size if i < num_sends - 1 else batch_size
+                    tensor_split = aggregated_tensor[start_idx:end_idx]
+                    activation_splits.append(tensor_split)
+
+                # Prepare gradient receive tensors
+                received_gradients_list = []
+                for i, recv_grad_shape in enumerate(recv_grad_shapes):
+                    grad_tensor = torch.empty(
+                        recv_grad_shape, device=torch.cuda.current_device(), dtype=dtype
+                    )
+                    received_gradients_list.append(grad_tensor)
+
+                # Create batch P2P operations for simultaneous send/receive
+                ops = []
+                for i, send_op in enumerate(rank_info.sends):
+                    # Send activation
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.isend, activation_splits[i], send_op.destination_rank
+                        )
+                    )
+                    print(
+                        f"rank {self.current_rank} prepared send activation to dst rank {send_op.destination_rank} shape {activation_splits[i].shape}"
+                    )
+                    
+                    # Receive gradient
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, received_gradients_list[i], send_op.destination_rank
+                        )
+                    )
+                    print(
+                        f"rank {self.current_rank} prepared receive gradient from dst rank {send_op.destination_rank} shape {received_gradients_list[i].shape}"
+                    )
+
+                # Execute all operations simultaneously
+                print(f"rank {self.current_rank} executing {len(ops)} simultaneous P2P operations")
+                reqs = torch.distributed.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
+
+                # To protect against race condition when using batch_isend_irecv()
+                torch.cuda.synchronize()
+
+                # Concatenate received gradients
+                aggregated_gradient = torch.cat(received_gradients_list, dim=0)
+                print(
+                    f"rank {self.current_rank} aggregated gradient shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
+                )
+
+                # Decompose and scatter to ranks in activation_gather_pg
+                tensor_dict = self._decompose_tensor_by_grid_dims(
+                    aggregated_gradient, self.src_grid, self.activation_gather_ranks
+                )
+
+                print('*' * 100)
+                print(
+                    f"rank {self.current_rank} scatter list shape {[x.shape for x in tensor_dict.values()]} doing the scatter in rank group {dist.get_process_group_ranks(self.activation_gather_pg)}"
+                )
+                print('*' * 100)
+
+                # Send each tensor in tensor_dict to corresponding ranks in activation_gather_pg
+                scatter_ranks = dist.get_process_group_ranks(self.activation_gather_pg)
+
+                # Collect all send requests for parallel execution
+                send_requests = []
+                received_gradient = None
+
+                for rank in scatter_ranks:
+                    if rank != self.current_rank:
+                        # Use asynchronous send for parallel execution
+                        req = dist.isend(
+                            tensor_dict[rank], dst=rank, group=self.activation_gather_pg
+                        )
+                        send_requests.append(req)
+                        print(
+                            f"rank {self.current_rank} initiated send of gradient chunk to rank {rank} shape {tensor_dict[rank].shape}"
+                        )
+                    else:
+                        # If sending to self, just copy the tensor
+                        received_gradient = tensor_dict[rank].clone()
+                        print(
+                            f"rank {self.current_rank} kept gradient chunk for self, shape {tensor_dict[rank].shape}"
+                        )
+
+                # Wait for all sends to complete
+                for req in send_requests:
+                    req.wait()
+
+                return received_gradient
+
+        elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
+            # Non-leader rank - participate in both gather (for activations) and receive (for gradients)
+            print(f"rank {self.current_rank} is a noop rank. Running gather on {self.activation_gather_ranks}")
+            # Participate in activation gather
+            dist.gather(
+                input_tensor,
+                gather_list=None,
+                dst=self.src_local_leader_rank,
+                group=self.activation_gather_pg,
+            )
+            # Receive gradient from leader
+            received_gradient = torch.empty(
+                grad_shape, device=torch.cuda.current_device(), dtype=dtype
+            )
+            print(f"rank {self.current_rank} is a noop rank. Waiting for gradient from leader rank {self.src_local_leader_rank}")
+            dist.recv(
+                received_gradient, src=self.src_local_leader_rank, group=self.activation_gather_pg
+            )
+            print(
+                f"rank {self.current_rank} received gradient from leader rank {self.src_local_leader_rank} shape {received_gradient.shape}"
+            )
+            return received_gradient
+
+        else:
+            raise ValueError(
+                f"Rank {self.current_rank} with role {rank_info.role} cannot participate in send_forward_recv_backward"
+            )
 
     def send_backward_recv_forward(
         self,
@@ -609,7 +775,170 @@ class BridgeCommunicator:
         Returns:
             torch.Tensor: The received activation tensor
         """
-        pass
+        if not self.is_current_rank_in_grid(self.dest_grid):
+            raise ValueError(
+                f"Rank {self.current_rank} is not in the destination grid. send_backward_recv_forward is only allowed on dest grid"
+            )
+
+        rank_info = self.comm_map.get(self.current_rank)
+        assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
+
+        if rank_info.role == 'RECEIVER':
+            # Current rank is a receiver - gather gradients from all ranks in activation_scatter_ranks
+            assert (
+                self.current_rank == self.dest_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
+            print(f"rank {self.current_rank} is a receiver rank. Running gather on {self.activation_scatter_ranks}")
+            # Gather gradients from all ranks in activation_scatter_ranks
+            gathered_tensors = [
+                torch.zeros_like(grad_tensor) for _ in range(len(self.activation_scatter_ranks))
+            ]
+            dist.gather(
+                grad_tensor,
+                gather_list=gathered_tensors,
+                dst=self.dest_local_leader_rank,
+                group=self.activation_scatter_pg,
+            )
+
+            # Reconstruct gradient tensor from gathered gradients
+            aggregated_gradient = self._reconstruct_tensor_from_gathered(
+                gathered_tensors, self.dest_grid, self.activation_scatter_pg, self.activation_scatter_ranks
+            )
+            print(f"rank {self.current_rank} gathered gradient tensor shape {aggregated_gradient.shape}")
+            
+            # Communicate shapes for both directions (send backward, receive forward)
+            recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
+                tensor_to_send_prev=aggregated_gradient, recv_prev=True
+            )
+            print(f"rank {self.current_rank} received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}")
+
+            # Prepare simultaneous send/receive operations
+            num_receives = len(rank_info.receives)
+            if num_receives > 0:
+                # Prepare gradient splits for sending
+                batch_size = aggregated_gradient.size(0)
+                split_size = batch_size // num_receives
+                gradient_splits = []
+                for i in range(num_receives):
+                    start_idx = i * split_size
+                    end_idx = (i + 1) * split_size if i < num_receives - 1 else batch_size
+                    tensor_split = aggregated_gradient[start_idx:end_idx]
+                    gradient_splits.append(tensor_split)
+
+                # Prepare activation receive tensors
+                received_activations_list = []
+                for i, recv_forward_shape in enumerate(recv_forward_shapes):
+                    activation_tensor = torch.empty(
+                        recv_forward_shape, device=torch.cuda.current_device(), dtype=dtype
+                    )
+                    received_activations_list.append(activation_tensor)
+
+                # Create batch P2P operations for simultaneous send/receive
+                ops = []
+                for i, recv_op in enumerate(rank_info.receives):
+                    # Send gradient
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.isend, gradient_splits[i], recv_op.source_rank
+                        )
+                    )
+                    print(
+                        f"rank {self.current_rank} prepared send gradient to src rank {recv_op.source_rank} shape {gradient_splits[i].shape}"
+                    )
+                    
+                    # Receive activation
+                    ops.append(
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, received_activations_list[i], recv_op.source_rank
+                        )
+                    )
+                    print(
+                        f"rank {self.current_rank} prepared receive activation from src rank {recv_op.source_rank} shape {received_activations_list[i].shape}"
+                    )
+
+                # Execute all operations simultaneously
+                print(f"rank {self.current_rank} executing {len(ops)} simultaneous P2P operations")
+                reqs = torch.distributed.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
+
+                # To protect against race condition when using batch_isend_irecv()
+                torch.cuda.synchronize()
+
+                # Concatenate received activations
+                aggregated_activation = torch.cat(received_activations_list, dim=0)
+                print(
+                    f"rank {self.current_rank} aggregated activation shape {aggregated_activation.shape} sum {aggregated_activation.sum()}"
+                )
+
+                # Decompose and scatter to ranks in activation_scatter_pg
+                tensor_dict = self._decompose_tensor_by_grid_dims(
+                    aggregated_activation, self.dest_grid, self.activation_scatter_ranks
+                )
+
+                print('*' * 100)
+                print(
+                    f"rank {self.current_rank} scatter list shape {[x.shape for x in tensor_dict.values()]} doing the scatter in rank group {dist.get_process_group_ranks(self.activation_scatter_pg)}"
+                )
+                print('*' * 100)
+
+                # Send each tensor in tensor_dict to corresponding ranks in activation_scatter_pg
+                scatter_ranks = dist.get_process_group_ranks(self.activation_scatter_pg)
+
+                # Collect all send requests for parallel execution
+                send_requests = []
+                received_activation = None
+
+                for rank in scatter_ranks:
+                    if rank != self.current_rank:
+                        # Use asynchronous send for parallel execution
+                        req = dist.isend(
+                            tensor_dict[rank], dst=rank, group=self.activation_scatter_pg
+                        )
+                        send_requests.append(req)
+                        print(
+                            f"rank {self.current_rank} initiated send of activation chunk to rank {rank} shape {tensor_dict[rank].shape}"
+                        )
+                    else:
+                        # If sending to self, just copy the tensor
+                        received_activation = tensor_dict[rank].clone()
+                        print(
+                            f"rank {self.current_rank} kept activation chunk for self, shape {tensor_dict[rank].shape}"
+                        )
+
+                # Wait for all sends to complete
+                for req in send_requests:
+                    req.wait()
+
+                return received_activation
+
+        elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
+            # Non-leader rank - participate in both gather (for gradients) and receive (for activations)
+            print(f"rank {self.current_rank} is a noop rank. Running gather on {self.activation_scatter_ranks}")
+            # Participate in gradient gather
+            dist.gather(
+                grad_tensor,
+                gather_list=None,
+                dst=self.dest_local_leader_rank,
+                group=self.activation_scatter_pg,
+            )
+            print(f"rank {self.current_rank} is a noop rank. Waiting for activation from leader rank {self.dest_local_leader_rank}")
+            # Receive activation from leader
+            received_activation = torch.empty(
+                forward_shape, device=torch.cuda.current_device(), dtype=dtype
+            )
+            dist.recv(
+                received_activation, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
+            )
+            print(
+                f"rank {self.current_rank} received activation from leader rank {self.dest_local_leader_rank} shape {received_activation.shape}"
+            )
+            return received_activation
+
+        else:
+            raise ValueError(
+                f"Rank {self.current_rank} with role {rank_info.role} cannot participate in send_backward_recv_forward"
+            )
 
     def _reconstruct_tensor_from_gathered(
         self,
@@ -928,8 +1257,6 @@ if __name__ == "__main__":
     assert bridge_communicator.dest_grid == grid2
     assert bridge_communicator.current_rank == dist.get_rank()
     # assert bridge_communicator.comm_map is not None
-
-    # random_hidden_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
     # current_rank = dist.get_rank()
     # if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
     #     bridge_communicator.send_forward(random_hidden_state)
@@ -938,12 +1265,17 @@ if __name__ == "__main__":
     #         tensor_shape=(16, 128, 512), dtype=random_hidden_state.dtype
     #     )
 
-    random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
-    if bridge_communicator.is_current_rank_in_grid(bridge_communicator.dest_grid):
-        bridge_communicator.send_backward(random_grad_state)
+    # if bridge_communicator.is_current_rank_in_grid(bridge_communicator.dest_grid):
+    #     bridge_communicator.send_backward(random_grad_state)
+    # else:
+    #     bridge_communicator.receive_backward(
+    #         tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype
+    #     )
+    if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
+        random_hidden_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
+        bridge_communicator.send_forward_recv_backward(random_hidden_state, grad_shape=(16, 128, 512), dtype=random_hidden_state.dtype)
     else:
-        bridge_communicator.receive_backward(
-            tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype
-        )
+        random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
+        bridge_communicator.send_backward_recv_forward(random_grad_state, forward_shape=(16, 128, 512), dtype=random_grad_state.dtype)
     # kill distributed
     dist.destroy_process_group()
