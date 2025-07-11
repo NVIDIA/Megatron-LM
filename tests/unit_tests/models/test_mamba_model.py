@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+from datetime import timedelta
+
 import pytest
 import torch
 
@@ -156,11 +158,19 @@ class TestMambaModel:
         pp_group = mesh.get_group(mesh_dim="pp")
         cp_group = mesh.get_group(mesh_dim="cp")
         tp_group = mesh.get_group(mesh_dim="tp")
+        embd_group_ranks = parallel_state.default_embedding_ranks(
+            torch.distributed.get_process_group_ranks(pp_group)
+        )
+        embd_group = torch.distributed.new_group(
+            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
+        )
 
         # Create model with custom process groups
         from megatron.core.process_groups_config import ModelCommProcessGroups
 
-        model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group, pp=pp_group)
+        model_comm_pgs = ModelCommProcessGroups(
+            tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group
+        )
 
         # Configure model with appropriate sizes for parallelism
         model_config = TransformerConfig(
