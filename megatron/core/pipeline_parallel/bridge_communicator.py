@@ -408,7 +408,7 @@ class BridgeCommunicator:
                 received_tensor,
                 scatter_list=scatter_list,
                 src=self.current_rank,
-                group=self.activation_scatter_pg
+                group=self.activation_scatter_pg,
             )
 
             print(f"rank {self.current_rank} scattered tensor chunks to all ranks in group")
@@ -420,10 +420,10 @@ class BridgeCommunicator:
                 tensor_shape, device=torch.cuda.current_device(), dtype=dtype
             )
             dist.scatter(
-                received_tensor, 
-                scatter_list=None, 
-                src=self.dest_local_leader_rank, 
-                group=self.activation_scatter_pg
+                received_tensor,
+                scatter_list=None,
+                src=self.dest_local_leader_rank,
+                group=self.activation_scatter_pg,
             )
             print(
                 f"rank {self.current_rank} received tensor from scatter operation, shape {received_tensor.shape}"
@@ -574,7 +574,7 @@ class BridgeCommunicator:
                 received_gradient,
                 scatter_list=scatter_list,
                 src=self.current_rank,
-                group=self.activation_gather_pg
+                group=self.activation_gather_pg,
             )
 
             print(f"rank {self.current_rank} scattered gradient chunks to all ranks in group")
@@ -586,10 +586,10 @@ class BridgeCommunicator:
                 tensor_shape, device=torch.cuda.current_device(), dtype=dtype
             )
             dist.scatter(
-                received_gradient, 
-                scatter_list=None, 
-                src=self.src_local_leader_rank, 
-                group=self.activation_gather_pg
+                received_gradient,
+                scatter_list=None,
+                src=self.src_local_leader_rank,
+                group=self.activation_gather_pg,
             )
             print(
                 f"rank {self.current_rank} received gradient from scatter operation, shape {received_gradient.shape}"
@@ -742,7 +742,7 @@ class BridgeCommunicator:
                     received_gradient,
                     scatter_list=scatter_list,
                     src=self.current_rank,
-                    group=self.activation_gather_pg
+                    group=self.activation_gather_pg,
                 )
 
                 print(f"rank {self.current_rank} scattered gradient chunks to all ranks in group")
@@ -768,10 +768,10 @@ class BridgeCommunicator:
                 f"rank {self.current_rank} is a noop rank. Waiting for gradient from leader rank {self.src_local_leader_rank}"
             )
             dist.scatter(
-                received_gradient, 
-                scatter_list=None, 
-                src=self.src_local_leader_rank, 
-                group=self.activation_gather_pg
+                received_gradient,
+                scatter_list=None,
+                src=self.src_local_leader_rank,
+                group=self.activation_gather_pg,
             )
             print(
                 f"rank {self.current_rank} received gradient from scatter operation, shape {received_gradient.shape}"
@@ -931,7 +931,7 @@ class BridgeCommunicator:
                     received_activation,
                     scatter_list=scatter_list,
                     src=self.current_rank,
-                    group=self.activation_scatter_pg
+                    group=self.activation_scatter_pg,
                 )
 
                 print(f"rank {self.current_rank} scattered activation chunks to all ranks in group")
