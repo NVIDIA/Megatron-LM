@@ -58,10 +58,10 @@ class BridgeCommunicator:
         self.current_rank = dist.get_rank()
         self.comm_map: Dict[int, RankCommInfo] = {}
 
-        self.activation_gather_ranks, self.activation_gather_pg = (
+        self.activation_gather_ranks = (
             self._create_activation_gather_scatter_pg(self.src_grid, is_src=True)
         )
-        self.activation_scatter_ranks, self.activation_scatter_pg = (
+        self.activation_scatter_ranks = (
             self._create_activation_gather_scatter_pg(self.dest_grid, is_src=False)
         )
 
@@ -72,6 +72,17 @@ class BridgeCommunicator:
             self.dest_grid, is_src=False
         )
 
+
+        if self.activation_gather_ranks:
+            print(f"Current rank {self.current_rank} generating scatter ranks in dest grid")
+            self.activation_scatter_ranks = self.get_boundary_pp_stage_ranks(self.dest_grid, is_src=False)
+        if self.activation_scatter_ranks:
+            print(f"Current rank {self.current_rank} generating gather ranks in src grid")
+            self.activation_gather_ranks = self.get_boundary_pp_stage_ranks(self.src_grid, is_src=True)
+        
+        self.activation_gather_pg = dist.new_group(ranks=self.activation_gather_ranks)
+        self.activation_scatter_pg = dist.new_group(ranks=self.activation_scatter_ranks)
+
         log_msg = (
             f"[Rank {self.current_rank}] "
             f"srcLeader={self.src_local_leader_rank} "
@@ -79,7 +90,6 @@ class BridgeCommunicator:
             f"gatherGrpRanks={self.activation_gather_ranks} "
             f"scatterGrpRanks={self.activation_scatter_ranks}"
         )
-
         print(log_msg, flush=True)
         dist.barrier()
 
@@ -119,6 +129,28 @@ class BridgeCommunicator:
                 ranks.append(group[0])
             leader_ranks.extend(ranks)
         return leader_ranks, local_leader_rank
+    
+    def get_boundary_pp_stage_ranks(self, grid: HyperCommGrid, is_src: bool):
+        """Get ranks of tp-cp corresponding to last stage of pp for the current grid."""
+        tpcp_ranks = grid._gen_rank_enum(['tp', 'cp'])
+        pp_dim = grid.shape[grid.dim_names.index('pp')]
+        boundary_pp_stage_ranks = []
+        for group in tpcp_ranks:
+            for rank in group:
+                rank_coords = []
+                temp_rank = rank - grid.rank_offset
+                for dim_size in reversed(grid.shape):
+                    rank_coords.append(temp_rank % dim_size)
+                    temp_rank //= dim_size
+                rank_coords.reverse()
+                pp_coord = rank_coords[grid.dim_names.index('pp')]
+                if is_src:
+                    if pp_coord == pp_dim - 1:
+                        boundary_pp_stage_ranks.append(rank)
+                else:
+                    if pp_coord == 0:
+                        boundary_pp_stage_ranks.append(rank)
+        return boundary_pp_stage_ranks
 
     def _create_activation_gather_scatter_pg(self, grid: HyperCommGrid, is_src: bool):
 
@@ -126,12 +158,11 @@ class BridgeCommunicator:
             self.current_rank < grid.rank_offset
             or self.current_rank >= grid.rank_offset + grid.size
         ):
-            return [], None
+            return []
 
         pp_group_ranks = dist.get_process_group_ranks(grid.get_pg(['pp']))
-
+        tpcp_ranks=grid._gen_rank_enum(['tp', 'cp'])
         activation_comm_ranks = []
-        activation_comm_pg = None
 
         # on the src grid, all tp-cp ranks of last pp stage and dp replica that current rank belongs to
         # participtes in the activation gather
@@ -140,11 +171,11 @@ class BridgeCommunicator:
 
         if is_src and not self.current_rank == pp_group_ranks[-1]:
             # if current rank belongs to src grid. If not belongs to last pp stage, return empty ranks and pg
-            return activation_comm_ranks, activation_comm_pg
+            return activation_comm_ranks
 
         if not is_src and not self.current_rank == pp_group_ranks[0]:
             # if current rank belongs to dest grid. If not belongs to first pp stage, return empty ranks and pg
-            return activation_comm_ranks, activation_comm_pg
+            return activation_comm_ranks
 
         all_tpcp_group_ranks = grid._gen_rank_enum(['tp', 'cp'])
         for each_group_ranks in all_tpcp_group_ranks:
@@ -152,10 +183,7 @@ class BridgeCommunicator:
                 activation_comm_ranks = each_group_ranks
                 break
 
-        activation_comm_pg = dist.new_group(ranks=activation_comm_ranks)
-        # activation_comm_pg = grid.get_pg(['tp', 'cp'])
-
-        return activation_comm_ranks, activation_comm_pg
+        return activation_comm_ranks
 
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
