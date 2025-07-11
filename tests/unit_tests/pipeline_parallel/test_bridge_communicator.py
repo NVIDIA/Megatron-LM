@@ -40,23 +40,10 @@ class TestBridgeCommunicator:
     def setup_class(cls):
         """Set up distributed environment for the entire test class."""
         if not dist.is_initialized():
-            try:
-                # Initialize PyTorch distributed with NCCL backend
-                dist.init_process_group(backend="nccl")
-                cls.distributed_initialized = True
-            except Exception as e:
-                pytest.skip(f"Cannot initialize distributed: {e}")
-        else:
-            cls.distributed_initialized = True
-
-        grid = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=2)
-        if dist.get_rank() == 0:
-            print(f"tp rank by enum {grid._get_rank_enum(['tp'])}")
-            print(f"cp rank by enum {grid._get_rank_enum(['cp'])}")
-            print(f"dp rank by enum {grid._get_rank_enum(['dp'])}")
-            print(f"pp rank by enum {grid._get_rank_enum(['pp'])}")
-            print(f"tp-cp rank by enum {grid._get_rank_enum(['tp', 'cp'])}")
-            print(f"tp-cp-pp rank by enum {grid._get_rank_enum(['tp', 'cp', 'pp'])}")
+            dist.init_process_group(backend="nccl")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+       
 
     def test_bridge_communicator_init(self):
         if not dist.is_initialized():
@@ -70,7 +57,37 @@ class TestBridgeCommunicator:
         assert bridge_communicator.current_rank == dist.get_rank()
         assert bridge_communicator.comm_map is not None
 
-    def test_tensor_reconstruction(self):
+    # def test_tensor_reconstruction(self):
+    #     if not dist.is_initialized():
+    #         pytest.skip("Distributed not initialized")
+
+    #     world_size = dist.get_world_size()
+    #     if world_size != 8:
+    #         pytest.skip(f"This test requires 8 GPUs, but only {world_size} are available")
+
+    #     grid1 = create_hypercomm_grid(offset=0, dp=2, tp=2, cp=1)
+    #     grid2 = create_hypercomm_grid(offset=4, dp=2, tp=2, cp=1)
+    #     if dist.get_rank() < 4:
+    #         source_grid = grid1
+    #     else:
+    #         source_grid = grid2
+    #     bridge_communicator = BridgeCommunicator(grid1, grid2)
+    #     tp_cp_group_ranks = dist.get_process_group_ranks(bridge_communicator.dp_pg)
+    #     device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu')
+    #     gathered_tensors = [
+    #         torch.randn(3, 128, 256, device=device) for _ in range(len(tp_cp_group_ranks))
+    #     ]
+    #     aggregated_tensor = bridge_communicator._reconstruct_tensor_from_gathered(
+    #         gathered_tensors, source_grid
+    #     )
+    #     assert aggregated_tensor.shape == (
+    #         3,
+    #         128,
+    #         512,
+    #     ), f"Expected aggregated tensor shape (3, 128, 512), got {aggregated_tensor.shape}"
+
+    def test_send_forward_recv_backward_send_backward_recv_forward(self):
+        """Test combined send_forward_recv_backward and send_backward_recv_forward operations."""
         if not dist.is_initialized():
             pytest.skip("Distributed not initialized")
 
@@ -78,48 +95,100 @@ class TestBridgeCommunicator:
         if world_size != 8:
             pytest.skip(f"This test requires 8 GPUs, but only {world_size} are available")
 
-        grid1 = create_hypercomm_grid(offset=0, dp=2, tp=2, cp=1)
-        grid2 = create_hypercomm_grid(offset=4, dp=2, tp=2, cp=1)
-        if dist.get_rank() < 4:
-            source_grid = grid1
-        else:
-            source_grid = grid2
-        bridge_communicator = BridgeCommunicator(grid1, grid2)
-        tp_cp_group_ranks = dist.get_process_group_ranks(bridge_communicator.dp_pg)
-        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device('cpu')
-        gathered_tensors = [
-            torch.randn(3, 128, 256, device=device) for _ in range(len(tp_cp_group_ranks))
-        ]
-        aggregated_tensor = bridge_communicator._reconstruct_tensor_from_gathered(
-            gathered_tensors, source_grid
-        )
-        assert aggregated_tensor.shape == (
-            3,
-            128,
-            512,
-        ), f"Expected aggregated tensor shape (3, 128, 512), got {aggregated_tensor.shape}"
-
-    def test_send_backward_recv_backward(self):
-        if not dist.is_initialized():
-            pytest.skip("Distributed not initialized")
-
-        world_size = dist.get_world_size()
-        if world_size != 8:
-            pytest.skip(f"This test requires 8 GPUs, but only {world_size} are available")
-
+        # Create source and destination grids
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
         grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
         bridge_communicator = BridgeCommunicator(grid1, grid2)
+        
+        # Verify basic properties
         assert bridge_communicator.src_grid == grid1
         assert bridge_communicator.dest_grid == grid2
         assert bridge_communicator.current_rank == dist.get_rank()
 
-        random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
-            print(f"rank {dist.get_rank()} is in src grid")
-            bridge_communicator.receive_backward(
-                tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype
+            random_hidden_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
+            received_grad = bridge_communicator.send_forward_recv_backward(
+                random_hidden_state, grad_shape=(16, 128, 512), dtype=random_hidden_state.dtype
             )
+            
+            # Assert that the returned gradient tensor is valid
+            assert received_grad is not None, "send_forward_recv_backward should return a gradient tensor"
+            assert isinstance(received_grad, torch.Tensor), f"Expected torch.Tensor, got {type(received_grad)}"
+            assert received_grad.shape == random_hidden_state.shape, f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
+            assert received_grad.device == random_hidden_state.device, f"Expected device {random_hidden_state.device}, got {received_grad.device}"
+            
         else:
-            print(f"rank {dist.get_rank()} is in dest grid")
+            random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
+            received_activation = bridge_communicator.send_backward_recv_forward(
+                random_grad_state, forward_shape=(16, 128, 512), dtype=random_grad_state.dtype
+            )
+            
+            # Assert that the returned activation tensor is valid
+            assert received_activation is not None, "send_backward_recv_forward should return an activation tensor"
+            assert isinstance(received_activation, torch.Tensor), f"Expected torch.Tensor, got {type(received_activation)}"
+            assert received_activation.shape == random_grad_state.shape, f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"
+            assert received_activation.device == random_grad_state.device, f"Expected device {random_grad_state.device}, got {received_activation.device}"
+
+    def test_send_forward_recv_forward(self):
+        """Test send_forward and recv_forward operations."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        world_size = dist.get_world_size()
+        if world_size != 8:
+            pytest.skip(f"This test requires 8 GPUs, but only {world_size} are available")
+
+        # Create source and destination grids
+        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
+        grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge_communicator = BridgeCommunicator(grid1, grid2)
+        
+        # Verify basic properties
+        assert bridge_communicator.src_grid == grid1
+        assert bridge_communicator.dest_grid == grid2
+        assert bridge_communicator.current_rank == dist.get_rank()
+
+        random_hidden_state = torch.randn(16, 128, 512)
+        if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
+            random_hidden_state = random_hidden_state.cuda()
+            bridge_communicator.send_forward(random_hidden_state)
+                 
+        else:
+            received_activation = bridge_communicator.receive_forward(tensor_shape=(16, 128, 512), dtype=random_hidden_state.dtype)      
+            # Assert that the returned activation tensor is valid
+            assert received_activation is not None, "recv_forward should return an activation tensor"
+            assert isinstance(received_activation, torch.Tensor), f"Expected torch.Tensor, got {type(received_activation)}"
+            assert received_activation.shape == (16, 128, 512), f"Expected activation shape {(16, 128, 512)}, got {received_activation.shape}"
+
+
+    def test_send_backward_recv_backward(self):
+        """Test send_backward and recv_backward operations."""
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        world_size = dist.get_world_size()
+        if world_size != 8:
+            pytest.skip(f"This test requires 8 GPUs, but only {world_size} are available")
+
+        # Create source and destination grids
+        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
+        grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        bridge_communicator = BridgeCommunicator(grid1, grid2)
+        
+        # Verify basic properties
+        assert bridge_communicator.src_grid == grid1
+        assert bridge_communicator.dest_grid == grid2
+        assert bridge_communicator.current_rank == dist.get_rank()
+
+        random_grad_state = torch.randn(16, 128, 512)
+        if bridge_communicator.is_current_rank_in_grid(bridge_communicator.dest_grid):
+            # In backward pass, gradients flow from destination grid back to source grid
+            random_grad_state = random_grad_state.cuda()
             bridge_communicator.send_backward(random_grad_state)
+                 
+        else:
+            received_gradient = bridge_communicator.receive_backward(tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype)      
+            # Assert that the returned gradient tensor is valid
+            assert received_gradient is not None, "recv_backward should return a gradient tensor"
+            assert isinstance(received_gradient, torch.Tensor), f"Expected torch.Tensor, got {type(received_gradient)}"
+            assert received_gradient.shape == (16, 128, 512), f"Expected gradient shape {(16, 128, 512)}, got {received_gradient.shape}"

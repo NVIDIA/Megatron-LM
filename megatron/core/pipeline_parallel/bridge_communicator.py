@@ -416,6 +416,7 @@ class BridgeCommunicator:
             # Wait for all sends to complete
             for req in send_requests:
                 req.wait()
+            return received_tensor
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
             # TODO: ykarnati - naive scatter for now - FIXME
@@ -431,7 +432,7 @@ class BridgeCommunicator:
             print(
                 f"rank {self.current_rank} received tensor from leader rank {self.dest_local_leader_rank} shape {received_tensor.shape}"
             )
-
+            return received_tensor
     def send_backward(self, grad_tensor: torch.Tensor):
         """Send backward gradient tensor.
 
@@ -1272,69 +1273,3 @@ class BridgeCommunicator:
         print(f"enum_order_tensor_dict keys: {enum_order_tensor_dict.keys()}")
         print("*" * 100)
         return enum_order_tensor_dict
-
-
-if __name__ == "__main__":
-    import os
-
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-
-    def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
-        """Create a HyperCommGrid with tensor parallelism=2, context parallelism=2, and data parallelism=2.
-
-        Returns:
-            HyperCommGrid: A grid configured with tp=2, cp=2, dp=2 (total size = 8).
-        """
-        # Set up environment for world size 8 if not already set
-        if "WORLD_SIZE" not in os.environ:
-            os.environ["WORLD_SIZE"] = "8"
-
-        grid = HyperCommGrid(
-            shape=[tp, cp, pp, dp],
-            dim_names=["tp", "cp", "pp", "dp"],
-            rank_offset=offset,
-            backend="nccl",
-        )
-        # print(grid)
-        _ = grid.create_pg(["tp"])
-        _ = grid.create_pg(["cp"])
-        _ = grid.create_pg(["pp"])
-        _ = grid.create_pg(["dp"])
-        return grid
-
-    grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
-    grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
-    bridge_communicator = BridgeCommunicator(grid1, grid2)
-    assert bridge_communicator.src_grid == grid1
-    assert bridge_communicator.dest_grid == grid2
-    assert bridge_communicator.current_rank == dist.get_rank()
-    # assert bridge_communicator.comm_map is not None
-    # current_rank = dist.get_rank()
-    # if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
-    #     bridge_communicator.send_forward(random_hidden_state)
-    # else:
-    #     bridge_communicator.receive_forward(
-    #         tensor_shape=(16, 128, 512), dtype=random_hidden_state.dtype
-    #     )
-
-    # if bridge_communicator.is_current_rank_in_grid(bridge_communicator.dest_grid):
-    #     bridge_communicator.send_backward(random_grad_state)
-    # else:
-    #     bridge_communicator.receive_backward(
-    #         tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype
-    #     )
-    if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
-        random_hidden_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
-        bridge_communicator.send_forward_recv_backward(
-            random_hidden_state, grad_shape=(16, 128, 512), dtype=random_hidden_state.dtype
-        )
-    else:
-        random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
-        bridge_communicator.send_backward_recv_forward(
-            random_grad_state, forward_shape=(16, 128, 512), dtype=random_grad_state.dtype
-        )
-    # kill distributed
-    dist.destroy_process_group()
