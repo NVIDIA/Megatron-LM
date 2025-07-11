@@ -47,7 +47,7 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
     """Builds the model.
 
     Args:
-        pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
+        pre_process (bool, optional): Set to true if you need to compute embeddings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
 
 
@@ -64,7 +64,7 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
     if args.spec is not None:
         mamba_stack_spec = import_module(args.spec)
     else:
-        raise("You must provide a valid Mamba layer spec!")
+        raise ValueError("You must provide a valid Mamba layer spec!")
 
     model = MambaModel(
         config=config,
@@ -137,14 +137,14 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
             result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isinf,
             message="found Inf in local forward loss calculation",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=True,
         )
     # Check for spiky loss
@@ -157,7 +157,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
                 context="loss",
             ),
             message="Spiky loss",
-            tolerance=0.0,        # forward pass calculations are determinisic
+            tolerance=0.0,        # forward pass calculations are deterministic
             fatal=False,
         )
 
