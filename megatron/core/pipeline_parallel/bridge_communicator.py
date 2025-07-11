@@ -58,11 +58,11 @@ class BridgeCommunicator:
         self.current_rank = dist.get_rank()
         self.comm_map: Dict[int, RankCommInfo] = {}
 
-        self.activation_gather_ranks = (
-            self._create_activation_gather_scatter_pg(self.src_grid, is_src=True)
+        self.activation_gather_ranks = self._create_activation_gather_scatter_pg(
+            self.src_grid, is_src=True
         )
-        self.activation_scatter_ranks = (
-            self._create_activation_gather_scatter_pg(self.dest_grid, is_src=False)
+        self.activation_scatter_ranks = self._create_activation_gather_scatter_pg(
+            self.dest_grid, is_src=False
         )
 
         self.src_tp_leaders, self.src_local_leader_rank = self.get_leader_rank(
@@ -72,14 +72,17 @@ class BridgeCommunicator:
             self.dest_grid, is_src=False
         )
 
-
         if self.activation_gather_ranks:
             print(f"Current rank {self.current_rank} generating scatter ranks in dest grid")
-            self.activation_scatter_ranks = self.get_boundary_pp_stage_ranks(self.dest_grid, is_src=False)
+            self.activation_scatter_ranks = self.get_boundary_pp_stage_ranks(
+                self.dest_grid, is_src=False
+            )
         if self.activation_scatter_ranks:
             print(f"Current rank {self.current_rank} generating gather ranks in src grid")
-            self.activation_gather_ranks = self.get_boundary_pp_stage_ranks(self.src_grid, is_src=True)
-        
+            self.activation_gather_ranks = self.get_boundary_pp_stage_ranks(
+                self.src_grid, is_src=True
+            )
+
         self.activation_gather_pg = dist.new_group(ranks=self.activation_gather_ranks)
         self.activation_scatter_pg = dist.new_group(ranks=self.activation_scatter_ranks)
 
@@ -129,7 +132,7 @@ class BridgeCommunicator:
                 ranks.append(group[0])
             leader_ranks.extend(ranks)
         return leader_ranks, local_leader_rank
-    
+
     def get_boundary_pp_stage_ranks(self, grid: HyperCommGrid, is_src: bool):
         """Get ranks of tp-cp corresponding to last stage of pp for the current grid."""
         tpcp_ranks = grid._gen_rank_enum(['tp', 'cp'])
@@ -161,7 +164,7 @@ class BridgeCommunicator:
             return []
 
         pp_group_ranks = dist.get_process_group_ranks(grid.get_pg(['pp']))
-        tpcp_ranks=grid._gen_rank_enum(['tp', 'cp'])
+        tpcp_ranks = grid._gen_rank_enum(['tp', 'cp'])
         activation_comm_ranks = []
 
         # on the src grid, all tp-cp ranks of last pp stage and dp replica that current rank belongs to
@@ -433,6 +436,7 @@ class BridgeCommunicator:
                 f"rank {self.current_rank} received tensor from leader rank {self.dest_local_leader_rank} shape {received_tensor.shape}"
             )
             return received_tensor
+
     def send_backward(self, grad_tensor: torch.Tensor):
         """Send backward gradient tensor.
 

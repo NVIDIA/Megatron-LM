@@ -43,7 +43,6 @@ class TestBridgeCommunicator:
             dist.init_process_group(backend="nccl")
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-       
 
     def test_bridge_communicator_init(self):
         if not dist.is_initialized():
@@ -99,35 +98,55 @@ class TestBridgeCommunicator:
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
         grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
         bridge_communicator = BridgeCommunicator(grid1, grid2)
-        
+
         # Verify basic properties
         assert bridge_communicator.src_grid == grid1
         assert bridge_communicator.dest_grid == grid2
         assert bridge_communicator.current_rank == dist.get_rank()
 
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
-            random_hidden_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
+            random_hidden_state = torch.randn(
+                16, 128, 512
+            ).cuda()  # (batch_size, seq_len, hidden_size)
             received_grad = bridge_communicator.send_forward_recv_backward(
                 random_hidden_state, grad_shape=(16, 128, 512), dtype=random_hidden_state.dtype
             )
-            
+
             # Assert that the returned gradient tensor is valid
-            assert received_grad is not None, "send_forward_recv_backward should return a gradient tensor"
-            assert isinstance(received_grad, torch.Tensor), f"Expected torch.Tensor, got {type(received_grad)}"
-            assert received_grad.shape == random_hidden_state.shape, f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
-            assert received_grad.device == random_hidden_state.device, f"Expected device {random_hidden_state.device}, got {received_grad.device}"
-            
+            assert (
+                received_grad is not None
+            ), "send_forward_recv_backward should return a gradient tensor"
+            assert isinstance(
+                received_grad, torch.Tensor
+            ), f"Expected torch.Tensor, got {type(received_grad)}"
+            assert (
+                received_grad.shape == random_hidden_state.shape
+            ), f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
+            assert (
+                received_grad.device == random_hidden_state.device
+            ), f"Expected device {random_hidden_state.device}, got {received_grad.device}"
+
         else:
-            random_grad_state = torch.randn(16, 128, 512).cuda()  # (batch_size, seq_len, hidden_size)
+            random_grad_state = torch.randn(
+                16, 128, 512
+            ).cuda()  # (batch_size, seq_len, hidden_size)
             received_activation = bridge_communicator.send_backward_recv_forward(
                 random_grad_state, forward_shape=(16, 128, 512), dtype=random_grad_state.dtype
             )
-            
+
             # Assert that the returned activation tensor is valid
-            assert received_activation is not None, "send_backward_recv_forward should return an activation tensor"
-            assert isinstance(received_activation, torch.Tensor), f"Expected torch.Tensor, got {type(received_activation)}"
-            assert received_activation.shape == random_grad_state.shape, f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"
-            assert received_activation.device == random_grad_state.device, f"Expected device {random_grad_state.device}, got {received_activation.device}"
+            assert (
+                received_activation is not None
+            ), "send_backward_recv_forward should return an activation tensor"
+            assert isinstance(
+                received_activation, torch.Tensor
+            ), f"Expected torch.Tensor, got {type(received_activation)}"
+            assert (
+                received_activation.shape == random_grad_state.shape
+            ), f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"
+            assert (
+                received_activation.device == random_grad_state.device
+            ), f"Expected device {random_grad_state.device}, got {received_activation.device}"
 
     def test_send_forward_recv_forward(self):
         """Test send_forward and recv_forward operations."""
@@ -142,7 +161,7 @@ class TestBridgeCommunicator:
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
         grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
         bridge_communicator = BridgeCommunicator(grid1, grid2)
-        
+
         # Verify basic properties
         assert bridge_communicator.src_grid == grid1
         assert bridge_communicator.dest_grid == grid2
@@ -152,14 +171,23 @@ class TestBridgeCommunicator:
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
             random_hidden_state = random_hidden_state.cuda()
             bridge_communicator.send_forward(random_hidden_state)
-                 
-        else:
-            received_activation = bridge_communicator.receive_forward(tensor_shape=(16, 128, 512), dtype=random_hidden_state.dtype)      
-            # Assert that the returned activation tensor is valid
-            assert received_activation is not None, "recv_forward should return an activation tensor"
-            assert isinstance(received_activation, torch.Tensor), f"Expected torch.Tensor, got {type(received_activation)}"
-            assert received_activation.shape == (16, 128, 512), f"Expected activation shape {(16, 128, 512)}, got {received_activation.shape}"
 
+        else:
+            received_activation = bridge_communicator.receive_forward(
+                tensor_shape=(16, 128, 512), dtype=random_hidden_state.dtype
+            )
+            # Assert that the returned activation tensor is valid
+            assert (
+                received_activation is not None
+            ), "recv_forward should return an activation tensor"
+            assert isinstance(
+                received_activation, torch.Tensor
+            ), f"Expected torch.Tensor, got {type(received_activation)}"
+            assert received_activation.shape == (
+                16,
+                128,
+                512,
+            ), f"Expected activation shape {(16, 128, 512)}, got {received_activation.shape}"
 
     def test_send_backward_recv_backward(self):
         """Test send_backward and recv_backward operations."""
@@ -174,7 +202,7 @@ class TestBridgeCommunicator:
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
         grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
         bridge_communicator = BridgeCommunicator(grid1, grid2)
-        
+
         # Verify basic properties
         assert bridge_communicator.src_grid == grid1
         assert bridge_communicator.dest_grid == grid2
@@ -185,10 +213,18 @@ class TestBridgeCommunicator:
             # In backward pass, gradients flow from destination grid back to source grid
             random_grad_state = random_grad_state.cuda()
             bridge_communicator.send_backward(random_grad_state)
-                 
+
         else:
-            received_gradient = bridge_communicator.receive_backward(tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype)      
+            received_gradient = bridge_communicator.receive_backward(
+                tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype
+            )
             # Assert that the returned gradient tensor is valid
             assert received_gradient is not None, "recv_backward should return a gradient tensor"
-            assert isinstance(received_gradient, torch.Tensor), f"Expected torch.Tensor, got {type(received_gradient)}"
-            assert received_gradient.shape == (16, 128, 512), f"Expected gradient shape {(16, 128, 512)}, got {received_gradient.shape}"
+            assert isinstance(
+                received_gradient, torch.Tensor
+            ), f"Expected torch.Tensor, got {type(received_gradient)}"
+            assert received_gradient.shape == (
+                16,
+                128,
+                512,
+            ), f"Expected gradient shape {(16, 128, 512)}, got {received_gradient.shape}"
