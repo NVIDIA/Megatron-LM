@@ -164,7 +164,6 @@ class BridgeCommunicator:
             return []
 
         pp_group_ranks = dist.get_process_group_ranks(grid.get_pg(['pp']))
-        tpcp_ranks = grid._gen_rank_enum(['tp', 'cp'])
         activation_comm_ranks = []
 
         # on the src grid, all tp-cp ranks of last pp stage and dp replica that current rank belongs to
@@ -398,42 +397,36 @@ class BridgeCommunicator:
             # Send each tensor in scatter_list to corresponding ranks in activation_scatter_pg
             scatter_ranks = dist.get_process_group_ranks(self.activation_scatter_pg)
 
-            # Collect all send requests for parallel execution
-            send_requests = []
+            # Prepare scatter list ordered by process group ranks
+            scatter_list = [tensor_dict[rank] for rank in scatter_ranks]
 
-            for rank in scatter_ranks:
-                if rank != self.current_rank:
-                    # Use asynchronous send for parallel execution
-                    req = dist.isend(tensor_dict[rank], dst=rank, group=self.activation_scatter_pg)
-                    send_requests.append(req)
-                    print(
-                        f"rank {self.current_rank} initiated send of tensor chunk {i} to rank {rank} shape {tensor_dict[rank].shape}"
-                    )
-                else:
-                    # If sending to self, just copy the tensor
-                    received_tensor = tensor_dict[rank].clone()
-                    print(
-                        f"rank {self.current_rank} kept tensor chunk {i} for self, shape {tensor_dict[rank].shape}"
-                    )
+            # Create tensor to receive the scattered data
+            received_tensor = torch.empty_like(tensor_dict[self.current_rank])
 
-            # Wait for all sends to complete
-            for req in send_requests:
-                req.wait()
+            # Scatter the tensors to all ranks in the group
+            dist.scatter(
+                received_tensor,
+                scatter_list=scatter_list,
+                src=self.current_rank,
+                group=self.activation_scatter_pg
+            )
+
+            print(f"rank {self.current_rank} scattered tensor chunks to all ranks in group")
             return received_tensor
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
-            # TODO: ykarnati - naive scatter for now - FIXME
-            # we dont always evenly divide the tensor into chunks.
-            # This is WRONG - just to test the comms
-
+            # Non-leader rank - participate in scatter operation
             received_tensor = torch.empty(
                 tensor_shape, device=torch.cuda.current_device(), dtype=dtype
             )
-            dist.recv(
-                received_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
+            dist.scatter(
+                received_tensor, 
+                scatter_list=None, 
+                src=self.dest_local_leader_rank, 
+                group=self.activation_scatter_pg
             )
             print(
-                f"rank {self.current_rank} received tensor from leader rank {self.dest_local_leader_rank} shape {received_tensor.shape}"
+                f"rank {self.current_rank} received tensor from scatter operation, shape {received_tensor.shape}"
             )
             return received_tensor
 
@@ -570,41 +563,36 @@ class BridgeCommunicator:
             # Send each tensor in tensor_dict to corresponding ranks in activation_gather_pg
             scatter_ranks = dist.get_process_group_ranks(self.activation_gather_pg)
 
-            # Collect all send requests for parallel execution
-            send_requests = []
-            received_gradient = None
+            # Prepare scatter list ordered by process group ranks
+            scatter_list = [tensor_dict[rank] for rank in scatter_ranks]
 
-            for rank in scatter_ranks:
-                if rank != self.current_rank:
-                    # Use asynchronous send for parallel execution
-                    req = dist.isend(tensor_dict[rank], dst=rank, group=self.activation_gather_pg)
-                    send_requests.append(req)
-                    print(
-                        f"rank {self.current_rank} initiated send of gradient chunk to rank {rank} shape {tensor_dict[rank].shape}"
-                    )
-                else:
-                    # If sending to self, just copy the tensor
-                    received_gradient = tensor_dict[rank].clone()
-                    print(
-                        f"rank {self.current_rank} kept gradient chunk for self, shape {tensor_dict[rank].shape}"
-                    )
+            # Create tensor to receive the scattered data
+            received_gradient = torch.empty_like(tensor_dict[self.current_rank])
 
-            # Wait for all sends to complete
-            for req in send_requests:
-                req.wait()
+            # Scatter the tensors to all ranks in the group
+            dist.scatter(
+                received_gradient,
+                scatter_list=scatter_list,
+                src=self.current_rank,
+                group=self.activation_gather_pg
+            )
 
+            print(f"rank {self.current_rank} scattered gradient chunks to all ranks in group")
             return received_gradient
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
-            # Non-leader rank - receive from leader
+            # Non-leader rank - participate in scatter operation
             received_gradient = torch.empty(
                 tensor_shape, device=torch.cuda.current_device(), dtype=dtype
             )
-            dist.recv(
-                received_gradient, src=self.src_local_leader_rank, group=self.activation_gather_pg
+            dist.scatter(
+                received_gradient, 
+                scatter_list=None, 
+                src=self.src_local_leader_rank, 
+                group=self.activation_gather_pg
             )
             print(
-                f"rank {self.current_rank} received gradient from leader rank {self.src_local_leader_rank} shape {received_gradient.shape}"
+                f"rank {self.current_rank} received gradient from scatter operation, shape {received_gradient.shape}"
             )
             return received_gradient
 
@@ -743,31 +731,21 @@ class BridgeCommunicator:
                 # Send each tensor in tensor_dict to corresponding ranks in activation_gather_pg
                 scatter_ranks = dist.get_process_group_ranks(self.activation_gather_pg)
 
-                # Collect all send requests for parallel execution
-                send_requests = []
-                received_gradient = None
+                # Prepare scatter list ordered by process group ranks
+                scatter_list = [tensor_dict[rank] for rank in scatter_ranks]
 
-                for rank in scatter_ranks:
-                    if rank != self.current_rank:
-                        # Use asynchronous send for parallel execution
-                        req = dist.isend(
-                            tensor_dict[rank], dst=rank, group=self.activation_gather_pg
-                        )
-                        send_requests.append(req)
-                        print(
-                            f"rank {self.current_rank} initiated send of gradient chunk to rank {rank} shape {tensor_dict[rank].shape}"
-                        )
-                    else:
-                        # If sending to self, just copy the tensor
-                        received_gradient = tensor_dict[rank].clone()
-                        print(
-                            f"rank {self.current_rank} kept gradient chunk for self, shape {tensor_dict[rank].shape}"
-                        )
+                # Create tensor to receive the scattered data
+                received_gradient = torch.empty_like(tensor_dict[self.current_rank])
 
-                # Wait for all sends to complete
-                for req in send_requests:
-                    req.wait()
+                # Scatter the tensors to all ranks in the group
+                dist.scatter(
+                    received_gradient,
+                    scatter_list=scatter_list,
+                    src=self.current_rank,
+                    group=self.activation_gather_pg
+                )
 
+                print(f"rank {self.current_rank} scattered gradient chunks to all ranks in group")
                 return received_gradient
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
@@ -782,18 +760,21 @@ class BridgeCommunicator:
                 dst=self.src_local_leader_rank,
                 group=self.activation_gather_pg,
             )
-            # Receive gradient from leader
+            # Receive gradient from leader using scatter operation
             received_gradient = torch.empty(
                 grad_shape, device=torch.cuda.current_device(), dtype=dtype
             )
             print(
                 f"rank {self.current_rank} is a noop rank. Waiting for gradient from leader rank {self.src_local_leader_rank}"
             )
-            dist.recv(
-                received_gradient, src=self.src_local_leader_rank, group=self.activation_gather_pg
+            dist.scatter(
+                received_gradient, 
+                scatter_list=None, 
+                src=self.src_local_leader_rank, 
+                group=self.activation_gather_pg
             )
             print(
-                f"rank {self.current_rank} received gradient from leader rank {self.src_local_leader_rank} shape {received_gradient.shape}"
+                f"rank {self.current_rank} received gradient from scatter operation, shape {received_gradient.shape}"
             )
             return received_gradient
 
@@ -939,31 +920,21 @@ class BridgeCommunicator:
                 # Send each tensor in tensor_dict to corresponding ranks in activation_scatter_pg
                 scatter_ranks = dist.get_process_group_ranks(self.activation_scatter_pg)
 
-                # Collect all send requests for parallel execution
-                send_requests = []
-                received_activation = None
+                # Prepare scatter list ordered by process group ranks
+                scatter_list = [tensor_dict[rank] for rank in scatter_ranks]
 
-                for rank in scatter_ranks:
-                    if rank != self.current_rank:
-                        # Use asynchronous send for parallel execution
-                        req = dist.isend(
-                            tensor_dict[rank], dst=rank, group=self.activation_scatter_pg
-                        )
-                        send_requests.append(req)
-                        print(
-                            f"rank {self.current_rank} initiated send of activation chunk to rank {rank} shape {tensor_dict[rank].shape}"
-                        )
-                    else:
-                        # If sending to self, just copy the tensor
-                        received_activation = tensor_dict[rank].clone()
-                        print(
-                            f"rank {self.current_rank} kept activation chunk for self, shape {tensor_dict[rank].shape}"
-                        )
+                # Create tensor to receive the scattered data
+                received_activation = torch.empty_like(tensor_dict[self.current_rank])
 
-                # Wait for all sends to complete
-                for req in send_requests:
-                    req.wait()
+                # Scatter the tensors to all ranks in the group
+                dist.scatter(
+                    received_activation,
+                    scatter_list=scatter_list,
+                    src=self.current_rank,
+                    group=self.activation_scatter_pg
+                )
 
+                print(f"rank {self.current_rank} scattered activation chunks to all ranks in group")
                 return received_activation
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
@@ -981,17 +952,18 @@ class BridgeCommunicator:
             print(
                 f"rank {self.current_rank} is a noop rank. Waiting for activation from leader rank {self.dest_local_leader_rank}"
             )
-            # Receive activation from leader
+            # Receive activation from leader using scatter operation
             received_activation = torch.empty(
                 forward_shape, device=torch.cuda.current_device(), dtype=dtype
             )
-            dist.recv(
+            dist.scatter(
                 received_activation,
+                scatter_list=None,
                 src=self.dest_local_leader_rank,
                 group=self.activation_scatter_pg,
             )
             print(
-                f"rank {self.current_rank} received activation from leader rank {self.dest_local_leader_rank} shape {received_activation.shape}"
+                f"rank {self.current_rank} received activation from scatter operation, shape {received_activation.shape}"
             )
             return received_activation
 
