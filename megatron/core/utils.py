@@ -401,6 +401,9 @@ def deprecate_inference_params(inference_context, inference_params):
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
+    if not torch.distributed.is_initialized():
+        return None
+
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             warnings.warn(
