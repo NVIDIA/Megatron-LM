@@ -30,6 +30,7 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.utils import (
     get_torch_version,
+    is_te_min_version,
     is_torch_min_version,
 )
 from megatron.training.activations import squared_relu
@@ -618,6 +619,11 @@ def validate_args(args, defaults={}):
             '--use-torch-fsdp2 not supported with fp16 yet'
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+
+        if args.fp8_param_gather and is_te_min_version("2.0.0"):
+            args.fp8_param_gather = False
+            warnings.warn('FSDP2 FP8 param gather is not supported yet in TE 2.0, will fallback to bf16' \
+                          'all_gather instead, turning off fp8_param_gather')
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
