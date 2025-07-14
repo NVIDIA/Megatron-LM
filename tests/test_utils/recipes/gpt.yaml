@@ -109,12 +109,6 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  # - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
-  #   products:
-  # - environment: [dev]
-  #   scope: [nightly] # Broken: #480
-  # - environment: [lts]
-  #   scope: [nightly] # Outdated: #502
   #######################################################################
   # MR tests: Mostly DEV on MR, and LTS on nightly cadence, except for  #
   #             some very important tests.                              #
@@ -431,6 +425,12 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_modelopt_distill_resume]
+    products:
+      - environment: [dev]
+        scope: [mr]
+      # - environment: [lts]
+      #   scope: [nightly] # Outdated: #502
   # - test_case: [gpt3_mr_mcore_te_tp2_pp1_fsdp2_resume_torch_dist_dgx_a100_1N8G]
   #   products:
   # - environment: [dev]
