@@ -60,6 +60,7 @@ pre:create_ci_branches:
       - branch: ci-weekly
       - branch: ci-pre-release
       - branch: ci-review-reminder
+      - branch: ci-upgrade-dependencies
   tags:
     - arch/amd64
     - env/prod
