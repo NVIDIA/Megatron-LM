@@ -46,8 +46,7 @@ GROUPEDGEMM_WHEEL=$(ls $INPUT_WHEEL_DIR/grouped_gemm*.whl) || true
 # Override deps that are already present in the base image
 # only for dev
 if [ "$ENVIRONMENT" = "dev" ]; then
-    uv pip install --no-cache-dir --no-deps $TE_WHEEL \
-        "nvidia-modelopt[torch]>=0.29.0" "setuptools<80.0.0"
+    uv pip install --no-cache-dir --no-deps $TE_WHEEL
 fi
 
 # Install heavy optional deps like mamba, causalconv1d, groupedgemm

@@ -1240,7 +1240,7 @@ requires-dist = [
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "<7" },
     { name = "multi-storage-client", marker = "extra == 'dev'" },
     { name = "numpy", specifier = "<2.0.0" },
-    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'" },
+    { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = "~=0.31.0" },
     { name = "nvtx", marker = "extra == 'dev'" },
     { name = "nvtx", marker = "extra == 'lts'" },
     { name = "sentencepiece", marker = "extra == 'mlm'" },
