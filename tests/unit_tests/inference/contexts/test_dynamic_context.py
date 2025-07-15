@@ -504,6 +504,7 @@ class TestDynamicContext:
         ].cpu().numpy().tolist() == [128, 128, 128, 128, 11, 11, 11]
 
         # The first 4 requests will require an extra chunk.
+        # Since 3 requests have finished, the last 3 rows should be all -1.
         assert torch.all(
             dynamic_context.request_to_kv_chunk_ids[0:10].cpu()
             == torch.tensor(
@@ -515,9 +516,9 @@ class TestDynamicContext:
                     [483, -1, -1, -1],
                     [481, -1, -1, -1],
                     [488, -1, -1, -1],
-                    [486, -1, -1, -1],
-                    [487, -1, -1, -1],
-                    [488, -1, -1, -1],
+                    [-1, -1, -1, -1],
+                    [-1, -1, -1, -1],
+                    [-1, -1, -1, -1],
                 ]
             )
         )
