@@ -438,7 +438,7 @@ class TestBridgeCommunicator:
         # Create 2 normal linear layers with no parallelization
         normal_layer1 = torch.nn.Linear(input_size, hidden_size, bias=True).cuda().bfloat16()
         normal_layer2 = torch.nn.Linear(hidden_size, input_size, bias=True).cuda().bfloat16()
-        
+
         # Initialize the normal layers
         init_method(normal_layer1.weight)
         init_method(normal_layer2.weight)
@@ -454,27 +454,31 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(grid1):
             # First layer: ColumnParallelLinear with tp=4
-            layer1 = ColumnParallelLinear(
-                input_size=input_size,
-                output_size=hidden_size,
-                config=config1,
-                init_method=init_method,
-                bias=True,
-                gather_output=False,
-                skip_bias_add=False,
-                tp_group=tp_group1,
-            ).cuda().bfloat16()
-            
+            layer1 = (
+                ColumnParallelLinear(
+                    input_size=input_size,
+                    output_size=hidden_size,
+                    config=config1,
+                    init_method=init_method,
+                    bias=True,
+                    gather_output=False,
+                    skip_bias_add=False,
+                    tp_group=tp_group1,
+                )
+                .cuda()
+                .bfloat16()
+            )
+
             # Initialize ColumnParallelLinear weights using normal_layer1 weights
             # For column parallel, we need to split the normal layer weights across tensor parallel ranks
             tp_rank = dist.get_rank(tp_group1)
             tp_size = dist.get_world_size(tp_group1)
-            
+
             # Calculate the portion of weights for this TP rank
             output_per_rank = hidden_size // tp_size
             start_idx = tp_rank * output_per_rank
             end_idx = (tp_rank + 1) * output_per_rank
-            
+
             # Copy the corresponding slice of weights and bias
             with torch.no_grad():
                 layer1.weight.copy_(normal_layer1.weight[start_idx:end_idx, :].bfloat16())
@@ -483,27 +487,31 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Second layer: RowParallelLinear with tp=1, cp=4
-            layer2 = RowParallelLinear(
-                input_size=hidden_size,
-                output_size=input_size,
-                config=config2,
-                init_method=init_method,
-                bias=True,
-                input_is_parallel=True,
-                skip_bias_add=False,
-                tp_group=tp_group2,
-            ).cuda().bfloat16()
-            
+            layer2 = (
+                RowParallelLinear(
+                    input_size=hidden_size,
+                    output_size=input_size,
+                    config=config2,
+                    init_method=init_method,
+                    bias=True,
+                    input_is_parallel=True,
+                    skip_bias_add=False,
+                    tp_group=tp_group2,
+                )
+                .cuda()
+                .bfloat16()
+            )
+
             # Initialize RowParallelLinear weights using normal_layer2 weights
             # For row parallel, we need to split the normal layer weights across tensor parallel ranks
             tp_rank = dist.get_rank(tp_group2)
             tp_size = dist.get_world_size(tp_group2)
-            
+
             # Calculate the portion of weights for this TP rank
             input_per_rank = hidden_size // tp_size
             start_idx = tp_rank * input_per_rank
             end_idx = (tp_rank + 1) * input_per_rank
-            
+
             # Copy the corresponding slice of weights
             with torch.no_grad():
                 layer2.weight.copy_(normal_layer2.weight[:, start_idx:end_idx].bfloat16())
@@ -517,9 +525,7 @@ class TestBridgeCommunicator:
 
         # Create input tensor (only on grid1)
         input_tensor = torch.randn(
-                (sequence_length, batch_size, input_size),
-                device="cuda",
-                dtype=torch.bfloat16,
+            (sequence_length, batch_size, input_size), device="cuda", dtype=torch.bfloat16
         )
 
         # Bridge communication: send forward activation from grid1 to grid2
@@ -554,12 +560,20 @@ class TestBridgeCommunicator:
             output2, _ = layer2(received_activation)
 
             # Verify output shape
-            assert output2.shape == (sequence_length//4, batch_size, input_size), f"Output2 shape mismatch: {output2.shape}"
-            
-            print(f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}")
+            assert output2.shape == (
+                sequence_length // 4,
+                batch_size,
+                input_size,
+            ), f"Output2 shape mismatch: {output2.shape}"
+
+            print(
+                f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}"
+            )
             print("Generating output using normal linear layers with no parallelization")
             output = normal_layer2(normal_layer1(input_tensor))
-            print(f"Generated output shape using linear layers with no parallelization: {output.shape}")
+            print(
+                f"Generated output shape using linear layers with no parallelization: {output.shape}"
+            )
 
             cp_group = grid2.get_pg(["cp"])
             print(f"Running all-gather across CP group on grid2: {cp_group}")
@@ -570,9 +584,10 @@ class TestBridgeCommunicator:
 
             # Check if full_output and output are the same tensors
             print(f"Comparing full_output {full_output.shape} with expected output {output.shape}")
-            assert torch.allclose(full_output, output, rtol=1e-3, atol=1e-3), "full_output and output tensors should be approximately equal"
+            assert torch.allclose(
+                full_output, output, rtol=1e-3, atol=1e-3
+            ), "full_output and output tensors should be approximately equal"
             print("SUCCESS: full_output and output tensors match!")
-            
 
         # Clean up
         Utils.destroy_model_parallel()
