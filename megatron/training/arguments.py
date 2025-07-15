@@ -2000,7 +2000,7 @@ def _add_rerun_machine_args(parser):
     group.add_argument('--error-injection-type', type=str, default='transient_error',
                        choices=['correct_result', 'transient_error', 'persistent_error'],
                        help='Type of error to inject. ')
-    group.add_argument('--rerun-mode', type=str, default='disabled',
+    group.add_argument('--rerun-mode', type=str, default='validate_results',
                        choices=['disabled', 'validate_results', 'report_stats'],
                        help='Use re-run engine to validate results (default) '
                        'or to emit stats on variability of computations due to '

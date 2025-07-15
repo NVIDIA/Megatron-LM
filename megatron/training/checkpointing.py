@@ -725,10 +725,11 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                 opt_param_scheduler.state_dict()
 
     # Rerun state
-    state_dict['rerun_state_machine'] = rerun_state
+    if rerun_state:
+        state_dict['rerun_state_machine'] = rerun_state
 
     # RNG states.
-    if not args.no_save_rng:
+    if not args.no_save_rng and rng_state:
         state_dict["rng_state"] = rng_state
     return state_dict
 
@@ -1267,6 +1268,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
 
     load_kwargs = {}
+    ignore_rng_state = False
+    ignore_rerun_state = True
     if ckpt_format == "torch_dist":
         ckpt_tp_pp = (
             state_dict['args'].tensor_model_parallel_size,
@@ -1281,6 +1284,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             getattr(args, 'encoder_tensor_model_parallel_size', 0),
             getattr(args, 'encoder_pipeline_model_parallel_size', 0),
         )
+        ckpt_world_size = getattr(state_dict['args'], 'world_size', 0)
+        run_world_size = getattr(args, 'world_size', 0)
+        ckpt_dp = getattr(state_dict['args'], 'data_parallel_size', 0)
+        run_dp = getattr(args, 'data_parallel_size', 0)
         mismatch_msg = "(TP, PP, encoder TP, encoder PP) mismatch after resume ({} vs {} from checkpoint)".format(
             run_tp_pp, ckpt_tp_pp
         )
@@ -1290,6 +1297,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 and not getattr(state_dict['args'], 'no_save_rng', False)):
             gen_sd_rng_state = get_rng_state(args.ckpt_format)  # we can load the rng state
         else:
+            ignore_rng_state = True
             gen_sd_rng_state = None
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
@@ -1324,20 +1332,27 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
 
         # Determine if rerun state will be loaded
+        gen_sd_rerun_state = None
         if (
-            ckpt_tp_pp == run_tp_pp
+            ckpt_world_size == run_world_size
+            and ckpt_tp_pp == run_tp_pp
+            and ckpt_dp == run_dp
             and not release
             and not args.finetune
             and 'rerun_state_machine' in state_dict
         ):
             rerun_state_machine = get_rerun_state_machine()
-            gen_sd_rerun_state = rerun_state_machine.state_dict(
-                data_iterator=None, ckpt_format=ckpt_format,
-            )
-        else:
-            gen_sd_rerun_state = None
-            if ckpt_tp_pp != run_tp_pp:
-                print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
+            if rerun_state_machine.validate_state_dict(state_dict['rerun_state_machine']):
+                gen_sd_rerun_state = rerun_state_machine.state_dict(
+                    data_iterator=None, ckpt_format=ckpt_format, force=True,
+                )
+                ignore_rerun_state = False
+        if (
+            ckpt_world_size != run_world_size
+            or ckpt_tp_pp != run_tp_pp
+            or ckpt_dp != run_dp
+        ):
+            print_rank_0("Job sharding has changed: Rerun state will be ignored")
 
         # [ModelOpt]: IMPORTANT! Restoring modelopt_state (sharded or not) must be performed
         # after the model instance has been created and before _load_base_checkpoint is called.
@@ -1496,15 +1511,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.reload_model_params()
 
     # rerun state
-    try:
-        if 'rerun_state_machine' in state_dict:
-            get_rerun_state_machine().load_state_dict(state_dict['rerun_state_machine'])
-    except Exception as e:
-        print(f"Unable to restore RerunMachine from checkpoint: {e}")
-        sys.exit()
+    if not ignore_rerun_state:
+        try:
+            if 'rerun_state_machine' in state_dict:
+                get_rerun_state_machine().load_state_dict(state_dict['rerun_state_machine'])
+        except Exception as e:
+            print(f"Unable to restore RerunMachine from checkpoint: {e}. Skipping.")
 
     # rng states.
-    if not release and not args.finetune and not args.no_load_rng:
+    if not release and not args.finetune and not args.no_load_rng and not ignore_rng_state:
         try:
             if 'rng_state' in state_dict:
                 # access rng_state for data parallel rank
