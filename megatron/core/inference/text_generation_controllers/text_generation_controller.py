@@ -24,6 +24,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import get_attention_mask
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.utils import get_model_config
 
@@ -581,13 +582,12 @@ class TextGenerationController:
 
         model_config = get_model_config(self.inference_wrapped_model.model)
 
-        # Verify that if echo mode is requested we do not generate any new tokens
-        echo = getattr(sampling_params, "echo", False)
-        assert (
-            not echo or sampling_params.num_tokens_to_generate == 0
-        ), f"Cannot generate new tokens when echoing"
-        if sampling_params.num_tokens_to_generate == 0 and not echo:
-            sampling_params.add_attributes({"echo": True})
+        # We only need an attention mask if we are exclusively doing prefill over
+        # prompts of variable length
+        use_attention_mask = (
+            sampling_params.num_tokens_to_generate == 0
+            and min_prompt_length_in_batch != max_prompt_length_in_batch
+        )
 
         # Check whether CUDA graphs are enabled
         enable_cuda_graph = model_config.enable_cuda_graph
@@ -689,7 +689,9 @@ class TextGenerationController:
             self.inference_wrapped_model.prep_model_for_inference()
 
             inference_input: Dict[str, Any] = self.prep_inference_input(
-                prompts_tokens=padded_batch_prompt_tokens, active_requests=active_requests
+                prompts_tokens=padded_batch_prompt_tokens,
+                active_requests=active_requests,
+                use_attention_mask=use_attention_mask,
             )
 
             assert (
@@ -706,7 +708,13 @@ class TextGenerationController:
                 self.inference_wrapped_model.model.module.set_symmetric_ar(None)
 
             context_start_position = 0
-            context_end_position = min_prompt_length_in_batch
+
+            # If we are exclusively doing prefill then we can process all prompt tokens
+            # together even if the prompt lengths are different
+            if sampling_params.num_tokens_to_generate == 0:
+                context_end_position = max_prompt_length_in_batch
+            else:
+                context_end_position = min_prompt_length_in_batch
 
             # The initial iteration of this loop runs the prefill phase up to the shortest
             # prompt length in the batch. Then every subsequent iterations runs a decode step.
@@ -734,6 +742,13 @@ class TextGenerationController:
                     and "attention_mask" in inference_input_for_context_window
                 ):
                     inference_input_for_context_window["attention_mask"] = None
+                elif use_attention_mask:
+                    assert (
+                        attention_mask := inference_input_for_context_window.get(
+                            "attention_mask", None
+                        )
+                        is not None
+                    )
 
                 # Only materialize prompt log probs if the user requests log probs
                 materialize_only_last_token_logits = (
@@ -985,18 +1000,30 @@ class TextGenerationController:
         return active_requests
 
     def prep_inference_input(
-        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[str, InferenceRequest]
+        self,
+        prompts_tokens: torch.Tensor,
+        active_requests: OrderedDict[str, InferenceRequest],
+        use_attention_mask: bool = False,
     ) -> Dict[str, Any]:
         """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
             active_requests (OrderedDict[str, InferenceRequest]): The input active requests
+            use_attention_mask (bool): Whether to use an attention mask. Should be set to True only
+                when exclusively doing prefill (no decode) with variable prompt lengths.
 
         Returns:
             A dict of the inference input for the current batch.
         """
-        return self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+        inference_input = self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+
+        if use_attention_mask and (
+            attention_mask := inference_input.get("attention_mask", None) is None
+        ):
+            inference_input["attention_mask"] = get_attention_mask(prompts_tokens.size(1))
+
+        return inference_input
 
     def stream_tokens(
         self,
