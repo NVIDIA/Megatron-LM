@@ -4,7 +4,8 @@ import random
 import time
 import torch
 from argparse import ArgumentParser, Namespace
-from typing import Any, List
+from typing import Any, List, Optional
+import json
 
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext
@@ -70,6 +71,14 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
     group.add_argument(
         "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
     )
+    group.add_argument(
+        "--prompt-file",
+        help='Jsonl file containing input prompts, where each item (i.e., line) '
+        'contains the field \'text\' where the value is the prompt. All other '
+        'fields within each item are ignored, and may be customized for each '
+        'application.',
+    )
+
 
     return parser
 
@@ -116,18 +125,16 @@ class Request:
             self.prompt_text,
         )
 
-
-def get_user_requests(args: Namespace, tokenizer: Any) -> List[Request]:
-    requests = [Request(p, -1.0, tokenizer) for p in args.prompts]
-    return requests
-
-
-def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
-    """Get example requests."""
+def get_time_offsets(
+    seed: Optional[int],
+    incoming_requests_per_sec: float,
+    incoming_requests_duration: float,
+) -> List[Request]:
+    """Get example time offsets."""
 
     import simpy  # Guard against this import in test case
 
-    random.seed(args.seed)
+    random.seed(seed)
 
     # Generate random time offsets.
     def arrival(r):
@@ -137,14 +144,30 @@ def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
 
     time_offsets = []
     env = simpy.Environment()
-    env.process(arrival(args.incoming_requests_per_sec))
-    env.run(args.incoming_requests_duration)
+    env.process(arrival(incoming_requests_per_sec))
+    env.run(incoming_requests_duration)
 
     # Ensure at least a single request.
     if len(time_offsets) == 0:
         time_offsets = [0.0]
 
-    # Initialize requests.
+    return time_offsets
+
+
+def get_user_requests(args: Namespace, tokenizer: Any) -> List[Request]:
+    requests = [Request(p, -1.0, tokenizer) for p in args.prompts]
+    return requests
+
+
+def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
+    """Get example requests."""
+
+    time_offsets = get_time_offsets(
+        args.seed,
+        args.incoming_requests_per_sec,
+        args.incoming_requests_duration,
+    )
+    
     requests = [
         Request("hi " * random.randint(*args.num_tokens_to_prompt), t, tokenizer)
         for t in time_offsets
@@ -152,10 +175,32 @@ def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
 
     return requests
 
+def get_requests_from_file(args: Namespace, tokenizer: Any) -> List[Request]:
+    """Get requests from a file."""
+    if not args.prompt_file:
+        raise ValueError("Prompt file is required to read requests from a file.")
+
+    requests = []
+    time_offsets = get_time_offsets(
+        args.seed,
+        args.incoming_requests_per_sec,
+        args.incoming_requests_duration,
+    )
+    
+    with open(args.prompt_file, 'r') as f:
+        for i, (line, time_offset) in enumerate(zip(f, time_offsets)):
+            item = json.loads(line.strip())
+            if 'text' in item:
+                requests.append(Request(item['text'], time_offset, tokenizer))
+    
+    return requests
+
 
 def build_requests(args: Namespace, tokenizer: Any) -> List[Request]:
     if args.prompts:
         return get_user_requests(args, tokenizer)
+    elif args.prompt_file:
+        return get_requests_from_file(args, tokenizer)
     else:
         return get_auto_requests(args, tokenizer)
 

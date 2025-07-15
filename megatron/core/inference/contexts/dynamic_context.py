@@ -762,7 +762,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.active_token_count += context_length
 
-    def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
+    def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
@@ -866,7 +866,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             kv_chunks_asigned = self.request_to_kv_chunk_ids[finished_idxs]
             non_zero_values_in_kv_memory = kv_chunks_asigned[kv_chunks_asigned != -1]
             self.chunk_allocator.release_memory_chunks(non_zero_values_in_kv_memory)
-            self.request_to_kv_chunk_ids[finished_idxs].fill_(-1)
+
+            # Reset the KV chunks for finished requests.
+            # Note: do not use fill_() (or add_() and similar inplace ops) here.
+            # The combinition of indexing with a tensor (like finished_idxs) and fill_()/add_() creates a clone
+            # and updates it instead of the original tensor.
+            self.request_to_kv_chunk_ids[finished_idxs] = -1
 
             if active_request_count > 0:
                 finished_idxs_on_left = (
@@ -881,11 +886,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     + self.paused_request_count
                 )
 
-                self._swap_book_keeping_tensors(
+                self._move_book_keeping_tensors(
                     src_idxs=active_idxs_on_right,
                     dst_idxs=finished_idxs_on_left,
                     next_tokens=next_tokens,
                 )
+
+                # Reset chunk ids for recently moved requests.
+                self.request_to_kv_chunk_ids[active_idxs_on_right] = -1
 
         # 5. We identify requests that require a new chunk and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current chunk and  require a new one in a pause state temporarily
@@ -931,7 +939,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 dst_idxs = torch.cat((active_request_ids_on_left, paused_requests_idxs_on_right))
                 src_idxs = torch.cat((paused_requests_idxs_on_right, active_request_ids_on_left))
-                self._swap_book_keeping_tensors(
+                self._move_book_keeping_tensors(
                     src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
                 )
 
@@ -974,6 +982,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count > 0:
             self.paused_tokens = next_tokens[: self.paused_request_count]
 
+        # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
+        # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
         self.request_kv_length_offsets[self.paused_request_count : self.total_request_count].add_(
             self.request_query_lengths[self.paused_request_count : self.total_request_count]
         )

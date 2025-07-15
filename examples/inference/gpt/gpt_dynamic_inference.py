@@ -177,7 +177,7 @@ def run_inference(
                 break
             try:
                 # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
-                engine.add_request(num_requests_added, request.prompt_text)
+                engine.add_request(num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate)
                 request.time_start = get_curr_time()
                 request.state = "started"
                 num_requests_added += 1
@@ -278,8 +278,8 @@ def main():
             request_idx = request_idxs[0]
             request = requests[request_idx]
             print(
-                f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... %s"
-                % request.output_text.replace("\n", "\\n")
+                f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... {request.output_text.replace("\n", "\\n")}"
+                
             )
 
     # Timing results.
