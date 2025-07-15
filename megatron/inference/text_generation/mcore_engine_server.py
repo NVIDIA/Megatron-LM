@@ -53,7 +53,6 @@ def run_mcore_engine(
     logprobs=True,
     tokens_to_generate=0,
     top_n_logprobs=0,
-    echo=False,
 ):
     """Server-compatible version of the MCore Engine, used in
     tools/run_text_generation_server.py."""
@@ -77,7 +76,6 @@ def run_mcore_engine(
         top_n_logprobs=top_n_logprobs,
         return_prompt_top_n_logprobs=True
     )
-    sampling_params.add_attributes({"echo": echo})
 
     context_tokens_tensor, context_length_tensor = tokenize_prompts(
         prompts=prompts, tokens_to_generate=tokens_to_generate, add_BOS=False, data_parallel=False

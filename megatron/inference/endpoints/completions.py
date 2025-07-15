@@ -74,8 +74,8 @@ class MegatronCompletions(Resource):
             local_kwargs["top_p_sampling"] = 0
 
         echo = local_kwargs.pop("echo")
-        if (not echo) and (local_kwargs["tokens_to_generate"] == 0):
-            return "echo=False not supported when tokens_to_generate=0", 400
+        if not echo and local_kwargs["tokens_to_generate"] == 0:
+            return "echo=False not supported when tokens_to_generate == 0", 400
 
         if local_kwargs.pop("best_of") > 1:
             return "best_of > 1 not supported", 400
@@ -109,7 +109,6 @@ class MegatronCompletions(Resource):
                 logprobs,
                 tokens_to_generate,
                 top_n_logprobs=top_n_logprobs,
-                echo=echo,
             )
             result = [
                 response_dict["text"],
