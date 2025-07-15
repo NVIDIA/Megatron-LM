@@ -2029,7 +2029,6 @@ def checkpoint_and_decide_exit(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
-        torch.distributed.barrier()
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
