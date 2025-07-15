@@ -51,7 +51,7 @@ class BridgeCommunicator:
         src_grid: HyperCommGrid,
         dest_grid: HyperCommGrid,
         dim_mapping: Optional[Dict[str, int]] = None,
-        requires_scatter_gather: bool = True
+        requires_scatter_gather: bool = True,
     ):
         """Initialize the bridge communicator between source and destination grids.
 
