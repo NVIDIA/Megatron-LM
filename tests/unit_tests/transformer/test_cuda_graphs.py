@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.ssm.mamba_block import MambaStack
@@ -74,6 +75,149 @@ class TestParallelTransformerBlockCudagraphs:
             assert (
                 len(parallel_transformer_block.layers[0].cudagraph_manager.cudagraph_runners) == 1
             )
+
+
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+)
+@pytest.mark.parametrize(
+    "total_num_layers, pp, vpp, account_for_embedding_in_pipeline_split, account_for_loss_in_pipeline_split, num_layers_in_first_pipeline_stage, num_layers_in_last_pipeline_stage, pp_layout, first_layer_numbers_golden, last_layer_numbers_golden",
+    [
+        (4, 1, None, False, False, None, None, None, [1], [4]),
+        (8, 2, None, False, False, None, None, None, [1, 5], [4, 8]),
+        (8, 2, 2, False, False, None, None, None, [1, 3, 5, 7], [2, 4, 6, 8]),
+        (14, 4, None, True, True, None, None, None, [1, 4, 8, 12], [3, 7, 11, 14]),
+        (
+            14,
+            4,
+            2,
+            True,
+            True,
+            None,
+            None,
+            None,
+            [1, 2, 4, 6, 8, 10, 12, 14],
+            [1, 3, 5, 7, 9, 11, 13, 14],
+        ),
+        (12, 4, None, False, False, 2, 2, None, [1, 3, 7, 11], [2, 6, 10, 12]),
+        (
+            12,
+            4,
+            2,
+            False,
+            False,
+            2,
+            2,
+            None,
+            [1, 2, 4, 6, 7, 8, 10, 12],
+            [1, 3, 5, 6, 7, 9, 11, 12],
+        ),
+        (
+            14,
+            4,
+            2,
+            False,
+            False,
+            None,
+            None,
+            [
+                ["embedding", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "decoder"],
+                ["decoder", "loss"],
+            ],
+            [1, 2, 4, 6, 8, 10, 12, 14],
+            [1, 3, 5, 7, 9, 11, 13, 14],
+        ),
+    ],
+)
+def test_cuda_graph_determine_first_last_layer_logic(
+    total_num_layers,
+    pp,
+    vpp,
+    account_for_embedding_in_pipeline_split,
+    account_for_loss_in_pipeline_split,
+    num_layers_in_first_pipeline_stage,
+    num_layers_in_last_pipeline_stage,
+    pp_layout,
+    first_layer_numbers_golden,
+    last_layer_numbers_golden,
+):
+    # Initialize RNG tracker
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+
+    # Initialize parallel state
+    Utils.initialize_model_parallel(
+        pipeline_model_parallel_size=pp, virtual_pipeline_model_parallel_size=vpp
+    )
+
+    # initialize model
+    torch.manual_seed(123)
+    model_parallel_cuda_manual_seed(123)
+    hidden_size = 128
+    transformer_config = TransformerConfig(
+        num_layers=total_num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+        virtual_pipeline_model_parallel_size=vpp,
+        pipeline_model_parallel_size=pp,
+        deallocate_pipeline_outputs=True,
+        enable_cuda_graph=True,
+        use_te_rng_tracker=True,
+        account_for_embedding_in_pipeline_split=account_for_embedding_in_pipeline_split,
+        account_for_loss_in_pipeline_split=account_for_loss_in_pipeline_split,
+        num_layers_in_first_pipeline_stage=num_layers_in_first_pipeline_stage,
+        num_layers_in_last_pipeline_stage=num_layers_in_last_pipeline_stage,
+        pipeline_model_parallel_layout=pp_layout,
+    )
+    model = []
+    for i in range(vpp or 1):
+        this_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=1024,
+            position_embedding_type="rope",
+            vp_stage=i,
+        ).cuda()
+        model.append(this_model)
+
+    # create runner by running a fake forward pass
+    sequence_length, micro_batch_size = 32, 1
+    hidden_states = torch.ones((sequence_length, micro_batch_size, hidden_size)).cuda()
+    attention_mask = torch.ones((1, 1, sequence_length, sequence_length), dtype=bool).cuda()
+    for m in model:
+        _ = m(
+            input_ids=None,
+            position_ids=None,
+            attention_mask=attention_mask,
+            decoder_input=hidden_states,
+        )
+
+    # Check if cuda graph is correctly setting is first/last layer
+    for m in model:
+        for l in m.decoder.layers:
+            assert hasattr(l, "cudagraph_manager")
+            assert (
+                len(l.cudagraph_manager.cudagraph_runners) == 1
+            ), "Cuda graph runner should be created"
+            runner = l.cudagraph_manager.cudagraph_runners[0]
+            assert runner.is_first_layer is not None and runner.is_last_layer is not None
+            assert runner.is_first_layer == (l.layer_number in first_layer_numbers_golden)
+            assert runner.is_last_layer == (l.layer_number in last_layer_numbers_golden)
+
+    # teardown
+    Utils.destroy_model_parallel()
+    _CudagraphGlobalRecord.cudagraph_created = False
+    _CudagraphGlobalRecord.cudagraph_record = []
 
 
 class TestLLaVACudaGraph:
@@ -271,6 +415,8 @@ class TestParallelMambaBlockCudagraphs:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
 
     @pytest.mark.skipif(
         not (HAVE_TE and is_te_min_version("1.5.0")),

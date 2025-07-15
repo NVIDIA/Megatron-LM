@@ -78,6 +78,53 @@ def _check_supported_type(arg):
     ), f"Cudagraphs recieved an arg of type {type(arg)} which is not supported."
 
 
+def _determine_if_transformer_decoder_layer(base_module):
+    """Determine if the given module is a transformer decoder layer."""
+    # import modules here to avoid a circular import
+    from megatron.core.ssm.mamba_layer import MambaLayer
+    from megatron.core.transformer.transformer_layer import BaseTransformerLayer, TransformerLayer
+
+    is_potential_decoder_layer = isinstance(
+        base_module, (TransformerLayer, BaseTransformerLayer, MambaLayer)
+    )
+    if not is_potential_decoder_layer:
+        return False
+    if isinstance(base_module, TransformerLayer) and not isinstance(
+        base_module.cross_attention, IdentityOp
+    ):
+        # If the layer has a cross attention, it is not a decoder layer
+        return False
+    else:
+        # Otherwise it is a decoder layer
+        return True
+
+
+def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
+    """Determine if the given module is the first/last layer of the PP+VPP chunk it belongs to.
+    Returns a tuple of two booleans indicating if the module is the first/last layer of the chunk.
+    """
+
+    # import modules here to avoid a circular import
+    from megatron.core.transformer.transformer_block import get_num_layers_to_build
+    from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+    # find all first/last layers of this PP stage
+    first_layer_numbers = []
+    last_layer_numbers = []
+    vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size() or 1
+    for i in range(vp_size):
+        # layer numbers are 1-indexed
+        layer_offset = get_transformer_layer_offset(base_module.config, vp_stage=i)
+        num_layers_to_build = get_num_layers_to_build(base_module.config, vp_stage=i)
+        if num_layers_to_build > 0:
+            first_layer_numbers.append(layer_offset + 1)
+            last_layer_numbers.append(layer_offset + num_layers_to_build)
+    return (
+        base_module.layer_number in first_layer_numbers,
+        base_module.layer_number in last_layer_numbers,
+    )
+
+
 class _CudagraphGlobalRecord:
     """A global datastructure that records of the ordering of all _CudaGraphRunner's
     first fwd or bwd passes. 'create_cudagraphs' will use this to create
@@ -395,50 +442,20 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
 
-        from megatron.core.ssm.mamba_layer import MambaLayer
-        from megatron.core.transformer.transformer_layer import (
-            BaseTransformerLayer,
-            TransformerLayer,
+        # Decide whether to reuse the input and output buffer, and if so,
+        # whether this layer is the first layer (which needs an input buffer)
+        # or the last layer (which needs an output buffer)
+
+        self.is_transformer_decoder_layer = _determine_if_transformer_decoder_layer(base_module)
+        self.reuse_input_output_buffer = (
+            share_cudagraph_io_buffers and self.is_transformer_decoder_layer
         )
-
-        self.is_first_layer = None
-        self.is_last_layer = None
-        if share_cudagraph_io_buffers == False:
-            self.reuse_input_output_buffer = False
-            self.is_first_layer = True
-            self.is_last_layer = True
-        else:
-            self.is_transformer_decoder_layer = False
-            self.reuse_input_output_buffer = False
-
-            # decides if this is an LLM layer
-            is_potential_decoder_layer = isinstance(
-                base_module, (TransformerLayer, BaseTransformerLayer, MambaLayer)
+        if self.reuse_input_output_buffer:
+            self.is_first_layer, self.is_last_layer = (
+                _determine_if_first_last_layer_of_this_vp_chunk(base_module)
             )
-
-            if is_potential_decoder_layer:
-                if isinstance(base_module, TransformerLayer) and not isinstance(
-                    base_module.cross_attention, IdentityOp
-                ):
-                    self.is_transformer_decoder_layer = False
-                else:
-                    self.is_transformer_decoder_layer = True
-            else:
-                self.is_transformer_decoder_layer = False
-
-            if self.is_transformer_decoder_layer:
-                self.reuse_input_output_buffer = True
-                total_num_layers = base_module.config.num_layers
-                pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-                vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
-                if vpp_size is None:
-                    vpp_size = 1
-
-                layers_per_chunk = total_num_layers // vpp_size // pp_size
-                self.is_first_layer = ((base_module.layer_number - 1) % layers_per_chunk) == 0
-                self.is_last_layer = (base_module.layer_number % layers_per_chunk) == 0
-            else:
-                self.reuse_input_output_buffer = False
+        else:
+            self.is_first_layer, self.is_last_layer = True, True
 
     def get_fp8_context(self):
         """Return a new fp8 context in cudagraph mode."""
@@ -819,7 +836,7 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = None):
+    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = True):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
