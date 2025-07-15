@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterable, Optional, Union
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import parallel_state
 from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
@@ -152,13 +152,12 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
-        runtime_gather_output = inference_input.get("runtime_gather_output")
         return self.model(
             tokens,
             position_ids,
             attention_mask,
             inference_context=self.inference_context,
-            runtime_gather_output=runtime_gather_output,
+            runtime_gather_output=True,  # Inference should always gather the logits
         )
 
     def _get_batch_size_and_seq_len(
@@ -201,7 +200,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """
         tokens = inference_input["tokens"]
         logits = self._forward(inference_input)
-        logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits, self.tp_group)
         self.inference_context.increment_sequence_len_offset(tokens.size(1))
 
         return logits
@@ -243,7 +241,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         logits = None
         if is_pipeline_last_stage(self.pp_group):
             logits = output_tensor
-            logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits, self.tp_group)
 
             # Explicitly cast logits to expected dtype
             logits = logits.to(self.inference_wrapper_config.params_dtype)
@@ -269,7 +266,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
         tokens = inference_input["tokens"]
         position_ids = inference_input["position_ids"]
         attention_mask = inference_input["attention_mask"]
-        runtime_gather_output = inference_input.get("runtime_gather_output")
         materialize_only_last_token_logits = (
             self.inference_context.materialize_only_last_token_logits
         )
@@ -317,7 +313,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
                     "position_ids": position_ids2use,
                     "attention_mask": attention_mask,
                     "inference_context": self.inference_context,
-                    "runtime_gather_output": runtime_gather_output,
                 }
             )
 
@@ -327,9 +322,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             self.inference_context.batch_size_offset += current_micro_batch_size
 
             if is_pipeline_last_stage(self.pp_group):
-                output_tensor = tensor_parallel.gather_from_tensor_model_parallel_region(
-                    output_tensor, self.tp_group
-                )
                 assert logits is not None
                 logits[start:end, ...] = output_tensor
 

@@ -195,6 +195,11 @@ class MambaModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        in_inference_mode = inference_context is not None and not self.training
+
+        if in_inference_mode:
+            assert runtime_gather_output, "Inference must always gather TP logits"
+
         # Decoder embedding.
         if decoder_input is not None:
             pass
@@ -215,7 +220,7 @@ class MambaModel(LanguageModule):
         # Wrap decoder_input to allow the decoder (MambaBlock) to delete the
         # reference held by this caller function, enabling early garbage collection
         # for inference.
-        if inference_context is not None and not self.training:
+        if in_inference_mode:
             decoder_input = WrappedTensor(decoder_input)
 
         # The following assert will currently fail when running inference.
@@ -244,11 +249,7 @@ class MambaModel(LanguageModule):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if (
-            not self.training
-            and inference_context is not None
-            and inference_context.materialize_only_last_token_logits
-        ):
+        if in_inference_mode and inference_context.materialize_only_last_token_logits:
             hidden_states = hidden_states[-1, :, :].unsqueeze(0)
 
         logits, _ = self.output_layer(
