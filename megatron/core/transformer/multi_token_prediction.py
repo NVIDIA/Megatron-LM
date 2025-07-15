@@ -14,7 +14,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import (
-    all_gather_last_dim_from_tensor_parallel_region,
+    gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType
@@ -454,8 +454,12 @@ class MultiTokenPredictionLayer(MegatronModule):
             # and the (i + K)-th tocken's embedding, and combine them with linear projection.
             hidden_states = torch.cat((decoder_input, hidden_states), -1)
             hidden_states, _ = self.eh_proj(hidden_states)
-            # For tensor parallel, all gather after linear_fc.
-            hidden_states = all_gather_last_dim_from_tensor_parallel_region(hidden_states)
+            # For tensor parallel we need to gather the tensor across the model-parallel
+            # ranks after the linear projection. This used to call
+            # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
+            # the gradient in backward pass and was therefore incorrect in this context.
+            # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
+            hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
             # For sequence parallel, scatter after linear_fc and before transformer layer.
             if self.sequence_parallel:
                 hidden_states = scatter_to_sequence_parallel_region(hidden_states)
@@ -641,6 +645,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         for layer_number in range(len(self.layers)):
             # Calc logits for the current Multi-Token Prediction (MTP) layers.
             input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+            position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
             # embedding
             decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
             # norm, linear projection and transformer
