@@ -51,6 +51,7 @@ class BridgeCommunicator:
         src_grid: HyperCommGrid,
         dest_grid: HyperCommGrid,
         dim_mapping: Optional[Dict[str, int]] = None,
+        requires_scatter_gather: bool = True
     ):
         """Initialize the bridge communicator between source and destination grids.
 
@@ -62,6 +63,7 @@ class BridgeCommunicator:
         self.src_grid = src_grid
         self.dest_grid = dest_grid
         self.current_rank = dist.get_rank()
+        self.requires_scatter_gather = requires_scatter_gather
         self.comm_map: Dict[int, RankCommInfo] = {}
         if dim_mapping is None:
             self.dim_mapping = {'s': 1, 'b': 0, 'h': 2}
@@ -389,7 +391,7 @@ class BridgeCommunicator:
                 )
                 received_tensors_list.append(tensor_to_recv)
 
-            aggregated_tensor = torch.cat(received_tensors_list, dim=0)
+            aggregated_tensor = torch.cat(received_tensors_list, dim=self.dim_mapping['b'])
             print(
                 f"rank {self.current_rank} aggregated tensor shape {aggregated_tensor.shape} sum {aggregated_tensor.sum()}"
             )
@@ -998,6 +1000,9 @@ class BridgeCommunicator:
         print(f"enum_group: {enum_group}")
         if not non_dp_dims:
             return gathered_tensors[0]
+        if not self.requires_scatter_gather:
+            # If we don't need to scatter/gather, we can just return the first tensor which contains the full activations
+            return gathered_tensors[0]
 
         curr_pg_ranks = dist.get_process_group_ranks(curr_pg)
         print(f"curr_pg: {curr_pg_ranks}")
@@ -1209,11 +1214,12 @@ class BridgeCommunicator:
         # Get all non-DP dimensions that were split
         non_dp_dims = [dim for dim in grid.dim_names if dim != "dp"]
         print(f"non_dp_dims: {non_dp_dims}")
-        if not non_dp_dims:
-            return [aggregated_tensor]
 
         # Get the rank enumeration to determine the exact order we need
         print(f"rank_enum: {rank_enum}")
+        if not self.requires_scatter_gather:
+            # If we don't need to scatter/gather, return a dict mapping each rank to a copy of the aggregated tensor
+            return {rank: aggregated_tensor.clone() for rank in rank_enum}
 
         # Map parallelism types to tensor dimensions
         dim_mapping = {

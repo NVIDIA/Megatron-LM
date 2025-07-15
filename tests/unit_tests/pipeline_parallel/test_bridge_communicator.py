@@ -277,7 +277,7 @@ class TestBridgeCommunicator:
         model_comm_pgs2 = ModelCommProcessGroups(tp=tp_group2, cp=cp_group2, pp=pp_group2)
 
         # Create bridge communicator
-        bridge_communicator = BridgeCommunicator(grid1, grid2)
+        bridge_communicator = BridgeCommunicator(grid1, grid2, dim_mapping={'s': 0, 'h': 2, 'b': 1}, requires_scatter_gather=False)
 
         # Create transformer blocks
         block1 = None
@@ -318,12 +318,12 @@ class TestBridgeCommunicator:
 
         # Forward pass through first block
         output1 = None
-        if block1 is not None:
-            output1 = block1(hidden_states=hidden_states, attention_mask=None)
-
+            
         # Bridge communication: send forward activation from grid1 to grid2
         if bridge_communicator.is_current_rank_in_grid(grid1):
             # Send forward activation to grid2
+            output1 = block1(hidden_states=hidden_states, attention_mask=None)
+            print(f"Grid1 rank {dist.get_rank()}: Sending initial activation with shape {output1.shape}")
             bridge_communicator.send_forward(output1)
 
         if bridge_communicator.is_current_rank_in_grid(grid2):
@@ -523,14 +523,16 @@ class TestBridgeCommunicator:
         batch_size = 2
         sequence_length = 512
 
-        # Create input tensor (only on grid1)
+        # Create input tensor (only on grid1) - ENABLE GRADIENTS
         input_tensor = torch.randn(
-            (sequence_length, batch_size, input_size), device="cuda", dtype=torch.bfloat16
+                (sequence_length, batch_size, input_size),
+                device="cuda",
+                dtype=torch.bfloat16,
+                requires_grad=True,  # Enable gradients for backward pass testing
         )
-
-        # Bridge communication: send forward activation from grid1 to grid2
+        # FORWARD PASS
         if bridge_communicator.is_current_rank_in_grid(grid1):
-            # Send forward activation to grid2
+            # Forward pass through first layer
             output1, _ = layer1(input_tensor)
             print(f"Grid1 rank {dist.get_rank()}: Sending activation with shape {output1.shape}")
             bridge_communicator.send_forward(output1)
@@ -589,5 +591,4 @@ class TestBridgeCommunicator:
             ), "full_output and output tensors should be approximately equal"
             print("SUCCESS: full_output and output tensors match!")
 
-        # Clean up
         Utils.destroy_model_parallel()
