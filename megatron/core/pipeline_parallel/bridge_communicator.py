@@ -46,17 +46,22 @@ class BridgeCommunicator:
       send_backward_recv_forward to be used by the pipeline schedule.
     """
 
-    def __init__(self, src_grid: HyperCommGrid, dest_grid: HyperCommGrid):
+    def __init__(self, src_grid: HyperCommGrid, dest_grid: HyperCommGrid, dim_mapping: Optional[Dict[str, int]] = None):
         """Initialize the bridge communicator between source and destination grids.
 
         Args:
             src_grid: Source HyperCommGrid
             dest_grid: Destination HyperCommGrid
+            dim_mapping: Dictionary mapping parallelism types to tensor dimensions
         """
         self.src_grid = src_grid
         self.dest_grid = dest_grid
         self.current_rank = dist.get_rank()
         self.comm_map: Dict[int, RankCommInfo] = {}
+        if dim_mapping is None:
+            self.dim_mapping = {'s': 1, 'b': 0, 'h': 2}  
+        else:
+            self.dim_mapping = dim_mapping
 
         self.activation_gather_ranks = self._create_activation_gather_scatter_pg(
             self.src_grid, is_src=True
@@ -1010,7 +1015,7 @@ class BridgeCommunicator:
             return tensors[0]
 
         # Map parallelism types to tensor dimensions
-        dim_mapping = {'tp': -1, 'cp': 1, 'ep': -1}  # TP/EP: hidden dim, CP: sequence dim
+        dim_mapping = {'tp': self.dim_mapping['h'], 'cp': self.dim_mapping['s'], 'ep': self.dim_mapping['h']}  # TP/EP: hidden dim, CP: sequence dim
 
         # Get grid shape for reconstruction
         grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
@@ -1202,7 +1207,7 @@ class BridgeCommunicator:
         print(f"rank_enum: {rank_enum}")
 
         # Map parallelism types to tensor dimensions
-        dim_mapping = {'tp': -1, 'cp': 1, 'ep': -1}  # TP/EP: hidden dim, CP: sequence dim
+        dim_mapping = {'tp': self.dim_mapping['h'], 'cp': self.dim_mapping['s'], 'ep': self.dim_mapping['h']}  # TP/EP: hidden dim, CP: sequence dim
 
         # Get grid shape for decomposition
         grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
