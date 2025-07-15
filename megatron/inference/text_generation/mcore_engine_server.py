@@ -25,9 +25,6 @@ class ModelInferenceWrapperServer(GPTInferenceWrapper):
     ) -> Dict[str, Any]:
         """
         Slices out the tokens, position ids, and masking for the specific context window.
-        This version also sets `runtime_gather_output` to be False to be compatible with
-        the inference server in tools/run_text_generation_server.py, which expects parallel logits
-        distributed across TP ranks.
 
         Args:
             inference_input (Dict[str, Any]): The inference input for the batch.
@@ -40,7 +37,6 @@ class ModelInferenceWrapperServer(GPTInferenceWrapper):
         inference_input = super().get_batch_for_context_window(
             inference_input, context_start_position, context_end_position
         )
-        inference_input["runtime_gather_output"] = False
         return inference_input
 
 
@@ -98,9 +94,11 @@ def run_mcore_engine(
 
     # Detokenize prompts into strings to pass through the engine
     detokenized_prompts = [
-        tokenizer.detokenize(p, skip_special_tokens=True)
-        if accepts_skip
-        else tokenizer.detokenize(p)
+        (
+            tokenizer.detokenize(p, skip_special_tokens=True)
+            if accepts_skip
+            else tokenizer.detokenize(p)
+        )
         for p in tokenized_prompts
     ]
 
