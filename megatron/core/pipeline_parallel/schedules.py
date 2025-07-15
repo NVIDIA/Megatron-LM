@@ -446,6 +446,30 @@ def check_first_val_step(first_val_step, forward_only, cond):
     else:
         return cond
 
+def heterogeneous_context_parallel(single_forward_step, total_num_tokens):
+    def forward_func_wrapper(*args, **kwargs):
+        # calculate new loop count
+        # TODO: N, complete_cp_assignment = get_heterogeneous_cp_assignment(data_iterator)
+        N=4
+        # TODO: calculate the right cp_assignment for micro-microbatch 0
+        # current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0)
+        # TODO: data["cp_assignment"] = current_cp_assignment
+        # TODO: create new data_iterator with the cp_assignment
+        # Run the 1st micro-microbatch
+        output_tensor, num_tokens = single_forward_step(*args, **kwargs)
+        total_num_tokens += num_tokens
+        # Run the N-1 backward steps, N-1 forward steps.
+        # We will be left with Nth backward step after this loop which is run in the original function.
+        for i in range(1, N):
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            
+            # TODO: calculate the right cp_assignment for micro-microbatch i
+            # current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i)
+            # TODO: data["cp_assignment"] = cp_assignment
+            # TODO: create new data_iterator with the cp_assignment
+            output_tensor, num_tokens = single_forward_step(*args, **kwargs)
+            total_num_tokens += num_tokens
+        return output_tensor, total_num_tokens
 
 def forward_backward_no_pipelining(
     *,
@@ -495,6 +519,9 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    if config.heterogeneous_context_parallel:
+        forward_step = heterogeneous_context_parallel(forward_step, total_num_tokens)
+
     with no_sync_func():
         for i in range(num_microbatches - 1):
             output_tensor, num_tokens = forward_step(
@@ -513,6 +540,9 @@ def forward_backward_no_pipelining(
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
+    # TODO: Does the last complete microbatch should run with sync?
+    # What will this do when we have multiple micro-microbatches within a forward and we ideally want only sync at end?
+    
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
     output_tensor, num_tokens = forward_step(
