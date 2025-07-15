@@ -247,18 +247,13 @@ class TestBridgeCommunicator:
 
         # Create first grid: tp=4, cp=1, dp=1, pp=1 (offset 0-3)
         grid1 = HyperCommGrid(
-            shape=[1, 4, 1, 1],
-            dim_names=["tp", "cp", "pp", "dp"],
-            rank_offset=0,
-            backend="nccl",
+            shape=[1, 4, 1, 1], dim_names=["tp", "cp", "pp", "dp"], rank_offset=0, backend="nccl"
         )
-        
+
         tp_group1 = grid1.create_pg("tp")
         cp_group1 = grid1.create_pg("cp")
         pp_group1 = grid1.create_pg("pp")
-        model_comm_pgs1 = ModelCommProcessGroups(
-            tp=tp_group1, cp=cp_group1, pp=pp_group1
-        )
+        model_comm_pgs1 = ModelCommProcessGroups(tp=tp_group1, cp=cp_group1, pp=pp_group1)
 
         # Create second grid: tp=1, cp=4, dp=1, pp=1 (offset 4-7)
         transformer_config_2 = TransformerConfig(
@@ -273,18 +268,13 @@ class TestBridgeCommunicator:
         )
 
         grid2 = HyperCommGrid(
-            shape=[4, 1, 1, 1],
-            dim_names=["tp", "cp", "pp", "dp"],
-            rank_offset=4,
-            backend="nccl",
+            shape=[4, 1, 1, 1], dim_names=["tp", "cp", "pp", "dp"], rank_offset=4, backend="nccl"
         )
-        
+
         tp_group2 = grid2.create_pg("tp")
         cp_group2 = grid2.create_pg("cp")
         pp_group2 = grid2.create_pg("pp")
-        model_comm_pgs2 = ModelCommProcessGroups(
-            tp=tp_group2, cp=cp_group2, pp=pp_group2
-        )
+        model_comm_pgs2 = ModelCommProcessGroups(tp=tp_group2, cp=cp_group2, pp=pp_group2)
 
         # Create bridge communicator
         bridge_communicator = BridgeCommunicator(grid1, grid2)
@@ -318,17 +308,13 @@ class TestBridgeCommunicator:
         # Test forward pass with bridge communicator
         sequence_length = 2048
         micro_batch_size = 2
-        
+
         # Create input tensor (only on grid1)
         hidden_states = None
         if block1 is not None:
-            hidden_states = (
-                torch.randn(
-                    (sequence_length, micro_batch_size, transformer_config.hidden_size),
-                    device="cuda",
-                )
-                .bfloat16()
-            )
+            hidden_states = torch.randn(
+                (sequence_length, micro_batch_size, transformer_config.hidden_size), device="cuda"
+            ).bfloat16()
 
         # Forward pass through first block
         output1 = None
@@ -339,28 +325,42 @@ class TestBridgeCommunicator:
         if bridge_communicator.is_current_rank_in_grid(grid1):
             # Send forward activation to grid2
             bridge_communicator.send_forward(output1)
-                        
+
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Receive forward activation from grid1
             received_activation = bridge_communicator.receive_forward(
                 tensor_shape=(sequence_length, micro_batch_size, transformer_config.hidden_size),
                 dtype=torch.bfloat16,
             )
-            
+
             # Verify received activation
             assert received_activation is not None, "Should receive activation from grid1"
-            assert received_activation.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size), f"Activation shape mismatch: {received_activation.shape}"
-            assert received_activation.device.type == "cuda", f"Activation should be on CUDA device: {received_activation.device}"
-            
-            print(f"Grid2 rank {dist.get_rank()}: Successfully received activation with shape {received_activation.shape}")
-            
+            assert received_activation.shape == (
+                sequence_length,
+                micro_batch_size,
+                transformer_config.hidden_size,
+            ), f"Activation shape mismatch: {received_activation.shape}"
+            assert (
+                received_activation.device.type == "cuda"
+            ), f"Activation should be on CUDA device: {received_activation.device}"
+
+            print(
+                f"Grid2 rank {dist.get_rank()}: Successfully received activation with shape {received_activation.shape}"
+            )
+
             # Forward pass through second block
             output2 = block2(hidden_states=received_activation, attention_mask=None)
-            
+
             # Verify output shape
-            assert output2.shape == (sequence_length, micro_batch_size, transformer_config.hidden_size), f"Output2 shape mismatch: {output2.shape}"
-            
-            print(f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}")
+            assert output2.shape == (
+                sequence_length,
+                micro_batch_size,
+                transformer_config.hidden_size,
+            ), f"Output2 shape mismatch: {output2.shape}"
+
+            print(
+                f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}"
+            )
 
         # Clean up
         Utils.destroy_model_parallel()
@@ -387,38 +387,28 @@ class TestBridgeCommunicator:
         model_parallel_cuda_manual_seed(123)
 
         # Import the linear layers
-        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
         from megatron.core.model_parallel_config import ModelParallelConfig
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 
         # Create first grid: tp=4, cp=1, dp=1, pp=1 (offset 0-3)
         grid1 = HyperCommGrid(
-            shape=[4, 1, 1, 1],
-            dim_names=["tp", "cp", "pp", "dp"],
-            rank_offset=0,
-            backend="nccl",
+            shape=[4, 1, 1, 1], dim_names=["tp", "cp", "pp", "dp"], rank_offset=0, backend="nccl"
         )
-        
+
         tp_group1 = grid1.create_pg("tp")
         cp_group1 = grid1.create_pg("cp")
         pp_group1 = grid1.create_pg("pp")
-        model_comm_pgs1 = ModelCommProcessGroups(
-            tp=tp_group1, cp=cp_group1, pp=pp_group1
-        )
+        model_comm_pgs1 = ModelCommProcessGroups(tp=tp_group1, cp=cp_group1, pp=pp_group1)
 
         # Create second grid: tp=1, cp=4, dp=1, pp=1 (offset 4-7)
         grid2 = HyperCommGrid(
-            shape=[1, 4, 1, 1],
-            dim_names=["tp", "cp", "pp", "dp"],
-            rank_offset=4,
-            backend="nccl",
+            shape=[1, 4, 1, 1], dim_names=["tp", "cp", "pp", "dp"], rank_offset=4, backend="nccl"
         )
-        
+
         tp_group2 = grid2.create_pg("tp")
         cp_group2 = grid2.create_pg("cp")
         pp_group2 = grid2.create_pg("pp")
-        model_comm_pgs2 = ModelCommProcessGroups(
-            tp=tp_group2, cp=cp_group2, pp=pp_group2
-        )
+        model_comm_pgs2 = ModelCommProcessGroups(tp=tp_group2, cp=cp_group2, pp=pp_group2)
 
         # Create model parallel configs
         config1 = ModelParallelConfig(
@@ -428,7 +418,7 @@ class TestBridgeCommunicator:
             perform_initialization=True,
             bf16=True,
         )
-        
+
         config2 = ModelParallelConfig(
             tensor_model_parallel_size=1,
             context_parallel_size=4,
@@ -443,7 +433,7 @@ class TestBridgeCommunicator:
         # Layer dimensions
         input_size = 2048
         hidden_size = 4096
-        
+
         # Create init method
         def init_method(tensor):
             torch.nn.init.normal_(tensor, mean=0.0, std=0.02)
@@ -454,41 +444,47 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(grid1):
             # First layer: ColumnParallelLinear with tp=4
-            layer1 = ColumnParallelLinear(
-                input_size=input_size,
-                output_size=hidden_size,
-                config=config1,
-                init_method=init_method,
-                bias=True,
-                gather_output=False,
-                skip_bias_add=False,
-                tp_group=tp_group1,
-            ).cuda().bfloat16()
+            layer1 = (
+                ColumnParallelLinear(
+                    input_size=input_size,
+                    output_size=hidden_size,
+                    config=config1,
+                    init_method=init_method,
+                    bias=True,
+                    gather_output=False,
+                    skip_bias_add=False,
+                    tp_group=tp_group1,
+                )
+                .cuda()
+                .bfloat16()
+            )
 
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Second layer: RowParallelLinear with tp=1, cp=4
-            layer2 = RowParallelLinear(
-                input_size=hidden_size,
-                output_size=input_size,
-                config=config2,
-                init_method=init_method,
-                bias=True,
-                input_is_parallel=True,
-                skip_bias_add=False,
-                tp_group=tp_group2,
-            ).cuda().bfloat16()
+            layer2 = (
+                RowParallelLinear(
+                    input_size=hidden_size,
+                    output_size=input_size,
+                    config=config2,
+                    init_method=init_method,
+                    bias=True,
+                    input_is_parallel=True,
+                    skip_bias_add=False,
+                    tp_group=tp_group2,
+                )
+                .cuda()
+                .bfloat16()
+            )
 
         # Test forward pass with bridge communicator
         batch_size = 2
         sequence_length = 512
-        
+
         # Create input tensor (only on grid1)
         input_tensor = None
         if layer1 is not None:
             input_tensor = torch.randn(
-                (sequence_length, batch_size, input_size),
-                device="cuda",
-                dtype=torch.bfloat16,
+                (sequence_length, batch_size, input_size), device="cuda", dtype=torch.bfloat16
             )
 
         # Forward pass through first layer
@@ -502,28 +498,41 @@ class TestBridgeCommunicator:
             # Send forward activation to grid2
             print(f"Grid1 rank {dist.get_rank()}: Sending activation with shape {output1.shape}")
             bridge_communicator.send_forward(output1)
-                        
+
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Receive forward activation from grid1
             received_activation = bridge_communicator.receive_forward(
-                tensor_shape=(sequence_length//4, batch_size, hidden_size),
-                dtype=torch.bfloat16,
+                tensor_shape=(sequence_length // 4, batch_size, hidden_size), dtype=torch.bfloat16
             )
-            
+
             # Verify received activation
             assert received_activation is not None, "Should receive activation from grid1"
-            assert received_activation.shape == (sequence_length//4, batch_size, hidden_size), f"Activation shape mismatch: {received_activation.shape}"
-            assert received_activation.device.type == "cuda", f"Activation should be on CUDA device: {received_activation.device}"
-            
-            print(f"Grid2 rank {dist.get_rank()}: Successfully received activation with shape {received_activation.shape}")
-            
+            assert received_activation.shape == (
+                sequence_length // 4,
+                batch_size,
+                hidden_size,
+            ), f"Activation shape mismatch: {received_activation.shape}"
+            assert (
+                received_activation.device.type == "cuda"
+            ), f"Activation should be on CUDA device: {received_activation.device}"
+
+            print(
+                f"Grid2 rank {dist.get_rank()}: Successfully received activation with shape {received_activation.shape}"
+            )
+
             # Forward pass through second layer
             output2, _ = layer2(received_activation)
-            
+
             # Verify output shape
-            assert output2.shape == (sequence_length//4, batch_size, input_size), f"Output2 shape mismatch: {output2.shape}"
-            
-            print(f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}")
+            assert output2.shape == (
+                sequence_length // 4,
+                batch_size,
+                input_size,
+            ), f"Output2 shape mismatch: {output2.shape}"
+
+            print(
+                f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}"
+            )
 
         # Clean up
         Utils.destroy_model_parallel()

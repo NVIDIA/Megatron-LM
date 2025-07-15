@@ -46,7 +46,12 @@ class BridgeCommunicator:
       send_backward_recv_forward to be used by the pipeline schedule.
     """
 
-    def __init__(self, src_grid: HyperCommGrid, dest_grid: HyperCommGrid, dim_mapping: Optional[Dict[str, int]] = None):
+    def __init__(
+        self,
+        src_grid: HyperCommGrid,
+        dest_grid: HyperCommGrid,
+        dim_mapping: Optional[Dict[str, int]] = None,
+    ):
         """Initialize the bridge communicator between source and destination grids.
 
         Args:
@@ -59,7 +64,7 @@ class BridgeCommunicator:
         self.current_rank = dist.get_rank()
         self.comm_map: Dict[int, RankCommInfo] = {}
         if dim_mapping is None:
-            self.dim_mapping = {'s': 1, 'b': 0, 'h': 2}  
+            self.dim_mapping = {'s': 1, 'b': 0, 'h': 2}
         else:
             self.dim_mapping = dim_mapping
 
@@ -1015,7 +1020,11 @@ class BridgeCommunicator:
             return tensors[0]
 
         # Map parallelism types to tensor dimensions
-        dim_mapping = {'tp': self.dim_mapping['h'], 'cp': self.dim_mapping['s'], 'ep': self.dim_mapping['h']}  # TP/EP: hidden dim, CP: sequence dim
+        dim_mapping = {
+            'tp': self.dim_mapping['h'],
+            'cp': self.dim_mapping['s'],
+            'ep': self.dim_mapping['h'],
+        }  # TP/EP: hidden dim, CP: sequence dim
 
         # Get grid shape for reconstruction
         grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
@@ -1207,7 +1216,11 @@ class BridgeCommunicator:
         print(f"rank_enum: {rank_enum}")
 
         # Map parallelism types to tensor dimensions
-        dim_mapping = {'tp': self.dim_mapping['h'], 'cp': self.dim_mapping['s'], 'ep': self.dim_mapping['h']}  # TP/EP: hidden dim, CP: sequence dim
+        dim_mapping = {
+            'tp': self.dim_mapping['h'],
+            'cp': self.dim_mapping['s'],
+            'ep': self.dim_mapping['h'],
+        }  # TP/EP: hidden dim, CP: sequence dim
 
         # Get grid shape for decomposition
         grid_shape = [grid.shape[grid.dim_names.index(dim)] for dim in non_dp_dims]
