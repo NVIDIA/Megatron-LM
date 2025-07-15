@@ -2184,8 +2184,8 @@ def get_expert_data_parallel_world_size(partial_expert_data_parallel=False):
     """Return world size for the expert data parallel group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return get_expert_data_parallel_group(
-            partial_expert_data_parallel=partial_expert_data_parallel.size()
-        )
+            partial_expert_data_parallel=partial_expert_data_parallel
+        ).size()
     else:
         return 0
 
