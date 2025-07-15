@@ -11,6 +11,7 @@ MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model -
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/mmlu.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
+    --expert-tensor-parallel-size ${ETP} \
     --expert-model-parallel-size ${EP} \
     --pipeline-model-parallel-size ${PP} \
     --tokenizer-model ${TOKENIZER_MODEL} \

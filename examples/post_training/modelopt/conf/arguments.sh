@@ -48,6 +48,11 @@ if [ -z ${TP} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} not set! (default: ${TP})\n"
 fi
 
+if [ -z ${ETP} ]; then
+    ETP=${TP}
+    printf "${MLM_WARNING} Variable ${PURPLE}TP${WHITE} not set! (default: ${ETP})\n"
+fi
+
 if [ -z ${EP} ]; then
     EP=1
     printf "${MLM_WARNING} Variable ${PURPLE}EP${WHITE} not set! (default: ${EP})\n"
