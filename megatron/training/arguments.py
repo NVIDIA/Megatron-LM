@@ -2029,7 +2029,7 @@ def _add_learning_rate_args(parser):
                        'and initial warmup, the learning rate at each '
                        'iteration would be different.')
     group.add_argument('--lr-decay-style', type=str, default='linear',
-                       choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD'],
+                       choices=['constant', 'linear', 'cosine', 'inverse-square-root', 'WSD', 'deepseek', 'deepseekv2'],
                        help='Learning rate decay function.')
     group.add_argument('--lr-wsd-decay-style', type=str, default='exponential',
                        choices=['exponential', 'linear', 'cosine', 'minus_sqrt'],

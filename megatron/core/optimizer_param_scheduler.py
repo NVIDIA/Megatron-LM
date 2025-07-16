@@ -139,6 +139,24 @@ class OptimizerParamScheduler:
         if self.lr_decay_style == 'constant':
             return max_lr
 
+        if self.lr_decay_style == 'deepseek':
+            total_steps = self.lr_warmup_steps + self.lr_decay_steps
+            if self.num_steps <= 0.8 * total_steps:
+                return max_lr
+            elif self.num_steps <= 0.9 * total_steps:
+                return max_lr * 0.316
+            else:
+                return max_lr * 0.316 * 0.316
+
+        if self.lr_decay_style == 'deepseekv2':
+            total_steps = self.lr_warmup_steps + self.lr_decay_steps
+            if self.num_steps <= 0.6 * total_steps:
+                return max_lr
+            elif self.num_steps <= 0.9 * total_steps:
+                return max_lr * 0.316
+            else:
+                return max_lr * 0.316 * 0.316
+
         # For any steps larger than `self.lr_decay_steps`, use `min_lr`.
         if self.num_steps > self.lr_decay_steps:
             return min_lr

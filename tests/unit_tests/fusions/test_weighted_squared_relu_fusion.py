@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.activations import squared_relu
+from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 
 
 @pytest.mark.internal

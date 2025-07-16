@@ -940,6 +940,8 @@ def _load_base_checkpoint(
         tracker_filename = get_checkpoint_tracker_filename(load_dir)
         if isfile(tracker_filename):
             iteration, release = read_metadata(tracker_filename)
+        if args.ckpt_step is not None:
+            iteration = args.ckpt_step
 
     # Allow user to specify the loaded iteration.
     if getattr(args, "ckpt_step", None):
@@ -1136,6 +1138,7 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    _set_arg('attention_backend', force=True)
 
     _set_arg('hybrid_override_pattern', force=True)
     _set_arg('spec', force=True)
@@ -1152,7 +1155,12 @@ def load_args_from_checkpoint(
     _set_arg('moe_token_dispatcher_type', force=True)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
+    _set_arg('moe_router_score_function', force=True)
+    _set_arg('moe_router_enable_expert_bias', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
+    # We set this to fp64 in the eval script for deterministic evals
+    # _set_arg('moe_router_dtype', force=True)
+    _set_arg('moe_router_topk_scaling_factor', force=True)
 
     # Mamba args.
     _set_arg('mamba_state_dim', force=True)
@@ -1496,7 +1504,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                          'Specify --no-load-optim or --finetune to prevent '
                          'attempting to load the optimizer state, '
                          'exiting ...'.format(checkpoint_name))
-            raise e
+            # raise e
     else:
         if (args.fp16 or args.bf16) and optimizer is not None:
             optimizer.reload_model_params()
@@ -1542,7 +1550,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                          'Specify --no-load-rng or --finetune to prevent '
                          'attempting to load the rng state, '
                          'exiting ...'.format(checkpoint_name))
-            sys.exit()
+            # sys.exit()
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
