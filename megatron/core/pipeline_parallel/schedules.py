@@ -446,15 +446,40 @@ def check_first_val_step(first_val_step, forward_only, cond):
     else:
         return cond
 
+def get_current_cp_assignment(complete_cp_assignment, microbatch_id, rank):
+    '''
+    complete_cp_assignment is a list of lists, 
+    Each inner list contains the cp_assignment (assigned GPU ranks) for a sub-sample
+    This function returns the ith sub-sample assigned to a GPU, None otherwise
+    For example, complete_cp_assignment = [[0, 1, 2, 3], [4, 5], [4, 5], [6, 7], [6, 7]]
+    For microbatch_id = 0; rank = 4; current_cp_assignment is [None, [4, 5], None, None, None]
+    This informs rank 4 that it should pick-up the 2nd sub-sample and share with rank 5
+    For microbatch_id = 1; rank = 4; current_cp_assignment is [None, None, [4, 5], None, None]
+    This informs rank 4 that it should pick-up the 3rd sub-sample and share with rank 5
+    '''
+    current_cp_assignment = [None] * len(complete_cp_assignment)
+    matched_sample = -1
+    index = None
+    for i, assigned_ranks in enumerate(complete_cp_assignment):
+        if rank in assigned_ranks:
+            matched_sample += 1
+            if matched_sample == microbatch_id:
+                current_cp_assignment[i] = assigned_ranks
+                break
+    return current_cp_assignment
+
 def heterogeneous_context_parallel(single_forward_step, total_num_tokens):
     def forward_func_wrapper(*args, **kwargs):
+        rank = torch.distributed.get_rank() # TODO: Get the correct rank based on process groups
+        original_data_iterator = args.data_iterator
+        data = next(original_data_iterator) # TODO: Protect for model parallelism
         # calculate new loop count
-        # TODO: N, complete_cp_assignment = get_heterogeneous_cp_assignment(data_iterator)
+        assert hasattr(data, "packed_seq_metadata"), "data must have a packed_seq_metadata attribute"
+        # TODO: N, complete_cp_assignment = get_heterogeneous_cp_assignment(data["packed_seq_metadata"])
         N=4
-        # TODO: calculate the right cp_assignment for micro-microbatch 0
-        # current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0)
-        # TODO: data["cp_assignment"] = current_cp_assignment
-        # TODO: create new data_iterator with the cp_assignment
+        current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0)
+        data["cp_assignment"] = current_cp_assignment
+        args.data_iterator = RerunDataIterator(iter([data]))
         # Run the 1st micro-microbatch
         output_tensor, num_tokens = single_forward_step(*args, **kwargs)
         total_num_tokens += num_tokens
@@ -463,10 +488,9 @@ def heterogeneous_context_parallel(single_forward_step, total_num_tokens):
         for i in range(1, N):
             backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
             
-            # TODO: calculate the right cp_assignment for micro-microbatch i
-            # current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i)
-            # TODO: data["cp_assignment"] = cp_assignment
-            # TODO: create new data_iterator with the cp_assignment
+            current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i)
+            data["cp_assignment"] = current_cp_assignment
+            args.data_iterator = RerunDataIterator(iter([data]))
             output_tensor, num_tokens = single_forward_step(*args, **kwargs)
             total_num_tokens += num_tokens
         return output_tensor, total_num_tokens
