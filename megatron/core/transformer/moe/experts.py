@@ -774,8 +774,8 @@ class TEGroupedMLP(MegatronModule):
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
         assert (
-            config.bias_dropout_fusion == False
-        ), "bias_dropout_fusion is not supported in TEGroupedMLP yet"
+            not (self.config.add_bias_linear and config.bias_dropout_fusion)
+        ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
         self.ep_group = model_comm_pgs.ep
 

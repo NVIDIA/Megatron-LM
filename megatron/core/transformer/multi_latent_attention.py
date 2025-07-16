@@ -168,6 +168,7 @@ class MultiLatentAttention(Attention):
         rotary_pos_emb=None,
         rotary_pos_cos=None,
         rotary_pos_sin=None,
+        yarn_mscale: float = 1.0,
         attention_bias=None,
         packed_seq_params=None,
         position_ids=None,
