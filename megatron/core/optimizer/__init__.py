@@ -152,9 +152,21 @@ def _get_param_groups(
             else:
                 params_map[key].append(param)
 
+    # Distributed checkpoint requires all ranks to have the same param groups,
+    # so we need to align the param groups across ranks, otherwise we may have
+    # runtime error when loading the checkpoint or numerical error when resuming training.
+    params_key = list(params_map.keys())
+    gathered_params_key = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_params_key, params_key)
+    for keys in gathered_params_key:
+        for key in keys:
+            if key not in params_key:
+                params_key.append(key)
+
     param_groups = []
-    for (wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr), params in params_map.items():
-        assert len(params) > 0
+    for key in params_key:
+        wd_mult, _lr_mult, is_expert_parallel, is_decoupled_lr = key
+        params = params_map[key] if key in params_map else []
         param_group = {
             'params': params,
             'wd_mult': wd_mult,
