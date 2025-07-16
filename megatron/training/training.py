@@ -1235,6 +1235,9 @@ def setup_model_and_optimizer(
         scale_lr_cond,
         lr_mult,
         use_gloo_process_groups=args.enable_gloo_process_groups,
+        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+        #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
