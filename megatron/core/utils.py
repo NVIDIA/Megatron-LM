@@ -5,6 +5,7 @@
 import array
 import functools
 import hashlib
+import heapq
 import inspect
 import logging
 import math
@@ -1862,6 +1863,68 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
 
     return batch
 
+def get_total_workload(seq_length: int):
+    return seq_length*seq_length
+
+def get_heterogeneous_cp_assignment(cu_seqlens: List[int], max_seqlen_per_cp_rank: int, cp_size: int, flops_calculator: Optional[Callable] = get_total_workload):
+    """
+    cu_seqlens: list of sub-sample sequence lengths
+    max_seqlen_per_cp_rank: list of max sequence length per CP rank
+    cp_size: total number of CP ranks
+    flops_calculator: function to calculate flops from cu_seqlens
+
+    Returns:
+      start_time[j]: the time job j begins
+      assignment[j]: list of resource IDs assigned to job j
+    """
+    cp_size_per_sample = [math.ceil(x / max_seqlen_per_cp_rank) for x in cu_seqlens]
+    total_workload_per_sample = [flops_calculator(x) for x in cu_seqlens]
+    total_workload_per_cp_rank = [work/cp_size for work, cp in zip(total_workload_per_sample, cp_size_per_sample)]
+    n = len(total_workload_per_cp_rank)
+    # jobs in descending p[j]
+    jobs = sorted(range(n), key=lambda j: total_workload_per_cp_rank[j], reverse=True)
+    current_time = 0
+
+    # a min-heap of free resource IDs
+    free_resources = list(range(cp_size))
+    heapq.heapify(free_resources)
+
+    # events: (release_time, [list of resource IDs freeing then])
+    events = []
+
+    start_time = [None] * n
+    assignment = [None] * n
+
+    while jobs:
+        made_progress = True
+        # try to schedule any job that fits in the currently free resources
+        while made_progress:
+            made_progress = False
+            for j in list(jobs):
+                if cp_size_per_sample[j] <= len(free_resources):
+                    # grab the lowest‐ID resources available
+                    assigned = [heapq.heappop(free_resources) for _ in range(cp_size_per_sample[j])]
+                    start_time[j] = current_time
+                    assignment[j] = assigned
+                    # schedule their release
+                    release_time = current_time + total_workload_per_cp_rank[j]
+                    heapq.heappush(events, (release_time, assigned))
+                    jobs.remove(j)
+                    made_progress = True
+                    break
+
+        # if nothing fits right now, advance to the next release event
+        if not made_progress and events:
+            t, freed_ids = heapq.heappop(events)
+            current_time = t
+            for rid in freed_ids:
+                heapq.heappush(free_resources, rid)
+        elif not events:
+            # should not happen when cp_size ≥ max(cp_size_per_sample)
+            break
+
+    # TODO: Return per GPU count of sub-samples to be processed instead of start_time
+    return start_time, assignment
 
 ######################
 ### NVTX profiling ###

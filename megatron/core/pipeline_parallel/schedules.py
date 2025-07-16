@@ -474,8 +474,8 @@ def heterogeneous_context_parallel(single_forward_step, total_num_tokens):
         original_data_iterator = args.data_iterator
         data = next(original_data_iterator) # TODO: Protect for model parallelism
         # calculate new loop count
-        assert hasattr(data, "packed_seq_metadata"), "data must have a packed_seq_metadata attribute"
-        # TODO: N, complete_cp_assignment = get_heterogeneous_cp_assignment(data["packed_seq_metadata"])
+        assert hasattr(data, "cu_seqlens"), "data must have a cu_seqlens attribute"
+        # TODO: N, complete_cp_assignment = get_heterogeneous_cp_assignment(data["cu_seqlens"], args.config.max_seqlen_per_cp_rank, args.config.context_parallel_size)
         N=4
         current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0)
         data["cp_assignment"] = current_cp_assignment
