@@ -2021,6 +2021,16 @@ def _add_initialization_args(parser):
     group.add_argument('--init-method-std', type=float, default=0.02,
                        help='Standard deviation of the zero mean normal '
                        'distribution used for weight initialization.')
+    group.add_argument('--embedding-init-method-std', type=float, default=None,
+                       help='Standard deviation of the zero mean normal '
+                       'distribution used for embedding weight initialization. '
+                       'If unset, embeddings will be initialized the same way '
+                       'as other weights. Setting this to a value around 1.0 '
+                       'may avoid loss spikes in training. Setting this to any '
+                       'value will also skip applying weight decay on embedding '
+                       'weights to avoid shrinkage towards zero. See '
+                       'https://arxiv.org/abs/2312.16903 for more details.'
+                       )
     group.add_argument('--init-method-xavier-uniform', action='store_true',
                        help='Enable Xavier uniform parameter initialization')
 

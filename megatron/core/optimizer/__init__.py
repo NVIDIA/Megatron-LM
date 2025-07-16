@@ -53,6 +53,7 @@ def _get_param_groups(
     min_lr: float,
     decoupled_lr: Optional[float],
     decoupled_min_lr: Optional[float],
+    default_skip_embedding_weight_decay: bool = False,
 ) -> List[Dict]:
     """Create parameter groups for optimizer.
 
@@ -74,6 +75,8 @@ def _get_param_groups(
         min_lr (float): minimum learning rate.
         decoupled_lr (Optional[float]): optional decoupled learning rate.
         decoupled_min_lr (Optional[float]): optional decoupled minimum learning rate.
+        default_skip_embedding_weight_decay (bool): whether to skip weight decay for embedding
+            parameters by default, if no_weight_decay_cond is not provided.
 
     Returns:
         List of parameter groups.
@@ -104,10 +107,17 @@ def _get_param_groups(
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
             if no_weight_decay_cond is not None:
-                no_wd = no_weight_decay_cond(name, param)
+                no_wd: bool = no_weight_decay_cond(name, param)
             else:
                 # Do not regularize biases and norm parameters.
-                no_wd = name.endswith(".bias") or len(param.shape) == 1
+                #  optionally, also skip weight decay for embedding parameters if requested
+                #  (useful if you do not want embeddings to shrink to zero in training
+                #  https://arxiv.org/abs/2312.16903)
+                no_wd = (
+                    name.endswith(".bias")
+                    or len(param.shape) == 1
+                    or (default_skip_embedding_weight_decay and "embedding" in name)
+                )
 
             if scale_lr_cond is not None:
                 scale_lr = scale_lr_cond(name, param)
@@ -216,6 +226,7 @@ def _get_param_groups_and_buffers(
     lr_mult: float,
     filter_fn: Callable,
     buffer_name: str,
+    default_skip_embedding_weight_decay: bool = False,
 ) -> Tuple[List[Dict], Dict[int, List[_ParamAndGradBuffer]]]:
     """Returns parameter groups and buffer for optimizer.
 
@@ -234,6 +245,8 @@ def _get_param_groups_and_buffers(
         min_lr (float): minimum learning rate.
         filter_fn (callable): filtering function for param_groups.
         buffer_name (str): name of buffer.
+        default_skip_embedding_weight_decay (bool): whether to skip weight decay for
+            embedding parameters by default, if no_weight_decay_cond is not provided.
 
     Returns:
         List of parameter groups and dictionary of model chunk IDs to buffers.
@@ -247,6 +260,7 @@ def _get_param_groups_and_buffers(
         min_lr=config.min_lr,
         decoupled_lr=config.decoupled_lr,
         decoupled_min_lr=config.decoupled_min_lr,
+        default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
     )
     param_groups = list(filter(filter_fn, param_groups))
     buffers = {}
@@ -456,6 +470,7 @@ def get_megatron_optimizer(
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
     use_gloo_process_groups: bool = True,
+    default_skip_embedding_weight_decay: bool = False,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -472,6 +487,10 @@ def get_megatron_optimizer(
             satisfy scale_lr_cond. Defaults to 1.0.
         use_gloo_process_groups (bool): if false, disable use of Gloo process groups
             in underlying Megatron optimizers.
+        default_skip_embedding_weight_decay (bool): whether to skip weight decay for
+            embedding parameters by default, if no_weight_decay_cond is not provided.
+            This is useful if you do not want embeddings to shrink to zero in training
+            as recommended in https://arxiv.org/abs/2312.16903
 
     Returns:
         Instance of MegatronOptimizer.
@@ -514,6 +533,7 @@ def get_megatron_optimizer(
                 lr_mult=lr_mult,
                 filter_fn=lambda g: True,
                 buffer_name='buffers',
+                default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
             )
             # Pass Gloo process groups into optimizer only if needed.
             if use_gloo_process_groups:
@@ -556,6 +576,7 @@ def get_megatron_optimizer(
             lr_mult=lr_mult,
             filter_fn=lambda g: not g['is_expert_parallel'],
             buffer_name='buffers',
+            default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
         )
         for model_chunk in dense_model_chunks:
             model_chunk.overlap_param_gather_with_optimizer_step = (
@@ -595,6 +616,7 @@ def get_megatron_optimizer(
         lr_mult=lr_mult,
         filter_fn=lambda g: g['is_expert_parallel'],
         buffer_name='expert_parallel_buffers',
+        default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
     )
     if len(moe_param_groups) > 0:
         model_parallel_rank = mpu.get_expert_tensor_model_pipeline_parallel_group().rank()

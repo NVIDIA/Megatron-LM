@@ -5,6 +5,7 @@ import os
 
 import pytest
 import torch
+from pytest import approx
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
@@ -26,7 +27,11 @@ class TestGPTModel:
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         transformer_config = TransformerConfig(
-            num_layers=2, hidden_size=12, num_attention_heads=4, use_cpu_initialization=True
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
         )
         self.gpt_model = GPTModel(
             config=transformer_config,
@@ -61,6 +66,16 @@ class TestGPTModel:
         assert self.gpt_model.decoder.input_tensor.shape[0] == sequence_length
         assert self.gpt_model.decoder.input_tensor.shape[1] == micro_batch_size
         assert self.gpt_model.decoder.input_tensor.shape[2] == config.hidden_size
+
+    def test_embedding_init(self):
+        """Test that we can initialize the embedding weights to something else. This test could be added to any model."""
+        config: TransformerConfig = self.gpt_model.config
+        assert self.gpt_model.embedding.word_embeddings.weight.std().cpu().item() == approx(
+            config.embedding_init_method_std, abs=1e-1
+        )
+        assert self.gpt_model.embedding.word_embeddings.weight.mean().cpu().item() == approx(
+            0.0, abs=1e-1
+        )
 
     @pytest.mark.internal
     def test_post_process_forward(self):
