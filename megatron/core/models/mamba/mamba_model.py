@@ -208,7 +208,7 @@ class MambaModel(LanguageModule):
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config
+                inference_context, self.decoder, decoder_input, self.config, None
             )
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
