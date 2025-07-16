@@ -28,7 +28,8 @@ class Symbols:
     MAMBA = "M"
     ATTENTION = "*"
     MLP = "-"
-    VALID = {MAMBA, ATTENTION, MLP}
+    MOE = 'E'
+    VALID = {MAMBA, ATTENTION, MLP, MOE}
 
 
 def _allocate_auto(
