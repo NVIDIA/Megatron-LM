@@ -35,6 +35,13 @@ from megatron.training import get_args, pretrain
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
     "llava_vlm": model_provider_llava_vlm,
+    "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
+}
+
+_DATASET_PROVIDERS = {
+    "mock": mock_train_valid_test_datasets_provider,
+    "llava_vlm": llava_vlm_dataloader_provider,
+    "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
 }
 
 def add_mimo_args(parser):
@@ -42,8 +49,8 @@ def add_mimo_args(parser):
     group = parser.add_argument_group('MIMO', 'MIMO specific arguments')
 
     # MIMO-specific parameters
-    group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to use')
-    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to use')
+    group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm]')
+    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm]')
 
     # mock dataloader related args
     # can control mock samples with total seq length and image seq length
@@ -120,8 +127,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     return batch
 
 def loss_func(loss_mask, output_tensor):
-    """
-    Simple loss function for MIMO model training.
+    """Simple loss function for MIMO model training.
 
     Args:
         loss_mask: mask indicating which tokens contribute to the loss
@@ -158,23 +164,22 @@ def forward_step(data_iterator, model):
 
 
 def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
-    """
-    Dataset provider for MIMO model training.
+    """Dataset provider for MIMO model training.
 
     Args:
         *provider_args: Additional arguments for the dataset provider
         **provider_kwargs: Additional keyword arguments for the dataset provider
     """
     runtime_args = get_args()
-    if runtime_args.dataset_provider == "mock":
-        return mock_train_valid_test_datasets_provider(*provider_args, **provider_kwargs)
-    elif runtime_args.dataset_provider == "energon_llava_vlm":
-        return llava_vlm_dataloader_provider(*provider_args, **provider_kwargs)
-    else:
+    try:
+        dataset_provider = _DATASET_PROVIDERS[runtime_args.dataset_provider]
+    except KeyError as e:
         raise ValueError(
-            f"Unknown dataset provider: {runtime_args.dataset_provider}. "
-            "Must be one of ['mock', 'energon_llava_vlm']"
-        )
+            f"Unsupported dataset provider '{runtime_args.dataset_provider}'. "
+            f"Available providers: {list(_DATASET_PROVIDERS.keys())}"
+        ) from e
+
+    return dataset_provider(*provider_args, **provider_kwargs)
 
 def model_provider(
     pre_process: bool = True,
@@ -183,8 +188,7 @@ def model_provider(
     add_decoder: bool = True,
     special_token_id: int = 32000,
 ):
-    """
-    Model provider for MIMO model training.
+    """Model provider for MIMO model training.
 
     Args:
         pre_process: Whether to pre-process the model
