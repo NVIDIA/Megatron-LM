@@ -312,13 +312,6 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
-    overlap_moe_expert_parallel_comm: bool = False
-    """If true, use batch-level overlapping in 1f1b stage for A2A communication hiding."""
-
-    delay_wgrad_compute: bool = False
-    """If true, delay the wgrad compute for better overlapping
-       in overlap_moe_expert_parallel_comm.
-   """
 
     ###################
     # CPU Offloading
@@ -404,7 +397,3 @@ class ModelParallelConfig:
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
 
-        if self.delay_wgrad_compute and not self.overlap_moe_expert_parallel_comm:
-            raise ValueError(
-                "Delaying wgrad compute only works when setting --overlap-moe-expert-parallel-comm"
-            )

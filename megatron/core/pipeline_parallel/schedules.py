@@ -668,8 +668,9 @@ def get_pp_rank_microbatches(
             # immediately start with 1F1B).
             num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
             num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
-            # When enabling overlap_moe_expert_parallel_comm, we need to add one more microbatch
-            # before 1f1b stages for a2a overlap.
+            # When enabling overlap_moe_expert_parallel_comm, we schedule one extra micro-batch
+            # forward step before the 1f1b stages. This is needed to ensure the forward
+            # and backward computations are independent in all 1f1b steps.
             if overlap_moe_expert_parallel_comm:
                 num_warmup_microbatches = num_warmup_microbatches + 1
     else:
