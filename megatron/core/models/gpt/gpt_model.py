@@ -552,7 +552,7 @@ class GPTModel(LanguageModule):
         Returns:
             ModelChunkSchedulePlan: The model chunk schedule plan.
         """
-        
+
         from .fine_grained_schedule import ModelChunkSchedulePlan
 
         return ModelChunkSchedulePlan(
