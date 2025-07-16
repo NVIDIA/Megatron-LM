@@ -55,12 +55,12 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [hybrid_inference_tp1_pp1_2B_logitsmatch]
+  - test_case: [hybrid_static_inference_tp1_pp1_2B_logitsmatch]
     products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [hybrid_inference_tp1_pp1_2B_cudagraphs]
+  - test_case: [hybrid_static_inference_tp1_pp1_2B_cudagraphs]
     products:
       - environment: [dev]
         scope: [mr]

@@ -637,3 +637,128 @@ class TestDynamicContext:
 
         # Verify that all 6 chunks were released by checking the available chunks
         assert dynamic_context.chunk_allocator.chunk_count_avail == initial_available_chunks + 6
+
+    @pytest.mark.experimental
+    def test_calculate_and_store_log_probs(self):
+        self._setup_model_parallel_group(1, 1)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            buffer_guarenteed_fraction=0.1,
+            chunk_size_tokens=128,
+            max_requests_override=None,
+            max_tokens_override=None,
+            buffer_overflow_factor=None,
+        )
+
+        # Add a few requests to the context
+        request_data = {
+            1001: {
+                "tokens": torch.randint(0, 100, (10,), device='cuda'),
+                "prefill_len": 10,
+                "initial_token_offset": 0,
+            },
+            1002: {
+                "tokens": torch.randint(0, 100, (5,), device='cuda'),
+                "prefill_len": 5,
+                "initial_token_offset": 10,
+            },
+            1003: {
+                "tokens": torch.randint(0, 100, (7,), device='cuda'),
+                "prefill_len": 7,
+                "initial_token_offset": 15,
+            },
+        }
+
+        current_token_idx = 0
+        for req_id, data in request_data.items():
+            dynamic_context.add_request(req_id, data["tokens"])
+            # Update the initial_token_offset as requests are added
+            request_data[req_id]["initial_token_offset"] = current_token_idx
+            current_token_idx += data["prefill_len"]
+
+        # --- Simulate Prefill Step ---
+        total_active_tokens = dynamic_context.active_token_count
+        vocab_size = 50000
+        # logits will have shape [1, total_active_tokens, vocab_size]
+        prefill_logits = torch.randn(
+            1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
+        )
+
+        # Call the function for prefill
+        prefill_log_probs = dynamic_context.calculate_log_probs(prefill_logits)
+
+        # Calculate expected prefill log probs for the selected tokens
+        expected_prefill_log_probs_all_logits = torch.nn.functional.log_softmax(
+            prefill_logits.squeeze(0), dim=-1
+        ).to(torch.float32)
+
+        active_token_ids = dynamic_context.token_to_input_ids[:total_active_tokens]
+        sequence_indices = torch.arange(total_active_tokens, device=prefill_logits.device)
+        expected_prefill_log_probs_selected = expected_prefill_log_probs_all_logits[
+            sequence_indices, active_token_ids
+        ]
+
+        for i, (req_id, data) in enumerate(request_data.items()):
+            req_len = data["tokens"].shape[0]
+            initial_token_offset = data["initial_token_offset"]
+
+            assert len(prefill_log_probs[i]) == req_len, len(prefill_log_probs[i])
+
+            # Extract the relevant slice of expected log probs for this request's tokens
+            expected_prefill_log_probs_selected_for_request = expected_prefill_log_probs_selected[
+                initial_token_offset : initial_token_offset + req_len
+            ]
+
+            # Compare the values (using allclose for float tensors)
+            assert torch.allclose(
+                torch.tensor(prefill_log_probs[i]),
+                expected_prefill_log_probs_selected_for_request.cpu(),
+            )
+
+        # --- Simulate Decode Step ---
+        # All requests are active, so the mask will be all ones for the current active requests
+        active_requests_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+
+        # New tokens for the decode step (one token per active request)
+        num_active_requests = dynamic_context.total_request_count
+        decode_new_tokens = torch.randint(0, 100, (num_active_requests,), device='cuda').int()
+
+        dynamic_context.update_requests(
+            active_requests_mask=active_requests_mask, new_tokens=decode_new_tokens
+        )
+
+        # Generate new logits for the decode step. Now each request contributes 1 token.
+        decode_logits = torch.randn(
+            1, num_active_requests, vocab_size, device='cuda', dtype=torch.float32
+        )
+        decode_log_probs = dynamic_context.calculate_log_probs(decode_logits)
+
+        # Verify the stored decode log probabilities
+        expected_decode_log_probs_all_logits = torch.nn.functional.log_softmax(
+            decode_logits.squeeze(0), dim=-1
+        ).to(torch.float32)
+
+        total_active_tokens = dynamic_context.active_token_count
+        active_token_ids = dynamic_context.token_to_input_ids[:total_active_tokens]
+        sequence_indices = torch.arange(total_active_tokens, device=prefill_logits.device)
+        expected_decode_log_probs_selected = expected_decode_log_probs_all_logits[
+            sequence_indices, active_token_ids
+        ]
+
+        for i, (req_id, data) in enumerate(request_data.items()):
+            assert len(decode_log_probs[i]) == 1, len(decode_log_probs[i])
+
+            # Extract the relevant slice of expected log probs for this request's tokens
+            expected_decode_log_probs_selected_for_request = expected_decode_log_probs_selected[
+                i : i + 1
+            ]
+
+            assert torch.allclose(
+                torch.tensor(decode_log_probs[i]),
+                expected_decode_log_probs_selected_for_request.cpu(),
+            )

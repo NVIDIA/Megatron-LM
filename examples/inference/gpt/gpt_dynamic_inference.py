@@ -22,8 +22,9 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider
+import json
 
-from .utils import (
+from utils import (
     add_common_inference_args,
     build_requests,
     build_dynamic_engine_setup_prefix,
@@ -43,7 +44,6 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Load checkpoint with `strict=False`.",
     )
-
     return parser
 
 
@@ -101,6 +101,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        materialize_only_last_token_logits=not args.return_log_probs,
     )
 
     return context
@@ -204,6 +205,9 @@ def run_inference(
                 request.time_end = get_curr_time()
                 request.output_text = finished_request.generated_text
                 request.state = "finished"
+                request.request_id = finished_request.request_id
+                if sampling_params.return_log_probs:
+                    request.log_probs = finished_request.prompt_log_probs + finished_request.generated_log_probs
                 num_requests_finished += 1
 
         # Check if all requests are finished.
@@ -281,6 +285,25 @@ def main():
                 f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... {request.output_text.replace("\n", "\\n")}"
                 
             )
+
+        # Write results to JSON. Primarily used for functional testing.
+        if args.output_path:
+            json_results = {}
+
+            for idx, req in enumerate(requests):
+                result_dict = {
+                    "input_prompt": req.prompt_text,
+                    "generated_text": req.output_text,
+                    "generated_tokens": req.output_tokens,
+                    "latency": req.time_end - req.time_start,
+                }
+                if sampling_params.return_log_probs:
+                    response_logprobs = req.log_probs
+                    result_dict["logprobs"] = response_logprobs
+                json_results[req.request_id] = result_dict
+            with open(args.output_path, "w") as fp:
+                json.dump(json_results, fp)
+
 
     # Timing results.
     stats = torch.cuda.memory_stats()

@@ -4,15 +4,15 @@ maintainers: [mcore]
 loggers: [stdout]
 spec:
   name: "{test_case}_{environment}_{platforms}"
-  model: gpt
+  model: moe
   build: mcore-pyt-{environment}
   nodes: 1
   gpus: 1
   n_repeat: 1
   platforms: dgx_a100
   artifacts:
-    /workspace/data/mcore_mistral/model: model/mcore_mistral/nemo_minitron-0.5b/v1
-    /workspace/data/mcore_mistral/tokenizer: model/mcore_mistral/nemo_minitron-0.5b/v1
+    /workspace/data/deepseek_16b_pyt/model: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
+    /workspace/data/deepseek_16b_pyt/tokenizer: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
   script_setup: |
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -56,12 +56,7 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [gpt_inference_tp1_pp1_583m_logitsmatch]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt_inference_tp1_pp1_583m_cudagraphs]
+  - test_case: [gpt_static_inference_tp1_pp1_ep1_16B_logitsmatch]
     products:
       - environment: [dev]
         scope: [mr]

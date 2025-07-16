@@ -21,23 +21,26 @@ def test_inference_pipeline(golden_values_path: str, test_values_path: str) -> N
     if isinstance(output_current, str):
         output_current = json.loads(output_current)
 
-    # Extract values directly from the loaded dictionaries
-    tokens_groundtruth = output_groundtruth["generated_tokens"]
-    tokens_current = output_current["generated_tokens"]
-    logprobs_groundtruth = output_groundtruth["logprobs"]
-    logprobs_current = output_current["logprobs"]
+    for request_id, groundtruth_results in output_groundtruth.items():
+        current_results = output_current[request_id]
 
-    # Check token equality
-    assert (
-        tokens_groundtruth == tokens_current
-    ), f"Token mismatch:\nGround truth: {tokens_groundtruth}\nCurrent: {tokens_current}"
+        # Extract values directly from the loaded dictionaries
+        tokens_groundtruth = groundtruth_results["generated_tokens"]
+        tokens_current = current_results["generated_tokens"]
+        logprobs_groundtruth = groundtruth_results["logprobs"]
+        logprobs_current = current_results["logprobs"]
 
-    # Check logprobs length and tolerance
-    assert len(logprobs_groundtruth) == len(
-        logprobs_current
-    ), f"Logprobs length mismatch: {len(logprobs_groundtruth)} vs {len(logprobs_current)}"
+        # Check token equality
+        assert (
+            tokens_groundtruth == tokens_current
+        ), f"Token mismatch:\nGround truth: {tokens_groundtruth}\nCurrent: {tokens_current}"
 
-    for i, (lp1, lp2) in enumerate(zip(logprobs_groundtruth, logprobs_current)):
-        assert math.isclose(
-            lp1, lp2, abs_tol=0.001
-        ), f"Logprobs differ at index {i}: {lp1:.5f} vs {lp2:.5f}"
+        # Check logprobs length and tolerance
+        assert len(logprobs_groundtruth) == len(
+            logprobs_current
+        ), f"Logprobs length mismatch: {len(logprobs_groundtruth)} vs {len(logprobs_current)}"
+
+        for i, (lp1, lp2) in enumerate(zip(logprobs_groundtruth, logprobs_current)):
+            assert math.isclose(
+                lp1, lp2, abs_tol=0.001
+            ), f"Logprobs differ at index {i}: {lp1:.5f} vs {lp2:.5f}"

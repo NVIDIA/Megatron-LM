@@ -72,13 +72,15 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--model-provider", choices=["mamba", "gpt"], default="gpt", help="Model provider"
     )
     group.add_argument(
+        "--output-path", type=str, default=None, help="Path to save generations as JSON"
+    )
+    group.add_argument(
         "--prompt-file",
         help='Jsonl file containing input prompts, where each item (i.e., line) '
         'contains the field \'text\' where the value is the prompt. All other '
         'fields within each item are ignored, and may be customized for each '
         'application.',
     )
-
 
     return parser
 
