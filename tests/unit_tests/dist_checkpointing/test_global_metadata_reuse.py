@@ -31,12 +31,12 @@ class TestGlobalMetadataReuse:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "test_global_metadata_reuse"
-        ) as non_persistent_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+        with (
+            TempNamedDir(
+                tmp_path_dist_ckpt / "test_global_metadata_reuse"
+            ) as non_persistent_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
@@ -101,18 +101,20 @@ class TestGlobalMetadataReuse:
         opt_param_scheduler = None
 
         mock_args = parse_args(ignore_unknown_args=True)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "test_global_metadata_reuse"
-        ) as non_persistent_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+        with (
+            TempNamedDir(
+                tmp_path_dist_ckpt / "test_global_metadata_reuse"
+            ) as non_persistent_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
             mock_args.non_persistent_ckpt_type = "global"
             mock_args.ckpt_assume_constant_structure = True
             mock_args.ckpt_fully_parallel_save = True
+            # We need full reshardability as we change TP/PP
+            mock_args.dist_ckpt_optim_fully_reshardable = True
 
             save_ckpt_context = {}
 
