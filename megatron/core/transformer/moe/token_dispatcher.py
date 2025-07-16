@@ -11,6 +11,7 @@ from megatron.core.config import is_experimental_enabled
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
+from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -1065,6 +1066,7 @@ class _DeepepManager(_DispatchManager):
         self.handle = None
         return hidden_states
 
+    @jit_fuser
     def _pad_routing_map(
         self, routing_map: torch.Tensor, tokens_per_expert: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1208,6 +1210,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         ).contiguous()
         return routing_map, probs
 
+    @jit_fuser
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
