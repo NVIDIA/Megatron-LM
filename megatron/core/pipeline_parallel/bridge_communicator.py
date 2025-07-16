@@ -337,7 +337,7 @@ class BridgeCommunicator:
                     # Send the tensor split to the destination rank
                     print(
                         f"rank {self.current_rank} sending tensor to dst rank {send_op.destination_rank} shape {tensor_split.shape} sum {tensor_split.sum()}"
-                    )                     
+                    )
                     dist.send(tensor_split, dst=send_op.destination_rank)
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
@@ -434,11 +434,11 @@ class BridgeCommunicator:
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
             # Non-leader rank - participate in scatter operation
             # Receive broadcasted tensor shape from leader rank
-            shape_tensor = torch.empty(
-                (3), device=torch.cuda.current_device(), dtype=torch.int64
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
             )
-            dist.broadcast(shape_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg)
-            
+
             # Use the received shape to create tensor for scatter operation
             received_shape = tuple(shape_tensor.tolist())
             received_tensor = torch.empty(
@@ -590,9 +590,11 @@ class BridgeCommunicator:
 
             # Create tensor to receive the scattered data
             received_gradient = torch.empty_like(tensor_dict[self.current_rank])
-            
+
             # Broadcast tensor shape to all ranks in scatter_pg
-            print(f"rank {self.current_rank} broadcasting shape tensor {tensor_dict[self.current_rank].shape}")
+            print(
+                f"rank {self.current_rank} broadcasting shape tensor {tensor_dict[self.current_rank].shape}"
+            )
             tensor_shape_to_scatter = tensor_dict[self.current_rank].shape
             shape_tensor = torch.tensor(
                 tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
@@ -613,18 +615,18 @@ class BridgeCommunicator:
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
             # Non-leader rank - participate in scatter operation
             # Receive broadcasted tensor shape from leader rank
-            shape_tensor = torch.empty(
-                (3), device=torch.cuda.current_device(), dtype=torch.int64
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.src_local_leader_rank, group=self.activation_gather_pg
             )
-            dist.broadcast(shape_tensor, src=self.src_local_leader_rank, group=self.activation_gather_pg)
-            
+
             # Use the received shape to create tensor for scatter operation
             print(f"rank {self.current_rank} received shape tensor {shape_tensor}")
             received_shape = tuple(shape_tensor.tolist())
             received_gradient = torch.empty(
                 received_shape, device=torch.cuda.current_device(), dtype=dtype
             )
-            
+
             dist.scatter(
                 received_gradient,
                 scatter_list=None,
@@ -803,11 +805,11 @@ class BridgeCommunicator:
                 f"rank {self.current_rank} is a noop rank. Waiting for gradient from leader rank {self.src_local_leader_rank}"
             )
             # Receive gradient from leader using scatter operation
-            shape_tensor = torch.empty(
-                (3), device=torch.cuda.current_device(), dtype=torch.int64
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.src_local_leader_rank, group=self.activation_gather_pg
             )
-            dist.broadcast(shape_tensor, src=self.src_local_leader_rank, group=self.activation_gather_pg)
-            
+
             # Use the received shape to create tensor for scatter operation
             received_shape = tuple(shape_tensor.tolist())
             received_gradient = torch.empty(
@@ -968,7 +970,9 @@ class BridgeCommunicator:
                 shape_tensor = torch.tensor(
                     tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
                 )
-                dist.broadcast(shape_tensor, src=self.current_rank, group=self.activation_scatter_pg)
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.activation_scatter_pg
+                )
 
                 # Scatter the tensors to all ranks in the group
                 dist.scatter(
@@ -997,11 +1001,11 @@ class BridgeCommunicator:
                 f"rank {self.current_rank} is a noop rank. Waiting for activation from leader rank {self.dest_local_leader_rank}"
             )
             # Receive activation from leader using scatter operation
-            shape_tensor = torch.empty(
-                (3), device=torch.cuda.current_device(), dtype=torch.int64
+            shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
+            dist.broadcast(
+                shape_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
             )
-            dist.broadcast(shape_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg)
-            
+
             # Use the received shape to create tensor for scatter operation
             received_shape = tuple(shape_tensor.tolist())
             received_activation = torch.empty(
@@ -1317,33 +1321,33 @@ class BridgeCommunicator:
         self, aggregated_tensor: torch.Tensor, num_splits: int
     ) -> List[torch.Tensor]:
         """Split an aggregated tensor into multiple tensors at the batch dimension.
-        
+
         Args:
             aggregated_tensor: The tensor to split
             num_splits: The number of splits to create
-            
+
         Returns:
             List of tensors split at the batch dimension
         """
         if num_splits <= 0:
             raise ValueError(f"num_splits must be positive, got {num_splits}")
-        
+
         if num_splits == 1:
             return [aggregated_tensor]
-        
+
         batch_size = aggregated_tensor.size(self.dim_mapping['b'])
         split_size = batch_size // num_splits
-        
+
         tensor_splits = []
         for i in range(num_splits):
             start_idx = i * split_size
             end_idx = (i + 1) * split_size if i < num_splits - 1 else batch_size
-            
+
             # Create slice objects for all dimensions
             slices = [slice(None)] * aggregated_tensor.ndim
             # Set the slice for the batch dimension
             slices[self.dim_mapping['b']] = slice(start_idx, end_idx)
             tensor_split = aggregated_tensor[tuple(slices)]
             tensor_splits.append(tensor_split)
-        
+
         return tensor_splits

@@ -152,7 +152,9 @@ class TestBridgeCommunicator:
             bridge_communicator.send_forward(random_hidden_state)
 
         else:
-            received_activation = bridge_communicator.receive_forward(dtype=random_hidden_state.dtype)
+            received_activation = bridge_communicator.receive_forward(
+                dtype=random_hidden_state.dtype
+            )
             # Assert that the returned activation tensor is valid
             assert (
                 received_activation is not None
@@ -212,24 +214,15 @@ class TestBridgeCommunicator:
         "grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs",
         [
             (1, 4, 1, 1, 4, 1, 1, 1, 2),  # Current setup: Grid1 cp=4, Grid2 tp=4,
-            (1, 4, 1, 1, 1, 1, 1, 4, 8)
+            (1, 4, 1, 1, 1, 1, 1, 4, 8),
         ],
     )
     def test_bridge_communicator_with_transformer_blocks(
-        self,
-        grid1_tp,
-        grid1_cp,
-        grid1_pp,
-        grid1_dp,
-        grid2_tp,
-        grid2_cp,
-        grid2_pp,
-        grid2_dp,
-        mbs
+        self, grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs
     ):
         """
         Test bridge communicator with two transformer blocks having different process group configurations.
-        
+
         Args:
             grid1_tp: Tensor parallelism size for grid1
             grid1_cp: Context parallelism size for grid1
@@ -270,7 +263,10 @@ class TestBridgeCommunicator:
 
         # Create first grid: tp=grid1_tp, cp=grid1_cp, pp=grid1_pp, dp=grid1_dp (offset 0-3)
         grid1 = HyperCommGrid(
-            shape=[grid1_tp, grid1_cp, grid1_pp, grid1_dp], dim_names=["tp", "cp", "pp", "dp"], rank_offset=0, backend="nccl"
+            shape=[grid1_tp, grid1_cp, grid1_pp, grid1_dp],
+            dim_names=["tp", "cp", "pp", "dp"],
+            rank_offset=0,
+            backend="nccl",
         )
 
         tp_group1 = grid1.create_pg("tp")
@@ -291,7 +287,10 @@ class TestBridgeCommunicator:
         )
 
         grid2 = HyperCommGrid(
-            shape=[grid2_tp, grid2_cp, grid2_pp, grid2_dp], dim_names=["tp", "cp", "pp", "dp"], rank_offset=4, backend="nccl"
+            shape=[grid2_tp, grid2_cp, grid2_pp, grid2_dp],
+            dim_names=["tp", "cp", "pp", "dp"],
+            rank_offset=4,
+            backend="nccl",
         )
 
         tp_group2 = grid2.create_pg("tp")
@@ -356,7 +355,11 @@ class TestBridgeCommunicator:
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Receive forward activation from grid1
             received_activation = bridge_communicator.receive_forward(
-                tensor_shape=(sequence_length, micro_batch_size//grid2_dp, transformer_config.hidden_size),
+                tensor_shape=(
+                    sequence_length,
+                    micro_batch_size // grid2_dp,
+                    transformer_config.hidden_size,
+                ),
                 dtype=torch.bfloat16,
             )
 
@@ -364,7 +367,7 @@ class TestBridgeCommunicator:
             assert received_activation is not None, "Should receive activation from grid1"
             assert received_activation.shape == (
                 sequence_length,
-                micro_batch_size//grid2_dp,
+                micro_batch_size // grid2_dp,
                 transformer_config.hidden_size,
             ), f"Activation shape mismatch: {received_activation.shape}"
             assert (
@@ -381,7 +384,7 @@ class TestBridgeCommunicator:
             # Verify output shape
             assert output2.shape == (
                 sequence_length,
-                micro_batch_size//grid2_dp,
+                micro_batch_size // grid2_dp,
                 transformer_config.hidden_size,
             ), f"Output2 shape mismatch: {output2.shape}"
 
