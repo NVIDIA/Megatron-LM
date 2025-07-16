@@ -214,7 +214,13 @@ class TestBridgeCommunicator:
         "grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs",
         [
             (1, 4, 1, 1, 4, 1, 1, 1, 2),  # Current setup: Grid1 cp=4, Grid2 tp=4,
+<<<<<<< HEAD
             (1, 4, 1, 1, 1, 1, 1, 4, 8),
+=======
+            (1, 4, 1, 1, 1, 1, 1, 4, 8), # Fan-out test
+            (1, 1, 1, 4, 4, 1, 1, 1, 8), # Fan-in test
+            # (2, 1, 2, 1, 4, 1, 1, 1, 8) # PP Test
+>>>>>>> 88184d131 (Adding more tests for different grid setups)
         ],
     )
     def test_bridge_communicator_with_transformer_blocks(
@@ -302,7 +308,6 @@ class TestBridgeCommunicator:
         bridge_communicator = BridgeCommunicator(
             grid1, grid2, dim_mapping={'s': 0, 'h': 2, 'b': 1}, requires_scatter_gather=False
         )
-
         # Create transformer blocks
         block1 = None
         block2 = None
@@ -354,6 +359,7 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Receive forward activation from grid1
+<<<<<<< HEAD
             received_activation = bridge_communicator.receive_forward(
                 tensor_shape=(
                     sequence_length,
@@ -374,19 +380,43 @@ class TestBridgeCommunicator:
                 received_activation.device.type == "cuda"
             ), f"Activation should be on CUDA device: {received_activation.device}"
 
+=======
+            
+            received_activation = bridge_communicator.receive_forward(dtype=torch.bfloat16)
+
+            # Verify received activation
+            assert received_activation is not None, "Should receive activation from grid1"
+>>>>>>> 88184d131 (Adding more tests for different grid setups)
             print(
                 f"Grid2 rank {dist.get_rank()}: Successfully received activation with shape {received_activation.shape}"
             )
 
             # Forward pass through second block
             output2 = block2(hidden_states=received_activation, attention_mask=None)
-
+            if grid1_dp > grid2_dp:
+                fan_in_factor = grid1_dp // grid2_dp
+                expected_output_shape = (
+                    sequence_length,
+                    micro_batch_size*fan_in_factor,
+                    transformer_config.hidden_size,
+                )
+            else:
+                fan_out_factor = grid2_dp // grid1_dp
+                expected_output_shape = (
+                    sequence_length,
+                    micro_batch_size//fan_out_factor,
+                    transformer_config.hidden_size,
+                )
             # Verify output shape
+<<<<<<< HEAD
             assert output2.shape == (
                 sequence_length,
                 micro_batch_size // grid2_dp,
                 transformer_config.hidden_size,
             ), f"Output2 shape mismatch: {output2.shape}"
+=======
+            assert output2.shape == expected_output_shape, f"Output2 shape mismatch: {output2.shape}"
+>>>>>>> 88184d131 (Adding more tests for different grid setups)
 
             print(
                 f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}"

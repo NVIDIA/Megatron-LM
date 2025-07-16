@@ -89,7 +89,7 @@ class BridgeCommunicator:
             self.activation_scatter_ranks = self.get_boundary_pp_stage_ranks(
                 self.dest_grid, is_src=False
             )
-        if self.activation_scatter_ranks:
+        else:
             print(f"Current rank {self.current_rank} generating gather ranks in src grid")
             self.activation_gather_ranks = self.get_boundary_pp_stage_ranks(
                 self.src_grid, is_src=True
@@ -192,6 +192,7 @@ class BridgeCommunicator:
             return activation_comm_ranks
 
         all_tpcp_group_ranks = grid._gen_rank_enum(['tp', 'cp'])
+        print(f"rank {self.current_rank} all_tpcp_group_ranks {all_tpcp_group_ranks}")
         for each_group_ranks in all_tpcp_group_ranks:
             if self.current_rank in each_group_ranks:
                 activation_comm_ranks = each_group_ranks
@@ -312,13 +313,13 @@ class BridgeCommunicator:
             gathered_tensors = [
                 torch.zeros_like(tensor_to_send) for _ in range(len(self.activation_gather_ranks))
             ]
+            print(f"rank {self.current_rank} gathering tensors from {self.activation_gather_ranks} to {self.src_local_leader_rank}")
             dist.gather(
                 tensor_to_send,
                 gather_list=gathered_tensors,
                 dst=self.src_local_leader_rank,
                 group=self.activation_gather_pg,
             )
-
             aggregated_tensor = self._reconstruct_tensor_from_gathered(
                 gathered_tensors,
                 self.src_grid,
