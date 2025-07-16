@@ -88,7 +88,7 @@ class TestBridgeCommunicator:
                 16, 128, 512
             ).cuda()  # (batch_size, seq_len, hidden_size)
             received_grad = bridge_communicator.send_forward_recv_backward(
-                random_hidden_state, grad_shape=(16, 128, 512), dtype=random_hidden_state.dtype
+                random_hidden_state, dtype=random_hidden_state.dtype
             )
 
             # Assert that the returned gradient tensor is valid
@@ -110,7 +110,7 @@ class TestBridgeCommunicator:
                 16, 128, 512
             ).cuda()  # (batch_size, seq_len, hidden_size)
             received_activation = bridge_communicator.send_backward_recv_forward(
-                random_grad_state, forward_shape=(16, 128, 512), dtype=random_grad_state.dtype
+                random_grad_state, dtype=random_grad_state.dtype
             )
 
             # Assert that the returned activation tensor is valid
@@ -152,9 +152,7 @@ class TestBridgeCommunicator:
             bridge_communicator.send_forward(random_hidden_state)
 
         else:
-            received_activation = bridge_communicator.receive_forward(
-                tensor_shape=(16, 128, 512), dtype=random_hidden_state.dtype
-            )
+            received_activation = bridge_communicator.receive_forward(dtype=random_hidden_state.dtype)
             # Assert that the returned activation tensor is valid
             assert (
                 received_activation is not None
@@ -194,9 +192,7 @@ class TestBridgeCommunicator:
             bridge_communicator.send_backward(random_grad_state)
 
         else:
-            received_gradient = bridge_communicator.receive_backward(
-                tensor_shape=(16, 128, 512), dtype=random_grad_state.dtype
-            )
+            received_gradient = bridge_communicator.receive_backward(dtype=random_grad_state.dtype)
             # Assert that the returned gradient tensor is valid
             assert received_gradient is not None, "recv_backward should return a gradient tensor"
             assert isinstance(
@@ -212,11 +208,38 @@ class TestBridgeCommunicator:
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
-    def test_bridge_communicator_with_transformer_blocks(self):
+    @pytest.mark.parametrize(
+        "grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs",
+        [
+            (1, 4, 1, 1, 4, 1, 1, 1, 2),  # Current setup: Grid1 cp=4, Grid2 tp=4,
+            (1, 4, 1, 1, 1, 1, 1, 4, 8)
+        ],
+    )
+    def test_bridge_communicator_with_transformer_blocks(
+        self,
+        grid1_tp,
+        grid1_cp,
+        grid1_pp,
+        grid1_dp,
+        grid2_tp,
+        grid2_cp,
+        grid2_pp,
+        grid2_dp,
+        mbs
+    ):
         """
         Test bridge communicator with two transformer blocks having different process group configurations.
-        First block: tp=4, cp=1, dp=1, pp=1
-        Second block: tp=1, cp=4, dp=1, pp=1
+        
+        Args:
+            grid1_tp: Tensor parallelism size for grid1
+            grid1_cp: Context parallelism size for grid1
+            grid1_pp: Pipeline parallelism size for grid1
+            grid1_dp: Data parallelism size for grid1
+            grid2_tp: Tensor parallelism size for grid2
+            grid2_cp: Context parallelism size for grid2
+            grid2_pp: Pipeline parallelism size for grid2
+            grid2_dp: Data parallelism size for grid2
+            mbs: Micro batch size
         """
         if not dist.is_initialized():
             pytest.skip("Distributed not initialized")
@@ -242,12 +265,12 @@ class TestBridgeCommunicator:
             attention_dropout=0.0,
             hidden_dropout=0.0,
             bf16=True,
-            context_parallel_size=4,  # Will be overridden per block
+            context_parallel_size=grid1_cp,  # Set to grid1 context parallel size
         )
 
-        # Create first grid: tp=4, cp=1, dp=1, pp=1 (offset 0-3)
+        # Create first grid: tp=grid1_tp, cp=grid1_cp, pp=grid1_pp, dp=grid1_dp (offset 0-3)
         grid1 = HyperCommGrid(
-            shape=[1, 4, 1, 1], dim_names=["tp", "cp", "pp", "dp"], rank_offset=0, backend="nccl"
+            shape=[grid1_tp, grid1_cp, grid1_pp, grid1_dp], dim_names=["tp", "cp", "pp", "dp"], rank_offset=0, backend="nccl"
         )
 
         tp_group1 = grid1.create_pg("tp")
@@ -255,7 +278,7 @@ class TestBridgeCommunicator:
         pp_group1 = grid1.create_pg("pp")
         model_comm_pgs1 = ModelCommProcessGroups(tp=tp_group1, cp=cp_group1, pp=pp_group1)
 
-        # Create second grid: tp=1, cp=4, dp=1, pp=1 (offset 4-7)
+        # Create second grid: tp=grid2_tp, cp=grid2_cp, pp=grid2_pp, dp=grid2_dp (offset 4-7)
         transformer_config_2 = TransformerConfig(
             num_layers=2,
             hidden_size=2048,
@@ -264,11 +287,11 @@ class TestBridgeCommunicator:
             attention_dropout=0.0,
             hidden_dropout=0.0,
             bf16=True,
-            context_parallel_size=1,  # Second block uses cp=4
+            context_parallel_size=grid2_cp,  # Set to grid2 context parallel size
         )
 
         grid2 = HyperCommGrid(
-            shape=[4, 1, 1, 1], dim_names=["tp", "cp", "pp", "dp"], rank_offset=4, backend="nccl"
+            shape=[grid2_tp, grid2_cp, grid2_pp, grid2_dp], dim_names=["tp", "cp", "pp", "dp"], rank_offset=4, backend="nccl"
         )
 
         tp_group2 = grid2.create_pg("tp")
@@ -309,7 +332,7 @@ class TestBridgeCommunicator:
 
         # Test forward pass with bridge communicator
         sequence_length = 2048
-        micro_batch_size = 2
+        micro_batch_size = mbs
 
         # Create input tensor (only on grid1)
         hidden_states = None
@@ -333,7 +356,7 @@ class TestBridgeCommunicator:
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Receive forward activation from grid1
             received_activation = bridge_communicator.receive_forward(
-                tensor_shape=(sequence_length, micro_batch_size, transformer_config.hidden_size),
+                tensor_shape=(sequence_length, micro_batch_size//grid2_dp, transformer_config.hidden_size),
                 dtype=torch.bfloat16,
             )
 
@@ -341,7 +364,7 @@ class TestBridgeCommunicator:
             assert received_activation is not None, "Should receive activation from grid1"
             assert received_activation.shape == (
                 sequence_length,
-                micro_batch_size,
+                micro_batch_size//grid2_dp,
                 transformer_config.hidden_size,
             ), f"Activation shape mismatch: {received_activation.shape}"
             assert (
@@ -358,7 +381,7 @@ class TestBridgeCommunicator:
             # Verify output shape
             assert output2.shape == (
                 sequence_length,
-                micro_batch_size,
+                micro_batch_size//grid2_dp,
                 transformer_config.hidden_size,
             ), f"Output2 shape mismatch: {output2.shape}"
 
