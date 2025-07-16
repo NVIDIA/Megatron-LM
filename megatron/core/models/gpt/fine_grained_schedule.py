@@ -35,7 +35,7 @@ class ModelChunkState:
 
 
 class LayerSchedulePlan:
-    """Schedule plan for a transformer layer.
+    """Schedule the executing plan of the nodes in a transformer layer.
 
     This class organizes the computation nodes for a transformer layer,
     including attention, post attention, MLP, dispatch, and combine nodes.
@@ -153,8 +153,9 @@ class LayerSchedulePlan:
     ):
         """Schedule one-forward-one-backward operations for a single transformer layer.
 
-        This function interleaves forward and backward operations to maximize
-        parallelism and efficiency.
+        This function interleaves forward and backward operations, overlapping the communications
+        (dispatch or combine) of one with the computations (att or mlp) of the other
+        to maximize parallelism and efficiency.
 
         Args:
             f_layer (TransformerLayerSchedulePlan): Forward layer (for current microbatch)
@@ -217,7 +218,7 @@ class LayerSchedulePlan:
 
 
 class ModelChunkSchedulePlan(AbstractSchedulePlan):
-    """Schedule plan for a model chunk.
+    """Schedule the executing plan of the sub-modules in a model chunk sub-modules.
 
     This class organizes the computation nodes for a model chunk,
     including preprocessing, transformer layers, and postprocessing.
@@ -244,7 +245,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         runtime_gather_output: Optional[bool] = None,
         loss_mask: Optional[Tensor] = None,
     ):
-        """Builds a schedule plan for a model chunk.
+        """Initialize the schedule plan of all Transformer layers' sub-modules.
 
         This function creates a schedule plan for a model chunk, including
         preprocessing, transformer layers, and postprocessing.

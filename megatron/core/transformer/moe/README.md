@@ -191,8 +191,8 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 Enable A2A overlap in the interleaved 1F1B pipeline parallel introduced from the DSv3 DualPipe implmentation. \
 **Features** 
 - Hide ep a2a communication by batch-level overlapping
-- Compatitable with interleaved 1F1B pipeline parallel
-- Support dW&dX split for better overlapping
+- Compatible with interleaved 1F1B pipeline parallel
+- Split weight gradient and activation gradient computations for better overlap with communications
 
 **Usage** 
 ```bash

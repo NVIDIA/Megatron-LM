@@ -38,11 +38,12 @@ def combined_1f1b_schedule_for_no_pipelining(
 ):
     """Scheduler for 1f1b with no pipelining.
 
-    This function is used to schedule the forward steps of one microbatch
-    and the backward steps of another microbatch.
-    The forward step is executed in parallel with the backward step of another microbatch.
-    EP A2A in forward step is hidden by the attention/mlp computation in the backward step.
-    Vice versa.
+    This function schedules micro-batches in a way that the forward pass of Transformer layers
+    for one micro-batch runs in parallel with the backward pass of another.
+    Each layer's forward and backward operations are co-scheduled to maximize the overlap of
+    their computations and communications.
+    EP A2A in forward step is hidden by the attention/mlp computation in the backward step,
+    and vice versa.
     Assuming we have 4 microbatches, the schedule is as follows:
     Phases 0: 1st microbatch forward
     Phases 1: 1st microbatch backward + 2nd microbatch forward
@@ -251,8 +252,9 @@ def combined_forward_backward_step(
         loss_node = b_output_tensor[0].loss_func
         b_output_tensor[0].loss_func = None
 
-        if b_output_tensor_grad[0] is None and config.grad_scale_func is not None:
-            b_output_tensor[0] = config.grad_scale_func(b_output_tensor[0])
+        if b_output_tensor_grad[0] is None:
+            if config.grad_scale_func is not None:
+                b_output_tensor[0] = config.grad_scale_func(b_output_tensor[0])
             # Backward pass for loss function
             torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
             b_output_tensor_grad[0] = loss_node.get_grad()
@@ -266,6 +268,7 @@ def combined_forward_backward_step(
     outer_fp8_context = get_fp8_context(config) if use_outer_fp8_context else nullcontext()
 
     b_grad = b_output_tensor_grad[0] if b_model else None
+    # combined forward and backward model chunk execution of two micro-batches
     with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
         # For GPT models, it calls fine_grained_schedule.py::ModelChunkSchedulePlan.run(),
         output_tensor = type(f_schedule_plan or b_schedule_plan).run(
