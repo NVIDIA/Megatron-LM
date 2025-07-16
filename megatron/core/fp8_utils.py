@@ -346,8 +346,12 @@ else:
     def _modify_underlying_storage_impl(*args, **kwargs):
         raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
 
-    def _quantize_param_shard_impl(*args, **kwargs):
-        raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
+    def _quantize_param_shard_impl(model_params, *args, **kwargs):
+        if len(model_params) == 0:
+            return
+        else:
+            # If TE is not installed, there shouldn't be any fp8 params.
+            raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
 
     def _correct_amax_history_if_needed_impl(*args, **kwargs):
         # If TE is not installed, we are definitely not using fp8 for training, so no correction
