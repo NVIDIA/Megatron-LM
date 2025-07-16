@@ -312,7 +312,6 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
-
     ###################
     # CPU Offloading
     ###################
@@ -396,4 +395,3 @@ class ModelParallelConfig:
                     "Pipeline parallel communication overlapping in warmup and flush is only "
                     "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )
-
