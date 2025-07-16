@@ -448,3 +448,13 @@ class TopKRouter(Router):
         scores, routing_map = self.routing(logits)
 
         return scores, routing_map
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        """Load the state dict of the router."""
+        self._maintain_float32_expert_bias()  # switch to float32 before loading
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def _save_to_state_dict(self, *args, **kwargs):
+        """Save the state dict of the router."""
+        self._maintain_float32_expert_bias()  # switch to float32 before saving
+        return super()._save_to_state_dict(*args, **kwargs)
