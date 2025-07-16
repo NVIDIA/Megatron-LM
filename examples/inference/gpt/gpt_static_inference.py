@@ -54,9 +54,6 @@ def add_static_inference_args(parser):
         help='Deprecated, use `--inference-max-requests` instead',
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
-    group.add_argument(
-        "--output-path", type=str, default=None, help="Path to save generations as JSON"
-    )
 
     return parser
 
@@ -197,14 +194,13 @@ def main():
     end_time = time.perf_counter()
     latency = end_time - start_time
 
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.get_rank() == 0 and args.output_path:
+        results_output = {}
         for idx, result in enumerate(results):
-            print(f' \n------------- RESULT FOR PROMPT {idx} --------------- ')
             result_dict = {
-                'id': result.request_id,
                 'input_prompt': result.prompt,
                 'generated_text': result.generated_text,
-                'generated_tokens': result.generated_tokens,
+                'generated_tokens': result.generated_tokens.tolist(),
                 'tpot': result.tpot,
                 'latency': latency,
             }
@@ -213,14 +209,10 @@ def main():
             if sampling_params.return_log_probs:
                 response_logprobs = result.prompt_log_probs + result.generated_log_probs
                 result_dict["logprobs"] = response_logprobs
+            results_output[result.request_id] = result_dict
 
-        # Write results to JSON. Primarily used for functional testing.
-        if args.output_path:
-            # Tensors cannot be serialized so we move these to CPU
-            result_dict['generated_tokens'] = result_dict['generated_tokens'].cpu().numpy().tolist()
-            results_as_json = json.dumps(result_dict)
-            with open(args.output_path, 'w') as f:
-                json.dump(results_as_json, f)
+        with open(args.output_path, 'w') as f:
+            json.dump(results_output, f)
 
     # Print unique prompts + outputs.
     if torch.distributed.get_rank() == 0:

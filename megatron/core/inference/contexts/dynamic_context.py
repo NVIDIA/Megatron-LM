@@ -2,9 +2,11 @@
 
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
+from packaging.version import Version as PkgVersion
 from torch import Tensor
 
 from megatron.core import parallel_state
@@ -123,8 +125,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
+        materialize_only_last_token_logits: bool = True,
     ):
-        super().__init__(materialize_only_last_token_logits=True)
+
+        super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
@@ -1037,3 +1041,35 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_chunk[: self.active_token_count] = (
             self.request_last_kv_chunk_offset[self.paused_request_count : self.total_request_count]
         )
+
+    def calculate_log_probs(self, logits: torch.Tensor) -> List[List[float]]:
+        """Calculate log probs for all active requests and return them.
+
+        TODO: @wdykas support top-n log probs.
+
+        Args:
+            logits: Raw model output logits with shape [1, sequence_length, vocab_size].
+
+        Returns:
+            List of lists where each inner list contains log probs for a request in the
+            same order as the active requests (from paused_request_count to total_request_count).
+        """
+        # Calculate log_probs (sequence_length x vocab_size)
+        log_probs = F.log_softmax(logits, dim=-1).to(torch.float32).squeeze()
+
+        # Extract the log probs for only the selected tokens
+        # (sequence_length x vocab_size) -> (sequence_length)
+        active_token_ids = self.token_to_input_ids[: self.active_token_count]
+        sequence_indices = torch.arange(self.active_token_count, device=log_probs.device)
+        selected_log_probs = log_probs[sequence_indices, active_token_ids]
+
+        # Split the log probs across request boundaries
+        active_query_lengths = self.request_query_lengths[
+            self.paused_request_count : self.total_request_count
+        ]
+        selected_log_probs_list = selected_log_probs.cpu().split(
+            active_query_lengths.tolist(), dim=0
+        )
+
+        # Convert each log prob tensor into a list
+        return [lp.tolist() for lp in selected_log_probs_list]

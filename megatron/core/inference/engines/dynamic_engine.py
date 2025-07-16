@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import deque
+from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -182,6 +183,7 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids: torch.Tensor,
         step_time: float,
         sample: torch.Tensor,
+        log_probs: torch.Tensor,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -191,6 +193,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_request_ids (torch.Tensor): A list of finished request ids
             step_time (float): The latency of the last step
             sample: (torch.Tensor): The newly generated tokens for each request
+            log_probs: (List): Log probs for each request
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -200,12 +203,24 @@ class DynamicInferenceEngine(AbstractEngine):
         finished_request_ids = set(finished_request_ids.tolist())
         self.finished_request_count += len(finished_request_ids)
 
-        for request_id, token in zip(request_ids.tolist(), sample.tolist()):
+        log_probs_iter = log_probs if log_probs else repeat(None)
+
+        for request_id, token, request_log_probs in zip(
+            request_ids.tolist(), sample.tolist(), log_probs_iter
+        ):
             request: DynamicInferenceRequest = self.requests[request_id]
             request.generated_tokens.append(token)
             if request.tpot is None:
                 request.tpot = []
             request.tpot.append(step_time)
+
+            if request_log_probs is not None:
+                # If prompt log probs is None we are in prefill
+                if request.prompt_log_probs is None:
+                    request.prompt_log_probs = request_log_probs
+                    request.generated_log_probs = []
+                else:
+                    request.generated_log_probs.extend(request_log_probs)
 
             if request_id in finished_request_ids:
                 request.generated_length = len(request.generated_tokens)
@@ -266,11 +281,11 @@ class DynamicInferenceEngine(AbstractEngine):
         step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
 
         if result is not None:
-            request_ids, finished_request_ids, sample = result
+            request_ids, finished_request_ids, sample, log_probs = result
 
             # TODO: Move this to a background thread?
             (active_requests, finished_requests) = self.post_process_requests(
-                request_ids, finished_request_ids, step_time, sample
+                request_ids, finished_request_ids, step_time, sample, log_probs
             )
 
             # TODO: Move this to a background thread?

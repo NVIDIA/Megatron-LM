@@ -430,6 +430,11 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
+        if sampling_params.return_log_probs:
+            assert (
+                context.materialize_only_last_token_logits is False
+            ), "Materialize only last token logits must be false for returning log probs"
+
         # No tokens?
         if context.active_token_count == 0:
             return None
@@ -479,7 +484,13 @@ class TextGenerationController:
                 pp_group=self.pp_group,
             )
 
-        last_token_logits = logits.squeeze(0)
+        # Last token logits.
+        if context.materialize_only_last_token_logits:
+            # When materialize_only_last_token_logits is true, last_token_logits is
+            # already called in the forward pass of GPT.
+            last_token_logits = logits.squeeze(0)
+        else:
+            last_token_logits = context.last_token_logits(logits)
 
         # Sample.
         # Use padded vocab size because tokenizer vocab size might not include padding
@@ -506,11 +517,15 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
+        log_probs = None
+        if sampling_params.return_log_probs:
+            log_probs = context.calculate_log_probs(logits)
+
         # Update requests.
         # New sample gets updated in update_requests, so we pass in a clone
         context.update_requests(active_request_mask, new_sample.clone())
 
-        return current_request_ids, finished_request_ids, new_sample
+        return current_request_ids, finished_request_ids, new_sample, log_probs
 
     def _update_top_n_logprobs_dict(
         self,
