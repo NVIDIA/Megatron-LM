@@ -214,8 +214,8 @@ class TestBridgeCommunicator:
         "grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs",
         [
             (1, 4, 1, 1, 4, 1, 1, 1, 2),  # Current setup: Grid1 cp=4, Grid2 tp=4,
-            (1, 4, 1, 1, 1, 1, 1, 4, 8), # Fan-out test
-            (1, 1, 1, 4, 4, 1, 1, 1, 8), # Fan-in test
+            (1, 4, 1, 1, 1, 1, 1, 4, 8),  # Fan-out test
+            (1, 1, 1, 4, 4, 1, 1, 1, 8),  # Fan-in test
             # (2, 1, 2, 1, 4, 1, 1, 1, 8) # PP Test
         ],
     )
@@ -355,7 +355,7 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Receive forward activation from grid1
-            
+
             received_activation = bridge_communicator.receive_forward(dtype=torch.bfloat16)
 
             # Verify received activation
@@ -370,18 +370,20 @@ class TestBridgeCommunicator:
                 fan_in_factor = grid1_dp // grid2_dp
                 expected_output_shape = (
                     sequence_length,
-                    micro_batch_size*fan_in_factor,
+                    micro_batch_size * fan_in_factor,
                     transformer_config.hidden_size,
                 )
             else:
                 fan_out_factor = grid2_dp // grid1_dp
                 expected_output_shape = (
                     sequence_length,
-                    micro_batch_size//fan_out_factor,
+                    micro_batch_size // fan_out_factor,
                     transformer_config.hidden_size,
                 )
             # Verify output shape
-            assert output2.shape == expected_output_shape, f"Output2 shape mismatch: {output2.shape}"
+            assert (
+                output2.shape == expected_output_shape
+            ), f"Output2 shape mismatch: {output2.shape}"
 
             print(
                 f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}"

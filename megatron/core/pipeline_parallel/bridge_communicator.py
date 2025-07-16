@@ -313,7 +313,9 @@ class BridgeCommunicator:
             gathered_tensors = [
                 torch.zeros_like(tensor_to_send) for _ in range(len(self.activation_gather_ranks))
             ]
-            print(f"rank {self.current_rank} gathering tensors from {self.activation_gather_ranks} to {self.src_local_leader_rank}")
+            print(
+                f"rank {self.current_rank} gathering tensors from {self.activation_gather_ranks} to {self.src_local_leader_rank}"
+            )
             dist.gather(
                 tensor_to_send,
                 gather_list=gathered_tensors,
