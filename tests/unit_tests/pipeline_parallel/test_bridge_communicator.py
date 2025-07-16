@@ -214,13 +214,9 @@ class TestBridgeCommunicator:
         "grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs",
         [
             (1, 4, 1, 1, 4, 1, 1, 1, 2),  # Current setup: Grid1 cp=4, Grid2 tp=4,
-<<<<<<< HEAD
-            (1, 4, 1, 1, 1, 1, 1, 4, 8),
-=======
             (1, 4, 1, 1, 1, 1, 1, 4, 8), # Fan-out test
             (1, 1, 1, 4, 4, 1, 1, 1, 8), # Fan-in test
             # (2, 1, 2, 1, 4, 1, 1, 1, 8) # PP Test
->>>>>>> 88184d131 (Adding more tests for different grid setups)
         ],
     )
     def test_bridge_communicator_with_transformer_blocks(
@@ -359,34 +355,11 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(grid2):
             # Receive forward activation from grid1
-<<<<<<< HEAD
-            received_activation = bridge_communicator.receive_forward(
-                tensor_shape=(
-                    sequence_length,
-                    micro_batch_size // grid2_dp,
-                    transformer_config.hidden_size,
-                ),
-                dtype=torch.bfloat16,
-            )
-
-            # Verify received activation
-            assert received_activation is not None, "Should receive activation from grid1"
-            assert received_activation.shape == (
-                sequence_length,
-                micro_batch_size // grid2_dp,
-                transformer_config.hidden_size,
-            ), f"Activation shape mismatch: {received_activation.shape}"
-            assert (
-                received_activation.device.type == "cuda"
-            ), f"Activation should be on CUDA device: {received_activation.device}"
-
-=======
             
             received_activation = bridge_communicator.receive_forward(dtype=torch.bfloat16)
 
             # Verify received activation
             assert received_activation is not None, "Should receive activation from grid1"
->>>>>>> 88184d131 (Adding more tests for different grid setups)
             print(
                 f"Grid2 rank {dist.get_rank()}: Successfully received activation with shape {received_activation.shape}"
             )
@@ -408,15 +381,7 @@ class TestBridgeCommunicator:
                     transformer_config.hidden_size,
                 )
             # Verify output shape
-<<<<<<< HEAD
-            assert output2.shape == (
-                sequence_length,
-                micro_batch_size // grid2_dp,
-                transformer_config.hidden_size,
-            ), f"Output2 shape mismatch: {output2.shape}"
-=======
             assert output2.shape == expected_output_shape, f"Output2 shape mismatch: {output2.shape}"
->>>>>>> 88184d131 (Adding more tests for different grid setups)
 
             print(
                 f"Grid2 rank {dist.get_rank()}: Successfully completed forward pass with output shape {output2.shape}"
