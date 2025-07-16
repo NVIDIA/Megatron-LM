@@ -28,8 +28,6 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
-from .fine_grained_schedule import ModelChunkSchedulePlan
-
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -554,6 +552,8 @@ class GPTModel(LanguageModule):
         Returns:
             ModelChunkSchedulePlan: The model chunk schedule plan.
         """
+        
+        from .fine_grained_schedule import ModelChunkSchedulePlan
 
         return ModelChunkSchedulePlan(
             self,
