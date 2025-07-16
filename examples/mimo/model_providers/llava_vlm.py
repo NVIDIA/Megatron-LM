@@ -61,6 +61,7 @@ def model_provider_llava_vlm(
     add_encoder=True,
     add_decoder=True,
     special_token_id: int = 32000,
+    is_video_input: bool = False
 ):
     """
     Build a LLaVA-style Vision-Language MIMO model composed of:
@@ -96,7 +97,7 @@ def model_provider_llava_vlm(
     # HF encoder
     vision_encoder = ModuleSpec(
         module=HFCLIPEncoderWrapper,
-        params={},
+        params={"is_video_input" : is_video_input},
     )
 
     # Create projection config for vision to language
