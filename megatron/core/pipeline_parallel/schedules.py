@@ -468,7 +468,7 @@ def get_current_cp_assignment(complete_cp_assignment, microbatch_id, rank):
                 break
     return current_cp_assignment
 
-def heterogeneous_context_parallel(single_forward_step, total_num_tokens):
+def heterogeneous_context_parallel(single_forward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type):
     def forward_func_wrapper(*args, **kwargs):
         rank = torch.distributed.get_rank() # TODO: Get the correct rank based on process groups
         original_data_iterator = args.data_iterator
@@ -486,7 +486,7 @@ def heterogeneous_context_parallel(single_forward_step, total_num_tokens):
         # Run the N-1 backward steps, N-1 forward steps.
         # We will be left with Nth backward step after this loop which is run in the original function.
         for i in range(1, N):
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, args.config)
             
             current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i)
             data["cp_assignment"] = current_cp_assignment
@@ -544,7 +544,7 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
     if config.heterogeneous_context_parallel:
-        forward_step = heterogeneous_context_parallel(forward_step, total_num_tokens)
+        forward_step = heterogeneous_context_parallel(forward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type)
 
     with no_sync_func():
         for i in range(num_microbatches - 1):
