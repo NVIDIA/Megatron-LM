@@ -214,10 +214,10 @@ class TestBridgeCommunicator:
         "grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs",
         [
             (1, 4, 1, 1, 4, 1, 1, 1, 2),  # Current setup: Grid1 cp=4, Grid2 tp=4,
-            (1, 4, 1, 1, 1, 1, 1, 4, 8), # Fan-out test
-            (1, 1, 1, 4, 4, 1, 1, 1, 8), # Fan-in test
-            (2, 1, 1, 2, 2, 1, 1, 2, 8), # Multiple dp groups test
-            (1, 1, 1, 4, 2, 1, 1, 2, 8) # Multiple dp groups test different dp sizes
+            (1, 4, 1, 1, 1, 1, 1, 4, 8),  # Fan-out test
+            (1, 1, 1, 4, 4, 1, 1, 1, 8),  # Fan-in test
+            (2, 1, 1, 2, 2, 1, 1, 2, 8),  # Multiple dp groups test
+            (1, 1, 1, 4, 2, 1, 1, 2, 8),  # Multiple dp groups test different dp sizes
         ],
     )
     def test_bridge_communicator_with_transformer_blocks(
