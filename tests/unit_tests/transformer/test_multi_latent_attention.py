@@ -37,6 +37,43 @@ def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
     return packed_seq_params
 
 
+def make_test_packed_seq_params_with_padding(
+    sequence_length=None, cu_seqlens=None, cu_seqlens_padded=None
+):
+    """Create PackedSeqParams with both regular and padded cu_seqlens for testing padded sequences."""
+    if cu_seqlens is None:
+        assert sequence_length is not None
+        cu_seqlens = [
+            0,
+            6,
+            19,
+            22,
+            sequence_length - 8,
+        ]  # Actual sequence lengths (with some padding removed)
+    if cu_seqlens_padded is None:
+        assert sequence_length is not None
+        cu_seqlens_padded = [0, 8, 22, 28, sequence_length]  # Padded sequence lengths
+
+    cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
+    cu_seqlens_padded = torch.IntTensor(cu_seqlens_padded).cuda()
+
+    # Use padded lengths for max_seqlen calculation
+    seqlens_padded = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
+    max_seqlen, _ = seqlens_padded.max(dim=0, keepdim=True)
+    max_seqlen = max_seqlen.tolist()[0]
+
+    packed_seq_params = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_kv=max_seqlen,
+        qkv_format='thd',
+    )
+    return packed_seq_params
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttention:
 
@@ -185,6 +222,57 @@ class TestParallelMLAAttention:
             assert output.shape[1] == micro_batch_size
             assert output.shape[2] == config.hidden_size
             assert bias.shape[0] == config.hidden_size
+
+    def test_gpu_forward_thd_padded(self):
+        """Test MLA forward pass with cu_seqlens_q_padded and cu_seqlens_kv_padded."""
+        if is_te_min_version("1.10.0"):
+            config = self.parallel_attention.config
+            sequence_length = 32
+            micro_batch_size = 1
+
+            self.parallel_attention.cuda().bfloat16()
+
+            # [sequence length, batch size, hidden size]
+            hidden_states = torch.ones(
+                (sequence_length, micro_batch_size, self.parallel_attention.config.hidden_size)
+            )
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            attention_mask = None
+
+            # Create packed seq params with both regular and padded cu_seqlens
+            packed_seq_params = make_test_packed_seq_params_with_padding(
+                sequence_length=sequence_length
+            )
+
+            # Verify that the PackedSeqParams has both regular and padded cu_seqlens
+            assert packed_seq_params.cu_seqlens_q is not None
+            assert packed_seq_params.cu_seqlens_kv is not None
+            assert packed_seq_params.cu_seqlens_q_padded is not None
+            assert packed_seq_params.cu_seqlens_kv_padded is not None
+
+            # Test the forward pass with padded cu_seqlens
+            output, bias = self.parallel_attention(
+                hidden_states, attention_mask, packed_seq_params=packed_seq_params
+            )
+
+            assert config.recompute_granularity is None
+            assert output.shape[0] == sequence_length
+            assert output.shape[1] == micro_batch_size
+            assert output.shape[2] == config.hidden_size
+            assert bias.shape[0] == config.hidden_size
+
+            # Test that the get_query_key_value_tensors function properly handles padded cu_seqlens
+            query, key, value = self.parallel_attention.get_query_key_value_tensors(
+                hidden_states, None, None, packed_seq_params, None
+            )
+
+            assert query is not None
+            assert key is not None
+            assert value is not None
+            assert query.is_contiguous()
+            assert key.is_contiguous()
+            assert value.is_contiguous()
 
     def test_checkpointed_gpu_forward(self):
         if is_te_min_version("1.10.0"):
