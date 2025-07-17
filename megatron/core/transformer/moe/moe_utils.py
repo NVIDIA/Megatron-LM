@@ -869,11 +869,11 @@ class RouterGatingLinearFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+    def forward(ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype):
         """
         Forward pass of the RouterGatingLinearFunction function.
         """
-        ctx.save_for_backward(inp, weight)
+        ctx.save_for_backward(inp, weight, bias)
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
@@ -881,10 +881,12 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         inp = inp.view(-1, inp_shape[-1])
 
         if te_general_gemm is not None and router_dtype != torch.float64:
-            output = te_general_gemm(weight, inp, router_dtype, layout="TN")
+            output = te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
             output = output[0]
-        else:
+        elif bias is None:
             output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+        else:
+            output = torch.addmm(bias, inp.to(router_dtype), weight.to(router_dtype).t())
 
         output = output.view(*inp_shape[:-1], -1)
         return output
@@ -894,7 +896,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         """
         Backward pass of the RouterGatingLinearFunction function.
         """
-        inp, weight = ctx.saved_tensors
+        inp, weight, bias = ctx.saved_tensors
         inp_shape = inp.shape
         grad_shape = grad_output.shape
         inp = inp.view(-1, inp_shape[-1])
@@ -912,18 +914,18 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
-
+        grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, None
+        return grad_input, grad_weight, grad_bias, None
 
 
-def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype):
+def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype):
     """
     Customized linear layer for router gating.
     This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.
     It can reduce the memory usage by avoiding saving the intermediate high precision tensors.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, router_dtype)
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
 
 
 # TODO(Hepteract): delete the usage of the global parallel_state.

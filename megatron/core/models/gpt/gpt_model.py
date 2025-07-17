@@ -363,7 +363,7 @@ class GPTModel(LanguageModule):
         if in_inference_mode and not has_config_logger_enabled(self.config):
             decoder_input = WrappedTensor(decoder_input)
 
-        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset, yarn_mscale
 
     def forward(
         self,
@@ -393,7 +393,7 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset, yarn_mscale = (
             self._preprocess(
                 input_ids=input_ids,
                 position_ids=position_ids,
