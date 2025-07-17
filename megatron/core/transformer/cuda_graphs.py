@@ -227,8 +227,7 @@ class _CudagraphGlobalRecord:
                     runner.create_bwd_graph(prev_bwd_hidden_state_inputgrad)
 
                     # The first input grad TransformerLayer is for 'hidden_states'
-                    if not runner.is_last_layer:
-                        prev_bwd_hidden_state_inputgrad = runner.static_grad_inputs[0]
+                    prev_bwd_hidden_state_inputgrad = runner.static_grad_inputs[0]
             else:
                 runner, graph_type = g[0:2]
                 if graph_type == 'fwd':
