@@ -75,9 +75,7 @@ class BridgeCommunicator:
         self.activation_scatter_pg = None
         self.gather_pg_list = []
         self.scatter_pg_list = []
-        activation_gather_ranks_list = self.get_boundary_pp_stage_ranks(
-            self.src_grid, is_src=True
-        )
+        activation_gather_ranks_list = self.get_boundary_pp_stage_ranks(self.src_grid, is_src=True)
         activation_scatter_ranks_list = self.get_boundary_pp_stage_ranks(
             self.dest_grid, is_src=False
         )
@@ -95,7 +93,7 @@ class BridgeCommunicator:
                 self.activation_scatter_ranks = activation_scatter_ranks
                 self.activation_scatter_pg = pg
             self.scatter_pg_list.append(pg)
-        
+
         self.src_tp_leaders, self.src_local_leader_rank = self.get_leader_rank(
             self.src_grid, is_src=True
         )
@@ -150,16 +148,16 @@ class BridgeCommunicator:
 
     def get_boundary_pp_stage_ranks(self, grid: HyperCommGrid, is_src: bool):
         """Get ranks of tp-cp corresponding to last stage of pp for the current grid for each dp dimension, ordered by the dp dimension"""
-        
+
         # Get tp-cp groups (each group has same dp and pp, different tp and cp)
         tpcp_groups = grid._gen_rank_enum(['tp', 'cp'])
         pp_size = grid.shape[grid.dim_names.index('pp')]
-        
+
         # Determine boundary pp stage
         boundary_pp_stage = pp_size - 1 if is_src else 0
-        
+
         boundary_pp_stage_ranks = []
-        
+
         for group in tpcp_groups:
             # Check if this group corresponds to the boundary pp stage
             # We can check any rank in the group since they all have the same pp coordinate
@@ -172,14 +170,14 @@ class BridgeCommunicator:
                     rank_coords.append(temp_rank % dim_size)
                     temp_rank //= dim_size
                 rank_coords.reverse()
-                
+
                 pp_coord = rank_coords[grid.dim_names.index('pp')]
-                
+
                 if pp_coord == boundary_pp_stage:
                     # This group is at the boundary pp stage, add all ranks from this group
                     # tp-cp groups are ordered by dp dimension, so we can just append the whole group
                     boundary_pp_stage_ranks.append(group)
-        
+
         return boundary_pp_stage_ranks
 
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
