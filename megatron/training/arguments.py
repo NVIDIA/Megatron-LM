@@ -20,6 +20,10 @@ from megatron.core.models.retro.utils import (
     get_gpt_data_dir as get_retro_data_dir,
 )
 from megatron.core.rerun_state_machine import RerunStateMachine
+from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    get_hybrid_total_pipeline_segment_count,
+    get_hybrid_total_layer_count
+)
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.enums import AttnBackend
@@ -528,6 +532,45 @@ def validate_args(args, defaults={}):
                 args.global_batch_size), flush=True)
     assert args.global_batch_size > 0
 
+    if args.hybrid_override_pattern is not None or args.is_hybrid_model is not None:
+        assert args.hybrid_override_pattern is not None, "--hybrid-override-pattern must be set for hybrid models"
+        assert args.is_hybrid_model is not None, "--is-hybrid-model must be set for hybrid models"
+
+        num_layers_in_pattern = get_hybrid_total_layer_count(args.hybrid_override_pattern)
+        if args.num_layers is not None:
+            assert args.num_layers == num_layers_in_pattern, \
+                '--num-layers does not match the number of layers in --hybrid-override-pattern'
+        args.num_layers = num_layers_in_pattern
+
+        assert args.decoder_first_pipeline_num_layers is None, \
+            'If --hybrid-override-pattern is specified, --decoder-first-pipeline-num-layers should ' \
+            'not be specified'
+        assert args.decoder_last_pipeline_num_layers is None, \
+            'If --hybrid-override-pattern is specified, --decoder-last-pipeline-num-layers should ' \
+            'not be specified'
+        assert (args.num_layers_per_virtual_pipeline_stage is None
+                and args.num_virtual_stages_per_pipeline_rank is None
+                and args.pipeline_model_parallel_layout is None), \
+            '--num-layers-per-virtual-pipeline-stage, --num-virtual-stages-per-pipeline-rank, and ' \
+            '--pipeline-model-parallel-layout should not be used with ' \
+            '--hybrid-override-pattern. To specify virtual pipelining, describe a number of ' \
+            'pipeline segments in --hybrid-override-pattern that is a multiple of ' \
+            '--pipeline-model-parallel-size greater than 1'
+        hybrid_pipeline_segments = get_hybrid_total_pipeline_segment_count(
+            args.hybrid_override_pattern
+        )
+        assert hybrid_pipeline_segments % args.transformer_pipeline_model_parallel_size == 0, \
+            'The number of hybrid pipeline segments described by --hybrid-override-pattern must ' \
+            'be evenly divisible by --pipeline-model-parallel-size'
+        assert hybrid_pipeline_segments >= args.transformer_pipeline_model_parallel_size, \
+            'The number of hybrid pipeline segments described by --hybrid-override-pattern must be greater than ' \
+            'or equal to --pipeline-model-parallel-size'
+        if hybrid_pipeline_segments > args.transformer_pipeline_model_parallel_size:
+            # Must be set here in order to assign virtual parallel ranks in training.py/get_model
+            args.virtual_pipeline_model_parallel_size = (
+                    hybrid_pipeline_segments // args.transformer_pipeline_model_parallel_size
+            )
+
     # Uneven virtual pipeline parallelism
     assert (
         int(args.num_layers_per_virtual_pipeline_stage is not None)
@@ -542,7 +585,9 @@ def validate_args(args, defaults={}):
         f'{args.pipeline_model_parallel_layout=}.'
     )
 
-    if args.pipeline_model_parallel_layout is not None:
+    if hasattr(args, 'virtual_pipeline_model_parallel_size'):
+        pass
+    elif args.pipeline_model_parallel_layout is not None:
         # Parse the input flattened layout to a list and get the vpp size.
         # We will validate the layout more carefully in the TransformerConfig constructor.
         num_stages = PipelineParallelLayerLayout.get_num_stages_from_str(args.pipeline_model_parallel_layout)
@@ -3340,20 +3385,9 @@ def _add_experimental_args(parser):
                        'To use local spec specify local as the argument.'
                        'For more details, see the model class, '
                        '`transformer_block.py`, or `transformer_layer.py`')
-    group.add_argument('--hybrid-attention-ratio', type=float, default=0.0,
-                       help='Ratio of attention layers to total layers, in the '
-                       'range [0.0, 1.0].')
-    group.add_argument('--hybrid-mlp-ratio', type=float, default=0.0,
-                       help='Ratio of mlp layers to total layers, in the '
-                       'range [0.0, 1.0].')
+    # TODO(duncan): change this to hybrid-layer-pattern throughout code before merging into main?
     group.add_argument('--hybrid-override-pattern', type=str, default=None,
-                       help='Force a specific hybrid layer pattern. The value'
-                            'should be a string of characters chosen from'
-                            'core.ssm.mamba_hybrid_layer_allocation.Symbols.'
-                            'If a value greater than 0.0 is supplied to any of the '
-                            'hybrid ratio arguments, then the number of each type'
-                            'of layer in the override pattern must match number in'
-                            'the overidden pattern')
+                       help='Specify a hybrid layer pattern.')
     group.add_argument('--mamba-state-dim', type=int, default=128,
                        help='State dimension for Mamba layers.')
     group.add_argument('--mamba-head-dim', type=int, default=64,

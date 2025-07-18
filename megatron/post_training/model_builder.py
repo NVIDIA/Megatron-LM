@@ -229,29 +229,21 @@ def modelopt_gpt_mamba_builder(args, pre_process, post_process, vp_stage=None, c
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model
         )
-        model_kwargs = {
-            "mamba_stack_spec": mamba_stack_spec,
-            "vocab_size": args.padded_vocab_size,
-            "max_sequence_length": args.max_position_embeddings,
-            "pre_process": pre_process,
-            "hybrid_attention_ratio": args.hybrid_attention_ratio,
-            "hybrid_mlp_ratio": args.hybrid_mlp_ratio,
-            "hybrid_override_pattern": args.hybrid_override_pattern,
-            "post_process": post_process,
-            "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
-            "parallel_output": True,
-            "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
-            "position_embedding_type": args.position_embedding_type,
-            "rotary_percent": args.rotary_percent,
-            "rotary_base": args.rotary_base,
-        }
-
-        model = MCoreMambaModel(config=config, **model_kwargs)
-
-        for l in range(model.decoder.num_layers_per_pipeline_rank):
-            layer_params = count_parameters_in_layer(model, f'decoder.layers.{l}.')
-            print_rank_0(f" == params layer {l}: {layer_params}")
-
+        model = MCoreMambaModel(
+            config=config,
+            mamba_stack_spec=mamba_stack_spec,
+            vocab_size=args.padded_vocab_size,
+            max_sequence_length=args.max_position_embeddings,
+            pre_process=pre_process,
+            hybrid_override_pattern=args.hybrid_override_pattern,
+            post_process=post_process,
+            fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+            parallel_output=True,
+            share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+            position_embedding_type=args.position_embedding_type,
+            rotary_percent=args.rotary_percent,
+            rotary_base=args.rotary_base,
+        )
     else:
         raise ValueError("ModelOpt does not support model type {}".format(args.export_model_type))
 

@@ -53,10 +53,6 @@ class MambaStack(MegatronModule):
             in fp32. Defaults to False.
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
-        hybrid_attention_ratio (float, optional): the target ratio of attention layers to
-            total layers. Defaults to 0.0.
-        hybrid_mlp_ratio (float, optional): the target ratio of mlp layers to total
-            layers. Defaults to 0.0.
         hybrid_override_pattern (str, optional): the hybrid layer pattern to override
              with. Defaults to None.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -75,20 +71,20 @@ class MambaStack(MegatronModule):
         submodules: MambaStackSubmodules,
         residual_in_fp32=False,
         pre_process: bool = True,
-        hybrid_attention_ratio: float = 0.0,
-        hybrid_mlp_ratio: float = 0.0,
         hybrid_override_pattern: str = None,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+        self.vp_stage = vp_stage
 
         assert pg_collection is not None, "pg_collection must be provided for MambaStack"
 
@@ -97,10 +93,9 @@ class MambaStack(MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
 
-        self.hybrid_attention_ratio = hybrid_attention_ratio
-        self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
 
+<<<<<<< HEAD
         self.layer_type_list = allocate_layers(
             self.config.num_layers,
             self.hybrid_attention_ratio,
@@ -116,6 +111,13 @@ class MambaStack(MegatronModule):
 
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
+=======
+        layer_type_list, pp_layer_offset = allocate_layers(self.hybrid_override_pattern, self.vp_stage)
+
+        self.layers = nn.ModuleList()
+        for i, layer_type in enumerate(layer_type_list):
+            layer_number = i + 1 + pp_layer_offset
+>>>>>>> 9ce3081ad7 (Improve pipeline parallel; add virtual pp (based on e6c1cdaf))
             fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
             with fp8_init_context:
                 if layer_type == LayerSymbols.MAMBA:
@@ -123,31 +125,51 @@ class MambaStack(MegatronModule):
                         submodules.mamba_layer,
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
+<<<<<<< HEAD
                         layer_number=i + 1 + pp_layer_offset,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+=======
+                        layer_number=layer_number,
+                        model_comm_pgs=model_comm_pgs,
+>>>>>>> 9ce3081ad7 (Improve pipeline parallel; add virtual pp (based on e6c1cdaf))
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
-                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.attention_layer,
                         config=self.config,
+<<<<<<< HEAD
                         layer_number=i + 1,
                         pg_collection=pg_collection,
+=======
+                        layer_number=layer_number,
+                        add_layer_offset=False,
+                        model_comm_pgs=model_comm_pgs,
+>>>>>>> 9ce3081ad7 (Improve pipeline parallel; add virtual pp (based on e6c1cdaf))
                     )
                 elif layer_type == LayerSymbols.MLP:
-                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.mlp_layer,
                         config=self.config,
+<<<<<<< HEAD
                         layer_number=i + 1,
                         pg_collection=pg_collection,
                     )
                 elif layer_type == LayerSymbols.MOE:
                     # Transformer layers apply their own pp_layer_offset
-                    layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1
+=======
+                        layer_number=layer_number,
+                        add_layer_offset=False,
+                        model_comm_pgs=model_comm_pgs,
                     )
+                elif layer_type == LayerSymbols.MOE:
+>>>>>>> 9ce3081ad7 (Improve pipeline parallel; add virtual pp (based on e6c1cdaf))
+                    layer = build_module(
+                        submodules.moe_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        add_layer_offset=False,
+                        model_comm_pgs=model_comm_pgs)
                 else:
                     assert False, "unexpected layer_type"
             self.layers.append(layer)
@@ -163,6 +185,7 @@ class MambaStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
+<<<<<<< HEAD
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
 
@@ -175,6 +198,23 @@ class MambaStack(MegatronModule):
         selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
 
         return offset, selected_list
+=======
+    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
+        """
+        Allocate inference cache for each layer.
+
+        Args:
+            batch_size (int): The batch size to use for inference.
+            max_seqlen (int): The maximum sequence length to use
+                for inference.
+            dtype (optional): The data type to use for allocation.
+                Defaults to the data type of the model.
+        """
+        return {
+            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
+            for i, layer in enumerate(self.layers)
+        }
+>>>>>>> 9ce3081ad7 (Improve pipeline parallel; add virtual pp (based on e6c1cdaf))
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.

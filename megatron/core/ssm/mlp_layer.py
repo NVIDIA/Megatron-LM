@@ -18,6 +18,7 @@ class MLPLayer(TransformerLayer):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
+        add_layer_offset: bool = True,
         hidden_dropout: float = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
     ):
@@ -25,6 +26,7 @@ class MLPLayer(TransformerLayer):
             config=config,
             submodules=submodules,
             layer_number=layer_number,
+            add_layer_offset=add_layer_offset,
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
         )

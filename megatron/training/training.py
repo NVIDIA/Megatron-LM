@@ -159,18 +159,14 @@ def print_datetime(string):
 def num_floating_point_operations(args, batch_size):
     def calculate_layer_counts():
         """Calculate the number of attention, Mamba, and MLP layers."""
+        assert args.hybrid_override_pattern is not None, \
+            "--hybrid-override-pattern must be set to calculate hybrid FLOPs"
         if args.hybrid_override_pattern:
-            counts = {'M': 0, '*': 0, '-': 0, 'E':0}
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
             for layer_type in args.hybrid_override_pattern:
                 if layer_type in counts:
                     counts[layer_type] += 1
             return counts['*'], counts['M'], counts['-'], counts['E']
-        else:
-            num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
-            num_mlp_layers = round(args.num_layers * args.hybrid_mlp_ratio)
-            num_mamba_layers = args.num_layers - num_attn_layers - num_mlp_layers
-            num_moe_layers = 0
-            return num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers
 
     def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
