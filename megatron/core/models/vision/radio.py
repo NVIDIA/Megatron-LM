@@ -9,6 +9,7 @@ from torch import nn
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -63,6 +64,8 @@ class RADIOViTModel(VisionModule):
         pos_dropout: int = 0,
         has_cpe: bool = True,
         embedder_bias: bool = False,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=transformer_config)
 
@@ -134,6 +137,8 @@ class RADIOViTModel(VisionModule):
 
         self.ln_pre = None
         self.ln_post = None
+        self.model_comm_pgs = model_comm_pgs
+        self.vp_stage = vp_stage
         if ln_pre_impl is not None:
             self.ln_pre = build_module(
                 ln_pre_impl,
@@ -154,6 +159,8 @@ class RADIOViTModel(VisionModule):
             spec=transformer_layer_spec,
             pre_process=True,
             post_process=False,
+            model_comm_pgs=self.model_comm_pgs,
+            vp_stage=self.vp_stage,
         )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:

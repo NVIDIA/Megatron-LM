@@ -17,6 +17,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
@@ -70,6 +71,7 @@ class GPTModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
+        model_comm_pgs (ModelCommProcessGroups): Model communication process groups
     """
 
     def __init__(
@@ -93,9 +95,10 @@ class GPTModel(LanguageModule):
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         mtp_block_spec: Optional[ModuleSpec] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -138,6 +141,7 @@ class GPTModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
@@ -150,6 +154,7 @@ class GPTModel(LanguageModule):
                 rope_scaling=rope_scaling,
                 rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.model_comm_pgs.cp,
             )
 
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
@@ -174,6 +179,7 @@ class GPTModel(LanguageModule):
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            model_comm_pgs=self.model_comm_pgs,
             vp_stage=vp_stage,
         )
 
@@ -212,6 +218,7 @@ class GPTModel(LanguageModule):
                 and self.share_embeddings_and_output_weights,
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.pre_process or self.post_process:

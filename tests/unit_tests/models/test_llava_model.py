@@ -539,7 +539,7 @@ def create_test_args(cp_size, sequence_parallel):
 
 class TestLLaVAModelTokenParallel:
 
-    def _init_llava_model(self, cp_size, tp_size, sequence_parallel, cp_group=None):
+    def _init_llava_model(self, cp_size, tp_size, sequence_parallel):
         language_hidden_size = 64
         language_num_attention_heads = 16
 
@@ -608,7 +608,6 @@ class TestLLaVAModelTokenParallel:
             img_h=336,
             img_w=336,
             patch_dim=14,
-            cp_group=cp_group,
         )
 
         return model
@@ -713,9 +712,7 @@ class TestLLaVAModelTokenParallel:
         )
         model = None
         with ctx:
-            model = self._init_llava_model(
-                cp_size, tp_size, sequence_parallel, cp_group=ps.get_context_parallel_group()
-            )
+            model = self._init_llava_model(cp_size, tp_size, sequence_parallel)
 
         if model is None:
             return

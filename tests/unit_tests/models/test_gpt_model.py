@@ -2,16 +2,21 @@
 
 import inspect
 import os
+from datetime import timedelta
 
 import pytest
 import torch
+from packaging import version
 from pytest import approx
 
+from megatron.core import parallel_state
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -188,3 +193,82 @@ class TestGPTWithFusedOps:
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length
         assert logits.shape[2] == self.gpt_model.vocab_size
+
+
+class TestGPTModelWithCustomPG:
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Device mesh feature requires PyTorch 2.3 or later",
+    )
+    @pytest.mark.parametrize(
+        "tp_size, dp_size, cp_size", [(1, 8, 1), (2, 4, 1)]  # TP 1, DP 8, CP 1  # TP 2, DP 4, CP 1
+    )
+    def test_gpt_model_with_custom_pg(self, tp_size, dp_size, cp_size):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        # Create HyperCommGrid with dimensions tp, cp, ep, pp, dp (reversed from device mesh order)
+        grid = HyperCommGrid([tp_size, cp_size, 1, 1, dp_size], ["tp", "cp", "ep", "pp", "dp"])
+
+        tp_group = grid.create_pg("tp")
+        cp_group = grid.create_pg("cp")
+        pp_group = grid.create_pg("pp")
+        ep_group = grid.create_pg("ep")
+        embd_group_ranks = parallel_state.default_embedding_ranks(
+            torch.distributed.get_process_group_ranks(pp_group)
+        )
+        embd_group = torch.distributed.new_group(
+            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
+        )
+        model_comm_pgs = ModelCommProcessGroups(
+            tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group, embd=embd_group
+        )
+
+        transformer_config = TransformerConfig(
+            num_layers=2, hidden_size=1024, num_attention_heads=16, use_cpu_initialization=True
+        )
+        self.gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=512,
+            model_comm_pgs=model_comm_pgs,
+            post_process=False,
+        )
+
+        # Check that model weights are distributed as expected when using TP
+        assert (
+            self.gpt_model.decoder.layers[0].self_attention.linear_qkv.weight.shape[0]
+            == (1024 * 3) / tp_size
+        )
+        assert self.gpt_model.decoder.layers[0].self_attention.linear_qkv.weight.shape[1] == 1024
+        assert self.gpt_model.decoder.layers[0].self_attention.linear_proj.weight.shape[0] == 1024
+        assert (
+            self.gpt_model.decoder.layers[0].self_attention.linear_proj.weight.shape[1]
+            == 1024 / tp_size
+        )
+
+        # Check that the logits output shape is correct
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+
+        self.gpt_model.cuda()
+
+        input_ids = torch.ones(micro_batch_size, sequence_length, dtype=torch.int64, device="cuda")
+        position_ids = torch.ones(
+            micro_batch_size, sequence_length, dtype=torch.int64, device="cuda"
+        )
+
+        logits = self.gpt_model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=None
+        )
+
+        assert logits.shape[0] == sequence_length
+        assert logits.shape[1] == micro_batch_size
+        assert logits.shape[2] == self.gpt_model.config.hidden_size
