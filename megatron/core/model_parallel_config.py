@@ -52,6 +52,19 @@ class ModelParallelConfig:
        type.
     """
 
+    #TODO: Should we calculate this using total seq length / cp size automatically?
+    max_seqlen_per_cp_rank: Optional[int] = None
+    """
+    Maximum sequence length per CP rank. This is used to calculate the number of sub-samples 
+    assigned to each CP rank when using heterogeneous context parallel.
+    """
+
+    heterogeneous_context_parallel: bool = False
+    """
+    If true, enables heterogeneous context parallel. This is used to balance the workload of 
+    each CP rank when we use packed samples with variable sequence lengths.
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
