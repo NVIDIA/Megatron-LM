@@ -269,6 +269,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         config: TransformerConfig,
         submodules: TransformerLayerSubmodules,
         layer_number: int = 1,
+        add_layer_offset: bool = True,
         hidden_dropout: Optional[float] = None,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
         vp_stage: Optional[int] = None,
@@ -306,7 +307,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
 
         self.submodules_config = submodules
-        self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage)
+        self.layer_number = layer_number + (get_transformer_layer_offset(self.config, vp_stage)
+                                            if add_layer_offset else 0)
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data

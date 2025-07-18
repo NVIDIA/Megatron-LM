@@ -56,10 +56,6 @@ class MambaStack(MegatronModule):
             in fp32. Defaults to False.
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
-        hybrid_attention_ratio (float, optional): the target ratio of attention layers to
-            total layers. Defaults to 0.0.
-        hybrid_mlp_ratio (float, optional): the target ratio of mlp layers to total
-            layers. Defaults to 0.0.
         hybrid_override_pattern (str, optional): the hybrid layer pattern to override
              with. Defaults to None.
         post_layer_norm (bool, optional): whether to include a final layer norm.
@@ -78,20 +74,20 @@ class MambaStack(MegatronModule):
         submodules: MambaStackSubmodules,
         residual_in_fp32=False,
         pre_process: bool = True,
-        hybrid_attention_ratio: float = 0.0,
-        hybrid_mlp_ratio: float = 0.0,
         hybrid_override_pattern: str = None,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
         dtype=None,
         model_comm_pgs: ModelCommProcessGroups = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=config)
         self.residual_in_fp32 = residual_in_fp32
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
+        self.vp_stage = vp_stage
 
         assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaStack"
 
@@ -100,25 +96,13 @@ class MambaStack(MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
 
-        self.hybrid_attention_ratio = hybrid_attention_ratio
-        self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
 
-        layer_type_list = allocate_layers(
-            self.config.num_layers,
-            self.hybrid_attention_ratio,
-            self.hybrid_mlp_ratio,
-            self.hybrid_override_pattern,
-        )
-
-        pp_layer_offset = 0
-        if self.pp_group.size() > 1:
-            pp_layer_offset, layer_type_list = self._select_layers_for_pipeline_parallel(
-                layer_type_list
-            )
+        layer_type_list, pp_layer_offset = allocate_layers(self.hybrid_override_pattern, self.vp_stage)
 
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(layer_type_list):
+            layer_number = i + 1 + pp_layer_offset
             fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
             with fp8_init_context:
                 if layer_type == LayerSymbols.MAMBA:
@@ -126,31 +110,32 @@ class MambaStack(MegatronModule):
                         submodules.mamba_layer,
                         config=self.config,
                         residual_in_fp32=residual_in_fp32,
-                        layer_number=i + 1 + pp_layer_offset,
+                        layer_number=layer_number,
                         model_comm_pgs=model_comm_pgs,
                     )
                 elif layer_type == LayerSymbols.ATTENTION:
-                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.attention_layer,
                         config=self.config,
-                        layer_number=i + 1,
+                        layer_number=layer_number,
+                        add_layer_offset=False,
                         model_comm_pgs=model_comm_pgs,
                     )
                 elif layer_type == LayerSymbols.MLP:
-                    # Transformer layers apply their own pp_layer_offset
                     layer = build_module(
                         submodules.mlp_layer,
                         config=self.config,
-                        layer_number=i + 1,
+                        layer_number=layer_number,
+                        add_layer_offset=False,
                         model_comm_pgs=model_comm_pgs,
                     )
                 elif layer_type == LayerSymbols.MOE:
-                    # Transformer layers apply their own pp_layer_offset
-                    # TODO: Pass in model_comm_pgs here?
                     layer = build_module(
-                        submodules.moe_layer, config=self.config, layer_number=i + 1
-                    )
+                        submodules.moe_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        add_layer_offset=False,
+                        model_comm_pgs=model_comm_pgs)
                 else:
                     assert False, "unexpected layer_type"
             self.layers.append(layer)
@@ -165,19 +150,6 @@ class MambaStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-
-    def _select_layers_for_pipeline_parallel(self, layer_type_list):
-        num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
-
-        assert self.config.virtual_pipeline_model_parallel_size is None, (
-            "The Mamba hybrid model does not currently support "
-            "virtual/interleaved pipeline parallelism"
-        )
-
-        offset = self.pp_group.rank() * num_layers_per_pipeline_rank
-        selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
-
-        return offset, selected_list
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """

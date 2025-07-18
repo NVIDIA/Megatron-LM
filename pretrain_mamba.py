@@ -43,7 +43,7 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
-def model_provider(pre_process=True, post_process=True) -> MambaModel:
+def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None) -> MambaModel:
     """Builds the model.
 
     Args:
@@ -72,8 +72,6 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
-        hybrid_attention_ratio=args.hybrid_attention_ratio,
-        hybrid_mlp_ratio=args.hybrid_mlp_ratio,
         hybrid_override_pattern=args.hybrid_override_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
@@ -81,7 +79,8 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
-        rotary_base=args.rotary_base
+        rotary_base=args.rotary_base,
+        vp_stage=vp_stage
     )
 
     for l in range(model.decoder.num_layers_per_pipeline_rank):

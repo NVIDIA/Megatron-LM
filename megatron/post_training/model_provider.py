@@ -188,8 +188,6 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
-            hybrid_attention_ratio=args.hybrid_attention_ratio,
-            hybrid_mlp_ratio=args.hybrid_mlp_ratio,
             hybrid_override_pattern=args.hybrid_override_pattern,
             post_process=post_process,
             fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,

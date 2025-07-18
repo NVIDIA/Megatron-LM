@@ -29,9 +29,6 @@ class MambaModel(LanguageModule):
             This is used for positional embedding
         pre_process (bool, optional): Include embedding layer
             (used with pipeline parallelism). Defaults to True.
-        hybrid_attention_ratio (float, optional): The target ratio of attention
-            layers to total layers
-        hybrid_mlp_ratio (float, optional): The target ratio of mlp layers to total layers
         hybrid_override_pattern (str, optional): The hybrid layer pattern to override with
         post_process (bool, optional): Include an output layer (used with pipeline parallelism).
             Defaults to True.
@@ -59,8 +56,6 @@ class MambaModel(LanguageModule):
         vocab_size: int,
         max_sequence_length: int,
         pre_process: bool = True,
-        hybrid_attention_ratio: float = 0.0,
-        hybrid_mlp_ratio: float = 0.0,
         hybrid_override_pattern: str = None,
         post_process: bool = True,
         fp16_lm_cross_entropy: bool = False,
@@ -73,6 +68,7 @@ class MambaModel(LanguageModule):
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
         super().__init__(config=config)
 
@@ -83,14 +79,13 @@ class MambaModel(LanguageModule):
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
         self.pre_process = pre_process
-        self.hybrid_attention_ratio = hybrid_attention_ratio
-        self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
+        self.vp_stage = vp_stage
 
         if model_comm_pgs is None:
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
@@ -125,12 +120,11 @@ class MambaModel(LanguageModule):
             mamba_stack_spec,
             self.config,
             pre_process=self.pre_process,
-            hybrid_attention_ratio=self.hybrid_attention_ratio,
-            hybrid_mlp_ratio=self.hybrid_mlp_ratio,
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
             model_comm_pgs=model_comm_pgs,
+            vp_stage=self.vp_stage
         )
 
         # Output
