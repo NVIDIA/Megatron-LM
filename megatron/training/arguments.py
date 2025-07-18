@@ -2851,7 +2851,7 @@ def _add_mla_args(parser):
                        help="Rotary scaling factor for the rotary embeddings.")
     group.add_argument('--mscale', type=float, default=1.0,
                        help="Mscale for YaRN RoPE in multi-latent attention.")
-    group.add_argument('--mscale-all-dim', type=float, default=1.0,
+    group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
 
     return parser
