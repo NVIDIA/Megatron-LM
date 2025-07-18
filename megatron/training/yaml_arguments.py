@@ -451,7 +451,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
     with open(yaml_path, "r") as f:
-        config = yaml.load(f,Loader=yaml.FullLoader)
+        config = yaml.safe_load(f)
         # Convert to nested namespace
         config_namespace = json.loads(json.dumps(config), object_hook=lambda item: SimpleNamespace(**item))
         # Add config location to namespace

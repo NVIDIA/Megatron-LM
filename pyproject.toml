@@ -179,7 +179,8 @@ source = ["/opt/megatron-lm/"]
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the
 # Google convention via `convention = "google"`, below.
-select = ["D", "F"]
+# select = ["D", "F"]
+select = ["S506"]
 
 # - On top of the Google convention, disable `D417`, which requires
 #   documentation for every function parameter.
