@@ -1,12 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import json
 import random
 import time
 import torch
 from argparse import ArgumentParser, Namespace
-from typing import Any, List, Optional
+from typing import Any
 import json
-
+import itertools
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext
 
@@ -81,6 +82,13 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         'fields within each item are ignored, and may be customized for each '
         'application.',
     )
+    group.add_argument(
+        "--random-sample-prompts",
+        action="store_true",
+        default=False,
+        help="Randomly sample prompts from the prompt file based on simulated request arrivals times "
+        "rather than inferring using all of them.",
+    )
 
     return parser
 
@@ -128,15 +136,14 @@ class Request:
         )
 
 def get_time_offsets(
-    seed: Optional[int],
+    seed: int | None,
     incoming_requests_per_sec: float,
     incoming_requests_duration: float,
-) -> List[Request]:
+) -> list[float]:
     """Get example time offsets."""
-
-    import simpy  # Guard against this import in test case
-
     random.seed(seed)
+    
+    import simpy  # Guard against this import in test case
 
     # Generate random time offsets.
     def arrival(r):
@@ -148,7 +155,7 @@ def get_time_offsets(
     env = simpy.Environment()
     env.process(arrival(incoming_requests_per_sec))
     env.run(incoming_requests_duration)
-
+    
     # Ensure at least a single request.
     if len(time_offsets) == 0:
         time_offsets = [0.0]
@@ -156,12 +163,23 @@ def get_time_offsets(
     return time_offsets
 
 
-def get_user_requests(args: Namespace, tokenizer: Any) -> List[Request]:
-    requests = [Request(p, -1.0, tokenizer) for p in args.prompts]
+def get_user_requests(args: Namespace, tokenizer: Any) -> list[Request]:
+    if args.random_sample_prompts:
+        # Maybe exclude some prompts after the first as well as including random time offsets
+        #  following a Poisson process.
+        time_offsets: list[float] = get_time_offsets(
+            args.seed,
+            args.incoming_requests_per_sec,
+            args.incoming_requests_duration,
+        )
+    else:
+        # One request per prompt with a -1 time offset default for each.
+        time_offsets = itertools.repeat(-1)
+    requests = [Request(p, t, tokenizer) for p,t in zip(args.prompts, time_offsets)]
     return requests
 
 
-def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
+def get_auto_requests(args: Namespace, tokenizer: Any) -> list[Request]:
     """Get example requests."""
 
     time_offsets = get_time_offsets(
@@ -177,18 +195,22 @@ def get_auto_requests(args: Namespace, tokenizer: Any) -> List[Request]:
 
     return requests
 
-def get_requests_from_file(args: Namespace, tokenizer: Any) -> List[Request]:
+def get_requests_from_file(args: Namespace, tokenizer: Any) -> list[Request]:
     """Get requests from a file."""
     if not args.prompt_file:
         raise ValueError("Prompt file is required to read requests from a file.")
 
     requests = []
-    time_offsets = get_time_offsets(
-        args.seed,
-        args.incoming_requests_per_sec,
-        args.incoming_requests_duration,
-    )
-    
+    if args.random_sample_prompts:
+        time_offsets: list[float] = get_time_offsets(
+            args.seed,
+            args.incoming_requests_per_sec,
+            args.incoming_requests_duration,
+        )
+    else:
+        # match the behavior of providing a list of --prompts, use -1 for each prompt
+        time_offsets = itertools.repeat(-1)
+
     with open(args.prompt_file, 'r') as f:
         for i, (line, time_offset) in enumerate(zip(f, time_offsets)):
             item = json.loads(line.strip())
@@ -198,8 +220,11 @@ def get_requests_from_file(args: Namespace, tokenizer: Any) -> List[Request]:
     return requests
 
 
-def build_requests(args: Namespace, tokenizer: Any) -> List[Request]:
+def build_requests(args: Namespace, tokenizer: Any) -> list[Request]:
+    # Check if we have any prompts (from command line or JSONL)
     if args.prompts:
+        if args.prompt_file:
+            raise ValueError("Cannot use both --prompts and --prompt-file")
         return get_user_requests(args, tokenizer)
     elif args.prompt_file:
         return get_requests_from_file(args, tokenizer)
@@ -208,7 +233,7 @@ def build_requests(args: Namespace, tokenizer: Any) -> List[Request]:
 
 
 def build_dynamic_engine_setup_prefix(
-    args: Namespace, context: DynamicInferenceContext, requests: List[DynamicInferenceRequest]
+    args: Namespace, context: DynamicInferenceContext, requests: list[DynamicInferenceRequest]
 ):
     """
     Returns a compact, pipe-separated summary of the dynamic-batching setup.
