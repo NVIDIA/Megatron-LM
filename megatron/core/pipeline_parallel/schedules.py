@@ -19,6 +19,7 @@ from megatron.core.utils import (
     get_model_config,
     get_model_type,
     get_model_xattn,
+    heterogeneous_context_parallel,
     nvtx_range_pop,
     nvtx_range_push,
 )
@@ -446,54 +447,6 @@ def check_first_val_step(first_val_step, forward_only, cond):
     else:
         return cond
 
-def get_current_cp_assignment(complete_cp_assignment, microbatch_id, rank):
-    '''
-    complete_cp_assignment is a list of lists, 
-    Each inner list contains the cp_assignment (assigned GPU ranks) for a sub-sample
-    This function returns the ith sub-sample assigned to a GPU, None otherwise
-    For example, complete_cp_assignment = [[0, 1, 2, 3], [4, 5], [4, 5], [6, 7], [6, 7]]
-    For microbatch_id = 0; rank = 4; current_cp_assignment is [None, [4, 5], None, None, None]
-    This informs rank 4 that it should pick-up the 2nd sub-sample and share with rank 5
-    For microbatch_id = 1; rank = 4; current_cp_assignment is [None, None, [4, 5], None, None]
-    This informs rank 4 that it should pick-up the 3rd sub-sample and share with rank 5
-    '''
-    current_cp_assignment = [None] * len(complete_cp_assignment)
-    matched_sample = -1
-    index = None
-    for i, assigned_ranks in enumerate(complete_cp_assignment):
-        if rank in assigned_ranks:
-            matched_sample += 1
-            if matched_sample == microbatch_id:
-                current_cp_assignment[i] = assigned_ranks
-                break
-    return current_cp_assignment
-
-def heterogeneous_context_parallel(single_forward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type):
-    def forward_func_wrapper(*args, **kwargs):
-        rank = torch.distributed.get_rank() # TODO: Get the correct rank based on process groups
-        original_data_iterator = args.data_iterator
-        data = next(original_data_iterator) # TODO: Protect for model parallelism
-        # calculate new loop count
-        assert hasattr(data, "cu_seqlens"), "data must have a cu_seqlens attribute"
-        # TODO: N, complete_cp_assignment = get_heterogeneous_cp_assignment(data["cu_seqlens"], args.config.max_seqlen_per_cp_rank, args.config.context_parallel_size)
-        N=4
-        current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0)
-        data["cp_assignment"] = current_cp_assignment
-        args.data_iterator = RerunDataIterator(iter([data]))
-        # Run the 1st micro-microbatch
-        output_tensor, num_tokens = single_forward_step(*args, **kwargs)
-        total_num_tokens += num_tokens
-        # Run the N-1 backward steps, N-1 forward steps.
-        # We will be left with Nth backward step after this loop which is run in the original function.
-        for i in range(1, N):
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, args.config)
-            
-            current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i)
-            data["cp_assignment"] = current_cp_assignment
-            args.data_iterator = RerunDataIterator(iter([data]))
-            output_tensor, num_tokens = single_forward_step(*args, **kwargs)
-            total_num_tokens += num_tokens
-        return output_tensor, total_num_tokens
 
 def forward_backward_no_pipelining(
     *,
@@ -544,7 +497,9 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
     if config.heterogeneous_context_parallel:
-        forward_step = heterogeneous_context_parallel(forward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type)
+        forward_step = heterogeneous_context_parallel(
+            forward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type
+        )
 
     with no_sync_func():
         for i in range(num_microbatches - 1):
@@ -565,8 +520,9 @@ def forward_backward_no_pipelining(
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     # TODO: Does the last complete microbatch should run with sync?
-    # What will this do when we have multiple micro-microbatches within a forward and we ideally want only sync at end?
-    
+    # What will this do when we have multiple micro-microbatches within a
+    # forward and we ideally want only sync at end?
+
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
     output_tensor, num_tokens = forward_step(
