@@ -5,7 +5,7 @@ from typing import List, Literal, Optional, Tuple
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.enums import ModelType
@@ -177,7 +177,7 @@ class T5Model(LanguageModule):
             )
         self.tp_group = get_tensor_model_parallel_group_if_none(model_comm_pgs.tp)
 
-        self.model_type = ModelType.encoder_and_decoder
+        self.model_type = ModelType.encoder_or_decoder
 
         # Tells schedules.py that this model has a skip connection
         # between the encoder's output and the decoder
@@ -494,11 +494,6 @@ class T5Model(LanguageModule):
             ShardedStateDict: sharded state dict for the T5Model
         """
         sharded_sd = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        if not parallel_state.is_inside_encoder():
-            for k, sh_ten in sharded_sd.items():
-                if not k.startswith(f'{prefix}decoder'):
-                    # Bump replica_id of all the layers shared with the encoder (output, embedding)
-                    sh_ten.replica_id = (sh_ten.replica_id[0] + 1, *sh_ten.replica_id[1:])
         return sharded_sd
 
 

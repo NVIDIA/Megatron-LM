@@ -1274,21 +1274,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         ckpt_tp_pp = (
             state_dict['args'].tensor_model_parallel_size,
             state_dict['args'].pipeline_model_parallel_size,
-            getattr(state_dict['args'], 'encoder_tensor_model_parallel_size', 0),
-            getattr(state_dict['args'], 'encoder_pipeline_model_parallel_size', 0),
         )
         run_tp_pp = (
             args.tensor_model_parallel_size,
             args.pipeline_model_parallel_size,
-            # TODO: change this to args.encoder_tensor_model_parallel_size after 30th Nov 24
-            getattr(args, 'encoder_tensor_model_parallel_size', 0),
-            getattr(args, 'encoder_pipeline_model_parallel_size', 0),
         )
+
         ckpt_world_size = getattr(state_dict['args'], 'world_size', 0)
         run_world_size = getattr(args, 'world_size', 0)
         ckpt_dp = getattr(state_dict['args'], 'data_parallel_size', 0)
         run_dp = getattr(args, 'data_parallel_size', 0)
-        mismatch_msg = "(TP, PP, encoder TP, encoder PP) mismatch after resume ({} vs {} from checkpoint)".format(
+        mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(
             run_tp_pp, ckpt_tp_pp
         )
 
