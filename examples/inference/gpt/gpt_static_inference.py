@@ -35,7 +35,7 @@ import json
 from megatron.training.initialize import initialize_megatron
 from megatron.training import get_model
 import asyncio
-from typing import AsyncIterator, List
+from typing import AsyncIterator, List, Any
 
 from examples.inference.gpt.utils import add_common_inference_args, build_requests
 
