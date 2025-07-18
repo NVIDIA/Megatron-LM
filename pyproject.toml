@@ -2,6 +2,7 @@
 
 [build-system]
 requires = ["setuptools<80.0.0", "pybind11"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
