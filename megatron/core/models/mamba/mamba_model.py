@@ -74,7 +74,7 @@ class MambaModel(LanguageModule):
         seq_len_interpolation_factor: Optional[float] = None,
         model_comm_pgs: Optional[ModelCommProcessGroups] = None,
     ) -> None:
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -92,11 +92,6 @@ class MambaModel(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
 
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(
-                required_pgs=['tp', 'pp', 'cp', 'tp_cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
-            )
-
         # megatron core pipelining currently depends on model type
         # TODO: remove this dependency ?
         self.model_type = ModelType.encoder_or_decoder
@@ -108,7 +103,7 @@ class MambaModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
-                tp_group=model_comm_pgs.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.position_embedding_type == 'rope':
@@ -118,7 +113,7 @@ class MambaModel(LanguageModule):
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
                 use_cpu_initialization=self.config.use_cpu_initialization,
-                cp_group=model_comm_pgs.cp,
+                cp_group=self.model_comm_pgs.cp,
             )
 
         self.decoder = build_module(
@@ -130,7 +125,7 @@ class MambaModel(LanguageModule):
             hybrid_override_pattern=self.hybrid_override_pattern,
             post_process=self.post_process,
             dtype=config.params_dtype,
-            model_comm_pgs=model_comm_pgs,
+            model_comm_pgs=self.model_comm_pgs,
         )
 
         # Output
@@ -145,7 +140,7 @@ class MambaModel(LanguageModule):
                 gather_output=not self.parallel_output,
                 skip_weight_param_allocation=self.pre_process
                 and self.share_embeddings_and_output_weights,
-                tp_group=model_comm_pgs.tp,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.pre_process or self.post_process:
