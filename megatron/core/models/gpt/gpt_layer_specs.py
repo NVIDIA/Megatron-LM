@@ -34,6 +34,8 @@ from megatron.core.transformer.transformer_layer import (
 )
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import TEFusedMLP, TENorm
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
@@ -42,6 +44,8 @@ except ImportError:
     HAVE_TE = False
 
 try:
+    import nvidia_kitchen  # pylint: disable=unused-import
+
     from megatron.core.extensions.kitchen import KitchenSpecProvider
 
     HAVE_KITCHEN = True

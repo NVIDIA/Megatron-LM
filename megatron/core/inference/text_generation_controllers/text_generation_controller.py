@@ -28,6 +28,8 @@ from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.utils import get_model_config
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
     HAVE_TE = True

@@ -29,6 +29,8 @@ from megatron.core.transformer.transformer_layer import (
 from megatron.core.utils import is_te_min_version
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,

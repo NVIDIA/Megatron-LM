@@ -40,6 +40,8 @@ except ImportError:
     HAVE_APEX = False
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,

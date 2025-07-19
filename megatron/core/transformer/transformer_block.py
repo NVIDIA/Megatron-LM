@@ -28,27 +28,38 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 try:
+    import transformer_engine.pytorch as te  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    import apex  # pylint: disable=unused-import
+
+    HAVE_APEX = True
+except ImportError:
+    HAVE_APEX = False
+
+get_cpu_offload_context = None
+te_checkpoint = None
+
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TENorm,
         get_cpu_offload_context,
         te_checkpoint,
     )
 
-    HAVE_TE = True
     LayerNormImpl = TENorm
-except ImportError:
-    HAVE_TE = False
-    get_cpu_offload_context = None
 
-    try:
-        import apex  # pylint: disable=unused-import
+elif HAVE_APEX:
+    LayerNormImpl = FusedLayerNorm
 
-        LayerNormImpl = FusedLayerNorm
+else:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    except ImportError:
-        from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
-        LayerNormImpl = WrappedTorchNorm
+    LayerNormImpl = WrappedTorchNorm
 
 
 def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:

@@ -16,6 +16,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 
     HAVE_TE = True
@@ -67,6 +69,7 @@ if HAVE_TE:
             )
 
         def forward(self, x, **kwargs):
+            """Forward of TELayerNormColumnParallelLinearGathered"""
             out, bias = super().forward(x)
             assert bias is None, "bias should be None since we set skip_bias_add=False"
 
@@ -100,6 +103,7 @@ class ColumnParallelLinearGathered(ColumnParallelLinear):
         runtime_gather_output: bool | None = None,
         **kwargs,
     ):
+        """Forward of ColumnParallelLinearGathered"""
         out, bias = super().forward(input_, weight, runtime_gather_output)
         assert bias is None, "bias should be None since we set skip_bias_add=False"
 
