@@ -23,6 +23,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
     from transformer_engine.pytorch.graph import restore_fp8_tensors, save_fp8_tensors
     from transformer_engine.pytorch.graph import set_capture_end as te_set_capture_end

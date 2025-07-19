@@ -32,6 +32,8 @@ SUPPORTED_ATTN_MASK = [
 ]
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 
     HAVE_TE = True
