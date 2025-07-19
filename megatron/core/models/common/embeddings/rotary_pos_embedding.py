@@ -190,7 +190,7 @@ class RotaryEmbedding(nn.Module):
         transformer: TransformerBlock,
         transformer_input: Tensor,
         transformer_config: TransformerConfig,
-        packed_seq_params: PackedSeqParams,
+        packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> float:
