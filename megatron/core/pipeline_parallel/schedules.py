@@ -496,14 +496,18 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-    if config.heterogeneous_context_parallel:
-        forward_step = heterogeneous_context_parallel(
-            forward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type
-        )
+    # Create a wrapper function that handles heterogeneous context parallel if needed
+    def forward_step_wrapper(*args, **kwargs):
+        if config.heterogeneous_context_parallel:
+            return heterogeneous_context_parallel(
+                forward_step, backward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type
+            )(*args, **kwargs)
+        else:
+            return forward_step(*args, **kwargs)
 
     with no_sync_func():
         for i in range(num_microbatches - 1):
-            output_tensor, num_tokens = forward_step(
+            output_tensor, num_tokens = forward_step_wrapper(
                 forward_step_func,
                 data_iterator,
                 model,

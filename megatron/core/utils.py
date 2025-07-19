@@ -1895,13 +1895,14 @@ def get_heterogeneous_cp_assignment(
       start_time[j]: the time job j begins
       assignment[j]: list of resource IDs assigned to job j
     """
+    sub_sample_lens = cu_seqlens[0][1:] - cu_seqlens[0][:-1]
     cp_rank = torch.distributed.get_rank()  # Get rank from CP group
-    cp_size_per_sample = [math.ceil(x / max_seqlen_per_cp_rank) for x in cu_seqlens]
+    cp_size_per_sample = [math.ceil(x / max_seqlen_per_cp_rank) for x in sub_sample_lens]
     total_workload_per_cp_rank = [
-        compute_estimator(x, cp) for x, cp in zip(cu_seqlens, cp_size_per_sample)
+        compute_estimator(x, cp) for x, cp in zip(sub_sample_lens, cp_size_per_sample)
     ]
     # Sort workloads in descending order
-    num_sub_samples = len(cu_seqlens)
+    num_sub_samples = len(sub_sample_lens)
     jobs = sorted(range(num_sub_samples), key=lambda j: total_workload_per_cp_rank[j], reverse=True)
 
     # a min-heap of free resource IDs (CP rank IDs)
@@ -1973,7 +1974,7 @@ def get_current_cp_assignment(complete_cp_assignment, microbatch_id, rank):
 
 
 def heterogeneous_context_parallel(
-    single_forward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type
+    single_forward_step, backward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type
 ):
     """
     Heterogeneous context parallel is a technique to balance the workload
@@ -1984,9 +1985,14 @@ def heterogeneous_context_parallel(
     """
 
     def forward_func_wrapper(*args, **kwargs):
+        nonlocal total_num_tokens
         rank = parallel_state.get_context_parallel_rank()
-        original_data_iterator = args.data_iterator
+        forward_signature = inspect.signature(single_forward_step)
+        bound_args = forward_signature.bind(*args, **kwargs)
+        bound_args.apply_defaults()
+        original_data_iterator = bound_args.arguments['data_iterator']
         data = next(original_data_iterator)  # TODO: Protect for model parallelism
+        config = bound_args.arguments['config']
         # calculate new loop count
         assert hasattr(data, "cu_seqlens"), (
             "data must have a cu_seqlens attribute to define the valid sequenece lengths "
@@ -1996,29 +2002,30 @@ def heterogeneous_context_parallel(
         # complete_cp_assignment: list of lists, inner list CP ranks assigned to a sub-sample
         num_subsamples, complete_cp_assignment = get_heterogeneous_cp_assignment(
             data["cu_seqlens"],
-            args.config.max_seqlen_per_cp_rank,
-            args.config.context_parallel_size,
+            config.max_seqlen_per_cp_rank,
+            config.context_parallel_size,
         )
         # current_cp_assignment: list of lists, each inner list contains the
         # CP ranks assigned to the sub-samples that are executing in the forward-backward loop.
         # See function get_current_cp_assignment for more details.
         current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0, rank)
         data["cp_assignment"] = current_cp_assignment
-        args.data_iterator = RerunDataIterator(iter([data]))
+        bound_args.arguments['data_iterator'] = RerunDataIterator(iter([data]))
         # Run the 1st micro-microbatch
-        output_tensor, num_tokens = single_forward_step(*args, **kwargs)
+        output_tensor, num_tokens = single_forward_step(*bound_args.args, **bound_args.kwargs)
         total_num_tokens += num_tokens
         # Run the N-1 backward steps, N-1 forward steps.
         # Will be left with Nth backward step after this loop which is run in the original function.
         for i in range(1, num_subsamples):
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, args.config)
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
-            current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i)
+            current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i, rank)
             data["cp_assignment"] = current_cp_assignment
-            args.data_iterator = RerunDataIterator(iter([data]))
-            output_tensor, num_tokens = single_forward_step(*args, **kwargs)
+            bound_args.arguments['data_iterator'] = RerunDataIterator(iter([data]))
+            output_tensor, num_tokens = single_forward_step(*bound_args.args, **bound_args.kwargs)
             total_num_tokens += num_tokens
         return output_tensor, total_num_tokens
+    return forward_func_wrapper
 
 
 ######################
