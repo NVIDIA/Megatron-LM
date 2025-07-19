@@ -5,6 +5,8 @@ from argparse import ArgumentParser
 from collections import defaultdict
 from tqdm import tqdm
 from typing import Dict, List
+import sys
+import os
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -19,12 +21,16 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
+
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider
 import json
 
-from utils import (
+from examples.inference.gpt.utils import (
     add_common_inference_args,
     build_requests,
     build_dynamic_engine_setup_prefix,
@@ -178,7 +184,9 @@ def run_inference(
                 break
             try:
                 # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
-                engine.add_request(num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate)
+                engine.add_request(
+                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
+                )
                 request.time_start = get_curr_time()
                 request.state = "started"
                 num_requests_added += 1
@@ -207,7 +215,9 @@ def run_inference(
                 request.state = "finished"
                 request.request_id = finished_request.request_id
                 if sampling_params.return_log_probs:
-                    request.log_probs = finished_request.prompt_log_probs + finished_request.generated_log_probs
+                    request.log_probs = (
+                        finished_request.prompt_log_probs + finished_request.generated_log_probs
+                    )
                 num_requests_finished += 1
 
         # Check if all requests are finished.
@@ -281,9 +291,9 @@ def main():
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]
+            output_text_escaped = request.output_text.replace("\n", "\\n")
             print(
-                f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... {request.output_text.replace("\n", "\\n")}"
-                
+                f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... {output_text_escaped}"
             )
 
         # Write results to JSON. Primarily used for functional testing.
@@ -303,7 +313,6 @@ def main():
                 json_results[req.request_id] = result_dict
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp)
-
 
     # Timing results.
     stats = torch.cuda.memory_stats()
