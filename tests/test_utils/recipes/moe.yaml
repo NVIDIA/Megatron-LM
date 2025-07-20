@@ -124,6 +124,21 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -160,6 +175,11 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_moe_mr_mcore_te_ep8_resume_torch_dist_dist_optimizer]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   #######################################################################
   # Super important MR tests that run for both DEV and LTS per MR       #
   #######################################################################
@@ -176,14 +196,6 @@ products:
   ###########################
   # Merge train tests       #
   ###########################
-  - test_case: [gpt3_moe_mr_mcore_te_ep8_resume_torch_dist_dist_optimizer]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-      - environment: [dev]
-        scope: [mr-slim]
-        platforms: [dgx_h100]
   - test_case: [gpt3_moe_mr_mcore_te_tp4_ep2_etp2_pp2_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
@@ -192,8 +204,11 @@ products:
       - environment: [dev]
         scope: [mr-slim]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mcore_te_tp1_pp1_ep8_etp1_cp_memory_speed]
+  - test_case: [gpt3_mcore_te_tp2_pp2_ep4_etp1_memory_speed]
     products:
       - environment: [dev]
         scope: [mr]
+        platforms: [dgx_h100]
+      - environment: [dev]
+        scope: [mr-slim]
         platforms: [dgx_h100]
