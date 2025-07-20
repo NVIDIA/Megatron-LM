@@ -20,6 +20,10 @@ CHECK_THRESHOLDS = {
         common.DeterministicTest(),
         common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
     ],
+    "mtp_1 loss": [
+        common.DeterministicTest(),
+        common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.05), rtol=0),
+    ],
     "num-zeros": [
         common.DeterministicTest(),
         common.ApproximateTest(atol_func=common.approximate_threshold(rtol=0.20), rtol=0),
