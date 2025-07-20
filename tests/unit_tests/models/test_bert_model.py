@@ -2,7 +2,6 @@
 
 import os
 
-import torch.distributed
 from megatron.core.device_utils import get_current_device
 from importlib.metadata import version
 
@@ -13,8 +12,8 @@ from pytest_mock import mocker
 
 from megatron.core.models.bert.bert_layer_specs import (
     HAVE_TE, 
-    bert_layer_with_transformer_engine_spec,
-    bert_layer_local_spec
+    get_bert_layer_with_transformer_engine_spec,
+    get_bert_layer_with_local_spec
 )
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.transformer.enums import AttnMaskType
@@ -22,7 +21,6 @@ from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 
 class TestBertModel:
 
@@ -42,10 +40,12 @@ class TestBertModel:
             pipeline_dtype=torch.bfloat16,
             attention_backend=AttnBackend.unfused if HAVE_TE else AttnBackend.auto,
         )
+        transformer_layer_spec=get_bert_layer_with_transformer_engine_spec() \
+                if HAVE_TE else get_bert_layer_with_local_spec()
         self.bert_model = BertModel(
             config=transformer_config,
             num_tokentypes=0,
-            transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=100,
             max_sequence_length=4,
         )
@@ -96,7 +96,6 @@ class TestBertModel:
         assert logits[0].shape[1] == sequence_length
         assert logits[0].shape[2] == self.bert_model.vocab_size
 
-@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required for this test")
 class TestBertModelAttentionDimensions:
 
     def teardown_method(self, method):
@@ -114,10 +113,12 @@ class TestBertModelAttentionDimensions:
             attention_backend=AttnBackend.auto,
         )
         # This should convert arbitray mask to padding mask
+        transformer_layer_spec=get_bert_layer_with_transformer_engine_spec() \
+                if HAVE_TE else get_bert_layer_with_local_spec()
         self.bert_model = BertModel(
             config=self.transformer_config,
             num_tokentypes=0,
-            transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=100,
             max_sequence_length=4,
         )
@@ -125,7 +126,7 @@ class TestBertModelAttentionDimensions:
     @pytest.mark.internal
     def test_local_spec(self, mocker):
         self.bert_model.config.attention_backend = AttnBackend.local
-        self.bert_model.transformer_layer_spec = bert_layer_local_spec
+        self.bert_model.transformer_layer_spec = get_bert_layer_with_local_spec()
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
         assert (
             attn_mask_dimensions == "b1ss"
@@ -134,7 +135,7 @@ class TestBertModelAttentionDimensions:
     @pytest.mark.internal
     def test_local_spec_exception(self, mocker):
         self.bert_model.config.attention_backend = AttnBackend.flash
-        self.bert_model.transformer_layer_spec = bert_layer_local_spec
+        self.bert_model.transformer_layer_spec = get_bert_layer_with_local_spec()
         with pytest.raises(Exception) as exc_info:
             self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
         assert (
@@ -143,13 +144,15 @@ class TestBertModelAttentionDimensions:
         )
 
     @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required for this test")
     def test_transformer_engine_version_1_10(self, mocker):
-        bert_layer_with_transformer_engine_spec.submodules.self_attention.params[
+        bert_te_spec = get_bert_layer_with_transformer_engine_spec()
+        bert_te_spec.submodules.self_attention.params[
             'attn_mask_type'
-        ] == AttnMaskType.arbitrary
+        ] = AttnMaskType.arbitrary
 
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.10"))
-        self.bert_model.transformer_layer_spec = bert_layer_with_transformer_engine_spec
+        self.bert_model.transformer_layer_spec = bert_te_spec
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
         attn_mask_type = self.bert_model.transformer_layer_spec.submodules.self_attention.params[
             'attn_mask_type'
@@ -162,27 +165,29 @@ class TestBertModelAttentionDimensions:
         ), f"Expected b11s for attn_mask_dimensions but got {attn_mask_dimensions}"
 
     @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required for this test")
     def test_transformer_engine_version_1_7_to_1_10_flash_attn(self, mocker):
         self.bert_model.config.attention_backend = AttnBackend.flash
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
-        self.bert_model.transformer_layer_spec = bert_layer_with_transformer_engine_spec
+        self.bert_model.transformer_layer_spec = get_bert_layer_with_transformer_engine_spec()
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
         assert (
             attn_mask_dimensions == "b11s"
         ), f"Expected b11s for attn_mask_dimensions but got {attn_mask_dimensions}"
 
     @pytest.mark.internal
-    @pytest.mark.skip("Not applicable to code")
+    @pytest.mark.skip("Not applicable")
     def test_transformer_engine_version_1_7_to_1_10_rng_error(self, mocker):
-        bert_layer_with_transformer_engine_spec.submodules.self_attention.params[
+        bert_te_spec = get_bert_layer_with_transformer_engine_spec()
+        bert_te_spec.submodules.self_attention.params[
             'attn_mask_type'
-        ] == AttnMaskType.padding
+        ] = AttnMaskType.padding
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
         with pytest.raises(Exception) as exc_info:
             self.bert_model = BertModel(
                 config=self.transformer_config,
                 num_tokentypes=0,
-                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+                transformer_layer_spec=bert_te_spec,
                 vocab_size=100,
                 max_sequence_length=4,
             )
@@ -193,13 +198,15 @@ class TestBertModelAttentionDimensions:
         )
 
     @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required for this test")
     def test_transformer_engine_version_1_7_to_1_10_unfused_attention(self, mocker):
         self.bert_model.config.attention_backend = AttnBackend.unfused
-        bert_layer_with_transformer_engine_spec.submodules.self_attention.params[
+        bert_te_spec = get_bert_layer_with_transformer_engine_spec()
+        bert_te_spec.submodules.self_attention.params[
             'attn_mask_type'
-        ] == AttnMaskType.padding
+        ] = AttnMaskType.padding
         mocker.patch("megatron.core.utils.get_te_version", return_value=PkgVersion("1.8"))
-        self.bert_model.transformer_layer_spec = bert_layer_with_transformer_engine_spec
+        self.bert_model.transformer_layer_spec = bert_te_spec
         attn_mask_dimensions = self.bert_model._sanity_check_attention_and_get_attn_mask_dimension()
         attn_mask_type = self.bert_model.transformer_layer_spec.submodules.self_attention.params[
             'attn_mask_type'
@@ -212,6 +219,7 @@ class TestBertModelAttentionDimensions:
         ), f"Expected b1ss for attn_mask_dimensions but got {attn_mask_dimensions}"
 
     @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required for this test")
     def test_transformer_engine_version_less_than_1_7(self, mocker):
         os.environ.pop('NVTE_FUSED_ATTN', None)
         os.environ.pop('NVTE_FLASH_ATTN', None)
@@ -222,7 +230,7 @@ class TestBertModelAttentionDimensions:
             self.bert_model = BertModel(
                 config=self.transformer_config,
                 num_tokentypes=0,
-                transformer_layer_spec=bert_layer_with_transformer_engine_spec,
+                transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
             )

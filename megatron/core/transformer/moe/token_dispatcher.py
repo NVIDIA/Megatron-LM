@@ -853,12 +853,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                         self.num_global_tokens_per_local_expert = maybe_move_tensor_to_cpu(
                             self.num_global_tokens_per_local_expert, record_stream=on_side_stream
                         )
-                if self.cuda_dtoh_stream:
+                if torch.cuda.is_available():
                     self.d2h_event = self.cuda_dtoh_stream.record_event()
-                else:
-                    self.d2h_event = None
 
-            if self.d2h_event and point == self.cuda_sync_point:
+            if torch.cuda.is_available() and point == self.cuda_sync_point:
                 # Synchronize with the DtoH stream at self.cuda_sync_point.
                 self.d2h_event.synchronize()
 

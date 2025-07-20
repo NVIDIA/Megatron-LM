@@ -6,6 +6,7 @@ import pytest
 import torch
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
     HAVE_TE = True
 except ImportError:

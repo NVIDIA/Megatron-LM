@@ -35,7 +35,6 @@ spec:
     ENVIRONMENT={environment}
     BUCKET="{test_case}"
     UNIT_TEST_REPEAT={n_repeat}
-    UNIT_TEST_TIMEOUT=10
 
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
@@ -49,7 +48,6 @@ spec:
       --environment $ENVIRONMENT \
       --bucket $BUCKET \
       --unit-test-repeat $UNIT_TEST_REPEAT \
-      --unit-test-timeout $UNIT_TEST_TIMEOUT \
       --log-dir {assets_dir}/logs/1/
 
     ls -al 

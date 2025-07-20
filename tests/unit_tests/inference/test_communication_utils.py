@@ -3,7 +3,6 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
-from megatron.core.device_utils import get_current_device_type
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,

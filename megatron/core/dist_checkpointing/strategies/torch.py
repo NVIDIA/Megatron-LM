@@ -69,8 +69,7 @@ from .resharding import (
 from .state_dict_saver import save_state_dict_async_finalize, save_state_dict_async_plan
 
 try:
-    if not torch.cuda.is_available():
-        raise ImportError
+    import transformer_engine # pylint: disable=unused-import
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
     HAVE_TE = True

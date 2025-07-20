@@ -41,7 +41,7 @@ fi
 # Create a temporary directory
 TEMP_DIR=$(mktemp -d)
 echo "Working in temporary directory: ${TEMP_DIR}"
-python3 -m venv "${TEMP_DIR}/venv"
+python3 -m venv "${TEMP_DIR}/venv" --system-site-packages
 source "${TEMP_DIR}/venv/bin/activate"
 
 # Ensure cleanup on script exit
@@ -66,7 +66,5 @@ mkdir -p "${OUTPUT_WHEEL_DIR}"
 
 # Build the wheel using python -m build
 export NVTE_FRAMEWORK=pytorch # Optionally set framework
-pip3 install --no-cache-dir setuptools pybind11 "cmake>=3.21" build ninja
-pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cu128 torch==2.7.0
 pip3 wheel --no-cache-dir --no-build-isolation -w "${OUTPUT_WHEEL_DIR}" .
 ls -al "${OUTPUT_WHEEL_DIR}"

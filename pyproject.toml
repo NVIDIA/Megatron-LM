@@ -19,7 +19,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch"]
+dependencies = ["torch", "numpy<2.0.0"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -69,10 +69,11 @@ dev = [
     "einops",
     "tensorstore!=0.1.46,!=0.1.72",
     "nvtx",
-    "numpy<2.0.0",
     "transformers",
     "multi-storage-client",
     "setuptools<80.0.0",
+    "nvidia-modelopt[torch]; sys_platform != 'darwin'",
+    "megatron-energon[av_decode]<7",
 ]
 
 lts = [
@@ -80,7 +81,6 @@ lts = [
     "einops",
     "tensorstore!=0.1.46,!=0.1.72",
     "nvtx",
-    "numpy<2.0.0",
     "transformers",
     "zarr",
     "setuptools<80.0.0",
@@ -94,6 +94,7 @@ test = [
     "pytest-mock",
     "pytest-cov",
     "pytest-random-order",
+    "pytest-asyncio",
 ]
 
 build = [
@@ -149,9 +150,9 @@ addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
-    "internal = mark a test as a test to private/internal functions.",
-    "flaky = mark flaky tests for LTS environment",
-    "flaky_in_dev = mark flaky tests for DEV environment",
+    "internal: mark a test as a test to private/internal functions.",
+    "flaky: mark flaky tests for LTS environment",
+    "flaky_in_dev: mark flaky tests for DEV environment",
 ]
 
 [tool.coverage.run]

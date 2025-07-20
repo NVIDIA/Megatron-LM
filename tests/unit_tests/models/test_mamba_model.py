@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from megatron.core.device_utils import get_current_device, get_current_device_type, get_xla_model
+from megatron.core.device_utils import get_current_device
 import pytest
 import torch
 
@@ -12,8 +12,6 @@ from megatron.core.tensor_parallel.random import model_parallel_device_manual_se
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
-
-xm = get_xla_model()
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Mamba model requires CUDA at this time.")
 class TestMambaModel:

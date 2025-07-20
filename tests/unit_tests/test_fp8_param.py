@@ -27,6 +27,7 @@ from tests.unit_tests.test_utilities import Utils
 
 _SEED = 1234
 try:
+    import transformer_engine  # pylint: disable=unused-import
     from transformer_engine.pytorch.fp8 import check_fp8_support
     fp8_available, reason_for_no_fp8 = check_fp8_support()
     HAVE_TE=True

@@ -35,6 +35,7 @@ from megatron.training.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
 
     HAVE_TE = True
@@ -59,6 +60,16 @@ except ImportError:
 
 xm = get_xla_model()
 
+def _find_submodule(model, submodule_name):
+    """
+    Find sub-module in model
+    """
+    for name, submodule in model.named_modules():
+        if name.endswith("." + submodule_name) or name == submodule_name:
+            return submodule
+    return None
+
+
 def model_provider(
     pre_process=True,
     post_process=True,
@@ -71,6 +82,11 @@ def model_provider(
     config = core_transformer_config_from_args(args)
     config.persist_layer_norm = HAVE_APEX
     config.gradient_accumulation_fusion = HAVE_APEX
+    use_te = args.transformer_impl == "transformer_engine"
+    if use_te:
+        layer_spec_fn = get_gpt_layer_with_transformer_engine_spec
+    else:
+        layer_spec_fn = get_gpt_layer_local_spec
 
     use_te = args.transformer_impl == "transformer_engine"
     if use_te:

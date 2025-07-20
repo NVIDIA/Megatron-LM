@@ -28,6 +28,7 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 try:
+    import transformer_engine # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import (
         TENorm,
         get_cpu_offload_context,

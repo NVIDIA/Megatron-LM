@@ -1,11 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
+
 from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
-from packaging.version import Version as PkgVersion
 
 from megatron.core.device_utils import get_current_device
 from megatron.core.enums import Fp8Recipe
@@ -21,9 +21,16 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     HAVE_TE = False
 
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
+
 # Check if Transformer Engine has class for fp8 tensors.
 HAVE_TE_FP8_TENSOR_CLASS = False
-try:
+if HAVE_TE:
     if is_te_min_version("2.0"):
         # In TE2.x, QuantizedTensor is the base class for all different type of fp8 tensors,
         # including fp8 tensor for delayed scaling, current scaling and mxfp8, etc.
@@ -32,9 +39,19 @@ try:
         from transformer_engine.pytorch.float8_tensor import Float8Tensor as FP8_TENSOR_CLASS
 
     HAVE_TE_FP8_TENSOR_CLASS = True
+else:
+    HAVE_TE_FP8_TENSOR_CLASS = False
+    FP8_TENSOR_CLASS = None
+
+# Check if Transformer Engine has MXFP8Tensor class
+
+try:
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
+
+    HAVE_TE_MXFP8TENSOR = True
 except (ImportError, ModuleNotFoundError):
-    # FP8 tensor class not found
-    pass
+    # MXFP8Tensor not found
+    HAVE_TE_MXFP8TENSOR = False
 
 # Check if Transformer Engine has MXFP8Tensor class
 HAVE_TE_MXFP8TENSOR = False
@@ -130,6 +147,10 @@ if HAVE_TE and is_te_min_version("2.2"):
 
         args = [model_params, main_params, start_offsets, data_parallel_group]
         if fsdp_shard_model_params is not None:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging not found, please install it with `pip install packaging`"
+                )
             if get_te_version() == PkgVersion("2.3.0.dev0+5fdd7bb") or is_te_min_version("2.3.0"):
                 args.append(fsdp_shard_model_params)
             else:
@@ -321,9 +342,9 @@ elif HAVE_TE and is_te_min_version("1.0"):
         for model_module in model:
             for param in model_module.parameters():
                 if is_float8tensor(param) and param._fp8_meta is not None:
-                    fp8_meta = param._fp8_meta['scaling_fwd']
+                    fp8_meta = param._fp8_meta["scaling_fwd"]
                     fp8_meta_index = param._fp8_meta_index
-                    if hasattr(param, 'get_high_precision_init_val'):
+                    if hasattr(param, "get_high_precision_init_val"):
                         fp8_meta.amax_history[0][fp8_meta_index].copy_(
                             param.get_high_precision_init_val().abs().max()
                         )

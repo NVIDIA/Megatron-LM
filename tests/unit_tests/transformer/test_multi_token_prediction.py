@@ -32,12 +32,13 @@ from megatron.training.global_vars import (
 from megatron.training.training import get_model, setup_model_and_optimizer
 from megatron.training.utils import unwrap_model
 from tests.unit_tests.test_utilities import Utils
+from megatron.core.utils import is_te_min_version
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
 
     HAVE_TE = True
-    from megatron.core.utils import is_te_min_version
 except ImportError:
     HAVE_TE = False
     TEColumnParallelGroupedLinear = None
@@ -251,6 +252,7 @@ class TestMultiTokenPrediction:
             assert f"mtp.layers.{i}.hnorm.weight" in sharded_state_dict.keys()
             assert f"mtp.layers.{i}.eh_proj.weight" in sharded_state_dict.keys()
 
+    @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
     @pytest.mark.parametrize("tp_size", [1, 2, 4])
     def test_forward_backward(self, tp_size):
         """Test MTP forward and backward with gptmodel."""

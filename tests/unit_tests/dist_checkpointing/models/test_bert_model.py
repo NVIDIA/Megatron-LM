@@ -7,8 +7,9 @@ import torch
 
 from megatron.core import parallel_state as ps
 from megatron.core.models.bert.bert_layer_specs import (
-    bert_layer_local_spec,
-    bert_layer_with_transformer_engine_spec,
+    HAVE_TE, 
+    get_bert_layer_with_transformer_engine_spec,
+    get_bert_layer_with_local_spec
 )
 from megatron.core.models.bert.bert_model import BertModel
 from megatron.core.transformer.enums import AttnBackend
@@ -21,16 +22,18 @@ from tests.unit_tests.dist_checkpointing.models.common import (
 )
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
-from megatron.core.models.bert.bert_layer_specs import bert_layer_local_spec, bert_layer_with_transformer_engine_spec
-
 
 def initialize_bert_model(
-    seed, layer_spec_fn=bert_layer_with_transformer_engine_spec, vocab_size=128, **config_kwargs
+    seed, 
+    layer_spec_fn=get_bert_layer_with_transformer_engine_spec \
+        if HAVE_TE else get_bert_layer_with_local_spec,
+    vocab_size=128, 
+    **config_kwargs
 ):
     torch.manual_seed(seed)
     model_parallel_device_manual_seed(seed)
 
-    layer_spec = layer_spec_fn() if callable(layer_spec_fn) else layer_spec_fn
+    layer_spec = layer_spec_fn()
 
     default_config_kwargs = dict(
         num_layers=8,
@@ -62,13 +65,20 @@ def initialize_bert_model(
 
 class TestBertModel:
     @pytest.mark.parametrize(
-        'src_layer_spec', [bert_layer_with_transformer_engine_spec, bert_layer_local_spec]
+        'src_layer_spec', [get_bert_layer_with_transformer_engine_spec, 
+                           get_bert_layer_with_local_spec]
     )
     @pytest.mark.parametrize(
-        'dst_layer_spec', [bert_layer_with_transformer_engine_spec, bert_layer_local_spec]
+        'dst_layer_spec', [get_bert_layer_with_transformer_engine_spec, 
+                           get_bert_layer_with_local_spec]
     )
     @pytest.mark.internal
     def test_sharded_state_dict_save_load(self, tmp_path_dist_ckpt, src_layer_spec, dst_layer_spec):
+        
+        if not HAVE_TE and (src_layer_spec == get_bert_layer_with_transformer_engine_spec or \
+                            dst_layer_spec == get_bert_layer_with_transformer_engine_spec):
+            return
+        
         common_test_simple_sharded_state_dict_save_load(
             initialize_bert_model, tmp_path_dist_ckpt, src_layer_spec, dst_layer_spec
         )
@@ -88,39 +98,44 @@ class TestBERTModelReconfiguration:
                 False,
                 (2, 4),
                 (4, 2),
-                bert_layer_with_transformer_engine_spec,
-                bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
             ),
             (
                 False,
                 (1, 8),
                 (8, 1),
-                bert_layer_with_transformer_engine_spec,
-                bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
             ),
             (
                 True,
                 (2, 1),
                 (1, 8),
-                bert_layer_with_transformer_engine_spec,
-                bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
             ),
             (
                 False,
                 (1, 1),
                 (2, 2),
-                bert_layer_with_transformer_engine_spec,
-                bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
+                get_bert_layer_with_transformer_engine_spec,
             ),
-            (True, (2, 1), (1, 8), bert_layer_local_spec, bert_layer_local_spec),
-            (True, (1, 1), (2, 4), bert_layer_with_transformer_engine_spec, bert_layer_local_spec),
-            (False, (1, 8), (2, 1), bert_layer_local_spec, bert_layer_with_transformer_engine_spec),
+            (True, (2, 1), (1, 8), get_bert_layer_with_local_spec, get_bert_layer_with_local_spec),
+            (True, (1, 1), (2, 4), get_bert_layer_with_transformer_engine_spec, get_bert_layer_with_local_spec),
+            (False, (1, 8), (2, 1), get_bert_layer_with_local_spec, get_bert_layer_with_transformer_engine_spec),
         ],
     )
     @pytest.mark.internal
     def test_parallel_reconfiguration_e2e(
         self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, src_layer_spec, dst_layer_spec, use_fpsl
     ):
+        if not HAVE_TE and \
+            ( src_layer_spec == get_bert_layer_with_transformer_engine_spec or \
+                dst_layer_spec == get_bert_layer_with_transformer_engine_spec):
+            return
+        
         """Test model saving and loading with different TP/PP"""
         Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
 

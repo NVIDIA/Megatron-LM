@@ -13,7 +13,7 @@ from megatron.core.transformer.attention import (
     SelfAttentionSubmodules,
 )
 try :
-    
+    import transformer_engine  # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -50,8 +50,9 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 def decoder_model_with_transformer_engine_default_spec(
     num_experts: Optional[int] = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False

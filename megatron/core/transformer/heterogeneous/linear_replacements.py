@@ -16,6 +16,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
 try:
+    import transformer_engine # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
 
     HAVE_TE = True

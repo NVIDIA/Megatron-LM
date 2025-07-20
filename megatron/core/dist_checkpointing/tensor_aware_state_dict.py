@@ -1,6 +1,6 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Utilities for transforming state_dict, including a tensor-aware implementation."""
+"""Utilities for transforming state_dict, including a tensor-aware implementation."""
 
 import copy
 import logging
@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
-from nvidia_resiliency_ext.checkpointing.local.base_state_dict import TensorAwareStateDict
 
 from megatron.core.device_utils import get_xla_model
 from megatron.core.parallel_state import get_default_process_group
@@ -39,6 +38,17 @@ xm = get_xla_model()
 
 logger = logging.getLogger(__name__)
 
+try:
+    from nvidia_resiliency_ext.checkpointing.local.base_state_dict import TensorAwareStateDict
+
+    HAVE_NVRX = True
+except ImportError:
+    import types
+
+    # Create a dummy class that mimics the real one
+    TensorAwareStateDict = types.new_class("TensorAwareStateDict", ())
+    HAVE_NVRX = False
+
 
 @dataclass
 class MCoreTensorAwareStateDict(TensorAwareStateDict):
@@ -55,7 +65,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
 
     @staticmethod
     def _validate_params(algo):
-        if algo != 'atomic' and algo != 'fully_parallel':
+        if algo != "atomic" and algo != "fully_parallel":
             raise NotImplementedError(
                 'Only "atomic" and "fully_parallel" sharding algorithms are supported.'
             )
@@ -69,13 +79,13 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
                 distribution = determine_main_replica_uniform_distribution(
                     sharded_part, parallelization_group, True
                 )
-                logger.debug(f'MCore_TASD._get_distribution calculated distribution')
+                logger.debug(f"MCore_TASD._get_distribution calculated distribution")
             else:
                 distribution = cached_distribution
-                logger.debug(f'MCore_TASD._get_distribution used cache')
+                logger.debug(f"MCore_TASD._get_distribution used cache")
         else:
             distribution = (None, None, None, None)
-            logger.debug(f'MCore_TASD._get_distribution returned empty distribution')
+            logger.debug(f"MCore_TASD._get_distribution returned empty distribution")
         return distribution
 
     @staticmethod
@@ -103,7 +113,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
     def from_state_dict(
         cls,
         sharded_state_dict: ShardedStateDict,
-        algo: str = 'fully_parallel',
+        algo: str = "fully_parallel",
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         cached_metadata: ShardDistribution = None,
         process_group: torch.distributed.ProcessGroup = None,
@@ -127,9 +137,16 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
             and optional cached metadata.
             - The metadata is stored in memory to speed up future saves.
         """
+        if not HAVE_NVRX:
+            raise ImportError(
+                "nvidia_resiliency_ext is not installed. "
+                "Please install it with "
+                "`pip install nvidia-resiliency-ext`"
+            )
+
         with debug_time("_get_distribution", logger):
             cls._validate_params(algo)
-            fully_parallel = algo == 'fully_parallel'
+            fully_parallel = algo == "fully_parallel"
             sharded_part, common_state_dict = save_preprocess(
                 sharded_state_dict, cached_metadata is None, process_group=process_group,
                 preprocess_common_before_consistancy_check=cls.preprocess_common_state_dict
@@ -165,7 +182,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         if self.is_hollow:
             for sh_base in nested_values(self.sharded_state_dict):
                 # FIXME: Hacky way to store the original device of the popped tensor
-                if isinstance(sh_base, ShardedTensor) and hasattr(sh_base, 'orig_device'):
+                if isinstance(sh_base, ShardedTensor) and hasattr(sh_base, "orig_device"):
                     yield sh_base
         else:
             for sh_base in nested_values(self.sharded_state_dict):
@@ -202,7 +219,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         for sh_ten in self._sharded_tensors:
             result.append(sh_ten.data)
             # FIXME: Hacky way to store the original device, which is not included in the metadata
-            setattr(sh_ten, 'orig_device', sh_ten.data.device.type)
+            setattr(sh_ten, "orig_device", sh_ten.data.device.type)
             sh_ten.data = None
         self._is_hollow = True
         return result
@@ -219,7 +236,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         for sh_ten, ten in zip_strict(self._sharded_tensors, tensor_data):
             # FIXME: Hacky way to store the original device
             if sh_ten.orig_device == ten.device.type:
-                delattr(sh_ten, 'orig_device')
+                delattr(sh_ten, "orig_device")
             # Tensor might be on non-original device
             sh_ten.data = ten
         self._is_hollow = False
@@ -236,7 +253,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         for sh_ten in self._sharded_tensors:
             # Hacky way to retrieve the original device
             sh_ten.init_data(sh_ten.orig_device)
-            delattr(sh_ten, 'orig_device')
+            delattr(sh_ten, "orig_device")
         self._is_hollow = False
 
     def copy_tensors_to_cpu(self, non_blocking=False):
@@ -251,14 +268,14 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
             xm.mark_step()
 
         for sh_ten in self._sharded_tensors:
-            if sh_ten.data.device.type == 'cpu':
+            if sh_ten.data.device.type == "cpu":
                 # Skip cloning if it's already confirmed to be a copy
-                if not hasattr(sh_ten, 'orig_device'):
+                if not hasattr(sh_ten, "orig_device"):
                     sh_ten.data = sh_ten.data.clone()
             else:
                 # FIXME: Hacky way to store the original device
-                if not hasattr(sh_ten, 'orig_device'):
-                    setattr(sh_ten, 'orig_device', sh_ten.data.device.type)
+                if not hasattr(sh_ten, "orig_device"):
+                    setattr(sh_ten, "orig_device", sh_ten.data.device.type)
                 sh_ten.data = sh_ten.data.detach().to("cpu", non_blocking=non_blocking)
 
     def restore_tensor_device(self, non_blocking=True):
@@ -269,9 +286,9 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         assert not self.is_hollow  # TODO raise exception
         for sh_ten in self._sharded_tensors:
             # FIXME: Hacky way to store the original device
-            if hasattr(sh_ten, 'orig_device'):
+            if hasattr(sh_ten, "orig_device"):
                 sh_ten.data = sh_ten.data.to(sh_ten.orig_device, non_blocking=non_blocking)
-                delattr(sh_ten, 'orig_device')
+                delattr(sh_ten, "orig_device")
 
         if xm:
             xm.mark_step()
@@ -329,8 +346,8 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
     def to_state_dict(
         self,
         sharded_state_dict: ShardedStateDict,
-        algo: str = 'atomic',
-        exchange_algo: str = 'broadcast',
+        algo: str = "atomic",
+        exchange_algo: str = "broadcast",
         validate_access_integrity: bool = True,
         parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
         strict: StrictHandling = StrictHandling.ASSUME_OK_UNEXPECTED,
@@ -342,7 +359,7 @@ class MCoreTensorAwareStateDict(TensorAwareStateDict):
         with debug_time("load_preprocess_and_state_dict_manipulations", logger):
             assert not self.is_hollow  # TODO raise exception
             self._validate_params(algo)
-            fully_parallel = algo == 'fully_parallel'
+            fully_parallel = algo == "fully_parallel"
 
             # __adding__ common part
             recreated_state_dict = dict_list_map_outplace(lambda x: x, self.common)

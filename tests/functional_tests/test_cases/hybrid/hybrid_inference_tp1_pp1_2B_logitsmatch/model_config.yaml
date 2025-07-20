@@ -6,6 +6,7 @@ ENV_VARS:
 TEST_TYPE: frozen-start
 MODE: inference
 MODEL_ARGS:
+<<<<<<<< HEAD:tests/functional_tests/test_cases/hybrid/hybrid_inference_tp1_pp1_2B_logitsmatch/model_config.yaml
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
   --log-timers-to-tensorboard: true
@@ -15,6 +16,22 @@ MODEL_ARGS:
   --tokenizer-model: ${DATA_PATH}/mamba_hybrid_2b/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
   --tokenizer-type: TikTokenizer
   --tiktoken-pattern: v2
+========
+  --tiktoken-pattern: v2
+  --use-mcore-models: true
+  --tokenizer-type: TikTokenizer
+  --tokenizer-model: ${DATA_PATH}/mcore_mistral/tokenizer/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --auto-detect-ckpt-format: true
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 4096
+  --attention-backend: flash
+  --use-checkpoint-args: true
+  --micro-batch-size: 1
+  --no-load-optim: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --timing-log-level: 2
+  --load: ${CHECKPOINT_LOAD_PATH}/mcore_mistral/model
+>>>>>>>> upstream/main:tests/functional_tests/test_cases/gpt/gpt_inference_tp1_pp1_583m_cudagraphs/model_config.yaml
   --distributed-backend: nccl
   --log-interval: 1
   --transformer-impl: transformer_engine
@@ -62,8 +79,17 @@ MODEL_ARGS:
   --top_k: 1
   --return-log-probs: true
   --num-tokens-to-generate: 30
+<<<<<<<< HEAD:tests/functional_tests/test_cases/hybrid/hybrid_inference_tp1_pp1_2B_logitsmatch/model_config.yaml
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 4096
+========
+  --flash-decode: true
+  --enable-cuda-graph: true
+  --te-rng-tracker: true
+  --inference-rng-tracker: true
+  --inference-max-requests: 1
+  --dist-ckpt-strictness: log_unexpected
+>>>>>>>> upstream/main:tests/functional_tests/test_cases/gpt/gpt_inference_tp1_pp1_583m_cudagraphs/model_config.yaml
   --output-path: ${TENSORBOARD_PATH}
   --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
 METRICS:

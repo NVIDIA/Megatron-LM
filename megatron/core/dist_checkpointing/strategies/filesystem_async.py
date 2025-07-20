@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Storage writer for PyT Distributed format allowing asynchronous save. """
+"""Storage writer for PyT Distributed format allowing asynchronous save."""
+
 import dataclasses
 import inspect
 import logging
@@ -15,7 +16,6 @@ from pathlib import Path
 from time import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 from torch import multiprocessing as mp
 from torch.distributed.checkpoint import FileSystemWriter
@@ -37,13 +37,20 @@ logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
 
+try:
+    import psutil
+
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
+
 _results_queue = None
 
 
 def _get_write_results_queue():
     global _results_queue
     if _results_queue is None:
-        ctx = mp.get_context('spawn')
+        ctx = mp.get_context("spawn")
         _results_queue = ctx.Manager().Queue()
     return _results_queue
 
@@ -83,7 +90,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         super().__init__(path, *args, **kwargs)
         if not self.single_file_per_rank:
             raise NotImplementedError(
-                'single_file_per_rank flag not supported for FileSystemWriterAsync'
+                "single_file_per_rank flag not supported for FileSystemWriterAsync"
             )
 
         self.can_run_decentralized_global_plan: bool = True
@@ -193,7 +200,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         """
         if not self.write_buckets:
             return None, None, []
-        transform_list = [self.transforms] if hasattr(self, 'transforms') else []
+        transform_list = [self.transforms] if hasattr(self, "transforms") else []
         return (
             partial(self.write_preloaded_data_multiproc, transform_list, self.use_msc),
             partial(self.preload_tensors, self.write_buckets, True),
@@ -255,7 +262,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger = logging.getLogger(__name__)
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
-        ctx = mp.get_context('fork')
+        ctx = mp.get_context("fork")
         local_results_queue = ctx.Queue()
         count_queue = ctx.JoinableQueue()
         p_list = []
@@ -264,11 +271,11 @@ class FileSystemWriterAsync(FileSystemWriter):
                 count_queue.put(i)
 
                 kwargs = {
-                    'local_proc_idx': i,
-                    'write_bucket': write_bucket,
-                    'results_queue': local_results_queue,
-                    'count_queue': count_queue,
-                    'use_fsync': True,
+                    "local_proc_idx": i,
+                    "write_bucket": write_bucket,
+                    "results_queue": local_results_queue,
+                    "count_queue": count_queue,
+                    "use_fsync": True,
                 }
 
                 if use_msc:
@@ -277,7 +284,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     # Remove the inspect after the test_async_save.py is fixed.
                     signature = inspect.signature(FileSystemWriterAsync.write_preloaded_data)
                     if len(signature.parameters) > 6:
-                        kwargs['use_msc'] = use_msc
+                        kwargs["use_msc"] = use_msc
 
                 p_list.append(
                     ctx.Process(
@@ -286,7 +293,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                     )
                 )
             except Exception as e:
-                err_msg = f'An error is caught while a proc {i} is created, error: {e}'
+                err_msg = f"An error is caught while a proc {i} is created, error: {e}"
                 logger.error(err_msg)
                 write_results_or_exc = RuntimeError(err_msg)
 
@@ -294,7 +301,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             for p in p_list:
                 p.start()
 
-            logger.debug('FileSystemWriterAsync: collecting worker results...')
+            logger.debug("FileSystemWriterAsync: collecting worker results...")
 
             # To make sure all nodes are completed
             count_queue.join()
@@ -305,8 +312,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                     local_proc_idx, local_results_or_exc = local_results_queue.get()
                 except queue.Empty:
                     write_results_or_exc = RuntimeError(
-                        'Unexpected empty `local_results_queue`'
-                        f' (got only {proc_idx}/{len(write_buckets)} items)'
+                        "Unexpected empty `local_results_queue`"
+                        f" (got only {proc_idx}/{len(write_buckets)} items)"
                     )
                     break
                 else:
@@ -322,12 +329,12 @@ class FileSystemWriterAsync(FileSystemWriter):
                     write_results_or_exc[local_proc_idx] = local_results_or_exc
                     p_list[local_proc_idx].join()
 
-            logger.debug('FileSystemWriterAsync: collected worker results successfully')
+            logger.debug("FileSystemWriterAsync: collected worker results successfully")
 
         global_results_queue.put(write_results_or_exc)
 
         w_end = time()
-        logger.debug(f"{w_end}, rank: {rank}," f" write(sync,parallel): {w_end - w_start}")
+        logger.debug(f"{w_end}, rank: {rank}, write(sync,parallel): {w_end - w_start}")
 
     @staticmethod
     @_disable_gc()
@@ -354,9 +361,9 @@ class FileSystemWriterAsync(FileSystemWriter):
         Returns: None, the write result are put into the `queue`
         """
         logger = logging.getLogger(__name__)
-        logger.debug(f'{local_proc_idx} started')
+        logger.debug(f"{local_proc_idx} started")
         mem_before = _process_memory()
-        use_msc = kwargs.get('use_msc', False)
+        use_msc = kwargs.get("use_msc", False)
 
         local_results = []
         try:
@@ -365,7 +372,7 @@ class FileSystemWriterAsync(FileSystemWriter):
             if "serialization_format" in inspect.signature(_write_item).parameters:
                 from torch.distributed.checkpoint.filesystem import SerializationFormat
 
-                extra_kwargs['serialization_format'] = SerializationFormat.TORCH_SAVE
+                extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
             if use_msc:
                 import multistorageclient as msc
 
@@ -395,7 +402,7 @@ class FileSystemWriterAsync(FileSystemWriter):
                         os.fsync(stream.fileno())
             local_output = (local_proc_idx, local_results)
         except Exception as e:
-            logger.debug(f'{local_proc_idx} failed')
+            logger.debug(f"{local_proc_idx} failed")
             local_output = (local_proc_idx, e)  # type: ignore[assignment]
 
         results_queue.put(local_output)
@@ -411,7 +418,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
     def write_data(self, plan: SavePlan, planner: SavePlanner) -> Future[List[WriteResult]]:
         """Write all items from ``plan``."""
-        raise NotImplementedError('write_data not implemented for FileSystemWriterAsync')
+        raise NotImplementedError("write_data not implemented for FileSystemWriterAsync")
 
     def retrieve_write_results(self) -> List[WriteResult]:
         """
@@ -430,15 +437,15 @@ class FileSystemWriterAsync(FileSystemWriter):
             try:
                 write_results_or_exc = self.results_queue.get_nowait()
             except queue.Empty:
-                raise RuntimeError('results_queue should not be empty')
+                raise RuntimeError("results_queue should not be empty")
 
         if isinstance(write_results_or_exc, Exception):
-            raise RuntimeError(f'Worker failure: {write_results_or_exc}') from write_results_or_exc
+            raise RuntimeError(f"Worker failure: {write_results_or_exc}") from write_results_or_exc
         write_results: dict = write_results_or_exc
         if len(write_results) != len(self.write_buckets):
             raise RuntimeError(
-                f'Incomplete worker results (expected {len(self.write_buckets)},'
-                f' got {len(write_results)}. This probably indicates a worker failure.'
+                f"Incomplete worker results (expected {len(self.write_buckets)},"
+                f" got {len(write_results)}. This probably indicates a worker failure."
             )
         return list(chain.from_iterable(write_results.values()))
 
@@ -623,6 +630,8 @@ def _process_memory() -> int:
 
     Returns (int): memory used by current process
     """
+    if not HAVE_PSUTIL:
+        raise RuntimeError("psutil is not installed, please install it with `pip install psutil`")
     process = psutil.Process(os.getpid())
     mem_info = process.memory_info()
     return mem_info.rss

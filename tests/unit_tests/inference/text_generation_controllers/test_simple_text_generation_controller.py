@@ -12,6 +12,7 @@ from megatron.core.device_utils import get_current_device, get_xla_model
 import torch
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
     from transformer_engine.pytorch.fp8 import check_fp8_support
     fp8_available, reason_for_no_fp8 = check_fp8_support()
     HAVE_TE=True

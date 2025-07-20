@@ -13,6 +13,8 @@ from megatron.core import parallel_state
 from megatron.core.device_utils import get_current_device, get_current_device_type, get_local_device_count
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 try:
+    import transformer_engine  # pylint: disable=unused-import
+    
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,
@@ -627,6 +629,10 @@ class TestTransformerBlockWithProcessGroups:
         # Set PyTorch random seed explicitly for reproducible input
         torch.manual_seed(12345)
         model_parallel_device_manual_seed(123)
+
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():

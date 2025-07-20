@@ -14,16 +14,22 @@ pattern:
 
 import abc
 import os
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
 
 from megatron.core.datasets.retro.config import Embedder, RetroPreprocessingConfig
-from megatron.core.datasets.retro.external_libs import faiss
 from megatron.core.datasets.retro.utils import GPTToTextDataset
 
 from .utils import get_index_dir
+
+try:
+    import faiss
+
+    HAVE_FAISS = True
+except ImportError:
+    HAVE_FAISS = False
 
 
 class Index(abc.ABC):
@@ -39,13 +45,16 @@ class Index(abc.ABC):
     """
 
     @classmethod
-    def make_object_verbose(cls, index: faiss.Index, verbose: bool) -> None:
+    def make_object_verbose(cls, index: "faiss.Index", verbose: bool) -> None:
         """Make index object verbose.
 
         Args:
             index (faiss.Index): Faiss object to set verbose.
             verbose (bool): Sets whether index should log status updates during training and adding.
         """
+        if not HAVE_FAISS:
+            raise ImportError("faiss is required to use the Index class. Please install faiss.")
+
         assert isinstance(verbose, bool)
         faiss.ParameterSpace().set_index_parameter(index, "verbose", verbose)
 
@@ -56,13 +65,14 @@ class Index(abc.ABC):
             config (RetroPreprocessingConfig): Retro preprocessing config.
 
         Returns:
-            File path to empty index (i.e., this index has had index.train() called, but not yet index.add()).
+            File path to empty index
+                (i.e., this index has had index.train() called, but not yet index.add()).
         """
         return os.path.join(
             get_index_dir(config), "empty_%.3f.faissindex" % config.retro_index_train_load_fraction
         )
 
-    def get_empty_index(self, config: RetroPreprocessingConfig) -> faiss.Index:
+    def get_empty_index(self, config: RetroPreprocessingConfig) -> "faiss.Index":
         """Get empty index (i.e., trained, but unpopulated).
 
         Args:
@@ -71,6 +81,8 @@ class Index(abc.ABC):
         Returns:
             Empty Faiss index, loaded from storage.
         """
+        if not HAVE_FAISS:
+            raise ImportError("faiss is required to use the Index class. Please install faiss.")
         return faiss.read_index(self.get_empty_index_path(config))
 
     def get_added_index_path(self, config: RetroPreprocessingConfig) -> str:
@@ -80,7 +92,8 @@ class Index(abc.ABC):
             config (RetroPreprocessingConfig): Retro preprocessing config.
 
         Returns:
-            File path to added index (i.e., this index has had both index.train() and index.add() called).
+            File path to added index
+                (i.e., this index has had both index.train() and index.add() called).
         """
         return os.path.join(
             get_index_dir(config),
@@ -88,7 +101,7 @@ class Index(abc.ABC):
             % (config.retro_index_train_load_fraction, config.retro_index_add_load_fraction),
         )
 
-    def get_added_index(self, config: RetroPreprocessingConfig) -> faiss.Index:
+    def get_added_index(self, config: RetroPreprocessingConfig) -> "faiss.Index":
         """Get index that has been populated with vectors.
 
         Args:
@@ -97,6 +110,8 @@ class Index(abc.ABC):
         Returns:
             'Added' (i.e., populated) Faiss index, loaded from storage.
         """
+        if not HAVE_FAISS:
+            raise ImportError("faiss is required to use the Index class. Please install faiss.")
         return faiss.read_index(self.get_added_index_path(config))
 
     @abc.abstractmethod
@@ -113,7 +128,8 @@ class Index(abc.ABC):
 
         Args:
             config (RetroPreprocessingConfig): Retro preprocessing config.
-            text_dataset (GPTToTextDataset): Text dataset that will be embedded and added to the index.
+            text_dataset (GPTToTextDataset): Text dataset that will be embedded
+                and added to the index.
         """
 
     def embed_text_dataset_block(
@@ -124,7 +140,8 @@ class Index(abc.ABC):
         Args:
             embedder (Embedder): Embedder used for embedding a text dataset.
             text_dataset (GPTToTextDataset): Text dataset that will be embedded.
-            _range (Tuple[int, int]): Start/end sample indices within text dataset used for embedding.
+            _range (Tuple[int, int]): Start/end sample indices within
+                text dataset used for embedding.
 
         Returns:
             An array of embeddings, with shape (len(text_dataset), dimension(embedder)).

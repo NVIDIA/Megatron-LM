@@ -44,15 +44,15 @@ except ImportError:
 
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    warnings.warn('Apex is not installed. Falling back to Torch Norm')
+    warnings.warn("Apex is not installed. Falling back to Torch Norm")
     LNImpl = WrappedTorchNorm
+    HAVE_APEX = False
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
-
-    if not HAVE_TE:
-        return get_vit_layer_with_local_spec()
-    
+    """
+    Returns ViT layer spec with Transformer Engine layers
+    """
     mlp = _get_mlp_module_spec(use_te=True)
     return ModuleSpec(
         module=TransformerLayer,
@@ -75,9 +75,9 @@ def get_vit_layer_with_transformer_engine_spec() -> ModuleSpec:
 
 
 def get_vit_layer_with_local_spec() -> ModuleSpec:
-    '''
+    """
     Returns ViT layer spec with Mcore local layers
-    '''
+    """
     mlp = _get_mlp_module_spec(use_te=False)
     return ModuleSpec(
         module=TransformerLayer,

@@ -6,6 +6,7 @@ from typing import Optional
 from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 try:
+    import transformer_engine # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
     HAVE_TE = True
 except ModuleNotFoundError:

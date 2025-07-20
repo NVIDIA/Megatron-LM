@@ -4,7 +4,6 @@ import pytest
 import torch
 
 from megatron.core.device_utils import get_current_device
-from megatron.core import parallel_state
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.process_groups_config import ModelCommProcessGroups

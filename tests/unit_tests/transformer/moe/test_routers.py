@@ -337,4 +337,3 @@ def test_router_gating_linear(router_dtype):
     assert torch.allclose(output, ref_output, **tols)
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
-    

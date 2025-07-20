@@ -57,33 +57,39 @@ except ImportError:
     HAVE_TE = False
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
-    'tensor_model_parallel': False,
-    'partition_dim': -1,
-    'partition_stride': 1,
+    "tensor_model_parallel": False,
+    "partition_dim": -1,
+    "partition_stride": 1,
 }
 
-xm = get_xla_model()
-
-if is_torch_min_version("2.4.0a0"):
-    custom_fwd = partial(torch.amp.custom_fwd, device_type=get_current_device_type())
-    custom_bwd = partial(torch.amp.custom_bwd, device_type=get_current_device_type())
-else:
+try:
+    if is_torch_min_version("2.4.0a0"):
+        custom_fwd = partial(torch.amp.custom_fwd, device_type=get_current_device_type())
+        custom_bwd = partial(torch.amp.custom_bwd, device_type=get_current_device_type())
+    else:
+        custom_fwd = torch.cuda.amp.custom_fwd
+        custom_bwd = torch.cuda.amp.custom_bwd
+except:
     custom_fwd = torch.cuda.amp.custom_fwd
     custom_bwd = torch.cuda.amp.custom_bwd
 
-
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
+xm = get_xla_model()
 
 def param_is_not_tensor_parallel_duplicate(param):
     """Returns true if the passed-in parameter is not a duplicate parameter
     on another TP rank."""
-    return (hasattr(param, 'tensor_model_parallel') and param.tensor_model_parallel) or (
+    return (hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel) or (
         get_tensor_model_parallel_rank() == 0
     )
 
@@ -94,9 +100,9 @@ def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
         assert not hasattr(tensor, attribute)
     # Set the attributes.
-    setattr(tensor, 'tensor_model_parallel', is_parallel)
-    setattr(tensor, 'partition_dim', dim)
-    setattr(tensor, 'partition_stride', stride)
+    setattr(tensor, "tensor_model_parallel", is_parallel)
+    setattr(tensor, "partition_dim", dim)
+    setattr(tensor, "partition_stride", stride)
 
 
 def set_defaults_if_not_set_tensor_model_parallel_attributes(tensor):
@@ -295,17 +301,17 @@ class VocabParallelEmbedding(torch.nn.Module):
 
     def sharded_state_dict(
         self,
-        prefix: str = '',
+        prefix: str = "",
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         """Non-default implementation for embeddings due to `allow_shape_mismatch` param"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
 
-        weight_prefix = f'{prefix}weight'
+        weight_prefix = f"{prefix}weight"
         return {
             weight_prefix: make_tp_sharded_tensor_for_checkpoint(
-                tensor=state_dict['weight'],
+                tensor=state_dict["weight"],
                 key=weight_prefix,
                 allow_shape_mismatch=True,
                 prepend_offsets=sharded_offsets,
@@ -589,12 +595,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 else:
                     raise RuntimeError("Unsupported gradient type for gradient accumulation fusion")
 
-            if hasattr(weight, 'grad_added_to_main_grad'):
+            if hasattr(weight, "grad_added_to_main_grad"):
                 # When overlap_grad_reduce is True, need to ensure that backward hooks
                 # are all run on the main backprop thread to prevent deadlocks. Setup
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
-                if getattr(weight, 'zero_out_wgrad', False):
+                if getattr(weight, "zero_out_wgrad", False):
                     grad_weight = torch.zeros(
                         weight.main_grad.shape,
                         dtype=input.dtype,
@@ -622,7 +628,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 xm.mark_step()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
-            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+            return (sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None)
 
         if ctx.allreduce_dgrad:
             if handle:
@@ -732,7 +738,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
-        if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+        if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") != "1":
             if sequence_parallel:
                 warnings.warn(
                     "When using sequence parallelism it is recommended to set the "
@@ -890,7 +896,7 @@ class ColumnParallelLinear(torch.nn.Module):
                         is_expert=self.is_expert,
                     )
 
-            setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
+            setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
         else:
             self.weight = None
 
@@ -912,9 +918,9 @@ class ColumnParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, 'allreduce', not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel and world_size <= 1:
@@ -934,7 +940,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
                 "module is not found. To use gradient_accumulation_fusion you must "
                 "install APEX with --cpp_ext and --cuda_ext. For example: "
-                "pip install --global-option=\"--cpp_ext\" --global-option=\"--cuda_ext .\" "
+                'pip install --global-option="--cpp_ext" --global-option="--cuda_ext ." '
                 "Note that the extension requires CUDA>=11. Otherwise, you must turn off "
                 "gradient accumulation fusion."
             )
@@ -950,7 +956,7 @@ class ColumnParallelLinear(torch.nn.Module):
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
             lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
-                f'{prefix}_extra_state'
+                f"{prefix}_extra_state"
             )
         )
 
@@ -1058,11 +1064,11 @@ class ColumnParallelLinear(torch.nn.Module):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 0, 'bias': 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
         )
 
     def set_extra_state(self, state: Any):
@@ -1202,7 +1208,7 @@ class RowParallelLinear(torch.nn.Module):
                     stride=stride,
                     is_expert=self.is_expert,
                 )
-        setattr(self.weight, 'allreduce', not (self.is_expert and self.expert_parallel))
+        setattr(self.weight, "allreduce", not (self.is_expert and self.expert_parallel))
 
         if bias:
             if config.use_cpu_initialization:
@@ -1220,17 +1226,17 @@ class RowParallelLinear(torch.nn.Module):
                 # Always initialize bias to zero.
                 with torch.no_grad():
                     self.bias.zero_()
-            setattr(self.bias, 'allreduce', not (self.is_expert and self.expert_parallel))
-            setattr(self.bias, 'sequence_parallel', self.sequence_parallel)
+            setattr(self.bias, "allreduce", not (self.is_expert and self.expert_parallel))
+            setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
 
         self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
 
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
             lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
-                f'{prefix}_extra_state'
+                f"{prefix}_extra_state"
             )
         )
 
@@ -1297,11 +1303,11 @@ class RowParallelLinear(torch.nn.Module):
             output_bias = self.bias
         return output, output_bias
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 1}, sharded_offsets
+            state_dict, prefix, {"weight": 1}, sharded_offsets
         )
 
     def set_extra_state(self, state: Any):

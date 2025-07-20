@@ -22,10 +22,14 @@ if xm:
         torch.distributed.ReduceOp.BOR: xm.REDUCE_OR,
     }
 
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
@@ -393,7 +397,7 @@ class _GatherFromSequenceParallelRegion(torch.autograd.Function):
             )
         else:
             assert ctx.output_split_sizes is None
-            return _split_along_first_dim(grad_output, ctx.group), None, None, None, None
+            return (_split_along_first_dim(grad_output, ctx.group), None, None, None, None)
 
 
 class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):

@@ -28,6 +28,13 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 from megatron.core.device_utils import get_current_device, get_xla_model
 
+try:
+    import transformer_engine
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
 xm=get_xla_model()
 
 class TestStaticInferenceEngine:

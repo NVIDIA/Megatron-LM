@@ -10,6 +10,7 @@ from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 
 try:
+    import transformer_engine # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import (
         TEDotProductAttention,
         TELayerNormColumnParallelLinear,

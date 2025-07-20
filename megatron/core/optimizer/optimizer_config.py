@@ -182,9 +182,13 @@ class OptimizerConfig:
         # different for different training precision settings. FP8 cases require different
         # handling while FP8 delayed scaling is an exception because the Adam optimizer in
         # TransformerEngine supports it in the kernel computation.
+        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
         self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
             self.use_precision_aware_optimizer
-            and (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+            and (
+                self.main_params_dtype != torch.float32
+                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+            )
         )
 
         if self.use_precision_aware_optimizer:

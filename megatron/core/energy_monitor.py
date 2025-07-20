@@ -5,6 +5,8 @@
 import torch
 import torch.distributed as dist
 
+from megatron.core.device_utils import get_current_device
+
 try:
     from pynvml import (
         NVMLError,

@@ -25,6 +25,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_device_rng_tracker
 
 try:
+    import transformer_engine  # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import (
             TENorm as WrappedTorchNorm
     )

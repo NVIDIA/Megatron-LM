@@ -4,10 +4,30 @@ import os
 from operator import itemgetter
 from typing import Any, Optional, Tuple, Union
 
-import einops
 import numpy as np
 import torch.distributed as dist
-from absl import logging
+
+try:
+    import einops
+
+    HAVE_EINOPS = True
+except ImportError:
+    HAVE_EINOPS = False
+
+try:
+    from absl import logging
+
+    HAVE_ABSL = True
+except ImportError:
+    import logging
+    import warnings
+
+    logging = logging.getLogger(__name__)
+    warnings.warn(
+        "absl.logging is not installed. Using logging.getLogger(__name__) instead. "
+        "Please install absl.logging with `pip install absl-py` to use absl.logging."
+    )
+    HAVE_ABSL = False
 
 
 class HyperCommGrid:
@@ -179,6 +199,12 @@ class HyperCommGrid:
         Although the function is lightweight enough to be inlined, a standalone one makes it
         easier to test against MCore's RankGenerator
         """
+
+        if not HAVE_EINOPS:
+            raise RuntimeError(
+                "einops is not installed. Please install it with `pip install einops`."
+            )
+
         # Need to reverse order of dim_names to match MCore convention
         dim_names_reverse = self.dim_names[::-1]
 

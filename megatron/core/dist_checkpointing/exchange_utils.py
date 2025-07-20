@@ -22,14 +22,14 @@ from .utils import _sharded_tensor_shard_id, _ShardId, debug_time
 
 # TODO: remove TE references once the TE bug is fixed
 # Check if Transformer Engine has Float8Tensor class
-HAVE_TE_FLOAT8TENSOR = False
+
 try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 
     HAVE_TE_FLOAT8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # Float8Tensor not found
-    pass
+    HAVE_TE_FLOAT8TENSOR = False
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
@@ -120,7 +120,7 @@ def _get_empty_tensor_for_exchange(
     return tensor, orig_device
 
 
-T = TypeVar('T')
+T = TypeVar("T")
 
 
 def distribute_shards_to_ranks(
@@ -174,7 +174,7 @@ def distribute_shards_to_ranks(
         shard_to_saving_rank[shard_id] = rank
         rank_sizes[rank] = (size + shard_to_size[shard_id], rank)
 
-    logger.debug(f'distribute_shards_to_ranks distribution: {rank_sizes}')
+    logger.debug(f"distribute_shards_to_ranks distribution: {rank_sizes}")
 
     return shard_to_saving_rank
 
@@ -302,7 +302,6 @@ def exchange_loaded_tensors_gather_rounds(
     cc_device = get_current_device() if xm is None else torch.device("cpu")
     # Group by dtype so that we all_gather tensors of the same dtype
     for dtype in sorted(set(map(lambda sh_ten: sh_ten.dtype, shard_to_metadata.values())), key=str):
-
         with debug_time(f"dtype_{dtype}"):
             # shards_by_rank maps rank to tensors loaded by this rank
             shards_by_rank: List[List[torch.Tensor]] = [
@@ -311,10 +310,10 @@ def exchange_loaded_tensors_gather_rounds(
             for shard_id, rank in main_rank_for_shard.items():
                 if len(all_ranks_for_shard[shard_id]) == 1:
                     assert all_ranks_for_shard[shard_id][0] == main_rank_for_shard[shard_id], (
-                        f'When there is only 1 ranks that needs a given shard,'
-                        f' it should be the loading rank.'
-                        f' Got: needs [{all_ranks_for_shard[shard_id][0]}]'
-                        f' vs loads [{main_rank_for_shard[shard_id]}]'
+                        f"When there is only 1 ranks that needs a given shard,"
+                        f" it should be the loading rank."
+                        f" Got: needs [{all_ranks_for_shard[shard_id][0]}]"
+                        f" vs loads [{main_rank_for_shard[shard_id]}]"
                     )
                     # Skipping the exchange since only the loading rank needs this tensor
                     # TODO: we can employ some optimizations even for `len(shard_to_ranks) > 1`
@@ -352,6 +351,8 @@ def exchange_loaded_tensors_gather_rounds(
                         # It's ok to keep the nominal dtype after exchange, because TE will handle
                         # this during state dict load.
                         # TODO: remove it once the bug is fixed
+                        from ..fp8_utils import is_float8tensor  # Avoid circular import
+
                         if is_float8tensor(local_ten):
                             try:
                                 local_ten = local_ten.from_float8()
@@ -414,11 +415,11 @@ def exchange_loaded_tensors_gather_object(
 
     # Error checks
     if len(all_loaded_tensors) != sum(map(len, all_loaded_tensors_list)):
-        err_msg = 'Duplicate shard ids loaded by different ranks'
+        err_msg = "Duplicate shard ids loaded by different ranks"
         if torch.distributed.get_rank() == 0:
             logger.error(
-                f'{err_msg}. Shards ids by rank:'
-                f' {[lt.keys() for lt in all_loaded_tensors_list]}'
+                f"{err_msg}. Shards ids by rank:"
+                f" {[lt.keys() for lt in all_loaded_tensors_list]}"
             )
         raise CheckpointingException(err_msg)
 
@@ -445,11 +446,11 @@ def exchange_loaded_objects_gather_object(
 
     # Error checks
     if len(all_loaded_objects) != sum(map(len, all_loaded_objects_list)):
-        err_msg = 'Duplicate shard ids loaded by different ranks'
+        err_msg = "Duplicate shard ids loaded by different ranks"
         if torch.distributed.get_rank() == 0:
             logger.error(
-                f'{err_msg}. Shards ids by rank:'
-                f' {[lt.keys() for lt in all_loaded_objects_list]}'
+                f"{err_msg}. Shards ids by rank:"
+                f" {[lt.keys() for lt in all_loaded_objects_list]}"
             )
         raise CheckpointingException(err_msg)
 
@@ -491,10 +492,10 @@ def exchange_loaded_tensors_broadcast(
     for idx, (shard_id, rank) in enumerate(main_rank_for_shard.items()):
         if len(all_ranks_for_shard[shard_id]) == 1:
             assert all_ranks_for_shard[shard_id][0] == main_rank_for_shard[shard_id], (
-                f'When there is only 1 ranks that needs a given shard,'
-                f' it should be the loading rank.'
-                f'Got: needs [{all_ranks_for_shard[shard_id][0]}]'
-                f' vs loads [{main_rank_for_shard[shard_id]}]'
+                f"When there is only 1 ranks that needs a given shard,"
+                f" it should be the loading rank."
+                f"Got: needs [{all_ranks_for_shard[shard_id][0]}]"
+                f" vs loads [{main_rank_for_shard[shard_id]}]"
             )
             # Skipping the exchange since only the loading rank needs this tensor
             # TODO: we can employ some optimizations even for `len(shard_to_ranks) > 1` case,
@@ -513,6 +514,8 @@ def exchange_loaded_tensors_broadcast(
         # It's ok to keep the nominal dtype after exchange, because TE will handle
         # this during state dict load.
         # TODO: remove it once the bug is fixed
+        from ..fp8_utils import is_float8tensor  # Avoid circular import
+
         if is_float8tensor(local_ten):
             try:
                 local_ten = local_ten.from_float8()
@@ -545,7 +548,7 @@ def exchange_by_distribution(
     unloaded_shards: Dict[_ShardId, ShardedTensor],
     shard_distribution: ShardDistribution,
     parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
-    exchange_algo='broadcast',
+    exchange_algo="broadcast",
 ) -> Dict[_ShardId, torch.Tensor]:
     """Exchange tensors loaded by different ranks using the specified exchange_algo.
 
@@ -566,13 +569,13 @@ def exchange_by_distribution(
             previously loaded tensors (from `loaded_tensors` input)
     """
 
-    assert shard_distribution is not None, 'Expecting distribution to perform exchange'
-    if exchange_algo == 'gather_object':
+    assert shard_distribution is not None, "Expecting distribution to perform exchange"
+    if exchange_algo == "gather_object":
         exchange_fn = exchange_loaded_tensors_gather_object
-    elif exchange_algo == 'gather_rounds':
+    elif exchange_algo == "gather_rounds":
         exchange_fn = exchange_loaded_tensors_gather_rounds
-    elif exchange_algo == 'broadcast':
+    elif exchange_algo == "broadcast":
         exchange_fn = exchange_loaded_tensors_broadcast
     else:
-        raise NotImplementedError(f'Unrecognized gather algorithm: {exchange_algo}')
+        raise NotImplementedError(f"Unrecognized gather algorithm: {exchange_algo}")
     return exchange_fn(loaded_tensors, unloaded_shards, shard_distribution, parallelization_group)

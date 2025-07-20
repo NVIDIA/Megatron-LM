@@ -14,9 +14,12 @@ from megatron.core.utils import (
 )
 from megatron.core.wrapped_process_group import WrappedProcessGroup
 
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+except Exception:
     dist_all_gather_func = torch.distributed._all_gather_base
 
 

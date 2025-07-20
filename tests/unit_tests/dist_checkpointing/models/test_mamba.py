@@ -16,12 +16,17 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
 try: 
+    import transformer_engine  # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import (
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,
     )
     HAVE_TE=True
 except ImportError:
+    from megatron.core.tensor_parallel.layers import (
+        ColumnParallelLinear, 
+        RowParallelLinear
+    )
     HAVE_TE = False
 
 from megatron.core.process_groups_config import ModelCommProcessGroups
@@ -51,9 +56,14 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
-    submodules = MambaMixerSubmodules(
-        in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
-    )
+    if HAVE_TE:
+        submodules = MambaMixerSubmodules(
+            in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
+        )
+    else:
+        submodules = MambaMixerSubmodules(
+            in_proj=ColumnParallelLinear, out_proj=RowParallelLinear
+        )
     model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['tp', 'cp'])
     model = MambaMixer(
         transformer_config,
@@ -70,7 +80,7 @@ def get_pp_offsets():
     pp_size = parallel_state.get_pipeline_model_parallel_world_size()
     return ((0, pp_rank, pp_size),)
 
-@pytest.mark.skipif(not HAVE_TE, reason="Tansformer engine is not available")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Mamba not supported on XLA yet")
 class TestMambaReconfiguration:
     @pytest.mark.parametrize(
         "use_fpsl,src_tp_pp_exp_cp,dest_tp_pp_exp_cp,use_glu",
