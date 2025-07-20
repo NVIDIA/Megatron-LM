@@ -1,29 +1,20 @@
 #!/bin/bash
 
 # from the root of the repo
-# ./run_vlm_train.sh /path/to/custom/dataset /path/to/language/model/checkpoint
+# ./run_avlm_train.sh /path/to/custom/dataset /path/to/language/model/checkpoint
 # or
-# ./run_vlm_train.sh /path/to/custom/dataset (no language model checkpoint)
+# ./run_avlm_train.sh /path/to/custom/dataset (no language model checkpoint)
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 DRY_RUN=false
-GPUS_PER_NODE=2
+GPUS_PER_NODE=8
 NUM_NODES=1
 DEBUG_MODE=false     # Set to true to enable debugging with debugpy-run
 DEBUG_PORT=5678      # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
 
 DATASET_PATH=$1
 PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH=${2:-"None"}
-
-# Conditionally build the language-model-checkpoint CLI flag. If the caller
-# did not supply a second positional argument, `$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH`
-# will be the literal string "None"; in that case we omit the flag entirely so
-# the training script does not receive a bogus path.
-LANGUAGE_MODEL_CKPT_ARG=()
-if [ "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH" != "None" ]; then
-  LANGUAGE_MODEL_CKPT_ARG=(--language-model-checkpoint "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH")
-fi
 
 # Parse command line arguments - only for debug mode
 if [ "$1" = "-d" ]; then
@@ -32,15 +23,21 @@ if [ "$1" = "-d" ]; then
 fi
 
 mbs=8
-gbs=128
+gbs=64
 
-WANDB_PROJECT='mimo-llava-train'
-EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs''
+WANDB_PROJECT='mimo-avlm-train'
+EXP_NAME='mimo_llava_avlm_pretrain_mbs_'$mbs'_gbs_'$gbs''
 
 # for storing checkpoints
-ROOT_DIR='./local/'
-CHECKPOINT_STORE_PATH=$ROOT_DIR'mimo_llava_train_hf_clip_'$EXP_NAME
+ROOT_DIR='./local'
+CHECKPOINT_STORE_PATH=$ROOT_DIR'/mimo_llava_train_hf_clip_hf_whisper_'$EXP_NAME
 mkdir -p $CHECKPOINT_STORE_PATH
+
+LANGUAGE_MODEL_CKPT_ARG=()
+if [ "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH" != "None" ]; then
+  LANGUAGE_MODEL_CKPT_ARG=(--language-model-checkpoint "$PRETRAINED_LANGUAGE_MODEL_CHECKPOINT_PATH")
+fi
+
 
 TENSORBOARD_LOGS_PATH='./logs'
 mkdir -p $TENSORBOARD_LOGS_PATH
@@ -51,7 +48,7 @@ DISTRIBUTED_ARGS=(
 )
 
 MODEL_PARALLEL_ARGS=(
-	--tensor-model-parallel-size 1
+	--tensor-model-parallel-size 8
 	--pipeline-model-parallel-size 1
 )
 
@@ -68,7 +65,7 @@ TRAINING_ARGS=(
     --lr-decay-iters 2200 
     --auto-detect-ckpt-format
     --accumulate-allreduce-grads-in-fp32
-    --model-provider llava_vlm
+    --model-provider llava_avlm
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -76,6 +73,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 2000 
     --eval-interval 20000 
     --save $CHECKPOINT_STORE_PATH 
+    --load $CHECKPOINT_STORE_PATH 
     --eval-iters 30
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
     --wandb-project $WANDB_PROJECT
@@ -93,7 +91,7 @@ TOKENIZER_ARGS=(
 # Dataset args
 DATASET_ARGS=(
     --dataloader-type external
-    --dataset-provider llava_vlm
+    --dataset-provider llava_avlm
     --data-path $DATASET_PATH
 )
 
@@ -107,6 +105,13 @@ GPT_MODEL_ARGS=(
     --position-embedding-type rope
 )
 
+# Audio model args
+AUDIO_MODEL_ARGS=(
+    --audio-encoder-model 'openai/whisper-base'
+    --hf-assign-unused-tokens '<audio>,32002'
+)
+
+
 # Run the training script based on configuration
 if [ "$DEBUG_MODE" = true ]; then
   echo "Running in debug mode with $GPUS_PER_NODE GPU(s) per node..."
@@ -117,6 +122,7 @@ if [ "$DEBUG_MODE" = true ]; then
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
+    ${AUDIO_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}
 else
   echo "Running in normal mode with $GPUS_PER_NODE GPU(s) per node..."
@@ -128,6 +134,7 @@ else
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
+    ${AUDIO_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}"
   else
     torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py \
@@ -136,6 +143,7 @@ else
     ${EVAL_AND_LOGGING_ARGS[@]} \
     ${TOKENIZER_ARGS[@]} \
     ${GPT_MODEL_ARGS[@]} \
+    ${AUDIO_MODEL_ARGS[@]} \
     ${DATASET_ARGS[@]}
   fi
 fi

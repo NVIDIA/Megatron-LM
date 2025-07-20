@@ -21,10 +21,12 @@ from megatron.core.parallel_state import (
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
+from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
 from data.mock import (
     train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
 )
+from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
 from utils.data_helpers import broadcast_nested_data_batch
@@ -36,12 +38,14 @@ _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
     "llava_vlm": model_provider_llava_vlm,
     "video_llava_vlm": partial(model_provider_llava_vlm, is_video_input=True),
+    "llava_avlm": model_provider_llava_avlm,
 }
 
 _DATASET_PROVIDERS = {
     "mock": mock_train_valid_test_datasets_provider,
     "llava_vlm": llava_vlm_dataloader_provider,
     "video_llava_vlm": partial(llava_vlm_dataloader_provider, is_video_input=True),
+    "llava_avlm": llava_avlm_dataloader_provider,
 }
 
 def add_mimo_args(parser):
@@ -49,8 +53,8 @@ def add_mimo_args(parser):
     group = parser.add_argument_group('MIMO', 'MIMO specific arguments')
 
     # MIMO-specific parameters
-    group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm]')
-    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm]')
+    group.add_argument('--dataset-provider', type=str, default='mock', help='Dataset provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
+    group.add_argument('--model-provider', type=str, default='mock', help='Model provider to choose from [mock, llava_vlm, video_llava_vlm, llava_avlm]')
 
     # mock dataloader related args
     # can control mock samples with total seq length and image seq length
@@ -60,6 +64,14 @@ def add_mimo_args(parser):
     group.add_argument('--image-token-id', type=int, default=32000, help='Image token ID')
     group.add_argument(
         '--image-seq-length', type=int, default=197, help='Number of image tokens to pad'
+    )
+    group.add_argument(
+        '--audio-encoder-model', type=str, default=None, help='Audio encoder model name'
+    )
+    group.add_argument(
+        '--hf-assign-unused-tokens', type=str, nargs='+', default=None,
+                       help='Assigning unused tokens to special tokens. Example: '
+                       '--hf-assign-unused-tokens "<audio>,32002" "<video>,32003"'
     )
     # checkpoint related args
     group.add_argument('--language-model-checkpoint', type=str, default=None, help='Path to language model checkpoint to load')
@@ -122,7 +134,6 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # For the modality inputs, the keys can be arbitrary
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
-
     batch = broadcast_nested_data_batch(data)
     return batch
 
@@ -186,7 +197,8 @@ def model_provider(
     post_process: bool = True,
     add_encoder: bool = True,
     add_decoder: bool = True,
-    special_token_id: int = 32000,
+    image_special_token_id: int = 32000,
+    audio_special_token_id: int = 32002,
 ):
     """Model provider for MIMO model training.
 
@@ -195,7 +207,8 @@ def model_provider(
         post_process: Whether to post-process the model
         add_encoder: Whether to add an encoder to the model (not supported yet)(default: True)
         add_decoder: Whether to add a decoder to the model (not supported yet)(default: True)
-        special_token_id: Special token ID for the model (default: 32000)
+        image_special_token_id: Special token ID for the image modality (default: 32000)
+        audio_special_token_id: Special token ID for the audio modality (default: 32002)
     """
     runtime_args = get_args()
 
@@ -207,12 +220,24 @@ def model_provider(
             f"Available providers: {list(_MODEL_PROVIDERS.keys())}"
         ) from e
 
+    if runtime_args.model_provider == "llava_vlm":
+        kwargs = {
+            "image_special_token_id": image_special_token_id,
+        }
+    elif runtime_args.model_provider == "llava_avlm":
+        kwargs = {
+            "image_special_token_id": image_special_token_id,
+            "audio_special_token_id": audio_special_token_id,
+        }
+    else:
+        raise ValueError(f"Unknown model provider: {runtime_args.model_provider}. Must be one of ['llava_vlm', 'llava_avlm', 'mock]")
+
     return builder_fn(
         pre_process,
         post_process,
         add_encoder,
         add_decoder,
-        special_token_id,
+        **kwargs,
     )
 
 
