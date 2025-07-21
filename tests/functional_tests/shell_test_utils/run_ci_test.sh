@@ -198,7 +198,7 @@ for i in $(seq 1 $N_REPEAT); do
         # Read test values from Tensorboard for non-inference tests.
         # Inference tests will load from JSON instead.
         if [[ "$MODE" == "pretraining" ]]; then
-            python3 $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+            uv run python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                 --logs-dir $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
@@ -229,7 +229,7 @@ for i in $(seq 1 $N_REPEAT); do
 
     # For pretraining jobs
     if [[ "$MODE" == "pretraining" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
-        pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
+        uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
             --golden-values-path $GOLDEN_VALUES_PATH \
             --tensorboard-path $TENSORBOARD_PATH \
             --train-iters $TRAIN_ITERS \
@@ -238,7 +238,7 @@ for i in $(seq 1 $N_REPEAT); do
 
         if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
             echo "Running pytest 1st vs 2nd run comparison"
-            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
+            uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
                 --tensorboard-path $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --model-config-path ${TRAINING_PARAMS_PATH} \
@@ -249,7 +249,7 @@ for i in $(seq 1 $N_REPEAT); do
     # For inference jobs
     if [[ "$MODE" == "inference" ]]; then
         if [[ "$TEST_TYPE" == "frozen-start" ]]; then
-            pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
+            uv run pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                 --golden-values-path $GOLDEN_VALUES_PATH \
                 --test-values-path $TENSORBOARD_PATH \
                 --model-config-path ${TRAINING_PARAMS_PATH} \

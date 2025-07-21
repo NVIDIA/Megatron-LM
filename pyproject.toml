@@ -67,14 +67,15 @@ mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb"]
 
 dev = [
     "tqdm",
-    "einops",
-    "tensorstore!=0.1.46,!=0.1.72",
-    "nvtx",
-    "transformers",
-    "multi-storage-client",
+    "einops~=0.8",
+    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
+    "nvtx~=0.2",
+    "transformers~=4.53",
+    "multi-storage-client~=0.20.3",
+    "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
-    "nvidia-modelopt[torch]~=0.31.0; sys_platform != 'darwin'",
-    "megatron-energon[av_decode]<7",
+    "nvidia-modelopt[torch]>=0.31.0a0,<0.32.0; sys_platform != 'darwin'",
+    "megatron-energon[av_decode]~=6.0",
 ]
 
 lts = [
@@ -92,7 +93,7 @@ test = [
     "coverage",
     "nltk",
     "wrapt",
-    "pytest",
+    "pytest==8.3.5",
     "pytest-mock",
     "pytest-cov",
     "pytest-random-order",
