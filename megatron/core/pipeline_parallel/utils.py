@@ -325,6 +325,7 @@ class VppContextManager:
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     """Unwrap_model to return the final model instance"""
     from megatron.core.models.gpt.gpt_model import GPTModel
+
     return_list = True
     if not isinstance(model, list):
         model = [model]
