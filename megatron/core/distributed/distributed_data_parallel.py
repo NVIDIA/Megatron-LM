@@ -495,6 +495,17 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
             if param in self.param_to_bucket_group:
+                # Skip wgrad accumulation and reduce if the param has been marked to skip
+                # Senario 1: For TE Linear modules, if the wgrad computation is delayed,
+                #   we set skip_wgrad_accumulation_and_reduce to True in backward pass,
+                #   so the wgrad accumulation and reduce will be skipped.
+                # Senario 2: For TE Linear modules, in backward_dw(), we call the post_backward_hook
+                #   with skip_wgrad_accumulation_and_reduce set to False,
+                #   so the wgrad accumulation and reduce will be performed.
+                # Senario 3: For other modules, we don't set the skip_wgrad_accumulation_and_reduce
+                #   for params, so the wgrad accumulation and reduce will be performed.
+                if getattr(param, 'skip_wgrad_accumulation_and_reduce', False):
+                    return
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
                     assert (

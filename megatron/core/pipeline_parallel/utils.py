@@ -13,6 +13,7 @@ from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as cu
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import make_viewless_tensor
+from megatron.core.extensions.transformer_engine import TE_MODULE_CLASSNAMES
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -283,3 +284,20 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     if not return_list:
         return unwrapped_model[0]
     return unwrapped_model
+
+def register_wgrad_accumulation_and_reduce_func(model):
+    """Register the wgrad accumulation and reduce function for the TE modules"""
+    if not isinstance(model, list):
+        model = [model]
+    for i in range(len(model)):
+        assert isinstance(model[i], DDP), "Only DDP wrapper is supported now."
+    unwrapped_model = unwrap_model(model)
+    for i in range(len(unwrapped_model)):
+        for name, module in unwrapped_model[i].named_modules():
+            if isinstance(module, TE_MODULE_CLASSNAMES):
+                register_wgrad_accumulation_and_reduce_func = getattr(
+                    module, 'register_wgrad_accumulation_and_reduce_func'
+                )
+                assert register_wgrad_accumulation_and_reduce_func is not None, \
+                    f"register_wgrad_accumulation_and_reduce_func is not found for {name}"
+                register_wgrad_accumulation_and_reduce_func(model[i]._make_backward_post_hook)

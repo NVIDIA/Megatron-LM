@@ -46,6 +46,8 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
+TE_MODULE_CLASSNAMES = (te.pytorch.Linear, te.pytorch.LayerNormLinear, te.pytorch.GroupedLinear)
+
 
 def _get_extra_te_kwargs(config: TransformerConfig):
     extra_transformer_engine_kwargs = {"params_dtype": config.params_dtype}

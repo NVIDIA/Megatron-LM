@@ -1051,8 +1051,8 @@ def validate_args(args, defaults={}):
     if args.delay_wgrad_compute:
         assert args.transformer_impl == 'transformer_engine', \
             "Delaying wgrad compute is only supported with transformer_engine implementation"
-        assert not args.overlap_grad_reduce, \
-            "Delaying wgrad compute is not supported with overlap_grad_reduce"
+        # assert not args.overlap_grad_reduce, \
+        #     "Delaying wgrad compute is not supported with overlap_grad_reduce"
 
     if args.mtp_num_layers:
         assert not args.use_legacy_models, "The legacy Megatron models does not support Multi-Token Prediction (MTP)."
