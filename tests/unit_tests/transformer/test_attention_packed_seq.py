@@ -16,7 +16,7 @@ from tests.unit_tests.test_utilities import Utils
 def make_test_packed_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
+    max_seqlen = seqlens.max().item()
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
@@ -31,7 +31,7 @@ def make_test_packed_padded_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 18, 44, 52, 96, 118]).cuda()
     cu_seqlens_padded = torch.IntTensor([0, 20, 48, 56, 100, sequence_length]).cuda()
     seqlens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
+    max_seqlen = seqlens.max().item()
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,

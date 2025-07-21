@@ -193,7 +193,7 @@ class RotaryEmbedding(nn.Module):
         packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> float:
+    ) -> int:
         """Function to get the rotary sequence length.
 
         Args:
@@ -205,7 +205,7 @@ class RotaryEmbedding(nn.Module):
             packed_seq_params (PackedSeqParams): Packed sequence params
 
         Returns:
-            float: The rotary sequence length
+            int: The rotary sequence length
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
