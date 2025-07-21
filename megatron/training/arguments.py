@@ -1049,9 +1049,10 @@ def validate_args(args, defaults={}):
             assert is_te_min_version("2.7.0"), (
                 "overlap_grad_reduce is only supported with TE >= 2.7.0 when enabling delay_wgrad_compute"
             )
-        if args.gradient_accumulation_fusion:
+        if not args.gradient_accumulation_fusion:
             assert is_te_min_version("2.7.0"), (
-                "gradient_accumulation_fusion is only supported with TE >= 2.7.0 when enabling delay_wgrad_compute"
+                "disabling gradient_accumulation_fusion is only supported with TE >= 2.7.0 "
+                "when enabling delay_wgrad_compute"
             )
 
     if args.mtp_num_layers:
