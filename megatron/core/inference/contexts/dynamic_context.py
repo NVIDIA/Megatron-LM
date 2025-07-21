@@ -305,6 +305,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             chunk_count_total=chunk_count_total, gtd_chunk_count=self.gtd_chunk_count
         )
 
+        # Optional SSM state dictionary for hybrid models
+        self.ssm_state = {}
+
         # Store the dummy chunk idx reference for convenience
         self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
         # Reset attention state.
@@ -357,6 +360,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         total_active_requests = self.total_request_count - self.paused_request_count
         return total_active_requests == self.active_token_count
+
+    def is_prefill_only(self) -> bool:
+        """Test if all active requests are in prefill phase."""
+        total_active_requests = self.total_request_count - self.paused_request_count
+        return total_active_requests == 0 or self.get_active_sequence_lengths().min() > 1
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""

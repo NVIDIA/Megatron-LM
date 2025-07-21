@@ -396,14 +396,20 @@ class MambaMixer(MegatronModule):
 
         conv_state, ssm_state = None, None
         if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()
-            ), "Mamba does not currently support dynamic inference batching."
             assert not self.config.sequence_parallel
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
-            if inference_context.seqlen_offset > 0:
+            if (
+                inference_context.is_static_batching() and not inference_context.is_prefill_only()
+            ) or (inference_context.is_dynamic_batching() and inference_context.is_decode_only()):
                 # The states are updated inplace
-                out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
+                if inference_context.is_dynamic_batching():
+                    hidden_states = hidden_states.unsqueeze(0)
+                    cache_seqlens, _ = inference_context.cu_query_lengths()
+                else:
+                    cache_seqlens = None
+                out, out_bias, _, _ = self.step(
+                    hidden_states, conv_state, ssm_state, cache_seqlens=cache_seqlens
+                )
                 return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -546,7 +552,7 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def step(self, hidden_states, conv_state, ssm_state):
+    def step(self, hidden_states, conv_state, ssm_state, cache_seqlens=None):
         """
         Performs inference step for decoding
         """
@@ -560,7 +566,7 @@ class MambaMixer(MegatronModule):
         #  b d_model --> b p(2d)
         zxBCdt, _ = self.in_proj(hidden_states)
 
-        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
+        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
         z, xBC, dt = torch.split(
             zxBCdt,
@@ -589,6 +595,7 @@ class MambaMixer(MegatronModule):
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
                 self.activation,
+                cache_seqlens=cache_seqlens,
             )
 
         x, B, C = torch.split(
@@ -669,6 +676,7 @@ class MambaMixer(MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=dt_bias,
                 dt_softplus=True,
+                cache_seqlens=cache_seqlens,
             )
             y = rearrange(y, "b h p -> b (h p)")
 
@@ -713,7 +721,14 @@ class MambaMixer(MegatronModule):
         assert inference_context is not None
         assert self.layer_number is not None
         if (
-            self.layer_number not in inference_context.key_value_memory_dict
+            (
+                inference_context.is_static_batching()
+                and self.layer_number not in inference_context.key_value_memory_dict
+            )
+            or (
+                not inference_context.is_static_batching()
+                and self.layer_number not in inference_context.ssm_state
+            )
             or batch_size != self.cached_batch_size
         ):
             conv_state = torch.zeros(
@@ -731,14 +746,19 @@ class MambaMixer(MegatronModule):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
+            if inference_context.is_static_batching():
+                inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
+            else:
+                inference_context.ssm_state[self.layer_number] = (conv_state, ssm_state)
             self.cached_batch_size = batch_size
         else:
-            conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
-            # TODO: Remove reference to `inference_context.sequence_len_offset` for dynamic batching
-            if inference_context.sequence_len_offset == 0:
-                conv_state.zero_()
-                ssm_state.zero_()
+            if inference_context.is_static_batching():
+                conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
+            else:
+                conv_state, ssm_state = inference_context.ssm_state[self.layer_number]
+        if inference_context.is_prefill_only():
+            conv_state.zero_()
+            ssm_state.zero_()
         return conv_state, ssm_state
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):

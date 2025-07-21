@@ -287,10 +287,7 @@ class MambaStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if inference_context:
-            assert (
-                inference_context.is_static_batching()
-            ), "Mamba currently does not support dynamic inference batching."
+        if inference_context and inference_context.is_static_batching():
             # NOTE(bnorick): match BaseInferenceContext attributes for
             # mamba_ssm.utils.generation.BaseInferenceContext,
             # this hack supports eval
@@ -321,8 +318,10 @@ class MambaStack(MegatronModule):
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
+        print(f"decoder_input shape: {hidden_states.shape}")
+
         with outer_fp8_context:
-            for layer in self.layers:
+            for l_no, layer in enumerate(self.layers):
                 inner_fp8_context = (
                     get_fp8_context(self.config, layer.layer_number - 1)
                     if use_inner_fp8_context
@@ -349,6 +348,8 @@ class MambaStack(MegatronModule):
                 # for cross-attention, and is not needed in our model.
                 if isinstance(hidden_states, tuple):
                     hidden_states = hidden_states[0]
+
+                print(f"Output of layer {l_no} hidden_states shape: {hidden_states.shape}")
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:

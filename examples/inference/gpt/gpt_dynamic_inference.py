@@ -27,7 +27,8 @@ sys.path.append(
 )
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
-from pretrain_gpt import model_provider
+from pretrain_gpt import model_provider as gpt_model_provider
+from pretrain_mamba import model_provider as mamba_model_provider
 import json
 
 from examples.inference.gpt.utils import (
@@ -59,7 +60,12 @@ def get_model() -> MegatronModule:
     args = get_args()
 
     # Build model.
-    model = _get_model(model_provider, wrap_with_ddp=False)
+    if args.model_provider == "gpt":
+        model = _get_model(gpt_model_provider, wrap_with_ddp=False)
+    elif args.model_provider == "mamba":
+        model = _get_model(mamba_model_provider, wrap_with_ddp=False)
+    else:
+        raise ValueError(f"Unknown model provider {args.model_provider}")
 
     # Load checkpoint.
     assert args.load is not None
@@ -90,6 +96,8 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
     max_gen_length = sampling_params.num_tokens_to_generate
     max_context_length = max(len(r.prompt_tokens) for r in requests)
     max_sequence_length = max_context_length + max_gen_length
+
+    # TODO(ksanthanam): Only initialize KV state for Transformer layers
 
     # Inference context.
     context = DynamicInferenceContext(
