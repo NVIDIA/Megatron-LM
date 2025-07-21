@@ -317,7 +317,7 @@ def combined_forward_backward_step(
     # For the TE modules including Linear, LayerNormLinear, GroupedLinear,
     # we need to manually set the wgrad accumulation and reduce function for the backward pass
     # so that the wgrad accumulation and reduce could be launched in the backward_dw() function.
-    if b_model is not None:
+    if config.delay_wgrad_compute and b_model is not None:
         register_wgrad_accumulation_and_reduce_func(b_model)
 
     # build the schedule plan and get loss function for forward step

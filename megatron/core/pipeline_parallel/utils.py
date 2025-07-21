@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
@@ -353,10 +354,12 @@ def register_wgrad_accumulation_and_reduce_func(model):
     for i in range(len(unwrapped_model)):
         for name, module in unwrapped_model[i].named_modules():
             if isinstance(module, TE_MODULE_CLASSNAMES):
-                register_wgrad_accumulation_and_reduce_func = getattr(
-                    module, 'register_wgrad_accumulation_and_reduce_func'
-                )
-                assert (
-                    register_wgrad_accumulation_and_reduce_func is not None
-                ), f"register_wgrad_accumulation_and_reduce_func is not found for {name}"
-                register_wgrad_accumulation_and_reduce_func(model[i]._make_backward_post_hook)
+                if hasattr(module, 'register_wgrad_accumulation_and_reduce_func'):
+                    module.register_wgrad_accumulation_and_reduce_func(
+                        model[i]._make_backward_post_hook
+                    )
+                else:
+                    warnings.warn(
+                        f"register_wgrad_accumulation_and_reduce_func is not found for {name}, "
+                        "skip the registration"
+                    )
