@@ -28,6 +28,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
+    get_pg_size,
     is_fa_min_version,
     nvtx_range_pop,
     nvtx_range_push,
@@ -135,7 +136,7 @@ class Attention(MegatronModule, ABC):
         self.model_comm_pgs = model_comm_pgs
 
         # Per attention head and per partition values
-        world_size = self.model_comm_pgs.tp.size()
+        world_size = get_pg_size(self.model_comm_pgs.tp)
         self.hidden_size_per_attention_head = divide(
             self.query_projection_size, self.config.num_attention_heads
         )

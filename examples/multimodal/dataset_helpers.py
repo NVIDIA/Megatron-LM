@@ -334,7 +334,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             try:
                 encoded_sample = self.encode_llava_sft(sample, truncate_for_sample_list_packing=True)
                 if current_length + encoded_sample.total_len > self.packing_seq_length:
-                    print(f"Encoding list of samples: stopped at {idx+1} samples to stick to {self.packing_seq_length}. Last sample key: {sample.__key__}")
+                    print(f"Encoding list of samples: stopped at {idx} samples to stick to {self.packing_seq_length}. Last sample key: {sample.__key__}")
                     break
                 else:
                     encoded_samples.append(encoded_sample)
@@ -832,7 +832,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         """Selects which samples will be packed together.
 
         NOTE: Energon dataloader calls this method internally if packing is used.
-        Please see https://nvidia.github.io/Megatron-Energon/packing.html
+        Please see https://nvidia.github.io/Megatron-Energon/advanced/packing.html
         """
         lengths = [sample.total_len for sample in samples]
 
@@ -846,7 +846,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         Function to pack a list of ImageTaskSample into a single ImageTaskSamplePacked.
 
         NOTE: Energon dataloader calls this method internally if packing is used.
-        Please see https://nvidia.github.io/Megatron-Energon/packing.html
+        Please see https://nvidia.github.io/Megatron-Energon/advanced/packing.html
 
         Args:
             samples: List of ImageTaskSample instances to pack into one sample.

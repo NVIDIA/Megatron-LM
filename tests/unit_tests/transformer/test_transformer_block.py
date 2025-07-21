@@ -9,6 +9,7 @@ from packaging import version
 
 from megatron.core import mpu, parallel_state
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ModelCommProcessGroups
@@ -261,13 +262,17 @@ class TestProcessGroupTransformerBlock:
         )
         model_parallel_cuda_manual_seed(123)
         if use_custom_pg:
-            # Create custom process groups
-            device_mesh = torch.distributed.init_device_mesh(
-                "cuda", (dp_size, tp_size, cp_size), mesh_dim_names=("dp", "tp", "cp")
-            )
-            # Get process groups from device mesh
-            tp_group = device_mesh.get_group(mesh_dim="tp")
-            cp_group = device_mesh.get_group(mesh_dim="cp")
+            # Initialize torch.distributed if not already initialized
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(backend='nccl')
+
+            # Create HyperCommGrid with dimensions cp, tp, dp (reversed from device mesh order)
+            grid = HyperCommGrid([cp_size, tp_size, dp_size], ["cp", "tp", "dp"])
+
+            # Get process groups from HyperCommGrid
+            tp_group = grid.create_pg("tp")
+            cp_group = grid.create_pg("cp")
+
             # Create ModelCommProcessGroups with custom process groups
             model_comm_pgs = ModelCommProcessGroups(tp=tp_group, cp=cp_group)
         else:

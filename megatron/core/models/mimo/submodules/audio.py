@@ -76,6 +76,7 @@ class AudioModalitySubmodules(ModalitySubmodules):
             if encoder_outputs.ndim == 3:
                 # its b,s,h -> we need to flatten it to b*s,h
                 encoder_outputs = encoder_outputs.reshape(-1, encoder_outputs.size(-1))
+                embeddings.append(encoder_outputs)
             elif encoder_outputs.ndim == 2:
                 # its b*s,h -> encoder already returned the flattened output
                 embeddings.append(encoder_outputs)

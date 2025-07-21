@@ -37,10 +37,6 @@ logger = logging.getLogger(__name__)
 def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
     pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
-    if not parallel_state.is_inside_encoder():
-        pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
-        if pp_decoder_start is not None:
-            pipeline_rank = pipeline_rank - pp_decoder_start
 
     if config.pipeline_model_parallel_size > 1:
 
@@ -582,6 +578,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             self.config.mlp_chunks_for_prefill > 1
             and inference_context is not None
             and not inference_context.is_decode_only()
+            and not isinstance(self.mlp, IdentityOp)
         )
 
         if self.recompute_mlp:

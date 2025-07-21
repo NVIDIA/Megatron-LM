@@ -1,8 +1,17 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import tensorrt_llm
 
 from megatron.core.export.model_type import ModelType
+
+try:
+    import tensorrt_llm
+
+    HAVE_TRTLLM = True
+except ImportError:
+    from unittest.mock import MagicMock
+
+    tensorrt_llm = MagicMock()
+    HAVE_TRTLLM = False
 
 TRT_MODEL_CONFIG = {
     ModelType.gpt: tensorrt_llm.models.gpt.config.GPTConfig,

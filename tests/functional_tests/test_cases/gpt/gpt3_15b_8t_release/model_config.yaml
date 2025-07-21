@@ -86,6 +86,7 @@ MODEL_ARGS:
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   # Add mixed precision args
   --bf16: true
+  --exit-interval: 51000
 METRICS:
   - "iteration-time"
   - "lm loss"

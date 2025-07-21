@@ -2,6 +2,7 @@
 
 Megatron-LM & Megatron-Core
 ===========================
+
 <h4>GPU optimized techniques for training transformer models at-scale</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
@@ -12,7 +13,7 @@ Megatron-LM & Megatron-Core
 
 # Latest News
 
-- **[2024/7]** Megatron-Core v0.7 improves scalability and training resiliency and adds support for multimodal training ([blog](https://developer.nvidia.com/blog/train-generative-ai-models-more-efficiently-with-new-nvidia-megatron-core-functionalities/)). 
+- **[2024/7]** Megatron-Core v0.7 improves scalability and training resiliency and adds support for multimodal training ([blog](https://developer.nvidia.com/blog/train-generative-ai-models-more-efficiently-with-new-nvidia-megatron-core-functionalities/)).
 - **[2024/6]** Megatron-Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
 - **[2024/1 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron-Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron-Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs. Explore the [Megatron-Core intro](#megatron-core) for more details.
 
@@ -68,20 +69,23 @@ Megatron-LM & Megatron-Core
 - [Projects Using Megatron](#projects-using-megatron)
 
 # Megatron Overview
+
 This repository comprises two essential components: **Megatron-LM** and **Megatron-Core**. Megatron-LM serves as a research-oriented framework leveraging Megatron-Core for large language model (LLM) training. Megatron-Core, on the other hand, is a library of GPU optimized training techniques that comes with formal product support including versioned APIs and regular releases. You can use Megatron-Core alongside Megatron-LM or [Nvidia NeMo Framework](https://docs.nvidia.com/deeplearning/nemo/user-guide/docs/en/main/nlp/nemo_megatron/mcore_customization.html) for an end-to-end and cloud-native solution. Alternatively, you can integrate Megatron-Core's building blocks into your preferred training framework.
 
 ## Megatron-LM
+
 First introduced in 2019, Megatron ([1](https://arxiv.org/pdf/1909.08053.pdf), [2](https://arxiv.org/pdf/2104.04473.pdf), and [3](https://arxiv.org/pdf/2205.05198)) sparked a wave of innovation in the AI community, enabling researchers and developers to utilize the underpinnings of this library to further LLM advancements. Today, many of the most popular LLM developer frameworks have been inspired by and built directly leveraging the open-source Megatron-LM library, spurring a wave of foundation models and AI startups. Some of the most popular LLM frameworks built on top of Megatron-LM include [Colossal-AI](https://github.com/hpcaitech/ColossalAI), [HuggingFace Accelerate](https://github.com/huggingface/accelerate), and [NVIDIA NeMo Framework](https://www.nvidia.com/en-us/ai-data-science/generative-ai/nemo-framework/). A list of projects that have directly used Megatron can be found [here](#projects-using-megatron).
 
 ## Megatron-Core
-Megatron-Core is an open-source PyTorch-based library that contains GPU-optimized techniques and cutting-edge system-level optimizations. It abstracts them into composable and modular APIs, allowing full flexibility for developers and model researchers to train custom transformers at-scale on NVIDIA accelerated computing infrastructure. This library is compatible with all NVIDIA Tensor Core GPUs, including FP8 acceleration support for [NVIDIA Hopper architectures](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/). 
 
-Megatron-Core offers core building blocks such as attention mechanisms, transformer blocks and layers, normalization layers, and embedding techniques. Additional functionality like activation recomputation, distributed checkpointing is also natively built-in to the library. The building blocks and functionality are all GPU optimized, and can be built with advanced parallelization strategies for optimal training speed and stability on NVIDIA Accelerated Computing Infrastructure. Another key component of the Megatron-Core library includes advanced model parallelism techniques (tensor, sequence, pipeline, context, and MoE expert parallelism). 
+Megatron-Core is an open-source PyTorch-based library that contains GPU-optimized techniques and cutting-edge system-level optimizations. It abstracts them into composable and modular APIs, allowing full flexibility for developers and model researchers to train custom transformers at-scale on NVIDIA accelerated computing infrastructure. This library is compatible with all NVIDIA Tensor Core GPUs, including FP8 acceleration support for [NVIDIA Hopper architectures](https://www.nvidia.com/en-us/data-center/technologies/hopper-architecture/).
+
+Megatron-Core offers core building blocks such as attention mechanisms, transformer blocks and layers, normalization layers, and embedding techniques. Additional functionality like activation recomputation, distributed checkpointing is also natively built-in to the library. The building blocks and functionality are all GPU optimized, and can be built with advanced parallelization strategies for optimal training speed and stability on NVIDIA Accelerated Computing Infrastructure. Another key component of the Megatron-Core library includes advanced model parallelism techniques (tensor, sequence, pipeline, context, and MoE expert parallelism).
 
 Megatron-Core can be used with [NVIDIA NeMo](https://www.nvidia.com/en-us/ai-data-science/products/nemo/), an enterprise-grade AI platform. Alternatively, you can explore Megatron-Core with the native PyTorch training loop [here](https://github.com/NVIDIA/Megatron-LM/tree/main/examples). Visit [Megatron-Core documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html) to learn more.
 
-
 # Training Speed and Scalability
+
 Our codebase is capable of efficiently training large language models (i.e., models with hundreds of billions of parameters) with both model and data parallelism. To demonstrate how our software scales with multiple GPUs and model sizes, we consider GPT models ranging from 2 billion parameters to 462 billion parameters. All models use a vocabulary size of 131,072 and a sequence length of 4096. We vary hidden size, number of attention heads, and number of layers to arrive at a specific model size. As the model size increases, we also modestly increase batch size. Our experiments use up to 6144 [H100](https://www.nvidia.com/en-us/data-center/h100/) GPUs. We perform fine-grained overlapping of data-parallel (`--overlap-grad-reduce --overlap-param-gather`), tensor-parallel (`--tp-comm-overlap`) and pipeline-parallel communication (enabled by default) with computation to improve scalability. The reported throughputs are measured for end-to-end training and include all operations including data loading, optimizer steps, communication, and even logging. Note that we did not train these models to convergence.
 
 ![Model table](images/model_table.png)
@@ -94,21 +98,24 @@ We also strong scaled the standard GPT-3 model (our version has slightly more th
 
 ![Strong scaling](images/strong_scaling.png)
 
-
 # Setup
 
-## Docker (Recommended)
+## Prerequisites
 
-We strongly recommend using the previous release of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability. This container comes with all dependencies pre-installed with compatible versions and optimized configurations for NVIDIA GPUs. 
+Megatron-LM and Megatron-Core requires the following upstream dependencies for best performance:
 
-```bash
-# Pull the previous NGC container (replace 25.04 with the previous month's version)
-docker pull nvcr.io/nvidia/pytorch:25.04-py3
-```
+- PyTorch (latest stable version)
+- CUDA, cuDNN, NCCL (latest stable versions)
+- Support for FP8 on NVIDIA Hopper, Ada, and Blackwell GPUs
+- For best performance, use NVIDIA Turing GPU architecture generations and later
+
+### Docker (Recommended)
+
+We strongly recommend using the previous release of [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) rather than the latest one. Our releases are always based on the previous month's NGC container, so this ensures compatibility and stability. This container comes with all dependencies pre-installed with compatible versions and optimized configurations for NVIDIA GPUs.
 
 ```bash
 # Run container with mounted directories
-docker run --gpus all -it --rm \
+docker run --runtime --nvidia --gpus all -it --rm \
   -v /path/to/megatron:/workspace/megatron \
   -v /path/to/dataset:/workspace/dataset \
   -v /path/to/checkpoints:/workspace/checkpoints \
@@ -117,23 +124,52 @@ docker run --gpus all -it --rm \
 
 ## Installation Options
 
-### Prerequisites
+Megatron-Core offers support for two NGC PyTorch environments: A moving head that supports the most recent
+upstream dependencies is referred to as `dev` in the following, and a long-term support of NGC PyTorch 24.01
+is referred to as `lts`.
 
-- PyTorch (latest stable version)
-- CUDA, cuDNN, NCCL (latest stable versions)
-- Support for FP8 on NVIDIA Hopper, Ada, and Blackwell GPUs
-- For best performance, use NVIDIA Turing GPU architecture generations and later
+Both environments can be combined with `mlm` which adds package dependencies for Megatron-LM on top of Megatron-Core.
 
 ### Install from PyPI
 
-To install the latest stable version with pip:
+Megatron-Core is available on PyPi. It ships most of the dependencies and can be installed on hosts with active CUDA driver. Run the following command to fetch and install it with pip:
 
 ```bash
 # Install the latest release
-pip install megatron-core
+pip install megatron-core[dev]
+```
+
+```bash
+# Install packages for LTS support NGC PyTorch 24.01
+pip install megatron-core[lts]
+```
+
+For a version of Megatron-Core with minimal dependencies (only torch), run:
+
+```bash
+pip install mnegatron-core
+```
+
+For dependencies required by Megatron-LM, please run:
+
+```bash
+pip install megatron-core[mlm]
 ```
 
 ### Install from Source
+
+For Hybrid models, Megatron-Core requires [mamba](https://github.com/state-spaces/mamba). If the pre-built wheel in PyPi does not fit your environment, you can fall back to an install-script Megatron-Core uses in its CI system. For this, please install `uv` first:
+
+```bash
+export UV_VERSION=0.7.2
+export PATH="$HOME/.local/bin:$PATH"
+curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh | sh
+export UV_PROJECT_ENVIRONMENT=./venv
+export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
+export UV_LINK_MODE=copy
+```
+
+Run the following command to build upstream dependencies from source:
 
 ```bash
 # Clone the repository
@@ -141,13 +177,13 @@ git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
 
 # Optionally checkout a specific release
-git checkout v0.11.0
+git checkout core_r0.13.0rc0
 
-# Install in development mode
-pip install -e .
+bash docker/common/install.sh --environment {dev,lts}
 ```
 
 ## Downloading Checkpoints
+
 We have provided pretrained [BERT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_bert_345m) and [GPT-345M](https://ngc.nvidia.com/catalog/models/nvidia:megatron_lm_345m) checkpoints to evaluate or for finetuning downstream tasks. To access these checkpoints, first [sign up](https://ngc.nvidia.com/signup) for and [setup](https://ngc.nvidia.com/setup/installers/cli) the NVIDIA GPU Cloud (NGC) Registry CLI. Further documentation for downloading models can be found in the [NGC documentation](https://docs.nvidia.com/dgx/ngc-registry-cli-user-guide/index.html#topic_6_4_1).
 
 Alternatively, you can directly download the checkpoints using:
@@ -163,6 +199,7 @@ The models require vocabulary files to run. The BERT  WordPiece vocab file can b
 # Usage
 
 After installation, there are several possible workflows. The most comprehensive is:
+
 1. Data preprocessing
 2. Pretraining
 3. Finetuning (Optional for zero-shot tasks)
@@ -173,7 +210,9 @@ However, steps 1 and 2 can be replaced by using one of the pretrained models men
 We've provided several scripts for pretraining both BERT and GPT in the [`examples`](./examples) directory, as well as scripts for both zero-shot and fine-tuned downstream tasks including MNLI, RACE, WikiText103, and LAMBADA evaluation. There is also a script for GPT interactive text generation.
 
 # Training
+
 ## Data Preprocessing
+
 The training data requires preprocessing. First, place your training data in a loose json format, with one json containing a text sample per line. For example:
 <pre>
 {"src": "www.nvidia.com", "text": "The quick brown fox", "type": "Eng", "id": "0", "title": "First Part"}
@@ -216,7 +255,6 @@ Further command line arguments are described in the source file [`preprocess_dat
 
 ## BERT Pretraining
 
-
 The [`examples/bert/train_bert_340m_distributed.sh`](examples/bert/train_bert_340m_distributed.sh) script runs single GPU 345M parameter BERT pretraining. Debugging is the primary use for single GPU training, as the code base and command line arguments are optimized for highly distributed training. Most of the arguments are fairly self-explanatory. By default, the learning rate decays linearly over the training iterations starting at `--lr` to a minimum set by `--min-lr` over `--lr-decay-iters` iterations. The fraction of training iterations used for warmup is set by `--lr-warmup-fraction`. While this is single GPU training, the batch size specified by `--micro-batch-size` is a single forward-backward path batch-size and the code will perform gradient accumulation steps until it reaches `global-batch-size` which is the batch size per iteration. The data is partitioned into a 949:50:1 ratio for training/validation/test sets (default is 969:30:1). This partitioning happens on the fly, but is consistent across runs with the same random seed (1234 by default, or specified manually with `--seed`). We use `train-iters` as the training iterations requested. Alternatively, one can provide `--train-samples` which is total number of samples to train on. If this option is present, then instead of providing `--lr-decay-iters`, one will need to provide `--lr-decay-samples`.
 
 The logging, checkpoint-saving, and evaluation interval options are specified. Note that the `--data-path` now includes the additional `_text_sentence` suffix added in preprocessing, but does not include the file extensions.
@@ -240,11 +278,11 @@ More details in [`examples/gpt3/README.md`](./examples/gpt3/README.md)
 
 Very similar to BERT and GPT, the `examples/t5/train_t5_220m_distributed.sh` script runs single GPU "base" (~220M parameter) T5 pretraining. The primary difference from BERT and GPT is the addition of the following arguments to accommodate the T5 architecture:
 
-* `--kv-channels` sets the inner dimension of the "key" and "value" matrices of all attention mechanisms in the model. For BERT and GPT this defaults to the hidden size divided by the number of attention heads, but can be configured for T5.
+- `--kv-channels` sets the inner dimension of the "key" and "value" matrices of all attention mechanisms in the model. For BERT and GPT this defaults to the hidden size divided by the number of attention heads, but can be configured for T5.
 
-* `--ffn-hidden-size` sets the hidden size in the feed-forward networks within a transformer layer. For BERT and GPT this defaults to 4 times the transformer hidden size, but can be configured for T5.
+- `--ffn-hidden-size` sets the hidden size in the feed-forward networks within a transformer layer. For BERT and GPT this defaults to 4 times the transformer hidden size, but can be configured for T5.
 
-* `--encoder-seq-length` and `--decoder-seq-length` set the sequence length for the encoder and decoder separately.
+- `--encoder-seq-length` and `--decoder-seq-length` set the sequence length for the encoder and decoder separately.
 
 All of the other arguments remain as they were for BERT and GPT pretraining. Run this example with the same steps described above for the other scripts.
 
@@ -274,10 +312,9 @@ We support two levels of recompute granularity: `selective` and `full`. Selectiv
 
 For cases where memory is very limited, `full` recompute saves just the inputs to a transformer layer, or a group, or block, of transformer layers, and recomputes everything else. To enable full activation recompute use `--recompute-granularity full`. When using `full` activation recompute, there are two methods: `uniform` and `block`, chosen using the `--recompute-method` argument.
 
-* The `uniform` method uniformly divides the transformer layers into groups of layers (each group of size `--recompute-num-layers`) and stores the input activations of each group in memory. The baseline group size is 1 and, in this case, the input activation of each transformer layer is stored. When the GPU memory is insufficient, increasing the number of layers per group reduces the memory usage, enabling a bigger model to be trained. For example, when `--recompute-num-layers` is set to 4, only the input activation of each group of 4 transformer layers is stored.
+- The `uniform` method uniformly divides the transformer layers into groups of layers (each group of size `--recompute-num-layers`) and stores the input activations of each group in memory. The baseline group size is 1 and, in this case, the input activation of each transformer layer is stored. When the GPU memory is insufficient, increasing the number of layers per group reduces the memory usage, enabling a bigger model to be trained. For example, when `--recompute-num-layers` is set to 4, only the input activation of each group of 4 transformer layers is stored.
 
-* The `block` method recomputes the input activations of a specific number (given by `--recompute-num-layers`) of individual transformer layers per pipeline stage and stores the input activations of the remaining layers in the pipeline stage. Reducing `--recompute-num-layers` results in storing the input activations to more transformer layers, which reduces the activation recomputation required in the backprop, thus improving training performance while increasing memory usage. For example, when we specify 5 layers to recompute of 8 layers per pipeline stage, the input activations of only the first 5 transformer layers are recomputed in the backprop step while the input activations for the final 3 layers are stored. `--recompute-num-layers` can be incrementally increased until the amount of memory storage space required is just small enough to fit in the available memory, thereby both maximally utilizing memory and maximizing performance.
-
+- The `block` method recomputes the input activations of a specific number (given by `--recompute-num-layers`) of individual transformer layers per pipeline stage and stores the input activations of the remaining layers in the pipeline stage. Reducing `--recompute-num-layers` results in storing the input activations to more transformer layers, which reduces the activation recomputation required in the backprop, thus improving training performance while increasing memory usage. For example, when we specify 5 layers to recompute of 8 layers per pipeline stage, the input activations of only the first 5 transformer layers are recomputed in the backprop step while the input activations for the final 3 layers are stored. `--recompute-num-layers` can be incrementally increased until the amount of memory storage space required is just small enough to fit in the available memory, thereby both maximally utilizing memory and maximizing performance.
 
 ## Distributed Optimizer
 
@@ -304,6 +341,7 @@ memory-efficient algorithm to compute exact attention. It speeds up model
 training and reduces memory requirement.
 
 To install FlashAttention:
+
 ```sh
 pip install flash-attn
 ```
@@ -315,7 +353,6 @@ In `examples/gpt3/train_gpt3_175b_distributed.sh` we have provided an example of
 With full global batch size of 1536 on 1024 A100 GPUs, each iteration takes around 32 seconds resulting in 138 teraFLOPs per GPU which is 44% of the theoretical peak FLOPs.
 
 ## Retro and InstructRetro
-
 
 Retro [(Borgeaud et al., 2022)](https://arxiv.org/abs/2112.04426) is an autoregressive decoder-only language model (LM) pretrained with retrieval-augmentation.
 Retro features practical scalability to support large-scale pretraining from scratch by retrieving from trillions of tokens.
@@ -329,6 +366,7 @@ The obtained foundation model, Retro 48B, largely outperforms the GPT counterpar
 With instruction tuning on Retro, InstructRetro demonstrates significant improvement over the instruction tuned GPT on downstream tasks in the zero-shot setting. Specifically, the average improvement of InstructRetro is 7% over its GPT counterpart across 8 short-form QA tasks, and 10% over GPT across 4 challenging long-form QA tasks. We also find that one can ablate the encoder from InstructRetro architecture and directly use the InstructRetro decoder backbone as GPT, while achieving comparable results.
 
 In this repo, we provide an end-to-end reproduction guide to implement Retro and InstructRetro, covering
+
 - **Retrieval database construction**, which supports billions or even trillions of tokens as a large-scale retrieval database.
 - **Pretraining with retrieval**, which supports pretraining from scratch and pretraining from a pretrained GPT model (Retro-fitting).
 - **Instruction tuning**, where we provide an open-source instruction tuning dataset and the training recipe for instruction tuning on Retro.
@@ -421,9 +459,11 @@ python tools/create_doc_index.py \
 -->
 
 ## Mixture of Experts
+
 MoE (Mixture of Experts) is a powerful LLM architecture implemented in the Megatron-Core framework, designed to enhance the efficiency and scalability of large language models. It leverages **Expert Parallelism**, allowing multiple experts to be distributed across different workers, where each worker processes distinct batches of training samples. This method significantly increases computational throughput, enabling models to achieve high performance metrics, such as 47% MFU during BF16 training for 8x7B on H100.
 
 Key Features of MoE:
+
 - **Parallelism Techniques**: MoE combines various parallelism strategies, including Expert Parallelism, Data Parallelism, Tensor Parallelism, Sequence Paralleism, Pipeline Parallelism, and Context Parallelism. This combination allows for handling larger model variants effectively.
 - **Router and Load Balancing**: The system employs advanced routing mechanisms like the Top-K router and utilizes load balancing algorithms to optimize token distribution among experts.
 - **Performance Optimizations**: Techniques such as GroupedGEMM and FP8 training enhance the efficiency of MoE models, particularly when multiple experts are involved.
@@ -468,15 +508,17 @@ curl 'http://localhost:5000/api' -X 'PUT' -H 'Content-Type: application/json; ch
 See [megatron/inference/text_generation_server.py](megatron/inference/text_generation_server.py) for more API options.
 
 ### Detoxify GPT via Self-generation
+
 We include an example in `examples/academic_paper_scripts/detxoify_lm/` to detoxify language models by leveraging the generative power of language models.
 
 See [examples/academic_paper_scripts/detxoify_lm/README.md](examples/academic_paper_scripts/detxoify_lm/README.md) for step-by-step tutorials on how to perform domain-adaptive training and detoxify LM using self-generated corpus.
 
-
 ## GPT Evaluation
+
 We include example scripts for GPT evaluation on WikiText perplexity evaluation and LAMBADA Cloze accuracy.
 
 ### WikiText Perplexity Evaluation
+
 For even comparison with prior works, we evaluate perplexity on the word-level [WikiText-103 test dataset](https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-v1.zip), and appropriately compute perplexity given the change in tokens when using our subword tokenizer.
 
 We use the following command to run WikiText-103 evaluation on a 345M parameter model.
@@ -509,8 +551,8 @@ python tasks/main.py \
        --no-load-rng
 </pre>
 
-
 ### LAMBADA Cloze Accuracy
+
 To compute LAMBADA cloze accuracy (the accuracy of predicting the last token given the preceding tokens) we utilize a detokenized, processed version of the [LAMBADA dataset](https://github.com/cybertronai/bflm/blob/master/lambada_test.jsonl).
 
 We use the following command to run LAMBADA evaluation on a 345M parameter model. Note that the `--strict-lambada` flag should be used to require whole word matching. Ensure that `lambada` is part of the file path.
@@ -541,7 +583,9 @@ python tasks/main.py \
 Further command line arguments are described in the source file [`main.py`](./tasks/main.py)
 
 ## BERT Task Evaluation
+
 ### RACE Evaluation
+
 The following script finetunes the BERT model for evaluation on the [RACE dataset](http://www.cs.cmu.edu/~glai1/data/race/). The `TRAIN_DATA` and `VALID_DATA` directory contain the RACE dataset as separate `.txt` files. Note that for RACE, the batch size is the number of RACE query's to evaluate. Since each RACE query has four samples, the effective batch size passed through the model will be four times the batch size specified on the command line.
 
 <pre>
@@ -581,6 +625,7 @@ python tasks/main.py \
 </pre>
 
 ### MNLI Evaluation
+
 The following script finetunes the BERT model for evaluation with the [MultiNLI sentence pair corpus](https://www.nyu.edu/projects/bowman/multinli/). Because the matching tasks are quite similar, the script can be quickly tweaked to work with the [Quora Question Pairs](https://www.kaggle.com/quora/question-pairs-dataset) (QQP) dataset as well.
 
 <pre>
@@ -607,31 +652,38 @@ python tasks/main.py \
 
 ## Llama-2 Inference and Finetuning
 
-The Llama-2 [family of models](https://ai.meta.com/llama/) are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At the time of release, Llama-2 models achieved among the best results for open-source models, and were competitive with the closed-source GPT-3.5 model (see https://arxiv.org/pdf/2307.09288.pdf).
+The Llama-2 [family of models](https://ai.meta.com/llama/) are an open-source set of pretrained & finetuned (for chat) models that have achieved strong results across a wide set of benchmarks. At the time of release, Llama-2 models achieved among the best results for open-source models, and were competitive with the closed-source GPT-3.5 model (see <https://arxiv.org/pdf/2307.09288.pdf>).
 
 The Llama-2 checkpoints can be loaded into Megatron for inference and finetuning. See documentation [here](docs/llama_mistral.md).
 
 # Model Optimization and Deployment
+
 Megatron-Core (MCore) `GPTModel` family supports advanced quantization algorithms and high-performance inference through TensorRT-LLM.
 
 ## Quantization and TensorRT-LLM Deployment
+
 See [Megatron Model Optimization and Deployment](examples/inference/quantization/README.md) for `llama2` and `nemotron3` examples.
 
 # Datasets
+
 We do not host any datasets for GPT or BERT training, however, we detail their collection so that our results may be reproduced.
 
 ## Collecting Wikipedia Training Data
+
 We recommend following the Wikipedia data extraction process specified by Google research: "the recommended pre-processing is to download [the latest dump](https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles.xml.bz2), extract the text with [WikiExtractor.py](https://github.com/attardi/wikiextractor), and then apply any necessary cleanup to convert it into plain text."
 
 We recommend using the `--json` argument when using WikiExtractor, which will dump the Wikipedia data into loose json format (one json object per line), making it more manageable on the file system and also readily consumable by our codebase. We recommend further preprocessing this json dataset with nltk punctuation standardization. For BERT training, use the `--split-sentences` flag to `preprocess_data.py` as described [above](#data-preprocessing) to include sentence breaks in the produced index. If you'd like to use Wikipedia data for GPT training you should still clean it with nltk/spacy/ftfy, but do not use the `--split-sentences` flag.
 
 ## Collecting GPT Webtext Data
+
 We utilize the publicly available [OpenWebText](https://github.com/eukaryote31/openwebtext) library from [jcpeterson](https://github.com/jcpeterson/openwebtext) and [eukaryote31's](https://github.com/eukaryote31/openwebtext) work to download urls. We then filter, clean, and deduplicate all downloaded content according to the procedure described in our [openwebtext](./tools/openwebtext) directory. For reddit URLs corresponding to content up to October 2018 we arrived at approximately 37GB of content.
 
 # Reproducibility
+
 Megatron training can be bitwise reproducible; to enable this mode use `--deterministic-mode`. This means that the same training config run twice in the same HW and SW environment should produce identical model checkpoints, losses and accuracy metric values (iteration time metrics may vary).
 
 There are currently three known Megatron optimizations that break reproducibility whilst still producing almost identical training runs:
+
 1. The specific NCCL algorithm that is used during an all-reduce (as specified by the environment variable `NCCL_ALGO`) is important. We have tested the following: `^NVLS`, `Tree`, `Ring`, `CollnetDirect`, `CollnetChain`. The code admits the use of `^NVLS`, which allows NCCL the choice of non-NVLS algorithms; its choice seems to be stable.
 2. Flash attention is non-deterministic; do not use `--use-flash-attn`.
 3. If using Transformer Engine, you must also set the environment variable `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0`.
@@ -695,21 +747,23 @@ Generally speaking, `torch_dist` is the more modern and recommended checkpoint f
 The general idea of this checkpoint format converter is that it launches the model just as one normally would for training, but before running any training iterations, it saves to the new checkpoint format, and then exits. It is important to note that all other launch args should remain the same, in order for the system to understand the previous checkpoint format.
 
 # Projects Using Megatron
+
 Below are some of the projects where we have directly used Megatron:
-* [BERT and GPT Studies Using Megatron](https://arxiv.org/pdf/1909.08053.pdf)
-* [BioMegatron: Larger Biomedical Domain Language Model](https://www.aclweb.org/anthology/2020.emnlp-main.379.pdf)
-* [End-to-End Training of Neural Retrievers for Open-Domain Question Answering](https://arxiv.org/abs/2101.00408)
-* [Large Scale Multi-Actor Generative Dialog Modeling](https://www.aclweb.org/anthology/2020.acl-main.8.pdf)
-* [Local Knowledge Powered Conversational Agents](https://arxiv.org/abs/2010.10150)
-* [MEGATRON-CNTRL: Controllable Story Generation with External Knowledge Using Large-Scale Language Models](https://www.aclweb.org/anthology/2020.emnlp-main.226.pdf)
-* [RACE Reading Comprehension Dataset Leaderboard](http://www.qizhexie.com/data/RACE_leaderboard.html)
-* [Training Question Answering Models From Synthetic Data](https://www.aclweb.org/anthology/2020.emnlp-main.468.pdf)
-* [Few-shot Instruction Prompts for Pretrained Language Models to Detect Social Biases](https://arxiv.org/abs/2112.07868)
-* [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
-* [Using DeepSpeed and Megatron to Train Megatron-Turing NLG 530B, A Large-Scale Generative Language Model](https://arxiv.org/abs/2201.11990)
-* [Multi-Stage Prompting for Knowledgeable Dialogue Generation](https://arxiv.org/abs/2203.08745)
-* [Evaluating Parameter Efficient Learning for Generation](https://aclanthology.org/2022.emnlp-main.319.pdf)
-* [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
-* [Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study](https://arxiv.org/abs/2304.06762)
-* [InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining](https://arxiv.org/abs/2310.07713)
-* [An Empirical Study of Mamba-based Language Models](https://arxiv.org/abs/2406.07887)
+
+- [BERT and GPT Studies Using Megatron](https://arxiv.org/pdf/1909.08053.pdf)
+- [BioMegatron: Larger Biomedical Domain Language Model](https://www.aclweb.org/anthology/2020.emnlp-main.379.pdf)
+- [End-to-End Training of Neural Retrievers for Open-Domain Question Answering](https://arxiv.org/abs/2101.00408)
+- [Large Scale Multi-Actor Generative Dialog Modeling](https://www.aclweb.org/anthology/2020.acl-main.8.pdf)
+- [Local Knowledge Powered Conversational Agents](https://arxiv.org/abs/2010.10150)
+- [MEGATRON-CNTRL: Controllable Story Generation with External Knowledge Using Large-Scale Language Models](https://www.aclweb.org/anthology/2020.emnlp-main.226.pdf)
+- [RACE Reading Comprehension Dataset Leaderboard](http://www.qizhexie.com/data/RACE_leaderboard.html)
+- [Training Question Answering Models From Synthetic Data](https://www.aclweb.org/anthology/2020.emnlp-main.468.pdf)
+- [Few-shot Instruction Prompts for Pretrained Language Models to Detect Social Biases](https://arxiv.org/abs/2112.07868)
+- [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
+- [Using DeepSpeed and Megatron to Train Megatron-Turing NLG 530B, A Large-Scale Generative Language Model](https://arxiv.org/abs/2201.11990)
+- [Multi-Stage Prompting for Knowledgeable Dialogue Generation](https://arxiv.org/abs/2203.08745)
+- [Evaluating Parameter Efficient Learning for Generation](https://aclanthology.org/2022.emnlp-main.319.pdf)
+- [Exploring the Limits of Domain-Adaptive Training for Detoxifying Large-Scale Language Models](https://arxiv.org/abs/2202.04173)
+- [Shall We Pretrain Autoregressive Language Models with Retrieval? A Comprehensive Study](https://arxiv.org/abs/2304.06762)
+- [InstructRetro: Instruction Tuning post Retrieval-Augmented Pretraining](https://arxiv.org/abs/2310.07713)
+- [An Empirical Study of Mamba-based Language Models](https://arxiv.org/abs/2406.07887)

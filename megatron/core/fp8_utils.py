@@ -1,11 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
+
 from contextlib import nullcontext
 from typing import List, Optional
 
 import torch
-from packaging.version import Version as PkgVersion
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -21,9 +21,16 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     pass
 
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except ImportError:
+    HAVE_PACKAGING = False
+
 # Check if Transformer Engine has class for fp8 tensors.
 HAVE_TE_FP8_TENSOR_CLASS = False
-try:
+if HAVE_TE:
     if is_te_min_version("2.0"):
         # In TE2.x, QuantizedTensor is the base class for all different type of fp8 tensors,
         # including fp8 tensor for delayed scaling, current scaling and mxfp8, etc.
@@ -32,19 +39,19 @@ try:
         from transformer_engine.pytorch.float8_tensor import Float8Tensor as FP8_TENSOR_CLASS
 
     HAVE_TE_FP8_TENSOR_CLASS = True
-except (ImportError, ModuleNotFoundError):
-    # FP8 tensor class not found
-    pass
+else:
+    HAVE_TE_FP8_TENSOR_CLASS = False
+    FP8_TENSOR_CLASS = None
 
 # Check if Transformer Engine has MXFP8Tensor class
-HAVE_TE_MXFP8TENSOR = False
+
 try:
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
     HAVE_TE_MXFP8TENSOR = True
 except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
-    pass
+    HAVE_TE_MXFP8TENSOR = False
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
@@ -130,6 +137,10 @@ if HAVE_TE and is_te_min_version("2.2"):
 
         args = [model_params, main_params, start_offsets, data_parallel_group]
         if fsdp_shard_model_params is not None:
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging not found, please install it with `pip install packaging`"
+                )
             if get_te_version() == PkgVersion("2.3.0.dev0+5fdd7bb") or is_te_min_version("2.3.0"):
                 args.append(fsdp_shard_model_params)
             else:
@@ -211,7 +222,7 @@ elif HAVE_TE and is_te_min_version("2.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device="cuda")
 
         # Update scaling factors.
         packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)
@@ -298,7 +309,7 @@ elif HAVE_TE and is_te_min_version("1.0"):
             scale_invs.append(model_param._scale_inv.view(1))
             model_param._reset_caches()
 
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device="cuda")
 
         # Update scaling factors.
         packed_scales = torch.empty(len(scales), dtype=torch.float32, device=scales[0].device)
@@ -321,9 +332,9 @@ elif HAVE_TE and is_te_min_version("1.0"):
         for model_module in model:
             for param in model_module.parameters():
                 if is_float8tensor(param) and param._fp8_meta is not None:
-                    fp8_meta = param._fp8_meta['scaling_fwd']
+                    fp8_meta = param._fp8_meta["scaling_fwd"]
                     fp8_meta_index = param._fp8_meta_index
-                    if hasattr(param, 'get_high_precision_init_val'):
+                    if hasattr(param, "get_high_precision_init_val"):
                         fp8_meta.amax_history[0][fp8_meta_index].copy_(
                             param.get_high_precision_init_val().abs().max()
                         )
@@ -335,8 +346,12 @@ else:
     def _modify_underlying_storage_impl(*args, **kwargs):
         raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
 
-    def _quantize_param_shard_impl(*args, **kwargs):
-        raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
+    def _quantize_param_shard_impl(model_params, *args, **kwargs):
+        if len(model_params) == 0:
+            return
+        else:
+            # If TE is not installed, there shouldn't be any fp8 params.
+            raise RuntimeError("Invalid Transformer Engine version for FP8 distributed optimizer")
 
     def _correct_amax_history_if_needed_impl(*args, **kwargs):
         # If TE is not installed, we are definitely not using fp8 for training, so no correction
@@ -385,6 +400,7 @@ if HAVE_TE:
             We return nullcontext() when: a) not using fp8 to train, b) layer_no is a layer
             that needs to be trained in bf16.
         """
+
         num_bf16_layers_at_start = (
             config.num_layers_at_start_in_bf16 if config.first_last_layers_bf16 else 0
         )
@@ -478,7 +494,7 @@ if HAVE_TE:
                 if "preserve_high_precision_init_val" in (
                     inspect.signature(transformer_engine.pytorch.fp8_model_init).parameters
                 ):
-                    context_args["preserve_high_precision_init_val"] = True
+                    context_args["preserve_high_precision_init_val"] = torch.is_grad_enabled()
                 fp8_context = transformer_engine.pytorch.fp8_model_init(**context_args)
 
             # First / last layer in bf16 isn't supported with delayed scaling since it

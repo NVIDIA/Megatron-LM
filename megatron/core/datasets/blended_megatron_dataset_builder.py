@@ -529,6 +529,7 @@ def _get_size_per_split_per_dataset(
     Returns:
         List[List[int]]: The number of samples to request per MegatronDataset per split
     """
+
     assert numpy.isclose(sum(normalized_weights), 1.0)
 
     # Use margin as buffer to ensure we satiate the request

@@ -48,6 +48,7 @@ def collect_train_test_metrics(
             "mem-max-allocated-bytes",
             "lm loss",
             "num-zeros",
+            "mtp_1 loss",
         ]
     }
 

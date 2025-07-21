@@ -127,19 +127,17 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         # Retrieve neighbors.
         if self.encoder:
-
             # Sequence length remainder.
             first_ns = ns % self.retro_chunk_length
 
             # Case 1: Sequence length not divisible by chunk length.
             if first_ns > 0:
-
                 # Split sequence into first partial chunk & remaining chunks.
-                first_chunk, rest_chunk = hidden_states[:first_ns], hidden_states[first_ns:]
+                first_chunk, rest_chunk = (hidden_states[:first_ns], hidden_states[first_ns:])
 
                 # Pad partial chunk with zeros.
                 first_chunk = torch.nn.functional.pad(
-                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), 'constant', 0
+                    first_chunk, (0, 0, 0, 0, 0, self.retro_chunk_length - first_ns), "constant", 0
                 )
 
                 # Concatenate padded chunk with remaining chunks.
@@ -184,7 +182,7 @@ class RetroDecoderCrossAttention(BaseRetroCrossAttention):
 
         # Pad attending tokens to sequence length.
         padded_chunks = torch.nn.functional.pad(
-            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), 'constant', 0
+            attending_chunks, (0, 0, 0, 0, 0, self.retro_chunk_length - 1), "constant", 0
         )
 
         # Permute attending chunks.
@@ -272,7 +270,6 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
 
         # Re-enable torch grad to enable fused optimization.
         with torch.enable_grad():
-
             # Bias-dropout-add.
             x = bias_dropout_add(
                 (
@@ -295,7 +292,7 @@ class RetroDecoderBiasDropoutAdd(MegatronModule):
             )
 
             # Prepend zeros for non-attending tokens.
-            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), 'constant', 0)[
+            x = torch.nn.functional.pad(x, (0, 0, 0, 0, pad, 0), "constant", 0)[
                 :ns
             ]  # [ ns, bs, d ]
 

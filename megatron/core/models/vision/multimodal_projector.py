@@ -1,4 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from typing import Optional
+
+import torch
+
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import build_module
@@ -17,6 +21,7 @@ class MultimodalProjector(MegatronModule):
         submodules (MLPSubmodules): Specifies MLP submodules for mlp type projector
         projector_type (str): Projector type
         input_size (int): Input size from feature encoder
+        tp_group (torch.distributed.ProcessGroup): Tensor parallel group
     """
 
     def __init__(
@@ -25,6 +30,7 @@ class MultimodalProjector(MegatronModule):
         submodules: MLPSubmodules,
         projector_type: str,
         input_size: int,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
         self.projector_type = projector_type
@@ -32,7 +38,9 @@ class MultimodalProjector(MegatronModule):
         assert submodules is not None, "MLPSubmodules must be provided"
 
         if self.projector_type == "mlp":
-            self.encoder = MLP(config=config, submodules=submodules, input_size=input_size)
+            self.encoder = MLP(
+                config=config, submodules=submodules, input_size=input_size, tp_group=tp_group
+            )
         elif self.projector_type == "affine":
             self.encoder = build_module(
                 submodules.linear_fc1,
@@ -45,6 +53,7 @@ class MultimodalProjector(MegatronModule):
                 skip_bias_add=True,
                 is_expert=False,
                 tp_comm_buffer_name=None,
+                tp_group=tp_group,
             )
         else:
             raise Exception(f"Unsupported multimodal projection type {self.projector_type}")

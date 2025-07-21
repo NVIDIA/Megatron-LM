@@ -17,7 +17,7 @@ class StaticInferenceContext(BaseInferenceContext):
     """
 
     def __init__(self, max_batch_size: int, max_sequence_length: int):
-        super().__init__(materialize_only_last_token_logits=False)
+        super().__init__(materialize_only_last_token_logits=True)
         self.max_sequence_length = max_sequence_length
         self.max_batch_size = max_batch_size
         self.sequence_len_offset = 0

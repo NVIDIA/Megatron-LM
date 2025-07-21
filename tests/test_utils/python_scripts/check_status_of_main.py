@@ -12,9 +12,8 @@ PROJECT_ID = int(os.getenv("CI_PROJECT_ID", 19378))
 GITLAB_ENDPOINT = os.getenv('GITLAB_ENDPOINT')
 RO_API_TOKEN = os.getenv("RO_API_TOKEN")
 
-logging.basicConfig()
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 def get_gitlab_handle():
@@ -22,11 +21,23 @@ def get_gitlab_handle():
 
 
 def most_recent_pipeline(target_branch: str):
-    pipelines = (
-        get_gitlab_handle()
-        .projects.get(PROJECT_ID)
-        .pipelines.list(ref=target_branch, source="push")
-    )
+    logger.info(f"Getting most recent pipeline for branch {target_branch}")
+    n_attempts = 0
+    while n_attempts < 3:
+        try:
+            pipelines = (
+                get_gitlab_handle()
+                .projects.get(PROJECT_ID)
+                .pipelines.list(ref=target_branch, source="push", get_all=False)
+            )
+            break
+        except Exception as e:
+            logger.error(f"Network error, retrying... ({n_attempts}/3)")
+            time.sleep(10 * (2**n_attempts))  # Exponential backoff: 10s, 20s, 40s
+            n_attempts += 1
+
+    logger.info(f"Pipelines: {pipelines}")
+
     return pipelines[0]
 
 
