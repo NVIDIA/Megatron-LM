@@ -528,14 +528,6 @@ class TransformerConfig(ModelParallelConfig):
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
-    overlap_moe_expert_parallel_comm: bool = False
-    """Overlap EP A2A communications with independent computations of different micro-batches
-    in 1f1b phase of pipelining or non-pipelining schedule.
-    """
-
-    delay_wgrad_compute: bool = False
-    """Delay the weight gradient computation to improve batch-level communication overlapping"""
-
     ##################
     # Context Parallel
     ##################
