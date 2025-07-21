@@ -25,8 +25,7 @@ def make_test_packed_seq_params(sequence_length=None, cu_seqlens=None):
         cu_seqlens = [0, 6, 19, 22, sequence_length]
     cu_seqlens = torch.IntTensor(cu_seqlens).cuda()
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
-    max_seqlen = max_seqlen.tolist()[0]
+    max_seqlen = seqlens.max().item()
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,

@@ -325,8 +325,8 @@ class TestLLaVAModel:
                 [0, 512, 1024, 1600], dtype=torch.int32
             ).cuda(),  # Just example values.
             cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).cuda(),
-            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).cuda(),
-            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).cuda(),
+            max_seqlen_q=1600,
+            max_seqlen_kv=1600,
         )
 
         # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
