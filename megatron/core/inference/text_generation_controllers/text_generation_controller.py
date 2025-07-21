@@ -445,8 +445,7 @@ class TextGenerationController:
         context.initialize_attention_state()
 
         # Get flat tokens, position ids.
-        input_ids = context.current_input_ids()
-        position_ids = context.current_position_ids()
+        input_ids, position_ids = context.current_input_and_position_ids()
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
