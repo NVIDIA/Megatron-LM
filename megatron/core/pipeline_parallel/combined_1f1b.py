@@ -14,6 +14,7 @@ from megatron.core.pipeline_parallel.utils import (
     register_wgrad_accumulation_and_reduce_func,
     set_streams,
     unwrap_model,
+    VppContextManager,
 )
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -119,6 +120,105 @@ def combined_1f1b_schedule_for_no_pipelining(
         b_context=b_context,
     )
     return forward_data_store, total_num_tokens
+
+def combined_forward_backward_step_for_interleaved_pipelining(
+    config,
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches,
+    forward_data_store,
+    forward_step_helper_preprocess,
+    forward_step_helper_postprocess,
+    backward_step_helper_preprocess,
+    backward_step_helper_postprocess,
+    get_microbatch_id_in_model_chunk,
+    get_model_chunk_id,
+    check_first_val_step,
+    is_first_microbatch_for_model_chunk,
+    collect_non_loss_data,
+    f_virtual_microbatch_id=None,
+    b_virtual_microbatch_id=None,
+    pre_forward=None,
+    pre_backward=None,
+    post_forward=None,
+    post_backward=None,
+):
+    """Helper method to run combined forward and backward step for A2A communication hiding.
+    This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
+    eventually calls `forward_backward_step` function defined in `combined_1f1b.py`.
+    This method is called only if `overlap_moe_expert_parallel_comm` is true."""
+
+    set_streams()
+    # forward prepare
+    f_model_chunk_id = None
+    f_microbatch_id = None
+    input_tensor = None
+    f_context = contextlib.nullcontext()
+    if f_virtual_microbatch_id is not None:
+        f_microbatch_id = get_microbatch_id_in_model_chunk(
+            f_virtual_microbatch_id, forward=True
+        )
+    if f_virtual_microbatch_id is not None:
+        f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
+        f_context = VppContextManager(f_model_chunk_id)
+        with f_context:
+            input_tensor = forward_step_helper_preprocess(
+                f_virtual_microbatch_id, f_model_chunk_id, f_microbatch_id
+            )
+    # backward prepare
+    b_model_chunk_id = None
+    b_input_tensor = None
+    b_output_tensor = None
+    b_output_tensor_grad = None
+    b_context = contextlib.nullcontext()
+    if b_virtual_microbatch_id is not None:
+        b_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
+        b_context = VppContextManager(b_model_chunk_id)
+        with b_context:
+            b_input_tensor, b_output_tensor, b_output_tensor_grad = (
+                backward_step_helper_preprocess(b_virtual_microbatch_id, b_model_chunk_id)
+            )
+    # Call combined forward and backward step to overlap the communication and computation
+    output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
+        forward_step_func,
+        data_iterator[f_model_chunk_id] if f_model_chunk_id is not None else None,
+        model[f_model_chunk_id] if f_model_chunk_id is not None else None,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        model[b_model_chunk_id] if b_model_chunk_id is not None else None,
+        b_input_tensor,
+        b_output_tensor,
+        b_output_tensor_grad,
+        config,
+        f_context=f_context,
+        b_context=b_context,
+        pre_forward=pre_forward,
+        pre_backward=pre_backward,
+        post_forward=post_forward,
+        post_backward=post_backward,
+        collect_non_loss_data=collect_non_loss_data,
+        checkpoint_activations_microbatch=None,
+        is_first_microbatch=check_first_val_step(
+            is_first_microbatch_for_model_chunk(f_virtual_microbatch_id)
+            if f_virtual_microbatch_id is not None
+            else None
+        ),
+        current_microbatch=f_microbatch_id,
+    )
+    # forward post process
+    if f_model_chunk_id is not None:
+        with f_context:
+            forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
+    # backward post process
+    if b_model_chunk_id:
+        # The same as the backward_step_helper
+        with b_context:
+            backward_step_helper_postprocess(b_virtual_microbatch_id)
+            if input_tensor is not None:
+                assert input_tensor_grad is not None
+    return output_tensor, input_tensor_grad
 
 
 def combined_forward_backward_step(

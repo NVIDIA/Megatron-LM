@@ -1240,10 +1240,6 @@ class TransformerConfig(ModelParallelConfig):
             assert is_torch_min_version(
                 "2.6.0"
             ), "A2A Overlap encounters hang issue with torch version < 2.6.0"
-            # Basic requirements for overlap_moe_expert_parallel_comm
-            assert (
-                self.pipeline_model_parallel_size == 1
-            ), '(Temporary) overlap_moe_expert_parallel_comm is not supported when PP>1.'
             # Expert model parallelism requirements
             assert (
                 self.expert_model_parallel_size > 1
