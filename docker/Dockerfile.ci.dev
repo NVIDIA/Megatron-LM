@@ -37,7 +37,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
 ENV PATH="/root/.local/bin:$PATH"
-ENV UV_PROJECT_ENVIRONMENT=/opt/venv
+ARG UV_PROJECT_ENVIRONMENT=/opt/venv
+ENV UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT}
+ENV VIRTUAL_ENV=$UV_PROJECT_ENVIRONMENT
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
 
@@ -72,11 +74,16 @@ EOF
 FROM main as jet
 ARG JET_API_VERSION
 ENV PATH="$PATH:/opt/jet/bin"
-RUN --mount=type=secret,id=JET_INDEX_URLS \
-    --mount=type=secret,id=LOGGER_INDEX_URL bash -ex <<"EOF"
+RUN --mount=type=secret,id=JET_INDEX_URLS bash -ex <<"EOF"
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
+    python -m venv /opt/jet 
+    /opt/jet/bin/pip install --no-cache-dir $JET_INDEX_URLS \
+        jet-api==$JET_API_VERSION \
+        "jet-client~=2.0" 
+EOF
+
+RUN --mount=type=secret,id=LOGGER_INDEX_URL bash -ex <<"EOF"
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
-    uv pip install --no-cache-dir jet-api==$JET_API_VERSION "jet-client~=2.0" --upgrade $JET_INDEX_URLS "setuptools<80.0.0"
     uv pip install --no-cache-dir "one-logger" --upgrade $LOGGER_INDEX_URL "setuptools<80.0.0"
 EOF
 ###
