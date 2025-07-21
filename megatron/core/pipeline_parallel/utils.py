@@ -11,7 +11,6 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core.extensions.transformer_engine import TE_MODULE_CLASSNAMES
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
 
@@ -325,6 +324,7 @@ class VppContextManager:
 
 def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
     """Unwrap_model to return the final model instance"""
+    from megatron.core.models.gpt.gpt_model import GPTModel
     return_list = True
     if not isinstance(model, list):
         model = [model]
