@@ -11,10 +11,10 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
+    VppContextManager,
     register_wgrad_accumulation_and_reduce_func,
     set_streams,
     unwrap_model,
-    VppContextManager,
 )
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -121,6 +121,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     )
     return forward_data_store, total_num_tokens
 
+
 def combined_forward_backward_step_for_interleaved_pipelining(
     config,
     forward_step_func,
@@ -156,9 +157,7 @@ def combined_forward_backward_step_for_interleaved_pipelining(
     input_tensor = None
     f_context = contextlib.nullcontext()
     if f_virtual_microbatch_id is not None:
-        f_microbatch_id = get_microbatch_id_in_model_chunk(
-            f_virtual_microbatch_id, forward=True
-        )
+        f_microbatch_id = get_microbatch_id_in_model_chunk(f_virtual_microbatch_id, forward=True)
     if f_virtual_microbatch_id is not None:
         f_model_chunk_id = get_model_chunk_id(f_virtual_microbatch_id, forward=True)
         f_context = VppContextManager(f_model_chunk_id)
@@ -176,8 +175,8 @@ def combined_forward_backward_step_for_interleaved_pipelining(
         b_model_chunk_id = get_model_chunk_id(b_virtual_microbatch_id, forward=False)
         b_context = VppContextManager(b_model_chunk_id)
         with b_context:
-            b_input_tensor, b_output_tensor, b_output_tensor_grad = (
-                backward_step_helper_preprocess(b_virtual_microbatch_id, b_model_chunk_id)
+            b_input_tensor, b_output_tensor, b_output_tensor_grad = backward_step_helper_preprocess(
+                b_virtual_microbatch_id, b_model_chunk_id
             )
     # Call combined forward and backward step to overlap the communication and computation
     output_tensor, num_tokens, input_tensor_grad = combined_forward_backward_step(
