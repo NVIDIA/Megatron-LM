@@ -147,6 +147,7 @@ class MambaStack(MegatronModule):
                     )
                 elif layer_type == LayerSymbols.MOE:
                     # Transformer layers apply their own pp_layer_offset
+                    # TODO: Pass in model_comm_pgs here?
                     layer = build_module(
                         submodules.moe_layer, config=self.config, layer_number=i + 1
                     )

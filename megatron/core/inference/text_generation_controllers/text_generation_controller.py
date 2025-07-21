@@ -56,6 +56,163 @@ class TextGenerationController:
         self.model_is_pipeline_parallel = not (
             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
+        # Initialize cache for sequence parallel modules
+        self._sequence_parallel_attr_cache = None
+
+        # Attributes for sequence parallel
+        self.sequence_parallel_attrs = [
+            "sequence_parallel",
+            "scatter_to_sequence_parallel",
+            "reduce_scatter_embeddings",
+        ]
+
+    # TODO (Peter): This code should not go into main. This is for unblocking purposes
+    def init_sequence_parallel_cache(self):
+        """
+        Initialize the cache of modules with sequence parallel attributes.
+        Only needs to be called once, subsequent calls have no effect.
+        """
+        if self._sequence_parallel_attr_cache is not None:
+            return  # Cache already initialized
+
+        from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+
+        # Initialize dictionary to hold attributes -> list of modules
+        self._sequence_parallel_attr_cache = {attr: [] for attr in self.sequence_parallel_attrs}
+
+        # Get the model
+        model = self.inference_wrapped_model.model.module
+
+        # Recursive function to find all modules with our target attributes
+        def find_modules_with_attrs(module):
+            if not isinstance(module, BaseMoELayer):
+                # Check if this module has any of our target attributes
+                for attr in self.sequence_parallel_attrs:
+                    if hasattr(module, attr):
+                        self._sequence_parallel_attr_cache[attr].append(module)
+                    if hasattr(module, "config"):
+                        if hasattr(module.config, attr):
+                            self._sequence_parallel_attr_cache[attr].append(module.config)
+
+                # Check all children modules recursively
+                for child in module._modules.values():
+                    if child is not None:
+                        find_modules_with_attrs(child)
+
+        # Skip embedding if not there
+        if hasattr(model, "embedding"):
+            find_modules_with_attrs(model.embedding)
+        find_modules_with_attrs(model.decoder)
+        for layer in model.decoder.layers:
+            find_modules_with_attrs(layer)
+
+    def set_model_to_sequence_parallel(self, set_to=False):
+        """
+        Set sequence parallel attributes for the model.
+
+        Args:
+            set_to: Value to set for sequence_parallel attributes
+        """
+        # Initialize cache if needed
+        if self._sequence_parallel_attr_cache is None:
+            self.init_sequence_parallel_cache()
+
+        # Set the high-level inference params
+        self.inference_wrapped_model.inference_params.sequence_parallel = set_to
+
+        # Set all cached attributes to desired value
+        for attr, modules in self._sequence_parallel_attr_cache.items():
+            for module in modules:
+                setattr(module, attr, set_to)
+
+        # Initialize cache for sequence parallel modules
+        self.moe_layer_cache = None
+
+    def init_moe_expert_cache(self):
+        """
+        Initialize the cache of MoE layers once
+        """
+        if self.moe_layer_cache is not None:
+            return  # already initialized
+
+        # Cache for moe layers.
+        # TODO(peter) do we need to cache sync point to fix
+        self.moe_layer_cache = []
+        seen_modules = set()
+
+        model = self.inference_wrapped_model.model.module
+
+        def walk(module):
+            # Collect from MoELayer fields
+            if isinstance(module, MoELayer):
+                oid = id(module)
+                if oid not in seen_modules:
+                    self.moe_layer_cache.append(module)
+
+            for child in module.children():
+                walk(child)
+
+        walk(model)
+
+    def set_decode_expert_padding(self, set_to: bool = False, capacity_factor=None):
+        """
+        Toggle MoE drop+pad at the decode boundary.
+
+        NO-DROP setting at decode:
+        capacity_factor = max_batchsize
+        The same factor is applied to BOTH the router and all token dispatchers
+        to keep capacity and shapes consistent.
+
+        When enabling, we also clear variable-size dispatcher metadata
+        so decode starts clean and capture-safe.
+        """
+        if self.moe_layer_cache is None:
+            self.init_moe_expert_cache()
+
+        cfg = get_model_config(self.inference_wrapped_model.model)
+        # unified no-drop factor used by router and dispatchers
+
+        # Flip global/config knobs read by the router
+        cfg.moe_pad_expert_input_to_capacity = bool(set_to)
+        cfg.moe_expert_capacity_factor = capacity_factor
+
+        # Update all token dispatchers
+        for moe_layer in self.moe_layer_cache:
+
+            dispatcher = moe_layer.token_dispatcher
+            # turn padding on/off
+            dispatcher.drop_and_pad = bool(set_to)
+
+            # make sure attribute exists even if class didn't define it
+            setattr(dispatcher, "moe_expert_capacity_factor", capacity_factor)
+
+            # Check fliping the modules config
+            if hasattr(dispatcher, "config"):
+                dispatcher.config.moe_pad_expert_input_to_capacity = bool(set_to)
+                dispatcher.config.moe_expert_capacity_factor = capacity_factor
+
+            # TODO (peter): Do we need to clear for next prefill
+            if set_to:
+                # clear any variable-size metadata from dropless prefill
+                for attr in (
+                    "input_splits",
+                    "output_splits",
+                    "output_splits_tp",
+                    "tokens_per_expert",
+                    "num_global_tokens_per_local_expert",
+                    "reversed_local_input_permutation_mapping",
+                    "capacity",
+                ):
+                    if hasattr(dispatcher, attr):
+                        setattr(dispatcher, attr, None)
+                if hasattr(dispatcher, "cuda_sync_point"):
+                    dispatcher.cuda_sync_point = "no_sync"
+
+            router = moe_layer.router
+            setattr(router, "moe_expert_capacity_factor", capacity_factor)
+            if hasattr(router, "config"):
+                router.config.moe_expert_capacity_factor = capacity_factor
+                router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
         # Initialize cache for sequence parallel modules
         self.moe_layer_cache = None
@@ -718,6 +875,13 @@ class TextGenerationController:
                 not self.inference_wrapped_model.inference_context.is_decode_only()
             ), f"Generation must start in prefill mode"
 
+            # Note(Peter): This currently will turn of sequence parallel for all non MoE modules.
+            # This should not make it into main probably I am just unblocking long context team.
+            sequence_parallel = get_model_config(
+                self.inference_wrapped_model.model
+            ).sequence_parallel
+            if sequence_parallel:
+                self.set_model_to_sequence_parallel(False)
             # Setting padding off for prefill if
             moe_pad_experts_for_cuda_graph_inference = (
                 self.inference_wrapped_model.inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
