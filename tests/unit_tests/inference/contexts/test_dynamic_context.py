@@ -48,6 +48,7 @@ class TestDynamicContext:
             kv_channels=kv_channels,
             num_attention_heads=num_attention_heads,
             max_sequence_length=max_sequence_length,
+            num_cuda_graphs=None,
             buffer_size_gb=buffer_size_gb,
             buffer_guaranteed_fraction=buffer_guarenteed_fraction,
             chunk_size_tokens=chunk_size_tokens,
@@ -64,22 +65,6 @@ class TestDynamicContext:
     @pytest.mark.experimental
     def test_initialize_dynamic_context(self):
         self._setup_model_parallel_group(1, 1)
-        with pytest.raises(AssertionError) as error:
-
-            dynamic_context = self._get_dynamic_context(
-                params_dtype=torch.float32,
-                num_layers=4,
-                kv_channels=8,
-                num_attention_heads=2,
-                max_sequence_length=512,
-                buffer_size_gb=0.01,
-                buffer_guarenteed_fraction=0.1,
-                chunk_size_tokens=128,
-                max_requests_override=None,
-                max_tokens_override=None,
-                buffer_overflow_factor=None,
-            )
-        assert f'gtd_request_count (64) > max_requests (40).' in str(error.value)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -94,8 +79,9 @@ class TestDynamicContext:
             max_tokens_override=None,
             buffer_overflow_factor=None,
         )
-        assert dynamic_context.gtd_chunk_count == 256
-        assert dynamic_context.gtd_request_count == 64
+
+        assert dynamic_context.gtd_chunk_count == 48
+        assert dynamic_context.gtd_request_count == 12
         assert dynamic_context.chunk_allocator.chunk_count_total == 491
         assert dynamic_context.max_requests == 122
         assert dynamic_context.max_tokens == 62848
@@ -112,6 +98,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
+            num_cuda_graphs=None,
             buffer_size_gb=1.0,
             buffer_guaranteed_fraction=0.1,
             chunk_size_tokens=128,
@@ -127,6 +114,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
+            num_cuda_graphs=None,
             buffer_size_gb=1.0,
             buffer_guaranteed_fraction=0.1,
             chunk_size_tokens=128,
@@ -154,6 +142,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
+            num_cuda_graphs=None,
             buffer_size_gb=0.01,
             buffer_guaranteed_fraction=0.1,
             chunk_size_tokens=32,
@@ -174,6 +163,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=512,
+            num_cuda_graphs=None,
             buffer_size_gb=0.1,
             buffer_guaranteed_fraction=0.1,
             chunk_size_tokens=128,
@@ -196,6 +186,7 @@ class TestDynamicContext:
             kv_channels=64,
             num_attention_heads=8,
             max_sequence_length=128,
+            num_cuda_graphs=None,
             buffer_size_gb=1.0,
             buffer_guaranteed_fraction=0.1,
             chunk_size_tokens=128,
@@ -206,7 +197,7 @@ class TestDynamicContext:
         dynamic_context.active_token_count = 10
         dynamic_context.paused_request_count = 5
         dynamic_context.padded_active_token_count = 10
-        dynamic_context.padded_active_sample_count = 5
+        dynamic_context.padded_active_request_count = 5
         dynamic_context.paused_tokens = torch.tensor([1, 2, 3], device='cuda')
         dynamic_context.request_ids.fill_(1)
         dynamic_context.request_query_lengths.fill_(1)
@@ -232,7 +223,7 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 0
         assert dynamic_context.paused_request_count == 0
         assert dynamic_context.padded_active_token_count == 0
-        assert dynamic_context.padded_active_sample_count == 0
+        assert dynamic_context.padded_active_request_count == 0
         assert dynamic_context.paused_tokens is None
         assert torch.all(dynamic_context.request_ids == -1)
         assert torch.all(dynamic_context.request_query_lengths == 0)

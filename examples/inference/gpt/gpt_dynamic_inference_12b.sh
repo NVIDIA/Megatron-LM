@@ -4,29 +4,40 @@
 
 set -u
 
+# Libraries.
 pip install simpy
 pip install sentencepiece
 pip install tiktoken
 
+# Environment variables.
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
+# Checkpoint.
 : ${CHECKPOINT_DIR:?"CHECKPOINT_DIR is not set"}
 : ${TOKENIZER_MODEL:?"TOKENIZER_MODEL is not set"}
 
+# Prompts.
 : ${NUM_TOKENS_TO_PROMPT="8 32"}
 : ${NUM_TOKENS_TO_GENERATE=256}
 : ${INCOMING_REQUESTS_DURATION=10.}
 : ${INCOMING_REQUESTS_PER_SEC=100.}
 
-: ${INFERENCE_DYNAMIC_BATCHING_BUFFER_SIZE_GB=50.}
-: ${INFERENCE_DYNAMIC_BATCHING_BUFFER_OVERFLOW_FACTOR=1.}
-: ${INFERENCE_DYNAMIC_BATCHING_BUFFER_GUARANTEED_FRACTION=0.05}
+# Dynamic context.
+: ${BUFFER_SIZE_GB=50.}
+: ${BUFFER_OVERFLOW_FACTOR=1.}
+: ${BUFFER_GUARANTEED_FRACTION=0.05}
 
+# Cuda graphs.
+: ${ENABLE_CUDA_GRAPHS=1}
+: ${NUM_CUDA_GRAPHS=16}
+: ${CUDA_GRAPH_SHARE_IO_BUFFERS=1}
+
+# Miscellaneous.
 : ${ENGINE=dynamic}
 : ${EXTRA_ARGS=""}
 # NSIGHT_PREFIX=/path/to/nsight/profile
 
-# --inference-rng-tracker \ # ... re-add after bugfix.
+# Arguments.
 ARGS=" \
     --no-persist-layer-norm \
     --apply-layernorm-1p \
@@ -63,18 +74,30 @@ ARGS=" \
     --distributed-timeout-minutes 2400 \
     --transformer-impl local \
     --use-flash-attn \
+    --inference-rng-tracker \
     \
     --inference-dynamic-batching \
-    --inference-dynamic-batching-buffer-size-gb ${INFERENCE_DYNAMIC_BATCHING_BUFFER_SIZE_GB} \
-    --inference-dynamic-batching-buffer-overflow-factor ${INFERENCE_DYNAMIC_BATCHING_BUFFER_OVERFLOW_FACTOR} \
-    --inference-dynamic-batching-buffer-guaranteed-fraction ${INFERENCE_DYNAMIC_BATCHING_BUFFER_GUARANTEED_FRACTION} \
+    --inference-dynamic-batching-buffer-size-gb ${BUFFER_SIZE_GB} \
+    --inference-dynamic-batching-buffer-overflow-factor ${BUFFER_OVERFLOW_FACTOR} \
+    --inference-dynamic-batching-buffer-guaranteed-fraction ${BUFFER_GUARANTEED_FRACTION} \
     \
-    --enable-cuda-graph \
     ${EXTRA_ARGS} \
 "
 
+# Cuda graphs.
+if [ "${ENABLE_CUDA_GRAPHS}" = 1 ]; then
+    ARGS+=" \
+        --enable-cuda-graph \
+        --inference-dynamic-batching-num-cuda-graphs ${NUM_CUDA_GRAPHS} \
+    "
+fi
+
+# Prompts.
 if [[ -v PROMPTS ]]; then
-    ARGS+=" --prompts ${PROMPTS}"
+    ARGS+=" \
+        --prompts ${PROMPTS} \
+        --num-tokens-to-generate ${NUM_TOKENS_TO_GENERATE} \
+    "
 else
     ARGS+=" \
         --num-tokens-to-prompt ${NUM_TOKENS_TO_PROMPT} \
@@ -84,9 +107,13 @@ else
     "
 fi
 
+# Command.
 CMD="python -m examples.inference.gpt.gpt_${ENGINE}_inference ${ARGS}"
 if [[ -v NSIGHT_PREFIX ]]; then
-    CMD="nsys profile -t cuda,nvtx,mpi -s none --wait=primary --show-output=true --force-overwrite=true --export=sqlite -o ${NSIGHT_PREFIX} ${CMD}"
+    CMD="nsys profile -s none -t nvtx,cuda --cudabacktrace=all --cuda-graph-trace=node --python-backtrace=cuda --wait all -o ${NSIGHT_PREFIX} --force-overwrite true --capture-range=cudaProfilerApi --capture-range-end=stop ${CMD}"
 fi
 
+echo "~~~"
+echo "CMD ... ${CMD}."
+echo "~~~"
 eval ${CMD}
