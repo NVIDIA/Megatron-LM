@@ -44,20 +44,25 @@ def add_text_generate_ptq_args(parser):
     group.add_argument(
         "--calib-size", type=int, default=512, help="Samples to use for ptq calibration."
     )
-    parser.add_argument(
+    group.add_argument(
         "--prompts",
         type=str,
         default=("Hello!|Born in California, Soyer trained as a"),
         help="Input texts. Please use | to separate different batches.",
     )
-    parser.add_argument(
+    group.add_argument(
         "--references",
         type=str,
         default="",
         help="Reference texts. Please use | to separate different batches.",
     )
-    parser.add_argument(
+    group.add_argument(
         "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
+    )
+    group.add_argument(
+        "--force-all-expert-routing",
+        action="store_true",
+        help="Forcing all experts to be routed during the calibration.",
     )
     add_modelopt_args(parser)
     return parser
@@ -158,11 +163,24 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
+    from megatron.core.transformer.moe.router import TopKRouter
+
     def _hf_dataset_forword_loop_func(model):
         dataloader = get_calib_dataloader(args.calib_size)
+    
+        if args.force_all_expert_routing:
+            for name, module in model.named_modules():
+                if isinstance(module, TopKRouter):
+                    module.topk = module.num_experts
+
         for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
             generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=1)
+
+            if args.force_all_expert_routing:
+                for name, module in model.named_modules():
+                    if isinstance(module, TopKRouter):
+                        module.topk = module.config.moe_router_topk
 
     unwrapped_model = unwrap_model(model)[0]
 

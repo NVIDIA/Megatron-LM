@@ -21,21 +21,15 @@ logger = logging.getLogger(__name__)
 # See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2469.
 try:
     # pylint: disable=unused-import
-    from apex.transformer.functional import fused_apply_rotary_pos_emb
+    from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
 except ImportError:
-    try:
-        from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
-    except ImportError:
-        fused_apply_rotary_pos_emb = None
+    fused_apply_rotary_pos_emb = None
 
 
 try:
     from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb_thd
 except ImportError:
-    try:
-        from apex.transformer.functional import fused_apply_rotary_pos_emb_thd
-    except ImportError:
-        fused_apply_rotary_pos_emb_thd = None
+    fused_apply_rotary_pos_emb_thd = None
 
 
 try:

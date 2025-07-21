@@ -113,6 +113,15 @@ class DistributedDataParallelConfig:
    """
 
     def __post_init__(self):
+        import os
+
         """Check the validity of the config."""
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+
+        if self.nccl_ub:
+            if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
+                raise ValueError(
+                    "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
+                    "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
+                )

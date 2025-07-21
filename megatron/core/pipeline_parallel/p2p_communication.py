@@ -276,6 +276,8 @@ def _communicate(
 
     """
 
+    # Create placeholder tensors for receive in forward and backward directions
+    # if needed.
     tensor_recv_prev_func = None
     tensor_recv_next_func = None
 
@@ -337,91 +339,46 @@ def _communicate(
     else:
         p2p_func = _p2p_ops
 
-    # Each rank can now be part of several different pipeline parallel groups
-    # (specifically, this can occur when encoder tensor parallelism != decoder
-    # tensor parallelism, and hence a rank in the encoder is going to feed
-    # several different decoder ranks. We therefore have to receive or send tensors
-    # from several groups. For convenience, I wrap everything into lists.
     pp_group = get_pipeline_model_parallel_group()
     next_rank = get_pipeline_model_parallel_next_rank()
     prev_rank = get_pipeline_model_parallel_prev_rank()
-    if not isinstance(pp_group, list):
-        pp_group = [pp_group]
-        assert not isinstance(next_rank, list)
-        next_rank = [next_rank]
-        assert not isinstance(prev_rank, list)
-        prev_rank = [prev_rank]
 
     if config.use_ring_exchange_p2p or config.batch_p2p_comm:
         reqs = []
     else:
         reqs = {}
-    tensor_recv_prev_list = []
-    tensor_recv_next_list = []
 
-    for group, nr, pr in zip(pp_group, next_rank, prev_rank):
-        if tensor_recv_prev_func is not None:
-            tensor_recv_prev = tensor_recv_prev_func()
-            tensor_recv_prev_list.append(tensor_recv_prev)
-        else:
-            tensor_recv_prev = None
+    tensor_recv_prev = None
+    tensor_recv_next = None
+    if tensor_recv_prev_func is not None:
+        tensor_recv_prev = tensor_recv_prev_func()
 
-        if tensor_recv_next_func is not None:
-            tensor_recv_next = tensor_recv_next_func()
-            tensor_recv_next_list.append(tensor_recv_next)
-        else:
-            tensor_recv_next = None
+    if tensor_recv_next_func is not None:
+        tensor_recv_next = tensor_recv_next_func()
 
-        p2p_reqs = p2p_func(
-            tensor_send_prev=tensor_send_prev,
-            tensor_recv_prev=tensor_recv_prev,
-            tensor_send_next=tensor_send_next,
-            tensor_recv_next=tensor_recv_next,
-            group=group,
-            prev_pipeline_rank=pr,
-            next_pipeline_rank=nr,
-        )
-        if isinstance(p2p_reqs, list):
-            reqs.extend(p2p_reqs)
-        else:
-            reqs.update(p2p_reqs)
+    p2p_reqs = p2p_func(
+        tensor_send_prev=tensor_send_prev,
+        tensor_recv_prev=tensor_recv_prev,
+        tensor_send_next=tensor_send_next,
+        tensor_recv_next=tensor_recv_next,
+        group=pp_group,
+        prev_pipeline_rank=prev_rank,
+        next_pipeline_rank=next_rank,
+    )
+    if isinstance(p2p_reqs, list):
+        reqs.extend(p2p_reqs)
+    else:
+        reqs.update(p2p_reqs)
 
     if wait_on_reqs and len(reqs) > 0:
         for req in reqs if isinstance(reqs, list) else reqs.values():
             req.wait()
         reqs = None
 
-    if (
-        (config.batch_p2p_comm and config.batch_p2p_sync)
-        # The lists below have a size > 1 only when ETP ≠ DTP,
-        # meaning this synchronization is required when ETP ≠ DTP.
-        or len(tensor_recv_prev_list) > 1
-        or len(tensor_recv_next_list) > 1
-    ):
+    if config.batch_p2p_comm and config.batch_p2p_sync:
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
         torch.cuda.synchronize()
-
-    def _handle_tensor_list(x):
-        """This basically handles all the cases that we expect to see. Either the list None,
-        or it's a singleton (the usual cases, since most ranks only belong to one pipeline group),
-        or everything returned is None, or everything returned is not None, and it has to be summed
-        together."""
-        if len(x) == 0:
-            return None
-        if len(x) == 1:
-            return x[0]
-        if all(xx is None for xx in x):
-            return None
-        # When the encoder's TP size differs from the decoder's TP size
-        # (with the constraint `encoder_tp_size <= decoder_tp_size`), each encoder TP rank
-        # may receive multiple gradients from corresponding decoder TP ranks.
-        # For example, if `ETP=1` and `DTP=2`, then encoder rank 0 will receive gradients
-        # from decoder ranks 1 and 2. These received gradients must be averaged.
-        return torch.stack(x, dim=0).mean(dim=0, dtype=torch.float32).to(x[0].dtype)
-
-    tensor_recv_prev = _handle_tensor_list(tensor_recv_prev_list)
-    tensor_recv_next = _handle_tensor_list(tensor_recv_next_list)
 
     return tensor_recv_prev, tensor_recv_next, reqs
 

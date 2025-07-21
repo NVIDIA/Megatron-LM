@@ -43,6 +43,8 @@ def get_eos_id():
         return 128001
     if hf_tokenizer.eos_token == "<|eot|>":
         return 200001
+    if hf_tokenizer.eos_token == "<|im_end|>":
+        return 151643
 
     return hf_tokenizer.eos_token_id
 
@@ -88,7 +90,6 @@ class SFTDataset(torch.utils.data.Dataset):
         tokenizer: transformers.PreTrainedTokenizerBase,
         seq_length: int,
         hf_dataset: Optional[str] = None,
-        num_medusa_heads: int = 0,
         num_shards: int = 1,
         shard_index: int = 0,
     ):
@@ -106,8 +107,6 @@ class SFTDataset(torch.utils.data.Dataset):
             tokenizer: hf tokenizer
             seq_length: max sequence length
             hf_dataset: not supported yet
-            num_medusa_heads: number of medusa heads will incease the sample sequence
-                length for training additional medusa prediction heads
         """
         if not isinstance(tokenizer, transformers.PreTrainedTokenizerBase):
             raise ValueError("SFTDataset only supports transformers.PreTrainedTokenizerBase!")
@@ -120,7 +119,6 @@ class SFTDataset(torch.utils.data.Dataset):
         self.data_transformation = lambda data: data
         self.num_shards = num_shards
         self.shard_index = shard_index
-        self.num_medusa_heads = num_medusa_heads
         self.indexed_dataset = []
         self._raw_sample_index = 0
 
@@ -210,7 +208,7 @@ class SFTDataset(torch.utils.data.Dataset):
 
     def _process_and_pack_example(self):
         """Process multiple raw data and pack them into fixed sequence length."""
-        required_packed_tokens = self.seq_length + 1 + self.num_medusa_heads
+        required_packed_tokens = self.seq_length + 1
         current_packed_samples = []
         current_packed_samples_token_count = 0
 
@@ -328,15 +326,13 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     if args.micro_batch_size > 1:
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
-    # Providing additional Medusa arguments to prepare the data
     kwargs = {
         "tokenizer": tokenizer._tokenizer,
         "seq_length": args.seq_length,
         # Optional kwargs
         "hf_dataset": args.finetune_hf_dataset,
-        "num_shards": mpu.get_data_parallel_world_size(),
-        "shard_index": mpu.get_data_parallel_rank(),
-        "num_medusa_heads": args.export_num_medusa_heads,
+        "num_shards": mpu.get_expert_data_parallel_world_size(),
+        "shard_index": mpu.get_expert_data_parallel_rank(),
     }
 
     data_path = [
@@ -385,69 +381,6 @@ def get_batch(data_iterator):
     )
     loss_mask = loss_mask * answer_only_loss_mask.to(dtype=loss_mask.dtype)
 
-    # Medusa label and loss_mask preparation
-    #
-    # Explanation:
-    #
-    # To predict 1 + k labels, an input tokens need to have additional k tokens. Given
-    # sequence length s, then overall s + 1 + k tokens are fed from the dataset.
-    #
-    # inputs = tokens[0:s]
-    # labels = tokens[1:1+s]
-    # kth medusa head labels = tokens[1+k:1+k+s]
-    #
-    # Examples: (s=5, k=2)
-    #
-    #                   | 0 1 2 3 4 5 6 7 |
-    # ------------------|-----------------|
-    # tokens            | x x x x x x x x |
-    # inputs            | x x x x x       |
-    # lm_head labels    |   x x x x x     | (next token prediction)
-    # 1st medusa labels |     x x x x x   | (next-next token prediction)
-    # 2nd medusa labels |       x x x x x | (next-next-next token prediction)
-    #
-    for i in range(args.export_num_medusa_heads):
-        new_labels = tokens_[:, 2 + i : 2 + i + args.seq_length]
-        new_loss_mask = data_b["loss_mask"][:, 2 + i : 2 + i + args.seq_length].to(
-            dtype=loss_mask.dtype
-        )
-        labels = torch.cat((labels, new_labels), dim=-1)
-        loss_mask = torch.cat((loss_mask, new_loss_mask), dim=-1)
-
-    if args.export_num_medusa_heads > 0:
-        loss_mask = loss_mask.view(args.export_num_medusa_heads + 1, -1)
-
-    # if args.export_num_eagle_layers > 0:
-    #    loss_mask = loss_mask[:, 1:]
-
-    # MTP label and loss_mask preparation
-    # Examples: (s=5, k=2)
-    #
-    #                   | 0 1 2 3 4 5 |
-    # ------------------|-------------|
-    # tokens            | x x x x x x |
-    # inputs            | x x x x x   |
-    # lm_head labels    |   x x x x x | (next token prediction)
-    # mtp_0 labels      |     x x x x | (next-next token prediction)
-    # mtp_1 labels      |       x x x | (next-next-next token prediction)
-    #
-    # mtp_i_labels = labels[:, 1 + i :]
-    # So we do not need to prepare extra labels for mtp
-    # Modelopt will shift labels and reuse them
-    #
-    # loss_mask
-    if args.export_num_mtp > 0:
-        loss_masks = []
-        for i in range(args.export_num_mtp):
-            new_loss_mask = data_b["loss_mask"][:, 2 + i : 1 + args.seq_length].to(
-                dtype=loss_mask.dtype, device=loss_mask.device
-            )
-            if i in args.export_freeze_mtp:
-                new_loss_mask = torch.zeros_like(
-                    new_loss_mask, dtype=loss_mask.dtype, device=loss_mask.device
-                )
-            loss_masks.append(new_loss_mask)
-        loss_mask = torch.cat(loss_masks, dim=-1)
 
     labels = labels.contiguous()
     loss_mask = loss_mask.contiguous()
@@ -529,6 +462,7 @@ def loss_func(loss_mask: torch.Tensor, model: GPTModel, output_tensor: torch.Ten
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     report_draft_acceptance_length(model)
+
 
 
 def forward_step(data_iterator, model: GPTModel):

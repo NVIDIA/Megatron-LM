@@ -10,6 +10,4 @@ for lib in required_libs:
     try:
         globals()[lib] = importlib.import_module(lib)
     except ImportError as e:
-        raise Exception(
-            f"Missing one or more packages required for Retro preprocessing: {required_libs}. Tried importing '{lib}'."
-        )
+        pass

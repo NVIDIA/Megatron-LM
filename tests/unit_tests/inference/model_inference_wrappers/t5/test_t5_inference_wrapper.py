@@ -112,7 +112,7 @@ class TestT5InferenceWrapper:
             self.vocab_size, size=self.encoder_sequence_length
         ).tolist()
 
-        self.inference_wrapped_model.prep_model_for_inference(prompts_tokens=batch_prompt_tokens)
+        self.inference_wrapped_model.prep_model_for_inference()
 
         inference_input = self.inference_wrapped_model.prep_inference_input(
             prompts_tokens=batch_prompt_tokens,

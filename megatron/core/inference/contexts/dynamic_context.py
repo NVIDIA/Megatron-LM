@@ -2,9 +2,10 @@
 
 import math
 import warnings
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from packaging.version import Version as PkgVersion
 from torch import Tensor
 
@@ -17,33 +18,40 @@ from megatron.core.utils import divide as core_divide
 from .base_context import BaseInferenceContext
 from .dynamic_chunk_allocator import ChunkAllocator
 
+try:
+    from packaging.version import Version as PkgVersion
+
+    HAVE_PACKAGING = True
+except:
+    HAVE_PACKAGING = False
+
 
 class ContextOverflowError(Exception):
-    '''Base exception for when a new request would not fit.'''
+    """Base exception for when a new request would not fit."""
 
     pass
 
 
 class RequestOverflowError(ContextOverflowError):
-    '''Adding request would overflow max request count.'''
+    """Adding request would overflow max request count."""
 
     pass
 
 
 class TokenOverflowError(ContextOverflowError):
-    '''Adding request would overflow max token count.'''
+    """Adding request would overflow max token count."""
 
     pass
 
 
 class MaxSequenceLengthOverflowError(ContextOverflowError):
-    '''Adding request would overflow max sequence length.'''
+    """Adding request would overflow max sequence length."""
 
     pass
 
 
 class ChunkOverflowError(ContextOverflowError):
-    '''Adding request would overflow available memory chunks.'''
+    """Adding request would overflow available memory chunks."""
 
     pass
 
@@ -117,9 +125,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
+        materialize_only_last_token_logits: bool = True,
     ):
 
-        super().__init__(materialize_only_last_token_logits=True)
+        super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
@@ -307,6 +316,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     @classmethod
     def round_up_tokens(cls, value):
         """Round up to nearest multiple of `TOKEN_ROUNDER` (above)."""
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "`packaging` is required for this functionality, please install it with `pip install packaging`"
+            )
         if PkgVersion(mcore_version) < PkgVersion("0.13"):
             return cls.round_up(value)
         return cls.TOKEN_ROUNDER * int(math.ceil(int(value) / cls.TOKEN_ROUNDER))
@@ -314,6 +327,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     @classmethod
     def round_up_requests(cls, value):
         """Round up to nearest multiple of `REQUEST_ROUNDER` (above)."""
+        if not HAVE_PACKAGING:
+            raise ImportError(
+                "`packaging` is required for this functionality, please install it with `pip install packaging`"
+            )
         if PkgVersion(mcore_version) < PkgVersion("0.13"):
             return cls.round_up(value)
         return cls.REQUEST_ROUNDER * int(math.ceil(int(value) / cls.REQUEST_ROUNDER))
@@ -367,6 +384,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     def get_max_sequence_lengths(self) -> Tensor:
         """Maximum sequence length for active requests."""
         return self.request_output_lengths[self.paused_request_count : self.total_request_count]
+
+    def get_active_request_count(self):
+        """Returns the current number of active requests."""
+        active_sequence_lengths = self.get_active_sequence_lengths()
+        max_sequence_lengths = self.get_max_sequence_lengths()
+        active_requests_mask = torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+        active_request_count = (active_requests_mask == 1).sum().item()
+        return active_request_count
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -741,7 +766,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.active_token_count += context_length
 
-    def _swap_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
+    def _move_book_keeping_tensors(self, src_idxs, dst_idxs, next_tokens):
         """
         Swaps all the relevent booking tensors with src idxs to dst idxs
         """
@@ -846,6 +871,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             non_zero_values_in_kv_memory = kv_chunks_asigned[kv_chunks_asigned != -1]
             self.chunk_allocator.release_memory_chunks(non_zero_values_in_kv_memory)
 
+            # Reset the KV chunks for finished requests.
+            # Note: do not use fill_() (or add_() and similar inplace ops) here.
+            # The combinition of indexing with a tensor (like finished_idxs) and fill_()/add_() creates a clone
+            # and updates it instead of the original tensor.
+            self.request_to_kv_chunk_ids[finished_idxs] = -1
+
             if active_request_count > 0:
                 finished_idxs_on_left = (
                     torch.nonzero(active_requests_mask[:active_request_count] == 0, as_tuple=True)[
@@ -859,11 +890,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                     + self.paused_request_count
                 )
 
-                self._swap_book_keeping_tensors(
+                self._move_book_keeping_tensors(
                     src_idxs=active_idxs_on_right,
                     dst_idxs=finished_idxs_on_left,
                     next_tokens=next_tokens,
                 )
+
+                # Reset chunk ids for recently moved requests.
+                self.request_to_kv_chunk_ids[active_idxs_on_right] = -1
 
         # 5. We identify requests that require a new chunk and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current chunk and  require a new one in a pause state temporarily
@@ -909,7 +943,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 dst_idxs = torch.cat((active_request_ids_on_left, paused_requests_idxs_on_right))
                 src_idxs = torch.cat((paused_requests_idxs_on_right, active_request_ids_on_left))
-                self._swap_book_keeping_tensors(
+                self._move_book_keeping_tensors(
                     src_idxs=src_idxs, dst_idxs=dst_idxs, next_tokens=next_tokens
                 )
 
@@ -952,6 +986,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.paused_request_count > 0:
             self.paused_tokens = next_tokens[: self.paused_request_count]
 
+        # add_ and fill_ calls seems to work as intended with sliced indexing (i.e. x[3:5].add(...) or x[3:5].fill_)
+        # but when another tensor is used for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
         self.request_kv_length_offsets[self.paused_request_count : self.total_request_count].add_(
             self.request_query_lengths[self.paused_request_count : self.total_request_count]
         )
@@ -972,7 +1008,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.paused_request_count : (self.paused_request_count + resume_request_count)
                 ]
                 == 0
-            ), 'The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. '
+            ), "The request_last_kv_chunk_offset should be 0 for the requests that just got resumed this step. "
 
             chunk_ids = self.chunk_allocator.allocate_memory_chunks(resume_request_count)
             row_idx = torch.arange(
@@ -1005,3 +1041,35 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_chunk[: self.active_token_count] = (
             self.request_last_kv_chunk_offset[self.paused_request_count : self.total_request_count]
         )
+
+    def calculate_log_probs(self, logits: torch.Tensor) -> List[List[float]]:
+        """Calculate log probs for all active requests and return them.
+
+        TODO: @wdykas support top-n log probs.
+
+        Args:
+            logits: Raw model output logits with shape [1, sequence_length, vocab_size].
+
+        Returns:
+            List of lists where each inner list contains log probs for a request in the
+            same order as the active requests (from paused_request_count to total_request_count).
+        """
+        # Calculate log_probs (sequence_length x vocab_size)
+        log_probs = F.log_softmax(logits, dim=-1).to(torch.float32).squeeze()
+
+        # Extract the log probs for only the selected tokens
+        # (sequence_length x vocab_size) -> (sequence_length)
+        active_token_ids = self.token_to_input_ids[: self.active_token_count]
+        sequence_indices = torch.arange(self.active_token_count, device=log_probs.device)
+        selected_log_probs = log_probs[sequence_indices, active_token_ids]
+
+        # Split the log probs across request boundaries
+        active_query_lengths = self.request_query_lengths[
+            self.paused_request_count : self.total_request_count
+        ]
+        selected_log_probs_list = selected_log_probs.cpu().split(
+            active_query_lengths.tolist(), dim=0
+        )
+
+        # Convert each log prob tensor into a list
+        return [lp.tolist() for lp in selected_log_probs_list]

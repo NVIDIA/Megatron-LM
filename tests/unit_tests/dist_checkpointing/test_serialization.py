@@ -19,7 +19,13 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, remove_sharded_tensors, save
+from megatron.core.dist_checkpointing import (
+    ShardedTensor,
+    load,
+    load_content_metadata,
+    remove_sharded_tensors,
+    save,
+)
 from megatron.core.dist_checkpointing.core import CheckpointingException, maybe_load_config
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensorFactory
@@ -601,6 +607,39 @@ class TestSerialization:
                 ]  # rank 3 held the main replica so did the saving
 
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        'content_metadata', [{'a': 3}, {'nested': {'a': 3}, 'flat': (5, {6: None})}, {}]
+    )
+    def test_content_metadata_load_from_checkpoint(self, tmp_path_dist_ckpt, content_metadata):
+        Utils.initialize_model_parallel(1, 1)
+        state_dict = {'common': (3, 5, 7)}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_content_metadata_load_from_checkpoint', sync=True
+        ) as ckpt_dir:
+            save(state_dict, ckpt_dir, content_metadata=content_metadata)
+            torch.distributed.barrier()
+            loaded_metadata = load_content_metadata(ckpt_dir)
+
+        assert loaded_metadata == content_metadata
+
+    @pytest.mark.parametrize(
+        'content_metadata', [{'a': 3}, {'nested': {'a': 3}, 'flat': (5, {6: None})}, {}]
+    )
+    def test_content_metadata_load_from_state_dict(self, tmp_path_dist_ckpt, content_metadata):
+        Utils.initialize_model_parallel(1, 1)
+        state_dict = {'common': (3, 5, 7)}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_content_metadata_load_from_state_dict', sync=True
+        ) as ckpt_dir:
+            save(state_dict, ckpt_dir, content_metadata=content_metadata)
+            torch.distributed.barrier()
+            loaded_state_dict = load(state_dict, ckpt_dir)
+            loaded_metadata = load_content_metadata(preloaded_state_dict=loaded_state_dict)
+
+        assert loaded_metadata == content_metadata
 
 
 class TestNonStrictLoad:

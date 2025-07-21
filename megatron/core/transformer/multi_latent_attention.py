@@ -92,7 +92,7 @@ class MultiLatentAttention(Attention):
         )
         self.qkv_up_checkpoint = None
 
-        mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale)
+        mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
 
         if self.config.rope_type == "rope":
@@ -103,11 +103,12 @@ class MultiLatentAttention(Attention):
                 cp_group=self.model_comm_pgs.cp,
             )
         elif self.config.rope_type == "yarn":
+
             self.rotary_pos_emb = YarnRotaryEmbedding(
                 self.config.qk_pos_emb_head_dim,
                 rotary_base=self.config.rotary_base,
                 scaling_factor=self.config.rotary_scaling_factor,
-                original_max_position_embeddings=self.config.max_position_embeddings,
+                original_max_position_embeddings=self.config.original_max_position_embeddings,
                 beta_fast=self.config.beta_fast,
                 beta_slow=self.config.beta_slow,
                 mscale=self.config.mscale,
@@ -399,8 +400,14 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
 
         if packed_seq_params is not None:
-            cu_seqlens_q = packed_seq_params.cu_seqlens_q
-            cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+            if packed_seq_params.cu_seqlens_q_padded is not None:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
+            else:
+                cu_seqlens_q = packed_seq_params.cu_seqlens_q
+            if packed_seq_params.cu_seqlens_kv_padded is not None:
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv_padded
+            else:
+                cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
         else:
             cu_seqlens_q = cu_seqlens_kv = None
 

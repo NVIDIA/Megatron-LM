@@ -3,13 +3,19 @@
 from typing import Callable, List, Optional
 
 import torch
-import transformer_engine as te
 
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+
+try:
+    import transformer_engine as te
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 FP8_PER_TENSOR_REAL_QUANT_CFG = {
     "quant_cfg": {
@@ -42,6 +48,12 @@ class Norm:
     """
 
     def __new__(cls, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
+        if not HAVE_TE:
+            raise ImportError(
+                "Transformer-Engine is not installed, please install it with "
+                "`pip install transformer-engine`"
+            )
+
         if config.normalization == "LayerNorm":
             instance = te.pytorch.LayerNorm(
                 hidden_size=hidden_size,
@@ -62,7 +74,7 @@ class Norm:
                 **_get_extra_te_kwargs(config),
             )
         else:
-            raise Exception('Only LayerNorm and RMSNorm are curently supported')
+            raise Exception("Only LayerNorm and RMSNorm are curently supported")
 
         def _state_dict_hook(self, state_dict, prefix, local_metadata):
             if "_extra_state" in state_dict:
@@ -108,16 +120,16 @@ class Linear(torch.nn.Linear):
         self._return_bias = skip_bias_add and bias
 
         if stride != 1:
-            raise ValueError('torch.nn.Linear does not support stride != 1')
+            raise ValueError("torch.nn.Linear does not support stride != 1")
 
         if skip_weight_param_allocation:
-            raise ValueError('torch.nn.Linear layers do not support skip_weight_param_allocation')
+            raise ValueError("torch.nn.Linear layers do not support skip_weight_param_allocation")
 
         if embedding_activation_buffer is not None:
-            raise ValueError('torch.nn.Linear does not support embedding_activation_buffer != None')
+            raise ValueError("torch.nn.Linear does not support embedding_activation_buffer != None")
 
         if grad_output_buffer is not None:
-            raise ValueError('torch.nn.Linear does not support grad_output_buffer != None')
+            raise ValueError("torch.nn.Linear does not support grad_output_buffer != None")
 
         super().__init__(
             in_features=input_size, out_features=output_size, bias=bias, dtype=config.params_dtype
@@ -126,15 +138,15 @@ class Linear(torch.nn.Linear):
         for param in self.parameters():
             if is_expert:
                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
-                setattr(param, 'allreduce', self.config.expert_model_parallel_size == 1)
+                setattr(param, "allreduce", self.config.expert_model_parallel_size == 1)
             else:
                 # Reduce the gradient on DP group
-                setattr(param, 'allreduce', True)
-                setattr(param, 'sequence_parallel', self.config.sequence_parallel)
+                setattr(param, "allreduce", True)
+                setattr(param, "sequence_parallel", self.config.sequence_parallel)
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
 
         for k, v in state_dict.items():
             if "_amax" in k or "_scale" in k:

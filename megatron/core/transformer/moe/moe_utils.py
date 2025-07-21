@@ -10,6 +10,8 @@ from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import (
         fused_permute,
         fused_permute_with_probs,
@@ -711,6 +713,7 @@ def track_moe_metrics(
     track_names: Optional[List[str]] = None,
     num_layers: Optional[int] = None,
     moe_layer_freq: Optional[Union[int, List[int]]] = None,
+    mtp_num_layers: Optional[int] = None,
 ):
     """Track the MoE metrics for logging."""
     # Aux loss logging
@@ -737,6 +740,9 @@ def track_moe_metrics(
         num_moe_layers = sum(moe_layer_freq)
     else:
         raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+
+    if mtp_num_layers is not None:
+        num_moe_layers += mtp_num_layers
 
     if writer is not None:
         aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}

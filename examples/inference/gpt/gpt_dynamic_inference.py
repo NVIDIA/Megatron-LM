@@ -4,27 +4,39 @@ import torch
 from argparse import ArgumentParser
 from collections import defaultdict
 from tqdm import tqdm
-from typing import List
+from typing import Dict, List
+import sys
+import os
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
     DynamicInferenceContext,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import GPTInferenceWrapper
-from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.inference.text_generation_controllers.text_generation_controller import TextGenerationController
-from megatron.core.transformer.module import MegatronModule
-from megatron.training import (
-    get_args,
-    get_model as _get_model,
-    get_tokenizer,
-    initialize_megatron,
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
 )
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
+from megatron.core.transformer.module import MegatronModule
+
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
+from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider
+import json
 
-from .utils import add_common_inference_args, build_requests, get_curr_time, Request
+from examples.inference.gpt.utils import (
+    add_common_inference_args,
+    build_requests,
+    build_dynamic_engine_setup_prefix,
+    get_curr_time,
+    Request,
+)
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -33,10 +45,11 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
     add_common_inference_args(parser)
 
     group = parser.add_argument_group(title='Dynamic inference')
-    group.add_argument("--inference-ckpt-non-strict", action="store_true",
-                       help="Load checkpoint with `strict=False`.")
-    
-
+    group.add_argument(
+        "--inference-ckpt-non-strict",
+        action="store_true",
+        help="Load checkpoint with `strict=False`.",
+    )
     return parser
 
 
@@ -68,10 +81,7 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context(
-    requests: List[Request],
-    sampling_params: SamplingParams,
-):
+def get_inference_context(requests: List[Request], sampling_params: SamplingParams):
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
@@ -86,7 +96,9 @@ def get_inference_context(
         params_dtype=args.params_dtype,
         num_layers=args.num_layers,
         kv_channels=args.kv_channels,
-        num_attention_heads=args.num_query_groups if args.group_query_attention else args.num_attention_heads,
+        num_attention_heads=(
+            args.num_query_groups if args.group_query_attention else args.num_attention_heads
+        ),
         max_sequence_length=max_sequence_length,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
@@ -95,14 +107,14 @@ def get_inference_context(
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        materialize_only_last_token_logits=not args.return_log_probs,
     )
 
     return context
 
 
 def get_inference_controller(
-    model: MegatronModule,
-    context: DynamicInferenceContext,
+    model: MegatronModule, context: DynamicInferenceContext
 ) -> TextGenerationController:
     """Buid text generation controller, which manages the model inference context.
 
@@ -122,9 +134,9 @@ def get_inference_controller(
 
     # Note: the following is taken from AbstractModelInferenceWrapper.prep_model_for_inference().
     from megatron.core import parallel_state
+
     model.model_is_pipeline_parallel = not (
-        parallel_state.is_pipeline_first_stage() and
-        parallel_state.is_pipeline_last_stage()
+        parallel_state.is_pipeline_first_stage() and parallel_state.is_pipeline_last_stage()
     )
 
     # Text generation controller.
@@ -134,10 +146,8 @@ def get_inference_controller(
 
 
 def run_inference(
-    requests: List[Request],
-    sampling_params: SamplingParams,
-    engine: DynamicInferenceEngine,
-) -> None:
+    requests: List[Request], sampling_params: SamplingParams, engine: DynamicInferenceEngine
+) -> List[Dict[str, float]]:
     """Add requests to engine and generate tokens.
 
     Args:
@@ -146,7 +156,7 @@ def run_inference(
         engine (DynamicInferenceEngine): Inference engine that manages generating tokens.
 
     Return:
-        None.
+        A dictionary of step times with `prefill` and `decode` keys.
     """
 
     # Initialize request arrival times.
@@ -173,9 +183,10 @@ def run_inference(
             if request.time_arrival > curr_time:
                 break
             try:
-
                 # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
-                engine.add_request(num_requests_added, request.prompt_text)
+                engine.add_request(
+                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
+                )
                 request.time_start = get_curr_time()
                 request.state = "started"
                 num_requests_added += 1
@@ -186,11 +197,10 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         is_decode_only = engine.context.is_decode_only()
-        finished_requests, step_time = engine.step(sampling_params, verbose=True)
+        active_requests, finished_requests, step_time = engine.step(sampling_params, verbose=True)
         step_id += 1
 
-        if len(finished_requests) > 0:
-            output_start = get_curr_time()
+        if len(active_requests) > 0 or len(finished_requests) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
@@ -203,25 +213,26 @@ def run_inference(
                 request.time_end = get_curr_time()
                 request.output_text = finished_request.generated_text
                 request.state = "finished"
+                request.request_id = finished_request.request_id
+                if sampling_params.return_log_probs:
+                    request.log_probs = (
+                        finished_request.prompt_log_probs + finished_request.generated_log_probs
+                    )
                 num_requests_finished += 1
-            
-            output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
-        if not (engine.has_unfinished_requests() or
-                num_requests_added < num_requests_total):
+        if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
-    return step_times, add_times, output_times
+    return step_times
 
 
-if __name__ == "__main__":
-
+@torch.inference_mode()
+def main():
     # Initialize Megatron.
     initialize_megatron(
         extra_args_provider=add_dynamic_inference_args,
-        args_defaults={'no_load_rng': True,
-                       'no_load_optim': True},
+        args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
 
     args = get_args()
@@ -243,41 +254,24 @@ if __name__ == "__main__":
     controller = get_inference_controller(model, context)
 
     # Inference engine.
-    engine = DynamicInferenceEngine(controller,
-                                    context,
-                                    termination_id=tokenizer.eod,
-                                    enable_cuda_graph=args.enable_cuda_graph,
-                                    random_seed=args.seed)
-
-    # Print setup.
-    setup_prefix = "dynamic | cg %d | %s | bf %.0f, flw %.1f [r %d, t %d], gtd %.2f [r %d] ... reqs %d" % (
-        args.enable_cuda_graph,
-        (
-            f"<user prompts, n {len(args.prompts)}>"
-            if args.prompts else
-            "<auto prompts> %s, %d, %.1e, %.1e" % (
-                "(%s)" % " ".join(map(str, args.num_tokens_to_prompt)),
-                args.num_tokens_to_generate,
-                args.incoming_requests_duration,
-                args.incoming_requests_per_sec,
-            )
-        ),
-        args.inference_dynamic_batching_buffer_size_gb,
-        args.inference_dynamic_batching_buffer_overflow_factor,
-        context.max_requests,
-        context.max_tokens,
-        args.inference_dynamic_batching_buffer_guaranteed_fraction,
-        context.gtd_request_count,
-        len(requests),
+    engine = DynamicInferenceEngine(
+        controller,
+        context,
+        termination_id=tokenizer.eod,
+        enable_cuda_graph=args.enable_cuda_graph,
+        random_seed=args.seed,
     )
+
+    setup_prefix = build_dynamic_engine_setup_prefix(args, context, requests)
     print("~~~")
     print(setup_prefix)
     print("~~~")
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times = run_inference(requests, sampling_params, engine)
-    total_time = get_curr_time() - t
+    step_times = run_inference(requests, sampling_params, engine)
+    torch.cuda.synchronize()
+    step_total = get_curr_time() - t
 
     # Validate all requests finished.
     for request in requests:
@@ -297,24 +291,58 @@ if __name__ == "__main__":
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]
-            print(f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... %s" % request.output_text.replace("\n", "\\n"))
+            output_text_escaped = request.output_text.replace("\n", "\\n")
+            print(
+                f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... {output_text_escaped}"
+            )
+
+        # Write results to JSON. Primarily used for functional testing.
+        if args.output_path:
+            json_results = {}
+
+            for idx, req in enumerate(requests):
+                result_dict = {
+                    "input_prompt": req.prompt_text,
+                    "generated_text": req.output_text,
+                    "generated_tokens": req.output_tokens,
+                    "latency": req.time_end - req.time_start,
+                }
+                if sampling_params.return_log_probs:
+                    response_logprobs = req.log_probs
+                    result_dict["logprobs"] = response_logprobs
+                json_results[req.request_id] = result_dict
+            with open(args.output_path, "w") as fp:
+                json.dump(json_results, fp)
 
     # Timing results.
     stats = torch.cuda.memory_stats()
     print("~~~")
-    print("%s ... mem %.1f/%.1f ... total time: %.3f ... step time: total %.3f [ p %.3f, d %.3f ], mean [ p %.3f, d %.3f ], count [ p %d, d %d ] ... add time: %.3f, output time: %.3f." % (
-        setup_prefix,
-        stats["allocated_bytes.all.peak"] / (1024**3),
-        stats["reserved_bytes.all.peak"] / (1024**3),
-        sum(step_times["prefill"]) + sum(step_times["decode"]) + sum(add_times),
-        sum(step_times["prefill"]) + sum(step_times["decode"]),
-        sum(step_times["prefill"]),
-        sum(step_times["decode"]),
-        sum(step_times["prefill"]) / len(step_times["prefill"]),
-        sum(step_times["decode"]) / len(step_times["decode"]),
-        len(step_times["prefill"]),
-        len(step_times["decode"]),
-        sum(add_times),
-        sum(output_times),
-    ))
+    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+
+    p_times = step_times["prefill"]
+    d_times = step_times["decode"]
+
+    p_total = sum(p_times)
+    d_total = sum(d_times)
+
+    p_count = len(p_times)
+    d_count = len(d_times)
+
+    p_mean = p_total / p_count
+    d_mean = d_total / d_count
+
+    print(
+        f"{setup_prefix} … "
+        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        f"total time: {step_total:.3f}s … "
+        f"step time: total {step_total:.3f}s "
+        f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+        f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+        f"count [ p {p_count}, d {d_count} ]."
+    )
     print("~~~")
+
+
+if __name__ == "__main__":
+    main()

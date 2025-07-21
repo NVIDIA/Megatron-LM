@@ -36,6 +36,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
 
+
 logger = logging.getLogger(__name__)
 # pylint: disable=line-too-long
 # list of local saved/loaded ShardedBase objects
@@ -64,34 +65,34 @@ class StrictHandling(Enum):
     """
 
     # Relies on the underlying strategy to raise error on unexpected keys
-    ASSUME_OK_UNEXPECTED = 'assume_ok_unexpected'
+    ASSUME_OK_UNEXPECTED = "assume_ok_unexpected"
     # Logs (with WARNING level) "unexpected" keys. Missing keys are ignored.
     # This is treated as a reasonable default for a "non-strict" load
-    LOG_UNEXPECTED = 'log_unexpected'
+    LOG_UNEXPECTED = "log_unexpected"
     # Logs (with WARNING level) all mismatched keys.
-    LOG_ALL = 'log_all'
+    LOG_ALL = "log_all"
     # Raise error on unexpected keys before load attempt.
     # Gives cleaner error message than `ASSUME_OK_UNEXPECTED` but requires
     # extra disk access.
-    RAISE_UNEXPECTED = 'raise_unexpected'
+    RAISE_UNEXPECTED = "raise_unexpected"
     # Raise error on any mismatch. Similar to `RAISE_UNEXPECTED` but requires
     # metadata exchange.
-    RAISE_ALL = 'raise_all'
+    RAISE_ALL = "raise_all"
     # "Unexpected" mismatches are not reported, but returned by the `load`
     # function along with the loaded state dict. Missing keys are ignored.
-    RETURN_UNEXPECTED = 'return_unexpected'
+    RETURN_UNEXPECTED = "return_unexpected"
     # All mismatches are returned along with the loaded state dict.
-    RETURN_ALL = 'return_all'
+    RETURN_ALL = "return_all"
     # Simply ignores mismatches (not recommended)
-    IGNORE_ALL = 'ignore_all'
+    IGNORE_ALL = "ignore_all"
 
     @staticmethod
-    def requires_explicit_ckpt_mismatch_check(val: 'StrictHandling') -> bool:
+    def requires_explicit_ckpt_mismatch_check(val: "StrictHandling") -> bool:
         """Whether a given strict flag involves mismatch check against the checkpoint."""
         return val != StrictHandling.ASSUME_OK_UNEXPECTED
 
     @staticmethod
-    def requires_global_app_metadata(val: 'StrictHandling') -> bool:
+    def requires_global_app_metadata(val: "StrictHandling") -> bool:
         """Whether a given strict option requires global metadata for validation."""
         return val in (
             StrictHandling.IGNORE_ALL,
@@ -101,7 +102,7 @@ class StrictHandling(Enum):
         )
 
     @staticmethod
-    def requires_returning_mismatch_keys(val: 'StrictHandling') -> bool:
+    def requires_returning_mismatch_keys(val: "StrictHandling") -> bool:
         """Whether a given strict option results in extra return value from the `load` function."""
         return val in (StrictHandling.RETURN_UNEXPECTED, StrictHandling.RETURN_ALL)
 
@@ -121,7 +122,7 @@ def parse_strict_flag(strict: Union[str, StrictHandling]) -> StrictHandling:
     try:
         return StrictHandling(strict)
     except (ValueError, TypeError) as e:
-        raise ValueError(f'Invalid strict flag: {e}') from e
+        raise ValueError(f"Invalid strict flag: {e}") from e
 
 
 def validate_integrity_and_strict_load(
@@ -130,7 +131,7 @@ def validate_integrity_and_strict_load(
     validate_access_integrity: bool,
     local_metadata: Optional[_LocalMetadata] = None,
     global_metadata: Optional[_GlobalMetadata] = None,
-    ckpt_sharded_metadata: Optional['CkptShardedMetadata'] = None,
+    ckpt_sharded_metadata: Optional["CkptShardedMetadata"] = None,
 ) -> Tuple[ShardedStateDict, Set[str], Set[str]]:
     """Validates sharding integrity and potential mismatches with the checkpoint.
 
@@ -166,7 +167,7 @@ def validate_integrity_and_strict_load(
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
         if ckpt_sharded_metadata is None:
             raise CheckpointingException(
-                'Cannot verify checkpoint mismatch with ckpt_sharded_metadata=None.'
+                "Cannot verify checkpoint mismatch with ckpt_sharded_metadata=None."
             )
         if local_metadata is None:
             local_metadata = [
@@ -195,7 +196,7 @@ def validate_integrity_and_strict_load(
     if validate_access_integrity:
         if global_metadata is None:
             raise CheckpointingException(
-                'Cannot check sharding intergrity without global_metadata (None).'
+                "Cannot check sharding intergrity without global_metadata (None)."
             )
         validate_sharding_integrity(global_metadata)
 
@@ -227,11 +228,11 @@ def verify_checkpoint_and_load_strategy(
     else:
         isdir = os.path.isdir(checkpoint_dir)
     if not isdir:
-        raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
+        raise CheckpointingException(f"Checkpoint directory {checkpoint_dir} does not exist")
 
     saved_config = maybe_load_config(checkpoint_dir)
     if saved_config is None:
-        raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
+        raise CheckpointingException(f"{checkpoint_dir} is not a distributed checkpoint")
 
     if sharded_strategy is None:
         sharded_strategy = get_default_strategy(
@@ -272,7 +273,7 @@ def adjust_non_strict_load(
     """
 
     def is_unexpected_key(x: ShardedBase):
-        assert isinstance(x, ShardedBase), f'Unexpected type {type(x)}'
+        assert isinstance(x, ShardedBase), f"Unexpected type {type(x)}"
         return x.key in sharded_keys_to_remove
 
     _, sharded_state_dict = extract_matching_values(sharded_state_dict, is_unexpected_key)
@@ -280,7 +281,7 @@ def adjust_non_strict_load(
 
 
 def _determine_missing_and_unexpected_keys(
-    ckpt_sharded_metadata: 'CkptShardedMetadata',
+    ckpt_sharded_metadata: "CkptShardedMetadata",
     local_metadata: _LocalMetadata,
     global_metadata: Optional[_GlobalMetadata] = None,
 ) -> Tuple[Set[str], Set[str]]:
@@ -320,9 +321,9 @@ def _determine_missing_and_unexpected_keys(
         missing_keys = set()
 
     if missing_keys:
-        logger.debug(f'Dist ckpt load missing keys: {missing_keys}')
+        logger.debug(f"Dist ckpt load missing keys: {missing_keys}")
     if unexpected_keys:
-        logger.debug(f'Dist ckpt load unexpected keys: {unexpected_keys}')
+        logger.debug(f"Dist ckpt load unexpected keys: {unexpected_keys}")
 
     return missing_keys, unexpected_keys
 
@@ -348,18 +349,18 @@ def maybe_report_missing_and_unexpected_keys(
     if not missing_keys and not unexpected_keys:
         return
     missing_title_msg = (
-        f'Some keys found in the checkpoint are missing in the provided sharded state dict. '
+        f"Some keys found in the checkpoint are missing in the provided sharded state dict. "
     )
-    missing_body_msg = f'Missing keys (for all ranks): {missing_keys}. '
-    unexpected_title_msg = f'Unexpected keys (not found in the checkpoint) encountered in the provided sharded state dict. '
-    unexpected_body_msg = f'Unexpected keys (for this rank): {unexpected_keys}. '
-    error_msg = ''
+    missing_body_msg = f"Missing keys (for all ranks): {missing_keys}. "
+    unexpected_title_msg = f"Unexpected keys (not found in the checkpoint) encountered in the provided sharded state dict. "
+    unexpected_body_msg = f"Unexpected keys (for this rank): {unexpected_keys}. "
+    error_msg = ""
     if missing_keys:
         error_msg += missing_title_msg
     if unexpected_keys:
         error_msg += unexpected_title_msg
 
-    error_msg += '\n'
+    error_msg += "\n"
     if missing_keys:
         error_msg += missing_body_msg
     if unexpected_keys:
@@ -395,7 +396,7 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
 
         if len(common_state_dict_diff) != 0:
             logger.warning(
-                f'There is difference in the common state dict in different ranks. The differences are {common_state_dict_diff}'
+                f"There is difference in the common state dict in different ranks. The differences are {common_state_dict_diff}"
             )
 
 
@@ -476,13 +477,13 @@ def _validate_sharding_for_key(rank_sharding: List[Tuple[int, ShardedTensor]]):
         shard_access_cnt = torch.minimum(shard_access_cnt, torch.tensor([1]))
     if not torch.all(shard_access_cnt == 1):
         raise CheckpointingException(
-            f'Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}'
+            f"Invalid access pattern for {rank_sharding[0][1]}: {shard_access_cnt}"
         )
 
 
 def _compute_shards_access(rank_sharding):
     shard_access_cnt = torch.zeros(
-        rank_sharding[0][1].axis_fragmentations, dtype=torch.int, device='cpu'
+        rank_sharding[0][1].axis_fragmentations, dtype=torch.int, device="cpu"
     )
     for rank, sharding in rank_sharding:
         if is_main_replica(sharding.replica_id):
@@ -505,7 +506,7 @@ def _validate_sharding_for_key_flattened(tensors_by_shard):
     expected_size = np.product(local_shape)
     if starts[0] != 0 or stops[-1] != expected_size or not np.all(starts[1:] == stops[:-1]):
         raise CheckpointingException(
-            f'Flattened ranges dont cover the whole shard {tensors_by_shard[0]} of size {expected_size}. Ranges: {(starts, stops)}'
+            f"Flattened ranges dont cover the whole shard {tensors_by_shard[0]} of size {expected_size}. Ranges: {(starts, stops)}"
         )
 
 
@@ -516,12 +517,12 @@ def _validate_objects_for_key(sharded_objects: List[ShardedObject]):
     ]
     if len(unique_keys) != len(set(unique_keys)):
         duplicates = {k: cnt for k, cnt in Counter(unique_keys).items() if cnt > 1}
-        logger.error(f'Duplicate ShardedObject keys and counts: {duplicates}')
-        raise CheckpointingException(f'Duplicate ShardedObject keys: {list(duplicates.keys())}')
+        logger.error(f"Duplicate ShardedObject keys and counts: {duplicates}")
+        raise CheckpointingException(f"Duplicate ShardedObject keys: {list(duplicates.keys())}")
     expected_shard_num = np.prod(sharded_objects[0][1].global_shape)
     if len(unique_keys) != expected_shard_num:
-        err_msg = f'Invalid access pattern: {expected_shard_num - len(unique_keys)} ShardedObject are missing.'
-        logger.error(f'{err_msg} Existing shards: {unique_keys}')
+        err_msg = f"Invalid access pattern: {expected_shard_num - len(unique_keys)} ShardedObject are missing."
+        logger.error(f"{err_msg} Existing shards: {unique_keys}")
         raise CheckpointingException(err_msg)
 
 
@@ -563,6 +564,6 @@ def validate_sharded_objects_handling(
         and not common_strategy.can_handle_sharded_objects
     ):
         raise CheckpointingException(
-            f'Either sharded strategy or common strategy must implement ShardedObjects handling.'
-            f' Both {sharded_strategy} and {common_strategy} specify can_handle_sharded_objects=False'
+            f"Either sharded strategy or common strategy must implement ShardedObjects handling."
+            f" Both {sharded_strategy} and {common_strategy} specify can_handle_sharded_objects=False"
         )

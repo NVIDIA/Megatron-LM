@@ -11,11 +11,17 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 
 HAVE_APEX_OR_TE = True
+USING_TE_OPTIMIZER = False
+USING_APEX_OPTIMIZER = False
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
+
+    USING_TE_OPTIMIZER = True
 except ImportError:
     try:
         from apex.optimizers import FusedAdam as Adam
+
+        USING_APEX_OPTIMIZER = True
     except ImportError:
         from torch.optim import AdamW as Adam
 
@@ -38,7 +44,7 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_b
 from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_shard
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper
+from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
 from .optimizer_config import OptimizerConfig
 
 logger = getLogger(__name__)
@@ -623,6 +629,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert len(steps) == 1, f"steps: {optimizer.state}"
                     step = steps[0]
                     break
+        elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
+            # Extract 'step', for TE FusedAdam support.
+            steps = list(
+                set(
+                    [
+                        g["step"]
+                        for g in inner_state_dict["param_groups"]
+                        if len(g["params"]) > 0 and "step" in g
+                    ]
+                )
+            )
+            assert len(steps) <= 1, f"steps: {steps}"
+            step = steps[0] if len(steps) == 1 else None
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}
@@ -631,7 +650,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if not HAVE_APEX_OR_TE:
                 # Native PyTorch param group requires step (i.e., iteration).
                 param_group["step"] = step
-            elif isinstance(self.optimizer, HybridDeviceOptimizer) and step is not None:
+            elif (
+                USING_TE_OPTIMIZER
+                or USING_APEX_OPTIMIZER
+                or isinstance(self.optimizer, HybridDeviceOptimizer)
+            ) and step is not None:
+                # TE FusedAdam will not accumulate step for empty param groups, so we need to
+                # align the step across param groups.
                 param_group["step"] = int(step)
 
         # Grad scaler state.
@@ -692,11 +717,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   contains an integer ordering of parameters within each group, and
         #   the ordering of parameters within its flattened parameter state
         #   list.
+        def make_needed_groups(param_group):
+            needed_groups = []
+            for key in param_group_identifier_keys:
+                # NeMo changes these variable names from `lr_mult` and `wd_mult`
+                # to `pre_lr_mult` and `pre_wd_mult`, so we need to check both.
+                if key in param_group:
+                    pass
+                elif f"pre_{key}" in param_group:
+                    key = f"pre_{key}"
+                else:
+                    raise ValueError(
+                        f"Key {key} (or pre_{key}) not found in param_group {param_group}."
+                    )
+                needed_groups.append(param_group[key])
+            needed_groups = tuple(needed_groups)
+            return needed_groups
+
+        param_groups_map = {}
+        for param_group in state_dict["optimizer"]["param_groups"]:
+            needed_groups = make_needed_groups(param_group)
+            param_groups_map[needed_groups] = param_group
         inner_state_dict = self.optimizer.state_dict()
-        state_dict_param_groups = [
-            {**group, "params": list(inner_state_dict["param_groups"][idx]["params"])}
-            for idx, group in enumerate(state_dict["optimizer"]["param_groups"])
-        ]
+        state_dict_param_groups = []
+        for inner_param_group in inner_state_dict["param_groups"]:
+            needed_groups = make_needed_groups(inner_param_group)
+            state_dict_param_groups.append(
+                {**param_groups_map[needed_groups], "params": inner_param_group['params']}
+            )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
@@ -1080,13 +1128,25 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self,
         model_sharded_state_dict: ShardedStateDict,
         is_loading: bool = False,
-        sharding_type: str = 'fully_sharded_model_space',
+        sharding_type: Optional[str] = None,
+        metadata: Optional[dict] = None,
     ):
         """
         Chooses between 3 param state sharding implementations as requested by `sharding_type`.
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
+        if sharding_type is not None:
+            logger.warning(
+                'DistributedOptimizer.sharded_state_dict parameter `sharding_type`'
+                ' is deprecated and will be removed.'
+                ' Use `metadata["distrib_optim_sharding_type"] instead`.'
+            )
+        else:
+            sharding_type = (metadata or {}).get(
+                'distrib_optim_sharding_type', 'fully_sharded_model_space'
+            )
+
         if not is_loading and sharding_type == 'fully_sharded_bucket_space':
             logger.warning(
                 '`fully_sharded_bucket_space` sharding for DistributedOptimizer'
@@ -2086,7 +2146,43 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                 shard_param_buffer.copy_(shard_main_param)
 
-    def _copy_model_params_to_main_params(self):
+    def _build_model_param_to_state_dict_param_map(self, state_dict):
+        """Create a map from model params to tensors in state_dict based on their names."""
+        state_dict_list = []
+        if "model0" in state_dict or "model_0" in state_dict:
+            # When there are multiple model chunks, the state_dict should have keys = "model0",
+            # "model1", "model2", etc (For NeMo, it's "model_0", "model_1", "model_2", etc).
+            prefix = "model" if "model0" in state_dict else "model_"
+            for i in range(len(self.model_chunks)):
+                k = f"{prefix}{i}"
+                assert k in state_dict, f"Wrong state_dict format, cannot find '{k}'"
+                state_dict_list.append(state_dict[k])
+        elif "model" in state_dict:
+            # When there is only one model chunk, the state_dict should have the key "model".
+            assert len(self.model_chunks) == 1
+            state_dict_list.append(state_dict["model"])
+        else:
+            assert len(self.model_chunks) == 1
+            state_dict_list.append(state_dict)
+
+        model_param_to_state_dict_param_map = {}
+        for chunk_idx, model_chunk in enumerate(self.model_chunks):
+            names_in_state_dict = set(state_dict_list[chunk_idx].keys())
+            for name, model_param in model_chunk.named_parameters():
+                while name.startswith("module."):
+                    name = name[len("module.") :]
+                matched_keys = [k for k in names_in_state_dict if name in k]
+                assert (
+                    len(matched_keys) == 1
+                ), f"Parameter {name} has {len(matched_keys)} matches in state dict"
+                state_dict_param = state_dict_list[chunk_idx][matched_keys[0]]
+                assert model_param.shape == state_dict_param.shape
+                model_param_to_state_dict_param_map[model_param] = state_dict_param
+                names_in_state_dict.remove(matched_keys[0])
+
+        return model_param_to_state_dict_param_map
+
+    def _copy_model_params_to_main_params(self, state_dict=None):
         """
         Copy model params to main params.
 
@@ -2108,6 +2204,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             return
 
+        if state_dict is not None:
+            # Build a mapping from the model params to the corresponding tensors in the state dict,
+            # so that whenever the model params are used to initialize the main params, they can be
+            # replaced by the corresponding tensors from the state dict to initialize the master
+            # weights.
+            model_param_to_state_dict_param_map = self._build_model_param_to_state_dict_param_map(
+                state_dict
+            )
+
         # Utility method for copying group params.
         def copy_group_params(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -2116,6 +2221,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     param_range_map = self._get_model_param_range_map(model_param)
                     param_range = param_range_map["param"]
                     assert param_range.size == shard_main_param.nelement()
+
+                    if state_dict is not None:
+                        # Use param from state_dict to initialize main_param
+                        model_param = model_param_to_state_dict_param_map[model_param]
 
                     if is_float8tensor(model_param):
                         shard_model_param = dequantize_fp8_tensor(model_param).view(-1)[

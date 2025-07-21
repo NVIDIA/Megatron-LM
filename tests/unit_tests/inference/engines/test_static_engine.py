@@ -28,7 +28,7 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestStaticInferenceEngine:
-    def setup_engine(self, engine_max_batch_size=None):
+    def setup_engine(self, engine_max_batch_size=None, vocab_size=100):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
@@ -36,7 +36,7 @@ class TestStaticInferenceEngine:
         model_parallel_cuda_manual_seed(123)
         self.batch_size = 4
         self.hidden_size = 12
-        self.vocab_size = 100
+        self.vocab_size = vocab_size
         self.sequence_length = 64
         transformer_config = TransformerConfig(
             num_layers=4,

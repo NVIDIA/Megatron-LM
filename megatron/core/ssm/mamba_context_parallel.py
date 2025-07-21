@@ -8,8 +8,10 @@ from megatron.core.tensor_parallel import all_to_all
 
 try:
     from einops import repeat
+
+    HAVE_EINOPS = True
 except ImportError:
-    raise ImportError("einops is required by the Mamba model but cannot be imported")
+    HAVE_EINOPS = False
 
 
 class MambaContextParallel:
@@ -55,6 +57,9 @@ class MambaContextParallel:
         D_cp1: torch.Tensor,
         D_has_hdim: bool,
     ) -> None:
+        if not HAVE_EINOPS:
+            raise ImportError("einops is required by the Mamba model but cannot be imported")
+
         self.cp_group = cp_group
         self.d_inner_local_tp = d_inner_local_tp
         self.nheads_local_tp = nheads_local_tp
@@ -142,14 +147,14 @@ class MambaContextParallel:
         # associated with consecutive groups of heads.
         B = repeat(
             B,
-            'l b (g n) -> l b (g r n)',
+            "l b (g n) -> l b (g r n)",
             g=self.ngroups_local_tp,
             n=self.d_state,
             r=self.group_repeat_count,
         )
         C = repeat(
             C,
-            'l b (g n) -> l b (g r n)',
+            "l b (g n) -> l b (g r n)",
             g=self.ngroups_local_tp,
             n=self.d_state,
             r=self.group_repeat_count,
