@@ -14,6 +14,13 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
 
+try:
+    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
+except ImportError:
+    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
+
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
@@ -69,13 +76,6 @@ def get_pp_prev_rank(pp_group: torch.distributed.ProcessGroup):
     current_rank_in_group = get_pg_rank(pp_group)
     pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
     return pp_ranks[current_rank_in_group - 1]
-
-try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
-except ImportError:
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
 
 
 def make_viewless(e):
