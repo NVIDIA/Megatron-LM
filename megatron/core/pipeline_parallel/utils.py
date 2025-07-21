@@ -345,7 +345,13 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
 
 
 def register_wgrad_accumulation_and_reduce_func(model):
-    """Register the wgrad accumulation and reduce function for the TE modules"""
+    """Register the wgrad accumulation and reduce function for the TE modules
+    When delaying wgrad compute, we need to let the TE modules skip the weight gradient accumulation
+    and reduce after the backward() method, and manually call the accumulation and reduce function
+    in the backward_dw() method.
+    This method is used to register the wgrad accumulation and reduce function for the TE modules.
+    Now only DDP wrapper is supported.
+    """
     if not isinstance(model, list):
         model = [model]
     for i in range(len(model)):
@@ -355,6 +361,7 @@ def register_wgrad_accumulation_and_reduce_func(model):
         for name, module in unwrapped_model[i].named_modules():
             if isinstance(module, TE_MODULE_CLASSNAMES):
                 if hasattr(module, 'register_wgrad_accumulation_and_reduce_func'):
+                    assert isinstance(model[i], DDP), "Only DDP wrapper is supported now."
                     module.register_wgrad_accumulation_and_reduce_func(
                         model[i]._make_backward_post_hook
                     )
