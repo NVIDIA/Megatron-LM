@@ -50,7 +50,7 @@ from megatron.core.utils import (
 try:
     import transformer_engine as te
 
-    TE_MODULE_CLASSNAMES = (te.pytorch.Linear, te.pytorch.LayerNormLinear, te.pytorch.GroupedLinear)
+    TE_MODULE_CLASSNAMES = (te.pytorch.Linear, te.pytorch.LayerNormLinear)
 
     HAVE_TE = True
 except ImportError:
@@ -953,6 +953,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
+    TE_MODULE_CLASSNAMES += (te.pytorch.GroupedLinear,)
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """
