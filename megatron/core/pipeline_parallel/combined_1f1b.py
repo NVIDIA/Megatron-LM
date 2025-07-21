@@ -11,9 +11,9 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
+    register_wgrad_accumulation_and_reduce_func,
     set_streams,
     unwrap_model,
-    register_wgrad_accumulation_and_reduce_func,
 )
 from megatron.core.utils import get_attr_wrapped_model
 

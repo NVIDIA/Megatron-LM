@@ -10,10 +10,10 @@ from torch.autograd import Variable
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
+from megatron.core.extensions.transformer_engine import TE_MODULE_CLASSNAMES
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
-from megatron.core.extensions.transformer_engine import TE_MODULE_CLASSNAMES
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -341,6 +341,7 @@ def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
         return unwrapped_model[0]
     return unwrapped_model
 
+
 def register_wgrad_accumulation_and_reduce_func(model):
     """Register the wgrad accumulation and reduce function for the TE modules"""
     if not isinstance(model, list):
@@ -354,6 +355,7 @@ def register_wgrad_accumulation_and_reduce_func(model):
                 register_wgrad_accumulation_and_reduce_func = getattr(
                     module, 'register_wgrad_accumulation_and_reduce_func'
                 )
-                assert register_wgrad_accumulation_and_reduce_func is not None, \
-                    f"register_wgrad_accumulation_and_reduce_func is not found for {name}"
+                assert (
+                    register_wgrad_accumulation_and_reduce_func is not None
+                ), f"register_wgrad_accumulation_and_reduce_func is not found for {name}"
                 register_wgrad_accumulation_and_reduce_func(model[i]._make_backward_post_hook)

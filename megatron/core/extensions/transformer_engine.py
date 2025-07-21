@@ -49,11 +49,13 @@ from megatron.core.utils import (
 
 try:
     import transformer_engine as te
+
     TE_MODULE_CLASSNAMES = (te.pytorch.Linear, te.pytorch.LayerNormLinear, te.pytorch.GroupedLinear)
 
     HAVE_TE = True
 except ImportError:
     from unittest.mock import MagicMock
+
     TE_MODULE_CLASSNAMES = ()
 
     te = MagicMock()
