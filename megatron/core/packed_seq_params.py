@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 
 from torch import Tensor
+from typing import List
 
 
 @dataclass
@@ -18,3 +19,4 @@ class PackedSeqParams:
     cu_seqlens_kv_padded: Tensor = None
     max_seqlen_q: Tensor = None
     max_seqlen_kv: Tensor = None
+    cp_assignment: List[int] = None
