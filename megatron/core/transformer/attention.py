@@ -662,7 +662,7 @@ class Attention(MegatronModule, ABC):
             )
         )
 
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             query = query.squeeze(1)
             key = key.squeeze(1)
             value = value.squeeze(1)
