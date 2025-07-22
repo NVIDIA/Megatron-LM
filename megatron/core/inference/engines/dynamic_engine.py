@@ -152,7 +152,10 @@ class DynamicInferenceEngine(AbstractEngine):
                                 "attention_mask": None,
                             }
                         )
-                        context.reset()  # this reset is absolutely necessary to reset the enforce non decode flag.
+                        # this reset is absolutely necessary to reset the 
+                        # enforce_non_decode flag within context.
+                        # do not remove it. 
+                        context.reset()  
 
             # Create cuda graphs.
             with torch.inference_mode():
