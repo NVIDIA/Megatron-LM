@@ -566,7 +566,10 @@ class _CudaGraphRunner(torch.nn.Module):
         # Initialize inference context.
         if inference_context and inference_context.is_dynamic_batching():
             num_warmup_requests = kwargs["hidden_states"].size(0)
-            inference_context.initialize_attention_state(num_warmup_requests=num_warmup_requests, enforce_non_decode_mode=self.is_non_decode_runner)
+            inference_context.initialize_attention_state(
+                num_warmup_requests=num_warmup_requests,
+                enforce_non_decode_mode=self.is_non_decode_runner,
+            )
 
         context = (
             torch.cuda.graph(cuda_graph=graph, pool=pool) if graph is not None else nullcontext()
@@ -957,7 +960,12 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = True, is_non_decode: bool = False):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        share_cudagraph_io_buffers: bool = True,
+        is_non_decode: bool = False,
+    ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
@@ -1076,7 +1084,7 @@ class CudaGraphManager(torch.nn.Module):
                         args,
                         kwargs,
                         self.share_cudagraph_io_buffers,
-                        is_non_decode_runner=self.is_non_decode
+                        is_non_decode_runner=self.is_non_decode,
                     )
                     self.cudagraph_runners.append(runner)
         else:

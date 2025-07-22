@@ -847,12 +847,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
-                (
-                    kwargs.get('inference_context') is not None
-                )
-                or (
-                    kwargs.get('inference_params') is not None
-                )
+                (kwargs.get('inference_context') is not None)
+                or (kwargs.get('inference_params') is not None)
             )
         ):
             assert (
@@ -861,9 +857,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             if kwargs['inference_context'].is_decode_only():
                 return self.cudagraph_manager(self, args, kwargs)
             elif kwargs['inference_context'].using_cuda_graph_this_step:
-                # it can happen that non-decode steps have a token count greater than the max 
-                # supported cuda graph batch size. In that case this flag will be set to 
-                # False by initialize_attention. The model implementation needs to query this 
+                # it can happen that non-decode steps have a token count greater than the max
+                # supported cuda graph batch size. In that case this flag will be set to
+                # False by initialize_attention. The model implementation needs to query this
                 # flag and decide whether to call the cudagraph-manager or not.
                 return self.cudagraph_manager_for_non_decode(self, args, kwargs)
         elif self.config.external_cuda_graph and self.training:
