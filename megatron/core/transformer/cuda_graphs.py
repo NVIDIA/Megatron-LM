@@ -483,6 +483,7 @@ class _CudaGraphRunner(torch.nn.Module):
         fwd_graph_input_args: List[Any],
         fwd_graph_input_kwargs: Dict[str, Any],
         share_cudagraph_io_buffers=None,
+        is_non_decode_runner: bool = False,
     ):
         """Creates a _CudaGraphRunner, which holds a single pair of fwd and bwd cudagraphs, which
         are not created until this runner records its graph creation into
@@ -540,6 +541,8 @@ class _CudaGraphRunner(torch.nn.Module):
         else:
             self.is_first_layer, self.is_last_layer = True, True
 
+        self.is_non_decode_runner = is_non_decode_runner
+
     def __str__(self):
         return "%s; hid %s" % (
             self.base_module.__class__.__name__,
@@ -563,7 +566,7 @@ class _CudaGraphRunner(torch.nn.Module):
         # Initialize inference context.
         if inference_context and inference_context.is_dynamic_batching():
             num_warmup_requests = kwargs["hidden_states"].size(0)
-            inference_context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+            inference_context.initialize_attention_state(num_warmup_requests=num_warmup_requests, enforce_non_decode_mode=self.is_non_decode_runner)
 
         context = (
             torch.cuda.graph(cuda_graph=graph, pool=pool) if graph is not None else nullcontext()
@@ -954,7 +957,7 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = True):
+    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = True, is_non_decode: bool = False):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
@@ -968,6 +971,7 @@ class CudaGraphManager(torch.nn.Module):
         """
         rng_tracker = get_cuda_rng_tracker()
         self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
+        self.is_non_decode = is_non_decode
 
         # need to delay the import here to avoid a circular import
         global HAVE_TE_GRAPHS
@@ -1072,6 +1076,7 @@ class CudaGraphManager(torch.nn.Module):
                         args,
                         kwargs,
                         self.share_cudagraph_io_buffers,
+                        is_non_decode_runner=self.is_non_decode
                     )
                     self.cudagraph_runners.append(runner)
         else:
