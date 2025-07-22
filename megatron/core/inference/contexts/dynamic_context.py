@@ -563,6 +563,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.enforce_non_decode_mode = False
 
     def add_dummy_requests_for_cudagraph_capture(self, num_warmup_requests: int) -> None:
+        """
+        Adds dummy requests of sequence length 1 to the context. These are using during 
+        cuda graph captures.
+        """
         for i in range(num_warmup_requests):
             self.add_request(
                 request_id=i,
