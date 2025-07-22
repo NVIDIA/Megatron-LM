@@ -1831,7 +1831,7 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
+def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = None, cp_rank: Optional[int] = None):
     """Slice batch input along sequence dimension into multiple chunks,
     which are parallelized across GPUs in a context parallel group.
     """
@@ -1842,12 +1842,14 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any]):
     # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
-    cp_size = parallel_state.get_context_parallel_world_size()
-    if cp_size > 1:
+    if cp_size is None:
+        cp_size = parallel_state.get_context_parallel_world_size()
+    if cp_rank is None:
         cp_rank = parallel_state.get_context_parallel_rank()
+    if cp_size > 1:
         for key, val in batch.items():
             if val is not None:
-                seq_dim = 1 if key != "attention_mask" else 2
+                seq_dim = 1 if key != 'attention_mask' else 2
                 val = val.view(
                     *val.shape[0:seq_dim],
                     2 * cp_size,
@@ -2000,6 +2002,16 @@ def heterogeneous_context_parallel(
         )
         # num_subsamples: number of sub-samples assigned to this CP rank
         # complete_cp_assignment: list of lists, inner list CP ranks assigned to a sub-sample
+        # TODO: When some ranks finish with their assigned sub-samples, they get the next microbatch from the data iterator.
+        # They then call heterogeneous_cp_assignment again. But some ranks are still executing their previous sub-samples.
+        # The scheduling algorithm assumes that all ranks have empty queues.
+        # Need to preserve the state of the queue. It should only empty at the end of global batch.
+        # OR should I force sync at the end of each microbatch across CP ranks?
+        # I think forcing sync at the end of each microbatch across CP ranks is the easier option.
+        # Since we only see 1 microbatch at a time, a later microbatch can have more GPUs for a sample than the 1st microbatch groups.
+        # For example, if microbatch 0 had group of 4 GPUs running for a sub-sample but microbatch 1 requires 6 GPUs
+        # If GPU 4,5 are done before 0,1,2,3 in microbatch 0, then they will be waiting for 0,1,2,3 to catch up which can lead to deadlock in comms.
+        # Unless we can stop 4,5 from executing which means partial syncs for each executing sub-sample.
         num_subsamples, complete_cp_assignment = get_heterogeneous_cp_assignment(
             data["cu_seqlens"],
             config.max_seqlen_per_cp_rank,
@@ -2010,6 +2022,8 @@ def heterogeneous_context_parallel(
         # See function get_current_cp_assignment for more details.
         current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0, rank)
         data["cp_assignment"] = current_cp_assignment
+        # TODO: Make this a tensor so that tensor parallel broadcast works
+        # data["cp_assignment"] = torch.tensor(current_cp_assignment, dtype=torch.int32)
         bound_args.arguments['data_iterator'] = RerunDataIterator(iter([data]))
         # Run the 1st micro-microbatch
         output_tensor, num_tokens = single_forward_step(*bound_args.args, **bound_args.kwargs)
@@ -2026,6 +2040,31 @@ def heterogeneous_context_parallel(
             total_num_tokens += num_tokens
         return output_tensor, total_num_tokens
     return forward_func_wrapper
+
+def get_sub_sample_on_this_cp_rank(batch, current_cp_assignment, packed_seq_params, cp_rank):
+    cu_lengths = packed_seq_params.cu_seqlens_q_padded
+    for i in range(len(current_cp_assignment)):
+        if current_cp_assignment[i] is not None:
+            assert cp_rank in current_cp_assignment[i], f"Current cp rank {cp_rank} is not part of the cp_assignment {current_cp_assignment[i]} given to this GPU"
+            start_index = cu_lengths[i]
+            end_index = cu_lengths[i+1]
+            cp_shard_ranks = current_cp_assignment[i]
+            break        
+    for key, data in batch.items():
+        batch[key] = data[:, start_index:end_index]
+        
+    # TODO: Clean this up. Reduce code by calculating indices once
+    sub_sample_packed_seq_params = PackedSeqParams(
+        qkv_format="sbhd",
+        cu_seqlens_q=torch.tensor([0, packed_seq_params.cu_seqlens_q[i+1] - packed_seq_params.cu_seqlens_q[i]], device="cpu", pin_memory=True),
+        cu_seqlens_kv=torch.tensor([0, packed_seq_params.cu_seqlens_kv[i+1] - packed_seq_params.cu_seqlens_kv[i]], device="cpu", pin_memory=True),
+        cu_seqlens_q_padded=torch.tensor([0, packed_seq_params.cu_seqlens_q_padded[i+1] - packed_seq_params.cu_seqlens_q_padded[i]], device="cpu", pin_memory=True),
+        cu_seqlens_kv_padded=torch.tensor([0, packed_seq_params.cu_seqlens_kv_padded[i+1] - packed_seq_params.cu_seqlens_kv_padded[i]], device="cpu", pin_memory=True),
+        max_seqlen_q=torch.tensor([end_index - start_index], device="cpu", pin_memory=True),
+        max_seqlen_kv=torch.tensor([end_index - start_index], device="cpu", pin_memory=True),
+        cp_assignment=cp_shard_ranks,
+    )
+    return batch, cp_shard_ranks, sub_sample_packed_seq_params
 
 
 ######################
