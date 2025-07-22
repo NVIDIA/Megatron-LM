@@ -99,13 +99,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
             print(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
-                % (len(context.cuda_graph_request_counts), context.cuda_graph_request_counts)
+                % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
             )
 
             # Iterate cuda graph dims.
-            tbar = enumerate(context.cuda_graph_request_counts)
+            tbar = enumerate(context.cuda_graph_token_counts)
             if HAVE_TQDM:
-                tbar = tqdm(tbar, total=len(context.cuda_graph_request_counts))
+                tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
             for tbar_idx, cuda_graph_request_count in tbar:
 
                 # Initialize attention state.
@@ -133,6 +133,24 @@ class DynamicInferenceEngine(AbstractEngine):
                         {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
                     )
                     context.reset()  # todo: @lmcafee, remove if unnecessary.
+
+
+                # non-decode cudagraph capture.
+                if cuda_graph_request_count > 1 and context.non_decode_cuda_graphs:
+                    context.initialize_attention_state(num_warmup_requests=cuda_graph_request_count, 
+                                                        enforce_non_decode_mode=True)
+                    # Get flat tokens, position ids.
+                    input_ids, position_ids = context.current_input_and_position_ids(
+                        num_warmup_tokens=cuda_graph_request_count
+                    )
+                    
+                    with torch.inference_mode():
+                        logits = controller.inference_wrapped_model.run_one_forward_step(
+                            {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+                        )
+                        context.reset()  # this reset is absolutely necessary to reset the enforce non decode flag.
+
+
 
             # Create cuda graphs.
             with torch.inference_mode():

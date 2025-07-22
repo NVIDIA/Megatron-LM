@@ -144,6 +144,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_model_parallel_size: Optional[int] = None,
         num_cuda_graphs: Optional[int] = None,
         materialize_only_last_token_logits: bool = True,
+        use_cuda_graphs_for_non_decode_steps: bool = True
     ):
 
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
@@ -264,8 +265,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-        # Cuda graph request counts (i.e., batch sizes used for decode-only steps).
-        self.cuda_graph_request_counts = None
+        # Cuda graph token-counts (i.e., token counts used by cuda-graph steps, both decode and non-decode).
+        self.cuda_graph_token_counts = None
         if num_cuda_graphs is not None:
 
             # Ensure valid num_cuda_graphs.
@@ -278,49 +279,60 @@ class DynamicInferenceContext(BaseInferenceContext):
                 math.ceil(int(self.cuda_graph_step_size) / cuda_graph_rounder)
             )
 
-            # Cuda graph request counts.
+            # Cuda graph token counts.
             if num_cuda_graphs == 1:
-                self.cuda_graph_request_counts = [self.max_requests]
+                self.cuda_graph_token_counts = [self.max_requests]
             else:
-                self.cuda_graph_request_counts = list(
+                self.cuda_graph_token_counts = list(
                     range(self.cuda_graph_step_size, self.max_requests, self.cuda_graph_step_size)
                 )
-                if self.cuda_graph_request_counts[-1] != self.max_requests:
-                    self.cuda_graph_request_counts.append(self.max_requests)
-                self.cuda_graph_request_counts.reverse()
+                if self.cuda_graph_token_counts[-1] != self.max_requests:
+                    self.cuda_graph_token_counts.append(self.max_requests)
+                self.cuda_graph_token_counts.reverse()
 
             # Set used for validating active cuda graph request count.
-            self.cuda_graph_request_counts_set = set(self.cuda_graph_request_counts)
+            self.cuda_graph_token_counts_set = set(self.cuda_graph_token_counts)
 
-        # `*_decode_only` tensors are for use with cuda graphs to maintain
-        # consistent input shapes, which is required to use cuda graphs. Cuda
-        # graphs are used only during decode-only steps (i.e., no requests are in
-        # the prefill phases). During these decode-only steps, the `*_decode_only`
+
+        self.non_decode_cuda_graphs = use_cuda_graphs_for_non_decode_steps and (num_cuda_graphs is not None)
+
+        # `*_cudagraph_only` tensors are for use with cuda graphs to maintain
+        # consistent input shapes, which is required to use cuda graphs. 
+        # During these steps, the `*_cudagraph_only`
         # tensors are used, otherwise their same-name but un-suffixed
         # corresponding tensors are used.
-        # TODO: @lmcafee, only use `_decode_only` tensors when both of the
-        # following conditions are met: 1) decode-only step, and 2) cuda graphs
-        # are enabled.
 
-        self.query_seq_lengths_decode_only = torch.full(
+        
+        self.query_seq_lengths_cudagraph_only = torch.full(
             (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        self.cu_query_seq_lengths_decode_only = torch.full(
+        self.cu_query_seq_lengths_cudagraph_only = torch.full(
             (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        self.kv_seq_lengths_decode_only = torch.full(
+        self.kv_seq_lengths_cudagraph_only = torch.full(
             (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        self.cu_kv_seq_lengths_decode_only = torch.full(
+        self.cu_kv_seq_lengths_cudagraph_only = torch.full(
             (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
         )
 
-        self.request_to_kv_chunk_ids_decode_only = torch.full(
+        self.request_to_kv_chunk_ids_cudagraph_only = torch.full(
             (self.max_requests, self.max_kv_chunk_count),
             0,
             dtype=torch.int,
             device=torch.cuda.current_device(),
         )
+
+        # when this flag is set to true, self.decode_only() will always return True
+        # this flag is toggled during cuda-graph capture of non-decode steps 
+        # to ensure that we are recording the correct attention kernel.
+        self.enforce_non_decode_mode = False
+
+        # it can happen that non-decode steps have a token count greater than the max 
+        # supported cuda graph batch size. In that case this flag will be set to 
+        # False by initialize_attention. The model implementation needs to query this 
+        # flag and decide whether to call or not call the cudagraph-manager.
+        self.using_cuda_graph_this_step = True
 
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
@@ -397,7 +409,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Once the request moves to decode phase active tokens is 1 for that request. So if all active requests are in decode phase, they will be equal to active token count.
         """
         total_active_requests = self.total_request_count - self.paused_request_count
-        return total_active_requests == self.active_token_count
+        return (total_active_requests == self.active_token_count) and (not self.enforce_non_decode_mode)
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
@@ -538,67 +550,83 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.max_seqlen_q = None
         self.max_seqlen_k = None
         self.cu_query_seq_lengths = None
-        self.cu_query_seq_lengths_decode_only.fill_(0)
-        self.query_seq_lengths_decode_only.fill_(0)
+        self.cu_query_seq_lengths_cudagraph_only.fill_(0)
+        self.query_seq_lengths_cudagraph_only.fill_(0)
         self.cu_kv_seq_lengths = None
-        self.cu_kv_seq_lengths_decode_only.fill_(0)
+        self.cu_kv_seq_lengths_cudagraph_only.fill_(0)
         self.kv_seq_lengths = None
-        self.kv_seq_lengths_decode_only.fill_(0)
-        self.request_to_kv_chunk_ids_decode_only.fill_(0)
+        self.kv_seq_lengths_cudagraph_only.fill_(0)
+        self.request_to_kv_chunk_ids_cudagraph_only.fill_(0)
         self.block_table = None
+        self.enforce_non_decode_mode = False
 
-    def initialize_attention_state(self, *, num_warmup_requests: Optional[int] = None) -> None:
+    def add_dummy_requests_for_cudagraph_capture(self, num_warmup_requests: int) -> None:
+        for i in range(num_warmup_requests):
+            self.add_request(request_id=i, tokens=torch.zeros(1, 
+                                                dtype=torch.long, 
+                                                device=torch.cuda.current_device()), 
+                                                num_tokens_to_generate=1)
+
+
+    def initialize_attention_state(self, *, num_warmup_requests: Optional[int] = None, enforce_non_decode_mode = False) -> None:
         """Initialize attention state so that every layer can use it.
 
         Args:
             num_warmup_requests (Optional[int]): Number of requests to use for
                 warming up cuda graphs. Must be less than or equal to
-                `max_requests`.
-
+                `max_requests`. These requests will be created with sequence-length=1 to record 
+                cuda graphs.
+            enforce_non_decode_mode (bool): If set to true, this flag will ensure that the output 
+            of self.is_decode_only is always False. This flag is used when we are capturing cuda graphs 
+            for non-decode steps. Never use this flag during actual inference!
         Return:
             None.
         """
 
         # Use of num_warmup_requests only for decode-only.
+        if enforce_non_decode_mode:
+            assert num_warmup_requests is not None, "the enforce_non_decode_mode flag is to be used only during cuda-graph capturing"
+            assert self.non_decode_cuda_graphs, "Set non-decode cuda graphs to True"
         if num_warmup_requests is not None:
-            assert self.is_decode_only(), "cuda graph warmup requires decode-only mode."
+            self.enforce_non_decode_mode = enforce_non_decode_mode
+            assert self.is_decode_only() == (not enforce_non_decode_mode)
+            if num_warmup_requests > self.max_requests:
+                raise ActiveRequestCountOverflowError(self.max_requests, num_warmup_requests) 
+            self.add_dummy_requests_for_cudagraph_capture(num_warmup_requests)
 
-        # Active request count.
-        active_request_count = (
-            self.total_request_count - self.paused_request_count
-            if num_warmup_requests is None
-            else num_warmup_requests
-        )
 
-        # Active cuda graph count (if decode-only).
-        active_cuda_graph_request_count = None
-        if self.is_decode_only():
-            if active_request_count > self.max_requests:
-                raise ActiveRequestCountOverflowError(self.max_requests, active_request_count)
+        active_token_count = self.active_token_count 
 
-            if self.cuda_graph_request_counts:
-                active_cuda_graph_request_count = (
-                    math.ceil(active_request_count / self.cuda_graph_step_size)
-                    * self.cuda_graph_step_size
-                )
-                active_cuda_graph_request_count = min(
-                    active_cuda_graph_request_count, self.max_requests
-                )
-                assert active_cuda_graph_request_count in self.cuda_graph_request_counts_set
-            else:
-                active_cuda_graph_request_count = self.max_requests
+        # padded_active_token count - store the number of padded tokens to match with the 
+        padded_active_token_count = None
+    
+        using_cuda_graphs_this_step = self.cuda_graph_token_counts and (self.is_decode_only() or self.non_decode_cuda_graphs) and (active_token_count <= self.cuda_graph_token_counts[0])
+
+        if using_cuda_graphs_this_step:
+            padded_active_token_count = (
+                math.ceil(active_token_count / self.cuda_graph_step_size)
+                * self.cuda_graph_step_size
+            )
+            padded_active_token_count = min(
+                padded_active_token_count, self.max_requests
+            )
+            assert padded_active_token_count in self.cuda_graph_token_counts_set
+            assert padded_active_token_count >= active_token_count
+            
+        elif self.is_decode_only():
+            padded_active_token_count = self.max_requests
+        else:
+            padded_active_token_count = self.round_up_tokens(self.active_token_count) 
 
         # Padded active token/request counts.
-        self.padded_active_token_count = (
-            active_cuda_graph_request_count
-            if self.is_decode_only()
-            else self.round_up_tokens(self.active_token_count)
-        )
+        self.padded_active_token_count = padded_active_token_count
+        # padded request count is same as the padded active token count if 
+        # if are in capture mode
         self.padded_active_request_count = (
-            active_cuda_graph_request_count
-            if self.is_decode_only()
+            padded_active_token_count if num_warmup_requests is not None 
             else (self.total_request_count - self.paused_request_count)
         )
+        
 
         # Update token position indexes.
         self.token_to_chunk_idx[self.active_token_count : self.padded_active_token_count] = (
@@ -616,21 +644,41 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.paused_request_count : self.total_request_count
         ]
         if self.is_decode_only():
-            self.query_seq_lengths_decode_only[
+            #todo: this op is unnecessary. Ask Lawrence if we can just chuck this out. 
+            self.query_seq_lengths_cudagraph_only[
                 0 : self.total_request_count - self.paused_request_count
             ] = query_lengths
             self.cu_query_seq_lengths = None  # ensure no accidental use
             self.max_seqlen_q = 1
         else:
-            cu_query_lengths = torch.cumsum(query_lengths, dim=0)
-            self.cu_query_seq_lengths = torch.full(
-                (self.total_request_count - self.paused_request_count + 1,),
-                0,
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-            self.cu_query_seq_lengths[1:] = cu_query_lengths
-            self.max_seqlen_q = query_lengths.max().item()
+            if using_cuda_graphs_this_step:
+                self.query_seq_lengths_cudagraph_only[
+                    0 : self.total_request_count - self.paused_request_count
+                ] = query_lengths
+                
+                self.cu_query_seq_lengths_cudagraph_only[1: self.padded_active_request_count + 1] = torch.cumsum(self.query_seq_lengths_cudagraph_only[: self.padded_active_request_count], dim=0)
+
+                # The following will be passed to the FA kernel. 
+                self.cu_query_seq_lengths = self.cu_query_seq_lengths_cudagraph_only[
+                : (self.padded_active_request_count + 1)]
+
+                # max_seqlen_q is a CPU argument to the FA kernel.
+                # It is used to decide the number of kernel blocks to launch.
+                # With cuda graphs, it will be frozen to whatever value we pass during the capture step.
+                # Hence it is important to always use it's maximum value during capture.
+                # The worst thing that will happen is that the kernel will launch a few empty blocks.
+                self.max_seqlen_q = self.padded_active_token_count
+
+            else:
+                cu_query_lengths = torch.cumsum(query_lengths, dim=0)
+                self.cu_query_seq_lengths = torch.full(
+                    (self.total_request_count - self.paused_request_count + 1,),
+                    0,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                self.cu_query_seq_lengths[1:] = cu_query_lengths
+                self.max_seqlen_q = query_lengths.max().item()
 
         kv_seq_lengths = self.request_kv_length_offsets + self.request_query_lengths
         self.kv_seq_lengths = kv_seq_lengths[self.paused_request_count : self.total_request_count]
@@ -640,39 +688,64 @@ class DynamicInferenceContext(BaseInferenceContext):
             # such that `kv_seq_lengths` has a static memory address and is therefore
             # cuda graph compatible. This allows `kv_seq_lengths` to transition between,
             # cuda graph sizes, which makes multi-batch-size cuda graphs possible.
-            self.kv_seq_lengths_decode_only[
+            self.kv_seq_lengths_cudagraph_only[
                 0 : self.total_request_count - self.paused_request_count
             ] = self.kv_seq_lengths
-            self.kv_seq_lengths = self.kv_seq_lengths_decode_only[
+            self.kv_seq_lengths = self.kv_seq_lengths_cudagraph_only[
                 : self.padded_active_request_count
             ]
             self.cu_kv_seq_lengths = None  # ensure no accidental use
             self.max_seqlen_k = self.max_sequence_length
         else:
-            self.cu_kv_seq_lengths = torch.full(
-                (self.total_request_count - self.paused_request_count + 1,),
-                0,
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
-            self.cu_kv_seq_lengths[1:] = torch.cumsum(self.kv_seq_lengths, dim=0)
-            self.max_seqlen_k = self.kv_seq_lengths.max().item()
+            if using_cuda_graphs_this_step:
+                self.kv_seq_lengths_cudagraph_only[0: self.total_request_count - self.paused_request_count] = self.kv_seq_lengths
+                self.kv_seq_lengths = self.kv_seq_lengths_cudagraph_only[: self.padded_active_request_count]
+                cu_kv_lengths = torch.cumsum(self.kv_seq_lengths, dim=0)
+                self.cu_kv_seq_lengths_cudagraph_only[1:cu_kv_lengths.size(0)+1] = cu_kv_lengths 
+                self.cu_kv_seq_lengths = self.cu_kv_seq_lengths_cudagraph_only[
+                : (self.padded_active_request_count + 1)
+                ]
+                # max_seqlen_k is a CPU argument to the FA kernel.
+                # It is used to decide the number of kernel blocks to launch.
+                # With cuda graphs, it will be frozen to whatever value we pass during the capture step.
+                # Hence it is important to always use it's maximum value during capture.
+                # The worst thing that will happen during replays is that the kernel will launch a few empty blocks.
+                self.max_seqlen_k = self.padded_active_token_count
+            else:
+                self.cu_kv_seq_lengths = torch.full(
+                    (self.total_request_count - self.paused_request_count + 1,),
+                    0,
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                self.cu_kv_seq_lengths[1:] = torch.cumsum(self.kv_seq_lengths, dim=0)
+                self.max_seqlen_k = self.kv_seq_lengths.max().item()
 
         # Update KV chunk IDs, block table.
         request_to_kv_chunk_ids = self.request_to_kv_chunk_ids[
             self.paused_request_count : self.total_request_count
         ]
         if self.is_decode_only():
-            self.request_to_kv_chunk_ids_decode_only[
+            self.request_to_kv_chunk_ids_cudagraph_only[
                 0 : self.total_request_count - self.paused_request_count
             ] = request_to_kv_chunk_ids
-            self.block_table = self.request_to_kv_chunk_ids_decode_only[
+            self.block_table = self.request_to_kv_chunk_ids_cudagraph_only[
                 : self.padded_active_request_count
             ]
         else:
-            self.block_table = self.request_to_kv_chunk_ids[
-                self.paused_request_count : self.total_request_count
-            ]
+            if using_cuda_graphs_this_step:
+                self.request_to_kv_chunk_ids_cudagraph_only[
+                    0 : self.total_request_count - self.paused_request_count
+                ] = request_to_kv_chunk_ids
+                self.block_table = self.request_to_kv_chunk_ids_cudagraph_only[
+                    : self.padded_active_request_count
+                ]
+            else:
+                self.block_table = self.request_to_kv_chunk_ids[
+                    self.paused_request_count : self.total_request_count
+                ]
+
+        self.using_cuda_graph_this_step = using_cuda_graphs_this_step
 
     def reset(self) -> None:
         """Reset entire context.
