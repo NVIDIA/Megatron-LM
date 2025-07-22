@@ -585,7 +585,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def add_dummy_requests_for_cudagraph_capture(self, num_warmup_requests: int) -> None:
         """
-        Adds dummy requests of sequence length 1 to the context. These are using during 
+        Adds dummy requests of sequence length 1 to the context. These are using during
         cuda graph captures.
         """
         for i in range(num_warmup_requests):
