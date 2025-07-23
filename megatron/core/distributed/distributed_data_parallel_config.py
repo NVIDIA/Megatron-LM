@@ -112,6 +112,9 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
    """
 
+    delay_wgrad_compute: bool = False
+    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
     def __post_init__(self):
         import os
 

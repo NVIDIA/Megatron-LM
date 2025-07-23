@@ -50,13 +50,13 @@ from megatron.core.utils import (
 try:
     import transformer_engine as te
 
-    TE_MODULE_CLASSNAMES = (te.pytorch.Linear, te.pytorch.LayerNormLinear)
+    TE_LINEAR_MODULE_CLASSNAMES = (te.pytorch.Linear, te.pytorch.LayerNormLinear)
 
     HAVE_TE = True
 except ImportError:
     from unittest.mock import MagicMock
 
-    TE_MODULE_CLASSNAMES = ()
+    TE_LINEAR_MODULE_CLASSNAMES = ()
 
     te = MagicMock()
     HAVE_TE = False
@@ -953,7 +953,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
-    TE_MODULE_CLASSNAMES += (te.pytorch.GroupedLinear,)
+    TE_LINEAR_MODULE_CLASSNAMES += (te.pytorch.GroupedLinear,)
 
     class TEGroupedLinear(te.pytorch.GroupedLinear):
         """

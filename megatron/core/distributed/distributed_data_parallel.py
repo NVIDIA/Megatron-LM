@@ -12,7 +12,7 @@ from ..fp8_utils import is_float8tensor
 from ..process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import log_single_rank
+from ..utils import log_single_rank, return_parent_te_linear_module
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
@@ -403,12 +403,22 @@ class DistributedDataParallel(_BaseDataParallel):
         self.grad_accs = []
         for param in self.module.parameters():
             if param.requires_grad:
-                # Expand so we get access to grad_fn.
-                param_tmp = param.expand_as(param)
-                # Get the gradient accumulator function.
-                grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                grad_acc.register_hook(self._make_backward_post_hook(param))
-                self.grad_accs.append(grad_acc)
+                parent_te_linear_module = return_parent_te_linear_module(self.module, param)
+                # Register the backward post hook for the TE Linear modules instead of the param
+                # so that the wgrad accumulation and reduce will be performed in the backward_dw()
+                # method of the TE Linear modules instead of the hook of backward() method.
+                if self.ddp_config.delay_wgrad_compute and parent_te_linear_module is not None:
+                    if hasattr(parent_te_linear_module, 'register_wgrad_accumulation_and_reduce_hooks'):
+                        parent_te_linear_module.register_wgrad_accumulation_and_reduce_hooks(
+                            self._make_backward_post_hook(param)
+                        )
+                else:
+                    # Expand so we get access to grad_fn.
+                    param_tmp = param.expand_as(param)
+                    # Get the gradient accumulator function.
+                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
+                    grad_acc.register_hook(self._make_backward_post_hook(param))
+                    self.grad_accs.append(grad_acc)
 
         self.use_forward_hook = (
             self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather
@@ -495,17 +505,6 @@ class DistributedDataParallel(_BaseDataParallel):
                 return
 
             if param in self.param_to_bucket_group:
-                # Skip wgrad accumulation and reduce if the param has been marked to skip
-                # Senario 1: For TE Linear modules, if the wgrad computation is delayed,
-                #   we set skip_wgrad_accumulation_and_reduce to True in backward pass,
-                #   so the wgrad accumulation and reduce will be skipped.
-                # Senario 2: For TE Linear modules, in backward_dw(), we call the post_backward_hook
-                #   with skip_wgrad_accumulation_and_reduce set to False,
-                #   so the wgrad accumulation and reduce will be performed.
-                # Senario 3: For other modules, we don't set the skip_wgrad_accumulation_and_reduce
-                #   for params, so the wgrad accumulation and reduce will be performed.
-                if getattr(param, 'skip_wgrad_accumulation_and_reduce', False):
-                    return
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
                     assert (
