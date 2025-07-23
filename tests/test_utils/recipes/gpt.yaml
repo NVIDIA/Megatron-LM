@@ -24,6 +24,7 @@ spec:
     /workspace/checkpoints/gpt3_mr_mcore_reruns_persistent_2_lts: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-persistent_v2
     /workspace/checkpoints/gpt_teacher: model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher
   script_setup: |
+    unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
     # Checkout latest
