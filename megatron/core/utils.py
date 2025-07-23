@@ -1996,9 +1996,9 @@ def return_parent_te_linear_module(model, param):
     """Check if a parameter is in a TE linear module."""
     from megatron.core.extensions.transformer_engine import TE_LINEAR_MODULE_CLASSNAMES
 
-    for name, module in model.named_modules():
+    for module in model.modules():
         if isinstance(module, TE_LINEAR_MODULE_CLASSNAMES):
-            for module_param in module.parameters():
-                if param is module_param:
+            for param_value in module.parameters():
+                if param is param_value:
                     return module
     return None

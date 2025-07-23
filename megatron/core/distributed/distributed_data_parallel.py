@@ -403,17 +403,20 @@ class DistributedDataParallel(_BaseDataParallel):
         self.grad_accs = []
         for param in self.module.parameters():
             if param.requires_grad:
-                parent_te_linear_module = return_parent_te_linear_module(self.module, param)
-                # Register the backward post hook for the TE Linear modules instead of the param
-                # so that the wgrad accumulation and reduce will be performed in the backward_dw()
-                # method of the TE Linear modules instead of the hook of backward() method.
-                if self.ddp_config.delay_wgrad_compute and parent_te_linear_module is not None:
-                    if hasattr(
+                # When delay_wgrad_compute is True, register the backward post hook for
+                # TE Linear modules instead of the param so that the wgrad accumulation and reduce
+                # will be performed in the backward_dw() method of the TE Linear modules
+                # instead of the hook of backward() method.
+                if self.ddp_config.delay_wgrad_compute and \
+                    getattr(param, 'skip_backward_post_hook', False):
+                    parent_te_linear_module = return_parent_te_linear_module(self.module, param)
+                    assert parent_te_linear_module is not None
+                    assert hasattr(
                         parent_te_linear_module, 'register_wgrad_accumulation_and_reduce_hooks'
-                    ):
-                        parent_te_linear_module.register_wgrad_accumulation_and_reduce_hooks(
-                            self._make_backward_post_hook(param)
-                        )
+                    ), 'TE Linear module must have register_wgrad_accumulation_and_reduce_hooks method'
+                    parent_te_linear_module.register_wgrad_accumulation_and_reduce_hooks(
+                        self._make_backward_post_hook(param)
+                    )
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
