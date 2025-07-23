@@ -407,8 +407,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 # TE Linear modules instead of the param so that the wgrad accumulation and reduce
                 # will be performed in the backward_dw() method of the TE Linear modules
                 # instead of the hook of backward() method.
-                if self.ddp_config.delay_wgrad_compute and \
-                    getattr(param, 'skip_backward_post_hook', False):
+                if self.ddp_config.delay_wgrad_compute and getattr(
+                    param, 'skip_backward_post_hook', False
+                ):
                     parent_te_linear_module = return_parent_te_linear_module(self.module, param)
                     assert parent_te_linear_module is not None
                     assert hasattr(
