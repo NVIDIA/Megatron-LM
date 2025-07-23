@@ -272,7 +272,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "double free or corruption" in concat_allranks_logs
         or "Call to CUDA function failed." in concat_allranks_logs
         or "Connection reset by peer" in concat_allranks_logs
-        or "free(): invalid pointer" in concat_allranks_logs
+        or "invalid pointer" in concat_allranks_logs
     )
 
 
