@@ -114,6 +114,7 @@ class Linear(torch.nn.Linear):
         tp_comm_buffer_name: str = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_is_parallel = None,  # To make compatible with TELinear
     ):
         self.config = config
 
@@ -162,7 +163,7 @@ class Linear(torch.nn.Linear):
         out = super().forward(x)
 
         if self._return_bias:
-            return out
+            return out, self.bias.detach()
         return out, None
 
 
