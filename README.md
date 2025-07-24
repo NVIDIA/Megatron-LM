@@ -177,7 +177,7 @@ git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
 
 # Optionally checkout a specific release
-git checkout core_r0.13.0rc0
+git checkout core_v0.13.0rc0
 
 bash docker/common/install.sh --environment {dev,lts}
 ```
