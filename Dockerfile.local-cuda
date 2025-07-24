@@ -1,0 +1,32 @@
+FROM nvcr.io/nvidia/pytorch:25.04-py3
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PJRT_DEVICE=CUDA
+
+RUN pip3 uninstall -y transformer_engine apex
+
+RUN pip3 install --upgrade pip
+RUN pip3 install --extra-index-url https://pypi.nvidia.com \
+    --no-cache-dir \
+    --upgrade-strategy only-if-needed -v \
+    flask-restful \
+    nltk \
+    pytest \
+    pytest-cov \
+    pytest_mock \
+    pytest_asyncio \
+    pytest-random-order \
+    sentencepiece \
+    tiktoken \
+    wandb \
+    tensorstore==0.1.76
+
+RUN pip3 install git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
+RUN pip3 install git+https://github.com/state-spaces/mamba.git@v2.2.2
+RUN pip3 install git+https://github.com/Dao-AILab/causal-conv1d.git@v1.4.0
+
+RUN pip3 install git+https://github.com/ajayvohra2005/nvidia-resiliency-ext-x.git@87a2c60e494498525a163af598dacbd57c8528b0
+RUN pip3 install multi-storage-client==0.20.3
+RUN pip3 install transformers==4.50.3 
+RUN pip3 install boto3==1.38.45
+WORKDIR /workspace

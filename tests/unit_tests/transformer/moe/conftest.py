@@ -18,10 +18,13 @@ def pytest_sessionfinish(session, exitstatus):
 @pytest.fixture(scope="session", autouse=True)
 def cleanup():
     yield
-    if torch.distributed.is_initialized():
-        print("Waiting for destroy_process_group")
-        torch.distributed.barrier()
-        torch.distributed.destroy_process_group()
+    try:
+        if torch.distributed.is_initialized():
+            print("Waiting for destroy_process_group")
+            torch.distributed.barrier()
+            torch.distributed.destroy_process_group()
+    except:
+        pass
 
 
 @pytest.fixture(scope="function", autouse=True)

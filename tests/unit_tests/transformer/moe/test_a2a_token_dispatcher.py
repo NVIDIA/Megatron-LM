@@ -16,10 +16,8 @@ from tests.unit_tests.transformer.moe.test_token_dispatcher import (
 xm = get_xla_model()
 
 def test_placeholder():
-    """This is here because otherwise there's no other test in this module (all disabled)
-    and pytest would fail."""
-    pass
-
+    Utils.initialize_model_parallel()
+    Utils.destroy_model_parallel()
 
 class TestAlltoAllDispatcher:
     def setup_method(self, method):
@@ -28,7 +26,7 @@ class TestAlltoAllDispatcher:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Device not available")
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2), (1, 1)])

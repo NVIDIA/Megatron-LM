@@ -23,6 +23,7 @@ except ImportError:
     HAVE_TE = False
 
 def test_device_rng_states_tracker():
+    Utils.initialize_model_parallel(1,1)
     rng_tracker = DeviceRNGStatesTracker()
     rng_tracker.set_states({"state1": 1234})
     assert rng_tracker.get_states()["state1"] == 1234
@@ -46,6 +47,7 @@ def test_device_rng_states_tracker():
         assert torch.equal(rng_tracker.get_states()['state2'], rng_state)
     else:
         assert int(rng_tracker.get_states()['state2']) == rng_state
+    Utils.destroy_model_parallel()
 
 def test_model_parallel_device_manual_seed():
     Utils.initialize_model_parallel(4,2)
@@ -54,15 +56,15 @@ def test_model_parallel_device_manual_seed():
     assert(rng_tracker.get_states()['model-parallel-rng'] is not None)
     Utils.destroy_model_parallel()
 
-
 def test_checkpoint():
+    Utils.initialize_model_parallel(1,1)
+
     def test_forward(*input):
         return input[0] + input[1]
 
     assert torch.equal(
         torch.ones(16) * 3, checkpoint(test_forward, None, torch.ones(16), torch.ones(16) * 2)
     )
-    Utils.initialize_model_parallel()
     input1 = torch.ones((4,4))
     checkpoint(test_forward, True, input1, torch.ones((4,4))*2)
     assert(torch.equal(torch.ones(input1.numel()).to(device=get_current_device()), input1))

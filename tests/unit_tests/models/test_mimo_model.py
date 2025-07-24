@@ -6,6 +6,7 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_mod
 
 import math
 
+from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 import pytest
 import torch
 import torch.nn as nn
@@ -186,6 +187,7 @@ class TestMimoModel:
         '''setup env and model'''
         try:
             Utils.initialize_model_parallel(1, 1)
+            model_parallel_device_manual_seed(123)
         except Exception as e:
             print(f"Warning: Could not initialize model parallel: {e}")
 

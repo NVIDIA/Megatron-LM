@@ -1,3 +1,4 @@
+from tests.unit_tests.test_utilities import Utils
 import torch
 
 from megatron.core.device_utils import get_current_device
@@ -8,11 +9,15 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 class TestRotaryEmbeddingWithPrecomputedCosSin:
 
     def setup_method(self):
+        Utils.initialize_model_parallel()
         self.batch_size = 3
         self.seq_len = 4
         self.d_rot = 6
         self.rotary_embedding = RotaryEmbedding(kv_channels=4, rotary_percent=1.0)
 
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+        
     def test_output_shapes_match(self):
 
         # Create input tensors
