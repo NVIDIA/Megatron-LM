@@ -65,8 +65,8 @@ class TrainingConfig:
 
     # ---------------- Validation config. ----------------
 
-    eval_iters: int = 100
-    """Number of iterations to run for evaluation validation/test for."""
+    eval_samples: int = 0
+    """Number of samples to run for evaluation. Used for both validation and test."""
 
     eval_interval: Optional[int] = 1000
     """Interval between running evaluation on validation set."""
