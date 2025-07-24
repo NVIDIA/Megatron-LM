@@ -56,7 +56,7 @@ publish:test_release_pypi_build_wheel:
     - |
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
         PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
-        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
+        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py
       fi
 
     - /opt/python/cp310-cp310/bin/python -m build
@@ -115,12 +115,12 @@ publish:test_release_pypi_test_wheel:
     - |
       if [[ "$PLATFORM" == "arm64" ]]; then
         for file in wheelhouse/*cp311*aarch64.whl; do
-          pip install --no-cache-dir "$file[dev,mlm]"
+          pip install --no-cache-dir "$file"
         done
-        
+
       else
         for file in wheelhouse/*cp311*x86_64.whl; do
-          pip install --no-cache-dir "$file[dev,mlm]"
+          pip install --no-cache-dir "$file"
         done
       fi
 
