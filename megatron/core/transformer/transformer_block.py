@@ -325,6 +325,19 @@ class TransformerBlock(MegatronModule):
             else:
                 layer_config = self.config
 
+            # If the first or last layers are bf16, disable tp comm overlap for them
+            if layer_config.first_last_layers_bf16 and layer_config.tp_comm_overlap:
+                num_bf16_layers_at_start = layer_config.num_layers_at_start_in_bf16
+                num_bf16_layers_at_end = layer_config.num_layers_at_end_in_bf16
+                # Since global layer number is 1-based, check if current layer is first or last
+                is_first_layer = global_layer_number <= num_bf16_layers_at_start
+                is_last_layer = global_layer_number > (layer_config.num_layers - num_bf16_layers_at_end)
+    
+            if is_first_layer or is_last_layer:
+                # Create a copy of config with tp comm overlap disabled for this layer
+                from dataclasses import replace
+                layer_config = replace(layer_config, tp_comm_overlap=False)
+
             fp8_init_context = get_fp8_context(layer_config, global_layer_number - 1, is_init=True)
             with fp8_init_context:
                 module = build_module(
