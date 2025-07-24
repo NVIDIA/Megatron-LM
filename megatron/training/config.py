@@ -29,8 +29,8 @@ class TrainingConfig:
     train_sync_interval: Optional[int] = None
     """Training CPU-GPU synchronization interval, to ensure that CPU is not running too far ahead of GPU."""
 
-    train_iters: Optional[int] = None
-    """Total number of iterations to train over all training runs."""
+    train_samples: Optional[int] = None
+    """Total number of samples to train over all training runs."""
 
     exit_interval: Optional[int] = None
     """Exit the program after the iteration is divisible by this value."""
