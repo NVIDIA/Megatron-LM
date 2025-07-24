@@ -4,12 +4,11 @@ import unittest.mock
 import numpy as np
 import pytest
 import torch
-
+from packaging.version import Version as PkgVersion
 
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.inference.text_generation_server import MegatronServer
 from megatron.training import tokenizer
-from packaging.version import Version as PkgVersion
 from tests.unit_tests.inference.engines.test_static_engine import TestStaticInferenceEngine
 from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
