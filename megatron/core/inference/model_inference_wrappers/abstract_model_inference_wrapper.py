@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, Optional, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.fp8_utils import prepare_model_for_fp8_inference
 from megatron.core.inference.communication_utils import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
@@ -78,6 +79,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.tp_group = model_comm_pgs.tp
         self.pp_group = model_comm_pgs.pp
+
+        if self.inference_wrapper_config.fp8 is not None:
+            self.model = prepare_model_for_fp8_inference(self.model)
 
     @property
     def inference_params(self):

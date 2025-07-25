@@ -2,7 +2,9 @@
 
 """Utility functions related to FP8 that are used throughout Megatron core"""
 
+import weakref
 from contextlib import nullcontext
+from functools import wraps
 from typing import List, Optional
 
 import torch
@@ -52,6 +54,29 @@ try:
 except (ImportError, ModuleNotFoundError):
     # MXFP8Tensor not found
     HAVE_TE_MXFP8TENSOR = False
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+        TELinear,
+        TERowParallelLinear,
+    )
+
+    TE_LINEAR_TYPES = (
+        TELinear,
+        TEColumnParallelLinear,
+        TERowParallelLinear,
+        TELayerNormColumnParallelLinear,
+    )
+else:
+    TE_LINEAR_TYPES = ()
+
+try:
+    from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+except ImportError:
+    Fp8Padding = None
+    Fp8Unpadding = None
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
@@ -511,3 +536,97 @@ else:
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""
         return nullcontext()
+
+
+if HAVE_TE:
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    # Modules that have been wrapped for inference for fp8
+    _fp8_inference_wrapped_modules = weakref.WeakSet()
+
+    def _wrap_te_linear_for_padding(module: torch.nn.Module):
+        """Wrap a TE linear module to automatically pad sequences for FP8 inference.
+
+        Modifies the module's forward method to:
+        1. Pad input sequences to FP8 alignment requirements
+        2. Run the original forward pass
+        3. Unpad outputs to original sequence length
+
+        Args:
+            module: A Transformer Engine linear layer (TELinear, TEColumnParallelLinear, etc.)
+        """
+        if module in _fp8_inference_wrapped_modules:
+            return
+        _pad_func = Fp8Padding(1)
+        _unpad_func = Fp8Unpadding(1)
+
+        original_forward = module.forward
+
+        @wraps(original_forward)
+        def padded_forward(input_tensor, *args, **kwargs):
+            # Only do padding for fp8 if we are in fp8 context
+            if not FP8GlobalStateManager.is_fp8_enabled():
+                return original_forward(input_tensor, *args, **kwargs)
+
+            seq_len, batch_size, hidden_size = input_tensor.shape
+            # Reshape to (S, B*H) to pad sequence dimension
+            input_2d = input_tensor.reshape(seq_len, -1)
+            # Pad the sequence dimension
+            padded_input_2d, _ = _pad_func(input_2d, [seq_len])
+            padded_seq_len = padded_input_2d.shape[0]
+
+            # Reshape back to (padded_S, B, H)
+            padded_input_3d = padded_input_2d.view(padded_seq_len, batch_size, hidden_size)
+            output = original_forward(padded_input_3d, *args, **kwargs)
+
+            # Handle output
+            if isinstance(output, tuple):
+                output_tensor = output[0]
+                other_outputs = output[1:]
+            else:
+                output_tensor = output
+                other_outputs = ()
+
+            # Unpad output - reshape to 2D, unpad, reshape back
+            _, _, output_hidden_size = output_tensor.shape
+            output_2d = output_tensor.reshape(padded_seq_len, -1)
+            unpadded_output_2d = _unpad_func(output_2d, [seq_len])
+            unpadded_output = unpadded_output_2d.reshape(seq_len, batch_size, output_hidden_size)
+
+            if other_outputs:
+                return (unpadded_output,) + other_outputs
+            else:
+                return unpadded_output
+
+        module.forward = padded_forward
+        _fp8_inference_wrapped_modules.add(module)
+
+    def prepare_model_for_fp8_inference(model):
+        """Prepare a model for FP8 inference by wrapping TE linear layers with padding support.
+
+        FP8 TE Gemms have specific shape requirements. This function wraps all Transformer
+        Engine linear layers in the model to automatically pad/unpad sequences during inference.
+
+        Args:
+            model (model (GPTModel): Model containing TE linear layers.
+
+        Returns:
+            GPTModel: The same model with wrapped linear layers (modified in-place).
+
+        """
+        assert Fp8Padding and Fp8Unpadding, "TE version does not have FP8 padding functions"
+        # Find and wrap all TE linear layers
+        for module in model.modules():
+            if isinstance(module, TE_LINEAR_TYPES):
+                _wrap_te_linear_for_padding(module)
+
+        return model
+
+else:
+
+    def prepare_model_for_fp8_inference(model):
+        """If trys using prepare_model_for_fp8_inference without TE we error"""
+        raise RuntimeError(
+            "prepare_model_for_fp8_inference requires Transformer Engine to be installed. "
+            "Please install transformer-engine to use FP8 inference."
+        )
