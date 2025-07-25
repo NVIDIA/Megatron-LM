@@ -4,6 +4,17 @@ set -x
 env
 eval "IMAGE=\$$IMAGE"
 
+# Start a named container in detached mode
+docker run -d --name download_test_data -w /workdir/ python:3.12-slim bash -c 'sleep infinity'
+docker cp tests/. download_test_data:/workdir/tests
+docker exec -e GH_TOKEN=$GH_TOKEN download_test_data bash -c '
+    ls -al /workdir/
+    pip install --no-cache-dir pygithub click
+    python tests/test_utils/python_scripts/download_unit_tests_dataset.py --assets-dir ./assets
+'
+docker cp download_test_data:/workdir/assets ./
+docker rm -f download_test_data
+
 docker context create tls-environment
 docker buildx create --name container --driver=docker-container --use tls-environment
 
