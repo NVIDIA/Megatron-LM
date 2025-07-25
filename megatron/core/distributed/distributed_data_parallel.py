@@ -414,7 +414,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     assert parent_te_linear_module is not None
                     assert hasattr(
                         parent_te_linear_module, 'register_wgrad_accumulation_and_reduce_hooks'
-                    ), 'TE Linear module must have register_wgrad_accumulation_and_reduce_hooks method'
+                    ), 'TE Linear module must register wgrad_accumulation_and_reduce_hooks'
                     parent_te_linear_module.register_wgrad_accumulation_and_reduce_hooks(
                         self._make_backward_post_hook(param)
                     )
