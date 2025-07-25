@@ -69,6 +69,7 @@ RUN bash -ex <<"EOF"
 
     bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment dev
 EOF
+COPY assets/ /opt/data/
 
 ##### For NVIDIANS only #####
 FROM main as jet

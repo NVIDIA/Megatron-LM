@@ -99,6 +99,7 @@ test = [
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
+    "pygithub",
 ]
 
 build = [
