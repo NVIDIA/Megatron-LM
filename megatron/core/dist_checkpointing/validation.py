@@ -373,28 +373,39 @@ def maybe_report_missing_and_unexpected_keys(
 
 
 def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
-    """Validate consistancy across ranks for the common state dict
+    """Validate consistency across ranks for the common state dict.
 
-    We save the common state dict only on rank 0. We validate to make sure that the common dict is consistant across ranks before saving.
+    Rank 0 broadcasts its common state dict. All ranks compare it with their local version
+    and return any differences. Rank 0 logs all diffs across ranks.
 
     Args:
-        common_state_dict: The common state dict present in all ransk
+        common_state_dict: The common state dict present in all ranks.
     """
-
-    # Gather the common state dict across ranks onto rank 0 for comparison
     rank = torch.distributed.get_rank()
-    other_rank_state_dicts = [None] * torch.distributed.get_world_size() if rank == 0 else None
-    torch.distributed.gather_object(common_state_dict, other_rank_state_dicts)
-    common_state_dict_diff = {}
-    if rank == 0:
-        assert other_rank_state_dicts
-        main_rank_state_dict = common_state_dict
-        for rank, rank_state_dict in enumerate(other_rank_state_dicts[1:], 1):
-            only_left, only_right, mismatch = diff(main_rank_state_dict, rank_state_dict)
-            if only_left or only_right or mismatch:
-                common_state_dict_diff[rank] = (only_left, only_right, mismatch)
+    world_size = torch.distributed.get_world_size()
 
-        if len(common_state_dict_diff) != 0:
+    # Broadcast the common state dict from rank 0
+    reference_state_dict = common_state_dict if rank == 0 else None
+    reference_state_dict = torch.distributed.broadcast_object_list([reference_state_dict], src=0)[0]
+
+    # Compare each rank's state dict with the reference
+    only_left, only_right, mismatch = diff(reference_state_dict, common_state_dict)
+
+    # Prepare output tuple if there's a difference
+    local_diff = (
+        (only_left, only_right, mismatch) if (only_left or only_right or mismatch) else None
+    )
+
+    # Gather diffs from all ranks to rank 0
+    all_diffs = [None] * world_size if rank == 0 else None
+    torch.distributed.gather_object(local_diff, all_diffs, dst=0)
+
+    if rank == 0:
+        common_state_dict_diff = {
+            r: diff_tuple for r, diff_tuple in enumerate(all_diffs) if diff_tuple is not None
+        }
+
+        if common_state_dict_diff:
             logger.warning(
                 f"There is difference in the common state dict in different ranks. The differences are {common_state_dict_diff}"
             )
