@@ -68,6 +68,11 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
+  - test_case: [gpt_static_inference_tp1_pp1_583m_fp8_cudagraphs]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
   - test_case: [gpt_static_inference_tp1_pp1_16b_multiprompt_tokensmatch]
     products:
       - environment: [dev]
