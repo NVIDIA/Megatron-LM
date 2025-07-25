@@ -256,6 +256,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         rotary_interleaved: bool = False,
         seq_len_interpolation_factor: Optional[float] = None,
         rotary_base: int = 10000,
+        cp_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> None:
         super().__init__()
 
@@ -271,6 +272,11 @@ class MultimodalRotaryEmbedding(nn.Module):
                 torch.arange(0, dim, 2, dtype=torch.float32, device=torch.cuda.current_device())
                 / dim
             )
+        )
+        self.cp_group = (
+            cp_group
+            if cp_group is not None
+            else parallel_state.get_context_parallel_group(check_initialized=False)
         )
 
     def forward(self, position_ids: torch.Tensor, mrope_section: List[int]) -> Tensor:
@@ -312,8 +318,8 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if parallel_state.get_context_parallel_world_size() > 1:
+        if self.cp_group is not None and self.cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
-            emb = get_pos_emb_on_this_cp_rank(emb, 0, parallel_state.get_context_parallel_group())
+            emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb
