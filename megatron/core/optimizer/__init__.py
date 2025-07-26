@@ -24,12 +24,13 @@ except ImportError:
         # See https://github.com/NVIDIA/apex/blob/7b73b12361068a10b0f44844534613f252a5ea75/apex/optimizers/fused_adam.py#L16.
         from torch.optim import AdamW as Adam, SGD
 
-from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 
 from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
-from ..utils import is_te_min_version, log_single_rank
+from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .optimizer import (
@@ -462,7 +463,7 @@ def _get_megatron_optimizer_based_on_param_groups(
             setattr(
                 optimizer,
                 'grad_stats_parallel_group',
-                mpu.get_intra_distributed_optimizer_instance_group(),
+                parallel_state.get_intra_distributed_optimizer_instance_group(),
             )
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
@@ -483,6 +484,8 @@ def get_megatron_optimizer(
     lr_mult: float = 1.0,
     use_gloo_process_groups: bool = True,
     default_skip_embedding_weight_decay: bool = False,
+    grad_comm_pgs: Optional[GradCommProcessGroups] = None,
+    model_comm_pgs: Optional[ModelCommProcessGroups] = None,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -503,6 +506,10 @@ def get_megatron_optimizer(
             embedding parameters by default, if no_weight_decay_cond is not provided.
             This is useful if you do not want embeddings to shrink to zero in training
             as recommended in https://arxiv.org/abs/2312.16903
+        grad_comm_pgs (Optional[GradCommProcessGroups]): gradient communication process groups.
+            If None, uses default parallel_state groups.
+        model_comm_pgs (Optional[ModelCommProcessGroups]): model communication process groups.
+            If None, uses default parallel_state groups.
 
     Returns:
         Instance of MegatronOptimizer.
@@ -517,15 +524,127 @@ def get_megatron_optimizer(
     else:
         all_dense_model_chunks = [model_chunks]
         overlap_param_gather_with_optimizer_step_flags = [False]
-    model_parallel_rank = mpu.get_model_parallel_group().rank()
 
-    if (
-        mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=False).size()
-        > mpu.get_data_parallel_group(with_context_parallel=True, partial_data_parallel=True).size()
-    ):
-        distributed_optimizer_instance_id = (
-            mpu.get_inter_distributed_optimizer_instance_group().rank()
+    if grad_comm_pgs is None and model_comm_pgs is None:
+        # Gradient communication groups
+        dp_cp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=False
         )
+        intra_dp_cp_group = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, partial_data_parallel=True
+        )
+
+        intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
+            partial_expert_data_parallel=True
+        )
+
+        # Gloo groups
+        if use_gloo_process_groups:
+            intra_dp_cp_group_gloo = parallel_state.get_data_parallel_group_gloo(
+                with_context_parallel=True, partial_data_parallel=True
+            )
+            intra_expt_dp_group_gloo = parallel_state.get_expert_data_parallel_group_gloo(
+                partial_expert_data_parallel=True
+            )
+        else:
+            intra_dp_cp_group_gloo = None
+            intra_expt_dp_group_gloo = None
+
+        # Model communication groups
+        mp_group = parallel_state.get_model_parallel_group()
+        expt_tp_pp_group = parallel_state.get_expert_tensor_model_pipeline_parallel_group()
+    elif grad_comm_pgs is not None and model_comm_pgs is not None:
+        # 1. dp group - this is always required
+        if not hasattr(grad_comm_pgs, 'dp'):
+            raise ValueError("dp process group is required but not provided in grad_comm_pgs")
+        dp_group = grad_comm_pgs.dp
+
+        # 2. dp_cp group:
+        # - If provided in grad_comm_pgs, use it
+        # - Otherwise check context_parallel_size
+        #   - If cp_size is 1, use same as dp
+        #   - If cp_size > 1, raise error as dp_cp is needed
+        if hasattr(grad_comm_pgs, 'dp_cp'):
+            dp_cp_group = grad_comm_pgs.dp_cp
+        else:
+            model_config = get_model_config(model_chunks[0])
+            cp_size = getattr(model_config, 'context_parallel_size', 1)
+            if cp_size == 1:
+                # If no context parallelism, dp_cp is same as dp
+                dp_cp_group = dp_group
+            else:
+                raise ValueError(
+                    "dp_cp process group is required when context_parallel_size > 1 "
+                    "but not provided in grad_comm_pgs"
+                )
+
+        # 3. Handle expert data parallel group
+        assert hasattr(grad_comm_pgs, 'expt_dp'), (
+            "expt_dp process group is required but not provided in grad_comm_pgs",
+            "please explicitly set it to None if you don't need it",
+        )
+        expt_dp_group = grad_comm_pgs.expt_dp
+
+        # 4. Handle intra_dp_cp, intra_expt_dp, and inter_dist_opt
+        #    based on optimizer instances:
+        # Get ddp_config from model chunks to determine optimizer instances
+        ddp_config = model_chunks[0].ddp_config
+        if ddp_config.num_distributed_optimizer_instances == 1:
+            # With a single optimizer instance:
+            # - intra_dp_cp is same as dp_cp
+            # - intra_expt_dp is same as expt_dp
+            # - inter_dist_opt is not needed (set to None)
+            intra_dp_cp_group = dp_cp_group
+            intra_expt_dp_group = expt_dp_group
+        else:
+            # With multiple optimizer instances, both groups must be provided
+            if not (
+                hasattr(grad_comm_pgs, 'intra_dp_cp')
+                and hasattr(grad_comm_pgs, 'intra_expt_dp')
+                and hasattr(grad_comm_pgs, 'inter_dist_opt')
+            ):
+                raise ValueError(
+                    "intra_dp_cp, intra_expt_dp, and inter_dist_opt "
+                    "process groups are required when using multiple optimizer "
+                    "instances (>1) but not provided in grad_comm_pgs"
+                )
+            intra_dp_cp_group = grad_comm_pgs.intra_dp_cp
+            intra_expt_dp_group = grad_comm_pgs.intra_expt_dp
+
+        # 5. Model communication groups
+        assert hasattr(model_comm_pgs, 'mp'), (
+            "mp process group is required but not provided in model_comm_pgs",
+            "please explicitly set it to None if you don't need it",
+        )
+        mp_group = model_comm_pgs.mp
+
+        # Expert tensor-model-pipeline group for MoE
+        assert hasattr(model_comm_pgs, 'tp_ep_pp'), (
+            "tp_ep_pp process group is required but not provided in model_comm_pgs",
+            "please explicitly set it to None if you don't need it",
+        )
+        expt_tp_pp_group = model_comm_pgs.tp_ep_pp
+
+        # Set up gloo groups - these might not be provided in process groups config
+        # so we need to create them or set to None
+        assert not use_gloo_process_groups, (
+            "Gloo process groups are not supported when grad_comm_pgs and model_comm_pgs are "
+            "provided. Please set use_gloo_process_groups to False."
+        )
+        intra_dp_cp_group_gloo = None
+        intra_expt_dp_group_gloo = None
+
+    else:
+        raise ValueError("Grad and model comm process groups must be provided or both must be None")
+
+    model_parallel_rank = get_pg_rank(mp_group)
+
+    if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
+        if grad_comm_pgs is not None:
+            inter_dist_opt_group = grad_comm_pgs.inter_dist_opt
+        else:
+            inter_dist_opt_group = parallel_state.get_inter_distributed_optimizer_instance_group()
+        distributed_optimizer_instance_id = get_pg_rank(inter_dist_opt_group)
     else:
         distributed_optimizer_instance_id = 0
 
@@ -547,24 +666,16 @@ def get_megatron_optimizer(
                 buffer_name='buffers',
                 default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
             )
-            # Pass Gloo process groups into optimizer only if needed.
-            if use_gloo_process_groups:
-                data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(
-                    with_context_parallel=True, partial_data_parallel=True
-                )
-            else:
-                data_parallel_group_gloo = None
+
             optimizers.append(
                 _get_megatron_optimizer_based_on_param_groups(
                     config,
                     model_chunks=model_chunk,
                     param_groups=param_groups,
                     per_model_buffers=buffers,
-                    model_parallel_group=mpu.get_model_parallel_group(),
-                    data_parallel_group=mpu.get_data_parallel_group(
-                        with_context_parallel=True, partial_data_parallel=True
-                    ),
-                    data_parallel_group_gloo=data_parallel_group_gloo,
+                    model_parallel_group=mp_group,
+                    data_parallel_group=dp_cp_group,
+                    data_parallel_group_gloo=intra_dp_cp_group_gloo,
                     data_parallel_group_idx=model_parallel_rank,
                     distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 )
@@ -596,23 +707,15 @@ def get_megatron_optimizer(
             )
 
         # Pass Gloo process groups into optimizer only if needed.
-        if use_gloo_process_groups:
-            data_parallel_group_gloo = mpu.get_data_parallel_group_gloo(
-                with_context_parallel=True, partial_data_parallel=True
-            )
-        else:
-            data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
                 model_chunks=dense_model_chunks,
                 param_groups=param_groups,
                 per_model_buffers=buffers,
-                model_parallel_group=mpu.get_model_parallel_group(),
-                data_parallel_group=mpu.get_data_parallel_group(
-                    with_context_parallel=True, partial_data_parallel=True
-                ),
-                data_parallel_group_gloo=data_parallel_group_gloo,
+                model_parallel_group=mp_group,
+                data_parallel_group=intra_dp_cp_group,
+                data_parallel_group_gloo=intra_dp_cp_group_gloo,
                 data_parallel_group_idx=model_parallel_rank,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
@@ -631,26 +734,22 @@ def get_megatron_optimizer(
         default_skip_embedding_weight_decay=default_skip_embedding_weight_decay,
     )
     if len(moe_param_groups) > 0:
-        model_parallel_rank = mpu.get_expert_tensor_model_pipeline_parallel_group().rank()
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
         # Pass Gloo process groups into optimizer only if needed.
         if use_gloo_process_groups:
-            data_parallel_group_gloo = mpu.get_expert_data_parallel_group_gloo(
-                partial_expert_data_parallel=True
-            )
+            expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
         else:
-            data_parallel_group_gloo = None
+            expt_data_parallel_group_gloo = None
         optimizers.append(
             _get_megatron_optimizer_based_on_param_groups(
                 config,
                 model_chunks=model_chunks,
                 param_groups=moe_param_groups,
                 per_model_buffers=moe_buffers,
-                model_parallel_group=mpu.get_expert_tensor_model_pipeline_parallel_group(),
-                data_parallel_group=mpu.get_expert_data_parallel_group(
-                    partial_expert_data_parallel=True
-                ),
-                data_parallel_group_gloo=data_parallel_group_gloo,
-                data_parallel_group_idx=model_parallel_rank,
+                model_parallel_group=expt_tp_pp_group,
+                data_parallel_group=intra_expt_dp_group,
+                data_parallel_group_gloo=expt_data_parallel_group_gloo,
+                data_parallel_group_idx=expt_model_parallel_rank,
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
             )
         )
