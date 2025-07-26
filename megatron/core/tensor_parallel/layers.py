@@ -625,7 +625,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     the weight gradients.
 
     In the case of sequence parallelism, the reduce scatter of the
-    input gradients is done asynchronously with the calcluation of the
+    input gradients is done asynchronously with the calculation of the
     weight gradients.
 
     Use of this module requires that the environment variable
@@ -747,7 +747,7 @@ class ColumnParallelLinear(torch.nn.Module):
             returns the master weights used for initialization.
         skip_bias_add:
             If True, do not add the bias term, instead return it to be added by the
-            caller. This enables performance optimations where bias can be fused with other
+            caller. This enables performance optimizations where bias can be fused with other
             elementwise operations.
         skip_weight_param_allocation:
             If True, weight parameter is not allocated and must be passed
@@ -1073,7 +1073,7 @@ class RowParallelLinear(torch.nn.Module):
             used for initialization.
         skip_bias_add:
             If True, do not add the bias term, instead return it to be added by the
-            caller. This enables performance optimations where bias can be fused with other
+            caller. This enables performance optimizations where bias can be fused with other
             elementwise operations.
         is_expert:
             If True, the layer is treated as an MoE expert layer
