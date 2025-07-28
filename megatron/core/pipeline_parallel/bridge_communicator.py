@@ -73,12 +73,10 @@ class BridgeCommunicator:
         # Create process groups for activation gather and scatter for each dp group on the last pp stage
         self.activation_gather_pg = None
         self.activation_scatter_pg = None
-        self.gather_pg_list = []
-        self.scatter_pg_list = []
+        
         activation_gather_ranks_list = self.get_boundary_pp_stage_ranks(self.src_grid, is_src=True)
-        activation_scatter_ranks_list = self.get_boundary_pp_stage_ranks(
-            self.dest_grid, is_src=False
-        )
+        activation_scatter_ranks_list = self.get_boundary_pp_stage_ranks(self.dest_grid, is_src=False)
+
         self.activation_gather_ranks = []
         self.activation_scatter_ranks = []
         for activation_gather_ranks in activation_gather_ranks_list:
@@ -86,13 +84,12 @@ class BridgeCommunicator:
             if self.current_rank in activation_gather_ranks:
                 self.activation_gather_ranks = activation_gather_ranks
                 self.activation_gather_pg = pg
-            self.gather_pg_list.append(pg)
+
         for activation_scatter_ranks in activation_scatter_ranks_list:
             pg = dist.new_group(ranks=activation_scatter_ranks)
             if self.current_rank in activation_scatter_ranks:
                 self.activation_scatter_ranks = activation_scatter_ranks
                 self.activation_scatter_pg = pg
-            self.scatter_pg_list.append(pg)
 
         self.src_tp_leaders, self.src_local_leader_rank = self.get_leader_rank(
             self.src_grid, is_src=True
@@ -108,11 +105,9 @@ class BridgeCommunicator:
             f"gatherGrpRanks={self.activation_gather_ranks} "
             f"scatterGrpRanks={self.activation_scatter_ranks}"
         )
-        print(log_msg, flush=True)
+        logging.info(log_msg)
 
         self.build_comm_schedule(self.src_tp_leaders, self.dest_tp_leaders)
-        if self.current_rank == self.src_local_leader_rank:
-            print(f"comm map  {self.current_rank} is {self.comm_map}")
         dist.barrier()
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
@@ -1198,9 +1193,6 @@ class BridgeCommunicator:
                     )
 
         # Execute all operations in a single batch
-        print(
-            f"rank {self.current_rank} is a {rank_info.role} and is executing {len(ops)} operations"
-        )
         if len(ops) > 0:
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
@@ -1316,22 +1308,6 @@ class BridgeCommunicator:
         if num_splits <= 0:
             raise ValueError(f"num_splits must be positive, got {num_splits}")
 
-        if num_splits == 1:
-            return [aggregated_tensor]
-
-        batch_size = aggregated_tensor.size(self.dim_mapping['b'])
-        split_size = batch_size // num_splits
-
-        tensor_splits = []
-        for i in range(num_splits):
-            start_idx = i * split_size
-            end_idx = (i + 1) * split_size if i < num_splits - 1 else batch_size
-
-            # Create slice objects for all dimensions
-            slices = [slice(None)] * aggregated_tensor.ndim
-            # Set the slice for the batch dimension
-            slices[self.dim_mapping['b']] = slice(start_idx, end_idx)
-            tensor_split = aggregated_tensor[tuple(slices)]
-            tensor_splits.append(tensor_split)
-
-        return tensor_splits
+        # torch.tensor_split handles the edge-cases for us (e.g., uneven splits, num_splits==1)
+        batch_dim = self.dim_mapping['b']
+        return list(torch.tensor_split(aggregated_tensor, num_splits, dim=batch_dim))
