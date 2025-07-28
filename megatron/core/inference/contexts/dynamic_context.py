@@ -202,13 +202,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
-            self.layer_map = torch.full(
-                (num_layers,), -1, dtype=torch.int32, device=torch.cuda.current_device()
-            )
-            for k, v in attention_layer_map.items():
-                self.layer_map[k] = v
-            for k, v in mamba_layer_map.items():
-                self.layer_map[k] = v
+            self.layer_map = attention_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = num_layers
@@ -601,7 +595,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
-        # TODO(ksanthanam): Move this slicing out of the CUDA graph capture region
         layer_number = self.layer_map[layer_number - 1]
         conv_state = self.mamba_conv_states[layer_number][
             self.paused_request_count : self.paused_request_count + self.padded_active_request_count
