@@ -768,7 +768,7 @@ def make_tp_sharded_tensor_for_checkpoint(
     is sharded across TP group.
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
-    
+
     Args:
         tensor: Tensor to shard
         key: Key for the sharded tensor
@@ -782,16 +782,16 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
-    
+
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    
+
     # Get groups with fallback to parallel_state
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-    
+
     # Use local get_pg_rank and get_pg_size functions
     tp_rank = get_pg_rank(tp_group)
     dp_rank = get_pg_rank(dp_cp_group)
@@ -827,11 +827,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             tensor.fully_shard_param_local_shard,
             tensor.shape,
             *prepend_offsets,
-            (
-                tp_axis + prepend_axis_num,
-                get_pg_rank(tp_group),
-                get_pg_size(tp_group),
-            ),
+            (tp_axis + prepend_axis_num, get_pg_rank(tp_group), get_pg_size(tp_group)),
             flattened_range=slice(*tensor.fully_shard_param_local_index),
             replica_id=replica_id,
             prepend_axis_num=prepend_axis_num,
@@ -855,7 +851,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     """Helper for instantiating a non-sharded ShardedTensor (replicated across TP and DP group).
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
-    
+
     Args:
         tensor: Tensor to create sharded tensor for
         key: Key for the sharded tensor
@@ -872,12 +868,12 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
-    
+
     # Get groups with fallback to parallel_state
     if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-    
+
     # Use local get_pg_rank and get_pg_size functions
     dp_rank = get_pg_rank(dp_cp_group)
     dp_size = get_pg_size(dp_cp_group)
