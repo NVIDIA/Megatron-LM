@@ -17,6 +17,7 @@ import numpy as np
 from time import time
 
 import torch
+from typing import Optional, Union, List, Dict, Any
 
 from megatron.core import mpu, tensor_parallel, dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedObject
@@ -282,7 +283,7 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def get_rng_state(ckpt_format: str, tp_group=None, pp_group=None):
+def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks."""
     args = get_args()
     rng_state = {
@@ -305,11 +306,6 @@ def get_rng_state(ckpt_format: str, tp_group=None, pp_group=None):
         rng_state_list = [rng_state]
 
     if ckpt_format == "torch_dist":
-        # Use provided groups or fallback to MPU functions
-        if tp_group is None and pp_group is None:
-            tp_group = mpu.get_tensor_model_parallel_group()
-            pp_group = mpu.get_pipeline_model_parallel_group()
-        
         pp_rank = get_pg_rank(pp_group)
         pp_size = get_pg_size(pp_group)
         tp_rank = get_pg_rank(tp_group)
@@ -346,7 +342,7 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -403,7 +399,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         iteration, save_dir, ckpt_format))
 
     # Collect rng state across data parallel ranks.
-    rng_state = get_rng_state(args.ckpt_format)
+    if tp_group is None and pp_group is None:
+        tp_group = mpu.get_tensor_model_parallel_group()
+        pp_group = mpu.get_pipeline_model_parallel_group()
+    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)
 
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
@@ -1233,7 +1232,7 @@ def load_args_from_checkpoint(
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1332,7 +1331,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         # Determine if RNG state will be loaded
         if (ckpt_tp_pp == run_tp_pp and not release and not args.finetune and not args.no_load_rng
                 and not getattr(state_dict['args'], 'no_save_rng', False)):
-            gen_sd_rng_state = get_rng_state(args.ckpt_format)  # we can load the rng state
+            if tp_group is None and pp_group is None:
+                tp_group = mpu.get_tensor_model_parallel_group()
+                pp_group = mpu.get_pipeline_model_parallel_group()
+            gen_sd_rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)  # we can load the rng state
         else:
             ignore_rng_state = True
             gen_sd_rng_state = None
@@ -1416,12 +1418,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     elif args.ckpt_format == "torch_dcp":
         model_sd = model[0].state_dict()
         optimizer_sd = optimizer.state_dict(is_loading=True)
+        if tp_group is None and pp_group is None:
+            tp_group = mpu.get_tensor_model_parallel_group()
+            pp_group = mpu.get_pipeline_model_parallel_group()
         sharded_state_dict = {
             "model": model_sd,
             "optimizer": optimizer_sd,
             "args": None,
             "iteration": 1,
-            "rng_state": get_rng_state(args.ckpt_format),
+            "rng_state": get_rng_state(args.ckpt_format, tp_group, pp_group),
             "checkpoint_version": None,
             "opt_param_scheduler": opt_param_scheduler.state_dict(),
             "num_floating_point_operations_so_far": 0,
