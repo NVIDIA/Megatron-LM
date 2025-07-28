@@ -24,7 +24,10 @@ from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import (
+    make_tp_sharded_tensor_for_checkpoint,
+    get_tensor_model_parallel_group_if_none,
+)
 
 
 class LanguageModule(MegatronModule):
