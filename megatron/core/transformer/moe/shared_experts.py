@@ -110,8 +110,11 @@ class SharedExpertMLP(MLP):
             state_dict = self.state_dict(prefix='', keep_vars=True)
             sub_sd = {
                 f'{prefix}{name}': make_sharded_tensor_for_checkpoint(
-                    state_dict[name], f'{prefix}{name}', prepend_offsets=sharded_offsets,
-                    tp_group=self.tp_group, dp_cp_group=metadata['dp_cp_group']
+                    state_dict[name],
+                    f'{prefix}{name}',
+                    prepend_offsets=sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
                 )
             }
             sharded_state_dict.update(sub_sd)

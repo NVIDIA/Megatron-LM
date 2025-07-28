@@ -107,13 +107,9 @@ def make_sharded_tensors_for_checkpoint(
             if tp_group is None and dp_cp_group is None:
                 tp_group = get_tensor_model_parallel_group_if_none(tp_group)
                 dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-                
-            replica_id = (
-                0,
-                get_pg_rank(tp_group),
-                get_pg_rank(dp_cp_group),
-            )
-            
+
+            replica_id = (0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group))
+
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
                 tensor, layer_key, sharded_offsets, replica_id=replica_id
             )
@@ -121,14 +117,21 @@ def make_sharded_tensors_for_checkpoint(
         elif layer_name in tensor_parallel_layers_axis_map:
             tp_axis = tensor_parallel_layers_axis_map[layer_name]
             sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
-                tensor, layer_key, tp_axis, prepend_offsets=sharded_offsets,
-                tp_group=tp_group, dp_cp_group=dp_cp_group,
+                tensor,
+                layer_key,
+                tp_axis,
+                prepend_offsets=sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=dp_cp_group,
             )
 
         else:
             sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
-                tensor, layer_key, prepend_offsets=sharded_offsets,
-                tp_group=tp_group, dp_cp_group=dp_cp_group,
+                tensor,
+                layer_key,
+                prepend_offsets=sharded_offsets,
+                tp_group=tp_group,
+                dp_cp_group=dp_cp_group,
             )
 
     return sharded_state_dict

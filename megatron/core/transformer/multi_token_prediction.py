@@ -22,7 +22,11 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint, make_viewless_tensor, get_pg_rank
+from megatron.core.utils import (
+    get_pg_rank,
+    make_tp_sharded_tensor_for_checkpoint,
+    make_viewless_tensor,
+)
 
 SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding,
@@ -42,7 +46,9 @@ except ImportError:
 
 
 def tie_word_embeddings_state_dict(
-    sharded_state_dict: ShardedStateDict, word_emb_weight: Tensor, word_emb_weight_key: str,
+    sharded_state_dict: ShardedStateDict,
+    word_emb_weight: Tensor,
+    word_emb_weight_key: str,
     tp_group: torch.distributed.ProcessGroup,
     dp_cp_group: torch.distributed.ProcessGroup,
 ) -> None:
@@ -75,8 +81,8 @@ def tie_word_embeddings_state_dict(
 
 
 def tie_output_layer_state_dict(
-    sharded_state_dict: ShardedStateDict, 
-    output_layer_weight: Tensor, 
+    sharded_state_dict: ShardedStateDict,
+    output_layer_weight: Tensor,
     output_layer_weight_key: str,
     tp_group: torch.distributed.ProcessGroup,
     dp_cp_group: torch.distributed.ProcessGroup,
