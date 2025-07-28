@@ -73,9 +73,11 @@ class BridgeCommunicator:
         # Create process groups for activation gather and scatter for each dp group on the last pp stage
         self.activation_gather_pg = None
         self.activation_scatter_pg = None
-        
+
         activation_gather_ranks_list = self.get_boundary_pp_stage_ranks(self.src_grid, is_src=True)
-        activation_scatter_ranks_list = self.get_boundary_pp_stage_ranks(self.dest_grid, is_src=False)
+        activation_scatter_ranks_list = self.get_boundary_pp_stage_ranks(
+            self.dest_grid, is_src=False
+        )
 
         self.activation_gather_ranks = []
         self.activation_scatter_ranks = []
