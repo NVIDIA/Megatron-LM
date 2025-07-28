@@ -26,6 +26,7 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import \
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.fp8_utils import is_float8tensor, dequantize_fp8_tensor
 from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_pg_rank, get_pg_size
 from .async_utils import schedule_async_save, is_empty_async_queue
 from .global_vars import get_args
 from .utils import unwrap_model, print_rank_0, append_to_progress_log, is_last_rank
@@ -281,7 +282,7 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def get_rng_state(ckpt_format: str):
+def get_rng_state(ckpt_format: str, tp_group=None, pp_group=None):
     """Collect rng state across data parallel ranks."""
     args = get_args()
     rng_state = {
@@ -304,10 +305,15 @@ def get_rng_state(ckpt_format: str):
         rng_state_list = [rng_state]
 
     if ckpt_format == "torch_dist":
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        pp_size = mpu.get_pipeline_model_parallel_world_size()
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_size = mpu.get_tensor_model_parallel_world_size()
+        # Use provided groups or fallback to MPU functions
+        if tp_group is None and pp_group is None:
+            tp_group = mpu.get_tensor_model_parallel_group()
+            pp_group = mpu.get_pipeline_model_parallel_group()
+        
+        pp_rank = get_pg_rank(pp_group)
+        pp_size = get_pg_size(pp_group)
+        tp_rank = get_pg_rank(tp_group)
+        tp_size = get_pg_size(tp_group)
         rng_state_list = ShardedObject('rng_state', rng_state_list, (pp_size, tp_size), (pp_rank, tp_rank),
                                        replica_id=mpu.get_data_parallel_rank(with_context_parallel=True))
 
