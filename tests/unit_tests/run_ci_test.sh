@@ -174,6 +174,7 @@ for i in $(seq $UNIT_TEST_REPEAT); do
         CMD=$(echo python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
             -xvs \
             --experimental \
+             ${IGNORE_ARGS[@]} \
             -m "'experimental and ${MARKER_ARG}'" $BUCKET)
 
         eval "$CMD"
