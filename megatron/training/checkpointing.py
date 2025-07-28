@@ -321,7 +321,25 @@ class CheckpointType(Enum):
     GLOBAL = auto()
     TORCH_DCP = auto()
 
-def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
+def _clean_metadata_for_serialization(metadata: dict) -> dict:
+    """Create a clean copy of metadata for serialization by removing non-serializable objects.
+    
+    Args:
+        metadata: Original metadata dict
+        
+    Returns:
+        Clean metadata dict suitable for serialization
+    """
+    if metadata is None:
+        return None
+    
+    clean_metadata = metadata.copy()
+    # Remove dp_cp_group as it's not serializable
+    clean_metadata.pop('dp_cp_group', None)
+    return clean_metadata
+
+
+def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
 
     The whole content metadata is passed to ``shared_state_dict`` model and optimizer methods
@@ -331,6 +349,10 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
     In particular, a simple integer (or SemVer) versioning flag (e.g. `metadata['version'] = 3.4`)
     is discouraged, because the metadata serves for all models and optimizers and it's practically
     impossible to enforce a linearly increasing versioning for this whole space.
+
+    Args:
+        args: Arguments namespace
+        dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     """
     metadata = {}
     if args.use_distributed_optimizer:
@@ -338,11 +360,17 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
             metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
+    
+    # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
+    if dp_cp_group is None:
+        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+    metadata['dp_cp_group'] = dp_cp_group
+    
     return metadata
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
-                    train_data_iterator=None, preprocess_common_state_dict_fn = None, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -356,6 +384,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     Dataloader checkpoint is only saved if the dataloader supports it. Currently this applies only
     to the Megatron Energon dataloader (multimodal) and not the built-in Megatron dataloader (text-only).
+
+    Args:
+        dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     """
     start_ckpt = time()
     args = get_args()
@@ -445,7 +476,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             or mpu.get_expert_data_parallel_rank() == 0 \
             or ckpt_type != CheckpointType.LEGACY:
         if ckpt_type != CheckpointType.LEGACY:
-            sharded_sd_metadata = _build_sharded_state_dict_metadata(args)
+            sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
             if args.use_distributed_optimizer:
                 print_rank_0(f'Storing distributed optimizer sharded state of type'
                              f' {sharded_sd_metadata["distrib_optim_sharding_type"]}')
@@ -497,7 +528,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                                          async_sharded_save=args.async_save,
                                                          validate_access_integrity=validate_sharding_integrity,
                                                          preprocess_common_before_consistancy_check=preprocess_common_state_dict_fn,
-                                                         content_metadata=sharded_sd_metadata)
+                                                         content_metadata=_clean_metadata_for_serialization(sharded_sd_metadata))
             # [ModelOpt]: save sharded modelopt_state
             if has_nvidia_modelopt:
                 save_sharded_modelopt_state(model, checkpoint_name, (args.ckpt_format, 1))
@@ -1232,7 +1263,7 @@ def load_args_from_checkpoint(
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None):
+                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of
@@ -1240,6 +1271,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
         for :attr:`model` and :attr:`optimizer`. In case of running FSDP2 with mcore distributed
         checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.
+    dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     """
     args = get_args()
     load_dir = getattr(args, load_arg)
@@ -1343,6 +1375,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
         print_rank_0(f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}')
+        
+        # Add dp_cp_group to loaded metadata. If not provided, fallback to global parallel state.
+        if sharded_sd_metadata is None:
+            sharded_sd_metadata = {}
+        if dp_cp_group is None:
+            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        sharded_sd_metadata['dp_cp_group'] = dp_cp_group
         # Determine if optimizer state will be loaded
         if (not release and not args.finetune and not args.no_load_optim
                 and not getattr(state_dict['args'], 'no_save_optim', False)):
@@ -1354,10 +1393,13 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     # Backward-compatibility with old checkpoints which don't have content versioning
                     # Can be removed after ending support for MLM optimizer checkpoints with MCore < v0.13
                     # (for MCore v0.13+ checkpoints `sharded_sd_metadata is not None`)
+                    if dp_cp_group is None:
+                        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
                     sharded_sd_metadata = {
                         'distrib_optim_sharding_type': ('fully_sharded_model_space'
                                                         if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
+                        'dp_cp_group': dp_cp_group,
                     }
                 if ckpt_tp_pp != run_tp_pp and sharded_sd_metadata['distrib_optim_sharding_type'] != 'fully_sharded_model_space':
                     raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
