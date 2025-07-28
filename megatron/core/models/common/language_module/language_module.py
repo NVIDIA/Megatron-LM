@@ -43,6 +43,7 @@ class LanguageModule(MegatronModule):
         if model_comm_pgs is None:
             model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
         self.model_comm_pgs = model_comm_pgs
+        self.tp_group = get_tensor_model_parallel_group_if_none(model_comm_pgs.tp)
         self.pp_group = model_comm_pgs.pp
         assert hasattr(self.model_comm_pgs, 'embd'), (
             "model_comm_pgs must have a embd. In previous version, it used default "
@@ -323,4 +324,6 @@ class LanguageModule(MegatronModule):
             key=first_stage_word_emb_key,
             replica_id=last_stage_word_emb_replica_id,
             allow_shape_mismatch=True,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )

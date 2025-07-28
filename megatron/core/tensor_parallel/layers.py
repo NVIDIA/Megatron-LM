@@ -309,6 +309,8 @@ class VocabParallelEmbedding(torch.nn.Module):
                 key=weight_prefix,
                 allow_shape_mismatch=True,
                 prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
             )
         }
 
