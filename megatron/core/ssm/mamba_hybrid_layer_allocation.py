@@ -10,6 +10,7 @@ else:
     from typing import Any
 
     def log_single_rank(logger: logging.Logger, *args: Any, rank: int = 0, **kwargs: Any):
+        """Logs a message to the given rank."""
         print(*args[1:], **kwargs)
 
 
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class Symbols:
+    """Symbols for different layer types."""
+
     MAMBA = "M"
     ATTENTION = "*"
     MLP = "-"
@@ -89,6 +92,7 @@ def allocate_layers(
     target_mlp_ratio: float,
     override_pattern: str = None,
 ) -> list:
+    """Allocates layers according to the requested distribution of layer types."""
     assert total_layers_count > 0
     assert target_attention_ratio >= 0.0 and target_attention_ratio <= 1.0
     assert target_mlp_ratio >= 0.0 and target_mlp_ratio <= 1.0
