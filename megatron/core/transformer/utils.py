@@ -89,7 +89,8 @@ def make_sharded_tensors_for_checkpoint(
         tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
             If None, defaults to parallel_state.get_tensor_model_parallel_group()
         dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
-            with context parallel. If None, defaults to parallel_state.get_data_parallel_group(with_context_parallel=True)
+            with context parallel. If None, defaults to 
+            parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     """
 
@@ -208,7 +209,8 @@ def sharded_state_dict_default(
         tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
             If None, defaults to parallel_state.get_tensor_model_parallel_group()
         dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
-            with context parallel. If None, defaults to parallel_state.get_data_parallel_group(with_context_parallel=True)
+            with context parallel. If None, defaults to 
+            parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     Returns:
         dict: dictionary of state dict keys mapped to ShardedTensors

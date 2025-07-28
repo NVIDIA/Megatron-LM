@@ -777,7 +777,8 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
         **kwargs: Additional arguments. May include:
             - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
-            - dp_cp_group: Data parallel + context parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group 
+              (default: None, falls back to parallel_state)
     """
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
@@ -859,7 +860,8 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
         replica_id: Replica ID for the tensor (default: None)
         **kwargs: Additional arguments. May include:
             - tp_group: Tensor parallel group (default: None, falls back to parallel_state)
-            - dp_cp_group: Data parallel + context parallel group (default: None, falls back to parallel_state)
+            - dp_cp_group: Data parallel + context parallel group 
+              (default: None, falls back to parallel_state)
     """
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
