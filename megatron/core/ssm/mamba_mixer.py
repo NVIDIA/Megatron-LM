@@ -398,16 +398,8 @@ class MambaMixer(MegatronModule):
             seqlens = inference_context.get_active_sequence_lengths()
             cu_seqlens, _ = inference_context.cu_query_lengths()
             if cu_seqlens is not None:
-                cu_seqlens = torch.cat(
-                    (
-                        cu_seqlens,
-                        torch.tensor(
-                            [hidden_states.shape[0]],
-                            dtype=cu_seqlens.dtype,
-                            device=cu_seqlens.device,
-                        ),
-                    )
-                )
+                # Add the total sequence length to cu_seqlens
+                cu_seqlens = torch.cat((cu_seqlens, cu_seqlens.new_tensor([hidden_states.shape[0]])))
             return_varlen_states = True
         else:
             seq_idx = None
@@ -425,6 +417,7 @@ class MambaMixer(MegatronModule):
             ) or (inference_context.is_dynamic_batching() and inference_context.is_decode_only()):
                 # The states are updated inplace
                 if inference_context.is_dynamic_batching():
+                    # Make batch dimension first and sequence dimension second (batch size will be 1)
                     hidden_states = rearrange(hidden_states, "l b d -> b l d").contiguous()
                 out, out_bias, _, _ = self.step(
                     hidden_states,
@@ -433,8 +426,7 @@ class MambaMixer(MegatronModule):
                     is_dynamic_batching=inference_context.is_dynamic_batching(),
                 )
                 if inference_context.is_dynamic_batching():
-                    # Undo transpose
-                    # TODO(ksanthanam): Tranpose bias?
+                    # Restore original shape of sequence dimension first followed by batch dimension
                     out = rearrange(out, "b l d -> l b d").contiguous()
                 return out, out_bias
 
@@ -522,7 +514,6 @@ class MambaMixer(MegatronModule):
                 if inference_context.is_dynamic_batching():
                     # Convert to channels-last memory layout to use seq_idx
                     # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
-                    # TODO(ksanthanam): Simplify
                     xBC_ = xBC.transpose(1, 2).contiguous().transpose(1, 2)
                 else:
                     xBC_ = xBC
@@ -642,7 +633,6 @@ class MambaMixer(MegatronModule):
 
         # Conv step
         if causal_conv1d_update is None:
-            # TODO(ksanthanam): Assert not using dynamic batching
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
             conv_state[:, :, -1] = xBC
             xBC = torch.sum(

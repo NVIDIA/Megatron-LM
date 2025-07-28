@@ -157,7 +157,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     ):
 
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
-
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
