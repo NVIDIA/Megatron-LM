@@ -225,6 +225,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Compute max_requets, max_tokens from buffer size and overflow factor.
         def bytes_to_max_requests_and_tokens(n_bytes):
+            #TODO(ksanthanam): Update to include Mamba state memory
             n_tokens = n_bytes / self.chunk_size_bytes * self.chunk_size_tokens
             n_requests = n_tokens / max_sequence_length
             return int(n_requests), int(n_tokens)
