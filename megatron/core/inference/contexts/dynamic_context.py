@@ -158,6 +158,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
 
+        # Per partition num heads and hidden size.
+        projection_size = kv_channels * num_attention_heads
+        if tensor_model_parallel_size is None:
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        else:
+            tp_size = tensor_model_parallel_size
+        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+
+        # Mamba states.
         self.is_hybrid_model = is_hybrid_model
         if self.is_hybrid_model:
             assert (
@@ -166,11 +176,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert (
                 mamba_num_groups is not None
             ), "`mamba_num_groups` must be specified for hybrid models"
+            assert mamba_d_model is not None, "`mamba_d_model` must be specified for hybrid models"
             assert mamba_d_conv is not None, "`mamba_d_conv` must be specified for hybrid models"
             assert mamba_d_state is not None, "`mamba_d_state` must be specified for hybrid models"
             assert (
                 hybrid_override_pattern is not None
             ), "`hybrid_override_pattern must be specified for hybrid models"
+
+            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+                self._mamba_state_size_per_layer_per_request(
+                    mamba_d_model=mamba_d_model,
+                    mamba_d_conv=mamba_d_conv,
+                    mamba_d_state=mamba_d_state,
+                    mamba_num_groups=mamba_num_groups,
+                    mamba_head_dim=mamba_head_dim,
+                    tp_size=tp_size,
+                )
+            )
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -191,20 +213,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             # The layer map is the identity function for pure Transformer models.
             self.num_attention_layers = num_layers
             self.num_mamba_layers = 0
+            (mamba_conv_states_shape, mamba_ssm_states_shape) = (None, None)
             self.layer_map = torch.tensor(
                 list(range(self.num_attention_layers)),
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
-
-        # Per partition num heads and hidden size.
-        projection_size = kv_channels * num_attention_heads
-        if tensor_model_parallel_size is None:
-            tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        else:
-            tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
@@ -223,11 +237,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         buffer_size_bytes_rem = buffer_size_bytes % self.chunk_size_bytes
         buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
 
-        # Compute max_requets, max_tokens from buffer size and overflow factor.
+        mamba_states_memory_per_request = 0
+        if self.is_hybrid_model:
+            mamba_states_memory_per_request += math.prod(mamba_conv_states_shape)
+            mamba_states_memory_per_request += math.prod(mamba_ssm_states_shape)
+            mamba_states_memory_per_request *= self.num_mamba_layers
+            mamba_states_memory_per_request *= dtype_size_bytes
+
+        # Compute max_requets, max_tokens from buffer size, overflow factor, and Mamba state size.
         def bytes_to_max_requests_and_tokens(n_bytes):
-            #TODO(ksanthanam): Update to include Mamba state memory
-            n_tokens = n_bytes / self.chunk_size_bytes * self.chunk_size_tokens
-            n_requests = n_tokens / max_sequence_length
+            bytes_per_token = self.chunk_size_bytes // self.chunk_size_tokens
+            cost_per_request_bytes = (
+                mamba_states_memory_per_request + max_sequence_length * bytes_per_token
+            )
+            n_requests = n_bytes // cost_per_request_bytes
+            n_tokens = n_requests * max_sequence_length
             return int(n_requests), int(n_tokens)
 
         self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
@@ -288,7 +312,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_chunk = torch.empty_like(self.token_to_input_ids)
 
         # Calculate the total number of chunks available in the buffer
-        chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
+        total_mamba_states_memory = mamba_states_memory_per_request * self.max_requests
+        chunk_count_total = (buffer_size_bytes - total_mamba_states_memory) // self.chunk_size_bytes
 
         # Memory buffer.
         self.memory_buffer = torch.full(
@@ -398,28 +423,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Optional state tensors for hybrid models
         if self.is_hybrid_model:
-            expand = 2  # Assume this is hard-coded
-            d_inner = mamba_d_model * expand
-            nheads = d_inner // mamba_head_dim
-            d_inner_local_tp = d_inner // tp_size
-            ngroups_local_tp = mamba_num_groups // tp_size
-            nheads_local_tp = nheads // tp_size
-            conv_dim = d_inner_local_tp + 2 * ngroups_local_tp * mamba_d_state
-            self.mamba_conv_states = torch.full(
-                (self.num_mamba_layers, self.max_requests, conv_dim, mamba_d_conv),
-                0,
+            self.mamba_conv_states = torch.zeros(
+                (self.num_mamba_layers, self.max_requests) + mamba_conv_states_shape,
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
-            self.mamba_ssm_states = torch.full(
-                (
-                    self.num_mamba_layers,
-                    self.max_requests,
-                    nheads_local_tp,
-                    mamba_head_dim,
-                    mamba_d_state,
-                ),
-                0,
+            self.mamba_ssm_states = torch.zeros(
+                (self.num_mamba_layers, self.max_requests) + mamba_ssm_states_shape,
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -468,6 +478,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         ROUNDER = getattr(cls, "ROUNDER", 64)
         return ROUNDER * int(math.ceil(int(value) / ROUNDER))
 
+    def _mamba_state_size_per_layer_per_request(
+        self,
+        mamba_d_model: int,
+        mamba_d_conv: int,
+        mamba_d_state: int,
+        mamba_num_groups: int,
+        mamba_head_dim: int,
+        tp_size: int,
+        expand: int = 2,
+    ) -> Tuple[Tuple[int], Tuple[int]]:
+        """Computes the Mamba conv and ssm states shapes per layer and request."""
+        d_inner = mamba_d_model * expand
+        nheads = d_inner // mamba_head_dim
+        d_inner_local_tp = d_inner // tp_size
+        ngroups_local_tp = mamba_num_groups // tp_size
+        nheads_local_tp = nheads // tp_size
+        conv_dim = d_inner_local_tp + 2 * ngroups_local_tp * mamba_d_state
+        mamba_conv_states_shape = (conv_dim, mamba_d_conv)
+        mamba_ssm_states_shape = (nheads_local_tp, mamba_head_dim, mamba_d_state)
+        return (mamba_conv_states_shape, mamba_ssm_states_shape)
+
     def is_static_batching(self) -> bool:
         """Is static batching? False."""
         return False
@@ -476,7 +507,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Test if all active requests are in decode phase.
 
         For a request in prefill phase active_tokens = query length
-        Once the request moves to decode phase active tokens is 1 for that request. So if all active requests are in decode phase, they will be equal to active token count.
+        Once the request moves to decode phase active tokens is 1 for that request.
+        So if all active requests are in decode phase, they will be equal to active token count.
         """
         total_active_requests = self.total_request_count - self.paused_request_count
         return total_active_requests == self.active_token_count
@@ -569,12 +601,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
+        # TODO(ksanthanam): Move this slicing out of the CUDA graph capture region
         layer_number = self.layer_map[layer_number - 1]
         conv_state = self.mamba_conv_states[layer_number][
-            self.paused_request_count : self.total_request_count
+            self.paused_request_count : self.paused_request_count + self.padded_active_request_count
         ]
         ssm_state = self.mamba_ssm_states[layer_number][
-            self.paused_request_count : self.total_request_count
+            self.paused_request_count : self.paused_request_count + self.padded_active_request_count
         ]
         return (conv_state, ssm_state)
 
@@ -709,10 +742,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_decode_only()
             else self.round_up_tokens(self.active_token_count)
         )
+        offset = 1 if self.padded_active_token_count > self.active_token_count else 0
         self.padded_active_request_count = (
             active_cuda_graph_request_count
             if self.is_decode_only()
-            else (self.total_request_count - self.paused_request_count)
+            else (self.total_request_count - self.paused_request_count + offset)
         )
 
         # Update token position indexes.

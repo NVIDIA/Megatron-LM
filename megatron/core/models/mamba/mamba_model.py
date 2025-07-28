@@ -245,7 +245,15 @@ class MambaModel(LanguageModule):
             output_weight = self.shared_embedding_or_output_weight()
 
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
-            hidden_states = hidden_states[-1, :, :].unsqueeze(0)
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
+                # state ([B, H]) → unsqueeze back to [1, B, H]
+                # (so that the output layer, which expects S×B×H, receives only the final token)
+                hidden_states = inference_context.last_token_logits(
+                    hidden_states.squeeze(1).unsqueeze(0)
+                ).unsqueeze(1)
 
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output

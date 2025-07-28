@@ -397,6 +397,17 @@ class MambaMixer(MegatronModule):
             seq_idx = inference_context.seq_idx()
             seqlens = inference_context.get_active_sequence_lengths()
             cu_seqlens, _ = inference_context.cu_query_lengths()
+            if cu_seqlens is not None:
+                cu_seqlens = torch.cat(
+                    (
+                        cu_seqlens,
+                        torch.tensor(
+                            [hidden_states.shape[0]],
+                            dtype=cu_seqlens.dtype,
+                            device=cu_seqlens.device,
+                        ),
+                    )
+                )
             return_varlen_states = True
         else:
             seq_idx = None
