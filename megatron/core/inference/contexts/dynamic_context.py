@@ -208,11 +208,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = num_layers
             self.num_mamba_layers = 0
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (None, None)
-            self.layer_map = torch.tensor(
-                list(range(self.num_attention_layers)),
-                dtype=torch.int32,
-                device=torch.cuda.current_device(),
-            )
+            self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
