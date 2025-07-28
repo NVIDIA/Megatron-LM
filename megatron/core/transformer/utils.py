@@ -11,6 +11,8 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import (
+    get_pg_rank,
+    get_tensor_model_parallel_group_if_none,
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
 )
@@ -65,6 +67,8 @@ def make_sharded_tensors_for_checkpoint(
     tensor_parallel_layers_axis_map: Optional[Dict[str, int]] = None,
     sharded_offsets: Iterable[Tuple[int, int, int]] = (),
     extra_state_suffix: str = '_extra_state',
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Wraps tensors from transformer layers with ShardedTensor or ShardedObject.
 
@@ -82,6 +86,10 @@ def make_sharded_tensors_for_checkpoint(
             applied (e.g. PP related), passed along to ShardedTensor
         extra_state_suffix (str, default = '_extra_state'): layers with this
             suffix will be wrapped with ShardedObject instead of ShardedTensor.
+        tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
+            If None, defaults to parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
+            with context parallel. If None, defaults to parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     """
 
@@ -94,8 +102,20 @@ def make_sharded_tensors_for_checkpoint(
         layer_key = f'{prefix}{layer_name}'
 
         if layer_name.endswith(extra_state_suffix):
+            # Compute replica_id when groups are provided
+            replica_id = None
+            if tp_group is None and dp_cp_group is None:
+                tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+                dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+                
+            replica_id = (
+                0,
+                get_pg_rank(tp_group),
+                get_pg_rank(dp_cp_group),
+            )
+            
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
-                tensor, layer_key, sharded_offsets
+                tensor, layer_key, sharded_offsets, replica_id=replica_id
             )
 
         elif layer_name in tensor_parallel_layers_axis_map:
@@ -163,6 +183,8 @@ def sharded_state_dict_default(
     prefix: str = '',
     sharded_offsets: Tuple[Tuple[int, int, int]] = (),
     metadata: Optional[dict] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> ShardedStateDict:
     """Provides implementation for sharded_state_dict method for non-MegatronModules.
 
@@ -178,6 +200,10 @@ def sharded_state_dict_default(
         sharded_offsets (Tuple[Tuple[int, int, int]], optional): sharding already
             applied (e.g. PP related) by sup-modules. Passed along to ShardedTensor
         metadata (dict, optional): metadata passed to module sharded_state_dict method
+        tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
+            If None, defaults to parallel_state.get_tensor_model_parallel_group()
+        dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
+            with context parallel. If None, defaults to parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     Returns:
         dict: dictionary of state dict keys mapped to ShardedTensors
@@ -190,7 +216,7 @@ def sharded_state_dict_default(
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
         module_sharded_sd = make_sharded_tensors_for_checkpoint(
-            module_sd, prefix, {}, sharded_offsets
+            module_sd, prefix, {}, sharded_offsets, tp_group=tp_group, dp_cp_group=dp_cp_group
         )
     return module_sharded_sd
 
