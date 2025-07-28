@@ -508,6 +508,8 @@ def validate_args(args, defaults={}):
                 args.num_layers_per_virtual_pipeline_stage
         else:
             args.virtual_pipeline_model_parallel_size = args.num_virtual_stages_per_pipeline_rank
+        if args.virtual_pipeline_model_parallel_size == 1:
+            args.virtual_pipeline_model_parallel_size = None
     else:
         args.virtual_pipeline_model_parallel_size = None
 
