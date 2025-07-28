@@ -121,12 +121,14 @@ def make_sharded_tensors_for_checkpoint(
         elif layer_name in tensor_parallel_layers_axis_map:
             tp_axis = tensor_parallel_layers_axis_map[layer_name]
             sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
-                tensor, layer_key, tp_axis, prepend_offsets=sharded_offsets
+                tensor, layer_key, tp_axis, prepend_offsets=sharded_offsets,
+                tp_group=tp_group, dp_cp_group=dp_cp_group,
             )
 
         else:
             sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
-                tensor, layer_key, prepend_offsets=sharded_offsets
+                tensor, layer_key, prepend_offsets=sharded_offsets,
+                tp_group=tp_group, dp_cp_group=dp_cp_group,
             )
 
     return sharded_state_dict
