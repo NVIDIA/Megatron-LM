@@ -788,9 +788,8 @@ def make_tp_sharded_tensor_for_checkpoint(
     new_offsets = []
     
     # Get groups with fallback to parallel_state
-    if tp_group is None:
+    if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
-    if dp_cp_group is None:
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     
     # Use local get_pg_rank and get_pg_size functions
@@ -875,9 +874,8 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     new_offsets = []
     
     # Get groups with fallback to parallel_state
-    if tp_group is None:
+    if tp_group is None and dp_cp_group is None:
         tp_group = parallel_state.get_tensor_model_parallel_group()
-    if dp_cp_group is None:
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
     
     # Use local get_pg_rank and get_pg_size functions
