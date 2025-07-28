@@ -1,6 +1,6 @@
 # Changelog
 
-## NVIDIA Megatron Core 0.13.0
+## NVIDIA Megatron Core 0.14.0
 
 * Features  
   * Inference  
@@ -63,6 +63,29 @@
   * Fix dynamic example script errors ([MR \!3653](https://github.com/NVIDIA/Megatron-LM/commit/72e290bf1f4bbf0c8047bb10a51da6ea6372e163))  
   * Guard TE import fix ([MR \!3666](https://github.com/NVIDIA/Megatron-LM/commit/ac198fc0d60a8c748597e01ca4c6887d3a7bcf3d))  
 * Known issues
+
+## NVIDIA Megatron Core 0.13.0
+
+* Support bf16 dtype for optimizer states to use precision-aware optimizer in TransformerEngine  
+* MoE
+  * Features:  
+    * Flexible Asymmetric Virtual Pipeline Parallelism with Custom Pipeline Layout (--pipeline-model-parallel-layout)  
+    * Add support to pass custom parallelism groups to MoE modules.  
+    * Add Hybrid Shard Data-Parallel support for MoE models (--num-distributed-optimizer-instances)  
+    * Support EP \+ custom FSDP training for DeepSeek-V3  
+    * FP8 support for Multi-Token-Prediction  
+  * Memory Optimization  
+    * Fine-grained recomputation to reduce activation memory. (--recompute-modules with \--recompute-granularity selective)  
+    * Memory efficient token permutation by moving the probs multiplication from unpermutation to activation function of GroupedMLP.  
+  * Performance Optimization  
+    * MLA RoPE fusion kernel and YARN embedding cache.  
+    * FP8 padding optimization of MoE models by padding the routing map.  
+  * Bug fixes:  
+    * Fix the aux loss calculation when expert\_bias or group limited routing is used. This leads to load\_balancing\_loss values change compared to the previous version.  
+    * Fix packed sequence support for MLA  
+  * Known Issues:  
+    * MTP is not compatible with flexible pipeline layout, will be fixed at \!3594.  
+    * MTP convergence issue with TP2, will be fixed at \!3594.
 
 ## NVIDIA Megatron Core 0.12.0
 
