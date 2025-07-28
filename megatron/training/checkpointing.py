@@ -562,14 +562,49 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                            barrier=False)
         else:
             def iter_finalize_fn():
+                prev_iteration = 0
+                save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
+                if save_retain_interval is not None:
+                    if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
+                        with open_file(tracker_filename, 'r') as f:
+                            prev_iteration = int(f.read().strip())
                 with open_file(tracker_filename, 'w') as f:
                     f.write(str(iteration))
+                tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
+                pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
                 print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
-                             f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
-                             f'p {(pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1}/{mpu.get_pipeline_model_parallel_world_size()} ]')
+                             f'[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, '
+                             f'p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]')
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
+
+                def delete_checkpoint(args, iteration_to_delete):
+                    checkpoint_name = get_checkpoint_name(args.save, iteration=iteration_to_delete,
+                                                          return_base_dir=True)
+                    try:
+                        shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
+                        print_rank_0(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
+                                     f'at {args.save}')
+                        if args.log_progress:
+                            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+                    except Exception as e:
+                        print_rank_0(f'  encountered exception "{e}" when trying to delete checkpoint from '
+                                     f'iteration {iteration_to_delete:7d} at {args.save}')
+                        # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
+                        pass
+
+                if save_retain_interval is not None:
+                    if prev_iteration > 0 and prev_iteration != iteration and prev_iteration % save_retain_interval != 0:
+                        checkpoint_name = get_checkpoint_name(args.save, iteration=prev_iteration,
+                                                              return_base_dir=True)
+                        # Don't delete if `checkpoint_name` is a symbolic link.
+                        if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
+                            print_rank_0(f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
+                                         f'at {args.save} since it is a symbolic link')
+                        else:
+                            # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
+                            threading.Thread(target=delete_checkpoint, args=(args, prev_iteration,)).start()
 
         if args.async_save:
             assert async_save_request is not None

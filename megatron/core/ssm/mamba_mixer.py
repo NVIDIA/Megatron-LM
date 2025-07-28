@@ -410,7 +410,7 @@ class MambaMixer(MegatronModule):
             assert not self.config.sequence_parallel
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
             if (
-                inference_context.is_static_batching() and not inference_context.is_prefill_only()
+                inference_context.is_static_batching() and inference_context.sequence_len_offset > 0
             ) or (inference_context.is_dynamic_batching() and inference_context.is_decode_only()):
                 # The states are updated inplace
                 if inference_context.is_dynamic_batching():

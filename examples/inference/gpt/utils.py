@@ -10,6 +10,7 @@ import json
 import itertools
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.contexts import DynamicInferenceContext
+from megatron.core.transformer.module import MegatronModule
 
 
 def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -128,8 +129,9 @@ class Request:
         self.state = "not-started"
 
     def __str__(self) -> str:
-        return "state '%s'; prompt len %d; output len %d; '%s'" % (
+        return "state '%s'; toffset %.1e; prompt len %d; output len %d; '%s'" % (
             self.state,
+            self.time_offset,
             len(self.prompt_tokens),
             len(self.output_tokens),
             self.prompt_text,
@@ -232,8 +234,20 @@ def build_requests(args: Namespace, tokenizer: Any) -> list[Request]:
         return get_auto_requests(args, tokenizer)
 
 
+def get_model_size_str(model):
+    n = sum(p.numel() for p in model.parameters())
+    for exp, suffix in ((12, "t"), (9, "b"), (6, "m"), (3, "k"), (0, "")):
+        nquery = int(10**exp)
+        if n > nquery:
+            return "%d%s" % (n // nquery, suffix)
+    raise Exception("something went wrong.")
+
+
 def build_dynamic_engine_setup_prefix(
-    args: Namespace, context: DynamicInferenceContext, requests: list[DynamicInferenceRequest]
+    args: Namespace,
+    model: MegatronModule,
+    context: DynamicInferenceContext,
+    requests: list[DynamicInferenceRequest],
 ):
     """
     Returns a compact, pipe-separated summary of the dynamic-batching setup.
@@ -251,6 +265,15 @@ def build_dynamic_engine_setup_prefix(
     Returns:
         A configuration string for logging.
     """
+    # CUDA graph config
+    if args.enable_cuda_graph:
+        cg_str = (
+            f"graphs {context.cuda_graph_request_counts[0]}:"
+            f"{context.cuda_graph_request_counts[-1]}"
+        )
+    else:
+        cg_str = "--"
+
     # Prompt description
     if args.prompts:
         prompts_str = f"<user prompts, n {len(args.prompts)}>"
@@ -263,9 +286,6 @@ def build_dynamic_engine_setup_prefix(
             f"{args.incoming_requests_duration:.1e}, "
             f"{args.incoming_requests_per_sec:.1e}"
         )
-
-    # CUDA graph config
-    cg_str = f"cg {args.enable_cuda_graph}"
 
     # Buffer limits config
     flw = args.inference_dynamic_batching_buffer_overflow_factor
@@ -282,6 +302,7 @@ def build_dynamic_engine_setup_prefix(
     )
 
     parts = [
+        get_model_size_str(model),
         "dynamic",
         cg_str,
         prompts_str,

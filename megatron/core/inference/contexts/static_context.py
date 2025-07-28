@@ -69,10 +69,6 @@ class StaticInferenceContext(BaseInferenceContext):
         """Functional access to `.decode_mode`, to match dynamic context."""
         return self.decode_mode
 
-    def is_prefill_only(self):
-        """Test if all active requests are in prefil phase."""
-        return self.sequence_len_offset == 0
-
     def reset(self):
         """Resets the inference state for a new batch."""
         self.sequence_len_offset = 0

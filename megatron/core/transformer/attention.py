@@ -444,7 +444,6 @@ class Attention(MegatronModule, ABC):
         cu_seqlens_q,
         cu_seqlens_k,
         seqlens_k,
-        seqlens_k_decode_only,
         block_table,
     ) -> Tensor:
         """Flash attention kernel for mixed decode and prefill samples.
@@ -458,7 +457,6 @@ class Attention(MegatronModule, ABC):
             cu_seqlens_q (Tensor): Cumulative query sequence lengths.
             cu_seqlens_k (Tensor): Cumulative key sequence lengths.
             seqlens_k (Tensor): key sequence lengths.
-            seqlens_k_decode_only (Tensor): key sequence lengths (decode_only).
             block_table (Tensor): KV cache chunk ids for all samples.
         Return:
             (Tensor) Attention output.
@@ -526,7 +524,7 @@ class Attention(MegatronModule, ABC):
                 "q": q,
                 "k_cache": k,
                 "v_cache": v,
-                "cache_seqlens": seqlens_k_decode_only,
+                "cache_seqlens": seqlens_k,
                 "causal": True,
                 "page_table" if HAVE_FA3 else "block_table": block_table,
             }
@@ -748,9 +746,7 @@ class Attention(MegatronModule, ABC):
                 # Dynamic batching attention kernel.
                 q, k, v = (query, key, value)
                 cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, kv_lengths_decode_only, max_seqlen_k = (
-                    inference_context.cu_kv_lengths()
-                )
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
                 core_attn_out = self.flash_decode_and_prefill(
                     q,
@@ -761,7 +757,6 @@ class Attention(MegatronModule, ABC):
                     cu_query_lengths,
                     cu_kv_lengths,
                     kv_lengths,
-                    kv_lengths_decode_only,
                     block_table,
                 )
                 core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')

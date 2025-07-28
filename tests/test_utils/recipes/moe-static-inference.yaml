@@ -14,6 +14,7 @@ spec:
     /workspace/data/deepseek_16b_pyt/model: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
     /workspace/data/deepseek_16b_pyt/tokenizer: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
   script_setup: |
+    unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
     # Checkout latest
