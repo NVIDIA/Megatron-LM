@@ -12,6 +12,9 @@ from torch import Tensor
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    get_layer_maps_from_hybrid_override_pattern,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
@@ -126,9 +129,56 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
         materialize_only_last_token_logits: bool = True,
+        is_hybrid_model: bool = False,
+        hybrid_override_pattern: str = None,
+        mamba_head_dim: int = None,
+        mamba_num_groups: int = None,
+        mamba_d_model: int = None,
+        mamba_d_conv: int = None,
+        mamba_d_state: int = None,
     ):
 
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        self.is_hybrid_model = is_hybrid_model
+        if self.is_hybrid_model:
+            assert (
+                mamba_head_dim is not None
+            ), "`mamba_head_dim` must be specified for hybrid models"
+            assert (
+                mamba_num_groups is not None
+            ), "`mamba_num_groups` must be specified for hybrid models"
+            assert mamba_d_conv is not None, "`mamba_d_conv` must be specified for hybrid models"
+            assert mamba_d_state is not None, "`mamba_d_state` must be specified for hybrid models"
+            assert (
+                hybrid_override_pattern is not None
+            ), "`hybrid_override_pattern must be specified for hybrid models"
+
+            # For hybrid models, the layer map converts the global layer index to the
+            # corresponding attention layer index or Mamba layer index depending on the
+            # layer type.
+            attention_layer_map, mamba_layer_map, _ = get_layer_maps_from_hybrid_override_pattern(
+                hybrid_override_pattern
+            )
+            self.num_attention_layers = len(attention_layer_map)
+            self.num_mamba_layers = len(mamba_layer_map)
+            self.layer_map = torch.full(
+                (num_layers,), -1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            for k, v in attention_layer_map.items():
+                self.layer_map[k] = v
+            for k, v in mamba_layer_map.items():
+                self.layer_map[k] = v
+        else:
+            # The layer map is the identity function for pure Transformer models.
+            self.num_attention_layers = num_layers
+            self.num_mamba_layers = 0
+            self.layer_map = torch.tensor(
+                list(range(self.num_attention_layers)),
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
@@ -144,7 +194,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.chunk_size_bytes = (
             dtype_size_bytes
             * 2  # key, value
-            * num_layers
+            * self.num_attention_layers
             * self.chunk_size_tokens
             * num_attention_heads_per_partition
             * hidden_size_per_attention_head
@@ -181,7 +231,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Initialize context state.
         self.params_dtype = params_dtype
-        self.num_layers = num_layers
         self.max_sequence_length = max_sequence_length
 
         self.total_request_count = 0
@@ -226,7 +275,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.memory_buffer = torch.full(
             (
                 2,  # key and value
-                self.num_layers,
+                self.num_attention_layers,
                 chunk_count_total,
                 self.chunk_size_tokens,
                 num_attention_heads_per_partition,
@@ -305,13 +354,42 @@ class DynamicInferenceContext(BaseInferenceContext):
             chunk_count_total=chunk_count_total, gtd_chunk_count=self.gtd_chunk_count
         )
 
-        # Optional SSM state dictionary for hybrid models
-        self.ssm_state = {}
+        # Optional state tensors for hybrid models
+        if self.is_hybrid_model:
+            expand = 2  # Assume this is hard-coded
+            d_inner = mamba_d_model * expand
+            nheads = d_inner // mamba_head_dim
+            d_inner_local_tp = d_inner // tp_size
+            ngroups_local_tp = mamba_num_groups // tp_size
+            nheads_local_tp = nheads // tp_size
+            conv_dim = d_inner_local_tp + 2 * ngroups_local_tp * mamba_d_state
+            self.mamba_conv_states = torch.full(
+                (self.num_mamba_layers, self.max_requests, conv_dim, mamba_d_conv),
+                0,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+            self.mamba_ssm_states = torch.full(
+                (
+                    self.num_mamba_layers,
+                    self.max_requests,
+                    nheads_local_tp,
+                    mamba_head_dim,
+                    mamba_d_state,
+                ),
+                0,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            self.mamba_conv_states = None
+            self.mamba_ssm_states = None
 
         # Store the dummy chunk idx reference for convenience
         self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
-        # Reset attention state.
+        # Reset attention and Mamba state.
         self.reset_attention_state()
+        self.reset_mamba_state()
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
@@ -383,6 +461,24 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.max_seqlen_k,
         )
 
+    def seq_idx(self) -> Tensor:
+        """
+        Returns a Tensor of shape (1, active_token_count) where each value correpsonds
+        to the request index to which the corresponding token belongs.
+        """
+        # Get map of token idx -> request idx
+        seq_idx = (
+            self.token_to_request_idx[: self.padded_active_token_count].clone().to(torch.int32)
+        )
+
+        # For padded tokens assign the next consecutive request idx
+        seq_idx[self.active_token_count : self.padded_active_token_count] = (
+            seq_idx[self.active_token_count - 1] + 1
+        )
+
+        # Add a batch dimension of 1 and return
+        return seq_idx.unsqueeze(0)
+
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
         lengths = self.request_kv_length_offsets + self.request_query_lengths
@@ -395,11 +491,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def get_active_request_count(self):
         """Returns the current number of active requests."""
-        active_sequence_lengths = self.get_active_sequence_lengths()
-        max_sequence_lengths = self.get_max_sequence_lengths()
-        active_requests_mask = torch.less(active_sequence_lengths, max_sequence_lengths).byte()
-        active_request_count = (active_requests_mask == 1).sum().item()
-        return active_request_count
+        return self.total_request_count - self.paused_request_count
 
     def append_key_value_cache(self, layer_number: int, key: Tensor, value: Tensor) -> None:
         """Append to KV cache.
@@ -410,6 +502,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             value (Tensor): Value tensor.
         """
 
+        layer_number = self.layer_map[layer_number - 1]
         chunk_idx = self.token_to_chunk_idx[: self.padded_active_token_count]
         local_kv_seq_idx = self.token_to_local_position_within_kv_chunk[
             : self.padded_active_token_count
@@ -418,10 +511,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         key = key.squeeze(1)
         value = value.squeeze(1)
 
-        self.memory_buffer[0, layer_number - 1, chunk_idx, local_kv_seq_idx] = key[
+        self.memory_buffer[0, layer_number, chunk_idx, local_kv_seq_idx] = key[
             : self.padded_active_token_count
         ]
-        self.memory_buffer[1, layer_number - 1, chunk_idx, local_kv_seq_idx] = value[
+        self.memory_buffer[1, layer_number, chunk_idx, local_kv_seq_idx] = value[
             : self.padded_active_token_count
         ]
 
@@ -435,11 +528,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
             to chunks within the chunked memory buffer.
         """
+        layer_number = self.layer_map[layer_number - 1]
         return (
-            self.memory_buffer[0, layer_number - 1],
-            self.memory_buffer[1, layer_number - 1],
+            self.memory_buffer[0, layer_number],
+            self.memory_buffer[1, layer_number],
             self.block_table,
         )
+
+    def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Returns the Mamba state tensors for the given layer."""
+        layer_number = self.layer_map[layer_number - 1]
+        conv_state = self.mamba_conv_states[layer_number][
+            self.paused_request_count : self.total_request_count
+        ]
+        ssm_state = self.mamba_ssm_states[layer_number][
+            self.paused_request_count : self.total_request_count
+        ]
+        return (conv_state, ssm_state)
 
     def apply_rotary_emb_query(
         self,
@@ -517,6 +622,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_seq_lengths_decode_only.fill_(0)
         self.kv_memory_decode_only.fill_(0)
         self.block_table = None
+
+    def reset_mamba_state(self) -> None:
+        """Reset state used within Mamba layers."""
+        if self.is_hybrid_model:
+            self.mamba_conv_states.fill_(0)
+            self.mamba_ssm_states.fill_(0)
 
     def initialize_attention_state(self) -> None:
         """Initialize attention state so that every layer can use it"""
@@ -637,6 +748,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset available chunk count.
         self.reset_attention_state()
+        self.reset_mamba_state()
         self.chunk_allocator.reset()
         self.request_to_kv_chunk_ids.fill_(-1)
 
@@ -789,6 +901,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_chunk_id[dst_idxs] = self.request_last_kv_chunk_id[src_idxs]
         self.request_last_kv_chunk_offset[dst_idxs] = self.request_last_kv_chunk_offset[src_idxs]
 
+        self._move_mamba_state_tensors(src_idxs, dst_idxs)
+
+    def _move_mamba_state_tensors(self, src_idxs, dst_idxs):
+        if self.is_hybrid_model:
+            self.mamba_conv_states[:, dst_idxs] = self.mamba_conv_states[:, src_idxs]
+            self.mamba_ssm_states[:, dst_idxs] = self.mabma_ssm_states[:, src_idxs]
+
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> None:
         """Update context state after calling engine.step().
@@ -858,6 +977,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_to_kv_chunk_ids.fill_(-1)
             self.total_request_count = 0
             self.active_token_count = 0
+
+            # Reset Mamba state.
+            self.reset_mamba_state()
+
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -884,6 +1007,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             # The combinition of indexing with a tensor (like finished_idxs) and fill_()/add_() creates a clone
             # and updates it instead of the original tensor.
             self.request_to_kv_chunk_ids[finished_idxs] = -1
+
+            # Reset the Mamba states for finished requests.
+            if self.is_hybrid_model:
+                self.mamba_conv_states[finished_idxs].fill_(0)
+                self.mamba_ssm_states[finished_idxs].fill_(0)
 
             if active_request_count > 0:
                 finished_idxs_on_left = (

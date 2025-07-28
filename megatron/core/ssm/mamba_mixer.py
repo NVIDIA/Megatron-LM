@@ -38,6 +38,7 @@ except ImportError:
 
 try:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
 except ImportError:
     causal_conv1d_fn = None
     causal_conv1d_update = None
@@ -392,6 +393,16 @@ class MambaMixer(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        if inference_context is not None and inference_context.is_dynamic_batching():
+            seq_idx = inference_context.seq_idx()
+            seqlens = inference_context.get_active_sequence_lengths()
+            cu_seqlens, _ = inference_context.cu_query_lengths()
+            return_varlen_states = True
+        else:
+            seq_idx = None
+            cu_seqlens = None
+            return_varlen_states = False
+
         _, batch, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
@@ -403,13 +414,17 @@ class MambaMixer(MegatronModule):
             ) or (inference_context.is_dynamic_batching() and inference_context.is_decode_only()):
                 # The states are updated inplace
                 if inference_context.is_dynamic_batching():
-                    hidden_states = hidden_states.unsqueeze(0)
-                    cache_seqlens, _ = inference_context.cu_query_lengths()
-                else:
-                    cache_seqlens = None
+                    hidden_states = rearrange(hidden_states, "l b d -> b l d").contiguous()
                 out, out_bias, _, _ = self.step(
-                    hidden_states, conv_state, ssm_state, cache_seqlens=cache_seqlens
+                    hidden_states,
+                    conv_state,
+                    ssm_state,
+                    is_dynamic_batching=inference_context.is_dynamic_batching(),
                 )
+                if inference_context.is_dynamic_batching():
+                    # Undo transpose
+                    # TODO(ksanthanam): Tranpose bias?
+                    out = rearrange(out, "b l d -> l b d").contiguous()
                 return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -467,27 +482,45 @@ class MambaMixer(MegatronModule):
                 dim=-1,
             )
 
-            # transpose: b l pd --> b pd l
-            xBC = rearrange(xBC, "b l d -> b d l").contiguous()
-
             # Compute short convolution
             if conv_state is not None:
                 # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
-                conv_state.copy_(
-                    F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
-                )  # Update state (B D W)
+                if inference_context.is_dynamic_batching():
+                    # xBC should have shape (b l d) for causal_conv1d_varlen_states
+                    conv_varlen_states = causal_conv1d_varlen_states(
+                        xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+                    )
+                    conv_state.copy_(conv_varlen_states)
+
+                    # transpose: b l pd --> b pd l
+                    xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+                else:
+                    # transpose: b l pd --> b pd l
+                    xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+
+                    conv_state.copy_(
+                        F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
+                    )  # Update state (B D W)
 
             seqlen = xBC.size(2)
             if causal_conv1d_fn is None:
                 xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
+                if inference_context.is_dynamic_batching():
+                    # Convert to channels-last memory layout to use seq_idx
+                    # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
+                    # TODO(ksanthanam): Simplify
+                    xBC_ = xBC.transpose(1, 2).contiguous().transpose(1, 2)
+                else:
+                    xBC_ = xBC
                 xBC = causal_conv1d_fn(
-                    x=xBC,
+                    x=xBC_,
                     weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
                     bias=self.cp.get_conv1d_bias(),
                     activation=self.activation,
+                    seq_idx=seq_idx,
                 )
 
             # transpose b pd l --> b l pd
@@ -534,11 +567,21 @@ class MambaMixer(MegatronModule):
                 dt_bias=self.cp.get_dt_bias().float(),
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
+                seq_idx=seq_idx,
+                cu_seqlens=cu_seqlens,
+                return_varlen_states=return_varlen_states,
             )
 
             if ssm_state is not None:
-                y, last_state = y
-                ssm_state.copy_(last_state)
+                if return_varlen_states:
+                    y, last_state, varlen_states = y
+                    # This has to be varlen_states, NOT last_state
+                    # See reference implementation:
+                    # https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/mamba_ssm/modules/mamba2.py#L267 # pylint: disable=line-too-long
+                    ssm_state.copy_(varlen_states)
+                else:
+                    y, last_state = y
+                    ssm_state.copy_(last_state)
 
             y = rearrange(y, "b l h p -> l b (h p)").contiguous()
             y = self.cp.post_conv_ssm(y)
@@ -552,13 +595,21 @@ class MambaMixer(MegatronModule):
 
         return out, out_bias
 
-    def step(self, hidden_states, conv_state, ssm_state, cache_seqlens=None):
+    def step(self, hidden_states, conv_state, ssm_state, is_dynamic_batching=False):
         """
         Performs inference step for decoding
         """
+
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
         dtype = hidden_states.dtype
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
+
+        if is_dynamic_batching:
+            batch_indices = torch.arange(
+                hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device
+            )
+        else:
+            batch_indices = None
 
         # l b d --> b d
         hidden_states = hidden_states.squeeze(0)
@@ -580,6 +631,7 @@ class MambaMixer(MegatronModule):
 
         # Conv step
         if causal_conv1d_update is None:
+            # TODO(ksanthanam): Assert not using dynamic batching
             conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
             conv_state[:, :, -1] = xBC
             xBC = torch.sum(
@@ -595,7 +647,7 @@ class MambaMixer(MegatronModule):
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
                 self.activation,
-                cache_seqlens=cache_seqlens,
+                conv_state_indices=batch_indices,
             )
 
         x, B, C = torch.split(
@@ -676,7 +728,7 @@ class MambaMixer(MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=dt_bias,
                 dt_softplus=True,
-                cache_seqlens=cache_seqlens,
+                state_batch_indices=batch_indices,
             )
             y = rearrange(y, "b h p -> b (h p)")
 
@@ -720,15 +772,12 @@ class MambaMixer(MegatronModule):
 
         assert inference_context is not None
         assert self.layer_number is not None
+
+        if inference_context.is_dynamic_batching():
+            return inference_context.mamba_states_cache(self.layer_number)
+
         if (
-            (
-                inference_context.is_static_batching()
-                and self.layer_number not in inference_context.key_value_memory_dict
-            )
-            or (
-                not inference_context.is_static_batching()
-                and self.layer_number not in inference_context.ssm_state
-            )
+            self.layer_number not in inference_context.key_value_memory_dict
             or batch_size != self.cached_batch_size
         ):
             conv_state = torch.zeros(
@@ -746,19 +795,13 @@ class MambaMixer(MegatronModule):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            if inference_context.is_static_batching():
-                inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
-            else:
-                inference_context.ssm_state[self.layer_number] = (conv_state, ssm_state)
+            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
             self.cached_batch_size = batch_size
         else:
-            if inference_context.is_static_batching():
-                conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
-            else:
-                conv_state, ssm_state = inference_context.ssm_state[self.layer_number]
-        if inference_context.is_prefill_only():
-            conv_state.zero_()
-            ssm_state.zero_()
+            conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
+            if inference_context.sequence_len_offset == 0:
+                conv_state.zero_()
+                ssm_state.zero_()
         return conv_state, ssm_state
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):

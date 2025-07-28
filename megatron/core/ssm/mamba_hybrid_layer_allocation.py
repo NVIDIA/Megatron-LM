@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from itertools import count
+from typing import Dict, Tuple
 
 if __name__ != "__main__":
     from megatron.core.utils import log_single_rank
@@ -154,6 +156,24 @@ def allocate_layers(
             f"Actual mlp ratio: {actual_mlp_ratio:.2f}.",
         )
     return layer_type_list
+
+
+def get_layer_maps_from_hybrid_override_pattern(
+    hybrid_override_pattern: str,
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
+    """
+    Returns maps from global layer index to the corresponding layer index
+    for each layer type in [Attention, Mamba, MLP] given a hybrid override
+    pattern string.
+    """
+    layer_maps = []
+    for symbol in [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP]:
+        counter = count()
+        layer_map = {
+            i: next(counter) for i, ch in enumerate(hybrid_override_pattern) if ch == symbol
+        }
+        layer_maps.append(layer_map)
+    return layer_maps
 
 
 if __name__ == "__main__":

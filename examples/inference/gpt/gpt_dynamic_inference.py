@@ -63,6 +63,7 @@ def get_model() -> MegatronModule:
     if args.model_provider == "gpt":
         model = _get_model(gpt_model_provider, wrap_with_ddp=False)
     elif args.model_provider == "mamba":
+        args.is_hybrid_model = True
         model = _get_model(mamba_model_provider, wrap_with_ddp=False)
     else:
         raise ValueError(f"Unknown model provider {args.model_provider}")
@@ -97,8 +98,6 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
     max_context_length = max(len(r.prompt_tokens) for r in requests)
     max_sequence_length = max_context_length + max_gen_length
 
-    # TODO(ksanthanam): Only initialize KV state for Transformer layers
-
     # Inference context.
     context = DynamicInferenceContext(
         params_dtype=args.params_dtype,
@@ -116,6 +115,13 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
+        is_hybrid_model=args.is_hybrid_model,
+        mamba_head_dim=args.mamba_head_dim,
+        mamba_num_groups=args.mamba_num_groups,
+        mamba_d_model=args.hidden_size,
+        mamba_d_conv=4, # Assume this is hardcoded
+        mamba_d_state=args.mamba_state_dim,
+        hybrid_override_pattern=args.hybrid_override_pattern,
     )
 
     return context
