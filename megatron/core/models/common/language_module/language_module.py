@@ -261,7 +261,9 @@ class LanguageModule(MegatronModule):
 
         # Guard for cases metadata is not provided
         if metadata is None:
-            metadata = {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
+            metadata = {
+                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+            }
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         first_stage_word_emb_key = f'{prefix}embedding.word_embeddings.weight'

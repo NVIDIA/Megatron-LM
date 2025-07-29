@@ -79,12 +79,11 @@ class TestLocalCheckpointing:
         opt_param_scheduler = None
         rng_state = None
         iteration = None
-        metadata = dict(dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True))
-        model_sd_kwargs = dict(metadata=metadata)
-        optim_sd_kwargs = dict(
-            sharding_type='fully_sharded_model_space',
-            metadata=metadata,
+        metadata = dict(
+            dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True)
         )
+        model_sd_kwargs = dict(metadata=metadata)
+        optim_sd_kwargs = dict(sharding_type='fully_sharded_model_space', metadata=metadata)
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
@@ -166,14 +165,11 @@ class TestLocalCheckpointing:
         )  # FIXME: fails with additional arguments (e.g.,'weight_decay')
         if use_ramdisk:
             tmp_path_dist_ckpt = Path("/dev/shm")
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "test_local", sync=True
-        ) as local_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch(
-            'megatron.training.async_utils.get_args', new=lambda: mock_args
-        ), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "test_local", sync=True) as local_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
             init_basic_mock_args(mock_args, tp, pp)
@@ -267,16 +263,13 @@ class TestLocalCheckpointing:
             tmp_path_dist_ckpt = Path("/dev/shm")
 
         def test_save_wrapper(save_wrapper, subdir):
-            with TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir, mock.patch(
-                'megatron.training.checkpointing.get_args', new=lambda: mock_args
-            ), mock.patch(
-                'megatron.training.async_utils.get_args', new=lambda: mock_args
-            ), mock.patch(
-                "megatron.training.checkpointing.update_num_microbatches"
-            ), mock.patch.object(
-                LocalCheckpointManager, '_save', new=save_wrapper
-            ), caplog.at_level(
-                logging.INFO
+            with (
+                TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir,
+                mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+                mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
+                mock.patch("megatron.training.checkpointing.update_num_microbatches"),
+                mock.patch.object(LocalCheckpointManager, '_save', new=save_wrapper),
+                caplog.at_level(logging.INFO),
             ):
 
                 local_ckpt_dir = (
