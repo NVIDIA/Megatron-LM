@@ -141,9 +141,9 @@ def get_gpt_layer_with_transformer_engine_spec(
                     params={"attn_mask_type": AttnMaskType.causal},
                     submodules=MLASelfAttentionSubmodules(
                         linear_q_proj=backend.column_parallel_linear(),
-                        linear_q_down_proj=backend.column_parallel_linear(),
+                        linear_q_down_proj=backend.linear(),
                         linear_q_up_proj=linear_q_up_proj,
-                        linear_kv_down_proj=backend.column_parallel_linear(),
+                        linear_kv_down_proj=backend.linear(),
                         linear_kv_up_proj=linear_kv_up_proj,
                         core_attention=backend.core_attention(),
                         linear_proj=backend.row_parallel_linear(),
