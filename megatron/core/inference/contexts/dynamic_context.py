@@ -1043,21 +1043,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # We determine how many requests we can resume and resume them
         # Assign released chunks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-        if (
-            self.chunk_allocator.chunk_count_avail
-            <= self.paused_request_count + self.gtd_chunk_count
-        ):
-            if active_request_count < self.gtd_request_count:
-                resume_request_count = min(
-                    self.paused_request_count, self.gtd_request_count - active_request_count
-                )
-            else:
-                # If there are more active requests than gtd requests and not enough
-                # chunks available, no requests can be resumed
-                resume_request_count = 0
+        num_non_gtd_chunks = max(0, self.chunk_allocator.chunk_count_avail - self.gtd_chunk_count)
+        if num_non_gtd_chunks:
+            # if we have non-gtd chunks, use them. Do not dip into the gtd-chunk pool
+            resume_request_count = min(num_non_gtd_chunks, self.paused_request_count)
         else:
-            # If there are more available chunks than (paused + gtd requests), resume all paused requests
-            resume_request_count = self.paused_request_count
+            # only dip into the gtd-chunk pool if we have run out of non-gtd-chunks and the active
+            # request count has fallen below a certain threshold.
+            resume_request_count = min(
+                max(self.gtd_request_count - active_request_count, 0), self.paused_request_count
+            )
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count
