@@ -11,6 +11,7 @@ import torch
 import transformer_engine as te
 
 from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -90,6 +91,20 @@ def make_test_packed_seq_params_with_padding(
     return packed_seq_params
 
 
+def get_mla_self_attn_submodules(linear_qkv_down_proj=None):
+    submodules = get_gpt_layer_with_transformer_engine_spec(
+        multi_latent_attention=True
+    ).submodules.self_attention.submodules
+    if linear_qkv_down_proj is not None:
+        submodules.linear_q_down_proj = linear_qkv_down_proj
+        submodules.linear_kv_down_proj = linear_qkv_down_proj
+    return submodules
+
+
+backend = TESpecProvider()
+linear_qkv_down_proj_options = [backend.linear(), backend.column_parallel_linear()]
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttention:
 
@@ -113,9 +128,7 @@ class TestParallelMLAAttention:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -180,9 +193,7 @@ class TestParallelMLAAttention:
             transformer_config.apply_rope_fusion = True
             checkpointed_parallel_attention = MLASelfAttention(
                 transformer_config,
-                get_gpt_layer_with_transformer_engine_spec(
-                    multi_latent_attention=True
-                ).submodules.self_attention.submodules,
+                get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
             )
@@ -299,9 +310,7 @@ class TestParallelMLAAttention:
             transformer_config.recompute_granularity = 'selective'
             checkpointed_parallel_attention = MLASelfAttention(
                 transformer_config,
-                get_gpt_layer_with_transformer_engine_spec(
-                    multi_latent_attention=True
-                ).submodules.self_attention.submodules,
+                get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
             )
@@ -340,9 +349,7 @@ class TestParallelMLAAttention:
             transformer_config.recompute_modules = ["mla_up_proj"]
             checkpointed_parallel_attention = MLASelfAttention(
                 transformer_config,
-                get_gpt_layer_with_transformer_engine_spec(
-                    multi_latent_attention=True
-                ).submodules.self_attention.submodules,
+                get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
             )
@@ -379,9 +386,10 @@ class TestParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+@pytest.mark.parametrize("linear_qkv_down_proj", linear_qkv_down_proj_options)
 class TestSequenceParallelMLAAttention:
-
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, linear_qkv_down_proj):
         self.tensor_parallel_size = 2
         Utils.initialize_model_parallel(self.tensor_parallel_size, 1)
         model_parallel_cuda_manual_seed(123)
@@ -401,9 +409,7 @@ class TestSequenceParallelMLAAttention:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -437,8 +443,10 @@ class TestSequenceParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+@pytest.mark.parametrize("linear_qkv_down_proj", linear_qkv_down_proj_options)
 class TestTensorParallelMLAAttention:
-    def setup_method(self, method):
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self, linear_qkv_down_proj):
         self.tensor_parallel_size = 2
         Utils.initialize_model_parallel(self.tensor_parallel_size, 1)
         model_parallel_cuda_manual_seed(123)
@@ -458,9 +466,7 @@ class TestTensorParallelMLAAttention:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -531,9 +537,7 @@ class TestContextParallelMLAAttention:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         ).bfloat16()
@@ -629,9 +633,7 @@ class TestParallelMLAAttentionPrecision:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
@@ -783,9 +785,7 @@ class TestContextParallelMLAAttentionPrecision:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         ).bfloat16()
@@ -925,9 +925,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
         )
         self.parallel_attention = MLASelfAttention(
             self.transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True
-            ).submodules.self_attention.submodules,
+            get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
         )
