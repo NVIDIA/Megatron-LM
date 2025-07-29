@@ -18,11 +18,12 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
-moe = get_moe_module_spec(use_te=True,
-                          num_experts=8,  # Can be anything non None
-                          moe_grouped_gemm=True,
-                          moe_use_legacy_grouped_gemm=False,
-                          )
+moe = get_moe_module_spec(
+    use_te=True,
+    num_experts=8,  # Can be anything non None
+    moe_grouped_gemm=True,
+    moe_use_legacy_grouped_gemm=False,
+)
 
 mamba_stack_spec = ModuleSpec(
     module=MambaStack,
@@ -73,11 +74,9 @@ mamba_stack_spec = ModuleSpec(
             ),
         ),
         moe_layer=ModuleSpec(
-            module=TransformerLayer, # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
+            module=TransformerLayer,  # TODO (rwaleffe): change this to be an "MoELayer" to work with CudaGraphs?
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm,
-                mlp=moe,
-                mlp_bda=get_bias_dropout_add,
+                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
     ),

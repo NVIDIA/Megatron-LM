@@ -147,9 +147,9 @@ class MambaStack(MegatronModule):
                     )
                 elif layer_type == LayerSymbols.MOE:
                     # Transformer layers apply their own pp_layer_offset
-                    layer = build_module(submodules.moe_layer,
-                                         config=self.config,
-                                         layer_number=i + 1)
+                    layer = build_module(
+                        submodules.moe_layer, config=self.config, layer_number=i + 1
+                    )
                 else:
                     assert False, "unexpected layer_type"
             self.layers.append(layer)
@@ -164,7 +164,6 @@ class MambaStack(MegatronModule):
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
             )
-
 
     def _select_layers_for_pipeline_parallel(self, layer_type_list):
         num_layers_per_pipeline_rank = self.config.num_layers // self.pp_group.size()
