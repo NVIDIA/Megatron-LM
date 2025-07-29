@@ -773,7 +773,9 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
             key = f"model{i}"
 
         if args.ckpt_format == "torch_dist":
-            model_sd = model[i].sharded_state_dict(**(model_sd_kwargs or {}))
+            model_sd = model[i].sharded_state_dict(**(model_sd_kwargs or {"metadata": {
+                    "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
+                }}))
         else:   # torch, torch_dcp
             model_sd = model[i].state_dict_for_save_checkpoint()
 
@@ -785,7 +787,9 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
             optimizer_sd = None
 
             if args.ckpt_format == "torch_dist":
-                optimizer_sd = optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {}))
+                optimizer_sd = optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {"metadata": {
+                    "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)
+                }}))
             else:
                 optimizer_sd = optimizer.state_dict()
 

@@ -12,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
@@ -92,8 +93,11 @@ class TestModelOptGPTModel:
     def test_sharded_state_dict_restore(self, tmp_path_dist_ckpt):
         """Save with the default TE spec and restore using the ModelOpt spec."""
         _dist_checkpoint_name = "default_model"
-        te_fused_sharded_state_dict = self.default_model.sharded_state_dict()
-        modelopt_sharded_state_dict = self.modelopt_model.sharded_state_dict()
+        metadata = {
+            "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True),
+        }
+        te_fused_sharded_state_dict = self.default_model.sharded_state_dict(metadata=metadata)
+        modelopt_sharded_state_dict = self.modelopt_model.sharded_state_dict(metadata=metadata)
 
         with TempNamedDir(tmp_path_dist_ckpt / _dist_checkpoint_name, sync=True) as tmpdirname:
             dist_checkpointing.save(te_fused_sharded_state_dict, tmpdirname)
