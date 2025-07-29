@@ -1379,13 +1379,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         sharded_sd_metadata = dist_checkpointing.load_content_metadata(preloaded_state_dict=state_dict)
         print_rank_0(f'sharded_state_dict metadata loaded from the checkpoint: {sharded_sd_metadata}')
-        
-        # Add dp_cp_group to loaded metadata. If not provided, fallback to global parallel state.
-        if sharded_sd_metadata is None:
-            sharded_sd_metadata = {}
-        if dp_cp_group is None:
-            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-        sharded_sd_metadata['dp_cp_group'] = dp_cp_group
+
         # Determine if optimizer state will be loaded
         if (not release and not args.finetune and not args.no_load_optim
                 and not getattr(state_dict['args'], 'no_save_optim', False)):
