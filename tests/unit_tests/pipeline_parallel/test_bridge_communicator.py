@@ -506,7 +506,7 @@ class TestBridgeCommunicator:
 
         output_grid_1 = block1(hidden_states=hidden_states, attention_mask=None)
 
-        output_grid_2 = block2(hidden_states=output_grid_1, attention_mask=None)
+        output_grid_2 = block2(hidden_states=hidden_states, attention_mask=None)
 
         logging.info(
             f"Rank {dist.get_rank()}: output_grid_1 shape {output_grid_1.shape} output_grid_2 shape {output_grid_2.shape}"
