@@ -31,6 +31,12 @@ class InferenceWrapperConfig:
     inference_max_seq_length: int = 2560
     """ Maximum sequence length for inference (prefill & decode). Necessary for CUDA graphs. """
 
+    prompt_segmentation_threshold: int | None = None
+    """If prompt length exceeds this value, it will be split into segments. This
+    feature allows to process very large prompts that normally would cause
+    Out Of Memory (OOM) during forward pass. If None, prompt segmentation is
+    disabled."""
+
     fp32_residual_connection: bool = False
     """Move residual connections to fp32. Obtained from arguments.py"""
 

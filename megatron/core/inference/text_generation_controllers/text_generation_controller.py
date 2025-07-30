@@ -577,6 +577,9 @@ class TextGenerationController:
         max_prompt_length_in_batch = max(prompt_lengths_in_batch)
         min_prompt_length_in_batch = min(prompt_lengths_in_batch)
 
+        pst = self.inference_wrapped_model.inference_wrapper_config.prompt_segmentation_threshold
+        pst = min(pst or min_prompt_length_in_batch, min_prompt_length_in_batch)
+
         # For batch inference the sampling params are the same for all request
         sampling_params: SamplingParams = list(active_requests.values())[0].sampling_params
 
@@ -714,7 +717,7 @@ class TextGenerationController:
             if sampling_params.num_tokens_to_generate == 0:
                 context_end_position = max_prompt_length_in_batch
             else:
-                context_end_position = min_prompt_length_in_batch
+                context_end_position = pst
 
             # The initial iteration of this loop runs the prefill phase up to the shortest
             # prompt length in the batch. Then every subsequent iterations runs a decode step.
