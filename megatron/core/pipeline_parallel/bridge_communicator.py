@@ -534,7 +534,9 @@ class BridgeCommunicator:
 
         if rank_info.role == 'SENDER':
             # Current rank is a sender - gather tensors from all ranks in activation_gather_group
-            assert self.current_rank == self.src_local_leader_rank, f"Rank {self.current_rank} is not the leader rank"
+            assert (
+                self.current_rank == self.src_local_leader_rank
+            ), f"Rank {self.current_rank} is not the leader rank"
             num_sends = len(rank_info.sends)
             activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
 
@@ -574,7 +576,7 @@ class BridgeCommunicator:
                             send_op.destination_rank,
                         )
                     )
-                
+
                 logging.debug(
                     f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                     f"executing {len(ops)} simultaneous P2P operations"
@@ -662,7 +664,6 @@ class BridgeCommunicator:
             assert (
                 self.current_rank == self.dest_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
-
 
             num_receives = len(rank_info.receives)
             gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)

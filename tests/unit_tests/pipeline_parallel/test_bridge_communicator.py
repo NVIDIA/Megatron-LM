@@ -51,7 +51,15 @@ def _create_transformer_block(hidden_size=4096, model_comm_pgs=None) -> Transfor
         context_parallel_size=cp_size,
     )
 
-    block = TransformerBlock(transformer_config, get_gpt_layer_with_transformer_engine_spec(), model_comm_pgs=model_comm_pgs).cuda().bfloat16()
+    block = (
+        TransformerBlock(
+            transformer_config,
+            get_gpt_layer_with_transformer_engine_spec(),
+            model_comm_pgs=model_comm_pgs,
+        )
+        .cuda()
+        .bfloat16()
+    )
     with torch.no_grad():
         for mod in block.modules():
             if hasattr(mod, "bias") and mod.bias is not None:
@@ -138,9 +146,19 @@ def _avg_params(module: torch.nn.Module, group: dist.ProcessGroup = None) -> Non
         dist.all_reduce(p.data, op=dist.ReduceOp.SUM, group=group or dist.group.WORLD)
         p.data.div_(world)
 
-def get_transformer_block_and_grid(tp_size, cp_size, pp_size, dp_size, ref_block, grid_offset: int = 0, use_global_parallel_state: bool = False, hidden_size: int = 4096):
+
+def get_transformer_block_and_grid(
+    tp_size,
+    cp_size,
+    pp_size,
+    dp_size,
+    ref_block,
+    grid_offset: int = 0,
+    use_global_parallel_state: bool = False,
+    hidden_size: int = 4096,
+):
     """Utility to build a ``TransformerBlock`` for tests."""
-    
+
     current_rank = dist.get_rank()
     if use_global_parallel_state:
         block = _create_transformer_block()
@@ -181,7 +199,9 @@ class TestBridgeCommunicator:
             )
         cls.global_tp_size = 2
         cls.global_cp_size = 1
-        Utils.initialize_model_parallel(tensor_model_parallel_size=cls.global_tp_size, context_parallel_size=cls.global_cp_size)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=cls.global_tp_size, context_parallel_size=cls.global_cp_size
+        )
 
     def teardown_class(cls):
         Utils.destroy_model_parallel()
@@ -314,7 +334,7 @@ class TestBridgeCommunicator:
         "grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid2_tp, grid2_cp, grid2_pp, grid2_dp, mbs",
         [
             #  (4, 1, 1, 1, 4, 1, 1, 1, 2),  # TP4 to TP4
-             (2, 1, 1, 2, 2, 1, 1, 2, 2),  # TP2DP2 to TP2DP2
+            (2, 1, 1, 2, 2, 1, 1, 2, 2),  # TP2DP2 to TP2DP2
             # (1, 4, 1, 1, 4, 1, 1, 1, 2),  # Current setup: Grid1 cp=4, Grid2 tp=4,
             # (1, 4, 1, 1, 1, 1, 1, 4, 8),  # Fan-out test
             # (1, 1, 1, 4, 4, 1, 1, 1, 8),  # Fan-in test
@@ -345,10 +365,22 @@ class TestBridgeCommunicator:
         _avg_params(ref_block, ref_grid.get_pg("dp"))
 
         block_grid_1, grid_1 = get_transformer_block_and_grid(
-            grid1_tp, grid1_cp, grid1_pp, grid1_dp, ref_block, grid_offset=0, hidden_size=hidden_size
+            grid1_tp,
+            grid1_cp,
+            grid1_pp,
+            grid1_dp,
+            ref_block,
+            grid_offset=0,
+            hidden_size=hidden_size,
         )
         block_grid_2, grid_2 = get_transformer_block_and_grid(
-            grid2_tp, grid2_cp, grid2_pp, grid2_dp, ref_block, grid_offset=4, hidden_size=hidden_size
+            grid2_tp,
+            grid2_cp,
+            grid2_pp,
+            grid2_dp,
+            ref_block,
+            grid_offset=4,
+            hidden_size=hidden_size,
         )
 
         dist.barrier()
@@ -390,12 +422,26 @@ class TestBridgeCommunicator:
                 output_grid_2.shape == expected_output_shape
             ), f"Output2 shape mismatch: {output_grid_2.shape}"
 
-            logging.info(f" Grid 2 rank {dist.get_rank()}: forward pass with output shape {output_grid_2.shape} sum {output_grid_2.sum()}")
+            logging.info(
+                f" Grid 2 rank {dist.get_rank()}: forward pass with output shape {output_grid_2.shape} sum {output_grid_2.sum()}"
+            )
 
-       
-        
-        global_block_1, _ = get_transformer_block_and_grid(TestBridgeCommunicator.global_tp_size,TestBridgeCommunicator.global_cp_size,1,2, ref_block, use_global_parallel_state=True)
-        global_block_2, _ = get_transformer_block_and_grid(TestBridgeCommunicator.global_tp_size,TestBridgeCommunicator.global_cp_size,1,2, ref_block, use_global_parallel_state=True)
+        global_block_1, _ = get_transformer_block_and_grid(
+            TestBridgeCommunicator.global_tp_size,
+            TestBridgeCommunicator.global_cp_size,
+            1,
+            2,
+            ref_block,
+            use_global_parallel_state=True,
+        )
+        global_block_2, _ = get_transformer_block_and_grid(
+            TestBridgeCommunicator.global_tp_size,
+            TestBridgeCommunicator.global_cp_size,
+            1,
+            2,
+            ref_block,
+            use_global_parallel_state=True,
+        )
 
         print(f"rank {dist.get_rank()} ")
         if dist.get_rank() == 0 or dist.get_rank() == 3:
@@ -432,8 +478,6 @@ class TestBridgeCommunicator:
             )
             torch.testing.assert_close(global_block_2_output, output_grid_2, rtol=1e-3, atol=1e-3)
 
-
-
     def test_tranformer_block_with_different_parallelisms(self):
 
         torch.manual_seed(12345)
@@ -442,12 +486,16 @@ class TestBridgeCommunicator:
 
         sequence_length = 2048
         micro_batch_size = 2
-        hidden_states = torch.randn((sequence_length, micro_batch_size, hidden_size), device="cuda").bfloat16()
+        hidden_states = torch.randn(
+            (sequence_length, micro_batch_size, hidden_size), device="cuda"
+        ).bfloat16()
 
         # tp8 dp 1 grid
         grid1 = create_hypercomm_grid(offset=0, tp=8, cp=1, pp=1, dp=1)
         model_comm_pgs_block1 = get_model_comm_pgs_from_grid(grid1)
-        block1 = _create_transformer_block(hidden_size=hidden_size, model_comm_pgs=model_comm_pgs_block1)
+        block1 = _create_transformer_block(
+            hidden_size=hidden_size, model_comm_pgs=model_comm_pgs_block1
+        )
 
         # tp4 dp 2 grid
         grid2 = create_hypercomm_grid(offset=0, tp=4, cp=1, pp=1, dp=2)
@@ -460,37 +508,42 @@ class TestBridgeCommunicator:
 
         output_grid_2 = block2(hidden_states=output_grid_1, attention_mask=None)
 
-        logging.info(f"Rank {dist.get_rank()}: output_grid_1 shape {output_grid_1.shape} output_grid_2 shape {output_grid_2.shape}")
-        logging.info(f"Rank {dist.get_rank()}: output_grid_1 sum {output_grid_1.sum()} output_grid_2 sum {output_grid_2.sum()}")
+        logging.info(
+            f"Rank {dist.get_rank()}: output_grid_1 shape {output_grid_1.shape} output_grid_2 shape {output_grid_2.shape}"
+        )
+        logging.info(
+            f"Rank {dist.get_rank()}: output_grid_1 sum {output_grid_1.sum()} output_grid_2 sum {output_grid_2.sum()}"
+        )
 
         _print_tp_full_weight(block1.layers[0].mlp.linear_fc1, model_comm_pgs_block1.tp)
         _print_tp_full_weight(block2.layers[0].mlp.linear_fc1, model_comm_pgs.tp)
 
         torch.testing.assert_close(output_grid_1, output_grid_2, rtol=1e-3, atol=1e-3)
 
-
-        
-
-
         # torch.testing.assert_close(output_grid_1, output_grid_2, rtol=1e-3, atol=1e-3)
-       
-def _print_tp_full_weight(col_parallel_layer, tp_group: torch.distributed.ProcessGroup) -> torch.Tensor:
 
-    local = col_parallel_layer.weight.data             # [out/tp, in]
+
+def _print_tp_full_weight(
+    col_parallel_layer, tp_group: torch.distributed.ProcessGroup
+) -> torch.Tensor:
+
+    local = col_parallel_layer.weight.data  # [out/tp, in]
     tp_size = dist.get_world_size(tp_group)
     parts = [torch.empty_like(local) for _ in range(tp_size)]
     dist.all_gather(parts, local, group=tp_group)
     full_weight = torch.cat(parts, dim=0)
-    logging.info(f"[TP Full weight]Rank {dist.get_rank()}: full_weight shape {full_weight.shape} sum {full_weight.sum()} first column sum {full_weight[0].sum()}")
-
+    logging.info(
+        f"[TP Full weight]Rank {dist.get_rank()}: full_weight shape {full_weight.shape} sum {full_weight.sum()} first column sum {full_weight[0].sum()}"
+    )
 
     if dist.get_rank() == 0:
-            tensor_for_broadcast = full_weight.clone()
+        tensor_for_broadcast = full_weight.clone()
     else:
         tensor_for_broadcast = torch.empty_like(full_weight)
-    
-    dist.broadcast(tensor_for_broadcast, src=0)
-    logging.info(f"[TP Recon weight]Rank {dist.get_rank()}: recon_weight shape {tensor_for_broadcast.shape} sum {tensor_for_broadcast.sum()} first column sum {tensor_for_broadcast[0].sum()}")
 
+    dist.broadcast(tensor_for_broadcast, src=0)
+    logging.info(
+        f"[TP Recon weight]Rank {dist.get_rank()}: recon_weight shape {tensor_for_broadcast.shape} sum {tensor_for_broadcast.sum()} first column sum {tensor_for_broadcast[0].sum()}"
+    )
 
     torch.testing.assert_close(full_weight, tensor_for_broadcast, rtol=1e-4, atol=0)
