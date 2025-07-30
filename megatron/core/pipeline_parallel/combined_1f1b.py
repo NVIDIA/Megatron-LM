@@ -12,9 +12,8 @@ from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     ScheduleNode,
     set_streams,
-    unwrap_model,
 )
-from megatron.core.utils import get_attr_wrapped_model
+from megatron.core.utils import get_attr_wrapped_model, unwrap_model
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -221,8 +220,14 @@ def combined_forward_backward_step(
             # The return value becomes (forward_schedule_plan, loss_function),
             # which is used to be (forward_output_tensor, loss_function).
             with context_manager:  # autocast context
+                unwrapped_model = unwrap_model(f_model)
+                from megatron.core.models.gpt.gpt_model import GPTModel
+
+                assert isinstance(
+                    unwrapped_model, GPTModel
+                ), "The final unwrapped model must be a GPTModel instance"
                 f_schedule_plan, loss_func = forward_step_func(
-                    data_iterator, unwrap_model(f_model), return_schedule_plan=True
+                    data_iterator, unwrapped_model, return_schedule_plan=True
                 )
                 assert isinstance(
                     f_schedule_plan, AbstractSchedulePlan
