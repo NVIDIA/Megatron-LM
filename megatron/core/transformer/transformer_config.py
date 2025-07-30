@@ -931,7 +931,9 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
-            self.pipeline_model_parallel_layout.validate_layer_layout(num_layers=self.num_layers)
+            self.pipeline_model_parallel_layout.validate_layer_layout(
+                num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
+            )
 
         # Uneven PP
         elif (
@@ -1265,8 +1267,8 @@ class TransformerConfig(ModelParallelConfig):
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
             assert (
-                self.mtp_num_layers is None
-            ), '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
+                self.mtp_num_layers is None or self.mtp_num_layers == 1
+            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:

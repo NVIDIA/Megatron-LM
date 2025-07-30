@@ -22,6 +22,7 @@ from megatron.core.pipeline_parallel.utils import (
     get_com_stream,
     get_comp_stream,
 )
+from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
 
 
 class ModelChunkState:
@@ -38,7 +39,8 @@ class LayerSchedulePlan:
     """Schedule the executing plan of the nodes in a transformer layer.
 
     This class organizes the computation nodes for a transformer layer,
-    including attention, post attention, MLP, dispatch, and combine nodes.
+    including attention, post attention, MLP, dispatch, combine and
+    mtp post process nodes.
 
     layer (LayerSchedulePlan)
     ├── attn (TransformerLayerNode): attention module
@@ -46,6 +48,7 @@ class LayerSchedulePlan:
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
+    └── mtp_post_process (PostProcessNode): mtp post process
     """
 
     attn = None
@@ -53,6 +56,7 @@ class LayerSchedulePlan:
     moe_dispatch = None
     mlp = None
     moe_combine = None
+    mtp_post_process = None
 
     def __init__(self, layer, event, chunk_state, comp_stream, com_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
@@ -83,19 +87,23 @@ class LayerSchedulePlan:
     def _build_callable_nodes(self, event, comp_stream, com_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
-            attn, post_attn, mlp, moe_dispatch and moe_combine.
+            attn, post_attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
         """
         from megatron.core.transformer.moe.moe_layer import MoELayer
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+        from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
         # build the forward and backward callables for the transformer/mtp layer
         fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
 
         # get flags for latter use
-        is_moe = isinstance(self.layer.mlp, MoELayer)
+        is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
+        is_moe = True if is_mtp else isinstance(self.layer.mlp, MoELayer)
         enable_deepep = self.layer.config.moe_enable_deepep
         extra_args["enable_deepep"] = enable_deepep
         extra_args["is_moe"] = is_moe
         extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
+        extra_args["is_mtp"] = is_mtp
 
         # wrapper to help create TransformerLayerNode
         def create_node(stream, module, name):
@@ -111,9 +119,14 @@ class LayerSchedulePlan:
                 extra_args=extra_args,
             )
 
-        (attn_module, post_attn_module, moe_dispatch_module, mlp_module, moe_combine_module, _) = (
-            fwd_callables
-        )
+        (
+            attn_module,
+            post_attn_module,
+            moe_dispatch_module,
+            mlp_module,
+            moe_combine_module,
+            mtp_post_process_module,
+        ) = fwd_callables
 
         # Create nodes for different operations in the layer
         # Each node type has a predefined name that determines its memory strategy
@@ -127,6 +140,13 @@ class LayerSchedulePlan:
             self.post_attn = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
             self.moe_combine = NoopScheduleNode()
+
+        if is_mtp:
+            self.mtp_post_process = create_node(
+                comp_stream, mtp_post_process_module, "mtp_post_process"
+            )
+        else:
+            self.mtp_post_process = NoopScheduleNode()
 
     def get_fp8_context(self):
         """
@@ -176,6 +196,7 @@ class LayerSchedulePlan:
 
         if b_layer is not None:
             with b_context:
+                b_grad = b_layer.mtp_post_process.backward(b_grad)
                 b_grad = b_layer.moe_combine.backward(b_grad)
 
         if f_layer is not None:
@@ -203,6 +224,7 @@ class LayerSchedulePlan:
         if f_layer is not None:
             with f_context and f_layer.get_fp8_context():
                 f_input = f_layer.moe_combine.forward(f_input)
+                f_input = f_layer.mtp_post_process.forward(f_input)
 
         if b_layer is not None:
             with b_context:
@@ -269,8 +291,8 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._event = torch.cuda.Event()
-        self._pre_process = None
-        self._post_process = None
+        self.pre_process = None
+        self.post_process = None
 
         comp_stream = get_comp_stream()
         com_stream = get_com_stream()
@@ -281,14 +303,21 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.attention_mask = attention_mask
         self._model_chunk_state.decoder_input = decoder_input
         self._model_chunk_state.labels = labels
+        self._model_chunk_state.labels_for_mtp = labels[:] if labels is not None else None
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
+        self._model_chunk_state.model = model
+        self._model_chunk_state.context = None
+        self._model_chunk_state.context_mask = None
+        self._model_chunk_state.attention_bias = None
 
         transformer_num_layers = model.decoder.num_layers_per_pipeline_rank
+        mtp_num_layers = get_mtp_num_layers_to_build(model.config, vp_stage=model.vp_stage)
+
         # build preprocess
-        self._pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
+        self.pre_process = PreProcessNode(model, self._model_chunk_state, self._event, comp_stream)
         # build layer schedule plan for each layer
         for layer_idx in range(transformer_num_layers):
             layer = model.decoder._get_layer(layer_idx)
@@ -296,9 +325,22 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
                 layer, self._event, self._model_chunk_state, comp_stream, com_stream
             )
             self._transformer_layers.append(layer_plan)
+
+        # build mtp layers
+        for layer_idx in range(mtp_num_layers):
+            extra_args = {
+                "is_first_layer": layer_idx == 0,
+                "is_last_layer": layer_idx == mtp_num_layers - 1,
+            }
+            layer = model.mtp.layers[layer_idx]
+            layer_plan = LayerSchedulePlan(
+                layer, self.event, self.state, comp_stream, com_stream, extra_args
+            )
+            self._transformer_layers.append(layer_plan)
+
         # build post process
         if model.post_process:
-            self._post_process = PostProcessNode(
+            self.post_process = PostProcessNode(
                 model, self._model_chunk_state, self._event, comp_stream
             )
 
@@ -317,16 +359,6 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         stream = torch.cuda.current_stream()
         self.event.wait(stream)
 
-    @property
-    def pre_process(self):
-        """Gets the preprocessing node."""
-        return self._pre_process
-
-    @property
-    def post_process(self):
-        """Gets the postprocessing node."""
-        return self._post_process
-
     def get_layer(self, i):
         """Gets the transformer layer at the specified index."""
         assert i < self.num_layers()
@@ -336,10 +368,6 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         """Gets the number of transformer layers."""
         return len(self._transformer_layers)
 
-    def add_layer(self, layer):
-        """Adds a transformer layer to the schedule plan."""
-        self._transformer_layers.append(layer)
-
     @property
     def state(self):
         """Gets the model chunk state."""
@@ -347,12 +375,13 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
 
     def release_state(self):
         """Release reference, this helps avoid memory leak."""
-        self._pre_process.model_chunk_state = None
-        self._pre_process = None
+        self._model_chunk_state.model = None
+        self.pre_process.model_chunk_state = None
+        self.pre_process = None
 
-        if self._post_process is not None:
-            self._post_process.model_chunk_state = None
-            self._post_process = None
+        if self.post_process is not None:
+            self.post_process.model_chunk_state = None
+            self.post_process = None
 
     @classmethod
     def run(

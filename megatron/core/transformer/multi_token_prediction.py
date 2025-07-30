@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -382,10 +382,136 @@ class MultiTokenPredictionLayer(MegatronModule):
         )
         self.offload_context = nullcontext()
 
+    def _get_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        embedding: Callable,
+        hidden_states: torch.Tensor,
+    ):
+        """
+        Preprocesses input data for the Multi-Token Prediction (MTP) layers.
+
+        This function computes the decoder input and sends updated input_ids and position_ids to
+        the next layer.
+
+        Args:
+            input_ids (torch.Tensor): The input token IDs.
+            position_ids (torch.Tensor): The position IDs corresponding to the input tokens.
+            embedding (Callable): The embedding module
+                from gpt model to compute the decoder input.
+            hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
+                sequence length, b is the batch size, and h is the hidden size.
+        """
+        # Calc logits for the current Multi-Token Prediction (MTP) layers.
+        input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+        position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
+        # embedding
+        decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        return input_ids, position_ids, decoder_input, hidden_states
+
+    def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
+        """
+        Concatenate the tokens before sending to transformer layer.
+        """
+        decoder_input = self.enorm(decoder_input)
+        decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
+        hidden_states = self.hnorm(hidden_states)
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        # At the (k - 1)-th MTP module, concatenates the i-th tocken's hidden_states
+        # and the (i + K)-th tocken's embedding, and combine them with linear projection.
+        hidden_states = torch.cat((decoder_input, hidden_states), -1)
+        hidden_states, _ = self.eh_proj(hidden_states)
+        # For tensor parallel we need to gather the tensor across the model-parallel
+        # ranks after the linear projection. This used to call
+        # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
+        # the gradient in backward pass and was therefore incorrect in this context.
+        # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
+        hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
+        # For sequence parallel, scatter after linear_fc and before transformer layer.
+        if self.sequence_parallel:
+            hidden_states = scatter_to_sequence_parallel_region(hidden_states)
+        return hidden_states
+
+    def _postprocess(
+        self,
+        labels: torch.Tensor,
+        loss_mask: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_main_model: torch.Tensor,
+        output_layer: Callable,
+        output_weight: torch.Tensor,
+        runtime_gather_output: bool,
+        compute_language_model_loss: Callable,
+    ):
+        """
+        Postprocesses the output of the transformer layers.
+
+        This function applies layer normalization, computes logits, calculates
+        the loss, and scales the hidden states of the main model.
+
+        Args:
+            labels (torch.Tensor): The ground truth labels for the tokens.
+            loss_mask (torch.Tensor): Mask to apply on the loss to ignore certain tokens.
+            hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
+                sequence length, b is the batch size, and h is the hidden size.
+            hidden_states_main_model (torch.Tensor): The hidden states from the last transformer
+                layer, this value is passed through all MTP layers.
+            output_layer (Callable): The output layer module from gpt model.
+            output_weight (torch.Tensor): The weight tensor from gpt model.
+            runtime_gather_output (bool): Flag to determine if output should be gathered at runtime.
+            compute_language_model_loss (Callable): The loss module from gpt model.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing
+            the processed hidden states, scaled hidden states of the main model, rolled labels,
+            and rolled loss mask.
+        """
+        # Layer norm before shared head layer.
+        hidden_states = self.final_layernorm(hidden_states)
+        # TENorm produces a "viewed" tensor. This will result in schedule.py's
+        # deallocate_output_tensor() throwing an error, so a viewless tensor is
+        # created to prevent this.
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        # output
+        mtp_logits, _ = output_layer(
+            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+        )
+        # Calc loss for the current Multi-Token Prediction (MTP) layers.
+        labels, _ = roll_tensor(labels, shifts=-1, dims=-1)
+        loss_mask, num_tokens = roll_tensor(loss_mask, shifts=-1, dims=-1)
+        mtp_loss = compute_language_model_loss(labels, mtp_logits)
+        mtp_loss = loss_mask * mtp_loss
+        if self.training:
+            MTPLossLoggingHelper.save_loss_to_tracker(
+                torch.sum(mtp_loss) / num_tokens,
+                self.layer_number - 1,
+                self.config.mtp_num_layers,
+                avg_group=parallel_state.get_tensor_and_context_parallel_group(),
+            )
+        mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
+        if self.config.calculate_per_token_loss:
+            hidden_states_main_model = MTPLossAutoScaler.apply(
+                hidden_states_main_model, mtp_loss_scale * mtp_loss
+            )
+        else:
+            hidden_states_main_model = MTPLossAutoScaler.apply(
+                hidden_states_main_model, mtp_loss_scale * mtp_loss / num_tokens
+            )
+        return hidden_states, hidden_states_main_model, labels, loss_mask
+
     def forward(
         self,
-        decoder_input: Tensor,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        labels: Tensor,
+        loss_mask: Tensor,
         hidden_states: Tensor,
+        hidden_states_main_model: Tensor,
         attention_mask: Tensor,
         context: Tensor = None,
         context_mask: Tensor = None,
@@ -396,29 +522,36 @@ class MultiTokenPredictionLayer(MegatronModule):
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
         sequence_len_offset: Tensor = None,
+        embedding=None,
+        output_layer=None,
+        output_weight: Optional[torch.Tensor] = None,
+        runtime_gather_output: Optional[bool] = None,
+        compute_language_model_loss=None,
     ):
         """
-        Perform the forward pass through the MTP layer.
+        Execute the forward pass through the Multi-Token Prediction (MTP) layer.
 
         Args:
-            hidden_states (Tensor): hidden states tensor of shape [s, b, h] where s is the
+            input_ids (Tensor): Input token IDs .
+            position_ids (Tensor): Positional IDs of the input tokens.
+            labels (Tensor): Ground truth labels for the tokens.
+            loss_mask (Tensor): Mask to apply on the loss to ignore certain tokens.
+            hidden_states (Tensor): Hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
-            decoder_input (Tensor): Input tensor of shape [s, b, h] where s is the
-                sequence length, b is the batch size, and h is the hidden size.
-                At the (k - 1)-th MTP module, the i-th element of decoder input is
-                the embedding of (i + K)-th tocken.
+            hidden_states_main_model (Tensor): Hidden states from the main model's last transformer
+                layer, passed through all MTP layers.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
-            context (Tensor, optional): Context tensor for cross-attention.
-            context_mask (Tensor, optional): Mask for cross-attention context
+            context (Tensor, optional): Context tensor for cross-attention, if applicable.
+            context_mask (Tensor, optional): Mask for cross-attention context, if applicable.
             rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
-            attention_bias (Tensor): Bias tensor for Q * K.T of shape in shape broadcastable
-                to [b, num_head, sq, skv], e.g. [1, 1, sq, skv].
-                Used as an alternative to apply attention mask for TE cuDNN attention.
-            inference_params (InferenceParams, optional): Parameters for inference-time
-                optimizations.
-            packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
-                processing.
+            rotary_pos_cos (Tensor, optional): Cosine component of rotary positional embeddings.
+            rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
+            sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
+            embedding (Callable): The embedding module from gpt model to compute the decoder input.
+            output_layer (Callable): The output layer module from gpt model.
+            output_weight (Tensor, optional): The weight tensor from gpt model.
+            compute_language_model_loss (Callable): The loss module from gpt model.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -429,7 +562,12 @@ class MultiTokenPredictionLayer(MegatronModule):
             packed_seq_params is None
         ), f"multi token prediction + sequence packing is not yet supported."
 
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=embedding,
+            hidden_states=hidden_states,
+        )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -444,28 +582,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             fp8_context = nullcontext()
 
         with rng_context, fp8_context:
-            decoder_input = self.enorm(decoder_input)
-            decoder_input = make_viewless_tensor(
-                inp=decoder_input, requires_grad=True, keep_graph=True
-            )
-            hidden_states = self.hnorm(hidden_states)
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-            # At the (k - 1)-th MTP module, concatenates the i-th tocken's hidden_states
-            # and the (i + K)-th tocken's embedding, and combine them with linear projection.
-            hidden_states = torch.cat((decoder_input, hidden_states), -1)
-            hidden_states, _ = self.eh_proj(hidden_states)
-            # For tensor parallel we need to gather the tensor across the model-parallel
-            # ranks after the linear projection. This used to call
-            # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
-            # the gradient in backward pass and was therefore incorrect in this context.
-            # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-            hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
-            # For sequence parallel, scatter after linear_fc and before transformer layer.
-            if self.sequence_parallel:
-                hidden_states = scatter_to_sequence_parallel_region(hidden_states)
-
+            hidden_states = self._concat_embeddings(hidden_states, decoder_input)
             hidden_states, _ = self.transformer_layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -479,15 +596,18 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
+        hidden_states, hidden_states_main_model, labels, loss_mask = self._postprocess(
+            labels=labels,
+            loss_mask=loss_mask,
+            hidden_states=hidden_states,
+            hidden_states_main_model=hidden_states_main_model,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            compute_language_model_loss=compute_language_model_loss,
+        )
 
-        # Layer norm before shared head layer.
-        hidden_states = self.final_layernorm(hidden_states)
-        # TENorm produces a "viewed" tensor. This will result in schedule.py's
-        # deallocate_output_tensor() throwing an error, so a viewless tensor is
-        # created to prevent this.
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-
-        return hidden_states
+        return hidden_states, hidden_states_main_model, input_ids, position_ids, labels, loss_mask
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -645,15 +765,20 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         hidden_states_main_model = hidden_states
         for layer_number in range(len(self.layers)):
-            # Calc logits for the current Multi-Token Prediction (MTP) layers.
-            input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
-            position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
-            # embedding
-            decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
-            # norm, linear projection and transformer
-            hidden_states = self.layers[layer_number](
-                decoder_input=decoder_input,
+            (
+                hidden_states,
+                hidden_states_main_model,
+                input_ids,
+                position_ids,
+                labels,
+                loss_mask,
+            ) = self.layers[layer_number](
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
                 hidden_states=hidden_states,
+                hidden_states_main_model=hidden_states_main_model,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
@@ -661,33 +786,13 @@ class MultiTokenPredictionBlock(MegatronModule):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                embedding=embedding,
+                output_layer=output_layer,
+                output_weight=output_weight,
+                compute_language_model_loss=compute_language_model_loss,
+                runtime_gather_output=runtime_gather_output,
                 **(extra_block_kwargs or {}),
             )
-            # output
-            mtp_logits, _ = output_layer(
-                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
-            )
-            # Calc loss for the current Multi-Token Prediction (MTP) layers.
-            labels, _ = roll_tensor(labels, shifts=-1, dims=-1)
-            loss_mask, num_tokens = roll_tensor(loss_mask, shifts=-1, dims=-1)
-            mtp_loss = compute_language_model_loss(labels, mtp_logits)
-            mtp_loss = loss_mask * mtp_loss
-            if self.training:
-                MTPLossLoggingHelper.save_loss_to_tracker(
-                    torch.sum(mtp_loss) / num_tokens,
-                    layer_number,
-                    self.config.mtp_num_layers,
-                    avg_group=parallel_state.get_tensor_and_context_parallel_group(),
-                )
-            mtp_loss_scale = self.mtp_loss_scaling_factor / self.config.mtp_num_layers
-            if self.config.calculate_per_token_loss:
-                hidden_states_main_model = MTPLossAutoScaler.apply(
-                    hidden_states_main_model, mtp_loss_scale * mtp_loss
-                )
-            else:
-                hidden_states_main_model = MTPLossAutoScaler.apply(
-                    hidden_states_main_model, mtp_loss_scale * mtp_loss / num_tokens
-                )
 
         return hidden_states_main_model
 
