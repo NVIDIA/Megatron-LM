@@ -534,13 +534,7 @@ class BridgeCommunicator:
 
         if rank_info.role == 'SENDER':
             # Current rank is a sender - gather tensors from all ranks in activation_gather_group
-            assert (
-                self.current_rank == self.src_local_leader_rank
-            ), f"Rank {self.current_rank} is not the leader rank"
-            logging.debug(
-                f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
-                f"is a sender rank. Running gather on {self.activation_gather_ranks}"
-            )
+            assert self.current_rank == self.src_local_leader_rank, f"Rank {self.current_rank} is not the leader rank"
             num_sends = len(rank_info.sends)
             activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
 
@@ -572,12 +566,6 @@ class BridgeCommunicator:
                             torch.distributed.isend, activation_splits[i], send_op.destination_rank
                         )
                     )
-                    logging.debug(
-                        f"[Bridge Communicator] [send_fwd_recv_bwd] Rank {self.current_rank} "
-                        f"prepared send activation to dst rank {send_op.destination_rank} "
-                        f"shape {activation_splits[i].shape}"
-                    )
-
                     # Receive gradient
                     ops.append(
                         torch.distributed.P2POp(
@@ -586,8 +574,7 @@ class BridgeCommunicator:
                             send_op.destination_rank,
                         )
                     )
-
-                # Execute all operations simultaneously
+                
                 logging.debug(
                     f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
                     f"executing {len(ops)} simultaneous P2P operations"
@@ -606,13 +593,13 @@ class BridgeCommunicator:
                     f"agg grad shape {aggregated_gradient.shape} sum {aggregated_gradient.sum()}"
                 )
                 # Broadcast tensor shape to all ranks in scatter_pg
-                tensor_shape_to_scatter = aggregated_gradient.shape
+                tensor_shape_to_broadcast = aggregated_gradient.shape
                 shape_tensor = torch.tensor(
-                    tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
+                    tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
                 )
                 dist.broadcast(shape_tensor, src=self.current_rank, group=self.activation_gather_pg)
 
-                # Scatter the tensors to all ranks in the group
+                # Broadcast the tensors to all ranks in the group
                 dist.broadcast(
                     aggregated_gradient, src=self.current_rank, group=self.activation_gather_pg
                 )
@@ -675,10 +662,7 @@ class BridgeCommunicator:
             assert (
                 self.current_rank == self.dest_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
-            logging.debug(
-                f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
-                f"is a receiver rank. Running gather on {self.activation_scatter_ranks}"
-            )
+
 
             num_receives = len(rank_info.receives)
             gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
