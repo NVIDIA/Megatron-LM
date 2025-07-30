@@ -8,11 +8,7 @@ import torch
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.utils import (
-    AbstractSchedulePlan,
-    ScheduleNode,
-    set_streams,
-)
+from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode, set_streams
 from megatron.core.utils import get_attr_wrapped_model, unwrap_model
 
 # Types

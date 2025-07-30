@@ -1991,6 +1991,7 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
 
     return decorator
 
+
 def unwrap_model(model, module_instances=None):
     """Unwrap_model to return the final model instance"""
     if module_instances is None:
