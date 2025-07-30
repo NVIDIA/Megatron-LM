@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.gpt.fine_grained_schedule import LayerSchedulePlan
+from megatron.core.models.common.model_chunk_schedule_plan import TransformerLayerSchedulePlan
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import is_te_min_version
@@ -67,7 +67,7 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
     comp_stream = torch.cuda.current_stream()
     com_stream = torch.cuda.Stream(device="cuda")
     layers = [
-        LayerSchedulePlan(
+        TransformerLayerSchedulePlan(
             model,
             event,
             DummyState(),
@@ -80,18 +80,20 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
     output_tensors = []
 
     # forward for 1st microbatch
-    output, _ = LayerSchedulePlan.run(layers[0], None, f_input=input_tensors[0], b_grad=None)
+    output, _ = TransformerLayerSchedulePlan.run(
+        layers[0], None, f_input=input_tensors[0], b_grad=None
+    )
     output_tensors.append(output)
     torch.cuda.synchronize()
     # overlapped forward and backward
     for i in range(1, microbatches):
-        f_input, b_grad = LayerSchedulePlan.run(
+        f_input, b_grad = TransformerLayerSchedulePlan.run(
             layers[i], layers[i - 1], f_input=input_tensors[i], b_grad=torch.ones_like(output)
         )
         output_tensors.append(f_input)
         torch.cuda.synchronize()
     # backward for last microbatch
-    LayerSchedulePlan.run(None, layers[-1], f_input=None, b_grad=torch.ones_like(output))
+    TransformerLayerSchedulePlan.run(None, layers[-1], f_input=None, b_grad=torch.ones_like(output))
     torch.cuda.synchronize()
     capture = {"outputs": output_tensors}
     for name, param in model.named_parameters():

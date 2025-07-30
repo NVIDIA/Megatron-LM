@@ -559,12 +559,12 @@ class GPTModel(LanguageModule):
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
 
         Returns:
-            ModelChunkSchedulePlan: The model chunk schedule plan.
+            TransformerModelChunkSchedulePlan: The model chunk schedule plan.
         """
 
-        from .fine_grained_schedule import ModelChunkSchedulePlan
+        from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 
-        return ModelChunkSchedulePlan(
+        return TransformerModelChunkSchedulePlan(
             self,
             input_ids,
             position_ids,
