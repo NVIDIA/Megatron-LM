@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.hyper_comm_grid import HyperCommGrid
-
+import logging
 
 @dataclass
 class SendOp:
