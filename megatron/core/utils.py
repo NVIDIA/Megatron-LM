@@ -2001,9 +2001,6 @@ def unwrap_model(model, module_instances=None):
 
         module_instances = (DDP, torch_FSDP, custom_FSDP, Float16Module)
 
-    if isinstance(model, list):
-        return [unwrap_model(m, module_instances) for m in model]
-
     return_list = True
     if not isinstance(model, list):
         model = [model]
