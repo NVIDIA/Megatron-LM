@@ -784,7 +784,6 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
     # Optimizer stuff.
     if not args.no_save_optim:
         if optimizer is not None and not optimizer.is_stub_optimizer:
-            optimizer_sd = None
 
             if args.ckpt_format == "torch_dist":
                 optimizer_sd = optimizer.sharded_state_dict(state_dict, **(optim_sd_kwargs or {"metadata": {
@@ -1391,13 +1390,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     # Backward-compatibility with old checkpoints which don't have content versioning
                     # Can be removed after ending support for MLM optimizer checkpoints with MCore < v0.13
                     # (for MCore v0.13+ checkpoints `sharded_sd_metadata is not None`)
-                    if dp_cp_group is None:
-                        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
                     sharded_sd_metadata = {
                         'distrib_optim_sharding_type': ('fully_sharded_model_space'
                                                         if getattr(state_dict['args'], 'ckpt_fully_parallel_save', False)
                                                         else 'dp_zero_gather_scatter'),
-                        'dp_cp_group': dp_cp_group,
                     }
                 if ckpt_tp_pp != run_tp_pp and sharded_sd_metadata['distrib_optim_sharding_type'] != 'fully_sharded_model_space':
                     raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
@@ -1406,6 +1402,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         else:
             gen_sd_optim = None
             gen_sd_opt_param_scheduler = None
+
+        if dp_cp_group is None:
+            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        sharded_sd_metadata.update({"dp_cp_group": dp_cp_group})
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
