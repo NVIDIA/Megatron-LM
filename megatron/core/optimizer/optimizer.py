@@ -1096,6 +1096,15 @@ class ChainedOptimizer(MegatronOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
+        metadata = kwargs.get('metadata') or {}
+        should_add_prefix = True  # Backward-compatibility
+        if (
+            metadata.get('chained_optim_avoid_prefix', False)
+            # This condition should be True if a distributed optimizer isn't used
+            and metadata.get('distrib_optim_sharding_type') != 'dp_zero_gather_scatter'
+        ):
+            should_add_prefix = False
+
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].sharded_state_dict(
                 model_sharded_state_dict, is_loading, **kwargs
@@ -1106,7 +1115,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 optim_state_dict = optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
-                add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                if should_add_prefix:
+                    add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 
