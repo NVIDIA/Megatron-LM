@@ -51,15 +51,12 @@ def _create_transformer_block(hidden_size=4096, model_comm_pgs=None) -> Transfor
         context_parallel_size=cp_size,
     )
 
-    block = (
-        TransformerBlock(
-            transformer_config,
-            get_gpt_layer_with_transformer_engine_spec(),
-            model_comm_pgs=model_comm_pgs,
-        )
-        .cuda()
-        .bfloat16()
-    )
+    block = TransformerBlock(transformer_config, get_gpt_layer_with_transformer_engine_spec(), model_comm_pgs=model_comm_pgs).cuda().bfloat16()
+    with torch.no_grad():
+        for mod in block.modules():
+            if hasattr(mod, "bias") and mod.bias is not None:
+                print(f"zeroing bias")
+                mod.bias.zero_()
     return block
 
 
@@ -141,21 +138,9 @@ def _avg_params(module: torch.nn.Module, group: dist.ProcessGroup = None) -> Non
         dist.all_reduce(p.data, op=dist.ReduceOp.SUM, group=group or dist.group.WORLD)
         p.data.div_(world)
 
-
-def get_transformer_block_and_grid(
-    tp_size,
-    cp_size,
-    pp_size,
-    dp_size,
-    grid_offset: int = 0,
-    use_global_parallel_state: bool = False,
-    hidden_size: int = 4096,
-):
+def get_transformer_block_and_grid(tp_size, cp_size, pp_size, dp_size, ref_block, grid_offset: int = 0, use_global_parallel_state: bool = False, hidden_size: int = 4096):
     """Utility to build a ``TransformerBlock`` for tests."""
-    ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
-    ref_model_comm_pgs = get_model_comm_pgs_from_grid(ref_grid)
-    ref_block = _create_transformer_block(hidden_size, ref_model_comm_pgs)
-    _avg_params(ref_block, ref_grid.get_pg("dp"))
+    
     current_rank = dist.get_rank()
     if use_global_parallel_state:
         block = _create_transformer_block()
@@ -354,11 +339,16 @@ class TestBridgeCommunicator:
         ).bfloat16()
         current_rank = dist.get_rank()
 
+        ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
+        ref_model_comm_pgs = get_model_comm_pgs_from_grid(ref_grid)
+        ref_block = _create_transformer_block(hidden_size, ref_model_comm_pgs)
+        _avg_params(ref_block, ref_grid.get_pg("dp"))
+
         block_grid_1, grid_1 = get_transformer_block_and_grid(
-            grid1_tp, grid1_cp, grid1_pp, grid1_dp, grid_offset=0, hidden_size=hidden_size
+            grid1_tp, grid1_cp, grid1_pp, grid1_dp, ref_block, grid_offset=0, hidden_size=hidden_size
         )
         block_grid_2, grid_2 = get_transformer_block_and_grid(
-            grid2_tp, grid2_cp, grid2_pp, grid2_dp, grid_offset=4, hidden_size=hidden_size
+            grid2_tp, grid2_cp, grid2_pp, grid2_dp, ref_block, grid_offset=4, hidden_size=hidden_size
         )
 
         dist.barrier()
@@ -404,8 +394,8 @@ class TestBridgeCommunicator:
 
        
         
-        global_block_1, _ = get_transformer_block_and_grid(TestBridgeCommunicator.global_tp_size,TestBridgeCommunicator.global_cp_size,1,2, use_global_parallel_state=True)
-        global_block_2, _ = get_transformer_block_and_grid(TestBridgeCommunicator.global_tp_size,TestBridgeCommunicator.global_cp_size,1,2, use_global_parallel_state=True)
+        global_block_1, _ = get_transformer_block_and_grid(TestBridgeCommunicator.global_tp_size,TestBridgeCommunicator.global_cp_size,1,2, ref_block, use_global_parallel_state=True)
+        global_block_2, _ = get_transformer_block_and_grid(TestBridgeCommunicator.global_tp_size,TestBridgeCommunicator.global_cp_size,1,2, ref_block, use_global_parallel_state=True)
 
         print(f"rank {dist.get_rank()} ")
         if dist.get_rank() == 0 or dist.get_rank() == 3:
@@ -475,6 +465,8 @@ class TestBridgeCommunicator:
 
         _print_tp_full_weight(block1.layers[0].mlp.linear_fc1, model_comm_pgs_block1.tp)
         _print_tp_full_weight(block2.layers[0].mlp.linear_fc1, model_comm_pgs.tp)
+
+        torch.testing.assert_close(output_grid_1, output_grid_2, rtol=1e-3, atol=1e-3)
 
 
         
