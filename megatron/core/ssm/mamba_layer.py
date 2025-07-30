@@ -131,10 +131,6 @@ class MambaLayer(MegatronModule):
 
         return hidden_states
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """Allocate the inference cache."""
-        return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
-
     def __call__(self, *args, **kwargs):
 
         # Training and validation mode CUDA graphs

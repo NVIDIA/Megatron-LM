@@ -12,9 +12,7 @@ from torch import Tensor
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-    get_layer_maps_from_hybrid_override_pattern,
-)
+from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
@@ -128,6 +126,25 @@ class DynamicInferenceContext(BaseInferenceContext):
             where the cuda graph batch sizes range from 1 to `max_requests` (as
             computed below). Due to rounding, the actual number of cuda graphs may
             not equal this argument.
+        materialize_only_last_token_logits (Optional[bool]): Whether to only
+            materialize logits for the last token. This should be set to False
+            if returning log probs.
+        is_hybrid_model (Optional[bool]): Whether the model is a hybrid model with
+            Mamba layers.
+        layer_type_list (Optional[List[str]]): A list of strings that indicates
+            the layer type (Mamba / Attention / MLP) for each layer.
+            See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list
+            of symbols. This must be provided for hybrid models.
+        mamba_head_dim: (Optional[int]): Head dimension for Mamba layers.
+            This must be provided for hybrid models.
+        mamba_num_groups (Optional[int]): Number of groups for Mamba layers.
+            This must be provided for hybrid models.
+        mamba_d_model (Optional[int]): The model hidden size.
+            This must be provided for hybrid models.
+        mamba_d_conv (Optional[int]): Convolution dimension for Mamba layers.
+            This must be provided for hybrid models.
+        mamba_d_state (Optional[int]): State dimension for Mamba layers.
+            This must be provided for hybrid models.
     """
 
     def __init__(
@@ -146,14 +163,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
         num_cuda_graphs: Optional[int] = None,
-        materialize_only_last_token_logits: bool = True,
-        is_hybrid_model: bool = False,
-        hybrid_override_pattern: str = None,
-        mamba_head_dim: int = None,
-        mamba_num_groups: int = None,
-        mamba_d_model: int = None,
-        mamba_d_conv: int = None,
-        mamba_d_state: int = None,
+        materialize_only_last_token_logits: Optional[bool] = True,
+        is_hybrid_model: Optional[bool] = False,
+        layer_type_list: Optional[List[str]] = None,
+        mamba_head_dim: Optional[int] = None,
+        mamba_num_groups: Optional[int] = None,
+        mamba_d_model: Optional[int] = None,
+        mamba_d_conv: Optional[int] = None,
+        mamba_d_state: Optional[int] = None,
     ):
 
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
@@ -179,8 +196,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert mamba_d_conv is not None, "`mamba_d_conv` must be specified for hybrid models"
             assert mamba_d_state is not None, "`mamba_d_state` must be specified for hybrid models"
             assert (
-                hybrid_override_pattern is not None
-            ), "`hybrid_override_pattern must be specified for hybrid models"
+                layer_type_list is not None
+            ), "`layer_type_list must be specified for hybrid models"
 
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (
                 self._mamba_state_size_per_layer_per_request(
@@ -196,8 +213,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
-            attention_layer_map, mamba_layer_map, _ = get_layer_maps_from_hybrid_override_pattern(
-                hybrid_override_pattern
+            attention_layer_map, mamba_layer_map, _ = get_layer_maps_from_layer_type_list(
+                layer_type_list
             )
             self.num_attention_layers = len(attention_layer_map)
             self.num_mamba_layers = len(mamba_layer_map)
@@ -235,6 +252,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Compute max_requets, max_tokens from buffer size, overflow factor, and Mamba state size.
         def bytes_to_max_requests_and_tokens(n_bytes):
+            # Leave room for a buffer request in the case of padding
+            n_bytes = max(0, n_bytes - mamba_states_memory_per_request)
             bytes_per_token = self.chunk_size_bytes // self.chunk_size_tokens
             cost_per_request_bytes = (
                 mamba_states_memory_per_request + max_sequence_length * bytes_per_token
@@ -302,7 +321,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Calculate the total number of chunks available in the buffer
         total_mamba_states_memory = mamba_states_memory_per_request * self.max_requests
-        chunk_count_total = (buffer_size_bytes - total_mamba_states_memory) // self.chunk_size_bytes
+        chunk_count_total = (
+            max(0, buffer_size_bytes - total_mamba_states_memory) // self.chunk_size_bytes
+        )
 
         # Memory buffer.
         self.memory_buffer = torch.full(
@@ -411,14 +432,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Optional state tensors for hybrid models
+        # We allocate for an additional buffer request in the event of padding
         if self.is_hybrid_model:
             self.mamba_conv_states = torch.zeros(
-                (self.num_mamba_layers, self.max_requests) + mamba_conv_states_shape,
+                (self.num_mamba_layers, self.max_requests + 1) + mamba_conv_states_shape,
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
             self.mamba_ssm_states = torch.zeros(
-                (self.num_mamba_layers, self.max_requests) + mamba_ssm_states_shape,
+                (self.num_mamba_layers, self.max_requests + 1) + mamba_ssm_states_shape,
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
@@ -1013,7 +1035,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _move_mamba_state_tensors(self, src_idxs, dst_idxs):
         if self.is_hybrid_model:
             self.mamba_conv_states[:, dst_idxs] = self.mamba_conv_states[:, src_idxs]
-            self.mamba_ssm_states[:, dst_idxs] = self.mabma_ssm_states[:, src_idxs]
+            self.mamba_ssm_states[:, dst_idxs] = self.mamba_ssm_states[:, src_idxs]
 
     # TODO: see if we can compile this function
     def update_requests(self, active_requests_mask: Tensor, new_tokens: Tensor) -> None:
@@ -1117,8 +1139,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset the Mamba states for finished requests.
             if self.is_hybrid_model:
-                self.mamba_conv_states[finished_idxs].fill_(0)
-                self.mamba_ssm_states[finished_idxs].fill_(0)
+                self.mamba_conv_states[:, finished_idxs].fill_(0)
+                self.mamba_ssm_states[:, finished_idxs].fill_(0)
 
             if active_request_count > 0:
                 finished_idxs_on_left = (

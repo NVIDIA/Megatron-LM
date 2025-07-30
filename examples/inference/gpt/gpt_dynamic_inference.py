@@ -90,7 +90,11 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context(requests: List[Request], sampling_params: SamplingParams):
+def get_inference_context(
+    requests: List[Request],
+    sampling_params: SamplingParams,
+    layer_type_list: Optional[List[str]] = None,
+):
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
@@ -109,7 +113,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
         max_sequence_length=max_sequence_length,
-        num_cuda_graphs=args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None,
+        num_cuda_graphs=(
+            args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
+        ),
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
@@ -119,12 +125,12 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
         is_hybrid_model=args.is_hybrid_model,
+        layer_type_list=layer_type_list,
         mamba_head_dim=args.mamba_head_dim,
         mamba_num_groups=args.mamba_num_groups,
         mamba_d_model=args.hidden_size,
-        mamba_d_conv=4, # Assume this is hardcoded
+        mamba_d_conv=4,
         mamba_d_state=args.mamba_state_dim,
-        hybrid_override_pattern=args.hybrid_override_pattern,
     )
 
     return context
@@ -270,10 +276,14 @@ def main():
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
 
-    # Requests, context, conroller.
     model = get_model()
+
+    # Layer type list for hybrid models
+    layer_type_list = getattr(model.decoder, "layer_type_list", None)
+
+    # Requests, context, controller.
     requests = build_requests(args, tokenizer)
-    context = get_inference_context(requests, sampling_params)
+    context = get_inference_context(requests, sampling_params, layer_type_list=layer_type_list)
     controller = get_inference_controller(model, context)
 
     # Inference engine.
@@ -292,7 +302,9 @@ def main():
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times, total_output_tokens = run_inference(requests, sampling_params, engine)
+    step_times, add_times, output_times, total_output_tokens = run_inference(
+        requests, sampling_params, engine
+    )
     torch.cuda.synchronize()
     total_time = get_curr_time() - t
 

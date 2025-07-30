@@ -32,6 +32,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
@@ -82,6 +84,8 @@ class DynamicEngineTestConfig:
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
+
+    model_provider: str = "gpt"
 
     def __post_init__(self):
 
@@ -143,6 +147,7 @@ class TestDynamicInferenceEngine:
         test_config: DynamicEngineTestConfig,
         transformer_config: TransformerConfig,
         requests: List[Request],
+        layer_type_list: Optional[List[str]],
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -165,6 +170,13 @@ class TestDynamicInferenceEngine:
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
+            is_hybrid_model=(test_config.model_provider == "mamba"),
+            layer_type_list=layer_type_list,
+            mamba_head_dim=transformer_config.mamba_head_dim,
+            mamba_num_groups=transformer_config.mamba_num_groups,
+            mamba_d_model=transformer_config.hidden_size,
+            mamba_d_conv=4,
+            mamba_d_state=transformer_config.mamba_state_dim,
         )
 
         return context
@@ -191,18 +203,6 @@ class TestDynamicInferenceEngine:
             force_reset_rng=True,
         )
 
-        # Transformer config.
-        transformer_config = TransformerConfig(
-            params_dtype=torch.bfloat16,
-            num_layers=4,
-            hidden_size=32,
-            num_attention_heads=4,
-            use_cpu_initialization=True,
-            enable_cuda_graph=test_config.num_cuda_graphs is not None,
-            inference_rng_tracker=True,
-            tensor_model_parallel_size=test_config.tensor_model_parallel_size,
-        )
-
         # Requests.
         requests = cls._build_requests(
             num_requests=test_config.num_requests,
@@ -215,19 +215,60 @@ class TestDynamicInferenceEngine:
         # Sampling params.
         sampling_params = SamplingParams(num_tokens_to_generate=test_config.max_output_length)
 
-        # GPT model.
-        model = GPTModel(
-            config=transformer_config,
-            transformer_layer_spec=get_gpt_layer_local_spec(),
-            vocab_size=vocab_size,
-            max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
-            parallel_output=True,
-        ).cuda()
+        if test_config.model_provider == "gpt":
+            # Transformer config.
+            transformer_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=4,
+                hidden_size=32,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                enable_cuda_graph=test_config.num_cuda_graphs is not None,
+                inference_rng_tracker=True,
+                tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+            )
+
+            # GPT model.
+            model = GPTModel(
+                config=transformer_config,
+                transformer_layer_spec=get_gpt_layer_local_spec(),
+                vocab_size=vocab_size,
+                max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
+                parallel_output=True,
+            ).cuda()
+        elif test_config.model_provider == "mamba":
+            # Transformer config.
+            transformer_config = TransformerConfig(
+                params_dtype=torch.bfloat16,
+                num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
+                hidden_size=256,  # The Mamba layer places several constraints on this
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                enable_cuda_graph=test_config.num_cuda_graphs is not None,
+                inference_rng_tracker=True,
+                tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+            )
+
+            # Mamba model.
+            model = MambaModel(
+                config=transformer_config,
+                mamba_stack_spec=mamba_stack_spec,
+                vocab_size=vocab_size,
+                max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
+                parallel_output=True,
+                hybrid_attention_ratio=0.3,
+                hybrid_mlp_ratio=0.3,
+            ).cuda()
+        else:
+            raise ValueError(f"Invalid model provider {test_config.model_provider}")
 
         for param in model.parameters():
             param.data = param.data.to(transformer_config.params_dtype)
 
         model.eval()
+
+        # Layer type list for hybrid models
+        layer_type_list = getattr(model.decoder, "layer_type_list", None)
 
         # Inference config.
         inference_config = InferenceWrapperConfig(
@@ -240,7 +281,10 @@ class TestDynamicInferenceEngine:
 
         # Inference context.
         inference_context = cls._build_inference_context(
-            test_config=test_config, transformer_config=transformer_config, requests=requests
+            test_config=test_config,
+            transformer_config=transformer_config,
+            requests=requests,
+            layer_type_list=layer_type_list,
         )
 
         # Inference model wrapper.
@@ -348,18 +392,19 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_simple(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_simple(self, model_provider: str) -> None:
         """Simple test that runs without errors, and validates output."""
 
         # Run test.
-        env = self._run_test()
+        env = self._run_test(model_provider=model_provider)
 
         # Validate max_requests, max_tokens.
         assert env.engine.context.max_requests == 8
         assert env.engine.context.max_tokens == 160
 
         # Validate output tokens.
-        expected_outputs = [
+        gpt_expected_outputs = [
             [69, 85, 55, 74, 85, 89],
             [29, 54, 33, 30, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98],
             [35, 78, 64, 59, 55, 67, 15, 58, 6, 37],
@@ -370,6 +415,24 @@ class TestDynamicInferenceEngine:
             [93, 24, 77, 11, 25, 7, 92, 97, 27, 56, 82],
         ]
 
+        mamba_expected_outputs = [
+            [89, 64, 59, 55, 67, 15],
+            [76, 41, 46, 82, 83, 94, 2, 61, 6, 98, 76, 97, 36, 37, 99],
+            [98, 22, 53, 6, 37, 87, 47, 22, 1, 87],
+            [17, 60, 0, 1, 76, 77, 11, 25, 18, 92],
+            [17, 71, 15, 70, 64, 40, 0, 64, 45, 57, 81, 35],
+            [16, 20, 26, 89, 20, 49, 28, 34, 81, 50, 53, 46, 58, 77],
+            [6, 54, 30, 36, 26, 27, 56, 82, 32, 8],
+            [89, 55, 97, 42, 80, 3, 83, 51, 20, 20, 43],
+        ]
+
+        if model_provider == "gpt":
+            expected_outputs = gpt_expected_outputs
+        elif model_provider == "mamba":
+            expected_outputs = mamba_expected_outputs
+        else:
+            raise ValueError(f"Invalid model_provider {model_provider}")
+
         assert len(env.requests) == len(expected_outputs)
         for request, expected_output in zip(env.requests, expected_outputs):
             assert request.output == expected_output
@@ -378,33 +441,43 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_overflow_factor(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_overflow_factor(self, model_provider: str) -> None:
         """Test overflow factor arg."""
         # Run test.
         env = self._run_test(
             context_buffer_overflow_factor=0.1,
             context_max_requests_override=None,
             context_max_tokens_override=None,
+            model_provider=model_provider,
         )
 
         # Validate max_requests, max_tokens.
-        assert env.engine.context.max_requests == 420
-        assert env.engine.context.max_tokens == 420
+        if model_provider == "gpt":
+            assert env.engine.context.max_requests == 420
+            assert env.engine.context.max_tokens == 420
+        elif model_provider == "mamba":
+            assert env.engine.context.max_requests == 24
+            assert env.engine.context.max_tokens == 24
 
     @pytest.mark.experimental
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_request_overflow(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_request_overflow(self, model_provider: str) -> None:
         """Test request overflow."""
-        self._run_test(context_max_requests_override=1)
+        self._run_test(context_max_requests_override=1, model_provider=model_provider)
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_token_overflow(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_token_overflow(self, model_provider: str) -> None:
         """Test token overflow."""
-        test_config = DynamicEngineTestConfig(context_max_tokens_override=8)
+        test_config = DynamicEngineTestConfig(
+            context_max_tokens_override=8, model_provider=model_provider
+        )
         env = self._build_test_env(test_config)
         env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
         assert list(env.engine.waiting_request_ids) == [0]
@@ -412,13 +485,16 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_chunk_overflow(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_chunk_overflow(self, model_provider: str) -> None:
         """Test token overflow."""
-        env = self._build_test_env(DynamicEngineTestConfig())
+        env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
         chunk_size_bytes = context.chunk_size_bytes
         buffer_size_gb = (chunk_size_bytes + 1) / 1024**3
-        test_config = DynamicEngineTestConfig(context_buffer_size_gb=buffer_size_gb)
+        test_config = DynamicEngineTestConfig(
+            context_buffer_size_gb=buffer_size_gb, model_provider=model_provider
+        )
         env = self._build_test_env(test_config)
         env.engine.add_request(0, env.requests[0].prompt, env.requests[0].num_tokens_to_generate)
         assert list(env.engine.waiting_request_ids) == [0]
@@ -426,18 +502,24 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_multi_add(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
-        self._run_test(num_gap_steps=0)
+        self._run_test(num_gap_steps=0, model_provider=model_provider)
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_fixed_output_lengths(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_fixed_output_lengths(self, model_provider: str) -> None:
         """Test generating a fixed number of output tokens."""
-        self._run_test(use_fixed_output_lengths=True)
+        self._run_test(use_fixed_output_lengths=True, model_provider=model_provider)
 
-    def test_cuda_graph_request_counts(self) -> None:
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_cuda_graph_request_counts(self, model_provider: str) -> None:
         """Test initialization of `cuda_graph_request_counts` in dynamic context."""
 
         # Test num_cuda_graphs.
@@ -452,7 +534,9 @@ class TestDynamicInferenceEngine:
             (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
         ]:
             env = self._build_test_env(
-                DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
+                DynamicEngineTestConfig(
+                    num_requests=64, num_cuda_graphs=num_cuda_graphs, model_provider=model_provider
+                )
             )
             actual_cuda_graph_request_counts = env.engine.context.cuda_graph_request_counts
             assert (
@@ -463,11 +547,19 @@ class TestDynamicInferenceEngine:
                 actual_cuda_graph_request_counts,
             )
 
-    def test_cuda_graph_warmup(self) -> None:
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_cuda_graph_warmup(self, model_provider: str) -> None:
         """Test initialization during cuda graph warmup."""
 
         # Initialize context.
-        env = self._build_test_env(DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8))
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=32, num_cuda_graphs=8, model_provider=model_provider
+            )
+        )
 
         context = env.engine.context
         assert context.is_decode_only()
@@ -526,11 +618,12 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_generate_function(self) -> None:
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_generate_function(self, model_provider: str) -> None:
         """Test the generate function that processes multiple prompts at once."""
         # Set up test environment
         test_config = DynamicEngineTestConfig(
-            num_requests=4, max_prompt_length=8, max_output_length=4
+            num_requests=4, max_prompt_length=8, max_output_length=4, model_provider=model_provider
         )
         env = self._build_test_env(test_config)
 
@@ -563,13 +656,16 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    async def test_run_engine(self):
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    async def test_run_engine(self, model_provider: str):
         """
         Test asynchronously adding and waiting for requests while the engine is
         running continuously.
         """
         # Test environment.
-        test_config = DynamicEngineTestConfig(use_fixed_output_lengths=True)
+        test_config = DynamicEngineTestConfig(
+            use_fixed_output_lengths=True, model_provider=model_provider
+        )
         env = self._build_test_env(test_config)
 
         engine_task = asyncio.create_task(

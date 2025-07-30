@@ -147,7 +147,7 @@ class MambaStack(MegatronModule):
         self.hybrid_mlp_ratio = hybrid_mlp_ratio
         self.hybrid_override_pattern = hybrid_override_pattern
 
-        layer_type_list = allocate_layers(
+        self.layer_type_list = allocate_layers(
             self.config.num_layers,
             self.hybrid_attention_ratio,
             self.hybrid_mlp_ratio,
@@ -156,12 +156,12 @@ class MambaStack(MegatronModule):
 
         pp_layer_offset = 0
         if self.pp_group.size() > 1:
-            pp_layer_offset, layer_type_list = self._select_layers_for_pipeline_parallel(
-                layer_type_list
+            pp_layer_offset, self.layer_type_list = self._select_layers_for_pipeline_parallel(
+                self.layer_type_list
             )
 
         self.layers = nn.ModuleList()
-        for i, layer_type in enumerate(layer_type_list):
+        for i, layer_type in enumerate(self.layer_type_list):
             fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
             with fp8_init_context:
                 if layer_type == LayerSymbols.MAMBA:
@@ -223,22 +223,6 @@ class MambaStack(MegatronModule):
         selected_list = layer_type_list[offset : offset + num_layers_per_pipeline_rank]
 
         return offset, selected_list
-
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """
-        Allocate inference cache for each layer.
-
-        Args:
-            batch_size (int): The batch size to use for inference.
-            max_seqlen (int): The maximum sequence length to use
-                for inference.
-            dtype (optional): The data type to use for allocation.
-                Defaults to the data type of the model.
-        """
-        return {
-            i: layer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
-            for i, layer in enumerate(self.layers)
-        }
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -319,7 +303,7 @@ class MambaStack(MegatronModule):
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         with outer_fp8_context:
-            for l_no, layer in enumerate(self.layers):
+            for layer in self.layers:
                 inner_fp8_context = (
                     get_fp8_context(self.config, layer.layer_number - 1)
                     if use_inner_fp8_context

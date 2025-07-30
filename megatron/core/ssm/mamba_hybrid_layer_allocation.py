@@ -2,7 +2,7 @@
 
 import logging
 from itertools import count
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 if __name__ != "__main__":
     from megatron.core.utils import log_single_rank
@@ -162,20 +162,17 @@ def allocate_layers(
     return layer_type_list
 
 
-def get_layer_maps_from_hybrid_override_pattern(
-    hybrid_override_pattern: str,
+def get_layer_maps_from_layer_type_list(
+    layer_type_list: List[str],
 ) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each layer type in [Attention, Mamba, MLP] given a hybrid override
-    pattern string.
+    for each layer type in [Attention, Mamba, MLP] given a layer type list.
     """
     layer_maps = []
     for symbol in [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP]:
         counter = count()
-        layer_map = {
-            i: next(counter) for i, ch in enumerate(hybrid_override_pattern) if ch == symbol
-        }
+        layer_map = {i: next(counter) for i, ch in enumerate(layer_type_list) if ch == symbol}
         layer_maps.append(layer_map)
     return layer_maps
 

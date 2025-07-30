@@ -395,11 +395,16 @@ class MambaMixer(MegatronModule):
 
         if inference_context is not None and inference_context.is_dynamic_batching():
             seq_idx = inference_context.seq_idx()
-            seqlens = inference_context.get_active_sequence_lengths()
             cu_seqlens, _ = inference_context.cu_query_lengths()
-            if cu_seqlens is not None:
+            if (
+                cu_seqlens is not None
+                and inference_context.padded_active_token_count
+                > inference_context.active_token_count
+            ):
                 # Add the total sequence length to cu_seqlens
-                cu_seqlens = torch.cat((cu_seqlens, cu_seqlens.new_tensor([hidden_states.shape[0]])))
+                cu_seqlens = torch.cat(
+                    (cu_seqlens, cu_seqlens.new_tensor([hidden_states.shape[0]]))
+                )
             return_varlen_states = True
         else:
             seq_idx = None
@@ -417,7 +422,8 @@ class MambaMixer(MegatronModule):
             ) or (inference_context.is_dynamic_batching() and inference_context.is_decode_only()):
                 # The states are updated inplace
                 if inference_context.is_dynamic_batching():
-                    # Make batch dimension first and sequence dimension second (batch size will be 1)
+                    # Make batch dimension first and sequence dimension second
+                    # (batch size will be 1)
                     hidden_states = rearrange(hidden_states, "l b d -> b l d").contiguous()
                 out, out_bias, _, _ = self.step(
                     hidden_states,
@@ -494,6 +500,8 @@ class MambaMixer(MegatronModule):
                     conv_varlen_states = causal_conv1d_varlen_states(
                         xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
                     )
+                    if conv_varlen_states.shape != conv_state.shape:
+                        torch.distributed.breakpoint(0)
                     conv_state.copy_(conv_varlen_states)
 
                     # transpose: b l pd --> b pd l
@@ -739,27 +747,6 @@ class MambaMixer(MegatronModule):
         # b pd --> b d
         out, out_bias = self.out_proj(y)
         return out.unsqueeze(0), out_bias, conv_state, ssm_state
-
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """
-        allocate inference cache
-        """
-        device = self.out_proj.weight.device
-        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
-        conv_state = torch.zeros(
-            batch_size, self.conv1d.weight.shape[0], self.d_conv, device=device, dtype=conv_dtype
-        )
-        ssm_dtype = self.in_proj.weight.dtype if dtype is None else dtype
-        # ssm_dtype = torch.float32
-        ssm_state = torch.zeros(
-            batch_size,
-            self.nheads_local_tp,
-            self.headdim,
-            self.d_state,
-            device=device,
-            dtype=ssm_dtype,
-        )
-        return conv_state, ssm_state
 
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.
