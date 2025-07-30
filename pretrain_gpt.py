@@ -176,7 +176,6 @@ def model_provider(
             mtp_block_spec = get_gpt_mtp_block_spec(
                 config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
             )
-
         model = GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
