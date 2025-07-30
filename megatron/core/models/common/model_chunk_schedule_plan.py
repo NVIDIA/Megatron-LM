@@ -9,13 +9,6 @@ from torch import Tensor
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.models.gpt.fine_grained_callables import (
-    PostProcessNode,
-    PreProcessNode,
-    TransformerLayerNode,
-    TransformerLayerState,
-    build_layer_callables,
-)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -34,13 +27,13 @@ class ModelChunkState:
     pass
 
 
-class LayerSchedulePlan:
+class TransformerLayerSchedulePlan:
     """Schedule the executing plan of the nodes in a transformer layer.
 
     This class organizes the computation nodes for a transformer layer,
     including attention, post attention, MLP, dispatch, and combine nodes.
 
-    layer (LayerSchedulePlan)
+    layer (TransformerLayerSchedulePlan)
     ├── attn (TransformerLayerNode): attention module
     ├── post_attn (TransformerLayerNode): layernorm -> router -> dispatch preprocess
     ├── moe_dispatch (TransformerLayerNode): dispatch All2All
@@ -67,9 +60,13 @@ class LayerSchedulePlan:
             com_stream (torch.cuda.Stream): CUDA stream for communication.
             extra_args (dict): extra arguments for the layer.
 
-        The event and chunk_state are binded to the ModelChunkSchedulePlan
+        The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
         and shared across all layers in the model chunk.
         """
+        from megatron.core.models.gpt.fine_grained_callables import (
+            TransformerLayerState,
+        )
+
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
@@ -85,6 +82,10 @@ class LayerSchedulePlan:
         Builds the callable nodes for the transformer/mtp layer:
             attn, post_attn, mlp, moe_dispatch and moe_combine.
         """
+        from megatron.core.models.gpt.fine_grained_callables import (
+            TransformerLayerNode,
+            build_layer_callables,
+        )
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
         # build the forward and backward callables for the transformer/mtp layer
@@ -218,17 +219,17 @@ class LayerSchedulePlan:
         return f_input, b_grad
 
 
-class ModelChunkSchedulePlan(AbstractSchedulePlan):
+class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     """Schedule the executing plan of the sub-modules in a model chunk sub-modules.
 
     This class organizes the computation nodes for a model chunk,
     including preprocessing, transformer layers, and postprocessing.
 
-    ModelChunkSchedulePlan
+    TransformerModelChunkSchedulePlan
     ├── pre_process: PreProcessNode
-    ├── layers: List[LayerSchedulePlan]
-    │   ├── layer[0]: LayerSchedulePlan
-    │   ├── layer[1]: LayerSchedulePlan
+    ├── layers: List[TransformerLayerSchedulePlan]
+    │   ├── layer[0]: TransformerLayerSchedulePlan
+    │   ├── layer[1]: TransformerLayerSchedulePlan
     │   └── ...
     └── post_process: PostProcessNode
     """
@@ -266,6 +267,11 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
+        from megatron.core.models.gpt.fine_grained_callables import (
+            PostProcessNode,
+            PreProcessNode,
+        )
+
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
         self._event = torch.cuda.Event()
@@ -292,7 +298,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         # build layer schedule plan for each layer
         for layer_idx in range(transformer_num_layers):
             layer = model.decoder._get_layer(layer_idx)
-            layer_plan = LayerSchedulePlan(
+            layer_plan = TransformerLayerSchedulePlan(
                 layer, self._event, self._model_chunk_state, comp_stream, com_stream
             )
             self._transformer_layers.append(layer_plan)
@@ -383,8 +389,8 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
         Phase 6: backward_dw of the first layer -> forward_postprocess -> backward_preprocess
 
         Args:
-            f_schedule_plan (ModelChunkSchedulePlan): The forward schedule plan
-            b_schedule_plan (ModelChunkSchedulePlan): The backward schedule plan
+            f_schedule_plan (TransformerModelChunkSchedulePlan): The forward schedule plan
+            b_schedule_plan (TransformerModelChunkSchedulePlan): The backward schedule plan
             b_grad (Tensor or None): The gradient of the loss function
             f_context (VppContextManager or None): The VppContextManager for the forward pass
             b_context (VppContextManager or None): The VppContextManager for the backward pass
@@ -428,7 +434,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_num_layers - 1 - i}b")
-            f_input, b_grad = LayerSchedulePlan.run(
+            f_input, b_grad = TransformerLayerSchedulePlan.run(
                 f_layer,
                 b_layer,
                 f_input=f_input,
@@ -444,7 +450,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
             for i in range(overlaped_layers, b_num_layers):
                 b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
                 torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
-                _, b_grad = LayerSchedulePlan.run(
+                _, b_grad = TransformerLayerSchedulePlan.run(
                     None, b_layer, b_grad=b_grad, is_last_layer_in_bwd=(i == b_num_layers - 1)
                 )
                 torch.cuda.nvtx.range_pop()
@@ -454,7 +460,7 @@ class ModelChunkSchedulePlan(AbstractSchedulePlan):
             for i in range(overlaped_layers, f_num_layers):
                 f_layer = f_schedule_plan.get_layer(i)
                 torch.cuda.nvtx.range_push(f"layer_{i}f")
-                f_input, _ = LayerSchedulePlan.run(f_layer, None, f_input=f_input)
+                f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
                 torch.cuda.nvtx.range_pop()
 
         if f_schedule_plan is not None and post_forward is not None:

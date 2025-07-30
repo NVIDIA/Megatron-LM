@@ -272,7 +272,7 @@ def combined_forward_backward_step(
     b_grad = b_output_tensor_grad[0] if b_model else None
     # combined forward and backward model chunk execution of two micro-batches
     with context_manager and outer_fp8_context:  # autocast context and delayed fp8 context
-        # For GPT models, it calls fine_grained_schedule.py::ModelChunkSchedulePlan.run(),
+        # For GPT models, it calls common::TransformerModelChunkSchedulePlan.run(),
         output_tensor = type(f_schedule_plan or b_schedule_plan).run(
             f_schedule_plan,
             b_schedule_plan,
