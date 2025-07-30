@@ -226,6 +226,7 @@ class TransformerLayerNode(ScheduleNode):
         is_moe = extra_args.get("is_moe", False)
         enable_deepep = extra_args.get("enable_deepep", False)
         free_input = should_free_input(name, is_moe, enable_deepep)
+        self.delay_wgrad_compute = extra_args.get("delay_wgrad_compute", False)
 
         super().__init__(
             weak_method(self.forward_impl),
@@ -271,6 +272,8 @@ class TransformerLayerNode(ScheduleNode):
 
     def backward_dw(self):
         """Computes the weight gradients for the transformer layer node."""
+        if not self.delay_wgrad_compute:
+            return
         with torch.cuda.nvtx.range(f"{self.name} wgrad"):
             for module in self.bwd_dw_callables:
                 module.backward_dw()

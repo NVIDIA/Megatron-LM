@@ -8,17 +8,7 @@ import torch
 from torch.autograd import Variable
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
-from megatron.core.transformer.module import Float16Module
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
-
-try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
-except ImportError:
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
 
 
 def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
@@ -93,7 +83,7 @@ def stream_acquire_context(stream, event):
         event.record(stream)
 
 
-class FakeScheduleNode:
+class NoopScheduleNode:
     """A placeholder node in the computation graph that simply passes through inputs and outputs.
 
     This class is used as a no-op node in the scheduling system when a real computation node
@@ -319,24 +309,3 @@ class VppContextManager:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)
-
-
-def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
-    """Unwrap_model to return the final model instance"""
-    from megatron.core.models.gpt.gpt_model import GPTModel
-
-    return_list = True
-    if not isinstance(model, list):
-        model = [model]
-        return_list = False
-    unwrapped_model = []
-    for model_module in model:
-        while isinstance(model_module, module_instances):
-            model_module = model_module.module
-        assert isinstance(
-            model_module, GPTModel
-        ), "The final unwrapped model must be a GPTModel instance"
-        unwrapped_model.append(model_module)
-    if not return_list:
-        return unwrapped_model[0]
-    return unwrapped_model

@@ -18,7 +18,7 @@ from megatron.core.models.gpt.fine_grained_callables import (
 )
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
-    FakeScheduleNode,
+    NoopScheduleNode,
     get_com_stream,
     get_comp_stream,
 )
@@ -95,6 +95,7 @@ class LayerSchedulePlan:
         enable_deepep = self.layer.config.moe_enable_deepep
         extra_args["enable_deepep"] = enable_deepep
         extra_args["is_moe"] = is_moe
+        extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
 
         # wrapper to help create TransformerLayerNode
         def create_node(stream, module, name):
@@ -123,9 +124,9 @@ class LayerSchedulePlan:
             self.moe_dispatch = create_node(com_stream, moe_dispatch_module, "moe_dispatch")
             self.moe_combine = create_node(com_stream, moe_combine_module, "moe_combine")
         else:
-            self.post_attn = FakeScheduleNode()
-            self.moe_dispatch = FakeScheduleNode()
-            self.moe_combine = FakeScheduleNode()
+            self.post_attn = NoopScheduleNode()
+            self.moe_dispatch = NoopScheduleNode()
+            self.moe_combine = NoopScheduleNode()
 
     def get_fp8_context(self):
         """
