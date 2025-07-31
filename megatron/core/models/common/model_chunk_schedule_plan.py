@@ -63,9 +63,7 @@ class TransformerLayerSchedulePlan:
         The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
         and shared across all layers in the model chunk.
         """
-        from megatron.core.models.gpt.fine_grained_callables import (
-            TransformerLayerState,
-        )
+        from megatron.core.models.gpt.fine_grained_callables import TransformerLayerState
 
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
@@ -159,9 +157,9 @@ class TransformerLayerSchedulePlan:
         (dispatch or combine) of one with the computations (att or mlp) of the other
         to maximize parallelism and efficiency.
 
-        When f_layer and b_layer are both not None, the forward and backward pass are overlapped as follows:
-        comm_stream:    moe_combine_bwd         | moe_dispatch_fwd -> moe_dispatch_bwd | moe_combine_fwd
-        compute_stream: attn_fwd->post_attn_fwd | mlp_bwd -> mlp_bwd_dw -> mlp_fwd     | post_attn_bwd->attn_bwd
+        When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
+        comm_stream: combine_bwd            | dispatch_fwd->dispatch_bwd  | combine_fwd
+        comp_stream: attn_fwd->post_attn_fwd| mlp_bwd->mlp_bwd_dw->mlp_fwd| post_attn_bwd->attn_bwd
 
         Args:
             f_layer (TransformerLayerSchedulePlan): Forward layer (for current microbatch)
@@ -271,10 +269,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
-        from megatron.core.models.gpt.fine_grained_callables import (
-            PostProcessNode,
-            PreProcessNode,
-        )
+        from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
 
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
