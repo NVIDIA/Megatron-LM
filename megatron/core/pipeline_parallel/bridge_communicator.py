@@ -13,18 +13,13 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 @dataclass
 class SendOp:
     """Describes a single send operation for a single rank."""
-
     destination_rank: int
-    batch_slice: slice
-    send_shape: Tuple[int, ...]
 
 
 @dataclass
 class RecvOp:
     """Describes a single receive operation for a single rank."""
-
     source_rank: int
-    recv_shape: Tuple[int, ...]
 
 
 @dataclass
@@ -32,7 +27,6 @@ class RankCommInfo:
     """Explicit communication plan for a single rank."""
 
     role: Literal['SENDER', 'RECEIVER', 'NOOP'] = 'NOOP'
-
     sends: List[SendOp] = field(default_factory=list)
     receives: List[RecvOp] = field(default_factory=list)
 
@@ -52,7 +46,6 @@ class BridgeCommunicator:
         src_grid: HyperCommGrid,
         dest_grid: HyperCommGrid,
         dim_mapping: Optional[Dict[str, int]] = None,
-        requires_scatter_gather: bool = True,
     ):
         """Initialize the bridge communicator between source and destination grids.
 
@@ -64,7 +57,6 @@ class BridgeCommunicator:
         self.src_grid = src_grid
         self.dest_grid = dest_grid
         self.current_rank = dist.get_rank()
-        self.requires_scatter_gather = requires_scatter_gather
         self.comm_map: Dict[int, RankCommInfo] = {}
         if dim_mapping is None:
             self.dim_mapping = {'s': 1, 'b': 0, 'h': 2}
@@ -225,11 +217,7 @@ class BridgeCommunicator:
                     self.comm_map[src_rank] = RankCommInfo(
                         role='SENDER',
                         sends=[
-                            SendOp(
-                                destination_rank=dest_rank,
-                                batch_slice=slice(None),
-                                send_shape=(1,),  # placeholder
-                            )
+                            SendOp(destination_rank=dest_rank)
                         ],
                     )
 
@@ -237,7 +225,7 @@ class BridgeCommunicator:
                 self.comm_map[dest_rank] = RankCommInfo(
                     role='RECEIVER',
                     receives=[
-                        RecvOp(source_rank=src_rank, recv_shape=(1,))  # placeholder
+                        RecvOp(source_rank=src_rank)
                         for src_rank in src_ranks
                     ],
                 )
@@ -252,11 +240,7 @@ class BridgeCommunicator:
                 self.comm_map[src_rank] = RankCommInfo(
                     role='SENDER',
                     sends=[
-                        SendOp(
-                            destination_rank=dest_rank,
-                            batch_slice=slice(None),
-                            send_shape=(1,),  # placeholder
-                        )
+                        SendOp(destination_rank=dest_rank)
                         for dest_rank in dest_ranks
                     ],
                 )
@@ -265,7 +249,7 @@ class BridgeCommunicator:
                 for dest_rank in dest_ranks:
                     self.comm_map[dest_rank] = RankCommInfo(
                         role='RECEIVER',
-                        receives=[RecvOp(source_rank=src_rank, recv_shape=(1,))],  # placeholder
+                        receives=[RecvOp(source_rank=src_rank)],
                     )
 
     def send_forward(self, tensor_to_send: torch.Tensor):
@@ -359,7 +343,7 @@ class BridgeCommunicator:
             return aggregated_tensor
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
-            # Non-leader rank - participate in scatter operation
+            # Non-leader rank - participate in broadcast
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
             dist.broadcast(
                 shape_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
@@ -481,7 +465,7 @@ class BridgeCommunicator:
             return aggregated_gradient
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
-            # Non-leader rank - participate in scatter operation
+            # Non-leader rank - participate in gather for gradients
             # Receive broadcasted tensor shape from leader rank
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
             dist.broadcast(
@@ -532,13 +516,12 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         if rank_info.role == 'SENDER':
-            # Current rank is a sender - gather tensors from all ranks in activation_gather_group
             assert (
                 self.current_rank == self.src_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
+
             num_sends = len(rank_info.sends)
             activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
-
             # Communicate shapes for both directions (send forward, receive backward)
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
                 tensor_to_send_next=activation_splits[0], recv_next=True
@@ -608,18 +591,14 @@ class BridgeCommunicator:
                 return aggregated_gradient
 
         elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
-            # participate in both gather (for activations) and receive (for gradients)
-            logging.debug(
-                f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
-                f"is a noop rank. Running gather on {self.activation_gather_ranks}"
-            )
-            # Receive gradient from leader using scatter operation
+            # participate in both gather for gradients
+            # Receive gradient from leader using broadcast
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
             dist.broadcast(
                 shape_tensor, src=self.src_local_leader_rank, group=self.activation_gather_pg
             )
 
-            # Use the received shape to create tensor for scatter operation
+            # Use the received shape to create tensor for broadcast
             received_shape = tuple(shape_tensor.tolist())
             received_gradient = torch.empty(
                 received_shape, device=torch.cuda.current_device(), dtype=dtype
@@ -629,7 +608,7 @@ class BridgeCommunicator:
             )
             logging.debug(
                 f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
-                f"received gradient from scatter operation, shape {received_gradient.shape}"
+                f"received gradient from broadcast, shape {received_gradient.shape}"
             )
             return received_gradient
 
@@ -659,7 +638,6 @@ class BridgeCommunicator:
         assert rank_info is not None, f"Rank {self.current_rank} is not in the comm map"
 
         if rank_info.role == 'RECEIVER':
-            # gather gradients from all ranks in activation_scatter_ranks
             assert (
                 self.current_rank == self.dest_local_leader_rank
             ), f"Rank {self.current_rank} is not the leader rank"
