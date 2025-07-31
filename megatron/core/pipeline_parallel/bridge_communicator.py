@@ -339,7 +339,6 @@ class BridgeCommunicator:
                     f"shape {tensor_to_recv.shape} sum {tensor_to_recv.sum()}"
                 )
                 received_tensors_list.append(tensor_to_recv)
-
             aggregated_tensor = torch.cat(received_tensors_list, dim=self.dim_mapping['b'])
             logging.debug(
                 f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
@@ -893,4 +892,6 @@ class BridgeCommunicator:
             raise ValueError(f"num_splits must be positive, got {num_splits}")
 
         batch_dim = self.dim_mapping['b']
-        return list(torch.tensor_split(aggregated_tensor, num_splits, dim=batch_dim))
+        splits = torch.tensor_split(aggregated_tensor, num_splits, dim=batch_dim)
+        # Ensure all splits are contiguous to avoid P2P communication issues
+        return [split.contiguous() for split in splits]

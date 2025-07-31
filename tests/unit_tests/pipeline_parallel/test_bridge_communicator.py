@@ -278,7 +278,7 @@ class TestBridgeCommunicator:
             (2, 1, 2, 1, 2),  # TP2DP2 to TP4DP1
             (4, 1, 4, 1, 4),  # TP4DP1 to TP4DP1
             (2, 2, 4, 1, 2),  # TP2DP2 to TP4DP1
-            # (4,1,2,2,2), # TP4DP1 to TP2DP2
+            (4,1,2,2,2), # TP4DP1 to TP2DP2
         ],
     )
     def test_bridge_communicator_with_transformer_blocks(
@@ -327,7 +327,7 @@ class TestBridgeCommunicator:
         bridge_communicator = BridgeCommunicator(
             grid_1, grid_2, dim_mapping={'s': 0, 'h': 2, 'b': 1}
         )
-
+        output_grid_2 = None
         if grid_1 is not None and bridge_communicator.is_current_rank_in_grid(grid_1):
             output_grid_1 = block_grid_1(hidden_states=hidden_states, attention_mask=None)
             bridge_communicator.send_forward(output_grid_1)
@@ -366,20 +366,25 @@ class TestBridgeCommunicator:
             hidden_states=global_block_1_output, attention_mask=None
         )
 
-        if bridge_communicator.is_current_rank_in_grid(grid_2):
+        if grid_2 is not None and bridge_communicator.is_current_rank_in_grid(grid_2):
             if grid1_dp == grid2_dp:
                 torch.testing.assert_close(
                     global_block_2_output, output_grid_2, rtol=1e-3, atol=1e-3
                 )
             elif grid1_dp < grid2_dp:
                 print(
-                    f"Yash output_grid_2 shape: {output_grid_2.shape} global_block_2_output shape: {global_block_2_output.shape}"
+                    f"output_grid_2 shape: {output_grid_2.shape} global_block_2_output shape: {global_block_2_output.shape}"
                 )
-                global_block_2_first_chunk = torch.chunk(
-                    global_block_2_output, grid2_dp // grid1_dp, dim=1
-                )[0]
+                grid2_dp_ranks = grid_2._gen_rank_enum([x for x in grid_2.dim_names if x != "dp"])
+                global_block_2_chunks = torch.split(
+                    global_block_2_output, global_block_2_output.shape[1] // grid2_dp, dim=1
+                )
+                relevant_chunk = None
+                for i, dp_ranks in enumerate(grid2_dp_ranks):
+                    if current_rank in dp_ranks:
+                        relevant_chunk = global_block_2_chunks[i]
                 torch.testing.assert_close(
-                    global_block_2_first_chunk, output_grid_2, rtol=1e-3, atol=1e-3
+                    relevant_chunk, output_grid_2, rtol=1e-3, atol=1e-3
                 )
             else:
                 output_grid_2_first_chunk = torch.chunk(output_grid_2, grid1_dp // grid2_dp, dim=1)[
