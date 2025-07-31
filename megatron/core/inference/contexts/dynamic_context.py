@@ -612,6 +612,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
+        assert self.is_hybrid_model
         layer_number = self.layer_map[layer_number - 1]
         conv_state = self.mamba_conv_states[layer_number][
             self.paused_request_count : self.paused_request_count + self.padded_active_request_count
@@ -1030,9 +1031,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_chunk_id[dst_idxs] = self.request_last_kv_chunk_id[src_idxs]
         self.request_last_kv_chunk_offset[dst_idxs] = self.request_last_kv_chunk_offset[src_idxs]
 
-        self._move_mamba_state_tensors(src_idxs, dst_idxs)
-
-    def _move_mamba_state_tensors(self, src_idxs, dst_idxs):
         if self.is_hybrid_model:
             self.mamba_conv_states[:, dst_idxs] = self.mamba_conv_states[:, src_idxs]
             self.mamba_ssm_states[:, dst_idxs] = self.mamba_ssm_states[:, src_idxs]
@@ -1139,8 +1137,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset the Mamba states for finished requests.
             if self.is_hybrid_model:
-                self.mamba_conv_states[:, finished_idxs].fill_(0)
-                self.mamba_ssm_states[:, finished_idxs].fill_(0)
+                self.mamba_conv_states[:, finished_idxs] = 0
+                self.mamba_ssm_states[:, finished_idxs] = 0
 
             if active_request_count > 0:
                 finished_idxs_on_left = (
@@ -1163,6 +1161,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
                 # Reset chunk ids for recently moved requests.
                 self.request_to_kv_chunk_ids[active_idxs_on_right] = -1
+                if self.is_hybrid_model:
+                    self.mamba_conv_states[:, active_idxs_on_right] = 0
+                    self.mamba_ssm_states[:, active_idxs_on_right] = 0
 
         # 5. We identify requests that require a new chunk and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current chunk and  require a new one in a pause state temporarily
