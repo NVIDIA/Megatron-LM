@@ -278,7 +278,7 @@ class TestBridgeCommunicator:
             (2, 1, 2, 1, 2),  # TP2DP2 to TP4DP1
             (4, 1, 4, 1, 4),  # TP4DP1 to TP4DP1
             (2, 2, 4, 1, 2),  # TP2DP2 to TP4DP1
-            (4,1,2,2,2), # TP4DP1 to TP2DP2
+            (4, 1, 2, 2, 2),  # TP4DP1 to TP2DP2
         ],
     )
     def test_bridge_communicator_with_transformer_blocks(
@@ -383,9 +383,7 @@ class TestBridgeCommunicator:
                 for i, dp_ranks in enumerate(grid2_dp_ranks):
                     if current_rank in dp_ranks:
                         relevant_chunk = global_block_2_chunks[i]
-                torch.testing.assert_close(
-                    relevant_chunk, output_grid_2, rtol=1e-3, atol=1e-3
-                )
+                torch.testing.assert_close(relevant_chunk, output_grid_2, rtol=1e-3, atol=1e-3)
             else:
                 output_grid_2_first_chunk = torch.chunk(output_grid_2, grid1_dp // grid2_dp, dim=1)[
                     0
