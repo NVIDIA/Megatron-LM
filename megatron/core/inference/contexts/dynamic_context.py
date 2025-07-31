@@ -252,12 +252,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Compute max_requets, max_tokens from buffer size, overflow factor, and Mamba state size.
         def bytes_to_max_requests_and_tokens(n_bytes):
-            # Leave room for a buffer request in the case of padding
-            n_bytes = max(0, n_bytes - mamba_states_memory_per_request)
             bytes_per_token = self.chunk_size_bytes // self.chunk_size_tokens
             cost_per_request_bytes = (
                 mamba_states_memory_per_request + max_sequence_length * bytes_per_token
             )
+            if self.is_hybrid_model:
+                # Leave room for a buffer request in the case of padding
+                n_bytes = max(0, n_bytes - cost_per_request_bytes)
             n_requests = n_bytes // cost_per_request_bytes
             n_tokens = n_requests * max_sequence_length
             return int(n_requests), int(n_tokens)
