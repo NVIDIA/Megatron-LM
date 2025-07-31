@@ -275,10 +275,10 @@ class TestBridgeCommunicator:
     @pytest.mark.parametrize(
         "grid1_tp, grid1_dp, grid2_tp, grid2_dp, parallel_state_tp",
         [
-        (2,1,2,1, 2), # TP2DP2 to TP4DP1
-        (4,1,4,1,4), # TP4DP1 to TP4DP1
-        (2,2,4,1,2), # TP2DP2 to TP4DP1
-        # (4,1,2,2,2), # TP4DP1 to TP2DP2
+            (2, 1, 2, 1, 2),  # TP2DP2 to TP4DP1
+            (4, 1, 4, 1, 4),  # TP4DP1 to TP4DP1
+            (2, 2, 4, 1, 2),  # TP2DP2 to TP4DP1
+            # (4,1,2,2,2), # TP4DP1 to TP2DP2
         ],
     )
     def test_bridge_communicator_with_transformer_blocks(
@@ -368,16 +368,26 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(grid_2):
             if grid1_dp == grid2_dp:
-                torch.testing.assert_close(global_block_2_output, output_grid_2, rtol=1e-3, atol=1e-3)
+                torch.testing.assert_close(
+                    global_block_2_output, output_grid_2, rtol=1e-3, atol=1e-3
+                )
             elif grid1_dp < grid2_dp:
-                print(f"Yash output_grid_2 shape: {output_grid_2.shape} global_block_2_output shape: {global_block_2_output.shape}")
-                global_block_2_first_chunk = torch.chunk(global_block_2_output, grid2_dp // grid1_dp, dim=1)[0]
-                torch.testing.assert_close(global_block_2_first_chunk, output_grid_2, rtol=1e-3, atol=1e-3)         
+                print(
+                    f"Yash output_grid_2 shape: {output_grid_2.shape} global_block_2_output shape: {global_block_2_output.shape}"
+                )
+                global_block_2_first_chunk = torch.chunk(
+                    global_block_2_output, grid2_dp // grid1_dp, dim=1
+                )[0]
+                torch.testing.assert_close(
+                    global_block_2_first_chunk, output_grid_2, rtol=1e-3, atol=1e-3
+                )
             else:
-                output_grid_2_first_chunk = torch.chunk(output_grid_2, grid1_dp // grid2_dp, dim=1)[0]
-                torch.testing.assert_close(global_block_2_output, output_grid_2_first_chunk, rtol=1e-3, atol=1e-3)
-                
-                
+                output_grid_2_first_chunk = torch.chunk(output_grid_2, grid1_dp // grid2_dp, dim=1)[
+                    0
+                ]
+                torch.testing.assert_close(
+                    global_block_2_output, output_grid_2_first_chunk, rtol=1e-3, atol=1e-3
+                )
 
         Utils.destroy_model_parallel()
 
