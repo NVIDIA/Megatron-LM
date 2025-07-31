@@ -338,7 +338,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_requests: List[DynamicInferenceRequest] = []
 
         # Print context state.
-        if verbose:
+        if verbose and torch.distributed.get_rank() == 0:
             context = self.context
             mem = torch.cuda.memory_stats()
             output_str = (

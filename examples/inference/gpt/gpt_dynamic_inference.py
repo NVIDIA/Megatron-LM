@@ -195,7 +195,9 @@ def run_inference(
     step_times = {"prefill": [], "decode": []}
     add_times = []
     output_times = []
-    tbar = tqdm(total=num_requests_total)
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
     while True:
         curr_time = get_curr_time()
@@ -214,7 +216,8 @@ def run_inference(
                 request.time_start = get_curr_time()
                 request.state = "started"
                 num_requests_added += 1
-                tbar.update(1)
+                if rank == 0:
+                    tbar.update(1)
             except ContextOverflowError:
                 break
         add_times.append(get_curr_time() - add_start)
@@ -295,10 +298,11 @@ def main():
         random_seed=args.seed,
     )
 
-    setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
-    print("~~~")
-    print(setup_prefix)
-    print("~~~")
+    if torch.distributed.get_rank() == 0:
+        setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
+        print("~~~")
+        print(setup_prefix)
+        print("~~~")
 
     # Run and time test.
     t = get_curr_time()
@@ -351,42 +355,42 @@ def main():
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp)
 
-    # Timing results.
-    stats = torch.cuda.memory_stats()
-    throughput = total_output_tokens / total_time
-    print("~~~")
-    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
-    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+        # Timing results.
+        stats = torch.cuda.memory_stats()
+        throughput = total_output_tokens / total_time
+        print("~~~")
+        peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+        peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
 
-    p_times = step_times["prefill"]
-    d_times = step_times["decode"]
+        p_times = step_times["prefill"]
+        d_times = step_times["decode"]
 
-    p_total = sum(p_times)
-    d_total = sum(d_times)
+        p_total = sum(p_times)
+        d_total = sum(d_times)
 
-    p_count = len(p_times)
-    d_count = len(d_times)
+        p_count = len(p_times)
+        d_count = len(d_times)
 
-    p_mean = p_total / p_count
-    d_mean = d_total / d_count
+        p_mean = p_total / p_count
+        d_mean = d_total / d_count
 
-    # Commented out for now as the step/add/output times are not calculated correctly.
-    # print(
-    #     f"{setup_prefix} … "
-    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-    #     f"total time: {step_total:.3f}s … "
-    #     f"step time: total {step_total:.3f}s "
-    #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
-    #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
-    #     f"count [ p {p_count}, d {d_count} ]."
-    # )
-    print(
-        f"{setup_prefix} … "
-        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
-        f"total time: {total_time:.3f}s … "
-        f"throughput: {throughput:.3f} tok/s"
-    )
-    print("~~~")
+        # Commented out for now as the step/add/output times are not calculated correctly.
+        # print(
+        #     f"{setup_prefix} … "
+        #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        #     f"total time: {step_total:.3f}s … "
+        #     f"step time: total {step_total:.3f}s "
+        #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+        #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+        #     f"count [ p {p_count}, d {d_count} ]."
+        # )
+        print(
+            f"{setup_prefix} … "
+            f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+            f"total time: {total_time:.3f}s … "
+            f"throughput: {throughput:.3f} tok/s"
+        )
+        print("~~~")
 
     # Stop Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
