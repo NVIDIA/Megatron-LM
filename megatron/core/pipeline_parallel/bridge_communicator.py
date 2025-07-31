@@ -47,17 +47,13 @@ class BridgeCommunicator:
 
         # TODO - CP support will be added in follow up PR.
         if 'cp' in self.src_grid.dim_names:
-            assert (
-                self.src_grid.shape[self.src_grid.dim_names.index('cp')] == 1
-            ), (
+            assert self.src_grid.shape[self.src_grid.dim_names.index('cp')] == 1, (
                 f"Src grid CP size must be 1, got "
                 f"{self.src_grid.shape[self.src_grid.dim_names.index('cp')]}"
             )
 
         if 'cp' in self.dest_grid.dim_names:
-            assert (
-                self.dest_grid.shape[self.dest_grid.dim_names.index('cp')] == 1
-            ), (
+            assert self.dest_grid.shape[self.dest_grid.dim_names.index('cp')] == 1, (
                 f"Dest grid CP size must be 1, got "
                 f"{self.dest_grid.shape[self.dest_grid.dim_names.index('cp')]}"
             )
