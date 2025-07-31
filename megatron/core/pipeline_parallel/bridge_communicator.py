@@ -152,23 +152,24 @@ class BridgeCommunicator:
         boundary_pp_stage_ranks = []
 
         for group in tpcp_groups:
-            # Check if this group corresponds to the boundary pp stage
             # We can check any rank in the group since they all have the same pp coordinate
-            if group:
-                sample_rank = group[0]
-                # Calculate rank coordinates
-                rank_coords = []
-                temp_rank = sample_rank - grid.rank_offset
-                for dim_size in reversed(grid.shape):
-                    rank_coords.append(temp_rank % dim_size)
-                    temp_rank //= dim_size
-                rank_coords.reverse()
+            if len(group) == 0:
+                continue
+            sample_rank = group[0]
+            # Calculate rank coordinates
+            rank_coords = []
+            temp_rank = sample_rank - grid.rank_offset
+                
+            # Extract coordinates in the original dimension order
+            for dim_size in grid.shape:
+                rank_coords.append(temp_rank % dim_size)
+                temp_rank //= dim_size
 
-                pp_coord = rank_coords[grid.dim_names.index('pp')]
+            pp_coord = rank_coords[grid.dim_names.index('pp')]
 
-                if pp_coord == boundary_pp_stage:
-                    # This group is at the boundary pp stage, add all ranks from this group
-                    boundary_pp_stage_ranks.append(group)
+            if pp_coord == boundary_pp_stage:
+                # This group is at the boundary pp stage, add all ranks from this group
+                boundary_pp_stage_ranks.append(group)
 
         return boundary_pp_stage_ranks
 
