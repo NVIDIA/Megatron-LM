@@ -888,8 +888,6 @@ def validate_args(args, defaults={}):
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
-    if args.rotary_interleaved and args.apply_rope_fusion:
-        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     if args.rotary_interleaved and args.use_legacy_models:
         raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
     if args.position_embedding_type != 'rope':

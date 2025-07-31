@@ -1080,10 +1080,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
             else:
                 if self.rotary_interleaved:
-                    if not is_te_min_version("2.3.0.dev0"):
+                    if not is_te_min_version("2.3.0"):
                         raise ValueError(
                             "rotary_interleaved does not work with apply_rope_fusion for "
-                            "TE < 2.3.0.dev0. Please install TE >= 2.3.0.dev0"
+                            "TE < 2.3.0. Please install TE >= 2.3.0"
                         )
 
                 from megatron.core.models.common.embeddings.rope_utils import (
@@ -1093,7 +1093,7 @@ class TransformerConfig(ModelParallelConfig):
 
                 if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
                     raise ValueError(
-                        "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
+                        "apply_rope_fusion is not available. Please install TE >= 1.4."
                     )
 
         if self.multi_latent_attention and self.rotary_interleaved:
