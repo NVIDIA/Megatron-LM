@@ -159,6 +159,10 @@ class TransformerLayerSchedulePlan:
         (dispatch or combine) of one with the computations (att or mlp) of the other
         to maximize parallelism and efficiency.
 
+        When f_layer and b_layer are both not None, the forward and backward pass are overlapped as follows:
+        comm_stream:    moe_combine_bwd         | moe_dispatch_fwd -> moe_dispatch_bwd | moe_combine_fwd
+        compute_stream: attn_fwd->post_attn_fwd | mlp_bwd -> mlp_bwd_dw -> mlp_fwd     | post_attn_bwd->attn_bwd
+
         Args:
             f_layer (TransformerLayerSchedulePlan): Forward layer (for current microbatch)
             b_layer (TransformerLayerSchedulePlan): Backward layer (for previous microbatch)
