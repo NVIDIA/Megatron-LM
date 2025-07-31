@@ -159,7 +159,7 @@ class BridgeCommunicator:
             # Calculate rank coordinates
             rank_coords = []
             temp_rank = sample_rank - grid.rank_offset
-                
+
             # Extract coordinates in the original dimension order
             for dim_size in grid.shape:
                 rank_coords.append(temp_rank % dim_size)

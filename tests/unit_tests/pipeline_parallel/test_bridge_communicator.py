@@ -457,55 +457,65 @@ class TestBridgeCommunicator:
     @pytest.mark.parametrize(
         "tp, cp, pp, dp, expected_src_ranks, expected_dest_ranks",
         [
-            # Test Case 1: tp=2, cp=1, pp=2, dp=2 
+            # Test Case 1: tp=2, cp=1, pp=2, dp=2
             (2, 1, 2, 2, [[2, 3], [6, 7]], [[0, 1], [4, 5]]),
-            # Test Case 2: tp=4, cp=1, pp=2, dp=1 
+            # Test Case 2: tp=4, cp=1, pp=2, dp=1
             (4, 1, 2, 1, [[4, 5, 6, 7]], [[0, 1, 2, 3]]),
-            # Test Case 3: tp=1, cp=1, pp=2, dp=4 
+            # Test Case 3: tp=1, cp=1, pp=2, dp=4
             (1, 1, 2, 4, [[1], [3], [5], [7]], [[0], [2], [4], [6]]),
-            # Test Case 4: tp=2, cp=1, pp=4, dp=1 
+            # Test Case 4: tp=2, cp=1, pp=4, dp=1
             (2, 1, 4, 1, [[6, 7]], [[0, 1]]),
         ],
     )
-    def test_get_boundary_pp_stage_ranks(self, tp, cp, pp, dp, expected_src_ranks, expected_dest_ranks):
+    def test_get_boundary_pp_stage_ranks(
+        self, tp, cp, pp, dp, expected_src_ranks, expected_dest_ranks
+    ):
         """Test get_boundary_pp_stage_ranks function with different parallelism configurations."""
-        
+
         # Create grid with specified parallelism dimensions
         grid = create_hypercomm_grid(offset=0, tp=tp, cp=cp, pp=pp, dp=dp)
         bridge_communicator = BridgeCommunicator(grid, grid)  # Using same grid for simplicity
-        
+
         # For source grid (is_src=True), should return ranks from last pp stage
         src_boundary_ranks = bridge_communicator.get_boundary_pp_stage_ranks(grid, is_src=True)
-        assert src_boundary_ranks == expected_src_ranks, f"Source: Expected {expected_src_ranks}, got {src_boundary_ranks}"
-        
+        assert (
+            src_boundary_ranks == expected_src_ranks
+        ), f"Source: Expected {expected_src_ranks}, got {src_boundary_ranks}"
+
         # For destination grid (is_src=False), should return ranks from first pp stage
         dest_boundary_ranks = bridge_communicator.get_boundary_pp_stage_ranks(grid, is_src=False)
-        assert dest_boundary_ranks == expected_dest_ranks, f"Dest: Expected {expected_dest_ranks}, got {dest_boundary_ranks}"
+        assert (
+            dest_boundary_ranks == expected_dest_ranks
+        ), f"Dest: Expected {expected_dest_ranks}, got {dest_boundary_ranks}"
 
     @pytest.mark.parametrize(
         "tp, cp, pp, dp, expected_src_leaders, expected_dest_leaders",
         [
-            # Test Case 1: tp=2, cp=1, pp=2, dp=2 
+            # Test Case 1: tp=2, cp=1, pp=2, dp=2
             (2, 1, 2, 2, [3, 7], [0, 4]),
-            # Test Case 2: tp=4, cp=1, pp=2, dp=1 
+            # Test Case 2: tp=4, cp=1, pp=2, dp=1
             (4, 1, 2, 1, [7], [0]),
-            # Test Case 3: tp=1, cp=1, pp=2, dp=4 
+            # Test Case 3: tp=1, cp=1, pp=2, dp=4
             (1, 1, 2, 4, [1, 3, 5, 7], [0, 2, 4, 6]),
-            # Test Case 4: tp=2, cp=1, pp=4, dp=1 
+            # Test Case 4: tp=2, cp=1, pp=4, dp=1
             (2, 1, 4, 1, [7], [0]),
         ],
     )
     def test_get_leader_rank(self, tp, cp, pp, dp, expected_src_leaders, expected_dest_leaders):
         """Test get_leader_rank function with different parallelism configurations."""
-        
+
         # Create grid with specified parallelism dimensions
         grid = create_hypercomm_grid(offset=0, tp=tp, cp=cp, pp=pp, dp=dp)
         bridge_communicator = BridgeCommunicator(grid, grid)  # Using same grid for simplicity
-        
+
         # For source grid (is_src=True), should return leader ranks from last pp stage of each dp replica
         src_leaders, _ = bridge_communicator.get_leader_rank(grid, is_src=True)
-        assert src_leaders == expected_src_leaders, f"Source leaders: Expected {expected_src_leaders}, got {src_leaders}"
-        
+        assert (
+            src_leaders == expected_src_leaders
+        ), f"Source leaders: Expected {expected_src_leaders}, got {src_leaders}"
+
         # For destination grid (is_src=False), should return leader ranks from first pp stage of each dp replica
         dest_leaders, _ = bridge_communicator.get_leader_rank(grid, is_src=False)
-        assert dest_leaders == expected_dest_leaders, f"Dest leaders: Expected {expected_dest_leaders}, got {dest_leaders}"
+        assert (
+            dest_leaders == expected_dest_leaders
+        ), f"Dest leaders: Expected {expected_dest_leaders}, got {dest_leaders}"
