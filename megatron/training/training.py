@@ -1868,6 +1868,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    if args.fp8:
+        # Run garbage collection after checkpoint saving to free memory from
+        # dequantized bf16 tensors that were temporarily created during fp8
+        # model checkpoint saving.
+        gc.collect()
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)

@@ -323,16 +323,16 @@ class CheckpointType(Enum):
 
 def _clean_metadata_for_serialization(metadata: dict) -> dict:
     """Create a clean copy of metadata for serialization by removing non-serializable objects.
-    
+
     Args:
         metadata: Original metadata dict
-        
+
     Returns:
         Clean metadata dict suitable for serialization
     """
     if metadata is None:
         return None
-    
+
     clean_metadata = metadata.copy()
     # Remove dp_cp_group as it's not serializable
     clean_metadata.pop('dp_cp_group', None)
@@ -360,12 +360,12 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
             metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
-    
+    metadata['chained_optim_avoid_prefix'] = True
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     metadata['dp_cp_group'] = dp_cp_group
-    
+
     return metadata
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,

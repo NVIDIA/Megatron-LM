@@ -335,9 +335,6 @@ def validate_yaml(args, defaults={}):
     # Load retro args (used by both Retro & GPT).
     if getattr(args, 'retro_project_dir', None) is not None:
         raise Exception("Retro untested for yaml args. See arguments.py.")
-
-    if args.language_model.rotary_interleaved and args.language_model.apply_rope_fusion:
-        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
