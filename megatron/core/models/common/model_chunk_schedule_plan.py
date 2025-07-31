@@ -426,10 +426,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
-        overlaped_layers = min(f_num_layers, b_num_layers)
+        overlapped_layers = min(f_num_layers, b_num_layers)
 
-        # combined forward and backward pass for overlaped layers
-        for i in range(overlaped_layers):
+        # combined forward and backward pass for overlapped layers
+        for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_num_layers - 1 - i}b")
@@ -446,7 +446,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # backward pass for the remaining layers
         with b_context:
-            for i in range(overlaped_layers, b_num_layers):
+            for i in range(overlapped_layers, b_num_layers):
                 b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
                 torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
                 _, b_grad = TransformerLayerSchedulePlan.run(
@@ -456,7 +456,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # forward pass for the remaining layers
         with f_context:
-            for i in range(overlaped_layers, f_num_layers):
+            for i in range(overlapped_layers, f_num_layers):
                 f_layer = f_schedule_plan.get_layer(i)
                 torch.cuda.nvtx.range_push(f"layer_{i}f")
                 f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)

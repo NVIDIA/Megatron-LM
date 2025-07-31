@@ -87,7 +87,8 @@ class NoopScheduleNode:
     """A placeholder node in the computation graph that simply passes through inputs and outputs.
 
     This class is used as a no-op node in the scheduling system when a real computation node
-    is not needed but the interface must be maintained. It simply returns its inputs unchanged
+    is not needed but the interface must be maintained (e.g., dense layer doesn't need 
+    moe_dispatch and moe_combine). It simply returns its inputs unchanged
     in both forward and backward passes.
     """
 
