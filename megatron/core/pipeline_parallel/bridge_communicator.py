@@ -15,8 +15,8 @@ class RankCommInfo:
     """Explicit communication plan for a single rank."""
 
     role: Literal['SENDER', 'RECEIVER', 'MEMBER'] = 'MEMBER'
-    send_to_ranks: List[int] = field(default_factory=list)  # destination ranks (outgoing)
-    recv_from_ranks: List[int] = field(default_factory=list)  # source ranks (incoming)
+    send_to_ranks: List[int] = field(default_factory=list)
+    recv_from_ranks: List[int] = field(default_factory=list)
 
 
 class BridgeCommunicator:
@@ -49,14 +49,18 @@ class BridgeCommunicator:
         if 'cp' in self.src_grid.dim_names:
             assert (
                 self.src_grid.shape[self.src_grid.dim_names.index('cp')] == 1
-            ), "Src grid CP size must be 1, got "
-            f"{self.src_grid.shape[self.src_grid.dim_names.index('cp')]}"
+            ), (
+                f"Src grid CP size must be 1, got "
+                f"{self.src_grid.shape[self.src_grid.dim_names.index('cp')]}"
+            )
 
         if 'cp' in self.dest_grid.dim_names:
             assert (
                 self.dest_grid.shape[self.dest_grid.dim_names.index('cp')] == 1
-            ), "Dest grid CP size must be 1, got "
-            f"{self.dest_grid.shape[self.dest_grid.dim_names.index('cp')]}"
+            ), (
+                f"Dest grid CP size must be 1, got "
+                f"{self.dest_grid.shape[self.dest_grid.dim_names.index('cp')]}"
+            )
 
         self.current_rank = dist.get_rank()
         self.comm_map: Dict[int, RankCommInfo] = {}
@@ -826,7 +830,7 @@ class BridgeCommunicator:
 
         # To protect against race condition when using batch_isend_irecv()
         # Following the pattern from the original p2p communication code
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
 
         # Extract shapes from received tensors
         for forward_shape_tensor in recv_forward_shape_tensors:

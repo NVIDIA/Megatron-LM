@@ -188,8 +188,8 @@ class TestBridgeCommunicator:
 
     def test_bridge_communicator_init(self):
 
-        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=2, pp=1, dp=1)
-        grid2 = create_hypercomm_grid(offset=4, tp=2, cp=2, pp=1, dp=1)
+        grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
+        grid2 = create_hypercomm_grid(offset=4, tp=2, cp=1, pp=1, dp=2)
         bridge_communicator = BridgeCommunicator(grid1, grid2)
         assert bridge_communicator.src_grid == grid1
         assert bridge_communicator.dest_grid == grid2
