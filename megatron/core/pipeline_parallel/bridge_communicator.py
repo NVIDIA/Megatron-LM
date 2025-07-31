@@ -13,12 +13,14 @@ from megatron.core.hyper_comm_grid import HyperCommGrid
 @dataclass
 class SendOp:
     """Describes a single send operation for a single rank."""
+
     destination_rank: int
 
 
 @dataclass
 class RecvOp:
     """Describes a single receive operation for a single rank."""
+
     source_rank: int
 
 
@@ -215,19 +217,13 @@ class BridgeCommunicator:
                 # Set up senders
                 for src_rank in src_ranks:
                     self.comm_map[src_rank] = RankCommInfo(
-                        role='SENDER',
-                        sends=[
-                            SendOp(destination_rank=dest_rank)
-                        ],
+                        role='SENDER', sends=[SendOp(destination_rank=dest_rank)]
                     )
 
                 # Set up receiver
                 self.comm_map[dest_rank] = RankCommInfo(
                     role='RECEIVER',
-                    receives=[
-                        RecvOp(source_rank=src_rank)
-                        for src_rank in src_ranks
-                    ],
+                    receives=[RecvOp(source_rank=src_rank) for src_rank in src_ranks],
                 )
         else:
             # Fan-out: fewer source leaders send to more destination leaders
@@ -239,17 +235,13 @@ class BridgeCommunicator:
                 # Set up sender
                 self.comm_map[src_rank] = RankCommInfo(
                     role='SENDER',
-                    sends=[
-                        SendOp(destination_rank=dest_rank)
-                        for dest_rank in dest_ranks
-                    ],
+                    sends=[SendOp(destination_rank=dest_rank) for dest_rank in dest_ranks],
                 )
 
                 # Set up receivers
                 for dest_rank in dest_ranks:
                     self.comm_map[dest_rank] = RankCommInfo(
-                        role='RECEIVER',
-                        receives=[RecvOp(source_rank=src_rank)],
+                        role='RECEIVER', receives=[RecvOp(source_rank=src_rank)]
                     )
 
     def send_forward(self, tensor_to_send: torch.Tensor):
@@ -581,7 +573,9 @@ class BridgeCommunicator:
                 shape_tensor = torch.tensor(
                     tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
                 )
-                dist.broadcast(shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg)
+                dist.broadcast(
+                    shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg
+                )
 
                 # Broadcast the tensors to all ranks in the group
                 dist.broadcast(
