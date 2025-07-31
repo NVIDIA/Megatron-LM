@@ -839,7 +839,7 @@ def validate_args(args, defaults={}):
                 f"environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while {fsdp_impl} "
                 "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
         elif args.overlap_moe_expert_parallel_comm:
-            warnings.warn("Try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
+            warnings.warn("For Hopper and before, try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
                          "Using tensor/context model parallelism requires setting the environment "
                          "variable CUDA_DEVICE_MAX_CONNECTIONS to 1 to maximize the performance. "
                          "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
