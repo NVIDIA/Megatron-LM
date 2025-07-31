@@ -65,14 +65,14 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
 
     event = torch.cuda.Event()
     comp_stream = torch.cuda.current_stream()
-    com_stream = torch.cuda.Stream(device="cuda")
+    comm_stream = torch.cuda.Stream(device="cuda")
     layers = [
         TransformerLayerSchedulePlan(
             model,
             event,
             DummyState(),
             comp_stream,
-            com_stream,
+            comm_stream,
             extra_args={"is_moe": True, "enable_deepep": False},
         )
         for _ in range(microbatches)

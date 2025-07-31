@@ -12,7 +12,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
-    get_com_stream,
+    get_comm_stream,
     get_comp_stream,
 )
 
@@ -47,7 +47,7 @@ class TransformerLayerSchedulePlan:
     mlp = None
     moe_combine = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, com_stream, extra_args={}):
+    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
 
         Args:
@@ -57,7 +57,7 @@ class TransformerLayerSchedulePlan:
                 record CUDA event across multiple nodes on different streams for synchronization.
             chunk_state (ModelChunkState): model state shared in the model chunk.
             comp_stream (torch.cuda.Stream): CUDA stream for computation.
-            com_stream (torch.cuda.Stream): CUDA stream for communication.
+            comm_stream (torch.cuda.Stream): CUDA stream for communication.
             extra_args (dict): extra arguments for the layer.
 
         The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
@@ -70,12 +70,12 @@ class TransformerLayerSchedulePlan:
         self.layer = layer
         self.event = event
         self.comp_stream = comp_stream
-        self.com_stream = com_stream
+        self.comm_stream = comm_stream
 
         # get callable nodes for transformer/mtp layer
-        self._build_callable_nodes(event, comp_stream, com_stream, extra_args)
+        self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
-    def _build_callable_nodes(self, event, comp_stream, com_stream, extra_args):
+    def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
             attn, post_attn, mlp, moe_dispatch and moe_combine.
@@ -120,8 +120,8 @@ class TransformerLayerSchedulePlan:
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
             self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
-            self.moe_dispatch = create_node(com_stream, moe_dispatch_module, "moe_dispatch")
-            self.moe_combine = create_node(com_stream, moe_combine_module, "moe_combine")
+            self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
+            self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
         else:
             self.post_attn = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
@@ -278,7 +278,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._post_process = None
 
         comp_stream = get_comp_stream()
-        com_stream = get_com_stream()
+        comm_stream = get_comm_stream()
 
         # save the inputs of model.forward() to ModelChunkState
         self._model_chunk_state.input_ids = input_ids
@@ -298,7 +298,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for layer_idx in range(transformer_num_layers):
             layer = model.decoder._get_layer(layer_idx)
             layer_plan = TransformerLayerSchedulePlan(
-                layer, self._event, self._model_chunk_state, comp_stream, com_stream
+                layer, self._event, self._model_chunk_state, comp_stream, comm_stream
             )
             self._transformer_layers.append(layer_plan)
         # build post process
@@ -466,7 +466,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             with f_context as ctx:
                 # post_forward()/send_forward_recv_forward() is running in the communication stream,
                 # so the p2p comm could be overlapped with the attn backward
-                with torch.cuda.stream(get_com_stream()):
+                with torch.cuda.stream(get_comm_stream()):
                     f_schedule_plan.wait_current_stream()
                     post_forward(f_input, ctx.vpp_rank)
 
