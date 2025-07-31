@@ -26,7 +26,7 @@ class RecvOp:
 class RankCommInfo:
     """Explicit communication plan for a single rank."""
 
-    role: Literal['SENDER', 'RECEIVER', 'NOOP'] = 'NOOP'
+    role: Literal['SENDER', 'RECEIVER', 'MEMBER'] = 'MEMBER'
     sends: List[SendOp] = field(default_factory=list)
     receives: List[RecvOp] = field(default_factory=list)
 
@@ -63,27 +63,27 @@ class BridgeCommunicator:
         else:
             self.dim_mapping = dim_mapping
 
-        self.activation_gather_pg = None
-        self.activation_scatter_pg = None
+        self.src_grid_broadcast_pg = None
+        self.dest_grid_broadcast_pg = None
 
-        activation_gather_ranks_list = self.get_boundary_pp_stage_ranks(self.src_grid, is_src=True)
-        activation_scatter_ranks_list = self.get_boundary_pp_stage_ranks(
+        src_grid_broadcast_ranks_list = self.get_boundary_pp_stage_ranks(self.src_grid, is_src=True)
+        dest_grid_broadcast_ranks_list = self.get_boundary_pp_stage_ranks(
             self.dest_grid, is_src=False
         )
 
-        self.activation_gather_ranks = []
-        self.activation_scatter_ranks = []
-        for activation_gather_ranks in activation_gather_ranks_list:
-            pg = dist.new_group(ranks=activation_gather_ranks)
-            if self.current_rank in activation_gather_ranks:
-                self.activation_gather_ranks = activation_gather_ranks
-                self.activation_gather_pg = pg
+        self.src_grid_broadcast_ranks = []
+        self.dest_grid_broadcast_ranks = []
+        for src_grid_broadcast_ranks in src_grid_broadcast_ranks_list:
+            pg = dist.new_group(ranks=src_grid_broadcast_ranks)
+            if self.current_rank in src_grid_broadcast_ranks:
+                self.src_grid_broadcast_ranks = src_grid_broadcast_ranks
+                self.src_grid_broadcast_pg = pg
 
-        for activation_scatter_ranks in activation_scatter_ranks_list:
-            pg = dist.new_group(ranks=activation_scatter_ranks)
-            if self.current_rank in activation_scatter_ranks:
-                self.activation_scatter_ranks = activation_scatter_ranks
-                self.activation_scatter_pg = pg
+        for dest_grid_broadcast_ranks in dest_grid_broadcast_ranks_list:
+            pg = dist.new_group(ranks=dest_grid_broadcast_ranks)
+            if self.current_rank in dest_grid_broadcast_ranks:
+                self.dest_grid_broadcast_ranks = dest_grid_broadcast_ranks
+                self.dest_grid_broadcast_pg = pg
 
         self.src_tp_leaders, self.src_local_leader_rank = self.get_leader_rank(
             self.src_grid, is_src=True
@@ -96,8 +96,8 @@ class BridgeCommunicator:
             f"[Rank {self.current_rank}] "
             f"srcLeader={self.src_local_leader_rank} "
             f"destLeader={self.dest_local_leader_rank} "
-            f"gatherGrpRanks={self.activation_gather_ranks} "
-            f"scatterGrpRanks={self.activation_scatter_ranks}"
+            f"srcBroadcastGrpRanks={self.src_grid_broadcast_ranks} "
+            f"destBroadcastGrpRanks={self.dest_grid_broadcast_ranks}"
         )
         logging.info(log_msg)
 
@@ -202,7 +202,7 @@ class BridgeCommunicator:
 
         # Initialize all ranks as NOOP by default
         for rank in all_ranks:
-            self.comm_map[rank] = RankCommInfo(role='NOOP')
+            self.comm_map[rank] = RankCommInfo(role='MEMBER')
 
         scale_factor = src_count / dest_count
         if scale_factor > 1:
@@ -333,20 +333,20 @@ class BridgeCommunicator:
             shape_tensor = torch.tensor(
                 aggregated_tensor.shape, device=aggregated_tensor.device, dtype=torch.int64
             )
-            dist.broadcast(shape_tensor, src=self.current_rank, group=self.activation_scatter_pg)
+            dist.broadcast(shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg)
 
             # Step 2: broadcast the actual tensor
             dist.broadcast(
-                aggregated_tensor, src=self.current_rank, group=self.activation_scatter_pg
+                aggregated_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
             )
 
             return aggregated_tensor
 
-        elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
+        elif rank_info.role == 'MEMBER' and self.current_rank in self.dest_grid_broadcast_ranks:
             # Non-leader rank - participate in broadcast
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
             dist.broadcast(
-                shape_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
+                shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
 
             received_shape = tuple(shape_tensor.tolist())
@@ -356,7 +356,7 @@ class BridgeCommunicator:
 
             # Receive the full tensor via broadcast
             dist.broadcast(
-                received_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
+                received_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
 
             logging.debug(
@@ -456,20 +456,20 @@ class BridgeCommunicator:
             shape_tensor = torch.tensor(
                 aggregated_gradient.shape, device=torch.cuda.current_device(), dtype=torch.int64
             )
-            dist.broadcast(shape_tensor, src=self.current_rank, group=self.activation_gather_pg)
+            dist.broadcast(shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg)
 
             # Scatter the tensors to all ranks in the group
             dist.broadcast(
-                aggregated_gradient, src=self.current_rank, group=self.activation_gather_pg
+                aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
             )
             return aggregated_gradient
 
-        elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
+        elif rank_info.role == 'MEMBER' and self.current_rank in self.src_grid_broadcast_ranks:
             # Non-leader rank - participate in gather for gradients
             # Receive broadcasted tensor shape from leader rank
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
             dist.broadcast(
-                shape_tensor, src=self.src_local_leader_rank, group=self.activation_gather_pg
+                shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
             )
 
             logging.debug(
@@ -482,7 +482,7 @@ class BridgeCommunicator:
             )
 
             dist.broadcast(
-                received_gradient, src=self.src_local_leader_rank, group=self.activation_gather_pg
+                received_gradient, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
             )
             logging.debug(
                 f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
@@ -581,21 +581,21 @@ class BridgeCommunicator:
                 shape_tensor = torch.tensor(
                     tensor_shape_to_broadcast, device=torch.cuda.current_device(), dtype=torch.int64
                 )
-                dist.broadcast(shape_tensor, src=self.current_rank, group=self.activation_gather_pg)
+                dist.broadcast(shape_tensor, src=self.current_rank, group=self.src_grid_broadcast_pg)
 
                 # Broadcast the tensors to all ranks in the group
                 dist.broadcast(
-                    aggregated_gradient, src=self.current_rank, group=self.activation_gather_pg
+                    aggregated_gradient, src=self.current_rank, group=self.src_grid_broadcast_pg
                 )
 
                 return aggregated_gradient
 
-        elif rank_info.role == 'NOOP' and self.current_rank in self.activation_gather_ranks:
+        elif rank_info.role == 'MEMBER' and self.current_rank in self.src_grid_broadcast_ranks:
             # participate in both gather for gradients
             # Receive gradient from leader using broadcast
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
             dist.broadcast(
-                shape_tensor, src=self.src_local_leader_rank, group=self.activation_gather_pg
+                shape_tensor, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
             )
 
             # Use the received shape to create tensor for broadcast
@@ -604,7 +604,7 @@ class BridgeCommunicator:
                 received_shape, device=torch.cuda.current_device(), dtype=dtype
             )
             dist.broadcast(
-                received_gradient, src=self.src_local_leader_rank, group=self.activation_gather_pg
+                received_gradient, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
             )
             logging.debug(
                 f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
@@ -707,19 +707,19 @@ class BridgeCommunicator:
                     tensor_shape_to_scatter, device=torch.cuda.current_device(), dtype=torch.int64
                 )
                 dist.broadcast(
-                    shape_tensor, src=self.current_rank, group=self.activation_scatter_pg
+                    shape_tensor, src=self.current_rank, group=self.dest_grid_broadcast_pg
                 )
 
                 # Scatter the tensors to all ranks in the group
                 dist.broadcast(
-                    aggregated_activation, src=self.current_rank, group=self.activation_scatter_pg
+                    aggregated_activation, src=self.current_rank, group=self.dest_grid_broadcast_pg
                 )
                 return aggregated_activation
 
-        elif rank_info.role == 'NOOP' and self.current_rank in self.activation_scatter_ranks:
+        elif rank_info.role == 'MEMBER' and self.current_rank in self.dest_grid_broadcast_ranks:
             shape_tensor = torch.empty((3), device=torch.cuda.current_device(), dtype=torch.int64)
             dist.broadcast(
-                shape_tensor, src=self.dest_local_leader_rank, group=self.activation_scatter_pg
+                shape_tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg
             )
 
             # Use the received shape to create tensor for scatter operation
@@ -730,7 +730,7 @@ class BridgeCommunicator:
             dist.broadcast(
                 received_activation,
                 src=self.dest_local_leader_rank,
-                group=self.activation_scatter_pg,
+                group=self.dest_grid_broadcast_pg,
             )
             logging.debug(
                 f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank}  "
@@ -762,7 +762,7 @@ class BridgeCommunicator:
             - List of gradient shapes that will be received (empty if not expecting gradients)
         """
         rank_info = self.comm_map.get(self.current_rank)
-        if not rank_info or rank_info.role == 'NOOP':
+        if not rank_info or rank_info.role == 'MEMBER':
             return [], []
 
         recv_forward_shapes = []
