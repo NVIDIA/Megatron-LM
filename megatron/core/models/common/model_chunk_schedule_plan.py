@@ -140,9 +140,8 @@ class TransformerLayerSchedulePlan:
             else nullcontext()
         )
 
-    @classmethod
+    @staticmethod
     def run(
-        cls,
         f_layer,
         b_layer,
         f_input=None,
@@ -359,9 +358,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self._post_process.model_chunk_state = None
             self._post_process = None
 
-    @classmethod
+    @staticmethod
     def run(
-        cls,
         f_schedule_plan,
         b_schedule_plan,
         b_grad=None,

@@ -247,10 +247,9 @@ class AbstractSchedulePlan(ABC):
     """To use combined 1f1b, model must implement build_schedule_plan while take the same
     signature as model forward but return an instance of AbstractSchedulePlan"""
 
-    @classmethod
+    @staticmethod
     @abstractmethod
     def run(
-        cls,
         f_schedule_plan,
         b_schedule_plan,
         grad=None,
