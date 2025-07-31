@@ -913,11 +913,7 @@ class TEGroupedMLP(MegatronModule):
 
                     def glu(x):
                         x = torch.chunk(x, 2, dim=-1)
-                        if self.config.swiglu_alpha is not None:
-                            return self.config.activation_func(self.config.swiglu_alpha * x[0]) * (
-                                    x[1] + 1) / self.config.swiglu_alpha
-                        else:
-                            return self.config.activation_func(x[0]) * x[1]
+                        return self.config.activation_func(x[0]) * (x[1] + self.config.glu_linear_offset)
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:

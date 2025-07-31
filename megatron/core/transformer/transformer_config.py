@@ -155,9 +155,9 @@ class TransformerConfig(ModelParallelConfig):
     """Store the input of MLP activation function in FP8 for backprop to save memory.
     The stored input is casted back to the original precision before backprop compuatation."""
 
-    swiglu_alpha: Optional[float] = None
-    """Multiplicative factor inside of the sigmoid function for Swiglu activation. Also adds a +1 
-    bias term in the non-glu part of activation.    """
+    glu_linear_offset: float = 0.0
+    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only used when 
+    gated_linear_unit is True"""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -205,7 +205,7 @@ class TransformerConfig(ModelParallelConfig):
     attention_softmax_denominator_offset: Optional[Union[Literal['learnable'], float]] = None
     """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
        This arg is only used in unfused DotProductAttention. If true, unfused torch softmax will be used
-       The offset is exponentiated. (i.e. set to value to 0 for a +1 in the denominator"""
+       The offset is exponentiated. (i.e. set to 0 for softmax-off-by-1"""
 
     ####################
     # initialization

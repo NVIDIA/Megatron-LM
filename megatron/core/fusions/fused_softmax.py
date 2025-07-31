@@ -241,6 +241,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         if self.softmax_denominator_weight is None:
             softmax_fn = torch.nn.Softmax(dim=-1)
         else:
+            self.softmax_denominator_weight = self.softmax_denominator_weight.to(input.device)
             softmax_fn = SoftmaxOne(-1, self.softmax_denominator_weight)
 
         probs = softmax_fn(mask_output)
