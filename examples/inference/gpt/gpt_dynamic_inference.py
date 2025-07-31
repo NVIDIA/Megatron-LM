@@ -6,7 +6,7 @@ import torch
 from argparse import ArgumentParser
 from collections import defaultdict
 from tqdm import tqdm
-from typing import Dict, List
+from typing import Dict, List, Optional
 import sys
 import os
 
@@ -279,7 +279,7 @@ def main():
     model = get_model()
 
     # Layer type list for hybrid models
-    layer_type_list = getattr(model.decoder, "layer_type_list", None)
+    layer_type_list = getattr(model.module.decoder, "layer_type_list", None)
 
     # Requests, context, controller.
     requests = build_requests(args, tokenizer)

@@ -121,8 +121,11 @@ class TestDynamicContext:
             assert dynamic_context.mamba_conv_states is None
             assert dynamic_context.mamba_ssm_states is None
         else:
-            # Add assertions specific to Mamba model initialization
-            # These values will depend on the mamba_params
+            assert dynamic_context.gtd_chunk_count == 120
+            assert dynamic_context.gtd_request_count == 30
+            assert dynamic_context.chunk_allocator.chunk_count_total == 1206
+            assert dynamic_context.max_requests == 300
+            assert dynamic_context.max_tokens == 153600
             assert dynamic_context.is_hybrid_model == True
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_conv_states is not None
@@ -390,10 +393,9 @@ class TestDynamicContext:
                 "mamba_d_conv": 4,
                 "mamba_d_state": 16,
             }
-            # Adjust num_layers to match the layer_type_list length for hybrid
             num_layers = len(mamba_params["layer_type_list"])
         else:
-            num_layers = 4  # Default for non-hybrid
+            num_layers = 4
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,

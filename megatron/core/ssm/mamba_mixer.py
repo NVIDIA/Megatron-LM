@@ -424,7 +424,7 @@ class MambaMixer(MegatronModule):
                 if inference_context.is_dynamic_batching():
                     # Make batch dimension first and sequence dimension second
                     # (batch size will be 1)
-                    hidden_states = rearrange(hidden_states, "l b d -> b l d").contiguous()
+                    hidden_states = hidden_states.transpose(0, 1)
                 out, out_bias, _, _ = self.step(
                     hidden_states,
                     conv_state,
@@ -433,7 +433,7 @@ class MambaMixer(MegatronModule):
                 )
                 if inference_context.is_dynamic_batching():
                     # Restore original shape of sequence dimension first followed by batch dimension
-                    out = rearrange(out, "b l d -> l b d").contiguous()
+                    out = out.transpose(0, 1)
                 return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
