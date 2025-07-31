@@ -69,23 +69,27 @@ class TrainingConfig:
     which mitigates the impact of CPU-associated jitters. When the manual gc is enabled, garbage
     collection is performed only at the start and the end of the validation routine by default."""
 
-    manual_gc_interval: int = 0
-    """Training step interval to trigger manual garbage collection.
-    When the value is set to 0, garbage collection is not triggered between training steps.
+    manual_gc_interval: Optional[int] = None
+    """Training step interval to trigger manual garbage collection. Values > 0 will trigger garbage
+    collections between training steps.
     """
 
     manual_gc_eval: bool = True
-    """When using manual garbage collection,
-    disable garbage collection at the start and the end of each evaluation run.
+    """When using manual garbage collection, this controls garbage collection at the start and the
+    end of each evaluation run.
     """
 
     # ---------------- Validation config. ----------------
 
-    eval_samples: int = 0
-    """Number of samples to run for evaluation. Used for both validation and test."""
+    eval_samples: Optional[int] = None
+    """Number of samples to run for evaluation. Used for both validation and test. If not set,
+    evaluation will not run.
+    """
 
-    eval_interval: Optional[int] = 1000
-    """Interval between running evaluation on validation set."""
+    eval_interval: Optional[int] = None
+    """Interval between running evaluation on validation set. If not set, evaluation will not run
+    during training.
+    """
 
     skip_train: bool = False
     """If set, bypass the training loop, optionally do evaluation for validation/test, and exit."""
