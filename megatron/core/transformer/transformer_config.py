@@ -11,6 +11,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from ..fusions.fused_bias_geglu import quick_gelu
 
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
@@ -1071,19 +1072,25 @@ class TransformerConfig(ModelParallelConfig):
             self.attention_softmax_in_fp32 = True
 
         if self.bias_activation_fusion:
-            if self.activation_func not in [F.gelu, F.silu]:
+            if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
                 raise ValueError(
                     "When bias_activation_fusion is True, activation function should be either "
-                    "gelu or swiglu"
+                    "gelu, swiglu, or quick_geglu"
                 )
-            if (
-                self.activation_func == F.gelu
-                and not self.gated_linear_unit
-                and not self.add_bias_linear
-            ):
+            if self.activation_func == F.gelu and not self.gated_linear_unit and not self.add_bias_linear:
                 raise ValueError(
-                    "When bias_activation_fusion is True, gated_linear_unit is False, "
+                    "When bias_activation_fusion is True, gated_linear_unit is False "
                     "and activation function is gelu, add_bias_linear must also be True."
+                )
+            if self.activation_func == quick_gelu and not self.gated_linear_unit:
+                raise ValueError(
+                    "When bias_activation_fusion is True and activation function is quick_gelu, "
+                    "gated_linear_unit must be True."
+                )
+            if self.glu_linear_offset != 0.0 and self.activation_func != quick_gelu:
+                raise ValueError(
+                    "When bias_activation_fusion is True and glu_linear_offset is non-zero, "
+                    "activation function must be quick_gelu."
                 )
 
         if self.activation_func_fp8_input_store:

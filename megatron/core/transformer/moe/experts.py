@@ -21,7 +21,10 @@ from megatron.core.dist_checkpointing.mapping import (
 )
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_align_size
-from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
+from megatron.core.fusions.fused_bias_swiglu import (
+    weighted_bias_swiglu_impl,
+)
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -793,7 +796,7 @@ class TEGroupedMLP(MegatronModule):
             config=self.config,
             init_method=self.config.init_method,
             bias=self.config.add_bias_linear,
-            skip_bias_add=True,
+            skip_bias_add=False,
             is_expert=True,
             tp_comm_buffer_name='fc1',
             tp_group=parallel_state.get_expert_tensor_parallel_group(),
@@ -905,8 +908,16 @@ class TEGroupedMLP(MegatronModule):
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
                     )
+                elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
+                    intermediate_parallel = weighted_bias_quick_geglu_impl(
+                        intermediate_parallel,
+                        bias_parallel,
+                        permuted_probs,
+                        self.config.activation_func_fp8_input_store,
+                        self.config.glu_linear_offset,
+                    )
                 else:
-                    raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
+                    raise ValueError("Only support fusion of swiglu and quick_geglu in TEGroupedMLP.")
             else:
                 intermediate_parallel = self._apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert)
                 if self.config.gated_linear_unit:
