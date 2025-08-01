@@ -134,6 +134,126 @@ class TestParallelTransformerLayer:
         config = self.parallel_transformer_layer.config
         assert get_transformer_layer_offset(config) == 0
 
+    @pytest.mark.parametrize(
+        "config_params,expected_offsets",
+        [
+            # Test case 1: Both first and last stages set (30 layers: 8+6+6+10)
+            (
+                {
+                    "num_layers": 30,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": 8,
+                    "num_layers_in_last_pipeline_stage": 10,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-3
+                    (0, 1): 15,  # Stage 0, VP 1: layers 15-18
+                    (1, 0): 4,  # Stage 1, VP 0: layers 4-6
+                    (1, 1): 19,  # Stage 1, VP 1: layers 19-21
+                    (2, 0): 7,  # Stage 2, VP 0: layers 7-9
+                    (2, 1): 22,  # Stage 2, VP 1: layers 22-24
+                    (3, 0): 10,  # Stage 3, VP 0: layers 10-14
+                    (3, 1): 25,  # Stage 3, VP 1: layers 25-29
+                },
+            ),
+            # Test case 2: Only first stage set (26 layers: 8+6+6+6)
+            (
+                {
+                    "num_layers": 26,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": 8,
+                    "num_layers_in_last_pipeline_stage": None,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-3
+                    (0, 1): 13,  # Stage 0, VP 1: layers 13-16
+                    (1, 0): 4,  # Stage 1, VP 0: layers 4-6
+                    (1, 1): 17,  # Stage 1, VP 1: layers 17-19
+                    (2, 0): 7,  # Stage 2, VP 0: layers 7-9
+                    (2, 1): 20,  # Stage 2, VP 1: layers 20-22
+                    (3, 0): 10,  # Stage 3, VP 0: layers 10-12
+                    (3, 1): 23,  # Stage 3, VP 1: layers 23-25
+                },
+            ),
+            # Test case 3: Only last stage set (26 layers: 6+6+6+8)
+            (
+                {
+                    "num_layers": 26,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": None,
+                    "num_layers_in_last_pipeline_stage": 8,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-2
+                    (0, 1): 13,  # Stage 0, VP 1: layers 13-15
+                    (1, 0): 3,  # Stage 1, VP 0: layers 3-5
+                    (1, 1): 16,  # Stage 1, VP 1: layers 16-18
+                    (2, 0): 6,  # Stage 2, VP 0: layers 6-8
+                    (2, 1): 19,  # Stage 2, VP 1: layers 19-21
+                    (3, 0): 9,  # Stage 3, VP 0: layers 9-12
+                    (3, 1): 22,  # Stage 3, VP 1: layers 22-25
+                },
+            ),
+            # Test case 4: Even distribution (24 layers: 6+6+6+6)
+            (
+                {
+                    "num_layers": 24,
+                    "pipeline_model_parallel_size": 4,
+                    "virtual_pipeline_model_parallel_size": 2,
+                    "num_layers_in_first_pipeline_stage": None,
+                    "num_layers_in_last_pipeline_stage": None,
+                    "pipeline_dtype": torch.bfloat16,
+                },
+                {
+                    (0, 0): 0,  # Stage 0, VP 0: layers 0-2
+                    (0, 1): 12,  # Stage 0, VP 1: layers 12-14
+                    (1, 0): 3,  # Stage 1, VP 0: layers 3-5
+                    (1, 1): 15,  # Stage 1, VP 1: layers 15-17
+                    (2, 0): 6,  # Stage 2, VP 0: layers 6-8
+                    (2, 1): 18,  # Stage 2, VP 1: layers 18-20
+                    (3, 0): 9,  # Stage 3, VP 0: layers 9-11
+                    (3, 1): 21,  # Stage 3, VP 1: layers 21-23
+                },
+            ),
+        ],
+    )
+    def test_get_layer_offset_parametrized(self, config_params, expected_offsets):
+        """
+        Parametrized test for get_transformer_layer_offset with different configurations.
+        Tests various combinations of first/last stage settings and virtual pipeline sizes.
+
+        This test verifies that the layer offset calculation correctly handles:
+        - Asymmetric pipeline stages (different layer counts per stage)
+        - Virtual pipeline parallelism (splitting physical stages into virtual stages)
+        - Various combinations of first/last stage configurations
+
+        The expected_offsets dictionary maps (pipeline_rank, vp_stage) tuples to
+        the expected starting layer index for that stage combination.
+        """
+
+        config = TransformerConfig(
+            hidden_size=512, num_attention_heads=8, use_cpu_initialization=True, **config_params
+        )
+
+        for (pipeline_rank, vp_stage), expected_offset in expected_offsets.items():
+            original_get_pipeline_rank = parallel_state.get_pipeline_model_parallel_rank
+            parallel_state.get_pipeline_model_parallel_rank = lambda: pipeline_rank
+
+            try:
+                actual_offset = get_transformer_layer_offset(config, vp_stage)
+                assert actual_offset == expected_offset, (
+                    f"Expected offset {expected_offset} for pipeline rank {pipeline_rank}, "
+                    f"VP stage {vp_stage}, but got {actual_offset}"
+                )
+            finally:
+                parallel_state.get_pipeline_model_parallel_rank = original_get_pipeline_rank
+
     @pytest.mark.parametrize('order', ['tp-pp-dp', 'tp-dp-pp'])
     @pytest.mark.parametrize('tp_pp', [(4, 2), (1, 1), (8, 1), (2, 2)])
     def test_sharded_state_dict(self, tp_pp, order):

@@ -188,6 +188,7 @@ class OptimizerConfig:
             and (
                 self.main_params_dtype != torch.float32
                 or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                or self.optimizer_cpu_offload
             )
         )
 

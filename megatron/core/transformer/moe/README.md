@@ -5,6 +5,9 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 ### What's New
 - **Support for DeepSeek-V3 architecture**
   - Enable TP for MLA and DeepSeek-V3
+  - Enable CP for MLA and DeepSeek-V3
+    - Requires TransformerEngine >= 2.5.0
+    - Many thanks to [SuperCB](https://github.com/SuperCB) from Xiaohongshu Inc. and [RandMist](https://github.com/RandMist) from WeChat Infra Department, Tencent Inc. for their contributions.
   - Support aux-loss-free load balancing strategy
   - Support node-limited routing
   - Support Multi-Token Prediction (MTP)

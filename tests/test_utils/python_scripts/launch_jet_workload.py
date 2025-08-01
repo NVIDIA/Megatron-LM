@@ -267,7 +267,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "illegal instruction" in concat_allranks_logs
         or "torch.distributed.DistNetworkError" in concat_allranks_logs
         or "Segmentation fault" in concat_allranks_logs
-        or "found NaN in local forward loss calculation" in concat_allranks_logs
+        or "found NaN in" in concat_allranks_logs
         or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
         or "double free or corruption" in concat_allranks_logs
         or "Call to CUDA function failed." in concat_allranks_logs

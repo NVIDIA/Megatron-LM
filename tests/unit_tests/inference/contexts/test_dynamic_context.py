@@ -115,17 +115,17 @@ class TestDynamicContext:
             assert dynamic_context.gtd_chunk_count == 48
             assert dynamic_context.gtd_request_count == 12
             assert dynamic_context.chunk_allocator.chunk_count_total == 491
-            assert dynamic_context.max_requests == 122
-            assert dynamic_context.max_tokens == 62464
+            assert dynamic_context.max_requests == 128
+            assert dynamic_context.max_tokens == 62848
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_conv_states is None
             assert dynamic_context.mamba_ssm_states is None
         else:
-            assert dynamic_context.gtd_chunk_count == 120
-            assert dynamic_context.gtd_request_count == 30
-            assert dynamic_context.chunk_allocator.chunk_count_total == 1206
-            assert dynamic_context.max_requests == 300
-            assert dynamic_context.max_tokens == 153600
+            assert dynamic_context.gtd_chunk_count == 112
+            assert dynamic_context.gtd_request_count == 28
+            assert dynamic_context.chunk_allocator.chunk_count_total == 1156
+            assert dynamic_context.max_requests == 320
+            assert dynamic_context.max_tokens == 153664
             assert dynamic_context.is_hybrid_model == True
             assert dynamic_context.num_mamba_layers == 1
             assert dynamic_context.mamba_conv_states is not None
@@ -423,7 +423,7 @@ class TestDynamicContext:
         assert dynamic_context.request_query_lengths[0] == context_length
         assert dynamic_context.request_kv_length_offsets[0] == 0
 
-        assert dynamic_context.request_last_kv_chunk_id[0] == 1204 if is_hybrid else 489
+        assert dynamic_context.request_last_kv_chunk_id[0].item() == (1154 if is_hybrid else 489)
         assert dynamic_context.request_last_kv_chunk_offset[0].item() == 15
         assert torch.all(
             dynamic_context.token_to_pos_ids[0:context_length]
@@ -529,7 +529,7 @@ class TestDynamicContext:
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
-            num_layers=num_layers,  # Use adjusted num_layers
+            num_layers=num_layers,
             kv_channels=8,
             num_attention_heads=2,
             max_sequence_length=512,
@@ -650,13 +650,13 @@ class TestDynamicContext:
                 dynamic_context.request_to_kv_chunk_ids[0:10].cpu()
                 == torch.tensor(
                     [
-                        [1194, 1197, -1, -1],
-                        [1195, 1194, -1, -1],
-                        [1199, 1201, -1, -1],
-                        [1200, 1202, -1, -1],
-                        [1198, -1, -1, -1],
-                        [1196, -1, -1, -1],
-                        [1203, -1, -1, -1],
+                        [1144, 1147, -1, -1],
+                        [1145, 1144, -1, -1],
+                        [1149, 1151, -1, -1],
+                        [1150, 1152, -1, -1],
+                        [1148, -1, -1, -1],
+                        [1146, -1, -1, -1],
+                        [1153, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],
                         [-1, -1, -1, -1],

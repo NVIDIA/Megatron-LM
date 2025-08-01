@@ -252,32 +252,33 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Compute max_requets, max_tokens from buffer size, overflow factor, and Mamba state size.
         def bytes_to_max_requests_and_tokens(n_bytes):
-            bytes_per_token = self.chunk_size_bytes // self.chunk_size_tokens
+            bytes_per_token = self.chunk_size_bytes / self.chunk_size_tokens
             cost_per_request_bytes = (
                 mamba_states_memory_per_request + max_sequence_length * bytes_per_token
             )
             if self.is_hybrid_model:
                 # Leave room for a buffer request in the case of padding
-                n_bytes = max(0, n_bytes - cost_per_request_bytes)
-            n_requests = n_bytes // cost_per_request_bytes
+                n_bytes -= cost_per_request_bytes
+            n_requests = n_bytes / cost_per_request_bytes
             n_tokens = n_requests * max_sequence_length
-            return int(n_requests), int(n_tokens)
+            n_requests = self.round_up_requests(int(n_requests), tp_size=tp_size)
+            n_tokens = self.round_up_tokens(int(n_tokens), tp_size=tp_size)
+            return n_requests, n_tokens
 
         self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
-
         if buffer_overflow_factor is not None:
             self.max_requests = self.round_up_requests(
-                int(self.max_requests * buffer_overflow_factor)
+                int(self.max_requests * buffer_overflow_factor), tp_size=tp_size
             )
             self.max_tokens = self.round_up_tokens(
-                int(self.max_tokens * buffer_overflow_factor / 50.0)
+                int(self.max_tokens * buffer_overflow_factor / 50.0), tp_size=tp_size
             )
 
         if max_requests_override is not None:
-            self.max_requests = self.round_up_requests(max_requests_override)
+            self.max_requests = self.round_up_requests(max_requests_override, tp_size=tp_size)
 
         if max_tokens_override is not None:
-            self.max_tokens = self.round_up_tokens(max_tokens_override)
+            self.max_tokens = self.round_up_tokens(max_tokens_override, tp_size=tp_size)
 
         self.max_requests = min(self.max_requests, self.max_tokens)  # e.g., decode only.
 
@@ -363,7 +364,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cuda_graph_step_size = cuda_graph_rounder * int(
                 math.ceil(int(self.cuda_graph_step_size) / cuda_graph_rounder)
             )
-
+            # Make sure divisble by TP size
+            self.cuda_graph_step_size = math.ceil(self.cuda_graph_step_size / tp_size) * tp_size
             # Cuda graph request counts.
             if num_cuda_graphs == 1:
                 self.cuda_graph_request_counts = [self.max_requests]
@@ -459,26 +461,46 @@ class DynamicInferenceContext(BaseInferenceContext):
     REQUEST_ROUNDER = 4
 
     @classmethod
-    def round_up_tokens(cls, value):
-        """Round up to nearest multiple of `TOKEN_ROUNDER` (above)."""
+    def round_up_tokens(cls, value, tp_size=None):
+        """Round up to nearest multiple of `TOKEN_ROUNDER` (above) that is also divisible by tensor model parallel size."""
         if not HAVE_PACKAGING:
             raise ImportError(
                 "`packaging` is required for this functionality, please install it with `pip install packaging`"
             )
         if PkgVersion(mcore_version) < PkgVersion("0.13"):
             return cls.round_up(value)
-        return cls.TOKEN_ROUNDER * int(math.ceil(int(value) / cls.TOKEN_ROUNDER))
+
+        # Make sure divisible by TP size
+        if tp_size is None:
+            # Check if parallel state is initialized before trying to get TP size
+            if parallel_state.is_initialized():
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            else:
+                tp_size = 1
+        token_rounder = math.ceil(cls.TOKEN_ROUNDER / tp_size) * tp_size
+
+        return token_rounder * int(math.ceil(int(value) / token_rounder))
 
     @classmethod
-    def round_up_requests(cls, value):
-        """Round up to nearest multiple of `REQUEST_ROUNDER` (above)."""
+    def round_up_requests(cls, value, tp_size=None):
+        """Round up to nearest multiple of `REQUEST_ROUNDER` (above) that is also divisible by tensor model parallel size."""
         if not HAVE_PACKAGING:
             raise ImportError(
                 "`packaging` is required for this functionality, please install it with `pip install packaging`"
             )
         if PkgVersion(mcore_version) < PkgVersion("0.13"):
             return cls.round_up(value)
-        return cls.REQUEST_ROUNDER * int(math.ceil(int(value) / cls.REQUEST_ROUNDER))
+
+        # Make sure divisible by TP size
+        if tp_size is None:
+            # Check if parallel state is initialized before trying to get TP size
+            if parallel_state.is_initialized():
+                tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            else:
+                tp_size = 1
+        request_rounder = math.ceil(cls.REQUEST_ROUNDER / tp_size) * tp_size
+
+        return request_rounder * int(math.ceil(int(value) / request_rounder))
 
     @classmethod
     def round_up(cls, value):
@@ -1221,21 +1243,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         # We determine how many requests we can resume and resume them
         # Assign released chunks to paused requests.
         # todo: @shanmugamr, un-pause requests using FIFO, rather than LIFO.
-        if (
-            self.chunk_allocator.chunk_count_avail
-            <= self.paused_request_count + self.gtd_chunk_count
-        ):
-            if active_request_count < self.gtd_request_count:
-                resume_request_count = min(
-                    self.paused_request_count, self.gtd_request_count - active_request_count
-                )
-            else:
-                # If there are more active requests than gtd requests and not enough
-                # chunks available, no requests can be resumed
-                resume_request_count = 0
+        num_non_gtd_chunks = max(0, self.chunk_allocator.chunk_count_avail - self.gtd_chunk_count)
+        if num_non_gtd_chunks:
+            # if we have non-gtd chunks, use them. Do not dip into the gtd-chunk pool
+            resume_request_count = min(num_non_gtd_chunks, self.paused_request_count)
         else:
-            # If there are more available chunks than (paused + gtd requests), resume all paused requests
-            resume_request_count = self.paused_request_count
+            # only dip into the gtd-chunk pool if we have run out of non-gtd-chunks and the active
+            # request count has fallen below a certain threshold.
+            resume_request_count = min(
+                max(self.gtd_request_count - active_request_count, 0), self.paused_request_count
+            )
 
         self.paused_request_count -= resume_request_count
         active_request_count += resume_request_count

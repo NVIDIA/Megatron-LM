@@ -375,28 +375,34 @@ def maybe_report_missing_and_unexpected_keys(
 def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
     """Validate consistancy across ranks for the common state dict
 
-    We save the common state dict only on rank 0. We validate to make sure that the common dict is consistant across ranks before saving.
+    We save the common state dict only on rank 0. We validate to make sure that the common dict is consistent across ranks before saving.
 
     Args:
         common_state_dict: The common state dict present in all ransk
     """
+    if not torch.distributed.is_initialized():
+        return
 
-    # Gather the common state dict across ranks onto rank 0 for comparison
+    # Broadcast the common state dict from rank 0 to all other ranks
+    # Each rank will do a comparison with its local rank vs the broadcasted state dict from rank 0
     rank = torch.distributed.get_rank()
-    other_rank_state_dicts = [None] * torch.distributed.get_world_size() if rank == 0 else None
-    torch.distributed.gather_object(common_state_dict, other_rank_state_dicts)
-    common_state_dict_diff = {}
-    if rank == 0:
-        assert other_rank_state_dicts
-        main_rank_state_dict = common_state_dict
-        for rank, rank_state_dict in enumerate(other_rank_state_dicts[1:], 1):
-            only_left, only_right, mismatch = diff(main_rank_state_dict, rank_state_dict)
-            if only_left or only_right or mismatch:
-                common_state_dict_diff[rank] = (only_left, only_right, mismatch)
 
-        if len(common_state_dict_diff) != 0:
+    object_list = [common_state_dict] if rank == 0 else [None]
+    torch.distributed.broadcast_object_list(object_list, src=0)
+    rank0_state_dict = object_list[0]
+
+    # Skip comparing rank 0 with itself
+    if rank > 0:
+        current_rank_state_dict = common_state_dict
+        only_in_rank0, only_in_current_rank, mismatch = diff(
+            rank0_state_dict, current_rank_state_dict
+        )
+        if only_in_rank0 or only_in_current_rank or mismatch:
             logger.warning(
-                f"There is difference in the common state dict in different ranks. The differences are {common_state_dict_diff}"
+                f"Rank {rank} common state dict differs from rank 0 common state dict. "
+                f"Keys only on rank 0: {only_in_rank0}, "
+                f"Keys only on {rank}: {only_in_current_rank}, "
+                f"Mismatched keys: {mismatch}"
             )
 
 

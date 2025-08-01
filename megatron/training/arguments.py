@@ -508,6 +508,8 @@ def validate_args(args, defaults={}):
                 args.num_layers_per_virtual_pipeline_stage
         else:
             args.virtual_pipeline_model_parallel_size = args.num_virtual_stages_per_pipeline_rank
+        if args.virtual_pipeline_model_parallel_size == 1:
+            args.virtual_pipeline_model_parallel_size = None
     else:
         args.virtual_pipeline_model_parallel_size = None
 
@@ -886,8 +888,6 @@ def validate_args(args, defaults={}):
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
-    if args.rotary_interleaved and args.apply_rope_fusion:
-        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     if args.rotary_interleaved and args.use_legacy_models:
         raise RuntimeError('--rotary-interleaved is not supported in legacy models.')
     if args.position_embedding_type != 'rope':
@@ -1028,6 +1028,10 @@ def validate_args(args, defaults={}):
             "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
             "as the hybrid device optimizer reuses the code path of this flag."
         )
+        assert not args.fp8_param_gather or args.fp8_recipe == "delayed", (
+            "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
+            "must be used in conjunction with `--fp8-recipe delayed`."
+        )
 
     # Check delay_wgrad_compute compatibility
     if args.delay_wgrad_compute:
@@ -1129,6 +1133,13 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['num_query_groups'] = None
     kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.rope_type is None:
+        # Pop 'rope_type' to let the config class use the default value.
+        kw_args.pop('rope_type', None)
+    else:
+        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
+            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
+        )
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
@@ -1878,6 +1889,10 @@ def _add_training_args(parser):
                        help='Disable rope fusion, the fusion is available '
                        'only when using megatron-core.',
                        dest='apply_rope_fusion')
+    group.add_argument('--rope-type', type=str, default=None,
+                      choices=['rope', 'yarn'],
+                      help='Type of rope to use. Note that MLA takes yarn by default, '
+                      'and common attention takes rope by default.')
     group.add_argument('--cross-entropy-loss-fusion', action='store_true',
                        help='Enabled fusion of cross entropy loss calculation.',
                        dest='cross_entropy_loss_fusion')
