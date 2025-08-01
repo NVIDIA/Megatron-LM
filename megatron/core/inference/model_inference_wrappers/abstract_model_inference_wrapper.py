@@ -117,7 +117,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
 
-        self.inference_context.reset()
+        self.inference_context = type(self.inference_context).from_config(self.inference_wrapper_config)
 
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
