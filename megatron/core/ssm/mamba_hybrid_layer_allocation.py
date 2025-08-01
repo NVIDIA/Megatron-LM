@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
-from itertools import count
 from typing import Dict, List, Tuple
 
 if __name__ != "__main__":
@@ -169,12 +168,13 @@ def get_layer_maps_from_layer_type_list(
     Returns maps from global layer index to the corresponding layer index
     for each layer type in [Attention, Mamba, MLP] given a layer type list.
     """
-    layer_maps = []
-    for symbol in [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP]:
-        counter = count()
-        layer_map = {i: next(counter) for i, ch in enumerate(layer_type_list) if ch == symbol}
-        layer_maps.append(layer_map)
-    return layer_maps
+    layer_types = [Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP]
+    layer_maps = {layer_type: {} for layer_type in layer_types}
+    for global_layer_idx, layer_type in enumerate(layer_type_list):
+        layer_map = layer_maps[layer_type]
+        local_layer_idx = len(layer_map)
+        layer_map[global_layer_idx] = local_layer_idx
+    return [layer_maps[layer_type] for layer_type in layer_types]
 
 
 if __name__ == "__main__":

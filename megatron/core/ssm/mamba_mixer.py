@@ -555,6 +555,9 @@ class MambaMixer(MegatronModule):
                 self.cp.cp_size == 1 or self.rmsnorm
             ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
 
+            # Note that both `seq_idx` and `cu_seqlens` must be passed in
+            # for variable length generation.
+            # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97 # pylint: disable=line-too-long
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
