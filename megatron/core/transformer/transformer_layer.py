@@ -720,7 +720,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 self.self_attention,
                 self.pre_cross_attn_layernorm,
                 self.cross_attention,
-                self.pre_mlp_layernorm,
             ]
 
         param_modules = []

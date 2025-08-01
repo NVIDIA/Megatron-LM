@@ -207,6 +207,10 @@ class MLP(MegatronModule):
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
+    def backward_dw(self):
+        self.linear_fc2.backward_dw()
+        self.linear_fc1.backward_dw()
+
 
 # pylint: disable=missing-function-docstring
 def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):

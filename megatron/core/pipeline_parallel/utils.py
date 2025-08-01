@@ -1,10 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
 
 import torch
 from torch.autograd import Variable
 
+from megatron.core import parallel_state
 from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
 
 
@@ -78,6 +81,24 @@ def stream_acquire_context(stream, event):
         yield
     finally:
         event.record(stream)
+
+
+class NoopScheduleNode:
+    """A placeholder node in the computation graph that simply passes through inputs and outputs.
+
+    This class is used as a no-op node in the scheduling system when a real computation node
+    is not needed but the interface must be maintained (e.g., dense layer doesn't need
+    moe_dispatch and moe_combine). It simply returns its inputs unchanged
+    in both forward and backward passes.
+    """
+
+    def forward(self, inputs):
+        """Passes through inputs unchanged in the forward pass."""
+        return inputs
+
+    def backward(self, outgrads):
+        """Passes through gradients unchanged in the backward pass."""
+        return outgrads
 
 
 class ScheduleNode:
@@ -220,3 +241,73 @@ class ScheduleNode:
         self.output = None
         del self.forward_func
         del self.backward_func
+
+
+class AbstractSchedulePlan(ABC):
+    """To use combined 1f1b, model must implement build_schedule_plan while take the same
+    signature as model forward but return an instance of AbstractSchedulePlan"""
+
+    @staticmethod
+    @abstractmethod
+    def run(
+        f_schedule_plan,
+        b_schedule_plan,
+        grad=None,
+        pre_forward=None,
+        pre_backward=None,
+        post_forward=None,
+        post_backward=None,
+    ):
+        """run() is the protocol between our schedule logic and model, which is used to schedule
+        the forward and backward schedule plans for the models.
+        """
+        ...
+
+
+_COMP_STREAM = None
+_COMM_STREAM = None
+
+
+def set_streams(comp_stream=None, comm_stream=None):
+    """Set the streams for communication and computation"""
+    global _COMP_STREAM
+    global _COMM_STREAM
+    if _COMP_STREAM is not None and _COMM_STREAM is not None:
+        return
+
+    if comp_stream is None:
+        comp_stream = torch.cuda.current_stream()
+    if comm_stream is None:
+        comm_stream = torch.cuda.Stream(device="cuda")
+
+    assert _COMP_STREAM is None
+    assert _COMM_STREAM is None
+    _COMP_STREAM = comp_stream
+    _COMM_STREAM = comm_stream
+
+
+def get_comp_stream():
+    """Get the stream for computation"""
+    global _COMP_STREAM
+    return _COMP_STREAM
+
+
+def get_comm_stream():
+    """Get the stream for communication"""
+    global _COMM_STREAM
+    return _COMM_STREAM
+
+
+class VppContextManager:
+    """A reusable context manager for switch vpp stage"""
+
+    def __init__(self, vpp_rank):
+        self.vpp_rank = vpp_rank
+
+    def __enter__(self):
+        self.origin_vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        parallel_state.set_virtual_pipeline_model_parallel_rank(self.vpp_rank)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)
