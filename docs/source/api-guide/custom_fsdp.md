@@ -21,12 +21,12 @@ Add these flag to enable MCore custom FSDP.
 
 ## Configuration Recommendations
 
-### 1. Disable `CUDA_MAX_CONNECTIONS`
+### 1. Disable `CUDA_DEVICE_MAX_CONNECTIONS`
 
-To ensure full parallelization of FSDP communication and computation, disable the CUDA_MAX_CONNECTIONS environment variable. This step avoids potential bubble in CUDA stream. (But it may slow down TP and CP to some extent.)
+To ensure full parallelization of FSDP communication and computation, disable the CUDA_DEVICE_MAX_CONNECTIONS environment variable. This step avoids potential bubble in CUDA stream. (But it may slow down TP and CP to some extent.)
 
 ```bash
-unset CUDA_MAX_CONNECTIONS
+unset CUDA_DEVICE_MAX_CONNECTIONS
 ```
 
 ### 2. Add `--calculate-per-token-loss`
