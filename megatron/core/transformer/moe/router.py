@@ -387,7 +387,7 @@ class TopKRouter(Router):
                     torch.tensor(1.0 - eps, device=input.device),
                     torch.tensor(1.0 + eps, device=input.device),
                 ).rsample
-            return input * self.input_jitter(input.shape)
+            return input * self.input_jitter(input.shape).type_as(input)
         else:
             return input
 
