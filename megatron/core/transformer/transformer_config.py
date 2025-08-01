@@ -1227,6 +1227,55 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
 
+        if self.overlap_moe_expert_parallel_comm:
+            # TODO: remove this after we fix the hang issue with torch version < 2.6.0
+            assert is_torch_min_version(
+                "2.6.0"
+            ), "A2A Overlap encounters hang issue with torch version < 2.6.0"
+            # Basic requirements for overlap_moe_expert_parallel_comm
+            assert (
+                self.pipeline_model_parallel_size == 1
+            ), '(Temporary) overlap_moe_expert_parallel_comm is not supported when PP>1.'
+            # Expert model parallelism requirements
+            assert (
+                self.expert_model_parallel_size > 1
+            ), 'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
+            assert self.moe_token_dispatcher_type in [
+                'alltoall',
+                'flex',
+            ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
+
+            assert (
+                self.recompute_granularity != 'full'
+            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.recompute_method is None
+            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.recompute_num_layers is None
+            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+
+            # Check if bf16 or fp16 is used
+            assert (
+                self.bf16 or self.fp16
+            ), 'overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
+
+            assert (
+                not self.moe_shared_expert_overlap
+            ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.mtp_num_layers is None
+            ), '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
+
+        # Check delay_wgrad_compute compatibility
+        if self.delay_wgrad_compute:
+            assert (
+                self.overlap_moe_expert_parallel_comm
+            ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
+            assert (
+                not self.moe_use_legacy_grouped_gemm
+            ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (

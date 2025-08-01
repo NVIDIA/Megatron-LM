@@ -1990,3 +1990,27 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
         return func
 
     return decorator
+
+
+def unwrap_model(model, module_instances=None):
+    """Unwrap_model to return the final model instance"""
+    if module_instances is None:
+        from megatron.core.distributed import DistributedDataParallel as DDP
+        from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
+        from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
+        from megatron.core.transformer.module import Float16Module
+
+        module_instances = (DDP, torch_FSDP, custom_FSDP, Float16Module)
+
+    return_list = True
+    if not isinstance(model, list):
+        model = [model]
+        return_list = False
+    unwrapped_model = []
+    for model_module in model:
+        while isinstance(model_module, module_instances):
+            model_module = model_module.module
+        unwrapped_model.append(model_module)
+    if not return_list:
+        return unwrapped_model[0]
+    return unwrapped_model

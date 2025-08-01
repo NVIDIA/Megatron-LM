@@ -237,6 +237,14 @@ class ModelParallelConfig:
        Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
     """
 
+    overlap_moe_expert_parallel_comm: bool = False
+    """Overlap EP A2A communications with independent computations of different micro-batches
+    in 1f1b phase of pipelining or non-pipelining schedule.
+    """
+
+    delay_wgrad_compute: bool = False
+    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
     ###################
     # Pipeline Parallel
     ###################
@@ -306,9 +314,6 @@ class ModelParallelConfig:
        rank 0 | 0 1 2 0 1 2 3 4 3 4 
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
-
-    delay_wgrad_compute: bool = False
-    """If true, delay the wgrad compute for better overlapping in combined 1F1B."""
 
     ###################
     # CPU Offloading

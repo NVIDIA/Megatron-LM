@@ -519,6 +519,64 @@ class GPTModel(LanguageModule):
             return self.output_layer.weight
         return None
 
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+    ):
+        """Builds a computation schedule plan for the model.
+
+        This function creates a schedule plan for a model chunk, including
+        preprocessing, transformer layers, and postprocessing.
+        The schedule plan is used to optimize computation and memory usage
+        in distributed environments.
+
+        Args:
+            input_ids (Tensor): Input token IDs.
+            position_ids (Tensor): Position IDs.
+            attention_mask (Tensor): Attention mask.
+            decoder_input (Tensor, optional): Decoder input tensor. Defaults to None.
+            labels (Tensor, optional): Labels for loss computation. Defaults to None.
+            inference_context (BaseInferenceContext, optional):
+                Inference context. Defaults to None.
+            packed_seq_params (PackedSeqParams, optional):
+                Parameters for packed sequences. Defaults to None.
+            extra_block_kwargs (dict, optional):
+                Additional keyword arguments for blocks. Defaults to None.
+            runtime_gather_output (Optional[bool], optional):
+                Whether to gather output at runtime. Defaults to None.
+            inference_params (InferenceParams, optional):
+                Parameters for inference. Defaults to None.
+            loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
+
+        Returns:
+            TransformerModelChunkSchedulePlan: The model chunk schedule plan.
+        """
+
+        from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+
+        return TransformerModelChunkSchedulePlan(
+            self,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            extra_block_kwargs,
+            runtime_gather_output,
+            loss_mask,
+        )
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
     ) -> ShardedStateDict:
