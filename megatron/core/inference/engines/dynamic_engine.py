@@ -25,6 +25,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.inference.utils import Counter
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.training import print_rank_0
 
 try:
     from tqdm import tqdm
@@ -97,7 +98,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_cuda_graph = enable_cuda_graph
         if enable_cuda_graph:
 
-            print(
+            print_rank_0(
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
                 % (len(context.cuda_graph_request_counts), context.cuda_graph_request_counts)
             )
@@ -120,7 +121,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if HAVE_TQDM:
                     tbar.set_description(tbar_str)
                 else:
-                    print(f"{tbar_idx}/{len(context.cuda_graph_request_counts)}. {tbar_str}")
+                    print_rank_0(f"{tbar_idx}/{len(context.cuda_graph_request_counts)}. {tbar_str}")
 
                 # Get flat tokens, position ids.
                 input_ids, position_ids = context.current_input_and_position_ids(
@@ -338,7 +339,7 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_requests: List[DynamicInferenceRequest] = []
 
         # Print context state.
-        if verbose and torch.distributed.get_rank() == 0:
+        if verbose:
             context = self.context
             mem = torch.cuda.memory_stats()
             output_str = (
@@ -377,7 +378,7 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if prev_is_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
-            print(output_str)
+            print_rank_0(output_str)
 
         self.step_count += 1
         range_pop()

@@ -493,23 +493,23 @@ class MambaMixer(MegatronModule):
 
             # Compute short convolution
             if conv_state is not None:
-                # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
-                # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 if inference_context.is_dynamic_batching():
                     # xBC should have shape (b l d) for causal_conv1d_varlen_states
-                    conv_varlen_states = causal_conv1d_varlen_states(
-                        xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+                    conv_state.copy_(
+                        causal_conv1d_varlen_states(
+                            xBC.squeeze(0), cu_seqlens, state_len=conv_state.shape[-1]
+                        )
                     )
-                    if conv_varlen_states.shape != conv_state.shape:
-                        torch.distributed.breakpoint(0)
-                    conv_state.copy_(conv_varlen_states)
 
-                    # transpose: b l pd --> b pd l
-                    xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+                    # Maintain channels-last memory layout to use seq_idx for causal_conv1d_fn
+                    # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
+                    xBC = xBC.transpose(1, 2)
                 else:
                     # transpose: b l pd --> b pd l
                     xBC = rearrange(xBC, "b l d -> b d l").contiguous()
 
+                    # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                    # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                     conv_state.copy_(
                         F.pad(xBC, (self.d_conv - xBC.shape[-1], 0))
                     )  # Update state (B D W)
@@ -519,14 +519,8 @@ class MambaMixer(MegatronModule):
                 xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
-                if inference_context.is_dynamic_batching():
-                    # Convert to channels-last memory layout to use seq_idx
-                    # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
-                    xBC_ = xBC.transpose(1, 2).contiguous().transpose(1, 2)
-                else:
-                    xBC_ = xBC
                 xBC = causal_conv1d_fn(
-                    x=xBC_,
+                    x=xBC,
                     weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
                     bias=self.cp.get_conv1d_bias(),
                     activation=self.activation,
