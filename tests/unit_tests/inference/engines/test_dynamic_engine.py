@@ -67,7 +67,7 @@ class DynamicEngineTestConfig:
     """Test configuration args."""
 
     set_rounder(4)
-    num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1)
+    num_requests: int = 2 * DynamicInferenceContext.round_up_requests(1, 1)
     max_prompt_length: int = 16
     max_output_length: int = 4
     num_gap_steps: int = 2
