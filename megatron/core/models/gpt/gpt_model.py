@@ -313,7 +313,10 @@ class GPTModel(LanguageModule):
 
         if (
             in_inference_mode
-            and (self.config.enable_cuda_graph or self.config.flash_decode)
+            and (
+                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                or self.config.flash_decode
+            )
             and rotary_pos_cos is not None
             and inference_context.is_static_batching()
         ):

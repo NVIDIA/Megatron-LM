@@ -298,7 +298,10 @@ class MambaStack(MegatronModule):
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
         if (
-            (self.config.enable_cuda_graph or self.config.flash_decode)
+            (
+                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                or self.config.flash_decode
+            )
             and inference_context
             and inference_context.is_static_batching()
             and not self.training
