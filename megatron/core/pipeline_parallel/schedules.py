@@ -24,7 +24,7 @@ from megatron.core.utils import (
 
 from .combined_1f1b import (
     combined_1f1b_schedule_for_no_pipelining,
-    combined_forward_backward_step_for_interleaved_pipelining,
+    combined_1f1b_schedule_for_interleaved_pipelining,
 )
 
 # Types
@@ -1160,7 +1160,7 @@ def forward_backward_pipelining_with_interleaving(
         wrap forward_helper, backward_helper, and combined_forward_backward_helper in a unified way
         """
         if config.overlap_moe_expert_parallel_comm and not forward_only:  # Combined 1F1B path
-            return combined_forward_backward_step_for_interleaved_pipelining(
+            return combined_1f1b_schedule_for_interleaved_pipelining(
                 config,
                 forward_step_func,
                 data_iterator,
@@ -1419,7 +1419,7 @@ def forward_backward_pipelining_with_interleaving(
 
             backward_k = k
 
-            # output send / receive sync
+            # Sync forward recv
             def pp_pre_forward(vp_stage=None):
                 if vp_stage is None:
                     vp_stage = get_model_chunk_id(forward_k, forward=True)
@@ -1438,7 +1438,7 @@ def forward_backward_pipelining_with_interleaving(
 
                 deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
 
-            # output async send / receive
+            # Async forward send / receive
             def pp_post_forward(output_tensor, vp_stage=None):
                 nonlocal send_next_wait_handle
                 nonlocal fwd_recv_buffer
@@ -1492,7 +1492,7 @@ def forward_backward_pipelining_with_interleaving(
 
                 return output_tensor
 
-            # grad send receive sync
+            # Sync backward recv
             def pp_pre_backward(vp_stage=None):
                 nonlocal recv_next_wait_handles
                 if vp_stage is None:
@@ -1510,7 +1510,7 @@ def forward_backward_pipelining_with_interleaving(
                             recv_next_wait_handle = recv_next_wait_handles.pop(0)
                             recv_next_wait_handle.wait()
 
-            # async grad send receive
+            # Async backward send / receive
             def pp_post_backward(input_tensor_grad, vp_stage=None):
                 nonlocal send_prev_wait_handle
                 nonlocal bwd_wait_handles

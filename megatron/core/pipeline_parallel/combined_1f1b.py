@@ -121,7 +121,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     return forward_data_store, total_num_tokens
 
 
-def combined_forward_backward_step_for_interleaved_pipelining(
+def combined_1f1b_schedule_for_interleaved_pipelining(
     config,
     forward_step_func,
     data_iterator,
@@ -146,8 +146,45 @@ def combined_forward_backward_step_for_interleaved_pipelining(
 ):
     """Helper method to run combined forward and backward step for A2A communication hiding.
     This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
-    eventually calls `forward_backward_step` function defined in `combined_1f1b.py`.
-    This method is called only if `overlap_moe_expert_parallel_comm` is true."""
+    eventually calls `combined_forward_backward_step` function defined in `combined_1f1b.py`.
+    This method is called only if `overlap_moe_expert_parallel_comm` is true.
+
+    Args:
+        The arguments could be categorized into 2 groups:
+        - Common arguments
+          - f_virtual_microbatch_id, b_virtual_microbatch_id,
+        - Arguments for combined_forward_backward_step()
+          - config, forward_step_func, data_iterator, model, num_microbatches, forward_data_store
+          - check_first_val_step, is_first_microbatch_for_model_chunk, collect_non_loss_data
+          - pre_forward, pre_backward, post_forward, post_backward
+        - Callables for the forward_step_helper() and backward_step_helper()
+          - forward_step_helper_preprocess, forward_step_helper_postprocess
+          - backward_step_helper_preprocess, backward_step_helper_postprocess
+          - get_microbatch_id_in_model_chunk, get_model_chunk_id
+
+    Returns:
+        output_tensor (Tensor or list[Tensor]): The output object(s) from the forward step.
+        input_tensor_grad (Tensor): The grad of the input tensor.
+
+    Descriptions:
+        This method merges the forward_step_helper() and backward_step_helper() methods in the schedules.py file.
+        Assuming that:
+            def forward_step_helper():
+                # forward_step_helper_preprocess()
+                # forward_step()
+                # forward_step_helper_postprocess()
+            def backward_step_helper():
+                # backward_step_helper_preprocess()
+                # backward_step()
+                # backward_step_helper_postprocess()
+        Then the combined_1f1b_schedule_for_interleaved_pipelining() method will be:
+            def combined_1f1b_schedule_for_interleaved_pipelining():
+                # forward_step_helper_preprocess()
+                # backward_step_helper_preprocess()
+                # combined_forward_backward_step() // merged forward_step() and backward_step()
+                # forward_step_helper_postprocess()
+                # backward_step_helper_postprocess()
+    """
 
     set_streams()
     # forward prepare
