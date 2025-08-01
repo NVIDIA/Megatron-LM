@@ -659,6 +659,9 @@ def validate_args(args, defaults={}):
             if args.rank == 0:
                 print('accumulate and all-reduce gradients in fp32 for '
                       'bfloat16 data type.', flush=True)
+    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+        assert not args.check_for_nan_in_loss_and_grad, \
+            "--no-check-for-nan-in-loss-and-grad should be set with full_iteration CUDA graph"
 
     if args.rank == 0:
         print('using {} for parameters ...'.format(args.params_dtype),
@@ -1234,18 +1237,20 @@ def _add_inference_args(parser):
     group.add_argument('--flash-decode', default=False, action="store_true",
                        help='Whether to use the flash decoding kernel.')
     group.add_argument('--enable-cuda-graph', default=False, action="store_true",
-                       help='Use CUDA graph capture and replay.')
+                       help='Use CUDA graph capture and replay. --cuda-graph-scope=\"full_iteration\" '
+                       'enables whole iteration CUDA graph. ')
     group.add_argument("--cuda-graph-warmup-steps", type=int, default=3,
                        help="Number of CUDA graph warmup steps")
     group.add_argument('--external-cuda-graph', action='store_true',
                        help='Use CUDA graph capture and replay. The CUDA graphs are'
                        'manually captured in the training script.')
     group.add_argument('--cuda-graph-scope', type=str, default='full',
-                       choices=['full', 'attn'],
+                       choices=['full', 'attn', 'full_iteration'],
                        help='Determines the CUDA graphs capturing scope. Valid values are '
-                       '\"full\" and \"attn\". \"Full\" scope captures a whole '
+                       '\"full\", \"attn\" and \"full_iteration\". \"Full\" scope captures a whole '
                        'Transformer layer. \"Attn\" scope only captures operations in '
-                       'TransformerLayer._forward_attention().')
+                       'TransformerLayer._forward_attention(). \"ful_iteration\" scope captures a '
+                       'whole iteration.')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')

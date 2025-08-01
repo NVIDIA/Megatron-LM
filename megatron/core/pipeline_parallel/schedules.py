@@ -522,7 +522,11 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+    if (
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
+    ):
         create_cudagraphs()
 
     return forward_data_store
@@ -765,7 +769,7 @@ def forward_backward_pipelining_with_interleaving(
 
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     forward_data_store = []
     output_tensor_grads = None
@@ -1579,7 +1583,11 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+    if (
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
+    ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
@@ -1806,7 +1814,7 @@ def forward_backward_pipelining_without_interleaving(
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if not forward_only:
         input_tensors = []
@@ -1991,7 +1999,11 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+    if (
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
+    ):
         create_cudagraphs()
 
     return forward_data_store

@@ -551,7 +551,9 @@ class TransformerConfig(ModelParallelConfig):
     # Cuda Graphs
     ##################
     enable_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
+    """When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
+    CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
+    determines the scope of graph capture."""
 
     cuda_graph_use_single_mempool: bool = False
     """When set to true, cudagraphs will be captured inside a single mempool, in which all
@@ -572,9 +574,11 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
     cuda_graph_scope: str = "full"
-    """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
-    capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
-    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
+    """Determines the CUDA graphs capturing scope. When external_cuda_graph is set to true,
+    valid values are "full" and "attn". "Full" scope captures a whole Transformer
+    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention().
+    When enable_cuda_graph is set to true, "full_iteration" can be specified as cuda_graph_scope
+    to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
     # miscellaneous
