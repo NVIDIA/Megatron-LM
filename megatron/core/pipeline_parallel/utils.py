@@ -258,7 +258,9 @@ class AbstractSchedulePlan(ABC):
         post_forward=None,
         post_backward=None,
     ):
-        """forward_backward is the protocol between our schedule logic and model"""
+        """run() is the protocol between our schedule logic and model, which is used to schedule
+        the forward and backward schedule plans for the models.
+        """
         ...
 
 

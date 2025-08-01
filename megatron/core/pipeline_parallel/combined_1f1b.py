@@ -54,14 +54,14 @@ def combined_1f1b_schedule_for_no_pipelining(
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
         data_iterator,
-        model,
+        model, # f_model
         num_microbatches,
         input_tensor,
         forward_data_store,
-        None,
+        None, # b_model
         input_tensor,
-        None,
-        None,
+        None, # b_output_tensor
+        None, # b_output_tensor_grad
         config,
         f_context=f_context,
         b_context=b_context,
@@ -79,14 +79,14 @@ def combined_1f1b_schedule_for_no_pipelining(
             output_tensor, num_tokens, _ = combined_forward_backward_step(
                 forward_step_func,
                 data_iterator,
-                model,
+                model, # f_model
                 num_microbatches,
                 input_tensor,
                 forward_data_store,
-                model,
-                input_tensor,
-                output_tensor,
-                output_tensor_grad,
+                model, # b_model
+                input_tensor, # b_input_tensor
+                output_tensor, # b_output_tensor
+                output_tensor_grad, # b_output_tensor_grad
                 config,
                 f_context=f_context,
                 b_context=b_context,
@@ -97,17 +97,18 @@ def combined_1f1b_schedule_for_no_pipelining(
             )
     total_num_tokens += num_tokens
     # The backward step for the last microbatch is executed alone, no a2a overlapping
+    # Run computation for last microbatch out of context handler (want to synchronize gradients).
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
         data_iterator,
-        None,
+        None, # f_model
         num_microbatches,
         input_tensor,
         forward_data_store,
-        model,
-        input_tensor,
-        output_tensor,
-        output_tensor_grad,
+        model, # b_model
+        input_tensor, # b_input_tensor
+        output_tensor, # b_output_tensor
+        output_tensor_grad, # b_output_tensor_grad
         config,
         f_context=f_context,
         b_context=b_context,
