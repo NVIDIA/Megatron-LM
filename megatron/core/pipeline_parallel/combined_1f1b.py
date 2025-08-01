@@ -167,7 +167,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
         input_tensor_grad (Tensor): The grad of the input tensor.
 
     Descriptions:
-        This method merges the forward_step_helper() and backward_step_helper() methods in the schedules.py file.
+        This method merges the forward_step_helper() and backward_step_helper() in schedules.py.
         Assuming that:
             def forward_step_helper():
                 # forward_step_helper_preprocess()
