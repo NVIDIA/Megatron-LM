@@ -320,8 +320,9 @@ def combined_forward_backward_step(
             # The return value becomes (forward_schedule_plan, loss_function),
             # which is used to be (forward_output_tensor, loss_function).
             with context_manager:  # autocast context
-                unwrapped_model = get_attr_wrapped_model(f_model, "build_schedule_plan",
-                    return_model_obj=True)
+                unwrapped_model = get_attr_wrapped_model(
+                    f_model, "build_schedule_plan", return_model_obj=True
+                )
                 from megatron.core.models.gpt.gpt_model import GPTModel
 
                 assert isinstance(unwrapped_model, GPTModel), (
