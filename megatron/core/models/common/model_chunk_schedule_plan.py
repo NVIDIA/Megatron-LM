@@ -179,6 +179,8 @@ class TransformerLayerSchedulePlan:
         When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
         comm_stream: combine_bwd            | dispatch_fwd->dispatch_bwd  | combine_fwd
         comp_stream: attn_fwd->post_attn_fwd| mlp_bwd->mlp_bwd_dw->mlp_fwd| post_attn_bwd->attn_bwd
+        For MTP, mtp_post_process_fwd is executed after the combine_fwd in the comp_stream,
+        and mtp_post_process_bwd is executed before the combine_bwd in the comp_stream.
 
         Args:
             f_layer (TransformerLayerSchedulePlan): Forward layer (for current microbatch)

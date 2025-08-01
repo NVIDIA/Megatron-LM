@@ -1992,18 +1992,6 @@ def nvtx_decorator(message: Optional[str] = None, color: Optional[str] = None):
     return decorator
 
 
-def return_parent_te_linear_module(model, param):
-    """Check if a parameter is in a TE linear module."""
-    from megatron.core.extensions.transformer_engine import TE_LINEAR_MODULE_CLASSNAMES
-
-    for module in model.modules():
-        if isinstance(module, TE_LINEAR_MODULE_CLASSNAMES):
-            for param_value in module.parameters():
-                if param is param_value:
-                    return module
-    return None
-
-
 def unwrap_model(model, module_instances=None):
     """Unwrap_model to return the final model instance"""
     if module_instances is None:

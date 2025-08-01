@@ -12,7 +12,7 @@ from ..fp8_utils import is_float8tensor
 from ..process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
-from ..utils import log_single_rank, return_parent_te_linear_module
+from ..utils import log_single_rank
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
@@ -403,21 +403,22 @@ class DistributedDataParallel(_BaseDataParallel):
         self.grad_accs = []
         for param in self.module.parameters():
             if param.requires_grad:
-                # When delay_wgrad_compute is True, register the backward post hook for
-                # TE Linear modules instead of the param so that the wgrad accumulation and reduce
-                # will be performed in the backward_dw() method of the TE Linear modules
-                # instead of the hook of backward() method.
+                # When delay_wgrad_compute is True and the param is marked with
+                # skip_backward_post_hook, register the backward post hook for its module
+                # instead of the param so that the wgrad accumulation and reduce will be performed
+                # in the backward_dw() method of the module instead of the hook of backward() method.
+                # Otherwise, register the backward post hook for the param.
                 if self.ddp_config.delay_wgrad_compute and getattr(
                     param, 'skip_backward_post_hook', False
                 ):
-                    parent_te_linear_module = return_parent_te_linear_module(self.module, param)
-                    assert parent_te_linear_module is not None
-                    assert hasattr(
-                        parent_te_linear_module, 'register_wgrad_accumulation_and_reduce_hooks'
-                    ), 'TE Linear module must register wgrad_accumulation_and_reduce_hooks'
-                    parent_te_linear_module.register_wgrad_accumulation_and_reduce_hooks(
-                        self._make_backward_post_hook(param)
-                    )
+                    for module in self.module.modules():
+                        if hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
+                            for param_value in module.parameters():
+                                if param is param_value:
+                                    module.register_wgrad_accumulation_and_reduce_hooks(
+                                        self._make_backward_post_hook(param)
+                                    )
+                                    break
                 else:
                     # Expand so we get access to grad_fn.
                     param_tmp = param.expand_as(param)
