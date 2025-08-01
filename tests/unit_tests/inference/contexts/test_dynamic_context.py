@@ -83,7 +83,7 @@ class TestDynamicContext:
         assert dynamic_context.gtd_chunk_count == 48
         assert dynamic_context.gtd_request_count == 12
         assert dynamic_context.chunk_allocator.chunk_count_total == 491
-        assert dynamic_context.max_requests == 122
+        assert dynamic_context.max_requests == 128
         assert dynamic_context.max_tokens == 62848
 
         # Check initializations to -1

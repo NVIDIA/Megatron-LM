@@ -26,6 +26,8 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import get_attention_mask
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_model_config
 
 try:
@@ -429,9 +431,11 @@ class TextGenerationController:
         # Get flat tokens, position ids.
         input_ids, position_ids = context.current_input_and_position_ids()
 
+        model_config = get_model_config(self.inference_wrapped_model.model)
+
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
-        symmetric_ar_type = get_model_config(self.inference_wrapped_model.model).symmetric_ar_type
+        symmetric_ar_type = model_config.symmetric_ar_type
         nccl_all_reduce_for_prefill = (
             self.inference_wrapped_model.inference_wrapper_config.nccl_all_reduce_for_prefill
         )
@@ -680,6 +684,21 @@ class TextGenerationController:
             assert (
                 not self.inference_wrapped_model.inference_context.is_decode_only()
             ), f"Generation must start in prefill mode"
+
+            # Sequence parallelism is required for MoE layers when using expert parallelism (EP)
+            # becausethe expert routing mechanism relies on sequence parallelism's communication
+            # infrastructure to distribute tokens across expert ranks. However, sequence parallelism
+            # is not currently supported for non-MoE layers during inference,so we selectively
+            # disable it for all other layer types. This is safe because MoE layers perform an
+            # all-gather operation on sequences before passing data to subsequent layers, ensuring
+            # that each rank has the complete sequence data needed for the next non-MoE layer.
+            tp_size = model_config.tensor_model_parallel_size
+            ep_size = model_config.expert_model_parallel_size
+            model_is_tp_ep = tp_size > 1 and ep_size > 1
+            if model_is_tp_ep:
+                set_model_to_sequence_parallel(
+                    self.inference_wrapped_model.model.module, False, exclude_modules=[BaseMoELayer]
+                )
 
             # If using symmetric kernels and we are using using nccl
             # for prefill turn off symmetric kernels
