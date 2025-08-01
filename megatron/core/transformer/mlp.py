@@ -171,7 +171,9 @@ class MLP(MegatronModule):
 
                 def glu(x):
                     x = torch.chunk(x, 2, dim=-1)
-                    return self.config.activation_func(x[0]) * (x[1] + self.config.glu_linear_offset)
+                    x_glu = x[0].clamp(min=None, max=7)
+                    x_linear = x[1].clamp(min=-7, max=7)
+                    return self.config.activation_func(x_glu) * (x_linear + self.config.glu_linear_offset)
 
                 intermediate_parallel = glu(intermediate_parallel)
             else:
