@@ -40,7 +40,7 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/venv
 ENV PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 ENV UV_LINK_MODE=copy
 
-RUN 
+RUN
 ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
@@ -57,6 +57,7 @@ RUN bash -ex <<"EOF"
     bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment lts
 EOF
 ENV PYTHONPATH="/opt/megatron-lm:$PYTHONPATH"
+COPY assets/ /opt/data/
 
 ##### For NVIDIANS only #####
 FROM main as jet

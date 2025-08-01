@@ -14,6 +14,7 @@ warnings.warn(
     DeprecationWarning,
 )
 from .dynamic_context import (
+    ActiveRequestCountOverflowError,
     ChunkOverflowError,
     ContextOverflowError,
     DynamicInferenceContext,

@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,9 @@ import torch.distributed
 
 from megatron.core import config
 from megatron.core.utils import is_te_min_version
+from tests.test_utils.python_scripts.download_unit_tests_dataset import (
+    get_oldest_release_and_assets,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -66,3 +70,28 @@ def tmp_path_dist_ckpt(tmp_path_factory) -> Path:
 
     else:
         yield tmp_dir
+
+
+@pytest.fixture(scope="session", autouse=True)
+def ensure_test_data():
+    """Ensure test data is available at /opt/data by downloading if necessary."""
+    data_path = Path("/opt/data")
+
+    # Check if data directory exists and has content
+    if not data_path.exists() or not any(data_path.iterdir()):
+        print("Test data not found at /opt/data. Downloading...")
+
+        try:
+            # Download assets to /opt/data
+            get_oldest_release_and_assets(assets_dir=str(data_path))
+
+            print("Test data downloaded successfully.")
+
+        except ImportError as e:
+            print(f"Failed to import download function: {e}")
+            # Don't fail the tests, just warn
+        except Exception as e:
+            print(f"Failed to download test data: {e}")
+            # Don't fail the tests, just warn
+    else:
+        print("Test data already available at /opt/data")

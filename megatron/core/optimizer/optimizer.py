@@ -23,7 +23,6 @@ except ImportError:
 
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        import warnings
 
         warnings.warn(
             'Transformer Engine and Apex are not installed. '
@@ -800,7 +799,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -953,7 +951,6 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
@@ -1139,6 +1136,15 @@ class ChainedOptimizer(MegatronOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
+        metadata = kwargs.get('metadata') or {}
+        should_add_prefix = True  # Backward-compatibility
+        if (
+            metadata.get('chained_optim_avoid_prefix', False)
+            # This condition should be True if a distributed optimizer isn't used
+            and metadata.get('distrib_optim_sharding_type') != 'dp_zero_gather_scatter'
+        ):
+            should_add_prefix = False
+
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].sharded_state_dict(
                 model_sharded_state_dict, is_loading, **kwargs
@@ -1150,7 +1156,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 optim_state_dict = optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
-                add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                if should_add_prefix:
+                    add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 

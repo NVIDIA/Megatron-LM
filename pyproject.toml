@@ -20,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch", "numpy<2.0.0"]
+dependencies = ["torch", "numpy<2.0.0", "packaging~=25.0"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -67,14 +67,16 @@ mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb"]
 
 dev = [
     "tqdm",
-    "einops",
-    "tensorstore!=0.1.46,!=0.1.72",
-    "nvtx",
-    "transformers",
-    "multi-storage-client",
+    "einops~=0.8",
+    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
+    "nvtx~=0.2",
+    "transformers~=4.53",
+    "multi-storage-client~=0.20.3",
+    "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
-    "nvidia-modelopt[torch]~=0.31.0; sys_platform != 'darwin'",
-    "megatron-energon[av_decode]<7",
+    "nvidia-modelopt[torch]>=0.31.0a0,<0.32.0; sys_platform != 'darwin'",
+    "megatron-energon[av_decode]~=6.0",
+    "flashinfer-python",
 ]
 
 lts = [
@@ -92,11 +94,12 @@ test = [
     "coverage",
     "nltk",
     "wrapt",
-    "pytest",
+    "pytest==8.3.5",
     "pytest-mock",
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
+    "pygithub",
 ]
 
 build = [
@@ -120,7 +123,7 @@ default-groups = ["linting", "build", "test"]
 
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
-# We don't want to install torch, torchvision, and triton 
+# We don't want to install torch, torchvision, and triton
 # because they are already installed in the base image.
 override-dependencies = [
     "torch; sys_platform == 'never'",

@@ -15,6 +15,7 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
@@ -34,6 +35,16 @@ try:
 except:
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
+
+
+try:
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
+    from megatron.core.post_training.modelopt.layers import Linear
+
+    HAVE_TE = True
+except ImportError:
+    TEColumnParallelLinear, TELinear, Linear = None, None, None
+    HAVE_TE = False
 
 
 @dataclass
@@ -282,6 +293,17 @@ class MLASelfAttention(MultiLatentAttention):
             )
 
         else:
+            q_down_proj_kwargs = {}
+            if submodules.linear_q_down_proj in [TELinear]:
+                q_down_proj_kwargs['parallel_mode'] = 'duplicated'
+            elif submodules.linear_q_down_proj in [
+                Linear,
+                TEColumnParallelLinear,
+                ColumnParallelLinear,
+            ]:
+                q_down_proj_kwargs['gather_output'] = False
+            else:
+                raise ValueError(f"Unsupported linear_q_down_proj: {submodules.linear_q_down_proj}")
 
             self.linear_q_down_proj = build_module(
                 submodules.linear_q_down_proj,
@@ -291,9 +313,10 @@ class MLASelfAttention(MultiLatentAttention):
                 init_method=self.config.init_method,
                 bias=False,
                 skip_bias_add=False,
-                gather_output=False,
                 is_expert=False,
                 tp_comm_buffer_name='q_down_proj',
+                skip_weight_param_allocation=False,
+                **q_down_proj_kwargs,
             )
 
             self.linear_q_up_proj = build_module(
@@ -309,6 +332,18 @@ class MLASelfAttention(MultiLatentAttention):
                 tp_comm_buffer_name='q_up_proj',
             )
 
+        kv_down_proj_kwargs = {}
+        if submodules.linear_kv_down_proj in [TELinear]:
+            kv_down_proj_kwargs['parallel_mode'] = 'duplicated'
+        elif submodules.linear_kv_down_proj in [
+            Linear,
+            TEColumnParallelLinear,
+            ColumnParallelLinear,
+        ]:
+            kv_down_proj_kwargs['gather_output'] = False
+        else:
+            raise ValueError(f"Unsupported linear_kv_down_proj: {submodules.linear_kv_down_proj}")
+
         self.linear_kv_down_proj = build_module(
             submodules.linear_kv_down_proj,
             self.config.hidden_size,
@@ -317,9 +352,10 @@ class MLASelfAttention(MultiLatentAttention):
             init_method=self.config.init_method,
             bias=False,
             skip_bias_add=False,
-            gather_output=False,
             is_expert=False,
             tp_comm_buffer_name='kv_down_proj',
+            skip_weight_param_allocation=False,
+            **kv_down_proj_kwargs,
         )
 
         self.linear_kv_up_proj = build_module(
@@ -382,13 +418,13 @@ class MLASelfAttention(MultiLatentAttention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.rope_type == "rope":
-            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
         else:
             if self.config.apply_rope_fusion:
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                    rotary_seq_len, dtype=hidden_states.dtype
+                    rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
                 )
                 rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -397,7 +433,7 @@ class MLASelfAttention(MultiLatentAttention):
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
             else:
-                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len)
+                rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
         if packed_seq_params is not None:
             if packed_seq_params.cu_seqlens_q_padded is not None:
@@ -453,7 +489,10 @@ class MLASelfAttention(MultiLatentAttention):
             kv_compressed, k_pos_emb = torch.split(
                 kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
             )
-            if parallel_state.get_tensor_model_parallel_world_size() > 1:
+            if (
+                parallel_state.get_tensor_model_parallel_world_size() > 1
+                and self.config.sequence_parallel
+            ):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
 
@@ -503,6 +542,8 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
             if self.config.apply_rope_fusion:
+                cp_rank = self.model_comm_pgs.cp.rank()
+                cp_size = self.model_comm_pgs.cp.size()
                 query = fused_apply_mla_rope_for_q(
                     q,
                     rotary_pos_cos,
@@ -510,6 +551,8 @@ class MLASelfAttention(MultiLatentAttention):
                     self.config.qk_head_dim,
                     self.config.qk_pos_emb_head_dim,
                     cu_seqlens_q,
+                    cp_rank,
+                    cp_size,
                 )
                 key, value = fused_apply_mla_rope_for_kv(
                     kv,
@@ -520,6 +563,8 @@ class MLASelfAttention(MultiLatentAttention):
                     self.config.qk_head_dim,
                     self.config.v_head_dim,
                     cu_seqlens_kv,
+                    cp_rank,
+                    cp_size,
                 )
             else:
                 q_len = q.size()[0]
@@ -528,11 +573,15 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                else:
+                elif packed_seq_params is None or self.config.context_parallel_size == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
-                    # the full rotary_pos_emb length.
+                    # the full rotary_pos_emb length, except for sequence packing + CP.
+                    # When sequence packing and context parallel are both enabled, the
+                    # position embedding will not split rotary_pos_emb, so it may exceed
+                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
+                    # to cover the full sequence, so we do not shorten it here.
                     rotary_pos_emb = rotary_pos_emb[0:q_len]
 
                 # q_no_pe: [num_tokens, n, qk_head_dim]

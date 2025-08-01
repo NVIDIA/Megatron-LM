@@ -8,6 +8,7 @@ from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
+    TELinear,
     TENorm,
     TERowParallelGroupedLinear,
     TERowParallelLinear,
@@ -22,6 +23,10 @@ from megatron.core.utils import get_te_version, is_te_min_version
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    def linear(self) -> type:
+        """Which linear module TE backend uses"""
+        return TELinear
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module TE backend uses"""

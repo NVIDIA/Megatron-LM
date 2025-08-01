@@ -7,13 +7,14 @@ spec:
   model: moe
   build: mcore-pyt-{environment}
   nodes: 1
-  gpus: 1
+  gpus: 8
   n_repeat: 1
   platforms: dgx_a100
   artifacts:
     /workspace/data/deepseek_16b_pyt/model: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
     /workspace/data/deepseek_16b_pyt/tokenizer: model/deepseek_16b_pyt/dcp/mcore-v1_bf16
   script_setup: |
+    unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
     # Checkout latest
@@ -57,6 +58,11 @@ spec:
 
 products:
   - test_case: [gpt_static_inference_tp1_pp1_ep1_16B_logitsmatch]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+  - test_case: [gpt_static_inference_tp4_pp1_ep4_16B_logitsmatch]
     products:
       - environment: [dev]
         scope: [mr]
