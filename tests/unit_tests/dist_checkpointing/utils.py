@@ -151,6 +151,10 @@ def init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=False):
     args.hidden_size = HIDDEN_SIZE
     args.num_attention_heads = NUM_ATTENTION_HEADS
     args.ckpt_step = None
+    args.use_custom_fsdp = False
+    args.dist_ckpt_pre_mcore_014 = False
+    args.dist_ckpt_optim_fully_reshardable = False
+    args.distrib_optim_fully_reshardable_mem_efficient = False
 
 
 def setup_model_and_optimizer(
