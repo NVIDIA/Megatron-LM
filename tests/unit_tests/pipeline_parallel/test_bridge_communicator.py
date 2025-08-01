@@ -401,6 +401,9 @@ class TestBridgeCommunicator:
 
         torch.manual_seed(12345)
 
+        # Initialize model parallel state (required for model_parallel_cuda_manual_seed)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
         hidden_size = 2048
         dtype = torch.float32
 
@@ -453,6 +456,9 @@ class TestBridgeCommunicator:
         )
 
         torch.testing.assert_close(output_grid_1, output_grid_2, rtol=1e-3, atol=1e-3)
+
+        # Clean up model parallel state
+        Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
         "tp, cp, pp, dp, expected_src_ranks, expected_dest_ranks",
