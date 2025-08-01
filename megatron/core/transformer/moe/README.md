@@ -188,10 +188,10 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 
 
 ### Batch-Level EP-A2A hidding
-Enable A2A overlap in the interleaved 1F1B pipeline parallel introduced from the DSv3 DualPipe implmentation. \
+Enable A2A overlap across different batches inspired by the DSv3 DualPipe implmentation. \
 **Features** 
 - Hide ep a2a communication by batch-level overlapping
-- Compatible with interleaved 1F1B pipeline parallel
+- Interleaved pipeline parallel will be supported soon
 - Split weight gradient and activation gradient computations for better overlap with communications
 
 **Usage** 

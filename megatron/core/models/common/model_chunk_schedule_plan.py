@@ -12,7 +12,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
-    get_com_stream,
+    get_comm_stream,
     get_comp_stream,
 )
 from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
@@ -51,7 +51,7 @@ class TransformerLayerSchedulePlan:
     moe_combine = None
     mtp_post_process = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, com_stream, extra_args={}):
+    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
         """Initializes a transformer layer schedule plan.
 
         Args:
@@ -61,27 +61,25 @@ class TransformerLayerSchedulePlan:
                 record CUDA event across multiple nodes on different streams for synchronization.
             chunk_state (ModelChunkState): model state shared in the model chunk.
             comp_stream (torch.cuda.Stream): CUDA stream for computation.
-            com_stream (torch.cuda.Stream): CUDA stream for communication.
+            comm_stream (torch.cuda.Stream): CUDA stream for communication.
             extra_args (dict): extra arguments for the layer.
 
         The event and chunk_state are binded to the TransformerModelChunkSchedulePlan
         and shared across all layers in the model chunk.
         """
-        from megatron.core.models.gpt.fine_grained_callables import (
-            TransformerLayerState,
-        )
+        from megatron.core.models.gpt.fine_grained_callables import TransformerLayerState
 
         self.layer_state = TransformerLayerState()
         self.chunk_state = chunk_state
         self.layer = layer
         self.event = event
         self.comp_stream = comp_stream
-        self.com_stream = com_stream
+        self.comm_stream = comm_stream
 
         # get callable nodes for transformer/mtp layer
-        self._build_callable_nodes(event, comp_stream, com_stream, extra_args)
+        self._build_callable_nodes(event, comp_stream, comm_stream, extra_args)
 
-    def _build_callable_nodes(self, event, comp_stream, com_stream, extra_args):
+    def _build_callable_nodes(self, event, comp_stream, comm_stream, extra_args):
         """
         Builds the callable nodes for the transformer/mtp layer:
             attn, post_attn, mlp, moe_dispatch and moe_combine, and mtp_post_process.
@@ -135,8 +133,8 @@ class TransformerLayerSchedulePlan:
         self.mlp = create_node(comp_stream, mlp_module, "mlp")
         if is_moe:
             self.post_attn = create_node(comp_stream, post_attn_module, "post_attn")
-            self.moe_dispatch = create_node(com_stream, moe_dispatch_module, "moe_dispatch")
-            self.moe_combine = create_node(com_stream, moe_combine_module, "moe_combine")
+            self.moe_dispatch = create_node(comm_stream, moe_dispatch_module, "moe_dispatch")
+            self.moe_combine = create_node(comm_stream, moe_combine_module, "moe_combine")
         else:
             self.post_attn = NoopScheduleNode()
             self.moe_dispatch = NoopScheduleNode()
@@ -162,9 +160,8 @@ class TransformerLayerSchedulePlan:
             else nullcontext()
         )
 
-    @classmethod
+    @staticmethod
     def run(
-        cls,
         f_layer,
         b_layer,
         f_input=None,
@@ -178,6 +175,10 @@ class TransformerLayerSchedulePlan:
         This function interleaves forward and backward operations, overlapping the communications
         (dispatch or combine) of one with the computations (att or mlp) of the other
         to maximize parallelism and efficiency.
+
+        When f_layer and b_layer are not None, forward and backward pass are overlapped as follows:
+        comm_stream: combine_bwd            | dispatch_fwd->dispatch_bwd  | combine_fwd
+        comp_stream: attn_fwd->post_attn_fwd| mlp_bwd->mlp_bwd_dw->mlp_fwd| post_attn_bwd->attn_bwd
 
         Args:
             f_layer (TransformerLayerSchedulePlan): Forward layer (for current microbatch)
@@ -289,10 +290,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         Returns:
             The model chunk schedule plan.
         """
-        from megatron.core.models.gpt.fine_grained_callables import (
-            PostProcessNode,
-            PreProcessNode,
-        )
+        from megatron.core.models.gpt.fine_grained_callables import PostProcessNode, PreProcessNode
 
         self._model_chunk_state = ModelChunkState()
         self._transformer_layers = []
@@ -301,7 +299,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self.post_process = None
 
         comp_stream = get_comp_stream()
-        com_stream = get_com_stream()
+        comm_stream = get_comm_stream()
 
         # save the inputs of model.forward() to ModelChunkState
         self._model_chunk_state.input_ids = input_ids
@@ -328,7 +326,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for layer_idx in range(transformer_num_layers):
             layer = model.decoder._get_layer(layer_idx)
             layer_plan = TransformerLayerSchedulePlan(
-                layer, self._event, self._model_chunk_state, comp_stream, com_stream
+                layer, self._event, self._model_chunk_state, comp_stream, comm_stream
             )
             self._transformer_layers.append(layer_plan)
 
@@ -389,9 +387,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             self.post_process.model_chunk_state = None
             self.post_process = None
 
-    @classmethod
+    @staticmethod
     def run(
-        cls,
         f_schedule_plan,
         b_schedule_plan,
         b_grad=None,
@@ -456,10 +453,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         f_num_layers = f_schedule_plan.num_layers() if f_schedule_plan is not None else 0
         b_num_layers = b_schedule_plan.num_layers() if b_schedule_plan is not None else 0
-        overlaped_layers = min(f_num_layers, b_num_layers)
+        overlapped_layers = min(f_num_layers, b_num_layers)
 
-        # combined forward and backward pass for overlaped layers
-        for i in range(overlaped_layers):
+        # combined forward and backward pass for overlapped layers
+        for i in range(overlapped_layers):
             f_layer = f_schedule_plan.get_layer(i)
             b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
             torch.cuda.nvtx.range_push(f"layer_{i}f-layer_{b_num_layers - 1 - i}b")
@@ -476,7 +473,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # backward pass for the remaining layers
         with b_context:
-            for i in range(overlaped_layers, b_num_layers):
+            for i in range(overlapped_layers, b_num_layers):
                 b_layer = b_schedule_plan.get_layer(b_num_layers - 1 - i)
                 torch.cuda.nvtx.range_push(f"layer_{b_num_layers - 1 - i}b")
                 _, b_grad = TransformerLayerSchedulePlan.run(
@@ -486,7 +483,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
 
         # forward pass for the remaining layers
         with f_context:
-            for i in range(overlaped_layers, f_num_layers):
+            for i in range(overlapped_layers, f_num_layers):
                 f_layer = f_schedule_plan.get_layer(i)
                 torch.cuda.nvtx.range_push(f"layer_{i}f")
                 f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
@@ -496,7 +493,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             with f_context as ctx:
                 # post_forward()/send_forward_recv_forward() is running in the communication stream,
                 # so the p2p comm could be overlapped with the attn backward
-                with torch.cuda.stream(get_com_stream()):
+                with torch.cuda.stream(get_comm_stream()):
                     f_schedule_plan.wait_current_stream()
                     post_forward(f_input, ctx.vpp_rank)
 

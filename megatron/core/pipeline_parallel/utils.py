@@ -87,7 +87,8 @@ class NoopScheduleNode:
     """A placeholder node in the computation graph that simply passes through inputs and outputs.
 
     This class is used as a no-op node in the scheduling system when a real computation node
-    is not needed but the interface must be maintained. It simply returns its inputs unchanged
+    is not needed but the interface must be maintained (e.g., dense layer doesn't need
+    moe_dispatch and moe_combine). It simply returns its inputs unchanged
     in both forward and backward passes.
     """
 
@@ -246,10 +247,9 @@ class AbstractSchedulePlan(ABC):
     """To use combined 1f1b, model must implement build_schedule_plan while take the same
     signature as model forward but return an instance of AbstractSchedulePlan"""
 
-    @classmethod
+    @staticmethod
     @abstractmethod
     def run(
-        cls,
         f_schedule_plan,
         b_schedule_plan,
         grad=None,
@@ -258,30 +258,32 @@ class AbstractSchedulePlan(ABC):
         post_forward=None,
         post_backward=None,
     ):
-        """forward_backward is the protocol between our schedule logic and model"""
+        """run() is the protocol between our schedule logic and model, which is used to schedule
+        the forward and backward schedule plans for the models.
+        """
         ...
 
 
 _COMP_STREAM = None
-_COM_STREAM = None
+_COMM_STREAM = None
 
 
-def set_streams(comp_stream=None, com_stream=None):
+def set_streams(comp_stream=None, comm_stream=None):
     """Set the streams for communication and computation"""
     global _COMP_STREAM
-    global _COM_STREAM
-    if _COMP_STREAM is not None and _COM_STREAM is not None:
+    global _COMM_STREAM
+    if _COMP_STREAM is not None and _COMM_STREAM is not None:
         return
 
     if comp_stream is None:
         comp_stream = torch.cuda.current_stream()
-    if com_stream is None:
-        com_stream = torch.cuda.Stream(device="cuda")
+    if comm_stream is None:
+        comm_stream = torch.cuda.Stream(device="cuda")
 
     assert _COMP_STREAM is None
-    assert _COM_STREAM is None
+    assert _COMM_STREAM is None
     _COMP_STREAM = comp_stream
-    _COM_STREAM = com_stream
+    _COMM_STREAM = comm_stream
 
 
 def get_comp_stream():
@@ -290,10 +292,10 @@ def get_comp_stream():
     return _COMP_STREAM
 
 
-def get_com_stream():
+def get_comm_stream():
     """Get the stream for communication"""
-    global _COM_STREAM
-    return _COM_STREAM
+    global _COMM_STREAM
+    return _COMM_STREAM
 
 
 class VppContextManager:
