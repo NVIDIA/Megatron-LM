@@ -169,7 +169,10 @@ class MTPLossLoggingHelper:
             name = f"mtp_{i+1} loss"
             loss = mtp_losses[i]
             if total_loss_dict is not None:
-                total_loss_dict[name] = loss
+                if name in total_loss_dict:
+                    total_loss_dict[name] += loss
+                else:
+                    total_loss_dict[name] = loss
             if writer is not None:
                 writer.add_scalar(name, loss, iteration)
             if wandb_writer is not None:
