@@ -178,6 +178,8 @@ def weighted_bias_quick_geglu_impl(input, bias, weights, fp8_input_store=False, 
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
+    x_glu, x_linear = input.chunk(2, -1)
+    input = torch.cat((x_glu.clamp(min=None, max=7.0), x_linear.clamp(min=-7.0, max=7.0)), -1)
     input = input.view(-1, ori_shape[-1])
     linear_offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
     if bias is not None:
