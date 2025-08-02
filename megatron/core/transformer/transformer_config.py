@@ -203,10 +203,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
-    attention_softmax_denominator_offset: Optional[Union[Literal['learnable'], float]] = None
+    softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
     """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       This arg is only used in unfused DotProductAttention. If true, unfused torch softmax will be used
-       The offset is exponentiated. (i.e. set to 0 for softmax-off-by-1"""
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+       and learnable offset."""
 
     ####################
     # initialization

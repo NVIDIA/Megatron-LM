@@ -873,6 +873,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ),
             tp_group=model_comm_pgs.tp,
             layer_number=layer_number,
+            softmax_type=self.config.softmax_type,
             **extra_kwargs,
         )
 

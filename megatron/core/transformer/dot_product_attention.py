@@ -101,6 +101,18 @@ class DotProductAttention(MegatronModule):
             self.config.attention_dropout if attention_dropout is None else attention_dropout
         )
 
+        if self.config.softmax_type == "vanilla":
+            self.softmax_offset = None
+        elif self.config.softmax_type == "off-by-one":
+            self.softmax_offset = torch.zeros(self.num_attention_heads_per_partition)
+        elif self.config.softmax_type == "learnable":
+            self.register_parameter(
+                "softmax_offset",
+                torch.nn.Parameter(torch.empty(self.num_attention_heads_per_partition))
+            )
+        else:
+            raise ValueError("Softmax type not supported")
+
     def forward(
         self,
         query: Tensor,
@@ -169,7 +181,7 @@ class DotProductAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
-        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
+        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask, self.softmax_offset)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -217,11 +229,11 @@ class DotProductAttention(MegatronModule):
         sharded_offsets: Tuple[Tuple[int, int, int]] = (),
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
-        if self.config.attention_softmax_denominator_offset == "learnable":
-            state_dict = self.scale_mask_softmax.state_dict(keep_vars=True)
+        if self.config.softmax_type == "learnable":
+            state_dict = self.state_dict(keep_vars=True)
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix+"scale_mask_softmax.", {'softmax_denominator_weight': 0}, sharded_offsets
+            state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
         )
 

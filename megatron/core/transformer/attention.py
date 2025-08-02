@@ -156,6 +156,7 @@ class Attention(MegatronModule, ABC):
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
             model_comm_pgs=self.model_comm_pgs,
+            softmax_type=self.config.softmax_type,
         )
 
         self.checkpoint_core_attention = (

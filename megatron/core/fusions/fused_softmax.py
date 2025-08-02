@@ -151,18 +151,10 @@ class FusedScaleMaskSoftmax(nn.Module):
         self.layer_number = layer_number
         self.scale = scale
         self.config = config
-        if config.attention_softmax_denominator_offset == 'learnable':
-            self.softmax_denominator_weight = nn.Parameter(
-                torch.empty(config.num_attention_heads // config.tensor_model_parallel_size)
-            )
-        elif config.attention_softmax_denominator_offset is not None:
-            self.softmax_denominator_weight = torch.ones(config.num_attention_heads // config.tensor_model_parallel_size) * config.attention_softmax_denominator_offset
-        else:
-            self.softmax_denominator_weight = None
 
         assert self.scale is None or self.softmax_in_fp32, "softmax should be in fp32 when scaled"
 
-    def forward(self, input: torch.Tensor, mask: Optional[torch.Tensor]):
+    def forward(self, input: torch.Tensor, mask: Optional[torch.Tensor], softmax_offset: Optional[torch.Tensor]):
         """Forward pass of softmax with masked input.
 
         In case attn_mask_type is causal the mask is generated and None can be passed.
@@ -173,11 +165,11 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         if (
             self.is_kernel_available(mask, *input.size())
-            and self.softmax_denominator_weight is None
+            and softmax_offset is None
         ):
             return self.forward_fused_softmax(input, mask)
         else:
-            return self.forward_torch_softmax(input, mask)
+            return self.forward_torch_softmax(input, mask, softmax_offset)
 
     def is_kernel_available(self, mask, b, np, sq, sk):
         attn_batches = b * np
@@ -219,7 +211,7 @@ class FusedScaleMaskSoftmax(nn.Module):
             else:
                 return ScaledSoftmax.apply(input, scale)
 
-    def forward_torch_softmax(self, input, mask):
+    def forward_torch_softmax(self, input, mask, softmax_offset):
         if self.input_in_float16 and self.softmax_in_fp32:
             input = input.float()
 
@@ -238,11 +230,10 @@ class FusedScaleMaskSoftmax(nn.Module):
             mask = get_default_causal_mask(sq)
 
         mask_output = self.mask_func(input, mask) if mask is not None else input
-        if self.softmax_denominator_weight is None:
+        if softmax_offset is None:
             softmax_fn = torch.nn.Softmax(dim=-1)
         else:
-            self.softmax_denominator_weight = self.softmax_denominator_weight.to(input.device)
-            softmax_fn = SoftmaxOne(-1, self.softmax_denominator_weight)
+            softmax_fn = SoftmaxOne(-1, softmax_offset.to(input.device))
 
         probs = softmax_fn(mask_output)
 
