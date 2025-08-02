@@ -23,8 +23,8 @@ from megatron.core.utils import (
 )
 
 from .combined_1f1b import (
-    combined_1f1b_schedule_for_no_pipelining,
     combined_1f1b_schedule_for_interleaved_pipelining,
+    combined_1f1b_schedule_for_no_pipelining,
 )
 
 # Types
