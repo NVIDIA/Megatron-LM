@@ -51,49 +51,6 @@ except ImportError:
     HAVE_TE = False
 
 
-# TODO(Hepteract): delete the usage of the global parallel_state.
-# Currently we still have to use the global parallel_state in expert_dist_ckpt_decorator(),
-# in order to set sub-module's process group while getting sharded_state_dict.
-# After sub-module's refactoring is done, we can pass model_comm_pgs to sub-module
-# and delete the function expert_dist_ckpt_decorator.
-def expert_dist_ckpt_decorator(func):
-    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-
-    Since !1940, the TP size for Expert layer can be different with Attention.
-    To make distributed checkpoint work in such cases, we use a decorator to
-    replace the default TP parallel states with expert-TP parallel states.
-    """
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Store original states
-        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
-        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
-        try:
-            # Set new states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = (
-                parallel_state.get_expert_tensor_parallel_rank()
-            )
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = (
-                parallel_state.get_expert_tensor_parallel_world_size()
-            )
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = (
-                parallel_state.get_expert_tensor_parallel_group()
-            )
-
-            # Execute the function
-            result = func(*args, **kwargs)
-        finally:
-            # Restore original states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
-        return result
-
-    return wrapper
-
-
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
@@ -300,7 +257,6 @@ class GroupedMLP(MegatronModule):
 
         return fc2_output, None
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """
         Maps local expert to global experts.
@@ -832,7 +788,6 @@ class TEGroupedMLP(MegatronModule):
 
         return output, output_bias
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -976,7 +931,6 @@ class SequentialMLP(MegatronModule):
 
             return output_local, output_bias_local
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
         sharded_state_dict = {}
