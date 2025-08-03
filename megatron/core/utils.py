@@ -853,7 +853,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     Optionally, can provide offsets which prepend new dimensions to the tensor.
 
-    Args:
+    Keyword Args:
         tensor: Tensor to create sharded tensor for
         key: Key for the sharded tensor
         prepend_offsets: Offsets to prepend to tensor dimensions (default: ())
