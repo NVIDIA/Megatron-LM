@@ -559,24 +559,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Cumulative key/value sequence lengths."""
         return (self.cu_kv_seq_lengths, self.kv_seq_lengths, self.max_seqlen_k)
 
-    def seq_idx(self) -> Tensor:
-        """
-        Returns a Tensor of shape (1, active_token_count) where each value correpsonds
-        to the request index to which the corresponding token belongs.
-        """
-        # Get map of token idx -> request idx
-        seq_idx = (
-            self.token_to_request_idx[: self.padded_active_token_count].clone().to(torch.int32)
-        )
-
-        # For padded tokens assign the next consecutive request idx
-        seq_idx[self.active_token_count : self.padded_active_token_count] = (
-            seq_idx[self.active_token_count - 1] + 1
-        )
-
-        # Add a batch dimension of 1 and return
-        return seq_idx.unsqueeze(0)
-
     def get_active_sequence_lengths(self) -> Tensor:
         """Total sequence length (query + key) for active requests."""
         lengths = self.request_kv_length_offsets + self.request_query_lengths
@@ -856,6 +838,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.block_table = self.request_to_kv_chunk_ids[
                 self.paused_request_count : self.total_request_count
             ]
+
+        # Set the request idx for padded tokens
+        self.token_to_request_idx[self.active_token_count : self.padded_active_token_count] = (
+            self.padded_active_request_count
+        )
 
     def reset(self) -> None:
         """Reset entire context.

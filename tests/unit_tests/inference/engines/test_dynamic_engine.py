@@ -36,8 +36,20 @@ from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_fa_min_version
+from megatron.core.utils import (
+    is_causal_conv1d_min_version,
+    is_fa_min_version,
+    is_mamba_min_version,
+)
 from tests.unit_tests.test_utilities import Utils
+
+
+def skip_if_mamba_causal_conv1d_not_available(model_provider: str):
+    if model_provider == "mamba":
+        if not is_causal_conv1d_min_version("1.5.2"):
+            pytest.skip(reason="causal_conv1d 1.5.2 is required")
+        if not is_mamba_min_version("2.2.5"):
+            pytest.skip(reason="mamba_ssm 2.2.5 is required")
 
 
 def set_rounder(value):
@@ -343,7 +355,6 @@ class TestDynamicInferenceEngine:
 
     @classmethod
     def _run_test(cls, **test_config_kwargs):
-
         # Test environment.
         test_config = DynamicEngineTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
@@ -395,6 +406,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_simple(self, model_provider: str) -> None:
         """Simple test that runs without errors, and validates output."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
 
         # Run test.
         env = self._run_test(model_provider=model_provider)
@@ -444,6 +456,8 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_overflow_factor(self, model_provider: str) -> None:
         """Test overflow factor arg."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
+
         # Run test.
         env = self._run_test(
             context_buffer_overflow_factor=0.1,
@@ -467,6 +481,8 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_request_overflow(self, model_provider: str) -> None:
         """Test request overflow."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
+
         self._run_test(context_max_requests_override=1, model_provider=model_provider)
 
     @pytest.mark.skipif(
@@ -475,6 +491,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_token_overflow(self, model_provider: str) -> None:
         """Test token overflow."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
         test_config = DynamicEngineTestConfig(
             context_max_tokens_override=8, model_provider=model_provider
         )
@@ -488,6 +505,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_chunk_overflow(self, model_provider: str) -> None:
         """Test token overflow."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
         env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
         chunk_size_bytes = context.chunk_size_bytes
@@ -505,6 +523,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
         self._run_test(num_gap_steps=0, model_provider=model_provider)
 
     @pytest.mark.skipif(
@@ -513,6 +532,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_fixed_output_lengths(self, model_provider: str) -> None:
         """Test generating a fixed number of output tokens."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
         self._run_test(use_fixed_output_lengths=True, model_provider=model_provider)
 
     @pytest.mark.skipif(
@@ -521,6 +541,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_cuda_graph_request_counts(self, model_provider: str) -> None:
         """Test initialization of `cuda_graph_request_counts` in dynamic context."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_request_counts in [
@@ -553,6 +574,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_cuda_graph_warmup(self, model_provider: str) -> None:
         """Test initialization during cuda graph warmup."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
 
         # Initialize context.
         env = self._build_test_env(
@@ -621,6 +643,8 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_generate_function(self, model_provider: str) -> None:
         """Test the generate function that processes multiple prompts at once."""
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
+
         # Set up test environment
         test_config = DynamicEngineTestConfig(
             num_requests=4, max_prompt_length=8, max_output_length=4, model_provider=model_provider
@@ -662,6 +686,8 @@ class TestDynamicInferenceEngine:
         Test asynchronously adding and waiting for requests while the engine is
         running continuously.
         """
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
+
         # Test environment.
         test_config = DynamicEngineTestConfig(
             use_fixed_output_lengths=True, model_provider=model_provider

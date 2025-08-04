@@ -27,7 +27,12 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, log_single_rank
+from megatron.core.utils import (
+    deprecate_inference_params,
+    is_causal_conv1d_min_version,
+    is_mamba_min_version,
+    log_single_rank,
+)
 
 from .mamba_context_parallel import MambaContextParallel
 
@@ -393,8 +398,21 @@ class MambaMixer(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        if inference_context is not None and inference_context.is_dynamic_batching():
-            seq_idx = inference_context.seq_idx()
+        in_inference_mode = inference_context is not None and not self.training
+
+        if in_inference_mode and inference_context.is_dynamic_batching():
+            assert is_causal_conv1d_min_version(
+                "1.5.2"
+            ), "causal_conv1d 1.5.2 required for dynamic_batching"
+            assert is_mamba_min_version("2.2.5"), "mamba_ssm 2.2.5 required for dynamic_batching"
+
+            seq_idx = (
+                inference_context.token_to_request_idx[
+                    : inference_context.padded_active_token_count
+                ]
+                .to(torch.int32)
+                .unsqueeze(0)
+            )
             cu_seqlens, _ = inference_context.cu_query_lengths()
             if (
                 cu_seqlens is not None
@@ -414,7 +432,7 @@ class MambaMixer(MegatronModule):
         _, batch, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
-        if inference_context is not None:
+        if in_inference_mode:
             assert not self.config.sequence_parallel
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
             if (
@@ -519,13 +537,18 @@ class MambaMixer(MegatronModule):
                 xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
-                xBC = causal_conv1d_fn(
-                    x=xBC,
-                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
-                    bias=self.cp.get_conv1d_bias(),
-                    activation=self.activation,
-                    seq_idx=seq_idx,
-                )
+                # TODO(ksanthanam): Remove the separate args construction once we upgrade the
+                # minimum `causal_conv1d` version
+                causal_conv1d_kwargs = {
+                    "x": xBC,
+                    "weight": rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                    "bias": self.cp.get_conv1d_bias(),
+                    "activation": self.activation,
+                }
+                if inference_context.is_dynamic_batching():
+                    causal_conv1d_kwargs["seq_idx"] = seq_idx
+                xBC = causal_conv1d_fn(**causal_conv1d_kwargs)
+                del causal_conv1d_kwargs
 
             # transpose b pd l --> b l pd
             xBC = rearrange(xBC, "b d l ->  b l d").contiguous()
@@ -558,26 +581,33 @@ class MambaMixer(MegatronModule):
             # Note that both `seq_idx` and `cu_seqlens` must be passed in
             # for variable length generation.
             # See https://github.com/state-spaces/mamba/blob/e0761ece1db07e0949dd88b4f4cd440420a19fd9/tests/test_generation.py#L97 # pylint: disable=line-too-long
-            y = mamba_chunk_scan_combined(
-                x,
-                dt,
-                A,
-                B,
-                C,
-                self.chunk_size,
-                D=(
+            # TODO(ksanthanam): Remove the separate args construction once we upgrade the
+            # minimum `mamba_ssm` version
+            mamba_chunk_scan_combined_args = [x, dt, A, B, C, self.chunk_size]
+            mamba_chunk_scan_combined_kwargs = {
+                "D": (
                     rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                     if self.D_has_hdim
                     else self.cp.get_D()
                 ),
-                z=z if not self.rmsnorm else None,
-                dt_bias=self.cp.get_dt_bias().float(),
-                dt_softplus=True,
-                return_final_states=ssm_state is not None,
-                seq_idx=seq_idx,
-                cu_seqlens=cu_seqlens,
-                return_varlen_states=return_varlen_states,
+                "z": z if not self.rmsnorm else None,
+                "dt_bias": self.cp.get_dt_bias().float(),
+                "dt_softplus": True,
+                "return_final_states": ssm_state is not None,
+            }
+            if inference_context.is_dynamic_batching():
+                mamba_chunk_scan_combined_kwargs.update(
+                    {
+                        "seq_idx": seq_idx,
+                        "cu_seqlens": cu_seqlens,
+                        "return_varlen_states": return_varlen_states,
+                    }
+                )
+            y = mamba_chunk_scan_combined(
+                *mamba_chunk_scan_combined_args, **mamba_chunk_scan_combined_kwargs
             )
+            del mamba_chunk_scan_combined_args
+            del mamba_chunk_scan_combined_kwargs
 
             if ssm_state is not None:
                 if return_varlen_states:
@@ -647,14 +677,21 @@ class MambaMixer(MegatronModule):
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC).to(dtype=dtype)
         else:
-            xBC = causal_conv1d_update(
+            # TODO(ksanthanam): Remove the separate args construction once we upgrade the
+            # minimum `causal_conv1d` version
+            causal_conv1d_update_args = [
                 xBC,
                 conv_state,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=batch_indices,
-            )
+            ]
+            causal_conv1d_update_kwargs = {}
+            if is_dynamic_batching:
+                causal_conv1d_update_kwargs["conv_state_indices"] = batch_indices
+            xBC = causal_conv1d_update(*causal_conv1d_update_args, **causal_conv1d_update_kwargs)
+            del causal_conv1d_update_args
+            del causal_conv1d_update_kwargs
 
         x, B, C = torch.split(
             xBC,
@@ -723,19 +760,21 @@ class MambaMixer(MegatronModule):
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+            # TODO(ksanthanam): Remove the separate args construction once we upgrade the
+            # minimum `mamba_ssm` version
+            selective_state_update_args = [ssm_state, x_reshaped, dt, A, B, C, D]
+            selective_state_update_kwargs = {
+                "z": z if not self.rmsnorm else None,
+                "dt_bias": dt_bias,
+                "dt_softplus": True,
+            }
+            if is_dynamic_batching:
+                selective_state_update_kwargs["state_batch_indices"] = batch_indices
             y = selective_state_update(
-                ssm_state,
-                x_reshaped,
-                dt,
-                A,
-                B,
-                C,
-                D,
-                z=z if not self.rmsnorm else None,
-                dt_bias=dt_bias,
-                dt_softplus=True,
-                state_batch_indices=batch_indices,
+                *selective_state_update_args, **selective_state_update_kwargs
             )
+            del selective_state_update_args
+            del selective_state_update_kwargs
             y = rearrange(y, "b h p -> b (h p)")
 
         if self.rmsnorm:
