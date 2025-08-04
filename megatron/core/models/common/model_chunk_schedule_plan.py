@@ -340,7 +340,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             }
             layer = model.mtp.layers[layer_idx]
             layer_plan = TransformerLayerSchedulePlan(
-                layer, self.event, self.state, comp_stream, com_stream, extra_args
+                layer, self.event, self.state, comp_stream, comm_stream, extra_args
             )
             self._transformer_layers.append(layer_plan)
 
