@@ -269,7 +269,7 @@ class LanguageModule(MegatronModule):
                 {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
             )
         else:
-            raise ValueError("unrecognized metadata type")
+            assert "dp_cp_group" in metadata, "metadata must be a dict with dp_cp_group as key"
 
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
