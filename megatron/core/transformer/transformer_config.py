@@ -744,7 +744,7 @@ class TransformerConfig(ModelParallelConfig):
                 "flex",
             ]:
                 raise ValueError(
-                    f'moe_shared_expert_overlap only works with alltoall or flex token dispatcher.'
+                    f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
         if self.moe_expert_capacity_factor is not None:

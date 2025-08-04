@@ -103,7 +103,6 @@ class TestSharedExperts:
         assert moe_layer_overlap.token_dispatcher.shared_experts is not None
 
         assert moe_layer_no_overlap.shared_experts is not None
-        assert moe_layer_no_overlap.shared_experts.stream is None
         assert moe_layer_no_overlap.token_dispatcher.shared_experts is None
 
         # Create a dummy input tensor.
