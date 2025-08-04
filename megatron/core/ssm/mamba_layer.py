@@ -11,6 +11,7 @@ from typing import Dict, Optional, Union
 import torch
 from torch import Tensor
 
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -21,6 +22,13 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params
+
+try:
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
 
 
 @dataclass
@@ -94,6 +102,9 @@ class MambaLayer(MegatronModule):
         self.layer_number = layer_number
         self.residual_in_fp32 = residual_in_fp32
         self.hidden_dropout = config.hidden_dropout
+        self.mamba_layer_recompute = (
+            config.recompute_granularity == 'selective' and "mamba" in config.recompute_modules
+        )
         self.mixer = build_module(
             submodules.mixer,
             self.config,
@@ -138,17 +149,36 @@ class MambaLayer(MegatronModule):
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
-        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = self.norm(hidden_states)
+        # Mamba forward: norm -> mixer -> bias_dropout_add
+        def custom_forward(hidden_states, residual):
+            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+            hidden_states = self.norm(hidden_states)
 
-        mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
+            mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
 
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mamba_bda(
+                    training=self.training, fused=self.config.bias_dropout_fusion
+                )(mixer_out_with_bias, residual, self.hidden_dropout)
 
-        return hidden_states
+            return hidden_states
+
+        if self.mamba_layer_recompute:
+            if self.config.fp8:
+                output = te_checkpoint(
+                    custom_forward,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    hidden_states,
+                    residual,
+                )
+            else:
+                output = tensor_parallel.checkpoint(custom_forward, False, hidden_states, residual)
+        else:
+            output = custom_forward(hidden_states, residual)
+
+        return output
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """Allocate the inference cache."""

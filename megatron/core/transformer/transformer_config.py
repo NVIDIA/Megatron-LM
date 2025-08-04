@@ -825,7 +825,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.recompute_granularity == 'selective':
             if len(self.recompute_modules) > 0:
-                allowed_modules = {"core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe"}
+                allowed_modules = {"core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "mamba"}
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
                     f'Invalid choices for recompute_modules: {invalid_modules}. '
