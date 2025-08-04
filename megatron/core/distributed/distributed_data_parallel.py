@@ -406,7 +406,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 # When delay_wgrad_compute is True and the param is marked with
                 # skip_backward_post_hook, register the backward post hook for its module
                 # instead of the param so that the wgrad accumulation and reduce will be performed
-                # in the backward_dw() method of the module instead of the hook of backward() method.
+                # in backward_dw() method of the module instead of the hook of backward() method.
                 # Otherwise, register the backward post hook for the param.
                 if self.ddp_config.delay_wgrad_compute and getattr(
                     param, 'skip_backward_post_hook', False
