@@ -134,6 +134,7 @@ def create_ckpt_load_args(create_args):
     args.ckpt_fully_parallel_save = False
     args.ckpt_fully_parallel_load = False
     args.dist_ckpt_strictness = 'assume_ok_unexpected'
+    args.use_custom_fsdp = False
 
     yield args
 
