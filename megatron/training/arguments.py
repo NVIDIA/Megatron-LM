@@ -901,6 +901,10 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+    group.add_argument('--keep_fp8_weight_transpose_cache', action='store_true', 
+                       help='Keep the fp8 weight transpose cache in memory to avoid recomputing it '
+                            ' This will use more memory')
+
     return parser
 
 def _add_inference_args(parser):

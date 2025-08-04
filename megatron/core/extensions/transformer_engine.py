@@ -214,6 +214,10 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group = None
 
+        if is_te_min_version("2.2.0"):
+            assert hasattr(te.pytorch.Linear, "keep_fp8_weight_transpose_cache"), "Transformer Engine v2.2.0 or later is required to use keep_fp8_weight_transpose_cache"
+            extra_kwargs["keep_fp8_weight_transpose_cache"] = self.config.keep_fp8_weight_transpose_cache
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -343,6 +347,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                         tp_comm_buffer_name is not None
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
+
+        if is_te_min_version("2.2.0"):
+            assert hasattr(te.pytorch.Linear, "keep_fp8_weight_transpose_cache"), "Transformer Engine v2.2.0 or later is required to use keep_fp8_weight_transpose_cache"
+            extra_kwargs["keep_fp8_weight_transpose_cache"] = self.config.keep_fp8_weight_transpose_cache
 
         super().__init__(
             in_features=input_size,
