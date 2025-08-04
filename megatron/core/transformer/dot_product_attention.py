@@ -230,7 +230,7 @@ class DotProductAttention(MegatronModule):
         metadata: Optional[dict] = None,
     ) -> ShardedStateDict:
         if self.config.softmax_type == "learnable":
-            state_dict = self.state_dict(keep_vars=True)
+            state_dict = self.state_dict(prefix="", keep_vars=True)
         else:
             state_dict = {}
         return make_sharded_tensors_for_checkpoint(
