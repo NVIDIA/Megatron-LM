@@ -520,7 +520,7 @@ def build_mtp_layer_callables(layer):
             hidden_states = layer._concat_embeddings(hidden_states, decoder_input)
             return attn_forward(node, hidden_states)
 
-    def submodule_mtp_post_process(node, hidden_states):
+    def submodule_mtp_postprocess_forward(node, hidden_states):
         output_weight = getattr(node.chunk_state, 'output_weight', None)
         if output_weight is None and node.chunk_state.model.share_embeddings_and_output_weights:
             output_weight = node.chunk_state.model.shared_embedding_or_output_weight()
@@ -562,7 +562,7 @@ def build_mtp_layer_callables(layer):
     dispatch_func = partial(rng_context_wrapper, dispatch_forward)
     mlp_func = partial(rng_context_wrapper, mlp_forward)
     combine_func = partial(rng_context_wrapper, combine_forward)
-    mtp_post_process_func = partial(rng_context_wrapper, submodule_mtp_post_process)
+    mtp_post_process_func = submodule_mtp_postprocess_forward
 
     forward_funcs = [
         attn_func,
