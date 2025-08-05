@@ -108,7 +108,7 @@ class DotProductAttention(MegatronModule):
         elif self.config.softmax_type == "learnable":
             self.register_parameter(
                 "softmax_offset",
-                torch.nn.Parameter(torch.empty(self.num_attention_heads_per_partition))
+                torch.nn.Parameter(torch.empty(self.num_attention_heads_per_partition, dtype=self.config.params_dtype)),
             )
         else:
             raise ValueError("Softmax type not supported")
