@@ -265,7 +265,6 @@ class TestBridgeCommunicator:
                 512,
             ), f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"
 
-    
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
         reason="Device mesh feature requires PyTorch 2.3 or later",
