@@ -758,6 +758,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_decode_only()
             else self.round_up_tokens(self.active_token_count)
         )
+        # Account for an extra request during non-decode steps if we include padding tokens.
+        # This is necessary for retrieving the correct state tensors for variable length
+        # generation with Mamba hybrid models.
         offset = 1 if self.padded_active_token_count > self.active_token_count else 0
         self.padded_active_request_count = (
             active_cuda_graph_request_count
@@ -839,7 +842,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.paused_request_count : self.total_request_count
             ]
 
-        # Set the request idx for padded tokens
+        # Set the request idx for padded tokens. This is necessary for variable length
+        # generation with Mamba hybrid models.
         self.token_to_request_idx[self.active_token_count : self.padded_active_token_count] = (
             self.padded_active_request_count
         )
