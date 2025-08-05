@@ -25,7 +25,6 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.inference.utils import Counter
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.training import print_rank_0
 
 try:
     from tqdm import tqdm
@@ -98,10 +97,11 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_cuda_graph = enable_cuda_graph
         if enable_cuda_graph:
 
-            print_rank_0(
-                "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
-                % (len(context.cuda_graph_request_counts), context.cuda_graph_request_counts)
-            )
+            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                print(
+                    "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
+                    % (len(context.cuda_graph_request_counts), context.cuda_graph_request_counts)
+                )
 
             # Iterate cuda graph dims.
             tbar = enumerate(context.cuda_graph_request_counts)
@@ -120,8 +120,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 tbar_str = f"cuda graph warmup, d {cuda_graph_request_count}"
                 if HAVE_TQDM:
                     tbar.set_description(tbar_str)
-                else:
-                    print_rank_0(f"{tbar_idx}/{len(context.cuda_graph_request_counts)}. {tbar_str}")
+                elif torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                    print(f"{tbar_idx}/{len(context.cuda_graph_request_counts)}. {tbar_str}")
 
                 # Get flat tokens, position ids.
                 input_ids, position_ids = context.current_input_and_position_ids(
@@ -378,7 +378,8 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             if prev_is_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
-            print_rank_0(output_str)
+            if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+                print(output_str)
 
         self.step_count += 1
         range_pop()

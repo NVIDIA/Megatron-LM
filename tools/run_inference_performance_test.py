@@ -109,6 +109,9 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
     )
 
+    # Layer type list for hybrid models
+    layer_type_list = getattr(model.module.decoder, "layer_type_list", None)
+
     if args.engine_type == "static":
         inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -127,12 +130,24 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
                 args.num_query_groups if args.group_query_attention else args.num_attention_heads
             ),
             max_sequence_length=args.inference_max_seq_length,
+            num_cuda_graphs=(
+                args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None
+            ),
             buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
             buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
             buffer_overflow_factor=args.inference_dynamic_batching_buffer_overflow_factor,
             max_requests_override=args.inference_dynamic_batching_max_requests_override,
             max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
             chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
+            tensor_model_parallel_size=args.tensor_model_parallel_size,
+            materialize_only_last_token_logits=not args.return_log_probs,
+            is_hybrid_model=args.is_hybrid_model,
+            layer_type_list=layer_type_list,
+            mamba_head_dim=args.mamba_head_dim,
+            mamba_num_groups=args.mamba_num_groups,
+            mamba_d_model=args.hidden_size,
+            mamba_d_conv=4,
+            mamba_d_state=args.mamba_state_dim,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             model, inference_wrapper_config, inference_context=context
@@ -281,6 +296,7 @@ def main():
     if args.model_provider == "gpt":
         model_provider = gpt_model_provider
     elif args.model_provider == "mamba":
+        args.is_hybrid_model = True
         model_provider = mamba_model_provider
 
     model = get_model(model_provider, wrap_with_ddp=False)
