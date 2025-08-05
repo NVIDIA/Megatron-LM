@@ -509,6 +509,10 @@ class MambaMixer(MegatronModule):
                 dim=-1,
             )
 
+            if inference_context.is_static_batching():
+                # transpose: b l pd --> b pd l
+                xBC = rearrange(xBC, "b l d -> b d l").contiguous()
+
             # Compute short convolution
             if conv_state is not None:
                 if inference_context.is_dynamic_batching():
@@ -523,9 +527,6 @@ class MambaMixer(MegatronModule):
                     # See https://github.com/Dao-AILab/causal-conv1d/blob/69e6dadc28b169a4c49cb86b586f64ee90242c70/csrc/causal_conv1d.cpp#L174 # pylint: disable=line-too-long
                     xBC = xBC.transpose(1, 2)
                 else:
-                    # transpose: b l pd --> b pd l
-                    xBC = rearrange(xBC, "b l d -> b d l").contiguous()
-
                     # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
                     # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                     conv_state.copy_(
