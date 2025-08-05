@@ -250,18 +250,14 @@ class TestBridgeCommunicator:
 
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
             random_hidden_state = torch.randn(16, 128, 512).cuda()
-            received_grad = bridge_communicator.send_forward_recv_backward(
-                random_hidden_state
-            )
+            received_grad = bridge_communicator.send_forward_recv_backward(random_hidden_state)
             assert (
                 received_grad.shape == random_hidden_state.shape
             ), f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
 
         else:
             random_grad_state = torch.randn(32, 128, 512).cuda()
-            received_activation = bridge_communicator.send_backward_recv_forward(
-                random_grad_state
-            )
+            received_activation = bridge_communicator.send_backward_recv_forward(random_grad_state)
 
             assert received_activation.shape == (
                 32,
@@ -294,8 +290,7 @@ class TestBridgeCommunicator:
         current_rank = dist.get_rank()
 
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=parallel_state_tp, 
-            create_gloo_process_groups=False
+            tensor_model_parallel_size=parallel_state_tp, create_gloo_process_groups=False
         )
 
         ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
@@ -402,7 +397,9 @@ class TestBridgeCommunicator:
         torch.manual_seed(12345)
 
         # Initialize model parallel state (required for model_parallel_cuda_manual_seed)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1, create_gloo_process_groups=False)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, create_gloo_process_groups=False
+        )
 
         hidden_size = 2048
         dtype = torch.float32

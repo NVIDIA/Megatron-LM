@@ -36,7 +36,7 @@ class BridgeCommunicator:
         dim_mapping: Optional[Dict[str, int]] = None,
         comm_dtype: Optional[torch.dtype] = None,
         src_module_name: Optional[str] = None,
-        dest_module_name: Optional[str] = None
+        dest_module_name: Optional[str] = None,
     ):
         """Initialize the bridge communicator between source and destination grids.
 
@@ -304,7 +304,9 @@ class BridgeCommunicator:
             received_tensors_list = []
             for i, src_rank in enumerate(rank_info.recv_from_ranks):
                 tensor_to_recv = torch.empty(
-                    recv_forward_shapes[i], device=torch.cuda.current_device(), dtype=self.comm_dtype
+                    recv_forward_shapes[i],
+                    device=torch.cuda.current_device(),
+                    dtype=self.comm_dtype,
                 )
                 dist.recv(tensor_to_recv, src=src_rank)
                 logging.debug(
@@ -481,9 +483,7 @@ class BridgeCommunicator:
             return received_gradient
 
     def send_forward_recv_backward(
-        self,
-        input_tensor: torch.Tensor,
-        grad_shape: Optional[Tuple[int, ...]] = None
+        self, input_tensor: torch.Tensor, grad_shape: Optional[Tuple[int, ...]] = None
     ) -> torch.Tensor:
         """Combined operation: send forward activation and receive backward gradient.
 
@@ -604,9 +604,7 @@ class BridgeCommunicator:
             return received_gradient
 
     def send_backward_recv_forward(
-        self,
-        grad_tensor: torch.Tensor,
-        forward_shape: Optional[Tuple[int, ...]] = None,
+        self, grad_tensor: torch.Tensor, forward_shape: Optional[Tuple[int, ...]] = None
     ) -> torch.Tensor:
         """Combined operation: send backward gradient and receive forward activation.
 
@@ -648,7 +646,9 @@ class BridgeCommunicator:
                 received_activations_list = []
                 for i, recv_forward_shape in enumerate(recv_forward_shapes):
                     activation_tensor = torch.empty(
-                        recv_forward_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
+                        recv_forward_shape,
+                        device=torch.cuda.current_device(),
+                        dtype=self.comm_dtype,
                     )
                     received_activations_list.append(activation_tensor)
 
