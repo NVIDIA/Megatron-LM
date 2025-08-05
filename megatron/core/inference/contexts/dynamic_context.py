@@ -617,14 +617,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
-        assert self.is_hybrid_model
+        assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
+
+        paused_request_count = self.paused_request_count
+        total_request_count = paused_request_count + self.padded_active_request_count
+
+        # Account for an extra request during non-decode steps if we include padding tokens.
+        if not self.is_decode_only() and self.padded_active_token_count > self.active_token_count:
+            total_request_count += 1
+
         layer_number = self.layer_map[layer_number - 1]
-        conv_state = self.mamba_conv_states[layer_number][
-            self.paused_request_count : self.paused_request_count + self.padded_active_request_count
-        ]
-        ssm_state = self.mamba_ssm_states[layer_number][
-            self.paused_request_count : self.paused_request_count + self.padded_active_request_count
-        ]
+        conv_state = self.mamba_conv_states[layer_number][paused_request_count:total_request_count]
+        ssm_state = self.mamba_ssm_states[layer_number][paused_request_count:total_request_count]
         return (conv_state, ssm_state)
 
     def apply_rotary_emb_query(
@@ -758,14 +762,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             if self.is_decode_only()
             else self.round_up_tokens(self.active_token_count)
         )
-        # Account for an extra request during non-decode steps if we include padding tokens.
-        # This is necessary for retrieving the correct state tensors for variable length
-        # generation with Mamba hybrid models.
-        offset = 1 if self.padded_active_token_count > self.active_token_count else 0
         self.padded_active_request_count = (
             active_cuda_graph_request_count
             if self.is_decode_only()
-            else (self.total_request_count - self.paused_request_count + offset)
+            else (self.total_request_count - self.paused_request_count)
         )
 
         # Update token position indexes.
@@ -841,12 +841,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.block_table = self.request_to_kv_chunk_ids[
                 self.paused_request_count : self.total_request_count
             ]
-
-        # Set the request idx for padded tokens. This is necessary for variable length
-        # generation with Mamba hybrid models.
-        self.token_to_request_idx[self.active_token_count : self.padded_active_token_count] = (
-            self.padded_active_request_count
-        )
 
     def reset(self) -> None:
         """Reset entire context.

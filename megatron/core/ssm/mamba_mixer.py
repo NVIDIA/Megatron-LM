@@ -9,7 +9,7 @@ import logging
 import math
 import warnings
 from dataclasses import dataclass, replace
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -406,32 +406,12 @@ class MambaMixer(MegatronModule):
             ), "causal_conv1d 1.5.2 required for dynamic_batching"
             assert is_mamba_min_version("2.2.5"), "mamba_ssm 2.2.5 required for dynamic_batching"
 
-            seq_idx = (
-                inference_context.token_to_request_idx[
-                    : inference_context.padded_active_token_count
-                ]
-                .to(torch.int32)
-                .unsqueeze(0)
-            )
-            cu_seqlens, _ = inference_context.cu_query_lengths()
-            if (
-                cu_seqlens is not None
-                and inference_context.padded_active_token_count
-                > inference_context.active_token_count
-            ):
-                # Add the total sequence length to cu_seqlens
-                cu_seqlens = torch.cat(
-                    (cu_seqlens, cu_seqlens.new_tensor([hidden_states.shape[0]]))
-                )
-            return_varlen_states = True
-        else:
-            seq_idx = None
-            cu_seqlens = None
-            return_varlen_states = False
-
         _, batch, dim = hidden_states.shape
-
         conv_state, ssm_state = None, None
+        seq_idx, cu_seqlens, return_varlen_states = self._get_varlen_generation_state(
+            inference_context
+        )
+
         if in_inference_mode:
             assert not self.config.sequence_parallel
             conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
@@ -784,6 +764,56 @@ class MambaMixer(MegatronModule):
         # b pd --> b d
         out, out_bias = self.out_proj(y)
         return out.unsqueeze(0), out_bias, conv_state, ssm_state
+
+    def _get_varlen_generation_state(
+        self, inference_context: Optional[BaseInferenceContext] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        """Constructs the variable length generation state for non-decode dynamic inference.
+
+        The returned state includes the following:
+            `seq_idx` (Tensor): A map from token idx to request idx, accounting for padded tokens.
+            `cu_seqlens` (Tensor): The cumulative sequence lengths, accounting for padded tokens.
+            `return_varlen_states` (bool): Whether to return a varlen states tensor for
+                `mamba_chunk_scan_combined`.
+
+        Returns empty state for training, static inference, or decode-only dynamic inference.
+
+        Args:
+            inference_context (InferenceContext): The inference context.
+
+        Returns:
+            A tuple of (`seq_idx`, `cu_seqlens`, `return_varlen_states`)
+        """
+
+        if (
+            inference_context is None
+            or not inference_context.is_dynamic_batching()
+            or inference_context.is_decode_only()
+        ):
+            return None, None, False
+
+        active_token_count = inference_context.active_token_count
+        padded_active_token_count = inference_context.padded_active_token_count
+
+        # Get a map from token idx to request idx for active tokens.
+        # We explicitly set the request idx for padded tokens as the
+        # next consecutive request idx.
+        seq_idx = (
+            inference_context.token_to_request_idx[:padded_active_token_count]
+            .clone()
+            .to(torch.int32)
+        )
+        padded_request_idx = seq_idx[active_token_count - 1] + 1
+        seq_idx[active_token_count:padded_active_token_count] = padded_request_idx
+        seq_idx = seq_idx.unsqueeze(0)
+
+        # Get the list of cumulative sequence lengths for active requests.
+        # We explicitly add the total sequence length to `cu_seqlens` to account for padding.
+        cu_seqlens, _ = inference_context.cu_query_lengths()
+        if cu_seqlens is not None and padded_active_token_count > active_token_count:
+            cu_seqlens = torch.cat((cu_seqlens, cu_seqlens.new_tensor([padded_active_token_count])))
+
+        return seq_idx, cu_seqlens, True
 
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.
