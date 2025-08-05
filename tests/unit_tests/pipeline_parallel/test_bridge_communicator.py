@@ -265,6 +265,11 @@ class TestBridgeCommunicator:
                 512,
             ), f"Expected activation shape {random_grad_state.shape}, got {received_activation.shape}"
 
+    
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Device mesh feature requires PyTorch 2.3 or later",
+    )
     @pytest.mark.parametrize(
         "grid1_tp, grid1_dp, grid2_tp, grid2_dp, parallel_state_tp",
         [
@@ -278,7 +283,6 @@ class TestBridgeCommunicator:
         self, grid1_tp, grid1_dp, grid2_tp, grid2_dp, parallel_state_tp
     ):
         """Test bridge communicator with two transformer blocks having different process group configurations."""
-
         hidden_size = 1024
         sequence_length = 16
         micro_batch_size = 8
@@ -288,18 +292,15 @@ class TestBridgeCommunicator:
             (sequence_length, micro_batch_size, hidden_size), device="cuda"
         ).to(dtype)
         current_rank = dist.get_rank()
-
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=parallel_state_tp, create_gloo_process_groups=False
         )
-
         ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
         ref_model_comm_pgs = _get_model_comm_pgs_from_grid(ref_grid)
         ref_block = _create_transformer_block(
             dtype=dtype, hidden_size=hidden_size, model_comm_pgs=ref_model_comm_pgs
         )
         _avg_params(ref_block, ref_grid.get_pg("dp"))
-
         block_grid_1, grid_1 = get_transformer_block_and_grid(
             ref_block,
             tp_size=grid1_tp,
@@ -308,7 +309,6 @@ class TestBridgeCommunicator:
             hidden_size=hidden_size,
             dtype=dtype,
         )
-
         block_grid_2, grid_2 = get_transformer_block_and_grid(
             ref_block,
             tp_size=grid2_tp,
@@ -336,7 +336,6 @@ class TestBridgeCommunicator:
                 micro_batch_size * factor if grid1_dp > grid2_dp else micro_batch_size // factor,
                 hidden_size,
             )
-
             assert (
                 output_grid_2.shape == expected_output_shape
             ), f"Output2 shape mismatch: {output_grid_2.shape}"
