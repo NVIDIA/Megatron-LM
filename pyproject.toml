@@ -117,6 +117,7 @@ linting = [
     "pylint==3.2.6",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
+flash_mla = ["flash_mla"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
@@ -129,6 +130,12 @@ override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
+]
+no-build-isolation-package = ["flash_mla"]
+
+[tool.uv.sources]
+flash_mla = [
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
 
 [tool.isort]

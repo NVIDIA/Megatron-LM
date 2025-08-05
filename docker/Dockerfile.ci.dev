@@ -65,7 +65,7 @@ COPY --from=build_groupedgemm $WHEEL_DIR/*.whl $WHEEL_DIR/
 RUN bash -ex <<"EOF"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     
-    uv sync --extra dev --extra mlm --link-mode copy --locked
+    uv sync --extra dev --extra mlm --link-mode copy --locked --all-groups 
 
     bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment dev
 EOF
