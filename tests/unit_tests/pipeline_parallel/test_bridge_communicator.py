@@ -201,7 +201,7 @@ class TestBridgeCommunicator:
 
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
         grid2 = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
-        bridge_communicator = BridgeCommunicator(grid1, grid2)
+        bridge_communicator = BridgeCommunicator(grid1, grid2, comm_dtype=torch.float32)
 
         random_hidden_state = torch.randn(16, 128, 512)
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
@@ -209,9 +209,7 @@ class TestBridgeCommunicator:
             bridge_communicator.send_forward(random_hidden_state)
 
         else:
-            received_activation = bridge_communicator.receive_forward(
-                dtype=random_hidden_state.dtype
-            )
+            received_activation = bridge_communicator.recv_forward()
             # default assunes bsh
             assert received_activation.shape == (
                 32,
@@ -227,15 +225,15 @@ class TestBridgeCommunicator:
         # Create source and destination grids
         grid1 = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
         grid2 = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
-        bridge_communicator = BridgeCommunicator(grid1, grid2)
-
         random_grad_state = torch.randn(16, 128, 512)
+        bridge_communicator = BridgeCommunicator(grid1, grid2, comm_dtype=torch.float32)
+
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.dest_grid):
             random_grad_state = random_grad_state.cuda()
             bridge_communicator.send_backward(random_grad_state)
 
         else:
-            received_gradient = bridge_communicator.receive_backward(dtype=random_grad_state.dtype)
+            received_gradient = bridge_communicator.recv_backward()
             assert received_gradient.shape == (
                 4,
                 128,
@@ -248,14 +246,13 @@ class TestBridgeCommunicator:
         # Create source and destination grids
         grid1 = create_hypercomm_grid(offset=0, tp=2, cp=1, pp=1, dp=2)
         grid2 = create_hypercomm_grid(offset=4, tp=4, cp=1, pp=1, dp=1)
-        bridge_communicator = BridgeCommunicator(grid1, grid2)
+        bridge_communicator = BridgeCommunicator(grid1, grid2, comm_dtype=torch.float32)
 
         if bridge_communicator.is_current_rank_in_grid(bridge_communicator.src_grid):
             random_hidden_state = torch.randn(16, 128, 512).cuda()
             received_grad = bridge_communicator.send_forward_recv_backward(
-                random_hidden_state, dtype=random_hidden_state.dtype
+                random_hidden_state
             )
-
             assert (
                 received_grad.shape == random_hidden_state.shape
             ), f"Expected gradient shape {random_hidden_state.shape}, got {received_grad.shape}"
@@ -263,7 +260,7 @@ class TestBridgeCommunicator:
         else:
             random_grad_state = torch.randn(32, 128, 512).cuda()
             received_activation = bridge_communicator.send_backward_recv_forward(
-                random_grad_state, dtype=random_grad_state.dtype
+                random_grad_state
             )
 
             assert received_activation.shape == (
@@ -296,7 +293,10 @@ class TestBridgeCommunicator:
         ).to(dtype)
         current_rank = dist.get_rank()
 
-        Utils.initialize_model_parallel(tensor_model_parallel_size=parallel_state_tp)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=parallel_state_tp, 
+            create_gloo_process_groups=False
+        )
 
         ref_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=8)
         ref_model_comm_pgs = _get_model_comm_pgs_from_grid(ref_grid)
@@ -325,7 +325,7 @@ class TestBridgeCommunicator:
 
         dist.barrier()
         bridge_communicator = BridgeCommunicator(
-            grid_1, grid_2, dim_mapping={'s': 0, 'h': 2, 'b': 1}
+            grid_1, grid_2, dim_mapping={'s': 0, 'h': 2, 'b': 1}, comm_dtype=dtype
         )
         output_grid_2 = None
         if grid_1 is not None and bridge_communicator.is_current_rank_in_grid(grid_1):
@@ -333,7 +333,7 @@ class TestBridgeCommunicator:
             bridge_communicator.send_forward(output_grid_1)
 
         if grid_2 is not None and bridge_communicator.is_current_rank_in_grid(grid_2):
-            received_activation = bridge_communicator.receive_forward(dtype=dtype)
+            received_activation = bridge_communicator.recv_forward()
             output_grid_2 = block_grid_2(hidden_states=received_activation, attention_mask=None)
             factor = max(grid1_dp, grid2_dp) // min(grid1_dp, grid2_dp)
             expected_output_shape = (
@@ -402,7 +402,7 @@ class TestBridgeCommunicator:
         torch.manual_seed(12345)
 
         # Initialize model parallel state (required for model_parallel_cuda_manual_seed)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, create_gloo_process_groups=False)
 
         hidden_size = 2048
         dtype = torch.float32

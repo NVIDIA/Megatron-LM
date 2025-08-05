@@ -34,6 +34,9 @@ class BridgeCommunicator:
         src_grid: HyperCommGrid,
         dest_grid: HyperCommGrid,
         dim_mapping: Optional[Dict[str, int]] = None,
+        comm_dtype: Optional[torch.dtype] = None,
+        src_module_name: Optional[str] = None,
+        dest_module_name: Optional[str] = None
     ):
         """Initialize the bridge communicator between source and destination grids.
 
@@ -44,6 +47,9 @@ class BridgeCommunicator:
         """
         self.src_grid = src_grid
         self.dest_grid = dest_grid
+        self.src_module_name = src_module_name
+        self.dest_module_name = dest_module_name
+        self.comm_dtype = comm_dtype
 
         # TODO - CP support will be added in follow up PR.
         if 'cp' in self.src_grid.dim_names:
@@ -76,13 +82,13 @@ class BridgeCommunicator:
         self.src_grid_broadcast_ranks = []
         self.dest_grid_broadcast_ranks = []
         for src_grid_broadcast_ranks in src_grid_broadcast_ranks_list:
-            pg = dist.new_group(ranks=src_grid_broadcast_ranks)
+            pg = dist.new_group(ranks=src_grid_broadcast_ranks, backend='nccl')
             if self.current_rank in src_grid_broadcast_ranks:
                 self.src_grid_broadcast_ranks = src_grid_broadcast_ranks
                 self.src_grid_broadcast_pg = pg
 
         for dest_grid_broadcast_ranks in dest_grid_broadcast_ranks_list:
-            pg = dist.new_group(ranks=dest_grid_broadcast_ranks)
+            pg = dist.new_group(ranks=dest_grid_broadcast_ranks, backend='nccl')
             if self.current_rank in dest_grid_broadcast_ranks:
                 self.dest_grid_broadcast_ranks = dest_grid_broadcast_ranks
                 self.dest_grid_broadcast_pg = pg
@@ -266,12 +272,11 @@ class BridgeCommunicator:
                     )
                     dist.send(tensor_split, dst=dest_rank)
 
-    def receive_forward(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    def recv_forward(self) -> torch.Tensor:
         """Receive forward activation tensor.
 
         Args:
             tensor_shape: Expected tensor shape (None if using shape communication)
-            dtype: Expected tensor dtype
 
         Returns:
             torch.Tensor: The received activation tensor
@@ -299,7 +304,7 @@ class BridgeCommunicator:
             received_tensors_list = []
             for i, src_rank in enumerate(rank_info.recv_from_ranks):
                 tensor_to_recv = torch.empty(
-                    recv_forward_shapes[i], device=torch.cuda.current_device(), dtype=dtype
+                    recv_forward_shapes[i], device=torch.cuda.current_device(), dtype=self.comm_dtype
                 )
                 dist.recv(tensor_to_recv, src=src_rank)
                 logging.debug(
@@ -336,7 +341,7 @@ class BridgeCommunicator:
 
             received_shape = tuple(shape_tensor.tolist())
             received_tensor = torch.empty(
-                received_shape, device=torch.cuda.current_device(), dtype=dtype
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
             )
 
             # Receive the full tensor via broadcast
@@ -386,7 +391,7 @@ class BridgeCommunicator:
                     )
                     dist.send(tensor_split, dst=src_rank)
 
-    def receive_backward(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    def recv_backward(self) -> torch.Tensor:
         """Receive backward gradient tensor.
 
         Note: Gradient receivers are activation 'SENDERS'
@@ -421,7 +426,7 @@ class BridgeCommunicator:
             for i, dest_rank in enumerate(rank_info.send_to_ranks):
                 # The destination rank that we sent to will send us gradients back
                 grad_tensor = torch.empty(
-                    recv_grad_shapes[i], device=torch.cuda.current_device(), dtype=dtype
+                    recv_grad_shapes[i], device=torch.cuda.current_device(), dtype=self.comm_dtype
                 )
                 dist.recv(grad_tensor, src=dest_rank)
                 logging.debug(
@@ -463,7 +468,7 @@ class BridgeCommunicator:
             )
             received_shape = tuple(shape_tensor.tolist())
             received_gradient = torch.empty(
-                received_shape, device=torch.cuda.current_device(), dtype=dtype
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
             )
 
             dist.broadcast(
@@ -478,15 +483,13 @@ class BridgeCommunicator:
     def send_forward_recv_backward(
         self,
         input_tensor: torch.Tensor,
-        grad_shape: Optional[Tuple[int, ...]] = None,
-        dtype: Optional[torch.dtype] = None,
+        grad_shape: Optional[Tuple[int, ...]] = None
     ) -> torch.Tensor:
         """Combined operation: send forward activation and receive backward gradient.
 
         Args:
             input_tensor: The tensor to send forward
             grad_shape: Expected gradient tensor shape
-            dtype: Expected tensor dtype
 
         Returns:
             torch.Tensor: The received gradient tensor
@@ -522,7 +525,7 @@ class BridgeCommunicator:
                 received_gradients_list = []
                 for i, recv_grad_shape in enumerate(recv_grad_shapes):
                     grad_tensor = torch.empty(
-                        recv_grad_shape, device=torch.cuda.current_device(), dtype=dtype
+                        recv_grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
                     )
                     received_gradients_list.append(grad_tensor)
 
@@ -589,7 +592,7 @@ class BridgeCommunicator:
             # Use the received shape to create tensor for broadcast
             received_shape = tuple(shape_tensor.tolist())
             received_gradient = torch.empty(
-                received_shape, device=torch.cuda.current_device(), dtype=dtype
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
             )
             dist.broadcast(
                 received_gradient, src=self.src_local_leader_rank, group=self.src_grid_broadcast_pg
@@ -604,14 +607,12 @@ class BridgeCommunicator:
         self,
         grad_tensor: torch.Tensor,
         forward_shape: Optional[Tuple[int, ...]] = None,
-        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         """Combined operation: send backward gradient and receive forward activation.
 
         Args:
             grad_tensor: The gradient tensor to send backward
             forward_shape: Expected forward tensor shape
-            dtype: Expected tensor dtype
 
         Returns:
             torch.Tensor: The received activation tensor
@@ -647,7 +648,7 @@ class BridgeCommunicator:
                 received_activations_list = []
                 for i, recv_forward_shape in enumerate(recv_forward_shapes):
                     activation_tensor = torch.empty(
-                        recv_forward_shape, device=torch.cuda.current_device(), dtype=dtype
+                        recv_forward_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
                     )
                     received_activations_list.append(activation_tensor)
 
@@ -711,7 +712,7 @@ class BridgeCommunicator:
             # Use the received shape to create tensor for scatter operation
             received_shape = tuple(shape_tensor.tolist())
             received_activation = torch.empty(
-                received_shape, device=torch.cuda.current_device(), dtype=dtype
+                received_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
             )
             dist.broadcast(
                 received_activation,
