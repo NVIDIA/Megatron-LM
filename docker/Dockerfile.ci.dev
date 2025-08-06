@@ -3,36 +3,8 @@
 ARG FROM_IMAGE_NAME
 ARG WHEEL_DIR=/workspace/wheels
 
-FROM ${FROM_IMAGE_NAME} as mcore_image
+FROM ${FROM_IMAGE_NAME} as main
 ENV PIP_CONSTRAINT=""
-RUN pip install -U pip
-
-FROM mcore_image as build_te
-ARG TE_COMMIT=b97c2bf7b93be265fd4d60f600718920297049ef
-ARG WHEEL_DIR
-WORKDIR /workspace
-COPY docker docker/
-RUN bash docker/common/build_te.sh --repo-ref $TE_COMMIT --output-wheel-dir $WHEEL_DIR
-
-FROM mcore_image as build_mamba
-ARG WHEEL_DIR
-WORKDIR /workspace
-COPY docker docker/
-RUN bash docker/common/build_mamba.sh --output-wheel-dir $WHEEL_DIR
-
-FROM mcore_image as build_causalconv1d
-ARG WHEEL_DIR
-WORKDIR /workspace
-COPY docker docker/
-RUN bash docker/common/build_causalconv1d.sh --output-wheel-dir $WHEEL_DIR
-
-FROM mcore_image as build_groupedgemm
-ARG WHEEL_DIR
-WORKDIR /workspace
-COPY docker docker/
-RUN bash docker/common/build_groupedgemm.sh --output-wheel-dir $WHEEL_DIR
-
-FROM mcore_image as main
 ENV DEBIAN_FRONTEND=noninteractive
 ARG UV_VERSION=0.7.2
 ARG YQ_VERSION=4.44.1
@@ -57,17 +29,24 @@ ARG WHEEL_DIR
 COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
-COPY docker/common/ /workspace/docker/common/
-COPY --from=build_te $WHEEL_DIR/*.whl $WHEEL_DIR/
-COPY --from=build_mamba $WHEEL_DIR/*.whl $WHEEL_DIR/
-COPY --from=build_causalconv1d $WHEEL_DIR/*.whl $WHEEL_DIR/
-COPY --from=build_groupedgemm $WHEEL_DIR/*.whl $WHEEL_DIR/
 RUN bash -ex <<"EOF"
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
-    
-    uv sync --extra dev --extra mlm --link-mode copy --locked --all-groups 
-
-    bash docker/common/install_source_wheels.sh --input-wheel-dir $WHEEL_DIR/ --environment dev
+    uv sync --extra dev --extra mlm --link-mode copy --locked \
+        --no-install-package torch \
+        --no-install-package torchvision \
+        --no-install-package triton \
+        --no-install-package nvidia-cublas-cu12 \
+        --no-install-package nvidia-cuda-cupti-cu12 \
+        --no-install-package nvidia-cuda-nvrtc-cu12 \
+        --no-install-package nvidia-cuda-runtime-cu12 \
+        --no-install-package nvidia-cudnn-cu12 \
+        --no-install-package nvidia-cufft-cu12 \
+        --no-install-package nvidia-cufile-cu12 \
+        --no-install-package nvidia-curand-cu12 \
+        --no-install-package nvidia-cusolver-cu12 \
+        --no-install-package nvidia-cusparse-cu12 \
+        --no-install-package nvidia-cusparselt-cu12 \
+        --no-install-package nvidia-nccl-cu12
 EOF
 COPY assets/ /opt/data/
 

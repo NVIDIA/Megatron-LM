@@ -71,10 +71,15 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "transformers~=4.53",
-    "multi-storage-client~=0.20.3",
+    "multi-storage-client~=0.20",
     "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
-    "nvidia-modelopt[torch]>=0.31.0a0,<0.32.0; sys_platform != 'darwin'",
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "nv-grouped-gemm~=1.1",
+    "transformer-engine[pytorch]>=2.5.0a0,<2.7.0",
+    "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
+    "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
     "megatron-energon[av_decode]~=6.0",
     "flashinfer-python",
     "onnxscript",
@@ -109,6 +114,7 @@ build = [
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
+    "torch",
 ]
 linting = [
     "ruff~=0.9.0",
@@ -122,7 +128,14 @@ flash_mla = ["flash_mla"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
-
+no-build-isolation-package = [
+    "transformer-engine",
+    "transformer-engine-torch",
+    "mamba-ssm",
+    "causal-conv1d",
+    "nv-grouped-gemm",
+    "flash_mla",
+]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
 # We don't want to install torch, torchvision, and triton
@@ -132,12 +145,12 @@ override-dependencies = [
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]
-no-build-isolation-package = ["flash_mla"]
 
 [tool.uv.sources]
 flash_mla = [
     { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
 ]
+transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "c90a720765bc01ebb5ba1f70a7ce2d16b2e46d77" } # on `release_v2.6`
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
