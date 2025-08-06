@@ -9,6 +9,7 @@ from typing import List, Optional
 import pytest
 import torch
 from tqdm import tqdm
+from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
@@ -37,19 +38,20 @@ from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
-    is_causal_conv1d_min_version,
+    check_mamba_dynamic_inference_support,
     is_fa_min_version,
-    is_mamba_min_version,
+    is_te_min_version,
 )
 from tests.unit_tests.test_utilities import Utils
 
 
 def skip_if_mamba_causal_conv1d_not_available(model_provider: str):
     if model_provider == "mamba":
-        if not is_causal_conv1d_min_version("1.5.2"):
-            pytest.skip(reason="causal_conv1d 1.5.2 is required")
-        if not is_mamba_min_version("2.2.5"):
-            pytest.skip(reason="mamba_ssm 2.2.5 is required")
+        dynamic_inference_available, reason_for_no_dynamic_inference = (
+            check_mamba_dynamic_inference_support()
+        )
+        if not dynamic_inference_available:
+            pytest.skip(reason_for_no_dynamic_inference)
 
 
 def set_rounder(value):
@@ -96,6 +98,7 @@ class DynamicEngineTestConfig:
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
+    fp8: bool = False
 
     model_provider: str = "gpt"
 
@@ -238,6 +241,8 @@ class TestDynamicInferenceEngine:
                 enable_cuda_graph=test_config.num_cuda_graphs is not None,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+                fp8="hybrid" if test_config.fp8 else None,
+                fp8_recipe="tensorwise" if test_config.fp8 else None,
             )
 
             # GPT model.
@@ -725,3 +730,17 @@ class TestDynamicInferenceEngine:
             )
 
         engine_task.cancel()
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_fp8_inference(self, model_provider: str):
+        skip_if_mamba_causal_conv1d_not_available(model_provider)
+
+        fp8_available, reason_for_no_fp8 = check_fp8_support()
+        if not fp8_available:
+            pytest.skip(reason_for_no_fp8)
+
+        self._run_test(model_provider=model_provider, fp8=True)

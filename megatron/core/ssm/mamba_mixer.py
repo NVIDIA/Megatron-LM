@@ -28,9 +28,8 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import (
+    check_mamba_dynamic_inference_support,
     deprecate_inference_params,
-    is_causal_conv1d_min_version,
-    is_mamba_min_version,
     log_single_rank,
 )
 
@@ -69,6 +68,14 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+HAVE_TE = False
+try:
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    HAVE_TE = True
+except (ImportError, ModuleNotFoundError):
+    # Transformer Engine not found
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -401,10 +408,10 @@ class MambaMixer(MegatronModule):
         in_inference_mode = inference_context is not None and not self.training
 
         if in_inference_mode and inference_context.is_dynamic_batching():
-            assert is_causal_conv1d_min_version(
-                "1.5.2"
-            ), "causal_conv1d 1.5.2 required for dynamic_batching"
-            assert is_mamba_min_version("2.2.5"), "mamba_ssm 2.2.5 required for dynamic_batching"
+            dynamic_inference_available, reason_for_no_dynamic_inference = (
+                check_mamba_dynamic_inference_support()
+            )
+            assert dynamic_inference_available, reason_for_no_dynamic_inference
 
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None
@@ -629,11 +636,17 @@ class MambaMixer(MegatronModule):
         else:
             batch_indices = None
 
-        # l b d --> b d
-        hidden_states = hidden_states.squeeze(0)
+        in_fp8_mode = HAVE_TE and FP8GlobalStateManager.is_fp8_enabled()
 
-        #  b d_model --> b p(2d)
+        if not in_fp8_mode:
+            # l b d --> b d
+            hidden_states = hidden_states.squeeze(0)
+
+        # b d_model --> b p(2d)
         zxBCdt, _ = self.in_proj(hidden_states)
+
+        if in_fp8_mode:
+            zxBCdt = zxBCdt.squeeze(0)
 
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inference decode"
 
@@ -761,9 +774,16 @@ class MambaMixer(MegatronModule):
         if self.rmsnorm:
             y = self.norm(y, z)
 
+        if in_fp8_mode:
+            y = y.unsqueeze(0)
+
         # b pd --> b d
         out, out_bias = self.out_proj(y)
-        return out.unsqueeze(0), out_bias, conv_state, ssm_state
+
+        if not in_fp8_mode:
+            out = out.unsqueeze(0)
+
+        return out, out_bias, conv_state, ssm_state
 
     def _get_varlen_generation_state(
         self, inference_context: Optional[BaseInferenceContext] = None

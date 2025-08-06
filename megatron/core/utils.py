@@ -441,6 +441,15 @@ def is_causal_conv1d_min_version(version, check_equality=True):
     return get_causal_conv1d_version() > PkgVersion(version)
 
 
+def check_mamba_dynamic_inference_support() -> Tuple[bool, Optional[str]]:
+    """Checks whether `causal_conv1d` and `mamba_ssm` support dynamic inference."""
+    if not is_causal_conv1d_min_version("1.5.0.post8"):
+        return False, "causal_conv1d >= 1.5.0.post8 is required"
+    elif not is_mamba_min_version("2.2.4"):
+        return False, "mamba_ssm >= 2.2.4 is required"
+    return True, None
+
+
 def ensure_divisibility(numerator, denominator):
     """Ensure that numerator is divisible by the denominator."""
     assert numerator % denominator == 0, "{} is not divisible by {}".format(numerator, denominator)
