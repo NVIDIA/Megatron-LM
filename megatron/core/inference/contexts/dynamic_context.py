@@ -582,7 +582,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             value (Tensor): Value tensor.
         """
 
-        layer_number = self.layer_map[layer_number - 1]
+        attention_layer_number = self.layer_map[layer_number - 1]
         chunk_idx = self.token_to_chunk_idx[: self.padded_active_token_count]
         local_kv_seq_idx = self.token_to_local_position_within_kv_chunk[
             : self.padded_active_token_count
@@ -591,10 +591,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         key = key.squeeze(1)
         value = value.squeeze(1)
 
-        self.memory_buffer[0, layer_number, chunk_idx, local_kv_seq_idx] = key[
+        self.memory_buffer[0, attention_layer_number, chunk_idx, local_kv_seq_idx] = key[
             : self.padded_active_token_count
         ]
-        self.memory_buffer[1, layer_number, chunk_idx, local_kv_seq_idx] = value[
+        self.memory_buffer[1, attention_layer_number, chunk_idx, local_kv_seq_idx] = value[
             : self.padded_active_token_count
         ]
 

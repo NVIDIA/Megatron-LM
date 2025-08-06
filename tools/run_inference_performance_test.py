@@ -23,6 +23,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import get_attr_wrapped_model
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -110,7 +111,8 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     )
 
     # Layer type list for hybrid models
-    layer_type_list = getattr(model.module.decoder, "layer_type_list", None)
+    decoder = get_attr_wrapped_model(model, "decoder")
+    layer_type_list = getattr(decoder, "layer_type_list", None)
 
     if args.engine_type == "static":
         inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
