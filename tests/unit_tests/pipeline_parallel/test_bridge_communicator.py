@@ -75,6 +75,11 @@ def _shard_and_copy_(
     for name, tgt_param in tgt_sd.items():
         full_param = ref_sd[name]
 
+        # Skip non-tensor entries (e.g., _metadata or other buffers stored as BytesIO).
+        if not (torch.is_tensor(tgt_param) and torch.is_tensor(full_param)):
+            logging.info(f'_shard_and_copy_ skipping non-tensor entry: {name}')
+            continue
+
         # Exact match – just copy.
         if full_param.shape == tgt_param.shape:
             tgt_param.copy_(full_param)
@@ -267,7 +272,7 @@ class TestBridgeCommunicator:
 
     @pytest.mark.skipif(
         version.parse(torch.__version__) < version.parse('2.3.0'),
-        reason="Device mesh feature requires PyTorch 2.3 or later",
+        reason="Feature requires PyTorch 2.3 or later",
     )
     @pytest.mark.parametrize(
         "grid1_tp, grid1_dp, grid2_tp, grid2_dp, parallel_state_tp",
@@ -387,6 +392,10 @@ class TestBridgeCommunicator:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Feature requires PyTorch 2.3 or later",
+    )
     def test_tranformer_block_with_different_parallelisms(self):
         os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
         os.environ["NVTE_FLASH_ATTN"] = "0"
