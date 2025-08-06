@@ -1085,8 +1085,63 @@ def validate_args(args, defaults={}):
         )
 
     # CUDA Graphs
+    if args.enable_cuda_graph or args.external_cuda_graph:
+        assert (
+            not args.enable_cuda_graph or not args.external_cuda_graph
+        ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+        if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
+            args.te_rng_tracker = True
+            warnings.warn("te_rng_tracker is not enabled, enabling it for CUDA graphs.")
+
     if args.external_cuda_graph:
-        assert args.te_rng_tracker, "--te-rng-tracker must be enabled when using CUDA Graphs."
+        for scope in args.cuda_graph_scope:
+            assert scope in [
+                'attn',
+                'mlp',
+                'moe',
+                'moe_router',
+                'moe_preprocess',
+                'mamba',
+            ], f"--cuda-graph-scope should be attn, mlp, moe, moe_router, moe_preprocess, or mamba, got {args.cuda_graph_scope}."
+        assert (
+            'moe' not in args.cuda_graph_scope or 'moe_router' not in args.cuda_graph_scope
+        ), 'cuda_graph_scope must not contain both moe and moe_router.'
+        if args.num_experts is None or args.num_experts == 1:
+            assert (
+                'moe' not in args.cuda_graph_scope and 'moe_router' not in args.cuda_graph_scope
+            ), 'moe cuda graph is only supported for MoE.'
+        if 'moe_preprocess' in args.cuda_graph_scope:
+            assert (
+                'moe_router' in args.cuda_graph_scope
+            ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+        if args.num_experts is not None and args.num_experts > 1:
+            if args.moe_layer_freq == 1 and (args.hybrid_override_pattern is None or '-' not in args.hybrid_override_pattern):
+                assert (
+                    'mlp' not in args.cuda_graph_scope
+                ), 'mlp cuda graph is only supported for dense model.'
+            if args.moe_token_dispatcher_type in ['flex', 'allgather']:
+                assert (
+                    'moe' not in args.cuda_graph_scope
+                ), 'moe cuda graph is not supported for flex or allgather token dispatcher.'
+            elif args.moe_token_dispatcher_type == 'alltoall' and (
+                args.moe_expert_capacity_factor is None or not args.moe_pad_expert_input_to_capacity
+            ):
+                assert (
+                    'moe' not in args.cuda_graph_scope
+                ), 'moe cuda graph is only supported with drop-padding MoE.'
+                if args.moe_expert_capacity_factor is not None or args.moe_router_padding_for_fp8:
+                    assert (
+                        'moe_preprocess' not in args.cuda_graph_scope
+                    ), 'moe_preprocess cuda graph is not supported when there are DtoH copies and synchronizations in the preprocess step.'
+
+        if "expandable_segments:True" in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""):
+            warnings.warn(
+                "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
+                "The training may crash with illegal memory access."
+            )
+        assert (
+            args.recompute_granularity != 'full'
+        ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
     # Print arguments.
     _print_args("arguments", args)
@@ -1260,12 +1315,17 @@ def _add_inference_args(parser):
     group.add_argument('--external-cuda-graph', action='store_true',
                        help='Use CUDA graph capture and replay. The CUDA graphs are'
                        'manually captured in the training script.')
-    group.add_argument('--cuda-graph-scope', type=str, default='full',
-                       choices=['full', 'attn'],
-                       help='Determines the CUDA graphs capturing scope. Valid values are '
-                       '\"full\" and \"attn\". \"Full\" scope captures a whole '
-                       'Transformer layer. \"Attn\" scope only captures operations in '
-                       'TransformerLayer._forward_attention().')
+    group.add_argument('--cuda-graph-scope', nargs='+', type=str, default=['attn', 'mlp'],
+                       help='Determines the CUDA graphs capturing scope. '
+                       'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+                       '"attn": captures operations in TransformerLayer._forward_attention(). '
+                       '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
+                       '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
+                       '"moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(). '
+                       'Note that if moe_shared_expert_compute_before_router is True, it also captures the shared experts. '
+                       '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
+                       '"mamba": captures the mamba layer. '
+                       '"full_iteration": captures a whole iteration.')
     group.add_argument('--inference-max-requests', type=int, default=8,
                        help='Maximum number of requests for inference.',
                        dest='inference_max_batch_size')
@@ -2741,6 +2801,11 @@ def _add_moe_args(parser):
     group.add_argument('--moe-shared-expert-overlap', action='store_true',
                        help='Enable overlapping between shared expert computations and dispatcher communications. '
                        'Without this, the shared epxerts execute after the routed experts. '
+                       'Only effective when moe-shared-expert-intermediate-size is set.')
+    group.add_argument('--moe-shared-expert-compute-before-router', action='store_true',
+                       help='Compute the shared experts before the router instead of in the experts_compute method. '
+                       'This makes the gradient from the shared experts side the last one added to the hidden_states, '
+                       'so the hidden_states gradient may differ by turning this option on or off. '
                        'Only effective when moe-shared-expert-intermediate-size is set.')
     group.add_argument('--moe-grouped-gemm', action='store_true',
                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')

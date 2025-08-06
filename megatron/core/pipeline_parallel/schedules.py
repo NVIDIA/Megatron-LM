@@ -179,6 +179,15 @@ def set_current_microbatch(model, microbatch_id):
     if decoder_exists and decoder is not None:
         for layer in decoder.layers:
             layer.current_microbatch = microbatch_id
+    mtp_exists = True
+    mtp = None
+    try:
+        mtp = get_attr_wrapped_model(model, "mtp")
+    except RuntimeError:
+        mtp_exists = False
+    if mtp_exists and mtp is not None:
+        for layer in mtp.layers:
+            layer.transformer_layer.current_microbatch = microbatch_id
 
 
 def forward_step(

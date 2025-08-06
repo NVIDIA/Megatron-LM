@@ -15,7 +15,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, is_graph_capturing
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -395,18 +395,31 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
 
+        self.is_moe_layer = isinstance(self.mlp, MoELayer)
+
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
         if self.config.recompute_granularity == 'selective':
             if "layernorm" in self.config.recompute_modules:
-                if not isinstance(self.input_layernorm, IdentityOp):
+                if not isinstance(self.input_layernorm, IdentityOp) and (
+                    not self.config.external_cuda_graph
+                    or 'attn' not in self.config.cuda_graph_scope
+                ):
                     self.recompute_input_layernorm = True
-                if not isinstance(self.pre_mlp_layernorm, IdentityOp):
+                if not isinstance(self.pre_mlp_layernorm, IdentityOp) and (
+                    not self.config.external_cuda_graph
+                    or (not self.is_moe_layer and 'mlp' not in self.config.cuda_graph_scope)
+                    or (
+                        self.is_moe_layer
+                        and 'moe' not in self.config.cuda_graph_scope
+                        and 'moe_router' not in self.config.cuda_graph_scope
+                    )
+                ):
                     self.recompute_pre_mlp_layernorm = True
             if "mlp" in self.config.recompute_modules:
 
-                if not isinstance(self.mlp, MoELayer):
+                if not self.is_moe_layer:
                     self.recompute_mlp = True
 
         # @jcasper how should we handle nvfuser?
@@ -626,6 +639,19 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="mlp")
 
+        # Return right here if we are partially capturing the MoE.
+        if (
+            self.is_moe_layer
+            and self.config.external_cuda_graph
+            and self.training
+            and is_graph_capturing()
+            and 'moe_router' in self.config.cuda_graph_scope
+        ):
+            return mlp_output_with_bias + [residual]
+
+        return self._forward_post_mlp(mlp_output_with_bias, residual)
+
+    def _forward_post_mlp(self, mlp_output_with_bias, residual):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
@@ -693,12 +719,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             requires_grad=True,
             device=torch.cuda.current_device(),
         )
-        static_inputs["attention_mask"] = (
-            ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-            .to(torch.cuda.current_device())
-            .reshape(1, 1, slen_per_cp, seq_length)
-            .tile(micro_batch_size, 1, 1, 1)
-        )
+        if 'attn' in self.config.cuda_graph_scope:
+            static_inputs["attention_mask"] = (
+                ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
+                .to(torch.cuda.current_device())
+                .reshape(1, 1, slen_per_cp, seq_length)
+                .tile(micro_batch_size, 1, 1, 1)
+            )
         return static_inputs
 
     def setup_manual_hooks(self, make_hook_func):
@@ -711,19 +738,22 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Select the modules who contain direct parameters and are covered by cudagraphs.
         # Add these modules to the `cuda_graph_manual_hooks` because their hooks will not
         # be automatically triggered when they go through the CUDA Graph path.
-        if self.config.cuda_graph_scope == 'full':
-            high_level_modules = [self]
-        else:
-            assert (
-                self.config.cuda_graph_scope == 'attn'
-            ), "Invalid cuda_graph_scope ${self.config.cuda_graph_scope}"
-            high_level_modules = [
+        high_level_modules = []
+        if 'attn' in self.config.cuda_graph_scope:
+            high_level_modules += [
                 self.input_layernorm,
                 self.self_attention,
                 self.pre_cross_attn_layernorm,
                 self.cross_attention,
-                self.pre_mlp_layernorm,
             ]
+        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
+            self.is_moe_layer and 'moe' in self.config.cuda_graph_scope
+        ):
+            high_level_modules += [self.pre_mlp_layernorm, self.mlp]
+        elif self.is_moe_layer and 'moe_router' in self.config.cuda_graph_scope:
+            high_level_modules += [self.pre_mlp_layernorm, self.mlp.router]
+            if self.config.moe_shared_expert_compute_before_router:
+                high_level_modules += [self.mlp.shared_experts]
 
         param_modules = []
         for module in high_level_modules:
@@ -731,7 +761,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 if next(submodule.parameters(recurse=False), None) is not None:
                     # Module contains direct parameters.
                     param_modules.append(submodule)
-                    continue
         if len(param_modules) > 0:
             for module in param_modules:
                 self.cuda_graph_manual_hooks.append((make_hook_func(), (module,)))
@@ -743,12 +772,27 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        context = None
+        if 'attn' in self.config.cuda_graph_scope:
+            hidden_states, context = self._forward_attention(*args, **kwargs)
+        else:
+            if len(args) > 0:
+                hidden_states = args[0]
+            else:
+                hidden_states = kwargs.pop("hidden_states")
 
-        if self.config.cuda_graph_scope == "full":
+        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
+            self.is_moe_layer
+            and (
+                'moe' in self.config.cuda_graph_scope
+                or 'moe_router' in self.config.cuda_graph_scope
+            )
+        ):
             hidden_states = self._forward_mlp(hidden_states)
-        cuda_graph_outputs = [hidden_states]
-
+        if not isinstance(hidden_states, list) and not isinstance(hidden_states, tuple):
+            cuda_graph_outputs = [hidden_states]
+        else:
+            cuda_graph_outputs = list(hidden_states)
         if context is not None:
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
@@ -762,6 +806,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         `inference_context` and `packed_seq_params` are excluded from
         input list while output is limited to `hidden_states`.
         """
+        if 'attn' not in self.config.cuda_graph_scope:
+            hidden_states, context = self._forward_attention(*args, **kwargs)
+            args = (hidden_states,)
+            kwargs = {}
 
         def _check_cuda_graph_replay_args(*args, **kwargs):
             """Helper function to get optional tensor arguments for CUDA graph."""
@@ -793,7 +841,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         device=torch.cuda.current_device(),
                     )
 
-                if not is_te_min_version("1.10.0", check_equality=False):
+                if not is_te_min_version("1.10.0"):
+                    # TE version < 1.10.0 does not support keyword arguments with CUDA graph.
                     for k, v in kwargs.items():
                         if k == "attention_mask":
                             if v is not None:
@@ -807,7 +856,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                                 )
                         else:
                             assert v is None, "Keyword Arguments not supported with CUDA graph."
-                elif optional_inputs['attention_mask'] is None:
+                elif (
+                    'attention_mask' in optional_inputs
+                    and optional_inputs['attention_mask'] is None
+                ):
                     # The attention_mask can be None when there is no padding to the input sequence.
                     # However, an attention_mask Tensor must be passed into cudagraph for replay, so
                     # we create an equivalent zero Tensor as the attention_mask.
@@ -828,17 +880,51 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             hook(*hook_args)
         cuda_graph_output = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
 
-        if cudagraph_kwargs['context'] is not None:
+        if cudagraph_kwargs.get('context') is not None:
             context = cuda_graph_output[-1]
             cuda_graph_output = cuda_graph_output[:-1]
         else:
             context = None
-        if self.config.cuda_graph_scope == "attn":
-            # CUDA Graph only covers the attention layer. Feed-forward
-            # layer still goes through the normal pass.
-            output = self._forward_mlp(*cuda_graph_output)
-        else:
+
+        if (not self.is_moe_layer and 'mlp' in self.config.cuda_graph_scope) or (
+            self.is_moe_layer and 'moe' in self.config.cuda_graph_scope
+        ):
+            # CUDA Graph captures the whole MLP/MoE part. CUDA Graph output is the layer output.
             output = cuda_graph_output[0]
+        elif self.is_moe_layer and 'moe_router' in self.config.cuda_graph_scope:
+            # CUDA Graph partially captures the MoE.
+            # The rest of the layer should go to the normal pass.
+            mlp_residual = cuda_graph_output[-1]
+            if self.config.moe_shared_expert_compute_before_router:
+                shared_expert_output = cuda_graph_output[3]
+                attr_outputs = cuda_graph_output[4:-1]
+            else:
+                shared_expert_output = None
+                attr_outputs = cuda_graph_output[3:-1]
+            cuda_graph_output = cuda_graph_output[:3]
+
+            if 'moe_preprocess' in self.config.cuda_graph_scope:
+                valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
+                assert len(attr_outputs) == len(
+                    valid_cudagraph_attrs
+                ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+                for i, attr_name in enumerate(valid_cudagraph_attrs):
+                    hier_attr_name = attr_name.split('.')
+                    attr = self.mlp.token_dispatcher
+                    for name in hier_attr_name[:-1]:
+                        attr = getattr(attr, name)
+                    setattr(attr, hier_attr_name[-1], attr_outputs[i])
+                hidden_states, probs, residual = cuda_graph_output
+            else:
+                assert not attr_outputs, "cuda_graph_attr_outputs should be empty"
+                hidden_states, probs, residual = self.mlp.preprocess(*cuda_graph_output)
+            mlp_output_with_bias = self.mlp.dispatch_compute_combine(
+                hidden_states, probs, residual, shared_expert_output
+            )
+            output = self._forward_post_mlp(mlp_output_with_bias, mlp_residual)
+        else:
+            # CUDA Graph does not capture the MLP/MoE part at all.
+            output = self._forward_mlp(*cuda_graph_output)
         return output, context
 
     def __call__(self, *args, **kwargs):
@@ -864,7 +950,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 kwargs.get('attention_mask') is None
             ), f"Attention mask must not be set when using CUDA graphs for decode"
             return self.cudagraph_manager(self, args, kwargs)
-        elif self.config.external_cuda_graph and self.training:
+        elif (
+            self.config.external_cuda_graph
+            and self.training
+            and (is_graph_capturing() or self.cuda_graphs)
+        ):
             if not self.cuda_graphs:
                 # Do CUDA Graphs capture.
                 cuda_graph_func = self._cuda_graph_capture

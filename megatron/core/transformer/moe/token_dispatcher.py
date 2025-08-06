@@ -70,6 +70,11 @@ class MoETokenDispatcher:
         self.tp_rank = self.tp_group.rank()
         self.ep_size = self.ep_group.size()
 
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = []
+        self.valid_cudagraph_attrs = None
+
     @abstractmethod
     def dispatch_preprocess(
         self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
@@ -227,6 +232,10 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # device token permutation is enabled and **AllGahter** is performed.
         self.global_local_map = None
 
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = ['routing_map']
+
     def dispatch_preprocess(
         self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
@@ -343,6 +352,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     (7) combine postprocess: unpermute tokens
     """
 
+    # DtoH copies are performed on this stream for overlapping with the main stream.
+    cuda_dtoh_stream = None
+
     def __init__(
         self,
         num_local_experts: int,
@@ -416,8 +428,25 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "before_finish": 3,
             "no_sync": 4,
         }
-        self.cuda_dtoh_point = "before_permutation_1"
-        self.cuda_dtoh_stream = torch.cuda.Stream()
+        if config.external_cuda_graph and 'moe_preprocess' in config.cuda_graph_scope:
+            self.cuda_dtoh_point = "before_ep_alltoall"
+        else:
+            self.cuda_dtoh_point = "before_permutation_1"
+        if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
+            MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
+
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = [
+            'tokens_per_expert',
+            'input_splits',
+            'output_splits',
+            'output_splits_tp',
+            'num_out_tokens',
+            'num_global_tokens_per_local_expert',
+            'reversed_local_input_permutation_mapping',
+            'routing_map',
+        ]
 
         self.shared_experts = None
 
@@ -1170,6 +1199,10 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             num_experts=self.tp_size * self.config.num_moe_experts,
             config=self.config,
         )
+
+        # Attributes that need to be captured in cudagraph. These attributes are returned
+        # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
+        self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
 
     def set_shared_experts(self, shared_experts):
         self.shared_experts = shared_experts

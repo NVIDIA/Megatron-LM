@@ -1760,6 +1760,19 @@ def is_submodule(module, parent_module, strict=True):
     return False
 
 
+def get_submodule_with_decoder(module):
+    """
+    Recursively get the submodule until it has a decoder attribute.
+    """
+    curmodule = module
+    while not hasattr(curmodule, 'decoder'):
+        if hasattr(curmodule, 'module'):
+            curmodule = curmodule.module
+        else:
+            return None
+    return curmodule
+
+
 ########################
 ### context parallel ###
 ########################

@@ -376,6 +376,12 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared epxerts execute after the routed experts."""
 
+    moe_shared_expert_compute_before_router: bool = False
+    """Compute the shared experts before the router instead of in the experts_compute method.
+    This makes the gradient from the shared experts side the last one added to the hidden_states,
+    so the hidden_states gradient may differ by turning this option on or off.
+    Invalid when moe_shared_expert_overlap is True."""
+
     moe_layer_freq: Union[int, List[int]] = 1
     """Frequency between MoE layers and Dense layers. Accepts either:
     - An integer N: Represents a 1:N ratio, meaning one expert layer for every N-1 dense layers.
@@ -556,7 +562,7 @@ class TransformerConfig(ModelParallelConfig):
     external_cuda_graph: bool = False
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
-    cuda_graph_scope: str = "full"
+    cuda_graph_scope: Optional[List[str]] = None
     """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
     capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
     layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
@@ -772,6 +778,9 @@ class TransformerConfig(ModelParallelConfig):
                 'CPU offloading does not work when activation recomputation is enabled'
             )
 
+        if self.external_cuda_graph and self.cuda_graph_scope is None:
+            self.cuda_graph_scope = ['attn', 'mlp']
+
         if self.recompute_granularity is not None:
             if self.recompute_granularity not in ['full', 'selective']:
                 raise ValueError(
@@ -845,6 +854,58 @@ class TransformerConfig(ModelParallelConfig):
             if self.fp8:
                 if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
                     raise ValueError("moe_act and layernorm recompute cannot work with fp8.")
+
+            if self.external_cuda_graph:
+                if "attn" in self.cuda_graph_scope:
+                    for module in self.recompute_modules:
+                        if module in ['core_attn', 'mla_up_proj']:
+                            raise ValueError(
+                                f'attn cuda graph is not supported with {module} recompute.'
+                            )
+                if "mlp" in self.cuda_graph_scope and "mlp" in self.recompute_modules:
+                    raise ValueError(f'mlp cuda graph is not supported with mlp recompute.')
+                if "moe" in self.cuda_graph_scope:
+                    for module in self.recompute_modules:
+                        if module in ['moe_act', 'moe', 'shared_experts']:
+                            raise ValueError(
+                                f'moe cuda graph is not supported with {module} recompute.'
+                            )
+                if "moe_router" in self.cuda_graph_scope:
+                    if 'moe' in self.recompute_modules:
+                        raise ValueError(
+                            f'moe_router cuda graph is not supported with moe recompute.'
+                        )
+                    if (
+                        self.moe_shared_expert_compute_before_router
+                        and 'shared_experts' in self.recompute_modules
+                    ):
+                        raise ValueError(
+                            "moe_router cuda graph is not supported with shared experts "
+                            "recompute when moe_shared_expert_compute_before_router is enabled."
+                        )
+                if "layernorm" in self.recompute_modules:
+                    if (
+                        "attn" in self.cuda_graph_scope
+                        and "mlp" in self.cuda_graph_scope
+                        and (
+                            "moe" in self.cuda_graph_scope or "moe_router" in self.cuda_graph_scope
+                        )
+                    ):
+                        raise ValueError('cuda graph is not supported with layernorm recompute.')
+                    if "attn" in self.cuda_graph_scope:
+                        warnings.warn(
+                            "input_layernorm recompute is not supported with attention cudagraph. "
+                            "Will only recompute the pre_mlp_layernorm."
+                        )
+                    if (
+                        "mlp" in self.cuda_graph_scope
+                        or "moe" in self.cuda_graph_scope
+                        or "moe_router" in self.cuda_graph_scope
+                    ):
+                        warnings.warn(
+                            "pre_mlp_layernorm recompute is not supported with mlp/moe cudagraph. "
+                            "Will only recompute the input_layernorm."
+                        )
 
         if self.moe_layer_recompute:
             warnings.warn(

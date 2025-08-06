@@ -431,15 +431,19 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+            transformer_layer_rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
         else:
             rng_context = nullcontext()
+            transformer_layer_rng_context = nullcontext()
 
         # Unlike transformer_block.py which needs to support mixed-precision in different layers,
         # currently MTP only use global fp8 context.
         if self.config.fp8:
             fp8_context = get_fp8_context(self.config)
+            transformer_layer_fp8_context = get_fp8_context(self.config)
         else:
             fp8_context = nullcontext()
+            transformer_layer_fp8_context = nullcontext()
 
         with rng_context, fp8_context:
             decoder_input = self.enorm(decoder_input)
@@ -460,6 +464,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             if self.sequence_parallel:
                 hidden_states = scatter_to_sequence_parallel_region(hidden_states)
 
+        # Use a separate context for the transformer layer. This is to ensure that when the
+        # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is True
+        # so that the fp8 weight caching can be triggered correctly.
+        with transformer_layer_rng_context, transformer_layer_fp8_context:
             hidden_states, _ = self.transformer_layer(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
