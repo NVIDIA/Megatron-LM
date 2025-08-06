@@ -183,7 +183,7 @@ def run_mtp_layer_a2a_overlap_with_capture(
         hidden_states[i] = hidden_states[i].clone()
 
     comp_stream = torch.cuda.current_stream()
-    com_stream = torch.cuda.Stream(device="cuda")
+    comm_stream = torch.cuda.Stream(device="cuda")
     layers = []
     for _ in range(microbatches):
         state = DummyState()
@@ -202,7 +202,7 @@ def run_mtp_layer_a2a_overlap_with_capture(
                 event,
                 state,
                 comp_stream,
-                com_stream,
+                comm_stream,
                 extra_args={
                     "is_moe": True,
                     "enable_deepep": False,
