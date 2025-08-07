@@ -121,9 +121,24 @@ class TestExpertLayerReconfiguration:
         [
             # changing PP is impossible because the number of layers must be the same
             (False, (2, 4, 1, 2), (2, 4, 1, 2), False),
+            (True, (2, 4, 1, 2), (2, 4, 1, 2), False),
+            (False, (2, 4, 1, 2), (1, 4, 1, 2), False),
+            (True, (2, 1, 1, 2), (1, 1, 1, 2), False),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), False),
+            (True, (1, 1, 1, 1), (1, 1, 4, 1), False),
+            (False, (1, 1, 8, 1), (1, 1, 2, 1), False),
+            (False, (2, 2, 2, 2), (4, 2, 1, 4), False),
+            (True, (1, 1, 4, 1), (8, 1, 1, 1), False),
+            (False, (1, 8, 1, 1), (1, 8, 1, 1), False),
+            (False, (1, 1, 4, 1), (2, 1, 1, 2), False),
+            (False, (2, 1, 4, 1), (2, 1, 1, 4), False),
+            (False, (1, 1, 1, 1), (1, 1, 1, 1), True),
+            (False, (1, 1, 1, 1), (1, 1, 4, 1), True),
+            (True, (1, 1, 1, 1), (2, 1, 1, 1), True),
+            (False, (1, 1, 4, 1), (8, 1, 1, 8), True),
         ],
     )
-    @pytest.mark.parametrize("expert_type", ['te_sequential'])
+    @pytest.mark.parametrize("expert_type", expert_type)
     @pytest.mark.parametrize(
         "load_order,store_order",
         [
