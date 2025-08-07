@@ -227,66 +227,6 @@ class TrackedValue:
         return self._value(*args, **kwargs)
 
 
-# TODO(Hepteract): delete the usage of the global parallel_state.
-# Currently we still have to use the global parallel_state in expert_dist_ckpt_decorator(),
-# in order to set sub-module's process group while getting sharded_state_dict.
-# After sub-module's refactoring is done, we can pass model_comm_pgs to sub-module
-# and delete the function expert_dist_ckpt_decorator.
-
-# DEBUGGING NOTE: This decorator now includes tracking of parallel_state variable access.
-# When functions decorated with @expert_dist_ckpt_decorator are called, any access to
-# _MPU_TENSOR_MODEL_PARALLEL_RANK, _MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE, or
-# _TENSOR_MODEL_PARALLEL_GROUP will print a detailed traceback showing where the
-# access occurred.
-#
-# To disable tracking:
-#   TrackedValue.GLOBAL_TRACKING_ENABLED = False
-# 
-# Or to disable tracking for specific variables, modify the TrackedValue instances
-# in the decorator below.
-
-def expert_dist_ckpt_decorator(func):
-    """Decorator of shared_state_dict in expert layer for distributed checkpoint.
-
-    Since !1940, the TP size for Expert layer can be different with Attention.
-    To make distributed checkpoint work in such cases, we use a decorator to
-    replace the default TP parallel states with expert-TP parallel states.
-    """
-
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        # Store original states
-        original_rank = parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK
-        original_size = parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE
-        original_group = parallel_state._TENSOR_MODEL_PARALLEL_GROUP
-        try:
-            # Set new tracked states
-            expert_rank = parallel_state.get_expert_tensor_parallel_rank()
-            expert_size = parallel_state.get_expert_tensor_parallel_world_size()
-            expert_group = parallel_state.get_expert_tensor_parallel_group()
-            
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = TrackedValue(
-                expert_rank, "_MPU_TENSOR_MODEL_PARALLEL_RANK"
-            )
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = TrackedValue(
-                expert_size, "_MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE"
-            )
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = TrackedValue(
-                expert_group, "_TENSOR_MODEL_PARALLEL_GROUP"
-            )
-
-            # Execute the function
-            result = func(*args, **kwargs)
-        finally:
-            # Restore original states
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_RANK = original_rank
-            parallel_state._MPU_TENSOR_MODEL_PARALLEL_WORLD_SIZE = original_size
-            parallel_state._TENSOR_MODEL_PARALLEL_GROUP = original_group
-        return result
-
-    return wrapper
-
-
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using GroupedGEMM.
 
@@ -1191,7 +1131,6 @@ class SequentialMLP(MegatronModule):
         for expert in self.local_experts:
             expert.backward_dw()
 
-    @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
         # Guard for cases metadata is not provided

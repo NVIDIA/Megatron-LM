@@ -76,9 +76,7 @@ class ExtendedRMSNorm(RMSNormGated):
         """Sharding along axis 0, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0}, sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
+            state_dict, prefix, {"weight": 0}, sharded_offsets
         )
 
 
@@ -379,6 +377,7 @@ class MambaMixer(MegatronModule):
             D_cp1=self.D,
             D_has_hdim=self.D_has_hdim,
         )
+        self.tp_group = model_comm_pgs.tp
 
     def forward(
         self,
