@@ -78,9 +78,7 @@ class MegatronModule(torch.nn.Module):
         # Save parameters
         self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            sharded_state_dict, prefix, sharded_offsets=sharded_offsets,
-            tp_group=self.tp_group,
-            dp_cp_group=metadata['dp_cp_group'],
+            sharded_state_dict, prefix, sharded_offsets=sharded_offsets
         )
         # Recurse into submodules
         for name, module in self.named_children():

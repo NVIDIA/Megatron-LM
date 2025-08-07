@@ -116,6 +116,7 @@ class Linear(torch.nn.Linear):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         self.config = config
+        self.tp_group = tp_group
 
         self._return_bias = skip_bias_add and bias
 
