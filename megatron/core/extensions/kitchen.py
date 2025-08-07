@@ -368,7 +368,10 @@ class KitchenLinear(nvidia_kitchen.Linear):
             self.parallel_mode is None
         ), "KitchenLinear sharded_state_dict can only be used with duplicated parallel mode"
         state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets)
+        return make_sharded_tensors_for_checkpoint(state_dict, prefix, None, sharded_offsets,
+                                                   tp_group=self.tp_group,
+                                                   dp_cp_group=metadata['dp_cp_group'],
+                                                   )
 
 
 class KitchenColumnParallelLinear(KitchenLinear):
@@ -427,7 +430,9 @@ class KitchenColumnParallelLinear(KitchenLinear):
         """Sharding along axis 0, bias sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets,
+            tp_group = self.tp_group,
+            dp_cp_group = metadata['dp_cp_group'],
         )
 
     def __repr__(self):
@@ -490,7 +495,9 @@ class KitchenRowParallelLinear(KitchenLinear):
         """Sharding along axis 1, bias not sharded"""
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 1}, sharded_offsets
+            state_dict, prefix, {"weight": 1}, sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
 
     def __repr__(self):
@@ -730,6 +737,8 @@ class KitchenGroupedLinear(nvidia_kitchen.GroupedLinear):
                     *sharded_offsets,
                     (ep_axis, local_expert_indices_offset + gemm_idx, num_global_experts),
                 ),
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
             )
             # Remove expert layers indexing from sharded keys
             replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", prefix)
@@ -1011,7 +1020,9 @@ class KitchenLayerNormColumnParallelLinear(nvidia_kitchen.LayerNormLinear):
         assert self.init_finished
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0, "bias": 0}, sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
 
     def __repr__(self):

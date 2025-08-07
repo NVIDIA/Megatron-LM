@@ -153,7 +153,9 @@ class Linear(torch.nn.Linear):
                 if v.ndim == 0:
                     state_dict[k] = v.view(1)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, sharded_offsets=sharded_offsets
+            state_dict, prefix, sharded_offsets=sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata['dp_cp_group'],
         )
         return sharded_state_dict
 
