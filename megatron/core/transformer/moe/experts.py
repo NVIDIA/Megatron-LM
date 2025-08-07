@@ -54,29 +54,29 @@ except ImportError:
 
 class TrackedValue:
     """A wrapper class that tracks access to a value and prints a traceback.
-    
+
     This class wraps any value and prints a detailed traceback whenever the value
     is accessed through any operation (arithmetic, comparison, conversion, etc.).
-    
+
     Usage:
         tracked_var = TrackedValue(42, "my_variable")
         # Any access to tracked_var will print a traceback:
         print(tracked_var + 5)  # Prints traceback for addition
         if tracked_var == 42:   # Prints traceback for comparison
             pass
-    
+
     To disable tracking globally:
         TrackedValue.GLOBAL_TRACKING_ENABLED = False
     """
-    
+
     # Global flag to enable/disable all tracking
     GLOBAL_TRACKING_ENABLED = True
-    
+
     def __init__(self, value, var_name, enable_tracking=True):
         self._value = value
         self._var_name = var_name
         self._enable_tracking = enable_tracking
-    
+
     def _print_access(self, operation):
         from megatron.training.utils import print_rank_0
 
@@ -91,137 +91,137 @@ class TrackedValue:
     def __getattribute__(self, name):
         if name.startswith('_') or name in ['__class__', '__dict__']:
             return object.__getattribute__(self, name)
-        
+
         # Print traceback when the tracked value is accessed
         self._print_access(f"Accessing attribute '{name}'")
-        
+
         # Return the attribute from the actual value
         return getattr(self._value, name)
-    
+
     def __int__(self):
         self._print_access("Converting to int")
         return int(self._value)
-    
+
     def __float__(self):
         self._print_access("Converting to float")
         return float(self._value)
-    
+
     def __bool__(self):
         self._print_access("Converting to bool")
         return bool(self._value)
-    
+
     def __eq__(self, other):
         self._print_access(f"Comparing == with {other}")
         return self._value == other
-    
+
     def __ne__(self, other):
         self._print_access(f"Comparing != with {other}")
         return self._value != other
-    
+
     def __lt__(self, other):
         self._print_access(f"Comparing < with {other}")
         return self._value < other
-    
+
     def __le__(self, other):
         self._print_access(f"Comparing <= with {other}")
         return self._value <= other
-    
+
     def __gt__(self, other):
         self._print_access(f"Comparing > with {other}")
         return self._value > other
-    
+
     def __ge__(self, other):
         self._print_access(f"Comparing >= with {other}")
         return self._value >= other
-    
+
     def __str__(self):
         self._print_access("Converting to string")
         return str(self._value)
-    
+
     def __repr__(self):
         self._print_access("Getting repr")
         return repr(self._value)
-    
+
     def __add__(self, other):
         self._print_access(f"Adding + {other}")
         return self._value + other
-    
+
     def __radd__(self, other):
         self._print_access(f"Right adding {other} +")
         return other + self._value
-    
+
     def __sub__(self, other):
         self._print_access(f"Subtracting - {other}")
         return self._value - other
-    
+
     def __rsub__(self, other):
         self._print_access(f"Right subtracting {other} -")
         return other - self._value
-    
+
     def __mul__(self, other):
         self._print_access(f"Multiplying * {other}")
         return self._value * other
-    
+
     def __rmul__(self, other):
         self._print_access(f"Right multiplying {other} *")
         return other * self._value
-    
+
     def __truediv__(self, other):
         self._print_access(f"Dividing / {other}")
         return self._value / other
-    
+
     def __rtruediv__(self, other):
         self._print_access(f"Right dividing {other} /")
         return other / self._value
-    
+
     def __floordiv__(self, other):
         self._print_access(f"Floor dividing // {other}")
         return self._value // other
-    
+
     def __rfloordiv__(self, other):
         self._print_access(f"Right floor dividing {other} //")
         return other // self._value
-    
+
     def __mod__(self, other):
         self._print_access(f"Modulo % {other}")
         return self._value % other
-    
+
     def __rmod__(self, other):
         self._print_access(f"Right modulo {other} %")
         return other % self._value
-    
+
     def __pow__(self, other):
         self._print_access(f"Power ** {other}")
-        return self._value ** other
-    
+        return self._value**other
+
     def __rpow__(self, other):
         self._print_access(f"Right power {other} **")
-        return other ** self._value
-    
+        return other**self._value
+
     def __hash__(self):
         self._print_access("Getting hash")
         return hash(self._value)
-    
+
     def __len__(self):
         self._print_access("Getting length")
         return len(self._value)
-    
+
     def __getitem__(self, key):
         self._print_access(f"Getting item [{key}]")
         return self._value[key]
-    
+
     def __setitem__(self, key, value):
         self._print_access(f"Setting item [{key}] = {value}")
         self._value[key] = value
-    
+
     def __contains__(self, item):
         self._print_access(f"Checking if contains {item}")
         return item in self._value
-    
+
     def __iter__(self):
         self._print_access("Getting iterator")
         return iter(self._value)
-    
+
     def __call__(self, *args, **kwargs):
         self._print_access(f"Calling with args={args}, kwargs={kwargs}")
         return self._value(*args, **kwargs)
