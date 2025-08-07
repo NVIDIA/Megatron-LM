@@ -24,9 +24,15 @@ def main(pipeline_id: int, only_failing: bool):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
 
-    gl = gitlab.Gitlab(
-        f"https://{os.getenv('GITLAB_ENDPOINT')}", private_token=os.getenv("RO_API_TOKEN")
-    )
+    gitlab_endpoint = os.getenv('GITLAB_ENDPOINT')
+    ro_api_token = os.getenv('RO_API_TOKEN')
+
+    if not gitlab_endpoint or not ro_api_token:
+        raise Exception(
+            "Environment variables {GITLAB_ENDPOINT} and {RO_API_TOKEN} have not been set. ie. GITLAB_ENDPOINT=<gitlab-endpoint>, RO_API_TOKEN=<gitlab-token>"
+        )
+
+    gl = gitlab.Gitlab(f"https://{gitlab_endpoint}", private_token=ro_api_token)
     logger.info("Setting only_failing to %s", only_failing)
 
     project = gl.projects.get(PROJECT_ID)
