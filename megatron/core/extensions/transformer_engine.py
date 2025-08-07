@@ -487,7 +487,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
-        self.tp_group = tp_group
+        self.tp_group_for_sharded_sd = tp_group
 
     def forward(self, x):
         """Forward."""
@@ -512,7 +512,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             prefix,
             {"weight": 0, "bias": 0},
             sharded_offsets,
-            tp_group=self.tp_group,
+            tp_group=self.tp_group_for_sharded_sd,
             dp_cp_group=metadata['dp_cp_group'],
         )
 
@@ -601,7 +601,7 @@ class TEColumnParallelLinear(TELinear):
                 with torch.no_grad():
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
-        self.tp_group = tp_group
+        self.tp_group_for_sharded_sd = tp_group
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias sharded"""
@@ -611,7 +611,7 @@ class TEColumnParallelLinear(TELinear):
             prefix,
             {"weight": 0, "bias": 0},
             sharded_offsets,
-            tp_group=self.tp_group,
+            tp_group=self.tp_group_for_sharded_sd,
             dp_cp_group=metadata['dp_cp_group'],
         )
 
@@ -701,7 +701,7 @@ class TERowParallelLinear(TELinear):
                     self.bias.zero_()
                 setattr(self.bias, "allreduce", True)
                 setattr(self.bias, "sequence_parallel", config.sequence_parallel)
-        self.tp_group = tp_group
+        self.tp_group_for_sharded_sd = tp_group
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 1, bias not sharded"""
@@ -711,7 +711,7 @@ class TERowParallelLinear(TELinear):
             prefix,
             {"weight": 1},
             sharded_offsets,
-            tp_group=self.tp_group,
+            tp_group=self.tp_group_for_sharded_sd,
             dp_cp_group=metadata['dp_cp_group'],
         )
 
@@ -1131,7 +1131,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 state_dict[f"{prefix}_extra_state"] = self._encode_extra_state(extra_state)
 
             self._register_load_state_dict_pre_hook(merge_extra_states, with_module=True)
-            self.tp_group = tp_group
+            self.tp_group_for_sharded_sd = tp_group
 
         def forward(self, x, m_splits):
             """Forward."""
@@ -1239,7 +1239,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         *sharded_offsets,
                         (ep_axis, local_expert_indices_offset + gemm_idx, num_global_experts),
                     ),
-                    tp_group=self.tp_group,
+                    tp_group=self.tp_group_for_sharded_sd,
                     dp_cp_group=metadata['dp_cp_group'],
                 )
                 # Remove expert layers indexing from sharded keys
@@ -1308,6 +1308,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
             )
+            self.tp_group_for_sharded_sd = tp_group
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
             """
@@ -1354,6 +1355,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_comm_buffer_name=tp_comm_buffer_name,
                 tp_group=tp_group,
             )
+            self.tp_group_for_sharded_sd = tp_group
 
         def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
             """
@@ -1464,7 +1466,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Construct layers
             super().__init__(norm_op, fc1_op, activation_op, fc2_op)
-            self.tp_group = tp_group
+            self.tp_group_for_sharded_sd = tp_group
 
         def forward(self, hidden_states: Tensor) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
@@ -1480,7 +1482,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 prefix,
                 {"weight": 0, "bias": 0},
                 sharded_offsets,
-                tp_group=self.tp_group,
+                tp_group=self.tp_group_for_sharded_sd,
                 dp_cp_group=metadata['dp_cp_group'],
             )
 

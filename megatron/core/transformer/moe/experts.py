@@ -978,6 +978,17 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
+        # Guard for cases metadata is not provided
+        if metadata is None:
+            metadata = {
+                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+            }
+        elif isinstance(metadata, dict) and "dp_cp_group" not in metadata:
+            metadata.update(
+                {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
+            )
+        else:
+            assert "dp_cp_group" in metadata, "metadata must be a dict with dp_cp_group as key"
         sharded_state_dict = {}
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)

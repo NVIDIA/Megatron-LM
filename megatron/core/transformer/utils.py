@@ -97,6 +97,10 @@ def make_sharded_tensors_for_checkpoint(
     if tensor_parallel_layers_axis_map is None:
         tensor_parallel_layers_axis_map = {}
 
+    if tp_group is None and dp_cp_group is None:
+        tp_group = get_tensor_model_parallel_group_if_none(tp_group)
+        dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
         tensor = state_dict[layer_name]
@@ -104,11 +108,6 @@ def make_sharded_tensors_for_checkpoint(
 
         if layer_name.endswith(extra_state_suffix):
             # Compute replica_id when groups are provided
-            replica_id = None
-            if tp_group is None and dp_cp_group is None:
-                tp_group = get_tensor_model_parallel_group_if_none(tp_group)
-                dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
-
             replica_id = (0, get_pg_rank(tp_group), get_pg_rank(dp_cp_group))
 
             sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
