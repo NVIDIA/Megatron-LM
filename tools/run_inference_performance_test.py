@@ -113,6 +113,11 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     # Layer type list for hybrid models
     decoder = get_attr_wrapped_model(model, "decoder")
     layer_type_list = getattr(decoder, "layer_type_list", None)
+    if args.is_hybrid_model:
+        (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
+    else:
+        mamba_conv_states_shape = None
+        mamba_ssm_states_shape = None
 
     if args.engine_type == "static":
         inference_wrapped_model = GPTInferenceWrapper(model, inference_wrapper_config)
@@ -145,11 +150,8 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             materialize_only_last_token_logits=not args.return_log_probs,
             is_hybrid_model=args.is_hybrid_model,
             layer_type_list=layer_type_list,
-            mamba_head_dim=args.mamba_head_dim,
-            mamba_num_groups=args.mamba_num_groups,
-            mamba_d_model=args.hidden_size,
-            mamba_d_conv=4,
-            mamba_d_state=args.mamba_state_dim,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
         )
         inference_wrapped_model = GPTInferenceWrapper(
             model, inference_wrapper_config, inference_context=context

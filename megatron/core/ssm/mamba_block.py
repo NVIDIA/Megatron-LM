@@ -9,7 +9,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -233,6 +233,13 @@ class MambaStack(MegatronModule):
         used by internal code to bypass the input provided by the
         forward_step_func"""
         self.input_tensor = input_tensor
+
+    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+        """Returns the Mamba conv and ssm states shapes per request."""
+        for layer_type, layer in zip(self.layer_type_list, self.layers):
+            if layer_type == LayerSymbols.MAMBA:
+                return layer.mamba_state_shapes_per_request()
+        assert False, "`MambaBlock` does not have a `MambaLayer`"
 
     def forward(
         self,

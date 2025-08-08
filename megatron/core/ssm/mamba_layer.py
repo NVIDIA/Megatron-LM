@@ -6,7 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -85,6 +85,10 @@ class MambaLayer(MegatronModule):
         self.norm = build_module(submodules.norm, self.config, self.config.hidden_size)
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
+
+    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+        """Returns the Mamba conv and ssm states shapes per request."""
+        return self.mixer.mamba_state_shapes_per_request()
 
     def forward(
         self,

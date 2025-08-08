@@ -166,11 +166,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         materialize_only_last_token_logits: Optional[bool] = True,
         is_hybrid_model: Optional[bool] = False,
         layer_type_list: Optional[List[str]] = None,
-        mamba_head_dim: Optional[int] = None,
-        mamba_num_groups: Optional[int] = None,
-        mamba_d_model: Optional[int] = None,
-        mamba_d_conv: Optional[int] = None,
-        mamba_d_state: Optional[int] = None,
+        mamba_conv_states_shape: Optional[Tuple[int]] = None,
+        mamba_ssm_states_shape: Optional[Tuple[int]] = None,
     ):
 
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
@@ -187,28 +184,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_hybrid_model = is_hybrid_model
         if self.is_hybrid_model:
             assert (
-                mamba_head_dim is not None
-            ), "`mamba_head_dim` must be specified for hybrid models"
-            assert (
-                mamba_num_groups is not None
-            ), "`mamba_num_groups` must be specified for hybrid models"
-            assert mamba_d_model is not None, "`mamba_d_model` must be specified for hybrid models"
-            assert mamba_d_conv is not None, "`mamba_d_conv` must be specified for hybrid models"
-            assert mamba_d_state is not None, "`mamba_d_state` must be specified for hybrid models"
-            assert (
                 layer_type_list is not None
             ), "`layer_type_list must be specified for hybrid models"
-
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
-                self._mamba_state_size_per_layer_per_request(
-                    mamba_d_model=mamba_d_model,
-                    mamba_d_conv=mamba_d_conv,
-                    mamba_d_state=mamba_d_state,
-                    mamba_num_groups=mamba_num_groups,
-                    mamba_head_dim=mamba_head_dim,
-                    tp_size=tp_size,
-                )
-            )
+            assert (
+                mamba_conv_states_shape is not None
+            ), "`mamba_conv_states_shape` must be specified for hybrid models"
+            assert (
+                mamba_ssm_states_shape is not None
+            ), "`mamba_ssm_states_shape` must be specified for hybrid models"
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the

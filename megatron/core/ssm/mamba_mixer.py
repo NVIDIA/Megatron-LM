@@ -835,6 +835,12 @@ class MambaMixer(MegatronModule):
 
         return seq_idx, cu_seqlens, True
 
+    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+        """Returns the Mamba conv and ssm states shapes per request."""
+        conv_states_shape = (self.conv1d.weight.shape[0], self.d_conv)
+        ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
+        return (conv_states_shape, ssm_states_shape)
+
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.
 
@@ -855,18 +861,16 @@ class MambaMixer(MegatronModule):
             self.layer_number not in inference_context.key_value_memory_dict
             or batch_size != self.cached_batch_size
         ):
+            conv_state_shape, ssm_state_shape = self.mamba_state_shapes_per_request()
             conv_state = torch.zeros(
                 batch_size,
-                self.conv1d.weight.shape[0],
-                self.d_conv,
+                *conv_state_shape,
                 device=self.conv1d.weight.device,
                 dtype=self.conv1d.weight.dtype,
             )
             ssm_state = torch.zeros(
                 batch_size,
-                self.nheads_local_tp,
-                self.headdim,
-                self.d_state,
+                *ssm_state_shape,
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
