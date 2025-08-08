@@ -2,7 +2,7 @@ import torch
 import argparse
 import megatron
 
-from megatron.core.transformer.moe.router import gen_offloading_plan
+from megatron.core.transformer.moe.offloading_planner import gen_offloading_plan
 
 def baseline_routing(scores, num_experts, EP, topk):
     # Pick top-k largest along columns (dim=1)
