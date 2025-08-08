@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -60,6 +60,9 @@ else:
     from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     LayerNormImpl = WrappedTorchNorm
+
+
+logger = logging.getLogger(__name__)
 
 
 def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
@@ -633,6 +636,8 @@ class TransformerBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the model.
         """
         assert not sharded_offsets, "Unexpected sharded offsets"
+        # TODO: remove multiple non_homogeneous_layers=True assignments
+        #  once non_homogeneous_layers=False support is dropped
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False
         )
@@ -646,6 +651,15 @@ class TransformerBlock(MegatronModule):
             non_homogeneous_layers = True
 
         if self.config.heterogeneous_block_specs:
+            non_homogeneous_layers = True
+
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        if singleton_local_shards:
+            if not non_homogeneous_layers:
+                logger.warning(
+                    'non_homogeneous_layers=False is deprecated.'
+                    ' Setting non_homogeneous_layers=True.'
+                )
             non_homogeneous_layers = True
 
         sharded_state_dict = {}

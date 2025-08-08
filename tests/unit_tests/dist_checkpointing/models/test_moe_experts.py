@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import os
 
 import pytest
 import torch
@@ -90,12 +91,6 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
     return model
 
 
-def get_pp_offsets():
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-    return ((0, pp_rank, pp_size),)
-
-
 expert_type = ['sequential', 'grouped']
 src_dest_expert_type = [('sequential', 'grouped'), ('grouped', 'sequential')]
 if is_te_min_version("1.7.0.dev0"):
@@ -148,6 +143,7 @@ class TestExpertLayerReconfiguration:
             # ("ep-tp-dp-pp", "tp-ep-dp-pp"),
         ],
     )
+    @pytest.mark.parametrize('singleton_local_shards', [True, False])
     def test_parallel_reconfiguration_e2e(
         self,
         tmp_path_dist_ckpt,
@@ -158,10 +154,12 @@ class TestExpertLayerReconfiguration:
         expert_type,
         load_order,
         store_order,
+        singleton_local_shards,
     ):
         """Test model saving and loading with different TP/PP/EP/ETP(expert-tensor-parallel)"""
         src_tp, src_pp, src_ep, src_etp = src_tp_pp_ep_etp
         dest_tp, dest_pp, dest_ep, dest_etp = dest_tp_pp_ep_etp
+        metadata = {'singleton_local_shards': singleton_local_shards}
         # Save checkpoint A
         Utils.initialize_model_parallel(
             src_tp,
@@ -170,13 +168,17 @@ class TestExpertLayerReconfiguration:
             expert_tensor_parallel_size=src_etp,
             order=store_order,
         )
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_A'
-        ) as ckpt_dir_A, TempNamedDir(
-            tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_B'
-        ) as ckpt_dir_B:
+        with (
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_A'
+            ) as ckpt_dir_A,
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_expert_layer_reconfiguration_model_B'
+            ) as ckpt_dir_B,
+        ):
+            layer_prefix = f'{parallel_state.get_pipeline_model_parallel_rank()}.'
             model_A = initialize_expert_layer(1, use_glu, expert_type)
-            sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
+            sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
             save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
@@ -207,12 +209,14 @@ class TestExpertLayerReconfiguration:
             else:
                 load_strategy = None
             state_dict = load(
-                model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
+                model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata),
                 ckpt_dir_A,
                 load_strategy,
             )
-            model_B.load_state_dict(state_dict)
-            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            model_B.load_state_dict(
+                {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
+            )
+            save(model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata), ckpt_dir_B)
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal
@@ -224,38 +228,49 @@ class TestExpertLayerReconfiguration:
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        "src_tp_pp_exp,dest_tp_pp_exp,use_glu",
+        "src_tp_pp_exp,dest_tp_pp_exp,use_glu,singleton_local_shards",
         [
             # changing PP is impossible because the number of layers must be the same
-            ((2, 4, 1), (2, 4, 1), False),
-            ((1, 1, 1), (1, 1, 4), False),
-            ((2, 2, 2), (4, 2, 1), False),
-            ((1, 1, 4), (8, 1, 1), False),
-            ((2, 1, 4), (1, 1, 8), False),
-            ((2, 4, 1), (2, 4, 1), True),
-            ((1, 1, 1), (1, 1, 4), True),
-            ((2, 2, 2), (4, 2, 1), True),
-            ((1, 1, 4), (8, 1, 1), True),
-            ((2, 1, 4), (1, 1, 8), True),
+            ((2, 4, 1), (2, 4, 1), False, False),
+            ((1, 1, 1), (1, 1, 4), False, True),
+            ((2, 2, 2), (4, 2, 1), False, False),
+            ((1, 1, 4), (8, 1, 1), False, True),
+            ((2, 1, 4), (1, 1, 8), False, False),
+            ((2, 4, 1), (2, 4, 1), True, True),
+            ((1, 1, 1), (1, 1, 4), True, False),
+            ((2, 2, 2), (4, 2, 1), True, True),
+            ((1, 1, 4), (8, 1, 1), True, False),
+            ((2, 1, 4), (1, 1, 8), True, True),
         ],
     )
     @pytest.mark.parametrize("src_module,dest_module", src_dest_expert_type)
     def test_sequential_grouped_mlp_interchangeable(
-        self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, use_glu, src_module, dest_module
+        self,
+        tmp_path_dist_ckpt,
+        src_tp_pp_exp,
+        dest_tp_pp_exp,
+        use_glu,
+        src_module,
+        dest_module,
+        singleton_local_shards,
     ):
         """Test model saving and loading with different TP/PP/expert parallelism"""
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
+        metadata = {'singleton_local_shards': singleton_local_shards}
         # Save checkpoint A
         Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_sequential_grouped_mlp_interchangeable_model_A'
-        ) as ckpt_dir_A, TempNamedDir(
-            tmp_path_dist_ckpt / 'test_sequential_grouped_mlp_interchangeable_model_B'
-        ) as ckpt_dir_B:
-
+        with (
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_sequential_grouped_mlp_interchangeable_model_A'
+            ) as ckpt_dir_A,
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_sequential_grouped_mlp_interchangeable_model_B'
+            ) as ckpt_dir_B,
+        ):
+            layer_prefix = f'{parallel_state.get_pipeline_model_parallel_rank()}.'
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module)
-            sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
+            sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
             save_strategy = get_default_save_sharded_strategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
@@ -265,12 +280,14 @@ class TestExpertLayerReconfiguration:
             model_B = initialize_expert_layer(1, use_glu, expert_type=dest_module)
             load_strategy = None
             state_dict = load(
-                model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
+                model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata),
                 ckpt_dir_A,
                 load_strategy,
             )
-            model_B.load_state_dict(state_dict)
-            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            model_B.load_state_dict(
+                {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
+            )
+            save(model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata), ckpt_dir_B)
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal
@@ -297,29 +314,38 @@ class TestExpertLayerReconfiguration:
             ('te_grouped', 'te_sequential', (1, 1, 4), (1, 1, 1)),
         ],
     )
+    @pytest.mark.parametrize('singleton_local_shards', [True, False])
     def test_sequential_grouped_mlp_extra_state(
-        self, tmp_path_dist_ckpt, src_tp_pp_exp, dest_tp_pp_exp, src_module, dst_module
+        self,
+        tmp_path_dist_ckpt,
+        src_tp_pp_exp,
+        dest_tp_pp_exp,
+        src_module,
+        dst_module,
+        singleton_local_shards,
     ):
         """Test saving and loading _extra_state"""
         src_tp, src_pp, src_exp = src_tp_pp_exp
         dest_tp, dest_pp, dest_exp = dest_tp_pp_exp
+        metadata = {'singleton_local_shards': singleton_local_shards}
         use_glu = True
         Utils.initialize_model_parallel(src_tp, src_pp, expert_model_parallel_size=src_exp)
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_A'
-        ) as ckpt_dir_A, TempNamedDir(
-            tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_B'
-        ) as ckpt_dir_B, fp8_autocast():
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_A') as ckpt_dir_A,
+            TempNamedDir(tmp_path_dist_ckpt / 'test_grouped_mlp_extra_state_model_B') as ckpt_dir_B,
+            fp8_autocast(),
+        ):
             tokens_per_expert = torch.tensor([16] * (8 // src_exp))
             input_tensor = torch.randn(tokens_per_expert.sum(), 16, device="cuda")
             probs = torch.rand((tokens_per_expert.sum(),), dtype=torch.float32, device="cuda")
 
             # Save checkpoint A
+            layer_prefix = f'{parallel_state.get_pipeline_model_parallel_rank()}.'
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
             model_A = model_A.cuda()
             # fp8 meta is initialized at the first step
             model_A(input_tensor, tokens_per_expert, probs)
-            sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
+            sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
             save_strategy = get_default_save_sharded_strategy()
             save(sharded_state_dict, ckpt_dir_A, save_strategy)
@@ -332,21 +358,25 @@ class TestExpertLayerReconfiguration:
             model_A = initialize_expert_layer(1, use_glu, expert_type=src_module, fp8=True)
             model_A = model_A.cuda()
             state_dict = load(
-                model_A.sharded_state_dict(sharded_offsets=get_pp_offsets()),
+                model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata),
                 ckpt_dir_A,
                 load_strategy,
             )
-            model_A.load_state_dict(state_dict)
+            model_A.load_state_dict(
+                {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
+            )
 
             # model_B load checkpoint A
             model_B = initialize_expert_layer(1, use_glu, expert_type=dst_module, fp8=True)
             model_B = model_B.cuda()
             state_dict = load(
-                model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
+                model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata),
                 ckpt_dir_A,
                 load_strategy,
             )
-            model_B.load_state_dict(state_dict)
+            model_B.load_state_dict(
+                {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
+            )
 
             # Should be bitwise equal
             if src_module == "te_grouped":

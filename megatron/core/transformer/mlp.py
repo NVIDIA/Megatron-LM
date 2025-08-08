@@ -198,18 +198,23 @@ class MLP(MegatronModule):
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         sharded_state_dict = {}
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
-                        sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
+                        sub_sd[k] = apply_swiglu_sharded_factory(
+                            v, sharded_offsets, singleton_local_shards
+                        )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
 
 # pylint: disable=missing-function-docstring
-def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
+def apply_swiglu_sharded_factory(
+    original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
+):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
     # and `cat`s during loading
@@ -231,13 +236,25 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
     def sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
-        offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset + axis_frag, axis_frag * 2)
+        if singleton_local_shards:
+            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+            offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+            w_key = f'{key}_w'
+            v_key = f'{key}_v'
+        else:
+            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
+            offset_v = (
+                swiglu_shard_axis + prepend_axis_num,
+                rank_offset + axis_frag,
+                axis_frag * 2,
+            )
+            w_key = key
+            v_key = key
         if flattened_range is None:
             tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
             return [
                 ShardedTensor.from_rank_offsets(
-                    key,
+                    w_key,
                     tensor_w,
                     *sharded_offsets,
                     offset_w,
@@ -245,7 +262,7 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                     prepend_axis_num=prepend_axis_num,
                 ),
                 ShardedTensor.from_rank_offsets(
-                    key,
+                    v_key,
                     tensor_v,
                     *sharded_offsets,
                     offset_v,
@@ -254,6 +271,10 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                 ),
             ]
         else:
+            if singleton_local_shards:
+                raise NotImplementedError(
+                    'singleton_local_shards not implemented for SwiGLU MLP flattened tensors'
+                )
             # Here we need to map a slice `t` (`flattened_range` specifies slice start and stop)
             # of the *original* flattened tensor into slices `w` and `v` of chunked
             # and flattened tensor.
