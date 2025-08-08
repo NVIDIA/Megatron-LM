@@ -172,9 +172,9 @@ DISTRIBUTED_ARGS=(
 
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
 else
-    uv run python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
+    uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
 fi
 
 # Run after script

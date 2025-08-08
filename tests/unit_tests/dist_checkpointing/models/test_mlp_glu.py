@@ -36,12 +36,6 @@ def initialize_mlp(glu=True):
     )
 
 
-def get_pp_offsets():
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-    return ((0, pp_rank, pp_size),)
-
-
 class TestParallelMLPWithGLU:
     def setup_method(self, method):
         pass
@@ -59,27 +53,32 @@ class TestParallelMLPWithGLU:
             ((1, 1), (2, 1)),
         ],
     )
-    def test_parallel_reconfiguration_e2e(self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp):
+    @pytest.mark.parametrize('singleton_local_shards', [True, False])
+    def test_parallel_reconfiguration_e2e(
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, singleton_local_shards
+    ):
         """Test module saving and loading with different TP/PP"""
         Utils.initialize_model_parallel(*src_tp_pp)
+        metadata = {'singleton_local_shards': singleton_local_shards}
 
         with (
             TempNamedDir(tmp_path_dist_ckpt / 'test_mlp_glu_reconfiguration_model_A') as ckpt_dir_A,
             TempNamedDir(tmp_path_dist_ckpt / 'test_mlp_glu_reconfiguration_model_B') as ckpt_dir_B,
         ):
             # Save checkpoint A
+            layer_prefix = f'{parallel_state.get_pipeline_model_parallel_rank()}.'
             mlp_A = initialize_mlp()
-            save(mlp_A.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A)
+            save(mlp_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata), ckpt_dir_A)
             Utils.destroy_model_parallel()
 
             # Load checkpoint A with different TP/PP and save as checkpoint B
             Utils.initialize_model_parallel(*dest_tp_pp)
             mlp_B = initialize_mlp()
             state_dict = load(
-                mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_A
+                mlp_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata), ckpt_dir_A
             )
-            mlp_B.load_state_dict(state_dict)
-            save(mlp_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            mlp_B.load_state_dict({k.removeprefix(layer_prefix): v for k, v in state_dict.items()})
+            save(mlp_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata), ckpt_dir_B)
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal

@@ -386,12 +386,15 @@ test:safe_imports:
     KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
     KUBERNETES_SERVICE_CPU_REQUEST: 8
     KUBERNETES_SERVICE_CPU_LIMIT: 12
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image:
+    name: python:3.11
+    entrypoint: [""]
   needs: [test:build_image]
   script:
     - env
     - python -m ensurepip --upgrade
-    - python -m pip install -e .
+    - python -m pip install --no-cache-dir -e .
+    - python -m pip install --no-cache-dir click
     - python .gitlab/scripts/check_imports.py --package-name megatron.core
   rules:
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
