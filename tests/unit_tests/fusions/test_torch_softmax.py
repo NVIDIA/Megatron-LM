@@ -33,13 +33,13 @@ class TestTorchSoftmax:
 
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device="cuda")
-        y = self.softmax(x, None)
+        y = self.softmax(x, None, None)
         assert x.shape == y.shape
 
     def test_causal_mask_input_shape_assert(self):
         x = torch.randn(1, 1, 4, 16, device="cuda")
         with pytest.raises(AssertionError):
-            self.softmax(x, None)
+            self.softmax(x, None, None)
 
     def test_causal_mask_equal_scores(self):
         # For equal input values (e.g. zero) correctly masked softmax should
@@ -49,7 +49,7 @@ class TestTorchSoftmax:
         #  [0.5, 0.5]]
         b, np, sq, sk = 8, 2, 32, 32
         x = torch.zeros([b, np, sq, sk]).cuda()
-        y = self.softmax(x, None)
+        y = self.softmax(x, None, None)
         y_expected = torch.tril(torch.ones(b, np, sq, sk, device="cuda"))
         y_expected /= torch.arange(1, sq + 1, device="cuda").reshape((-1, 1))
         assert torch.allclose(y, y_expected, rtol=1e-08, atol=1e-08)
@@ -63,7 +63,7 @@ class TestSoftmaxOne:
             num_attention_heads=4,
             fp16=False,
             bf16=False,
-            attention_softmax_denominator_offset=1.0,
+            softmax_type="off-by-one",
             attention_softmax_in_fp32=True,
         )
         self.softmax = FusedScaleMaskSoftmax(
@@ -76,46 +76,46 @@ class TestSoftmaxOne:
 
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device="cuda")
-        y = self.softmax(x, None)
+        softmax_offset = torch.zeros(x.size(1), device="cuda")
+        y = self.softmax(x, None, softmax_offset)
         assert x.shape == y.shape
 
     def test_fixed_offset(self):
         x = torch.tensor([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]]], device="cuda")
 
-        output = self.softmax(x, None)
+        # Use logit offset of 0.0 per head so denominator adds 1.0 per position
+        softmax_offset = torch.zeros(x.size(1), device="cuda")
+        output = self.softmax(x, None, softmax_offset)
 
-        # Manual computation for verification
-        exp_x = torch.exp(x - x.max(dim=-1, keepdim=True).values)
-        expected = exp_x / (1.0 + exp_x.sum(dim=-1, keepdim=True))
+        # Manual computation matching implementation semantics
+        qk = torch.cat(
+            [
+                x,
+                softmax_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1),
+            ],
+            dim=-1,
+        )
+        expected = torch.softmax(qk, dim=-1)[..., :-1]
 
         assert torch.allclose(output, expected, rtol=1e-5)
 
     def test_learnable_offset(self):
         x = torch.tensor([[[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]]], device="cuda")
 
-        # Configure with learnable offset
-        config_learnable = TransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            attention_softmax_denominator_offset='learnable',
-        )
-        softmax_learnable = FusedScaleMaskSoftmax(
-            config=config_learnable,
-            attn_mask_type=AttnMaskType.causal,
-            mask_func=attention_mask_func,
-            layer_number=1,
-            scale=None,
-        ).to("cuda")
+        # Learnable offset provided externally (logit space)
+        learnable_offset = torch.nn.Parameter(torch.empty(x.size(1), device="cuda"))
+        learnable_offset.data.normal_(mean=0.0, std=0.01)
+        output = self.softmax(x, None, learnable_offset)
 
-        # Initialize learnable weight
-        softmax_learnable.softmax_denominator_weight.data.normal_(mean=0.0, std=0.01)
-        output = softmax_learnable(x, None)
-
-        exp_x = torch.exp(x - x.max(dim=-1, keepdim=True).values)
-        expected = exp_x / (
-            softmax_learnable.softmax_denominator_weight + exp_x.sum(dim=-1, keepdim=True)
+        # Manual computation: append logit, softmax, then drop the extra slot
+        qk = torch.cat(
+            [
+                x,
+                learnable_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1),
+            ],
+            dim=-1,
         )
+        expected = torch.softmax(qk, dim=-1)[..., :-1]
 
         assert torch.allclose(output, expected, rtol=1e-5)
 
@@ -124,7 +124,8 @@ class TestSoftmaxOne:
             [[[[1e10, -1e10, 1e10], [-1e10, 1e10, -1e10], [1e10, -1e10, 1e10]]]], device="cuda"
         )
 
-        output = self.softmax(x, None)
+        softmax_offset = torch.zeros(x.size(1), device="cuda")
+        output = self.softmax(x, None, softmax_offset)
 
         assert torch.all(torch.isfinite(output))
         assert torch.all((output >= 0) & (output <= 1))
@@ -134,7 +135,8 @@ class TestSoftmaxOne:
         # produce equal scores among non-masked elements
         b, np, sq, sk = 8, 2, 32, 32
         x = torch.zeros([b, np, sq, sk], device="cuda")
-        y = self.softmax(x, None)
+        softmax_offset = torch.zeros(x.size(1), device="cuda")
+        y = self.softmax(x, None, softmax_offset)
 
         # Expected: lower triangular matrix with rows normalized
         y_expected = torch.tril(torch.ones(b, np, sq, sk, device="cuda"))
@@ -186,7 +188,7 @@ class TestFusedScaleMaskSoftmaxComprehensive:
                 scale=scale,
             )
 
-            y = softmax(x, None)
+            y = softmax(x, None, None)
             assert x.shape == y.shape
             # Check if output is a valid probability distribution
             assert torch.allclose(y.sum(dim=-1), torch.ones_like(y.sum(dim=-1)), rtol=1e-5)
@@ -202,7 +204,7 @@ class TestFusedScaleMaskSoftmaxComprehensive:
             masked_softmax_fusion=False,
             attention_softmax_in_fp32=True,
             tensor_model_parallel_size=1,
-            window_size=[10, 0],  # Sliding window attention
+            window_size=(10, 0),  # Sliding window attention
         )
 
         softmax = FusedScaleMaskSoftmax(
@@ -214,7 +216,7 @@ class TestFusedScaleMaskSoftmaxComprehensive:
         )
 
         x = torch.randn(2, 4, 16, 16, device="cuda")
-        y = softmax(x, None)
+        y = softmax(x, None, None)
         assert x.shape == y.shape
 
     def test_fused_kernel_availability(self):
@@ -263,7 +265,7 @@ class TestFusedScaleMaskSoftmaxComprehensive:
             else:
                 mask = None
 
-            y = softmax(x, mask)
+            y = softmax(x, mask, None)
             assert x.shape == y.shape
 
     def test_mixed_precision(self):
@@ -298,7 +300,7 @@ class TestFusedScaleMaskSoftmaxComprehensive:
             elif config_params["bf16"]:
                 x = x.bfloat16()
 
-            y = softmax(x, None)
+            y = softmax(x, None, None)
             assert x.shape == y.shape
 
     def test_gradient_flow(self):
@@ -312,7 +314,7 @@ class TestFusedScaleMaskSoftmaxComprehensive:
         )
 
         x = torch.randn(2, 4, 8, 8, device="cuda", requires_grad=True)
-        y = softmax(x, None)
+        y = softmax(x, None, None)
         loss = y.sum()
         loss.backward()
 
@@ -339,5 +341,5 @@ class TestFusedScaleMaskSoftmaxComprehensive:
 
         # This should work as layer_number is provided as parameter
         x = torch.randn(2, 4, 8, 8, device="cuda")
-        y = softmax(x, None)
+        y = softmax(x, None, None)
         assert x.shape == y.shape

@@ -1,14 +1,7 @@
 import pytest
 import torch
 
-from megatron.core.fusions.fused_bias_swiglu import (
-    BiasAlphaSwiGLUFunction,
-    BiasSwiGLUFunction,
-    bias_alphaswiglu,
-    bias_alphaswiglu_back,
-    bias_swiglu_impl,
-    weighted_bias_swiglu_impl,
-)
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 
 
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
