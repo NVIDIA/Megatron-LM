@@ -29,9 +29,9 @@ class ModelChunkState:
 
 
 class TransformerLayerSchedulePlan:
-    """Schedule the executing plan of the nodes in a transformer layer.
+    """Schedule the executing plan of the nodes in a transformer/mtp layer.
 
-    This class organizes the computation nodes for a transformer layer,
+    This class organizes the computation nodes for a transformer/mtp layer,
     including attention, post attention, MLP, dispatch, combine and
     mtp post process nodes.
 
@@ -42,6 +42,13 @@ class TransformerLayerSchedulePlan:
     ├── mlp (TransformerLayerNode): mlp module
     ├── moe_combine (TransformerLayerNode): combine All2All
     └── mtp_post_process (PostProcessNode): mtp post process
+
+    Note that MTP layer has the same operation and execution order with TransformerLayer regarding
+    post_attn, moe_dispatch, mlp, moe_combine, but contains extra operations in attn and
+    mtp_post_process:
+    * mtp.attn wraps around transformer_layer.attn with extra norm, proj and embedding operations.
+    * mtp.mtp_post_process contains output_layer, mtp loss operations, whereas
+      transformer_layer.mtp_post_process is empty.
     """
 
     attn = None
@@ -90,14 +97,17 @@ class TransformerLayerSchedulePlan:
         )
         from megatron.core.transformer.moe.moe_layer import MoELayer
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-        from megatron.core.transformer.transformer_layer import make_viewless_tensor
 
         # build the forward and backward callables for the transformer/mtp layer
         fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
 
         # get flags for latter use
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
-        is_moe = True if is_mtp else isinstance(self.layer.mlp, MoELayer)
+        is_moe = (
+            isinstance(self.layer.transformer_layer.mlp, MoELayer)
+            if is_mtp
+            else isinstance(self.layer.mlp, MoELayer)
+        )
         enable_deepep = self.layer.config.moe_enable_deepep
         extra_args["enable_deepep"] = enable_deepep
         extra_args["is_moe"] = is_moe
