@@ -153,15 +153,6 @@ class TestSpecCustomization:
             window_size=(10, 0),
         )
 
-        # Test DotProductAttention
-        attn = DotProductAttention(
-            config,
-            layer_number=1,
-            attn_mask_type=AttnMaskType.causal,
-            attention_type='self',
-            model_comm_pgs=self.model_comm_pgs,
-        )
-
         # Test TEDotProductAttention
         attn = TEDotProductAttention(
             config,

@@ -229,7 +229,6 @@ def bias_swiglu_impl(input, bias, fp8_input_store=False, cpu_offload_input=False
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
-        output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store)
         output = BiasSwiGLUFunction.apply(input, bias, fp8_input_store, cpu_offload_input)
     else:
         output = SwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input)

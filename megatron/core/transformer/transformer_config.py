@@ -1416,3 +1416,8 @@ class MLATransformerConfig(TransformerConfig):
 
     yarn_correction_range_round_to_int: bool = True
     """Whether to round dim range bounds to integer"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+            raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
