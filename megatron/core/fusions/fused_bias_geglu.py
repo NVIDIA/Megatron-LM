@@ -166,7 +166,7 @@ class WeightedQuickGeGLUFunction(torch.autograd.Function):
         return input_grad, wgrad, None, None
 
 
-def weighted_bias_quick_geglu_impl(input, bias, weights, fp8_input_store=False, linear_offset=0.0):
+def weighted_bias_quick_geglu_impl(input, bias, weights, fp8_input_store=False, linear_offset=0.0, clamp_value=None):
     """
     Token-wise-weighted bias quick_geglu fusion.
         input: [num_selected_experts * seq_len, hidden_size * 2]
@@ -178,8 +178,9 @@ def weighted_bias_quick_geglu_impl(input, bias, weights, fp8_input_store=False, 
     """
     ori_shape = input.shape
     assert len(ori_shape) in [2, 3]
-    x_glu, x_linear = input.chunk(2, -1)
-    input = torch.cat((x_glu.clamp(min=None, max=7.0), x_linear.clamp(min=-7.0, max=7.0)), -1)
+    if clamp_value is not None:
+        x_glu, x_linear = input.chunk(2, -1)
+        input = torch.cat((x_glu.clamp(min=None, max=clamp_value), x_linear.clamp(min=-clamp_value, max=clamp_value)), -1)
     input = input.view(-1, ori_shape[-1])
     linear_offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
     if bias is not None:

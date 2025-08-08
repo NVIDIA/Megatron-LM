@@ -915,6 +915,7 @@ class TEGroupedMLP(MegatronModule):
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
                         self.config.glu_linear_offset,
+                        self.config.activation_func_clamp_value,
                     )
                 else:
                     raise ValueError("Only support fusion of swiglu and quick_geglu in TEGroupedMLP.")
@@ -923,9 +924,10 @@ class TEGroupedMLP(MegatronModule):
                 if self.config.gated_linear_unit:
 
                     def glu(x):
-                        x = torch.chunk(x, 2, dim=-1)
-                        x_glu = x[0].clamp(min=None, max=7)
-                        x_linear = x[1].clamp(min=-7, max=7)
+                        x_glu, x_linear = torch.chunk(x, 2, dim=-1)
+                        if (val := self.config.activation_func_clamp_value) is not None:
+                            x_glu = x_glu.clamp(min=None, max=val)
+                            x_linear = x_linear.clamp(min=-val, max=val)
                         return self.config.activation_func(x_glu) * (x_linear + self.config.glu_linear_offset)
 
                     intermediate_parallel = glu(intermediate_parallel)

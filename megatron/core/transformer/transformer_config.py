@@ -160,6 +160,10 @@ class TransformerConfig(ModelParallelConfig):
     """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only used when 
     gated_linear_unit is True"""
 
+    activation_func_clamp_value: Optional[float] = None
+    """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func is 
+    quick_gelu."""
+
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
