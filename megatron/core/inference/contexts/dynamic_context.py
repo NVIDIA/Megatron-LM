@@ -495,27 +495,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         ROUNDER = getattr(cls, "ROUNDER", 64)
         return ROUNDER * int(math.ceil(int(value) / ROUNDER))
 
-    def _mamba_state_size_per_layer_per_request(
-        self,
-        mamba_d_model: int,
-        mamba_d_conv: int,
-        mamba_d_state: int,
-        mamba_num_groups: int,
-        mamba_head_dim: int,
-        tp_size: int,
-        expand: int = 2,
-    ) -> Tuple[Tuple[int], Tuple[int]]:
-        """Computes the Mamba conv and ssm states shapes per layer and request."""
-        d_inner = mamba_d_model * expand
-        nheads = d_inner // mamba_head_dim
-        d_inner_local_tp = d_inner // tp_size
-        ngroups_local_tp = mamba_num_groups // tp_size
-        nheads_local_tp = nheads // tp_size
-        conv_dim = d_inner_local_tp + 2 * ngroups_local_tp * mamba_d_state
-        mamba_conv_states_shape = (conv_dim, mamba_d_conv)
-        mamba_ssm_states_shape = (nheads_local_tp, mamba_head_dim, mamba_d_state)
-        return (mamba_conv_states_shape, mamba_ssm_states_shape)
-
     def is_static_batching(self) -> bool:
         """Is static batching? False."""
         return False
