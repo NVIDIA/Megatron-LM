@@ -135,15 +135,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             the layer type (Mamba / Attention / MLP) for each layer.
             See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list
             of symbols. This must be provided for hybrid models.
-        mamba_head_dim: (Optional[int]): Head dimension for Mamba layers.
+        mamba_conv_states_shape: (Optional[Tuple[int]]): Mamba conv states shape per request.
             This must be provided for hybrid models.
-        mamba_num_groups (Optional[int]): Number of groups for Mamba layers.
-            This must be provided for hybrid models.
-        mamba_d_model (Optional[int]): The model hidden size.
-            This must be provided for hybrid models.
-        mamba_d_conv (Optional[int]): Convolution dimension for Mamba layers.
-            This must be provided for hybrid models.
-        mamba_d_state (Optional[int]): State dimension for Mamba layers.
+        mamba_ssm_states_shape: (Optional[Tuple[int]]): Mamba ssm states shape per request.
             This must be provided for hybrid models.
     """
 
