@@ -81,6 +81,11 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                 - num_layers_in_first_pipeline_stage
                 - num_layers_in_last_pipeline_stage
             )
+            middle_pipeline_rank = (
+                pipeline_rank
+                if config.num_layers_in_first_pipeline_stage is None
+                else pipeline_rank - 1
+            )
 
             middle_pipeline_rank = (
                 pipeline_rank
@@ -131,6 +136,8 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                         * (
                             num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
                             // middle_pipeline_stages
+                            if middle_num_layers > 0
+                            else 0
                         )
                     )
             else:
