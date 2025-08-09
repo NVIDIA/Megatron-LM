@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -22,6 +23,7 @@ from megatron.core.dist_checkpointing.mapping import (
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -880,6 +882,13 @@ class TEGroupedMLP(MegatronModule):
                     )
                 else:
                     raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
+            elif (
+                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
+            ):
+                assert bias_parallel is None
+                intermediate_parallel = weighted_squared_relu_impl(
+                    intermediate_parallel, permuted_probs
+                )
             else:
                 if bias_parallel is not None:
                     shape = intermediate_parallel.shape
