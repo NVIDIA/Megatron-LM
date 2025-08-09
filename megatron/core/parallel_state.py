@@ -1846,6 +1846,30 @@ def get_all_ranks():
         get_expert_model_parallel_rank(),
     ]
     return "_".join(map(lambda x: str(x or 0), ranks))
+    
+
+def get_all_world_sizes():
+    """Get world sizes of tensor-model-parallel, data-parallel, context-parallel,
+    pipeline-model-parallel and expert-model-parallel groups."""
+    sizes = [
+        get_tensor_model_parallel_world_size() or 0,
+        get_data_parallel_world_size() or 0,
+        get_context_parallel_world_size() or 0,
+        get_pipeline_model_parallel_world_size() or 0,
+        get_expert_model_parallel_world_size() or 0,
+    ]
+    return "_".join(map(str, sizes))
+
+
+def get_world_sizes_dict():
+    """Return a dict with world sizes for tp/dp/cp/pp/ep."""
+    return {
+        "tp": int(get_tensor_model_parallel_world_size() or 0),
+        "dp": int(get_data_parallel_world_size() or 0),
+        "cp": int(get_context_parallel_world_size() or 0),
+        "pp": int(get_pipeline_model_parallel_world_size() or 0),
+        "ep": int(get_expert_model_parallel_world_size() or 0),
+    }
 
 
 def destroy_model_parallel():
