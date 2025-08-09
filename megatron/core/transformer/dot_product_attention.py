@@ -108,7 +108,11 @@ class DotProductAttention(MegatronModule):
         elif self.config.softmax_type == "learnable":
             self.register_parameter(
                 "softmax_offset",
-                torch.nn.Parameter(torch.empty(self.num_attention_heads_per_partition, dtype=self.config.params_dtype)),
+                torch.nn.Parameter(
+                    torch.empty(
+                        self.num_attention_heads_per_partition, dtype=self.config.params_dtype
+                    )
+                ),
             )
         else:
             raise ValueError("Softmax type not supported")
@@ -181,7 +185,9 @@ class DotProductAttention(MegatronModule):
         # ===========================
 
         # attention scores and attention mask [b, np, sq, sk]
-        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask, self.softmax_offset)
+        attention_probs: Tensor = self.scale_mask_softmax(
+            attention_scores, attention_mask, self.softmax_offset
+        )
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -236,4 +242,3 @@ class DotProductAttention(MegatronModule):
         return make_sharded_tensors_for_checkpoint(
             state_dict, prefix, {'softmax_offset': 0}, sharded_offsets
         )
-

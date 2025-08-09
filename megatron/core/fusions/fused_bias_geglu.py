@@ -85,7 +85,6 @@ def bias_geglu_impl(input, bias):
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
-
 # ------------------------- QUICK GEGLU FUSION --------------------------
 
 
@@ -111,7 +110,9 @@ def quick_geglu(y: torch.Tensor, linear_offset: float = 0.0) -> torch.Tensor:
 
 
 @jit_fuser
-def weighted_quick_geglu(y: torch.Tensor, weights: torch.Tensor, linear_offset: float = 0.0) -> torch.Tensor:
+def weighted_quick_geglu(
+    y: torch.Tensor, weights: torch.Tensor, linear_offset: float = 0.0
+) -> torch.Tensor:
     """Token-wise-weighted Quick-GEGLU activation.
 
     The weights tensor is expected to have the same first-dimension length as ``y`` and a trailing
@@ -129,7 +130,8 @@ def quick_geglu_back(g, y, linear_offset: float = 0.0) -> torch.Tensor:
     sigmoid_out = torch.sigmoid(1.702 * y_1)
     dy_1 = g * sigmoid_out * (1 + 1.702 * y_1 * (1 - sigmoid_out)) * (y_2 + linear_offset)
     dy_2 = g * y_1 * sigmoid_out
-    return torch.cat((dy_1, dy_2), -1) 
+    return torch.cat((dy_1, dy_2), -1)
+
 
 @jit_fuser
 def weighted_quick_geglu_back(g, y, weights, linear_offset: float = 0.0):
@@ -151,7 +153,13 @@ class WeightedQuickGeGLUFunction(torch.autograd.Function):
     """Autograd function for token-wise weighted Quick-GEGLU (no bias)."""
 
     @staticmethod
-    def forward(ctx, input: torch.Tensor, weights: torch.Tensor, fp8_input_store: bool, linear_offset: torch.Tensor):
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        weights: torch.Tensor,
+        fp8_input_store: bool,
+        linear_offset: torch.Tensor,
+    ):
         input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
         ctx.save_for_backward(input_for_backward, weights, linear_offset)
         ctx.ori_input_dtype = input.dtype
@@ -166,7 +174,9 @@ class WeightedQuickGeGLUFunction(torch.autograd.Function):
         return input_grad, wgrad, None, None
 
 
-def weighted_bias_quick_geglu_impl(input, bias, weights, fp8_input_store=False, linear_offset=0.0, clamp_value=None):
+def weighted_bias_quick_geglu_impl(
+    input, bias, weights, fp8_input_store=False, linear_offset=0.0, clamp_value=None
+):
     """
     Token-wise-weighted bias quick_geglu fusion.
         input: [num_selected_experts * seq_len, hidden_size * 2]
@@ -180,7 +190,13 @@ def weighted_bias_quick_geglu_impl(input, bias, weights, fp8_input_store=False, 
     assert len(ori_shape) in [2, 3]
     if clamp_value is not None:
         x_glu, x_linear = input.chunk(2, -1)
-        input = torch.cat((x_glu.clamp(min=None, max=clamp_value), x_linear.clamp(min=-clamp_value, max=clamp_value)), -1)
+        input = torch.cat(
+            (
+                x_glu.clamp(min=None, max=clamp_value),
+                x_linear.clamp(min=-clamp_value, max=clamp_value),
+            ),
+            -1,
+        )
     input = input.view(-1, ori_shape[-1])
     linear_offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
     if bias is not None:

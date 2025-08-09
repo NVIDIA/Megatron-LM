@@ -869,7 +869,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype):
+    def forward(
+        ctx, inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+    ):
         """
         Forward pass of the RouterGatingLinearFunction function.
         """
@@ -919,7 +921,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None
 
 
-def router_gating_linear(inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype):
+def router_gating_linear(
+    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, router_dtype: torch.dtype
+):
     """
     Customized linear layer for router gating.
     This linear layer accepts bfloat16 input and weight, and can return output with router_dtype.

@@ -89,11 +89,7 @@ class TestSoftmaxOne:
 
         # Manual computation matching implementation semantics
         qk = torch.cat(
-            [
-                x,
-                softmax_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1),
-            ],
-            dim=-1,
+            [x, softmax_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1)], dim=-1
         )
         expected = torch.softmax(qk, dim=-1)[..., :-1]
 
@@ -109,11 +105,7 @@ class TestSoftmaxOne:
 
         # Manual computation: append logit, softmax, then drop the extra slot
         qk = torch.cat(
-            [
-                x,
-                learnable_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1),
-            ],
-            dim=-1,
+            [x, learnable_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1)], dim=-1
         )
         expected = torch.softmax(qk, dim=-1)[..., :-1]
 
@@ -283,7 +275,7 @@ class TestFusedScaleMaskSoftmaxComprehensive:
                 num_attention_heads=8,
                 masked_softmax_fusion=False,
                 tensor_model_parallel_size=1,
-                **config_params
+                **config_params,
             )
 
             softmax = FusedScaleMaskSoftmax(

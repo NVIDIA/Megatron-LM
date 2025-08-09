@@ -113,7 +113,10 @@ class SoftmaxOne(nn.Module):
         self.denominator_offset = denominator_offset
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        qk = torch.cat([x, self.denominator_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1)], dim=-1)
+        qk = torch.cat(
+            [x, self.denominator_offset.reshape(1, -1, 1, 1).expand(x.size(0), -1, x.size(2), -1)],
+            dim=-1,
+        )
         ret = torch.softmax(qk, dim=-1)[..., :-1]
         return ret
 
@@ -154,7 +157,12 @@ class FusedScaleMaskSoftmax(nn.Module):
 
         assert self.scale is None or self.softmax_in_fp32, "softmax should be in fp32 when scaled"
 
-    def forward(self, input: torch.Tensor, mask: Optional[torch.Tensor], softmax_offset: Optional[torch.Tensor]):
+    def forward(
+        self,
+        input: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        softmax_offset: Optional[torch.Tensor],
+    ):
         """Forward pass of softmax with masked input.
 
         In case attn_mask_type is causal the mask is generated and None can be passed.
@@ -163,10 +171,7 @@ class FusedScaleMaskSoftmax(nn.Module):
         # [b, np, sq, sk]
         assert input.dim() == 4
 
-        if (
-            self.is_kernel_available(mask, *input.size())
-            and softmax_offset is None
-        ):
+        if self.is_kernel_available(mask, *input.size()) and softmax_offset is None:
             return self.forward_fused_softmax(input, mask)
         else:
             return self.forward_torch_softmax(input, mask, softmax_offset)

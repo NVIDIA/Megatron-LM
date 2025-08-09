@@ -905,7 +905,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 core_attention_bias_type="post_scale_bias", core_attention_bias=attention_bias
             )
         if attn_mask_type == AttnMaskType.no_mask and self.config.window_size is not None:
-            if (qkv_format == "bshd" and query.size(1) == 1) or (qkv_format == "sbhd" and query.size(0) == 1):
+            if (qkv_format == "bshd" and query.size(1) == 1) or (
+                qkv_format == "sbhd" and query.size(0) == 1
+            ):
                 #  need to change mask type for SWA inference decode stage.
                 attn_mask_type = AttnMaskType.causal_bottom_right
         if self.te_forward_mask_type:

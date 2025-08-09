@@ -11,8 +11,8 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from ..fusions.fused_bias_geglu import quick_gelu
 
+from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
     get_te_version,
@@ -1081,7 +1081,11 @@ class TransformerConfig(ModelParallelConfig):
                     "When bias_activation_fusion is True, activation function should be either "
                     "gelu, swiglu, or quick_geglu"
                 )
-            if self.activation_func == F.gelu and not self.gated_linear_unit and not self.add_bias_linear:
+            if (
+                self.activation_func == F.gelu
+                and not self.gated_linear_unit
+                and not self.add_bias_linear
+            ):
                 raise ValueError(
                     "When bias_activation_fusion is True, gated_linear_unit is False "
                     "and activation function is gelu, add_bias_linear must also be True."
@@ -1156,7 +1160,9 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.num_moe_experts is not None and self.add_bias_linear:
-            assert self.expert_tensor_parallel_size == 1, "Bias in Moe is only supported when ETP==1"
+            assert (
+                self.expert_tensor_parallel_size == 1
+            ), "Bias in Moe is only supported when ETP==1"
 
         if self.moe_router_enable_expert_bias and self.moe_router_score_function != "sigmoid":
             raise ValueError(

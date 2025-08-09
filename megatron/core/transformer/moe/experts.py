@@ -22,9 +22,7 @@ from megatron.core.dist_checkpointing.mapping import (
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
-from megatron.core.fusions.fused_bias_swiglu import (
-    weighted_bias_swiglu_impl,
-)
+from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -776,8 +774,8 @@ class TEGroupedMLP(MegatronModule):
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
-        assert (
-            not (self.config.add_bias_linear and config.bias_dropout_fusion)
+        assert not (
+            self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
         self.ep_group = model_comm_pgs.ep
@@ -918,9 +916,13 @@ class TEGroupedMLP(MegatronModule):
                         self.config.activation_func_clamp_value,
                     )
                 else:
-                    raise ValueError("Only support fusion of swiglu and quick_geglu in TEGroupedMLP.")
+                    raise ValueError(
+                        "Only support fusion of swiglu and quick_geglu in TEGroupedMLP."
+                    )
             else:
-                intermediate_parallel = self._apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert)
+                intermediate_parallel = self._apply_bias(
+                    intermediate_parallel, bias_parallel, tokens_per_expert
+                )
                 if self.config.gated_linear_unit:
 
                     def glu(x):
@@ -928,7 +930,9 @@ class TEGroupedMLP(MegatronModule):
                         if (val := self.config.activation_func_clamp_value) is not None:
                             x_glu = x_glu.clamp(min=None, max=val)
                             x_linear = x_linear.clamp(min=-val, max=val)
-                        return self.config.activation_func(x_glu) * (x_linear + self.config.glu_linear_offset)
+                        return self.config.activation_func(x_glu) * (
+                            x_linear + self.config.glu_linear_offset
+                        )
 
                     intermediate_parallel = glu(intermediate_parallel)
                 else:

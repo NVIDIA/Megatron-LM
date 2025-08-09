@@ -4,13 +4,13 @@ from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
 import torch
-from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.models.common.embeddings import YarnRotaryEmbedding
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
@@ -363,7 +363,14 @@ class GPTModel(LanguageModule):
         if in_inference_mode and not has_config_logger_enabled(self.config):
             decoder_input = WrappedTensor(decoder_input)
 
-        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset, yarn_mscale
+        return (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            yarn_mscale,
+        )
 
     def forward(
         self,
@@ -393,14 +400,19 @@ class GPTModel(LanguageModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset, yarn_mscale = (
-            self._preprocess(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                decoder_input=decoder_input,
-                inference_context=inference_context,
-                packed_seq_params=packed_seq_params,
-            )
+        (
+            decoder_input,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+            yarn_mscale,
+        ) = self._preprocess(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            decoder_input=decoder_input,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
         )
 
         # Run decoder.
