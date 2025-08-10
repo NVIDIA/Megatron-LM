@@ -13,6 +13,7 @@ from modelopt.torch.export import import_mcore_gpt_from_hf
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.parallel_state import destroy_model_parallel
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_provider import model_provider
@@ -183,3 +184,5 @@ if __name__ == "__main__":
     torch.distributed.barrier()
 
     save_checkpoint(1, model, None, None, 0)
+
+    destroy_model_parallel()

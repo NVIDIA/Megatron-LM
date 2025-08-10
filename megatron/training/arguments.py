@@ -2451,6 +2451,10 @@ def _add_tokenizer_args(parser):
     group = parser.add_argument_group(title='tokenizer')
     group.add_argument('--vocab-size', type=int, default=None,
                        help='Size of vocab before EOD or padding.')
+    group.add_argument('--padded-vocab-size', type=int, default=None,
+                       help='Vocabulary size of the model (padded to be divisible by '
+                       'tensor model parallel size). If not provided, it will be '
+                       'automatically calculated from vocab-size.')
     group.add_argument('--vocab-file', type=str, default=None,
                        help='Path to the vocab file.')
     group.add_argument('--merge-file', type=str, default=None,
