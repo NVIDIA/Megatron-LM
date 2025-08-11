@@ -94,7 +94,7 @@ class PreProcessNode(ScheduleNode):
         self.chunk_state = chunk_state
 
     def forward_impl(self):
-        """Implements the forward pass for preprocessing.
+        """forward pass for pre-processing.
 
         This method handles:
         1. Decoder embedding computation

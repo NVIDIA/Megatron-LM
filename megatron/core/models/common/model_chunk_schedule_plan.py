@@ -31,7 +31,7 @@ class ModelChunkState:
 class TransformerLayerSchedulePlan:
     """Schedule the executing plan of the nodes in a transformer/mtp layer.
 
-    This class organizes the computation nodes for a transformer/mtp layer,
+    This class organizes the sub-modules of a transformer/mtp layer,
     including attention, post attention, MLP, dispatch, combine and
     mtp post process nodes.
 
@@ -414,8 +414,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Model Chunk level 1f1b fine-grained scheduler.
 
         This function schedules the forward and backward passes for a model chunk,
-        which interleaves forward and backward operations across multiple layers
-        to maximize parallelism and efficiency.
+        which interleaves forward and backward function of multiple Transformer layers
+        within a model chunk, and this is needed to overlap the submodules between the individual
+        forward and backward functions.
 
         Assume there are 4 layers in the given model chunk:
         Phase 0: p2p_comm_sync -> forward_preprocess -> p2p_comm_sync -> backward_postprocess
