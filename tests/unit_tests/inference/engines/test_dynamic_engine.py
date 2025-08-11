@@ -4,7 +4,7 @@ import asyncio
 import random
 import types
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pytest
 import torch
@@ -39,6 +39,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     check_mamba_dynamic_inference_support,
+    get_attr_wrapped_model,
     is_fa_min_version,
     is_te_min_version,
 )
@@ -163,6 +164,8 @@ class TestDynamicInferenceEngine:
         transformer_config: TransformerConfig,
         requests: List[Request],
         layer_type_list: Optional[List[str]],
+        mamba_conv_states_shape: Optional[Tuple[int]] = None,
+        mamba_ssm_states_shape: Optional[Tuple[int]] = None,
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -187,11 +190,8 @@ class TestDynamicInferenceEngine:
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
             is_hybrid_model=(test_config.model_provider == "mamba"),
             layer_type_list=layer_type_list,
-            mamba_head_dim=transformer_config.mamba_head_dim,
-            mamba_num_groups=transformer_config.mamba_num_groups,
-            mamba_d_model=transformer_config.hidden_size,
-            mamba_d_conv=4,
-            mamba_d_state=transformer_config.mamba_state_dim,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
         )
 
         return context
@@ -285,7 +285,17 @@ class TestDynamicInferenceEngine:
         model.eval()
 
         # Layer type list for hybrid models
-        layer_type_list = getattr(model.decoder, "layer_type_list", None)
+        decoder = get_attr_wrapped_model(model, "decoder")
+        layer_type_list = getattr(decoder, "layer_type_list", None)
+        if test_config.model_provider == "mamba":
+            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
+                decoder.mamba_state_shapes_per_request()
+            )
+            print(f"mamba_conv_states_shape={mamba_conv_states_shape}")
+            print(f"mamba_ssm_states_shape={mamba_ssm_states_shape}")
+        else:
+            mamba_conv_states_shape = None
+            mamba_ssm_states_shape = None
 
         # Inference config.
         inference_config = InferenceWrapperConfig(
@@ -302,6 +312,8 @@ class TestDynamicInferenceEngine:
             transformer_config=transformer_config,
             requests=requests,
             layer_type_list=layer_type_list,
+            mamba_conv_states_shape=mamba_conv_states_shape,
+            mamba_ssm_states_shape=mamba_ssm_states_shape,
         )
 
         # Inference model wrapper.
@@ -674,7 +686,7 @@ class TestDynamicInferenceEngine:
         assert len(finished_requests) == len(
             prompts
         ), "Should return same number of finished requests as prompts"
-        print()
+
         # Check each request was processed
         for i, request in enumerate(finished_requests):
             # Verify each request has generated tokens

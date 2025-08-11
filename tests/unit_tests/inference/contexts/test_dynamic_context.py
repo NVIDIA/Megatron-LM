@@ -44,14 +44,10 @@ class TestDynamicContext:
         # Mamba-specific parameters
         is_hybrid_model=False,
         layer_type_list=None,
-        mamba_head_dim=None,
-        mamba_num_groups=None,
-        mamba_d_model=None,
-        mamba_d_conv=None,
-        mamba_d_state=None,
         rounder=64,
     ):
         set_rounder(rounder)
+
         dynamic_context = DynamicInferenceContext(
             params_dtype=params_dtype,
             num_layers=num_layers,
@@ -67,11 +63,8 @@ class TestDynamicContext:
             max_tokens_override=max_tokens_override,
             is_hybrid_model=is_hybrid_model,
             layer_type_list=layer_type_list,
-            mamba_head_dim=mamba_head_dim,
-            mamba_num_groups=mamba_num_groups,
-            mamba_d_model=mamba_d_model,
-            mamba_d_conv=mamba_d_conv,
-            mamba_d_state=mamba_d_state,
+            mamba_conv_states_shape=(544, 4),
+            mamba_ssm_states_shape=(8, 64, 16),
         )
         return dynamic_context
 
@@ -83,17 +76,12 @@ class TestDynamicContext:
     def test_initialize_dynamic_context(self, is_hybrid: bool):
         self._setup_model_parallel_group(1, 1)
 
-        # Mamba-specific parameters if is_hybrid is True
+        # Mamba-specific parameters
         mamba_params = {}
         if is_hybrid:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
 
         dynamic_context = self._get_dynamic_context(
@@ -187,11 +175,6 @@ class TestDynamicContext:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
 
         dynamic_context = self._get_dynamic_context(
@@ -225,11 +208,6 @@ class TestDynamicContext:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
 
         dynamic_context = self._get_dynamic_context(
@@ -263,11 +241,6 @@ class TestDynamicContext:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
 
         dynamic_context = self._get_dynamic_context(
@@ -387,11 +360,6 @@ class TestDynamicContext:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
             num_layers = len(mamba_params["layer_type_list"])
         else:
@@ -470,11 +438,6 @@ class TestDynamicContext:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
             num_layers = len(mamba_params["layer_type_list"])
         else:
@@ -701,11 +664,6 @@ class TestDynamicContext:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
             num_layers = len(mamba_params["layer_type_list"])
         else:
@@ -786,11 +744,6 @@ class TestDynamicContext:
             mamba_params = {
                 "is_hybrid_model": True,
                 "layer_type_list": [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP],
-                "mamba_head_dim": 64,
-                "mamba_num_groups": 1,
-                "mamba_d_model": 256,
-                "mamba_d_conv": 4,
-                "mamba_d_state": 16,
             }
             num_layers = len(mamba_params["layer_type_list"])
         else:
@@ -893,11 +846,6 @@ class TestDynamicContext:
         mamba_params = {
             "is_hybrid_model": True,
             "layer_type_list": [Symbols.MAMBA, Symbols.ATTENTION, Symbols.MAMBA, Symbols.ATTENTION],
-            "mamba_head_dim": 64,
-            "mamba_num_groups": 1,
-            "mamba_d_model": 256,
-            "mamba_d_conv": 4,
-            "mamba_d_state": 16,
         }
         num_layers = len(mamba_params["layer_type_list"])
 
