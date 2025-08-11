@@ -700,6 +700,12 @@ def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = No
             torch.distributed.all_reduce(
                 values, group=tracker[name]['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
+        # This ensures proper loss averaging across all ranks including CP ranks
+        torch.distributed.all_reduce(
+            values,
+            group=parallel_state.get_data_parallel_group(with_context_parallel=True),
+            op=torch.distributed.ReduceOp.AVG,
+        )
 
 
 def track_moe_metrics(
