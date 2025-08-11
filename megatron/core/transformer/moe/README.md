@@ -196,7 +196,8 @@ Enable A2A overlap across different batches inspired by the DSv3 DualPipe implme
 - Hide ep a2a communication by batch-level overlapping
 - Split weight gradient and activation gradient computations for better overlap with communications
 - Support interleaved pipelined parallelism
-- Support MTP and FP8
+- Support FP8 training
+- Support MTP (`-mtp-num-layers 1` only, multiple MTP layers are not supported yet.)
 
 
 **Usage** 
