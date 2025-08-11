@@ -14,13 +14,16 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
@@ -28,14 +31,14 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import unwrap_model
+from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
+from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 try:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
 
     HAVE_TE = True
-    from megatron.core.utils import is_te_min_version
 except ImportError:
     HAVE_TE = False
 
@@ -51,20 +54,18 @@ class TestMultiTokenPredictionLayer:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    def _create_mtp_config(self, tp_size=1):
-        return TransformerConfig(
+    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        config = TransformerConfig(
             mtp_num_layers=2,
             num_layers=4,
             hidden_size=64,
             num_attention_heads=8,
             use_cpu_initialization=True,
-            tensor_model_parallel_size=tp_size,
-            sequence_parallel=True if tp_size > 1 else False,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=True if tp > 1 else False,
+            context_parallel_size=cp,  # Enable CP for MTP testing
         )
-
-    def _create_mtp_block_spec(self, config=None, tp_size=1, use_te=False):
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
-        config = self._create_mtp_config(tp_size=tp_size)
         if use_te:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
         else:
@@ -72,16 +73,14 @@ class TestMultiTokenPredictionLayer:
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
-        return mtp_block_spec
+        return config, mtp_block_spec
 
-    @pytest.mark.parametrize(('tp_size'), [1, 2, 4])
-    def test_constructor_local(self, tp_size):
+    @pytest.mark.parametrize(('tp'), [(1), (2), (4)])
+    def test_constructor_local(self, tp):
         """Test basic construction of MTP module."""
 
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
-        config = self._create_mtp_config(tp_size=tp_size)
-        mtp_block_spec = self._create_mtp_block_spec(config=config, tp_size=tp_size, use_te=False)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp=1)
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
@@ -90,25 +89,24 @@ class TestMultiTokenPredictionLayer:
             assert mtp.layers[i].layer_number == i + 1
             assert mtp.layers[i].enorm.weight.shape[0] == config.hidden_size
             assert mtp.layers[i].hnorm.weight.shape[0] == config.hidden_size
-            assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp_size
+            assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp
             assert mtp.layers[i].eh_proj.weight.shape[1] == config.hidden_size * 2
             assert mtp.layers[i].transformer_layer is not None
         num_weights = sum([p.numel() for p in mtp.parameters()])
-        if tp_size == 1:
+        if tp == 1:
             assert num_weights == 58560 * config.mtp_num_layers
-        elif tp_size == 2:
+        elif tp == 2:
             assert num_weights == 29664 * config.mtp_num_layers
-        elif tp_size == 4:
+        elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
 
     @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
-    @pytest.mark.parametrize(('tp_size'), [1, 2, 4])
-    def test_constructor_ues_te(self, tp_size):
+    @pytest.mark.parametrize(('tp', 'cp'), [(1, 1), (1, 2), (2, 1), (2, 2)])
+    def test_constructor_ues_te(self, tp, cp):
         """Test basic construction of MTP module."""
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
-        config = self._create_mtp_config(tp_size=tp_size)
-        mtp_block_spec = self._create_mtp_block_spec(config=config, tp_size=tp_size, use_te=True)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp, use_te=True)
         mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
@@ -117,15 +115,15 @@ class TestMultiTokenPredictionLayer:
             assert mtp.layers[i].layer_number == i + 1
             assert mtp.layers[i].enorm.weight.shape[0] == config.hidden_size
             assert mtp.layers[i].hnorm.weight.shape[0] == config.hidden_size
-            assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp_size
+            assert mtp.layers[i].eh_proj.weight.shape[0] == config.hidden_size / tp
             assert mtp.layers[i].eh_proj.weight.shape[1] == config.hidden_size * 2
             assert mtp.layers[i].transformer_layer is not None
         num_weights = sum([p.numel() for p in mtp.parameters()])
-        if tp_size == 1:
+        if tp == 1:
             assert num_weights == 58560 * config.mtp_num_layers
-        elif tp_size == 2:
+        elif tp == 2:
             assert num_weights == 29664 * config.mtp_num_layers
-        elif tp_size == 4:
+        elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
 
 
@@ -139,6 +137,7 @@ class TestMultiTokenPrediction:
         Utils.destroy_model_parallel()
         destroy_global_vars()
         destroy_num_microbatches_calculator()
+        MTPLossLoggingHelper.tracker = {}
 
     def model_provider(
         self,
@@ -173,7 +172,9 @@ class TestMultiTokenPrediction:
 
         return model
 
-    def create_test_args(self, tp, sequence_length, micro_batch_size, fp8=None):
+    def create_test_args(
+        self, tp, cp, sequence_length, micro_batch_size, fp8=None, full_recompute=False
+    ):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
@@ -191,7 +192,7 @@ class TestMultiTokenPrediction:
         args.seq_length = sequence_length
         args.tensor_model_parallel_size = tp
         args.sequence_parallel = True if tp > 1 else False
-        args.context_parallel_size = 1
+        args.context_parallel_size = cp
         args.position_embedding_type = 'rope'
         args.num_experts = 8
         args.train_iters = 1
@@ -205,14 +206,20 @@ class TestMultiTokenPrediction:
         args.no_save_optim = True
         args.no_load_optim = True
         args.no_load_rng = True
-        if TEColumnParallelGroupedLinear is not None:
-            # only use grouped gemm if there is TEColumnParallelGroupedLinear in TE
+        if HAVE_TE:
+            # only use grouped gemm if there is TE
             args.moe_grouped_gemm = True
         else:
             args.moe_grouped_gemm = False
         args.bf16 = True
         if fp8 is not None:
             args.fp8 = 'e4m3'
+        if full_recompute:
+            args.recompute_granularity = 'full'
+            args.recompute_method = 'uniform'
+            args.recompute_num_layers = 1
+        else:
+            args.recompute_granularity = None
         args.add_bias_linear = False
         args.swiglu = True
 
@@ -229,15 +236,26 @@ class TestMultiTokenPrediction:
             (micro_batch_size, 1, seq_length, seq_length), dtype=bool
         ).cuda()
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
-        return input_ids, labels, position_ids, attention_mask, loss_mask
+        batch = {
+            'tokens': input_ids,
+            'labels': labels,
+            'loss_mask': loss_mask,
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+        }
+        return batch
 
-    @pytest.mark.parametrize("tp_size", [1, 2, 4])
-    def test_sharded_state_dict(self, tp_size):
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    @pytest.mark.parametrize(("tp", "cp"), [(1, 1), (1, 2), (2, 1), (2, 2)])
+    def test_sharded_state_dict(self, tp, cp):
         """Test MTP with different tensor parallel sizes."""
-        args = self.create_test_args(tp_size, self.seq_length, self.micro_batch_size)
+        args = self.create_test_args(tp, cp, self.seq_length, self.micro_batch_size)
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         gpt_model = get_model(self.model_provider, ModelType.encoder_or_decoder)
         gpt_model = unwrap_model(gpt_model)
         sharded_state_dict = gpt_model[0].sharded_state_dict()
@@ -246,63 +264,136 @@ class TestMultiTokenPrediction:
             assert f"mtp.layers.{i}.hnorm.weight" in sharded_state_dict.keys()
             assert f"mtp.layers.{i}.eh_proj.weight" in sharded_state_dict.keys()
 
-    @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
-    @pytest.mark.parametrize("tp_size", [1, 2, 4])
-    def test_forward_backward(self, tp_size):
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    @pytest.mark.parametrize("full_recompute", [False, True])
+    @pytest.mark.parametrize(
+        ("tp", "cp"), [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4), (4, 1), (4, 2)]
+    )
+    def test_forward_backward(self, tmp_path_dist_ckpt, tp, cp, full_recompute):
         """Test MTP forward and backward with gptmodel."""
-        args = self.create_test_args(tp_size, self.seq_length, self.micro_batch_size)
+        tp_ref = 1
+        cp_ref = 1
+        args = self.create_test_args(tp_ref, cp_ref, self.seq_length, self.micro_batch_size)
         set_args(args)
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
-        input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
-            self.seq_length, self.micro_batch_size
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp_ref, context_parallel_size=cp_ref
         )
-        gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+        tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
+        gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             self.model_provider, ModelType.encoder_or_decoder
         )
-        gpt_model = unwrap_model(gpt_model)
-        output = gpt_model[0].forward(
-            input_ids=input_ids,
+        output_ref = gpt_model_ref[0].forward(
+            input_ids=tokens,
             position_ids=position_ids,
             attention_mask=attention_mask,
             labels=labels,
             loss_mask=loss_mask,
         )
+        tracker = MTPLossLoggingHelper.tracker
+        mtp_loss_ref = None
+        assert "values" in tracker
+        mtp_loss_ref = tracker['values'].clone()
+        MTPLossLoggingHelper.clean_loss_in_tracker()
 
-        # Check output shapes
-        assert output.shape[0] == self.micro_batch_size
-        assert output.shape[1] == self.seq_length
+        iteration = 123
+        num_floating_point_operations_so_far = 456
 
-        # Verify gradients
-        loss = output.mean()
-        loss.backward()
-        # for param in gpt_model[0].parameters():
-        for name, param in gpt_model[0].named_parameters():
-            assert param.main_grad is not None
+        def set_ckpt_path(ckpt_path):
+            args.save = ckpt_path
+            args.load = ckpt_path
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
+        ) as ckpt_dir_A:
+            set_ckpt_path(ckpt_dir_A)
+            save_checkpoint(
+                iteration,
+                gpt_model_ref,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+            )
+
+            expected_ckpt_path = args.save / "iter_0000123" / ".metadata"
+            assert os.path.exists(expected_ckpt_path)
+
+            # Test with different TP/CP configuration
+            Utils.destroy_model_parallel()
+            args = self.create_test_args(
+                tp, cp, self.seq_length, self.micro_batch_size, full_recompute=full_recompute
+            )
+            set_args(args)
+            set_ckpt_path(ckpt_dir_A)
+            torch.manual_seed(_SEED)
+            Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+            gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+                self.model_provider, ModelType.encoder_or_decoder
+            )
+            load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
+            batch["output_ref"] = output_ref
+            # Get batch for current CP rank (handles CP tensor splitting)
+            batch = get_batch_on_this_cp_rank(batch)
+            tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
+            output = gpt_model[0].forward(
+                input_ids=tokens,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+            tracker = MTPLossLoggingHelper.tracker
+            assert "values" in tracker
+            mtp_loss = tracker['values'].clone()
+            # Average MTP loss across CP ranks for comparison with reference
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups(required_pgs=['cp'])
+            torch.distributed.all_reduce(
+                mtp_loss, group=model_comm_pgs.cp, op=torch.distributed.ReduceOp.AVG
+            )
+            MTPLossLoggingHelper.clean_loss_in_tracker()
+            assert torch.allclose(output_ref, output, rtol=1e-03, atol=1e-03)
+            assert torch.allclose(mtp_loss, mtp_loss_ref, rtol=1e-02, atol=1e-02)
+
+            # Check output shapes - sequence length is divided by CP size
+            assert output.shape[0] == self.micro_batch_size
+            assert output.shape[1] == self.seq_length / cp
+
+            # Verify gradients
+            loss = output.mean()
+            loss.backward()
+            # for param in gpt_model[0].parameters():
+            for name, param in gpt_model[0].named_parameters():
+                assert param.main_grad is not None
 
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("1.7.0"),
         reason="Only transformer-engine>=1.7.0 supports MoE FP8 training",
     )
-    def test_fp8_support(self):
+    @pytest.mark.parametrize("full_recompute", [False, True])
+    def test_fp8_support(self, full_recompute):
         """Test MTP with FP8 training enabled."""
-        tp_size = 1
+        tp = 1
+        cp = 1
         fp8 = 'e4m3'
-        args = self.create_test_args(tp_size, self.seq_length, self.micro_batch_size, fp8)
+        args = self.create_test_args(
+            tp, cp, self.seq_length, self.micro_batch_size, fp8, full_recompute=full_recompute
+        )
         set_args(args)
 
         torch.manual_seed(_SEED)
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
-        input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
-            self.seq_length, self.micro_batch_size
-        )
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
+        batch = self.get_batch(self.seq_length, self.micro_batch_size)
+        tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             self.model_provider, ModelType.encoder_or_decoder
         )
-        gpt_model = unwrap_model(gpt_model)
 
         output = gpt_model[0].forward(
-            input_ids=input_ids,
+            input_ids=tokens,
             position_ids=position_ids,
             attention_mask=attention_mask,
             labels=labels,
@@ -310,6 +401,9 @@ class TestMultiTokenPrediction:
         )
 
         assert output.dtype == torch.float32  # Output should be converted back to float32
+
+        loss = output.mean()
+        loss.backward()
 
 
 class TestMTPLossLoggingHelper:
