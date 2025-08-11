@@ -28,7 +28,7 @@ async_calls = AsyncCallsQueue()
 
 def get_default_strategy(action: StrategyAction, backend: str, version: int):
     """Retrieves a default strategy for a given action, backend and version."""
-    error_hint: str = None
+    error_hint: str = ""
     try:
         if backend == 'zarr':
             error_hint = ' Please install `zarr` and `tensorstore!=0.1.46` packages'
@@ -114,18 +114,18 @@ class LoadCommonStrategy(LoadStrategyBase):
     """Load strategy for common (non-sharded) objects"""
 
     @abstractmethod
-    def load_common(self, checkpoint_dir: Path):
+    def load_common(self, checkpoint_dir: Union[str, Path]):
         """Load common part of the checkpoint."""
         raise NotImplementedError
 
     @abstractmethod
     def load_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]
     ):
         """Load sharded objects from the checkpoint."""
         raise NotImplementedError
 
-    def load_sharded_metadata(self, checkpoint_dir: Path) -> ShardedStateDict:
+    def load_sharded_metadata(self, checkpoint_dir: Union[str, Path]) -> ShardedStateDict:
         """Load just the metadata from the checkpoint."""
         if not self.can_handle_sharded_objects:
             return {}
@@ -136,12 +136,12 @@ class LoadShardedStrategy(LoadStrategyBase):
     """Load strategy for sharded tensors"""
 
     @abstractmethod
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Load the sharded part of the checkpoint."""
         raise NotImplementedError
 
     @abstractmethod
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Union[str, Path]):
         """Load tensors metadata from the checkpoint for ShardedTensors.
 
         Returns a dictionary similar to a sharded state dict, but note that
@@ -155,7 +155,7 @@ class LoadShardedStrategy(LoadStrategyBase):
             f'Loading only tensors metadata not implemented for {self.__class__.__name__}'
         )
 
-    def load_sharded_metadata(self, checkpoint_dir: Path):
+    def load_sharded_metadata(self, checkpoint_dir: Union[str, Path]):
         """Load sharded metadata from the checkpoint for ShardedTensors and ShardedObjects.
 
         Returns a dictionary similar to a sharded state dict, but note that
@@ -170,7 +170,7 @@ class LoadShardedStrategy(LoadStrategyBase):
             f'Loading only sharded metadata not implemented for {self.__class__.__name__}'
         )
 
-    def remove_sharded_tensors(self, checkpoint_dir: str, key_prefix: str):
+    def remove_sharded_tensors(self, checkpoint_dir: Union[str, Path], key_prefix: str):
         """Remove all tensors whose key starts with key_prefix"""
         raise NotImplementedError
 
@@ -179,12 +179,12 @@ class SaveCommonStrategy(SaveStrategyBase):
     """Save strategy for common (non-sharded) objects"""
 
     @abstractmethod
-    def save_common(self, common_state_dict: StateDict, checkpoint_dir: Path):
+    def save_common(self, common_state_dict: StateDict, checkpoint_dir: Union[str, Path]):
         """Save common part of the state dict."""
         raise NotImplementedError
 
     def save_sharded_objects(
-        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_objects_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]
     ):
         """Save sharded objects from the state dict."""
         raise NotImplementedError
@@ -194,7 +194,7 @@ class SaveShardedStrategy(SaveStrategyBase):
     """Save strategy for sharded tensors"""
 
     @abstractmethod
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Save the sharded part of the state dict."""
         raise NotImplementedError
 
@@ -204,7 +204,7 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
 
     @abstractmethod
     def async_save(
-        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]
     ) -> AsyncRequest:
         """Perform preparation and return an AsyncRequest to the external caller.
 
@@ -218,7 +218,7 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
         """
         raise NotImplementedError
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Each async strategy can be trivially used as a sync strategy."""
         async_request = self.async_save(sharded_state_dict, checkpoint_dir)
         # multiprocessing routines  may cause issue when called on parent process

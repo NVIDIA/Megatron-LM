@@ -83,6 +83,10 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from megatron.core.msc_utils import MultiStorageClientFeature
+
+MSC_PREFIX = "msc://"
+
 _metadata_fn: str = ".metadata"
 
 
@@ -370,7 +374,8 @@ def _unwrap_pyt_sharded_tensor(sh_ten: TorchShardedTensor) -> List[torch.Tensor]
             ten = ten.view(-1)
         else:
             for _ in range(mcore_sh_ten.prepend_axis_num):
-                ten = ten.squeeze(0)
+                assert ten.size(0) == 1
+                ten = ten[0]  # NOTE: ten.squeeze(0) uses more memory for FP8 tensors
         ret_tensors.append(ten)
     return ret_tensors
 
@@ -426,7 +431,7 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
 class MCoreSavePlan(SavePlan):
     """SavePlan with MCore specific data."""
 
-    mcore_data: Dict[str, Dict[str, Any]] = None  # Mcore related data about each tensor
+    mcore_data: Optional[Dict[str, Dict[str, Any]]] = None  # Mcore related data about each tensor
 
 
 class MCoreSavePlanner(DefaultSavePlanner):
@@ -494,7 +499,9 @@ class MCoreSavePlanner(DefaultSavePlanner):
     def create_global_plan(self, all_plans: List[MCoreSavePlan]) -> Tuple[List[SavePlan], Metadata]:
         """Merges MCore data for all plans."""
         global_plan, metadata = super().create_global_plan(all_plans)
-        metadata.mcore_data = dict(ChainMap(*(plan.mcore_data for plan in all_plans)))
+        metadata.mcore_data = dict(
+            ChainMap(*(plan.mcore_data for plan in all_plans))  # type: ignore[arg-type]
+        )
         return global_plan, metadata
 
     def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
@@ -530,7 +537,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         self,
         *args,
         shapes_validation_sharded_tensors: Iterable[ShardedTensor] = (),
-        allow_shape_mismatch_sharded_tensors: Dict[str, ShardedTensor] = None,
+        allow_shape_mismatch_sharded_tensors: Optional[Dict[str, ShardedTensor]] = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -653,7 +660,7 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         keep_only_main_replica: bool = True,
         thread_count: int = 2,
         cached_metadata: bool = False,
-        separation_hint: str = None,
+        separation_hint: Optional[str] = None,
     ):
         """Adds parameters specific to PyT Distributed format
         Args:
@@ -712,7 +719,10 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
         # Use PyT saving mechanism
         writer = FileSystemWriterAsync(
-            checkpoint_dir, separation_hint=self.separation_hint, thread_count=self.thread_count
+            checkpoint_dir,
+            separation_hint=self.separation_hint,
+            thread_count=self.thread_count,
+            use_msc=MultiStorageClientFeature.is_enabled(),
         )
         # This should be set differently if we run in a smaller process group than the default
         coordinator = 0
@@ -797,6 +807,19 @@ class TorchDistSaveShardedStrategy(AsyncSaveShardedStrategy):
         return True
 
 
+def _get_filesystem_reader(
+    checkpoint_dir: Union[str, Path], cache_metadata: bool = False
+) -> FileSystemReader:
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
+
+    if cache_metadata:
+        return CachedMetadataFileSystemReader(checkpoint_dir)
+
+    return FileSystemReader(checkpoint_dir)
+
+
 def get_reformulation_metadata(
     sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
 ) -> Dict[str, TensorReformulationMetadata]:
@@ -811,7 +834,8 @@ def get_reformulation_metadata(
             N-D flattened tensor from the sharded_state_dict to its original global shape
             as stored in `mcore_data` in the checkpoint.
     """
-    ckpt_metadata = FileSystemReader(checkpoint_dir).read_metadata()
+    fs_reader = _get_filesystem_reader(checkpoint_dir)
+    ckpt_metadata = fs_reader.read_metadata()
     reformulation_metadata = {}
     for sh_ten in nested_values(sharded_state_dict):
         if not is_nd_flattened_tensor(sh_ten):
@@ -888,7 +912,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             sharded_state_dict, True, load_legacy_1d_flatten_tensors=has_legacy_1d_flattened_tensors
         )
         # Load PyT Distributed format
-        fsr = CachedMetadataFileSystemReader(checkpoint_dir)
+        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=True)
         checkpoint.load_state_dict(
             pyt_state_dict,
             fsr,
@@ -911,7 +935,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             for k, v in pyt_state_dict.items()
         }
         mcore_state_dict = _replace_sharded_keys_with_state_dict_keys(
-            mcore_state_dict, flat_mapping, rename_mapping
+            mcore_state_dict, flat_mapping, rename_mapping  # type: ignore[arg-type]
         )
         _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
         # Apply N-D tensors resharding postprocessing
@@ -923,7 +947,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
     def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):
         """Uses tensors metadata stored in the metadata file."""
         if metadata is None:
-            fs_reader = FileSystemReader(checkpoint_dir)
+            fs_reader = _get_filesystem_reader(checkpoint_dir)
             metadata = fs_reader.read_metadata()
 
         mcore_data = getattr(metadata, 'mcore_data', {})
@@ -955,7 +979,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
 
     def load_sharded_metadata(self, checkpoint_dir: Path) -> ShardedStateDict:
         """Uses tensors and objects metadata stored in the metadata file."""
-        fs_reader = FileSystemReader(checkpoint_dir)
+        fs_reader = _get_filesystem_reader(checkpoint_dir)
         metadata = fs_reader.read_metadata()
 
         sharded_metadata = {}
@@ -1003,14 +1027,18 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             if k.startswith(key_prefix):
                 continue
             new_state_dict_metadata[k] = original_metadata.state_dict_metadata[k]
-        for k in original_metadata.planner_data.keys():
-            if k.startswith(key_prefix):
-                continue
-            new_planner_data[k] = original_metadata.planner_data[k]
-        for k in original_metadata.storage_data.keys():
-            if k.fqn.startswith(key_prefix):
-                continue
-            new_storage_data[k] = original_metadata.storage_data[k]
+        original_planner_data = original_metadata.planner_data
+        if original_planner_data is not None:
+            for k in original_planner_data.keys():
+                if k.startswith(key_prefix):
+                    continue
+                new_planner_data[k] = original_metadata.planner_data[k]
+        original_storage_data = original_metadata.storage_data
+        if original_storage_data is not None:
+            for k in original_storage_data.keys():
+                if k.fqn.startswith(key_prefix):
+                    continue
+                new_storage_data[k] = original_metadata.storage_data[k]
         metadata = Metadata(
             state_dict_metadata=new_state_dict_metadata,
             planner_data=new_planner_data,
@@ -1019,10 +1047,12 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
         fs_writer = FileSystemWriter(checkpoint_dir)
         metadata_filename = cast(Path, fs_writer.fs.concat_path(fs_writer.path, _metadata_fn))
         tmp_path = cast(
-            metadata_filename, fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.tmp")
+            metadata_filename,  # type: ignore[valid-type]
+            fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.tmp"),
         )
         old_path = cast(
-            metadata_filename, fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.bck")
+            metadata_filename,  # type: ignore[valid-type]
+            fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.bck"),
         )
         ## save the new metadata
         with fs_writer.fs.create_stream(tmp_path, "wb") as metadata_file:
