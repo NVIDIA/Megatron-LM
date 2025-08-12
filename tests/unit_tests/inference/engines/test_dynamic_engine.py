@@ -497,9 +497,11 @@ class TestDynamicInferenceEngine:
                 # Initialize attention state.
                 if num_warmup_requests == 1 and enforce_non_decode_mode:
                     continue
-                
-                context.initialize_attention_state(num_warmup_requests=num_warmup_requests, 
-                                                   enforce_non_decode_mode=enforce_non_decode_mode)
+
+                context.initialize_attention_state(
+                    num_warmup_requests=num_warmup_requests,
+                    enforce_non_decode_mode=enforce_non_decode_mode,
+                )
 
                 # Validate request & token counts.
                 if enforce_non_decode_mode:
