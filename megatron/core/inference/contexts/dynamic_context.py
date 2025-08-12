@@ -280,7 +280,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             # Make sure divisble by TP size
             self.cuda_graph_step_size = math.ceil(self.cuda_graph_step_size / tp_size) * tp_size
-            # Cuda graph request counts.
+
+            # Cuda graph token counts.
             if num_cuda_graphs == 1:
                 self.cuda_graph_token_counts = [self.max_requests]
             else:
@@ -784,7 +785,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 ]
 
         self.using_cuda_graph_this_step = using_cuda_graphs_this_step
-
 
     def reset(self) -> None:
         """Reset entire context.
