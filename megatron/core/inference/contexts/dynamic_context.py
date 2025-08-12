@@ -332,8 +332,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # it can happen that non-decode steps have a token count greater than the max
         # supported cuda graph batch size. In that case this flag will be set to
-        # False by initialize_attention. The model implementation needs to query this
-        # flag and decide whether to call or not call the cudagraph-manager.
+        # False by initialize_attention. During a non-decode forward pass, if we find that 
+        # this flag is False, we will not use cuda graphs for that step.
         self.using_cuda_graph_this_step = True
 
         # Guaranteed active requests.
