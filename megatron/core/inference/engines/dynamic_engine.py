@@ -377,7 +377,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def suspend(self):
-        
+        pax({
+            "requests" : self.requests,
+            "requests / 0" : list(self.requests.values())[0],
+        })
+        raise Exception("remove context.")
+
+    def resume(self):
+        raise Exception("restore context.")
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def _notify_cond_for_new_request(self):
