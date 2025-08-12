@@ -170,6 +170,8 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
+sleep 5
+set -x
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?
@@ -181,7 +183,10 @@ fi
 AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | yq '.AFTER_SCRIPT')
 if [[ "$AFTER_SCRIPT" != null ]]; then
     eval "$AFTER_SCRIPT"
-fi
+fi 
+
+# Set permissions
+chmod -R g+w $OUTPUT_PATH
 
 if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
     echo "Suppressing errors during checkpoint recording."

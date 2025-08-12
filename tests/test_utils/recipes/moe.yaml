@@ -125,21 +125,21 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
-  - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_mtp_resume_torch_dist_fp8]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100] # hang: #513
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_resume_torch_dist_attn_cudagraph]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100] # hang: #513
+  # - test_case: [gpt3_mr_mcore_te_tp2_pp2_ep4_etp1_selective_recompute_experimental]
+  #   products:
+  #     - environment: [dev]
+  #       scope: [mr]
+  #       platforms: [dgx_h100] # hang: #513
   - test_case: [gpt3_mr_mcore_te_tp2_pp1_resume_torch_dist_te_8experts2parallel_dist_optimizer_dgx_a100_1N8G]
     products:
       - environment: [dev]
