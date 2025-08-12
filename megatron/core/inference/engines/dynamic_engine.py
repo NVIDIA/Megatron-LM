@@ -355,6 +355,11 @@ class DynamicInferenceEngine(AbstractEngine):
             self.run_engine_with_coordinator(sampling_params)
         )
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    def suspend(self):
+        
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
         async with self._cond:
