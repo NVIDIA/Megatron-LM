@@ -196,8 +196,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             tp_size = parallel_state.get_tensor_model_parallel_world_size()
         else:
             tp_size = tensor_model_parallel_size
-        hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
-        num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
+        self.hidden_size_per_attention_head = core_divide(projection_size, num_attention_heads)
+        self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.chunk_size_tokens = chunk_size_tokens
@@ -219,9 +219,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
         # Adjust buffer to be a multiple of chunk size.
-        buffer_size_bytes = int(buffer_size_gb * 1024**3)
-        buffer_size_bytes_rem = buffer_size_bytes % self.chunk_size_bytes
-        buffer_size_bytes = buffer_size_bytes - buffer_size_bytes_rem
+        self.buffer_size_bytes = int(buffer_size_gb * 1024**3)
+        self.buffer_size_bytes_rem = self.buffer_size_bytes % self.chunk_size_bytes
+        self.buffer_size_bytes = self.buffer_size_bytes - self.buffer_size_bytes_rem
+
+        # Calculate the total number of chunks available in the buffer
+        self.chunk_count_total = self.buffer_size_bytes // self.chunk_size_bytes
+
+        # Max number of chunks per request.
+        self.max_kv_chunk_count = math.ceil(max_sequence_length / self.chunk_size_tokens)
 
         # Compute max_requets, max_tokens from buffer size and overflow factor.
         def bytes_to_max_requests_and_tokens(n_bytes):
@@ -231,7 +237,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 int(n_tokens), tp_size=tp_size
             )
 
-        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(buffer_size_bytes)
+        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(self.buffer_size_bytes)
         if buffer_overflow_factor is not None:
             self.max_requests = self.round_up_requests(
                 int(self.max_requests * buffer_overflow_factor), tp_size=tp_size
@@ -401,34 +407,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-        # Guaranteed active requests.
-        # * See details in the class docstring above. `gtd_request_fraction` is
-        #   the fraction of chunks in the memory buffer that are reserved for
-        #   guaranteeing that some number of active requests can always proceed
-        #   with their generations. The number of chunks defined by
-        #   `buffer_guaranteed_fraction * chunk_count_total` is converted to a
-        #   number of requests that this reserved space can safely handle
-        #   (`gtd_request_count`).
-        # * Note: computing the size of this guaranteed space from chunks rather
-        #   than bytes is safer due to the non-linear impacts of a large
-        #   `chunk_size_tokens` or `max_kv_chunk_count`. When computing from
-        #   chunks, this space will always be less than `chunk_count_total`. When
-        #   computing from bytes, this space can unexpectedly be much larger than
-        #   `chunk_count_total`, resulting in stalled generations.
-        gtd_chunk_count = int(buffer_guaranteed_fraction * chunk_count_total)
-        gtd_chunk_count = min(gtd_chunk_count, chunk_count_total)
-        self.gtd_request_count = max(1, gtd_chunk_count // self.max_kv_chunk_count)
-        self.gtd_chunk_count = self.gtd_request_count * self.max_kv_chunk_count
-
-        # Initialize chunk allocator
-        self.chunk_allocator = ChunkAllocator(
-            chunk_count_total=chunk_count_total, gtd_chunk_count=self.gtd_chunk_count
-        )
-
-        # Store the dummy chunk idx reference for convenience
-        self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
         # Reset attention state.
+        # TODO(@lmcafee): move to __init__()?
         self.reset_attention_state()
+
+    def deallocate_all_tensors(self):
+        """? ? ?"""
+
+        raise Exception("what to do?")
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
