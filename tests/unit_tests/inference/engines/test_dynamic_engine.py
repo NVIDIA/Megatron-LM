@@ -504,22 +504,20 @@ class TestDynamicInferenceEngine:
                 )
 
                 # Validate request & token counts.
-                if enforce_non_decode_mode:
-                    assert expected_cuda_graph_token_count == context.padded_active_token_count
-                else:
-                    assert (
-                        expected_cuda_graph_token_count
-                        == context.padded_active_request_count
-                        == context.padded_active_token_count
-                    ), (
-                        "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
-                        % (
-                            num_warmup_requests,
-                            expected_cuda_graph_token_count,
-                            context.padded_active_request_count,
-                            context.padded_active_token_count,
-                        )
+                
+                assert (
+                    expected_cuda_graph_token_count
+                    == context.padded_active_request_count
+                    == context.padded_active_token_count
+                ), (
+                    "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
+                    % (
+                        num_warmup_requests,
+                        expected_cuda_graph_token_count,
+                        context.padded_active_request_count,
+                        context.padded_active_token_count,
                     )
+                )
 
                 # Validate input/position dimensions.
                 input_ids, pos_ids = context.current_input_and_position_ids()
