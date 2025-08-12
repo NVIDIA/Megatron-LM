@@ -125,6 +125,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             where the cuda graph batch sizes range from 1 to `max_requests` (as
             computed below). Due to rounding, the actual number of cuda graphs may
             not equal this argument.
+        materialize_only_last_token_logits (bool): If True, only the last token logits
+            are materialized in the context.
+        use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode 
+        engine steps.  
     """
 
     def __init__(
