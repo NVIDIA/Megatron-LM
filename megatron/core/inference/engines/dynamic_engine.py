@@ -377,15 +377,53 @@ class DynamicInferenceEngine(AbstractEngine):
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def suspend(self):
-        # pax({
-        #     "requests" : self.requests,
-        #     "requests / 0" : list(self.requests.values())[0],
-        # })
-        # raise Exception("remove context.")
+        """? ? ?"""
         self.context.deallocate_all_tensors()
 
     def resume(self):
-        raise Exception("restore context.")
+        """? ? ?"""
+
+        # Allocate context tensors.
+        self.context.allocate_all_tensors()
+
+        # Reset context state (i.e., paused_request_count, total_request_count, etc.).
+        self.context.reset()
+
+        # Add requests.
+        for request_id, request in self.requests.items():
+
+            # Concatenate prompt + generated tokens.
+            tokens = torch.cat(
+                (
+                    request.prompt_tokens,
+                    torch.tensor(
+                        request.generated_tokens,
+                        dtype=request.prompt_tokens.dtype,
+                        device=request.prompt_tokens.device,
+                    ),
+                ),
+                dim=0,
+            )
+
+            # Add request.
+            self.context.add_request(
+                request_id,
+                tokens,
+                request.sampling_params.num_tokens_to_generate
+                - len(request.generated_tokens),
+            )
+
+            # >>>
+            # pax("request_id, request, tokens")
+            # <<<
+
+        # >>>
+        pax({
+            "requests" : self.requests,
+            "requests / 0" : list(self.requests.values())[0],
+        })
+        raise Exception("resume engine, yay.")
+        # <<<
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def _notify_cond_for_new_request(self):
