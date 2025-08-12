@@ -964,7 +964,7 @@ class CudaGraphManager(torch.nn.Module):
         self,
         config: TransformerConfig,
         share_cudagraph_io_buffers: bool = True,
-        extra_runner_kwargs: dict = {}
+        extra_runner_kwargs: dict = {},
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.

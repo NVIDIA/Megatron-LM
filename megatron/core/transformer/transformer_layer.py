@@ -285,8 +285,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         self.config.flash_decode
                     ), "--flash-decode is required to use CUDA graphs during inference"
                 self.cudagraph_manager = CudaGraphManager(config)
-                self.cudagraph_manager_for_non_decode = CudaGraphManager(config, 
-                                                                         extra_runner_kwargs={"is_non_decode_runner": True})
+                self.cudagraph_manager_for_non_decode = CudaGraphManager(
+                    config, extra_runner_kwargs={"is_non_decode_runner": True}
+                )
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
                 # the number of microbatches. Multiple CUDA graphs per layer is required to support
