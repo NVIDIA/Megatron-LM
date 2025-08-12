@@ -357,11 +357,12 @@ class DynamicInferenceEngine(AbstractEngine):
 
     # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def suspend(self):
-        pax({
-            "requests" : self.requests,
-            "requests / 0" : list(self.requests.values())[0],
-        })
-        raise Exception("remove context.")
+        # pax({
+        #     "requests" : self.requests,
+        #     "requests / 0" : list(self.requests.values())[0],
+        # })
+        # raise Exception("remove context.")
+        self.context.deallocate_all_tensors()
 
     def resume(self):
         raise Exception("restore context.")
