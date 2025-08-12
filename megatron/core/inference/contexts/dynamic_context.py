@@ -705,9 +705,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
                 # max_seqlen_q is a CPU argument to the FA kernel.
                 # It is used to decide the number of kernel blocks to launch.
-                # With cuda graphs, it will be frozen to whatever value we pass during the capture step.
-                # Hence it is important to always use it's maximum value during capture.
-                # The worst thing that will happen is that the kernel will launch a few empty blocks.
+                # With cuda graphs, it will be frozen to whatever value we pass during capture.
+                # Hence it is important to always use it's maximum possible value during capture.
+                # During actual inference, the worst thing that will happen is that the kernel will launch a few empty blocks.
                 self.max_seqlen_q = self.padded_active_token_count
 
             else:
@@ -752,9 +752,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 ]
                 # max_seqlen_k is a CPU argument to the FA kernel.
                 # It is used to decide the number of kernel blocks to launch.
-                # With cuda graphs, it will be frozen to whatever value we pass during the capture step.
-                # Hence it is important to always use it's maximum value during capture.
-                # The worst thing that will happen during replays is that the kernel will launch a few empty blocks.
+                # With cuda graphs, it will be frozen to whatever value we pass during capture.
+                # Hence it is important to always use it's maximum possible value during capture.
+                # During actual inference, the worst thing that will happen is that the kernel will launch a few empty blocks.
                 self.max_seqlen_k = self.padded_active_token_count
             else:
                 self.cu_kv_seq_lengths = torch.full(
