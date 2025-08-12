@@ -127,8 +127,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             not equal this argument.
         materialize_only_last_token_logits (bool): If True, only the last token logits
             are materialized in the context.
-        use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode 
-        engine steps.  
+        use_cuda_graphs_for_non_decode_steps (bool): If True, use cuda graphs for non-decode
+        engine steps.
     """
 
     def __init__(
@@ -336,7 +336,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # it can happen that non-decode steps have a token count greater than the max
         # supported cuda graph batch size. In that case this flag will be set to
-        # False by initialize_attention. During a non-decode forward pass, if we find that 
+        # False by initialize_attention. During a non-decode forward pass, if we find that
         # this flag is False, we will not use cuda graphs for that step.
         self.using_cuda_graph_this_step = True
 
