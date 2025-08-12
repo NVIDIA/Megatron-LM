@@ -325,7 +325,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-        # when this flag is set to true, self.decode_only() will always return True
+        # when this flag is set to true, self.decode_only() will always return False
         # this flag is toggled during cuda-graph capture of non-decode steps
         # to ensure that we are recording the correct attention kernel.
         self.enforce_non_decode_mode = False
