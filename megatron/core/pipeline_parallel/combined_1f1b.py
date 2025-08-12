@@ -146,7 +146,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
 ):
     """Helper method to run combined forward and backward step for A2A communication hiding.
     This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
-    eventually calls `combined_forward_backward_step` function defined in `combined_1f1b.py`.
+    eventually calls `combined_forward_backward_step` method defined in `combined_1f1b.py`.
     This method is called only if `overlap_moe_expert_parallel_comm` is true.
 
     Args:
