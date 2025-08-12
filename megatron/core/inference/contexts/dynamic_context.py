@@ -419,7 +419,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """? ? ?"""
 
         # >>>
-        mem0 = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # mem0 = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # <<<
 
         keys = list(vars(self).keys())
@@ -429,15 +429,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                 delattr(self, key)
 
         # >>>
-        mem1 = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        pax({
-            "mem0" : mem0 / 1024**3,
-            "mem1" : mem1 / 1024**3,
-            "diff" : (mem1 - mem0) / 1024**3,
-        })
+        # mem1 = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # pax({
+        #     "mem0" : mem0 / 1024**3,
+        #     "mem1" : mem1 / 1024**3,
+        #     "diff" : (mem1 - mem0) / 1024**3,
+        # })
         # <<<
-
-        raise Exception("what to do?")
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
