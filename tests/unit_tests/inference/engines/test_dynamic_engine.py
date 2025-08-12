@@ -437,11 +437,11 @@ class TestDynamicInferenceEngine:
         """Test generating a fixed number of output tokens."""
         self._run_test(use_fixed_output_lengths=True)
 
-    def test_cuda_graph_request_counts(self) -> None:
-        """Test initialization of `cuda_graph_request_counts` in dynamic context."""
+    def test_cuda_graph_token_counts(self) -> None:
+        """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
         # Test num_cuda_graphs.
-        for num_cuda_graphs, expected_cuda_graph_request_counts in [
+        for num_cuda_graphs, expected_cuda_graph_token_counts in [
             (0, [64]),
             (1, [64]),
             (2, [64, 32]),
@@ -454,13 +454,13 @@ class TestDynamicInferenceEngine:
             env = self._build_test_env(
                 DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
             )
-            actual_cuda_graph_request_counts = env.engine.context.cuda_graph_request_counts
+            actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
             assert (
-                actual_cuda_graph_request_counts == expected_cuda_graph_request_counts
-            ), "num_cuda_graphs %d ... cuda_graph_request_counts: expected %s, found %s." % (
+                actual_cuda_graph_token_counts == expected_cuda_graph_token_counts
+            ), "num_cuda_graphs %d ... cuda_graph_token_counts: expected %s, found %s." % (
                 num_cuda_graphs,
-                expected_cuda_graph_request_counts,
-                actual_cuda_graph_request_counts,
+                expected_cuda_graph_token_counts,
+                actual_cuda_graph_token_counts,
             )
 
     def test_cuda_graph_warmup(self) -> None:
@@ -471,12 +471,12 @@ class TestDynamicInferenceEngine:
 
         context = env.engine.context
         assert context.is_decode_only()
-        assert context.cuda_graph_request_counts == [
+        assert context.cuda_graph_token_counts == [
             32,
             24,
             16,
             8,
-        ], "cuda_graph_request_counts: %s." % str(context.cuda_graph_request_counts)
+        ], "cuda_graph_token_counts: %s." % str(context.cuda_graph_request_counts)
 
         # Iterate request counts.
         for num_warmup_requests, expected_cuda_graph_request_count in [
@@ -514,6 +514,8 @@ class TestDynamicInferenceEngine:
             # Validate input/position dimensions.
             input_ids, pos_ids = context.current_input_and_position_ids()
             assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_request_count
+
+            context.reset()
 
         # Test active request count overflow.
         for num_warmup_requests in (64, 128, 1024):

@@ -631,7 +631,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         padded_active_token_count = None
 
         using_cuda_graphs_this_step = (
-            self.cuda_graph_token_counts
+            self.cuda_graph_token_counts is not None
             and (self.is_decode_only() or self.non_decode_cuda_graphs)
             and (active_token_count <= self.cuda_graph_token_counts[0])
         )
@@ -644,9 +644,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             padded_active_token_count = min(padded_active_token_count, self.max_requests)
             assert padded_active_token_count in self.cuda_graph_token_counts_set
             assert padded_active_token_count >= active_token_count
-
-        elif self.is_decode_only():
-            padded_active_token_count = self.max_requests
         else:
             padded_active_token_count = self.round_up_tokens(self.active_token_count)
 
@@ -656,7 +653,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # if are in capture mode
         self.padded_active_request_count = (
             padded_active_token_count
-            if num_warmup_requests is not None
+            if self.is_decode_only()
             else (self.total_request_count - self.paused_request_count)
         )
 
@@ -787,6 +784,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 ]
 
         self.using_cuda_graph_this_step = using_cuda_graphs_this_step
+
 
     def reset(self) -> None:
         """Reset entire context.
