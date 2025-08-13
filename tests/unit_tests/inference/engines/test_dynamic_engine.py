@@ -503,7 +503,7 @@ class TestDynamicInferenceEngine:
             (24, 24),
             (28, 32),
             (32, 32),
-        ]:            
+        ]:
             # Initialize attention state.
             if num_warmup_requests == 1 and enforce_non_decode_mode:
                 continue

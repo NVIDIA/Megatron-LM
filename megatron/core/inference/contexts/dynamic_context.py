@@ -653,7 +653,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.padded_active_token_count = self.round_up_tokens(self.active_token_count)
 
-       
         # How are we calculating the padded active request count?
         # Case 1: Using cuda graphs:
         #         It is always the same as padded_active_token_count, whether its decode or non-decode.
@@ -792,7 +791,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.block_table = self.request_to_kv_chunk_ids[
                     self.paused_request_count : self.total_request_count
                 ]
-
 
     def reset(self) -> None:
         """Reset entire context.
