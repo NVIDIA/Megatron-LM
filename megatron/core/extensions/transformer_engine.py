@@ -1243,7 +1243,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         (ep_axis, global_expert_idx, num_global_experts),
                     )
                 sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict, '', tp_axis_map, new_sharded_offsets,
+                    state_dict,
+                    '',
+                    tp_axis_map,
+                    new_sharded_offsets,
                     tp_group=self.tp_group_for_sharded_sd,
                     dp_cp_group=metadata['dp_cp_group'],
                 )
