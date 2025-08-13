@@ -47,11 +47,10 @@ def test_device_rng_states_tracker():
         assert torch.equal(rng_tracker.get_states()['state2'], rng_state)
     else:
         assert int(rng_tracker.get_states()['state2']) == rng_state
-    Utils.destroy_model_parallel()
 
 def test_model_parallel_device_manual_seed():
     Utils.initialize_model_parallel(4,2)
-    model_parallel_device_manual_seed(0)
+    model_parallel_device_manual_seed(0, force_reset_rng=True)
     rng_tracker = get_device_rng_tracker()
     assert(rng_tracker.get_states()['model-parallel-rng'] is not None)
     Utils.destroy_model_parallel()

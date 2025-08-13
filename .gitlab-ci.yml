@@ -238,6 +238,7 @@ variables:
       - "code-freeze"
       - "release"
       - "review-reminder"
+      - "upgrade-dependencies"
     description: Type of publish (freeze or final release)
 
   # CI wide variables

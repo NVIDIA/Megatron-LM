@@ -3,11 +3,11 @@
 from typing import List, Optional, Tuple, Union
 
 from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.wrapped_process_group import WrappedProcessGroup
 import torch
 
 from megatron.core import ModelParallelConfig
 from megatron.core.parallel_state import (
-    get_default_process_group,
     get_pipeline_model_parallel_group,
     get_pipeline_model_parallel_next_rank,
     get_pipeline_model_parallel_prev_rank,
@@ -20,6 +20,43 @@ from megatron.core.utils import nvtx_decorator
 Shape = Union[List[int], torch.Size]
 
 xm = get_xla_model()
+
+def get_source_dest_pairs(pipeline_ranks):
+    """
+    Given pipeline parallel ranks as a list of lists, returns source-destination pairs
+    where source < destination.
+    
+    Args:
+        pipeline_ranks: List of lists, where each inner list contains ranks for one pipeline stage
+        
+    Returns:
+        List of [source, destination] pairs
+        
+    Example:
+        Input: [[0, 2, 4, 6], [1, 3, 5, 7]]
+        Output: [[0, 1], [2, 3], [4, 5], [6, 7]]
+    """
+    if len(pipeline_ranks) < 2:
+        return []
+    
+    pairs = []
+    
+    # Get the number of data parallel groups (length of each pipeline stage)
+    num_dp_groups = len(pipeline_ranks[0])
+    
+    # For each data parallel group, create pairs between consecutive pipeline stages
+    for dp_idx in range(num_dp_groups):
+        for stage_idx in range(len(pipeline_ranks) - 1):
+            source = pipeline_ranks[stage_idx][dp_idx]
+            destination = pipeline_ranks[stage_idx + 1][dp_idx]
+            
+            # Ensure source < destination
+            if source < destination:
+                pairs.append([source, destination])
+            else:
+                pairs.append([destination, source])
+    
+    return pairs
 
 def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next, config):
     """Communicate tensor shapes between stages. Used to communicate
@@ -62,9 +99,22 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
         )
 
     if xm:
+        pp_group = get_pipeline_model_parallel_group()
+        wpg = WrappedProcessGroup(pp_group)
+
         xm.mark_step()
 
-    if config.use_ring_exchange_p2p:
+        if send_prev_shape_tensor is not None or recv_prev_shape_tensor is not None:
+            tensor = send_prev_shape_tensor if send_prev_shape_tensor is not None else recv_prev_shape_tensor
+            recv_prev_shape_tensor = xm.collective_permute(tensor, get_source_dest_pairs(wpg.rank_groups))
+
+        if send_next_shape_tensor is not None or recv_next_shape_tensor is not None:
+            tensor = send_next_shape_tensor if send_next_shape_tensor is not None else recv_next_shape_tensor
+            recv_next_shape_tensor = xm.collective_permute(tensor, get_source_dest_pairs(wpg.rank_groups))
+
+        xm.mark_step()
+
+    elif config.use_ring_exchange_p2p:
         torch.distributed.ring_exchange(
             tensor_send_prev=send_prev_shape_tensor,
             tensor_recv_prev=recv_prev_shape_tensor,
@@ -75,46 +125,31 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
     else:
         ops = []
         if send_prev_shape_tensor is not None:
-            if xm:
-                send_prev_shape_tensor = send_prev_shape_tensor.cpu()
-
             send_prev_op = torch.distributed.P2POp(
                 torch.distributed.isend,
                 send_prev_shape_tensor,
                 get_pipeline_model_parallel_prev_rank(),
-                group=get_default_process_group()
             )
             ops.append(send_prev_op)
         if recv_prev_shape_tensor is not None:
-            if xm:
-                recv_prev_shape_tensor_orig = recv_prev_shape_tensor
-                recv_prev_shape_tensor = recv_prev_shape_tensor.cpu()
             recv_prev_op = torch.distributed.P2POp(
                 torch.distributed.irecv,
                 recv_prev_shape_tensor,
                 get_pipeline_model_parallel_prev_rank(),
-                group=get_default_process_group()
             )
             ops.append(recv_prev_op)
         if send_next_shape_tensor is not None:
-            if xm:
-                send_next_shape_tensor = send_next_shape_tensor.cpu()
             send_next_op = torch.distributed.P2POp(
                 torch.distributed.isend,
                 send_next_shape_tensor,
                 get_pipeline_model_parallel_next_rank(),
-                group=get_default_process_group()
             )
             ops.append(send_next_op)
         if recv_next_shape_tensor is not None:
-            if xm:
-                recv_next_shape_tensor_orig = recv_next_shape_tensor
-                recv_next_shape_tensor = recv_next_shape_tensor.cpu()
             recv_next_op = torch.distributed.P2POp(
                 torch.distributed.irecv,
                 recv_next_shape_tensor,
                 get_pipeline_model_parallel_next_rank(),
-                group=get_default_process_group()
             )
             ops.append(recv_next_op)
         if len(ops) > 0:
@@ -122,22 +157,9 @@ def _communicate_shapes(tensor_send_next, tensor_send_prev, recv_prev, recv_next
             for req in reqs:
                 req.wait()
 
-            if xm:
-                device = get_current_device()
-                if recv_prev_shape_tensor:
-                    recv_prev_shape_tensor_orig.data = recv_prev_shape_tensor.to(device=device)
-                    recv_prev_shape_tensor = recv_prev_shape_tensor_orig
-                if recv_next_shape_tensor:
-                    recv_next_shape_tensor_orig.data = recv_next_shape_tensor.to(device=device)
-                    recv_next_shape_tensor = recv_next_shape_tensor_orig
-                xm.mark_step()
-                    
         # To protect against race condition when using batch_isend_irecv().
         # should take this out once the bug with batch_isend_irecv is resolved.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        elif xm:
-            xm.mark_step()
+        torch.cuda.synchronize()
 
     recv_prev_shape = [0, 0, 0]
     if recv_prev_shape_tensor is not None:
@@ -160,6 +182,8 @@ def _batched_p2p_ops(
     prev_pipeline_rank: int,
     next_pipeline_rank: int,
 ):
+    assert xm is None, "_batched_p2p_ops not supported for XLA"
+    
     ops = []
     if tensor_send_prev is not None:
         send_prev_op = torch.distributed.P2POp(
@@ -203,6 +227,7 @@ def _p2p_ops(
     if (
         get_pipeline_model_parallel_world_size() == 2
         and torch.distributed.get_backend(group) != 'ucc'
+        and xm is None
     ):
         # Use the global process group for one of the two p2p communications
         # to allow the overlap of the independent communications.
@@ -215,6 +240,23 @@ def _p2p_ops(
     else:
         even_recv_odd_send_group = group
 
+    if xm:
+        wpg = WrappedProcessGroup(group)
+
+        xm.mark_step()
+
+        if tensor_send_next is not None or tensor_recv_next is not None:
+            tensor = tensor_send_next if tensor_send_next is not None else tensor_recv_next
+            tensor_recv_next = xm.collective_permute(tensor, get_source_dest_pairs(wpg.rank_groups))
+
+        if tensor_send_prev is not None or tensor_recv_prev is not None:
+            tensor = tensor_send_prev if tensor_send_prev is not None else tensor_recv_prev
+            tensor_recv_prev = xm.collective_permute(tensor, get_source_dest_pairs(wpg.rank_groups))
+
+        xm.mark_step()
+
+        return reqs
+    
     if get_pipeline_model_parallel_rank() % 2 == 0:
         if tensor_send_next is not None:
             send_next_req = torch.distributed.isend(
@@ -310,6 +352,8 @@ def _communicate(
 
     """
 
+    # Create placeholder tensors for receive in forward and backward directions
+    # if needed.
     tensor_recv_prev_func = None
     tensor_recv_next_func = None
 
@@ -358,132 +402,62 @@ def _communicate(
         tensor_recv_next_func = create_tensor_recv_next
 
     # Send tensors in both the forward and backward directions as appropriate.
-    if config.use_ring_exchange_p2p:
-
+    if config.use_ring_exchange_p2p and xm is None:
         def _ring_exchange_wrapper(**kwargs):
             torch.distributed.ring_exchange(**kwargs)
             return []
 
         p2p_func = _ring_exchange_wrapper
-    elif config.batch_p2p_comm:
+    elif config.batch_p2p_comm and xm is None:
         assert wait_on_reqs
         p2p_func = _batched_p2p_ops
     else:
         p2p_func = _p2p_ops
 
-    # Each rank can now be part of several different pipeline parallel groups
-    # (specifically, this can occur when encoder tensor parallelism != decoder
-    # tensor parallelism, and hence a rank in the encoder is going to feed
-    # several different decoder ranks. We therefore have to receive or send tensors
-    # from several groups. For convenience, I wrap everything into lists.
     pp_group = get_pipeline_model_parallel_group()
     next_rank = get_pipeline_model_parallel_next_rank()
     prev_rank = get_pipeline_model_parallel_prev_rank()
-    if not isinstance(pp_group, list):
-        pp_group = [pp_group]
-        assert not isinstance(next_rank, list)
-        next_rank = [next_rank]
-        assert not isinstance(prev_rank, list)
-        prev_rank = [prev_rank]
 
-    if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+    if (config.use_ring_exchange_p2p or config.batch_p2p_comm) and xm is None:
         reqs = []
     else:
         reqs = {}
-    tensor_recv_prev_list = []
-    tensor_recv_next_list = []
 
-    if xm:
-        xm.mark_step()
-        
-    for group, nr, pr in zip(pp_group, next_rank, prev_rank):
-        if tensor_recv_prev_func is not None:
-            tensor_recv_prev = tensor_recv_prev_func()
-            tensor_recv_prev_list.append(tensor_recv_prev)
-        else:
-            tensor_recv_prev = None
+    tensor_recv_prev = None
+    tensor_recv_next = None
+    if tensor_recv_prev_func is not None:
+        tensor_recv_prev = tensor_recv_prev_func()
 
-        if tensor_recv_next_func is not None:
-            tensor_recv_next = tensor_recv_next_func()
-            tensor_recv_next_list.append(tensor_recv_next)
-        else:
-            tensor_recv_next = None
+    if tensor_recv_next_func is not None:
+        tensor_recv_next = tensor_recv_next_func()
 
-        if xm:
-            xm_tensor_recv_prev_list = []
-            xm_tensor_recv_next_list = []
-            if tensor_send_prev is not None:
-                tensor_send_prev = tensor_send_prev.cpu()
-            if tensor_recv_prev is not None:
-                tensor_recv_prev = tensor_recv_prev.cpu()
-                xm_tensor_recv_prev_list.append(tensor_recv_prev)
-            if tensor_send_next is not None:
-                tensor_send_next = tensor_send_next.cpu()
-            if tensor_recv_next is not None:
-                tensor_recv_next = tensor_recv_next.cpu()
-                xm_tensor_recv_next_list.append(tensor_recv_next)
+    p2p_reqs = p2p_func(
+        tensor_send_prev=tensor_send_prev,
+        tensor_recv_prev=tensor_recv_prev,
+        tensor_send_next=tensor_send_next,
+        tensor_recv_next=tensor_recv_next,
+        group=pp_group,
+        prev_pipeline_rank=prev_rank,
+        next_pipeline_rank=next_rank,
+    )
 
-            group = get_default_process_group()
+    assert xm is None or not p2p_reqs, f"{p2p_reqs} must be empty for XLA"
 
-        p2p_reqs = p2p_func(
-            tensor_send_prev=tensor_send_prev,
-            tensor_recv_prev=tensor_recv_prev,
-            tensor_send_next=tensor_send_next,
-            tensor_recv_next=tensor_recv_next,
-            group=group,
-            prev_pipeline_rank=pr,
-            next_pipeline_rank=nr,
-        )
-        if isinstance(p2p_reqs, list):
-            reqs.extend(p2p_reqs)
-        else:
-            reqs.update(p2p_reqs)
+    if isinstance(p2p_reqs, list):
+        reqs.extend(p2p_reqs)
+    else:
+        reqs.update(p2p_reqs)
 
     if wait_on_reqs and len(reqs) > 0:
         for req in reqs if isinstance(reqs, list) else reqs.values():
             req.wait()
         reqs = None
 
-    if xm:
-        device = get_current_device()
-        for i, tensor_recv_prev in enumerate(xm_tensor_recv_prev_list):
-            tensor_recv_prev_list[i].data = tensor_recv_prev.to(device=device)
-        for i, tensor_recv_next in enumerate(xm_tensor_recv_next_list):
-            tensor_recv_next_list[i].data = tensor_recv_next.to(device=device)
-    if (
-        (config.batch_p2p_comm and config.batch_p2p_sync)
-        # The lists below have a size > 1 only when ETP ≠ DTP,
-        # meaning this synchronization is required when ETP ≠ DTP.
-        or len(tensor_recv_prev_list) > 1
-        or len(tensor_recv_next_list) > 1
-    ):
+    if(config.batch_p2p_comm and config.batch_p2p_sync) and xm is None:
         # To protect against race condition when using batch_isend_irecv().
         # User should assert that we have a modern enough PyTorch to not need this
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        elif xm:
-            xm.mark_step()
-
-    def _handle_tensor_list(x):
-        """This basically handles all the cases that we expect to see. Either the list None,
-        or it's a singleton (the usual cases, since most ranks only belong to one pipeline group),
-        or everything returned is None, or everything returned is not None, and it has to be summed
-        together."""
-        if len(x) == 0:
-            return None
-        if len(x) == 1:
-            return x[0]
-        if all(xx is None for xx in x):
-            return None
-        # When the encoder's TP size differs from the decoder's TP size
-        # (with the constraint `encoder_tp_size <= decoder_tp_size`), each encoder TP rank
-        # may receive multiple gradients from corresponding decoder TP ranks.
-        # For example, if `ETP=1` and `DTP=2`, then encoder rank 0 will receive gradients
-        # from decoder ranks 1 and 2. These received gradients must be averaged.
-        return torch.stack(x, dim=0).mean(dim=0, dtype=torch.float32).to(x[0].dtype)
-
-    tensor_recv_prev = _handle_tensor_list(tensor_recv_prev_list)
-    tensor_recv_next = _handle_tensor_list(tensor_recv_next_list)
 
     return tensor_recv_prev, tensor_recv_next, reqs
 

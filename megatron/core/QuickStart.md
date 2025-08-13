@@ -269,11 +269,11 @@ if __name__ == "__main__":
     from pathlib import Path
     from torch.optim import Adam
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.tensor_parallel.random import model_parallel_device_manual_seed
 
     if __name__ == "__main__":
         initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
-        model_parallel_cuda_manual_seed(123)
+        model_parallel_device_manual_seed(123)
 
         gpt_model = model_provider()
         device = torch.device("cuda")

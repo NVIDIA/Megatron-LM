@@ -390,7 +390,8 @@ test:safe_imports:
   needs: [test:build_image]
   script:
     - env
-    - pip install -e .
+    - python -m ensurepip --upgrade
+    - python -m pip install -e .
     - python .gitlab/scripts/check_imports.py --package-name megatron.core
   rules:
     - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'

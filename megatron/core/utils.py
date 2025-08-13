@@ -26,6 +26,7 @@ from types import TracebackType
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 from megatron.core.device_utils import get_current_device, get_xla_model
+from megatron.core.unified_timer_event import TimerEvent
 import torch
 
 from megatron.core import config
@@ -413,6 +414,9 @@ def deprecate_inference_params(inference_context, inference_params):
 def get_tensor_model_parallel_group_if_none(tp_group, is_expert=False, check_initialized=True):
     """Issue a deprecation warning if tp_group is None and return the default tp group."""
     # TODO(zijiey): remove this function later.
+    if not torch.distributed.is_initialized():
+        return None
+
     if tp_group is None:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
             warnings.warn(
@@ -1217,10 +1221,10 @@ class StragglerDetector:
         bdata (bool): when true, just collect get_batch
         dev (int): cuda device
         evt_q (LifoQueue): cuda event queue
-        start_gemm_ev (list[torch.cuda.Event]): cuda start event
-        stop_gemm_ev (list[torch.cuda.Event]): cuda stop event
-        start_data_ev (list[torch.cuda.Event]): cuda start event
-        stop_data_ev (list[torch.cuda.Event]): cuda stop event
+        start_gemm_ev (list[TimerEvent]): cuda start event
+        stop_gemm_ev (list[TimerEvent]): cuda stop event
+        start_data_ev (list[TimerEvent]): cuda start event
+        stop_data_ev (list[TimerEvent]): cuda stop event
         start_gemm_tm (list[int]): start time (wallclock)
         stop_gemm_tm (list[int]): stop time (wallclock)
         start_data_tm (list[int]): start time for get_batch
@@ -1267,10 +1271,10 @@ class StragglerDetector:
         self.bdata: bool = False
         self.dev: Union[torch.device, int, None] = None
         self.evt_q: Union[queue.LifoQueue, None] = None
-        self.start_gemm_ev: List[torch.cuda.Event] = []
-        self.stop_gemm_ev: List[torch.cuda.Event] = []
-        self.start_data_ev: List[torch.cuda.Event] = []
-        self.stop_data_ev: List[torch.cuda.Event] = []
+        self.start_gemm_ev: List[TimerEvent] = []
+        self.stop_gemm_ev: List[TimerEvent] = []
+        self.start_data_ev: List[TimerEvent] = []
+        self.stop_data_ev: List[TimerEvent] = []
         self.start_gemm_tm: List[int] = []
         self.stop_gemm_tm: List[int] = []
         self.start_data_tm: List[int] = []
@@ -1345,7 +1349,7 @@ class StragglerDetector:
                 self.dev = torch.device("cpu")
             # cache some events
             for _ in range(prefill):
-                self.evt_q.put(torch.cuda.Event(enable_timing=True))
+                self.evt_q.put(TimerEvent(enable_timing=True))
             if self.rank == 0:
                 # Start the controller
                 self._controller()
@@ -1390,8 +1394,8 @@ class StragglerDetector:
             sev = self.evt_q.get()  # no try-catch
             eev = self.evt_q.get()  # no try-catch
         else:
-            sev = torch.cuda.Event(enable_timing=True)
-            eev = torch.cuda.Event(enable_timing=True)
+            sev = TimerEvent(enable_timing=True)
+            eev = TimerEvent(enable_timing=True)
         # First check if this start is for data
         if self.bdata:
             self.start_data_ev.append(sev)

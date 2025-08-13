@@ -56,7 +56,7 @@ publish:test_release_pypi_build_wheel:
     - |
       if [ "$PUBLISH_DRYRUN" = "yes" ]; then
         PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" megatron/core/package_info.py)
-        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py 
+        sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" megatron/core/package_info.py
       fi
 
     - /opt/python/cp310-cp310/bin/python -m build
@@ -115,12 +115,12 @@ publish:test_release_pypi_test_wheel:
     - |
       if [[ "$PLATFORM" == "arm64" ]]; then
         for file in wheelhouse/*cp311*aarch64.whl; do
-          pip install --no-cache-dir "$file[dev,mlm]"
+          pip install --no-cache-dir "$file"
         done
-        
+
       else
         for file in wheelhouse/*cp311*x86_64.whl; do
-          pip install --no-cache-dir "$file[dev,mlm]"
+          pip install --no-cache-dir "$file"
         done
       fi
 
@@ -184,10 +184,11 @@ publish:test_release_version_bump:
 
     - git config --global user.email "mcore-bot@nvidia.com"
     - git config --global user.name "Mcore Bot"
-    - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+    - git remote set-url origin "https://gitlab-ci-token:${PROJECT_ACCESS_TOKEN_MCORE}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
     - |
       CMD=$(
         cat <<'EOF'
+          git fetch origin $PUBLISH_VERSION_BUMP_BRANCH && \
           git switch $PUBLISH_VERSION_BUMP_BRANCH && \
           git add megatron/core/package_info.py && \
           git commit -m "chore: Version bump" && \
@@ -544,3 +545,39 @@ publish:code_freeze:
         -d "target_branch=$RELEASE_BRANCH" \
         -d "title=chore: Fix version of \`$RELEASE_BRANCH\`" \
         -d "description=[🤖]: Hi @okoenig 👋,<br><br>we've adjusted the version number of \`$RELEASE_BRANCH\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
+
+publish:upgrade_dependencies:
+  stage: publish
+  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  script:
+    - export GITLAB_ENDPOINT
+    - export RO_API_TOKEN=${PAT}
+    - export BRANCH_NAME=ci-bot/build/upgrade-dependencies-$(date +%Y-%m-%d)
+    - uv lock --upgrade
+    - git checkout -b $BRANCH_NAME
+    - git add uv.lock pyproject.toml
+    - git config --global user.email "mcore-bot@nvidia.com"
+    - git config --global user.name "Mcore Bot"
+    - git remote set-url origin "https://gitlab-ci-token:${PAT}@${GITLAB_ENDPOINT}/$CI_PROJECT_NAMESPACE/megatron-lm.git"
+    - |
+      git commit -m "chore: Upgrade dependencies"
+    - git push --force -u origin $BRANCH_NAME
+    - |
+      curl \
+        --header "PRIVATE-TOKEN: $PROJECT_ACCESS_TOKEN_MCORE" \
+        --url https://${GITLAB_ENDPOINT}/api/v4/projects/${CI_PROJECT_ID}/merge_requests \
+        -d "source_branch=$BRANCH_NAME" \
+        -d "target_branch=main" \
+        -d "title=chore: Upgrade dependencies ($(date +%Y-%m-%d))" \
+        -d "labels=test::Run functional tests" \
+        -d "description=[🤖]: Hi @okoenig 👋,<br><br>we've upgraded the dependencies of \`$BRANCH_NAME\` for you! 🚀<br><br>Please review and approve this cherry pick by your convenience\!"
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  rules:
+    - if: $CI_COMMIT_BRANCH == "ci-upgrade-dependencies" && $PUBLISH == "yes" && $PUBLISH_SCOPE == "upgrade-dependencies"
+    - when: never

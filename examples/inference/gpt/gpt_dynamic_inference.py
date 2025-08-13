@@ -1,10 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import hashlib
+import os
 import torch
 from argparse import ArgumentParser
 from collections import defaultdict
 from tqdm import tqdm
-from typing import List
+from typing import Dict, List
+import sys
+import os
 
 from megatron.core.inference.contexts.dynamic_context import (
     ContextOverflowError,
@@ -19,11 +23,22 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.transformer.module import MegatronModule
+
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
 from megatron.training import get_args, get_model as _get_model, get_tokenizer, initialize_megatron
 from megatron.training.checkpointing import load_checkpoint
 from pretrain_gpt import model_provider
+import json
 
-from .utils import add_common_inference_args, build_requests, get_curr_time, Request
+from examples.inference.gpt.utils import (
+    add_common_inference_args,
+    build_requests,
+    build_dynamic_engine_setup_prefix,
+    get_curr_time,
+    Request,
+)
 
 
 def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -37,7 +52,6 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Load checkpoint with `strict=False`.",
     )
-
     return parser
 
 
@@ -88,6 +102,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
             args.num_query_groups if args.group_query_attention else args.num_attention_heads
         ),
         max_sequence_length=max_sequence_length,
+        num_cuda_graphs=args.inference_dynamic_batching_num_cuda_graphs if args.enable_cuda_graph else None,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         buffer_guaranteed_fraction=args.inference_dynamic_batching_buffer_guaranteed_fraction,
         chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
@@ -95,6 +110,7 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_requests_override=args.inference_dynamic_batching_max_requests_override,
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
+        materialize_only_last_token_logits=not args.return_log_probs,
     )
 
     return context
@@ -134,7 +150,7 @@ def get_inference_controller(
 
 def run_inference(
     requests: List[Request], sampling_params: SamplingParams, engine: DynamicInferenceEngine
-) -> None:
+) -> List[Dict[str, float]]:
     """Add requests to engine and generate tokens.
 
     Args:
@@ -143,7 +159,7 @@ def run_inference(
         engine (DynamicInferenceEngine): Inference engine that manages generating tokens.
 
     Return:
-        None.
+        A dictionary of step times with `prefill` and `decode` keys.
     """
 
     # Initialize request arrival times.
@@ -160,6 +176,7 @@ def run_inference(
     add_times = []
     output_times = []
     tbar = tqdm(total=num_requests_total)
+    total_output_tokens = 0
     while True:
         curr_time = get_curr_time()
 
@@ -170,9 +187,10 @@ def run_inference(
             if request.time_arrival > curr_time:
                 break
             try:
-
                 # Using `prompt_text` instead of `prompt_tokens` for fair comparison.
-                engine.add_request(num_requests_added, request.prompt_text)
+                engine.add_request(
+                    num_requests_added, request.prompt_text, sampling_params.num_tokens_to_generate
+                )
                 request.time_start = get_curr_time()
                 request.state = "started"
                 num_requests_added += 1
@@ -183,11 +201,10 @@ def run_inference(
 
         # Step inference engine (i.e., generate a token for each active request).
         is_decode_only = engine.context.is_decode_only()
-        finished_requests, step_time = engine.step(sampling_params, verbose=True)
+        active_requests, finished_requests, step_time = engine.step(sampling_params, verbose=True)
         step_id += 1
 
-        if len(finished_requests) > 0:
-            output_start = get_curr_time()
+        if len(active_requests) > 0 or len(finished_requests) > 0:
             if is_decode_only:
                 step_times["decode"].append(step_time)
             else:
@@ -197,18 +214,22 @@ def run_inference(
             for finished_request in finished_requests:
                 request = requests[finished_request.request_id]
                 request.output_tokens = finished_request.generated_tokens
+                total_output_tokens += len(request.output_tokens)
                 request.time_end = get_curr_time()
                 request.output_text = finished_request.generated_text
                 request.state = "finished"
+                request.request_id = finished_request.request_id
+                if sampling_params.return_log_probs:
+                    request.log_probs = (
+                        finished_request.prompt_log_probs + finished_request.generated_log_probs
+                    )
                 num_requests_finished += 1
-
-            output_times.append(get_curr_time() - output_start)
 
         # Check if all requests are finished.
         if not (engine.has_unfinished_requests() or num_requests_added < num_requests_total):
             break
 
-    return step_times, add_times, output_times
+    return step_times, add_times, output_times, total_output_tokens
 
 
 @torch.inference_mode()
@@ -218,6 +239,10 @@ def main():
         extra_args_provider=add_dynamic_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+
+    # Start Nsight profiler.
+    if os.environ.get("NSIGHT_PREFIX"):
+        torch.cuda.cudart().cudaProfilerStart()
 
     args = get_args()
     tokenizer = get_tokenizer()
@@ -246,38 +271,15 @@ def main():
         random_seed=args.seed,
     )
 
-    # Print setup.
-    setup_prefix = (
-        "dynamic | cg %d | %s | bf %.0f, flw %.1f [r %d, t %d], gtd %.2f [r %d] ... reqs %d"
-        % (
-            args.enable_cuda_graph,
-            (
-                f"<user prompts, n {len(args.prompts)}>"
-                if args.prompts
-                else "<auto prompts> %s, %d, %.1e, %.1e"
-                % (
-                    "(%s)" % " ".join(map(str, args.num_tokens_to_prompt)),
-                    args.num_tokens_to_generate,
-                    args.incoming_requests_duration,
-                    args.incoming_requests_per_sec,
-                )
-            ),
-            args.inference_dynamic_batching_buffer_size_gb,
-            args.inference_dynamic_batching_buffer_overflow_factor,
-            context.max_requests,
-            context.max_tokens,
-            args.inference_dynamic_batching_buffer_guaranteed_fraction,
-            context.gtd_request_count,
-            len(requests),
-        )
-    )
+    setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
     print("~~~")
     print(setup_prefix)
     print("~~~")
 
     # Run and time test.
     t = get_curr_time()
-    step_times, add_times, output_times = run_inference(requests, sampling_params, engine)
+    step_times, add_times, output_times, total_output_tokens = run_inference(requests, sampling_params, engine)
+    torch.cuda.synchronize()
     total_time = get_curr_time() - t
 
     # Validate all requests finished.
@@ -298,33 +300,71 @@ def main():
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]
+            output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
+            output_text_escaped = request.output_text.replace("\n", "\\n")
             print(
-                f"{unique_idx}/{len(unique_prompt_map)} [{len(request_idxs)}]. {prompt_text} ... %s"
-                % request.output_text.replace("\n", "\\n")
+                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
+                f"{prompt_text} ... {output_text_escaped}"
             )
+
+        # Write results to JSON. Primarily used for functional testing.
+        if args.output_path:
+            json_results = {}
+
+            for idx, req in enumerate(requests):
+                result_dict = {
+                    "input_prompt": req.prompt_text,
+                    "generated_text": req.output_text,
+                    "generated_tokens": req.output_tokens,
+                    "latency": req.time_end - req.time_start,
+                }
+                if sampling_params.return_log_probs:
+                    response_logprobs = req.log_probs
+                    result_dict["logprobs"] = response_logprobs
+                json_results[req.request_id] = result_dict
+            with open(args.output_path, "w") as fp:
+                json.dump(json_results, fp)
 
     # Timing results.
     stats = torch.cuda.memory_stats()
+    throughput = total_output_tokens / total_time
     print("~~~")
+    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+
+    p_times = step_times["prefill"]
+    d_times = step_times["decode"]
+
+    p_total = sum(p_times)
+    d_total = sum(d_times)
+
+    p_count = len(p_times)
+    d_count = len(d_times)
+
+    p_mean = p_total / p_count
+    d_mean = d_total / d_count
+
+    # Commented out for now as the step/add/output times are not calculated correctly.
+    # print(
+    #     f"{setup_prefix} … "
+    #     f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+    #     f"total time: {step_total:.3f}s … "
+    #     f"step time: total {step_total:.3f}s "
+    #     f"[ p {p_total:.3f}s, d {d_total:.3f}s ], "
+    #     f"mean [ p {p_mean:.3f}s, d {d_mean:.3f}s ], "
+    #     f"count [ p {p_count}, d {d_count} ]."
+    # )
     print(
-        "%s ... mem %.1f/%.1f ... total time: %.3f ... step time: total %.3f [ p %.3f, d %.3f ], mean [ p %.3f, d %.3f ], count [ p %d, d %d ] ... add time: %.3f, output time: %.3f."
-        % (
-            setup_prefix,
-            stats["allocated_bytes.all.peak"] / (1024**3),
-            stats["reserved_bytes.all.peak"] / (1024**3),
-            sum(step_times["prefill"]) + sum(step_times["decode"]) + sum(add_times),
-            sum(step_times["prefill"]) + sum(step_times["decode"]),
-            sum(step_times["prefill"]),
-            sum(step_times["decode"]),
-            sum(step_times["prefill"]) / len(step_times["prefill"]),
-            sum(step_times["decode"]) / len(step_times["decode"]),
-            len(step_times["prefill"]),
-            len(step_times["decode"]),
-            sum(add_times),
-            sum(output_times),
-        )
+        f"{setup_prefix} … "
+        f"mem {peak_alloc_gb:.1f}/{peak_resvd_gb:.1f} GB … "
+        f"total time: {total_time:.3f}s … "
+        f"throughput: {throughput:.3f} tok/s"
     )
     print("~~~")
+
+    # Stop Nsight profiler.
+    if os.environ.get("NSIGHT_PREFIX"):
+        torch.cuda.cudart().cudaProfilerStop()
 
 
 if __name__ == "__main__":

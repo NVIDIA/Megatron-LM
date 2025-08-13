@@ -69,7 +69,7 @@ def broadcast_nested_data_batch(nested_dict: Dict[str, Any]) -> Dict[str, Any]:
 
     # On src rank: make a dict {joined_path: tensor}
     if mpu.get_tensor_model_parallel_rank() == 0:
-        data_dict = {".".join(p): t.cuda() for p, t in zip(paths, tensors)}
+        data_dict = {".".join(p): t.to(get_current_device()) for p, t in zip(paths, tensors)}
     else:
         data_dict = {}
 

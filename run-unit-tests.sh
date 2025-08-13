@@ -10,6 +10,8 @@ then
 	export NCCL_SOCKET_IFNAME=lo
 	export NCCL_DEBUG=WARN
 	export CUDA_DEVICE_MAX_CONNECTIONS=1
+	export NVTE_DEBUG=1 
+	export NVTE_DEBUG_LEVEL=2
 fi
 export NLTK_DATA=/workspace/data/nltk_data
 

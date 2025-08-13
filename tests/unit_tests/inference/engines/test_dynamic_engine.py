@@ -13,6 +13,7 @@ from tqdm import tqdm
 from megatron.core import config, parallel_state
 from megatron.core.device_utils import get_current_device
 from megatron.core.inference.contexts.dynamic_context import (
+    ActiveRequestCountOverflowError,
     ChunkOverflowError,
     DynamicInferenceContext,
     RequestOverflowError,
@@ -81,6 +82,7 @@ class DynamicEngineTestConfig:
     tensor_model_parallel_size: int = 1
 
     use_fixed_output_lengths: bool = False
+    num_cuda_graphs: int = None
 
     def __post_init__(self):
 
@@ -156,6 +158,7 @@ class TestDynamicInferenceEngine:
             kv_channels=transformer_config.kv_channels,
             num_attention_heads=transformer_config.num_query_groups,
             max_sequence_length=max_sequence_length,
+            num_cuda_graphs=test_config.num_cuda_graphs,
             buffer_size_gb=test_config.context_buffer_size_gb,
             buffer_guaranteed_fraction=test_config.context_buffer_guaranteed_fraction,
             chunk_size_tokens=test_config.context_chunk_size_tokens,
@@ -182,7 +185,12 @@ class TestDynamicInferenceEngine:
         # Random state.
         random.seed(random_seed)
         torch.manual_seed(random_seed)
-        model_parallel_device_manual_seed(random_seed)
+        model_parallel_device_manual_seed(
+            seed=random_seed,
+            inference_rng_tracker=True,
+            use_cudagraphable_rng=False,
+            force_reset_rng=True,
+        )
 
         # Transformer config.
         transformer_config = TransformerConfig(
@@ -191,6 +199,8 @@ class TestDynamicInferenceEngine:
             hidden_size=32,
             num_attention_heads=4,
             use_cpu_initialization=True,
+            enable_cuda_graph=test_config.num_cuda_graphs is not None,
+            inference_rng_tracker=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
         )
 
@@ -274,7 +284,9 @@ class TestDynamicInferenceEngine:
     def _run_step(cls, env):
         set_rounder(4)
         # Step inference engine (i.e., generate one token per request).
-        finished_requests, step_time = env.engine.step(env.sampling_params, verbose=False)
+        active_requests, finished_requests, step_time = env.engine.step(
+            env.sampling_params, verbose=False
+        )
 
         # Nothing done?
         if len(finished_requests) == 0:
@@ -425,6 +437,92 @@ class TestDynamicInferenceEngine:
     def test_fixed_output_lengths(self) -> None:
         """Test generating a fixed number of output tokens."""
         self._run_test(use_fixed_output_lengths=True)
+
+    def test_cuda_graph_request_counts(self) -> None:
+        """Test initialization of `cuda_graph_request_counts` in dynamic context."""
+
+        # Test num_cuda_graphs.
+        for num_cuda_graphs, expected_cuda_graph_request_counts in [
+            (0, [64]),
+            (1, [64]),
+            (2, [64, 32]),
+            (4, [64, 48, 32, 16]),
+            (8, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (16, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (64, [64, 56, 48, 40, 32, 24, 16, 8]),
+            (1024, [64, 56, 48, 40, 32, 24, 16, 8]),
+        ]:
+            env = self._build_test_env(
+                DynamicEngineTestConfig(num_requests=64, num_cuda_graphs=num_cuda_graphs)
+            )
+            actual_cuda_graph_request_counts = env.engine.context.cuda_graph_request_counts
+            assert (
+                actual_cuda_graph_request_counts == expected_cuda_graph_request_counts
+            ), "num_cuda_graphs %d ... cuda_graph_request_counts: expected %s, found %s." % (
+                num_cuda_graphs,
+                expected_cuda_graph_request_counts,
+                actual_cuda_graph_request_counts,
+            )
+
+    def test_cuda_graph_warmup(self) -> None:
+        """Test initialization during cuda graph warmup."""
+
+        # Initialize context.
+        env = self._build_test_env(DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8))
+
+        context = env.engine.context
+        assert context.is_decode_only()
+        assert context.cuda_graph_request_counts == [
+            32,
+            24,
+            16,
+            8,
+        ], "cuda_graph_request_counts: %s." % str(context.cuda_graph_request_counts)
+
+        # Iterate request counts.
+        for num_warmup_requests, expected_cuda_graph_request_count in [
+            (1, 8),
+            (2, 8),
+            (4, 8),
+            (8, 8),
+            (10, 16),
+            (12, 16),
+            (16, 16),
+            (20, 24),
+            (24, 24),
+            (28, 32),
+            (32, 32),
+        ]:
+
+            # Initialize attention state.
+            context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+
+            # Validate request & token counts.
+            assert (
+                expected_cuda_graph_request_count
+                == context.padded_active_request_count
+                == context.padded_active_token_count
+            ), (
+                "failed ... num_warmup_requests (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
+                % (
+                    num_warmup_requests,
+                    expected_cuda_graph_request_count,
+                    context.padded_active_request_count,
+                    context.padded_active_token_count,
+                )
+            )
+
+            # Validate input/position dimensions.
+            input_ids, pos_ids = context.current_input_and_position_ids()
+            assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_request_count
+
+        # Test active request count overflow.
+        for num_warmup_requests in (64, 128, 1024):
+            try:
+                context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+            except ActiveRequestCountOverflowError as e:
+                continue
+            raise Exception("`ActiveRequestCountOverflowError should have been raised.")
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"

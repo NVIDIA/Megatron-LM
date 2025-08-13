@@ -56,7 +56,7 @@ class LanguageModelEmbedding(MegatronModule):
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
-            init_method=self.config.init_method,
+            init_method=self.config.embedding_init_method,
             reduce_scatter_embeddings=self.reduce_scatter_embeddings,
             config=self.config,
             tp_group=self.tp_group,
@@ -70,7 +70,7 @@ class LanguageModelEmbedding(MegatronModule):
 
             # Initialize the position embeddings.
             if self.config.perform_initialization:
-                self.config.init_method(self.position_embeddings.weight)
+                self.config.embedding_init_method(self.position_embeddings.weight)
 
         if self.num_tokentypes > 0:
             self.tokentype_embeddings = torch.nn.Embedding(
@@ -78,7 +78,7 @@ class LanguageModelEmbedding(MegatronModule):
             )
             # Initialize the token-type embeddings.
             if self.config.perform_initialization:
-                self.config.init_method(self.tokentype_embeddings.weight)
+                self.config.embedding_init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 

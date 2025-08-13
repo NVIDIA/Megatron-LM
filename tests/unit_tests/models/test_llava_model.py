@@ -340,8 +340,8 @@ class TestLLaVAModel:
                 [0, 512, 1024, 1600], dtype=torch.int32
             ).to(device=get_current_device()),  # Just example values.
             cu_seqlens_kv=torch.tensor([0, 512, 1024, 1600], dtype=torch.int32).to(device=get_current_device()),
-            max_seqlen_q=torch.tensor(1600, dtype=torch.int32).to(device=get_current_device()),
-            max_seqlen_kv=torch.tensor(1600, dtype=torch.int32).to(device=get_current_device()),
+            max_seqlen_q=1600,
+            max_seqlen_kv=1600,
         ) if HAVE_TE else None
 
         # NOTE: Packing is only supported with BF16. Use BF16 here and switch back to default.
@@ -554,7 +554,7 @@ def create_test_args(cp_size, sequence_parallel):
 
 class TestLLaVAModelTokenParallel:
 
-    def _init_llava_model(self, cp_size, tp_size, sequence_parallel, cp_group=None):
+    def _init_llava_model(self, cp_size, tp_size, sequence_parallel):
         language_hidden_size = 64
         language_num_attention_heads = 16
 
@@ -623,7 +623,6 @@ class TestLLaVAModelTokenParallel:
             img_h=336,
             img_w=336,
             patch_dim=14,
-            cp_group=cp_group,
         )
 
         return model
@@ -729,9 +728,7 @@ class TestLLaVAModelTokenParallel:
         )
         model = None
         with ctx:
-            model = self._init_llava_model(
-                cp_size, tp_size, sequence_parallel, cp_group=ps.get_context_parallel_group()
-            )
+            model = self._init_llava_model(cp_size, tp_size, sequence_parallel)
 
         if model is None:
             return

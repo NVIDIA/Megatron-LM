@@ -41,6 +41,8 @@ from megatron.core.transformer.utils import (
 )
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
+
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
     HAVE_TE_FP8 = True
 except ImportError:

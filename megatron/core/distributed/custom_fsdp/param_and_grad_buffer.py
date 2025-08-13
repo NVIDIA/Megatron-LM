@@ -13,6 +13,7 @@ from contextlib import ExitStack, nullcontext
 from enum import Enum
 from typing import Any, Callable, List, Optional, Tuple
 
+from megatron.core.unified_timer_event import TimerEvent
 import torch
 from torch.distributed import _coalescing_manager
 
@@ -280,7 +281,7 @@ class Bucket:
     Attributes:
         data (torch.Tensor): A tensor containing the data elements
             grouped together in a bucket.
-        data_operation_event (Optional[torch.cuda.Event]): An optional CUDA event
+        data_operation_event (Optional[TimerEvent]): An optional CUDA event
             used to synchronize data operations.
         status (Any): An optional status object used to track the state of the bucket.
 
@@ -290,7 +291,7 @@ class Bucket:
     """
 
     data: torch.Tensor
-    data_operation_event: Optional[torch.cuda.Event] = None
+    data_operation_event: Optional[TimerEvent] = None
     status: Any = None
 
 

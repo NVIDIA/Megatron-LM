@@ -159,7 +159,7 @@ if __name__ == "__main__":
             label = ["A", "B", "C", "D"][test_example["answer"]]
             tokens = tokenizer(prompt, return_tensors="pt")
             generated_ids = simple_generate(
-                unwrapped_model, tokens.input_ids.cuda(), osl=2, disable_tqdm=disable_tqdm
+                unwrapped_model, tokens.input_ids.to(get_current_device()), osl=2, disable_tqdm=disable_tqdm
             )
             predict = tokenizer.batch_decode(generated_ids)[0].strip()
             correct += [True] if predict.startswith(label) else [False]

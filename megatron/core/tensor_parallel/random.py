@@ -247,6 +247,7 @@ def model_parallel_device_manual_seed(
     tp_rank: Optional[int] = None,
     ep_rank: Optional[int] = None,
     etp_rank: Optional[int] = None,
+    force_reset_rng: bool = False,
 ):
     """Initialize model parallel device seed.
 
@@ -277,7 +278,9 @@ def model_parallel_device_manual_seed(
     # Data parallel gets the original seed.
     data_parallel_seed = seed
 
-    initialize_rng_tracker(te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng)
+    initialize_rng_tracker(
+        te_rng_tracker, inference_rng_tracker, use_cudagraphable_rng, force_reset=force_reset_rng
+    )
     _DEVICE_RNG_STATE_TRACKER.reset()
     # Set the default state.
     set_device_manual_seed(data_parallel_seed)

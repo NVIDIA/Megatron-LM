@@ -1,4 +1,9 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+
+from megatron.core.device_utils import get_current_device
+import torch
+
+
 class Counter:
     """A simple counter class
 
@@ -16,3 +21,15 @@ class Counter:
     def reset(self) -> None:
         """Reset counter"""
         self.counter = 0
+
+
+def get_attention_mask(seq_length: int) -> torch.Tensor:
+    """Constructs an attention mask given the input sequence length."""
+    attention_mask = torch.tril(
+        torch.ones((1, seq_length, seq_length), device=get_current_device())
+    ).view(1, 1, seq_length, seq_length)
+
+    # Convert to boolean
+    attention_mask = attention_mask < 0.5
+
+    return attention_mask

@@ -2,10 +2,67 @@
 from contextlib import contextmanager
 from typing import Callable, Optional
 
+from megatron.core.unified_timer_event import TimerEvent
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
+
+
+def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
+    """Return True if in the first pipeline model-parallel stage, False otherwise."""
+    return get_pg_rank(pp_group) == 0
+
+
+def is_pp_last_stage(pp_group: torch.distributed.ProcessGroup):
+    """Return True if in the last pipeline-model-parallel stage, False otherwise."""
+    return get_pg_rank(pp_group) == (get_pg_size(pp_group) - 1)
+
+
+def is_vp_first_stage(vp_stage: int, vp_size: int | None):
+    """Return True if in the first virtual pipeline model-parallel stage, False otherwise."""
+    if vp_size is None or vp_size <= 1:
+        return True
+    return vp_stage == 0
+
+
+def is_vp_last_stage(vp_stage: int, vp_size: int | None):
+    """Return True if in the last virtual pipeline model-parallel stage, False otherwise."""
+    if vp_size is None or vp_size <= 1:
+        return True
+    return vp_stage == (vp_size - 1)
+
+
+def get_pp_first_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the first rank in the pipeline parallel group."""
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[0]
+
+
+def get_pp_last_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the last rank in the pipeline parallel group."""
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[-1]
+
+
+def get_pp_next_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the next rank in the pipeline parallel group, or None if last
+    stage."""
+    if is_pp_last_stage(pp_group):
+        return None
+    current_rank_in_group = get_pg_rank(pp_group)
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[current_rank_in_group + 1]
+
+
+def get_pp_prev_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the previous rank in the pipeline parallel group, or None if
+    first stage."""
+    if is_pp_first_stage(pp_group):
+        return None
+    current_rank_in_group = get_pg_rank(pp_group)
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[current_rank_in_group - 1]
 
 
 def make_viewless(e):
@@ -35,7 +92,7 @@ class ScheduleNode:
         self,
         forward_func: Callable,
         stream: torch.cuda.Stream,
-        event: torch.cuda.Event,
+        event: TimerEvent,
         backward_func: Optional[Callable] = None,
         free_input: bool = False,
         name: str = "schedule_node",
@@ -49,7 +106,7 @@ class ScheduleNode:
                 - 'compute' stream: Used for computational nodes like attention and experts.
                 - 'communicate' stream: Used for nodes that handle token communication,
                   such as token dispatch and combine operations in MoE layers.
-            event (torch.cuda.Event): The CUDA event used for synchronization. Each
+            event (TimerEvent): The CUDA event used for synchronization. Each
                 microbatch within a model chunk shares the same event, which is used
                 to manage dependencies between nodes operating on different streams.
             backward_func (callable, optional): Function for the backward pass.

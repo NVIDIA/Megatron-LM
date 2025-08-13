@@ -209,7 +209,7 @@ def test_grad_sync(
     expected_grad_data_value_after_collective = 1
     # under the following conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/DP
     # this is because when average_in_collective=False, the grad data is always first scaled by 1/DP and then summed by AR/RS
-    # and when use_distributed_optimizer=True, only for rank=0 param_and_grad_buffer.grad_data[0] is updated, for other ranks
+    # and when use_distributed_optimizer=xm is None, only for rank=0 param_and_grad_buffer.grad_data[0] is updated, for other ranks
     # another shard of grad_data is updated while param_and_grad_buffer.grad_data[0] is unchanged (=1/DP)
     if (
         use_distributed_optimizer

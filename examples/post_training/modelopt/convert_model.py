@@ -16,7 +16,7 @@ from megatron.core.enums import ModelType
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_provider import model_provider
-from megatron.training import get_args  # , get_model
+from megatron.training import get_args, get_tokenizer
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import print_rank_0, unwrap_model
@@ -37,6 +37,58 @@ def add_convert_args(parser):
     group.add_argument(
         "--extra-model-path", type=str, default=None, help="Extra module weights to load"
     )
+    group.add_argument(
+        '--export-num-medusa-heads',
+        type=int,
+        default=0,
+        help='Number of Medusa heads for speculative decoding.',
+    )
+    group.add_argument(
+        '--export-eagle-algorithm',
+        type=str,
+        choices=['eagle1', 'eagle3', 'eagle-mtp'],
+        default="eagle-mtp",
+        help='Chosing the between different flavors of EAGLE algorithms.',
+    )
+    group.add_argument(
+        '--export-num-eagle-layers',
+        type=int,
+        default=0,
+        help='Number of EAGLE layers for speculative decoding.',
+    )
+    group.add_argument(
+        '--export-draft-vocab-size',
+        type=int,
+        default=0,
+        help='The reduced vocabulary size of the draft model.',
+    )
+    group.add_argument(
+        '--export-eagle-ffn-hidden-size',
+        type=int,
+        default=0,
+        help='ffn_hidden_size of the eagle module. Using base model ffn_hidden_size is set to 0.',
+    )
+
+    group.add_argument(
+        '--export-num-mtp',
+        type=int,
+        default=0,
+        help='Number of MTP modules for speculative decoding.',
+    )
+    group.add_argument(
+        '--export-freeze-mtp',
+        type=int,
+        nargs="*",
+        default=[],
+        help='Index of MTP that will be frozen in training.',
+    )
+    group.add_argument(
+        '--export-parallel-draft-step',
+        type=int,
+        default=1,
+        help='The number of tokens generated in parallel draft. If set to 1, draft is not in parallel mode.',
+    )
+
     add_modelopt_args(parser)
     return parser
 
@@ -90,7 +142,10 @@ if __name__ == "__main__":
 
     if args.export_num_eagle_layers > 0:
         mtsp_config = ALGO_TO_CONFIG[args.export_eagle_algorithm]
+        mtsp_config["config"]["eagle_num_layers"] = args.export_num_eagle_layers
         mtsp_config["config"]["draft_vocab_size"] = args.export_draft_vocab_size
+        mtsp_config["config"]["ffn_hidden_size"] = args.export_eagle_ffn_hidden_size
+        mtsp_config["config"]["parallel_draft_step"] = args.export_parallel_draft_step
 
         unwrapped_model = mtsp.convert(unwrapped_model, mtsp_config)
 
@@ -99,6 +154,17 @@ if __name__ == "__main__":
             if eagle_module is not None:
                 mcore_eagle_state_dict = torch.load(args.extra_model_path)
                 eagle_module.load_state_dict(mcore_eagle_state_dict, strict=False)
+
+        # Add mask tokens for parallel draft
+        if args.export_parallel_draft_step > 1:
+            assert args.export_parallel_draft_step <= 4, "Parallel draft only supports steps less than or equal to 4."
+            tokenizer = get_tokenizer()
+            for i in range(args.export_parallel_draft_step - 1):
+                mask_token = "[MASK_{}]".format(i)
+                tokenizer._tokenizer.add_tokens([mask_token], special_tokens=True) 
+                token_id = tokenizer._tokenizer.convert_tokens_to_ids(mask_token)
+                setattr(unwrapped_model, "mask_token_{}".format(i), torch.tensor(token_id))
+                
 
     if args.export_num_medusa_heads > 0:
         config = {"medusa_num_heads": args.export_num_medusa_heads, "medusa_num_layers": 1}

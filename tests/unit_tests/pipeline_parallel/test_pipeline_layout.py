@@ -1,12 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-import os
 import traceback
 from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.distributed
 
 from megatron.core import mpu, parallel_state
 from megatron.core.device_utils import get_current_device, get_xla_model
@@ -15,6 +13,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
     get_gpt_layer_local_spec as gpt_local_spec
 )
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
@@ -48,6 +47,7 @@ def initialize_gpt_model(
     vocab_size=128,
     virtual_pipeline_model_parallel_size=None,
     is_moe=False,
+    with_mtp=False,
     **config_kwargs,
 ):
     torch.manual_seed(seed)
@@ -71,12 +71,26 @@ def initialize_gpt_model(
         transformer_config.moe_ffn_hidden_size = 128
         transformer_config.num_moe_experts = 4
         transformer_config.add_bias_linear = False
+    if with_mtp:
+        transformer_config.mtp_num_layers = 1
+        transformer_config.mtp_loss_scaling_factor = 1.0
     model = []
     for i in range(virtual_pipeline_model_parallel_size or 1):
         if is_moe:
             layer_spec = layer_spec_fn(transformer_config, use_transformer_engine=HAVE_TE, vp_stage=i)
         else:
             layer_spec = layer_spec_fn()
+
+        if is_moe and with_mtp and mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i):
+            transformer_layer_spec_for_mtp = gpt_te_spec(transformer_config) if HAVE_TE else gpt_local_spec(transformer_config)
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                transformer_config,
+                transformer_layer_spec_for_mtp,
+                use_transformer_engine=HAVE_TE,
+                vp_stage=i,
+            )
+        else:
+            mtp_block_spec = None
         pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
         post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
         this_model = (
@@ -89,6 +103,8 @@ def initialize_gpt_model(
                 post_process=post_process,
                 position_embedding_type="rope",
                 vp_stage=i,
+                mtp_block_spec=mtp_block_spec,
+                share_embeddings_and_output_weights=False,
             )
             .bfloat16()
             .to(get_current_device())
@@ -141,8 +157,9 @@ def create_args():
 @pytest.mark.skipif(xm, reason="Test fails on XLA")
 # Dense and MoE Models
 @pytest.mark.parametrize(
-    ('tp_pp_vpp', 'pp_layout', 'is_moe'),
+    ('tp_pp_vpp', 'pp_layout', 'is_moe', 'with_mtp'),
     [
+        ((1, 2, 1), None, True, True),
         (
             (1, 4, 2),
             [
@@ -156,8 +173,9 @@ def create_args():
                 ["decoder"] * 2 + ["loss"],
             ],
             False,
+            True,
         ),
-        ((1, 2, None), [["embedding"] + ["decoder"] * 4, ["decoder"] * 4 + ["loss"]], False),
+        ((1, 2, None), [["embedding"] + ["decoder"] * 4, ["decoder"] * 4 + ["loss"]], False, False),
         (
             (1, 4, 2),
             [
@@ -171,11 +189,13 @@ def create_args():
                 ["decoder"] * 2 + ["loss"],
             ],
             True,
+            False,
         ),
-        ((1, 2, None), [["embedding"] + ["decoder"] * 4, ["decoder"] * 4 + ["loss"]], True),
+        ((1, 2, None), [["embedding"] + ["decoder"] * 4, ["decoder"] * 4 + ["loss"]], True, False),
+        ((1, 4, 2), "E|t*3|(t|)*5L", True, True),
     ],
 )
-def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe):
+def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_moe, with_mtp):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     args = create_args
@@ -203,9 +223,10 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         """Forward training step. Copied from `pretrain_gpt.py`"""
         tokens = torch.LongTensor([[2, 1, 2, 3, 4, 5, 7, 6]]).to(get_current_device())
         position_ids = torch.arange(8).view(1, -1).to(get_current_device())
+        labels = torch.ones_like(position_ids)
         attention_mask = None
 
-        output_tensor = model(tokens, position_ids, attention_mask)
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
         def loss_func(output_tensor: torch.Tensor):
             loss = output_tensor.sum()
@@ -226,13 +247,14 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
         pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
         is_moe=is_moe,
+        with_mtp=with_mtp,
     )
     model = model if isinstance(model, list) else [model]
 
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
-        data_iterator=[range(0, 100)] * len(model),
+        data_iterator=[get_batch_iterator(seq_length=8, micro_batch_size=1)] * len(model),
         model=model,
         num_microbatches=4,
         seq_length=8,
@@ -250,6 +272,7 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
         save_checkpoint(
             iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far
         )
+        print(f"save checkpoint done")
 
         set_tp_pp_vpp(1, 1)
         model_baseline = initialize_gpt_model(
@@ -263,13 +286,14 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
             virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
             pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
             is_moe=is_moe,
+            with_mtp=with_mtp,
         )
         load_checkpoint([model_baseline], optimizer, opt_param_scheduler, strict=False)
 
         forward_backward_func = get_forward_backward_func()
         losses_reduced_baseline = forward_backward_func(
             forward_step_func=forward_step_func,
-            data_iterator=range(0, 100),
+            data_iterator=get_batch_iterator(seq_length=8, micro_batch_size=1),
             model=[model_baseline],
             num_microbatches=4,
             seq_length=8,
@@ -283,3 +307,40 @@ def test_forward_vpp(create_args, tmp_path_dist_ckpt, tp_pp_vpp, pp_layout, is_m
 
     Utils.destroy_model_parallel()
     unset_num_microbatches_calculator()
+
+
+def get_batch_iterator(seq_length, micro_batch_size, num_batches=None):
+    """
+    Generator function that yields batches indefinitely or for a specified number of batches.
+
+    Args:
+        seq_length: Length of the sequence
+        micro_batch_size: Size of each micro batch
+        num_batches: Optional number of batches to generate. If None, generates indefinitely.
+    """
+    batch_count = 0
+    while num_batches is None or batch_count < num_batches:
+        # Generate different data for each batch by adding batch_count offset
+        data = list(range(batch_count, batch_count + seq_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
+        labels = 1 + torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).to(get_current_device())
+        position_ids = (
+            torch.tensor(list(range(seq_length)), dtype=torch.int64)
+            .repeat((micro_batch_size, 1))
+            .to(get_current_device())
+        )
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, seq_length, seq_length), dtype=bool
+        ).to(get_current_device())
+        loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).to(get_current_device())
+
+        yield input_ids, labels, position_ids, attention_mask, loss_mask
+        batch_count += 1
+
+
+# if __name__ == "__main__":
+#     import os
+
+#     args = create_args()
+#     test_forward_vpp(args, Path("./tmp_path_dist_ckpt"), (1, 2, 1), None, True, True)
+#     print("test done")

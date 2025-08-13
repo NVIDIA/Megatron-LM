@@ -194,7 +194,7 @@ def test_grad_sync(
     ):
         # With above conditions, the data in param_and_grad_buffer.grad_data[0] equals to 1/data_parallel_word_size
         # When average_in_collective=False, the grad data is always first scaled by 1/data_parallel_word_size and then summed by AR/RS
-        # when use_distributed_optimizer=True, only for rank=0 param_and_grad_buffer.grad_data[0] is updated, for other ranks
+        # when use_distributed_optimizer=xm is None, only for rank=0 param_and_grad_buffer.grad_data[0] is updated, for other ranks
         # another shard of grad_data is updated while param_and_grad_buffer.grad_data[0] is unchanged (=1/data_parallel_word_size)
         non_ep_expected_grad_data_value_after_collective /= (
             parallel_state.get_data_parallel_world_size()

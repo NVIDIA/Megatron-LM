@@ -28,7 +28,6 @@ except ImportError:
 
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        import warnings
 
         warnings.warn(
             'Transformer Engine and Apex are not installed. '
@@ -810,7 +809,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -904,7 +902,11 @@ class FP32Optimizer(MegatronOptimizer):
         for param_group in self.optimizer.param_groups:
             for param in param_group['params']:
                 if hasattr(param, 'main_grad'):
-                    param.grad = param.main_grad.to(device=param.grad.device, dtype=param.grad.dtype)
+                    if param.grad:
+                        param.grad = param.main_grad.to(device=param.grad.device, dtype=param.grad.dtype)
+                    else:
+                        param.grad = param.main_grad
+                        
         if timers is not None:
             timers('optimizer-copy-to-main-grad').stop()
 
@@ -970,7 +972,6 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             if not HAVE_APEX_OR_TE:
@@ -1166,6 +1167,7 @@ class ChainedOptimizer(MegatronOptimizer):
                 model_sharded_state_dict, is_loading, **kwargs
             )
         else:
+            self._synchronize_steps()
             sharded_state_dict = {}
             for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
                 optim_state_dict = optimizer.sharded_state_dict(
@@ -1189,6 +1191,7 @@ class ChainedOptimizer(MegatronOptimizer):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
+        self._synchronize_steps()
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -1278,9 +1281,12 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
                 continue
+            parameters = optimizer.get_parameters()
+            if len(parameters) == 0:
+                continue
             if optimizer.config.clip_grad > 0.0:
                 clip_grad_by_total_norm_fp32(
-                    optimizer.get_parameters(),
+                    parameters,
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
                     use_decoupled_grad=(
@@ -1347,3 +1353,24 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_parameter_state_from_dp_zero(
                 state_dict, update_legacy_format=update_legacy_format
             )
+
+    def _synchronize_steps(self):
+        """
+        Synchronize the step of all optimizers.
+        TE FusedAdam will not accumulate "step" for empty param groups,
+        so we need to align the step across param groups before saving and after loading.
+        """
+
+        steps = []
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.optimizer.param_groups:
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    steps.append(param_group['step'])
+        steps = list(set(steps))
+        assert len(steps) <= 1, f"steps: {steps}"
+        step = steps[0] if len(steps) == 1 else None
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.optimizer.param_groups:
+                param_group['step'] = step
+
+        return step
