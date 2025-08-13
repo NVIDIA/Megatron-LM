@@ -75,19 +75,20 @@ class TestGPTModelReconfiguration:
             'store_order',
             'src_tp_pp',
             'dest_tp_pp',
+            'singleton_local_shards',
             'src_layer_spec_fn',
             'dst_layer_spec_fn',
         ),
         [
-            (False, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), gpt_te_spec, gpt_te_spec),
-            (False, 'tp-pp-dp', 'tp-pp-dp', (1, 8), (8, 1), gpt_te_spec, gpt_te_spec),
-            (True, 'tp-dp-pp', 'tp-pp-dp', (2, 1), (1, 8), gpt_te_spec, gpt_te_spec),
-            (False, 'tp-dp-pp', 'tp-dp-pp', (1, 1), (2, 2), gpt_te_spec, gpt_te_spec),
-            (True, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), gpt_local_spec, gpt_local_spec),
-            (False, 'tp-dp-pp', 'tp-pp-dp', (1, 1), (2, 4), gpt_te_spec, gpt_local_spec),
-            (True, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), gpt_local_spec, gpt_te_spec),
-            (False, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), gpt_te_spec, gpt_local_spec),
-            (False, 'tp-dp-pp', 'tp-pp-dp', (2, 4), (2, 4), gpt_local_spec, gpt_local_spec),
+            (False, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), True, gpt_te_spec, gpt_te_spec),
+            (False, 'tp-pp-dp', 'tp-pp-dp', (1, 8), (8, 1), False, gpt_te_spec, gpt_te_spec),
+            (True, 'tp-dp-pp', 'tp-pp-dp', (2, 1), (1, 8), True, gpt_te_spec, gpt_te_spec),
+            (False, 'tp-dp-pp', 'tp-dp-pp', (1, 1), (2, 2), True, gpt_te_spec, gpt_te_spec),
+            (True, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), False, gpt_local_spec, gpt_local_spec),
+            (False, 'tp-dp-pp', 'tp-pp-dp', (1, 1), (2, 4), False, gpt_te_spec, gpt_local_spec),
+            (True, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), True, gpt_local_spec, gpt_te_spec),
+            (False, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), False, gpt_te_spec, gpt_local_spec),
+            (False, 'tp-dp-pp', 'tp-pp-dp', (2, 4), (2, 4), True, gpt_local_spec, gpt_local_spec),
         ],
     )
     def test_parallel_reconfiguration_e2e(
@@ -100,6 +101,7 @@ class TestGPTModelReconfiguration:
         use_fpsl,
         load_order,
         store_order,
+        singleton_local_shards,
     ):
         """Test model saving and loading with different TP/PP"""
         Utils.initialize_model_parallel(src_tp_pp[0], src_tp_pp[1])
@@ -113,6 +115,7 @@ class TestGPTModelReconfiguration:
             use_fpsl,
             load_order,
             store_order,
+            metadata={'singleton_local_shards': singleton_local_shards},
         )
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):

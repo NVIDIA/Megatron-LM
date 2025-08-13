@@ -148,6 +148,7 @@ class TestLocalCheckpointing:
             # ShardedObjects and ShardedTensors should be replaced
             assert issubclass(i[-1], ShardedBase)
 
+    @pytest.mark.internal
     @pytest.mark.parametrize(('tp,pp'), [(2, 4), (1, 1)])
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
@@ -177,6 +178,7 @@ class TestLocalCheckpointing:
             mock_args.non_persistent_ckpt_type = 'local'
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
+            mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
             checkpointing_context = {
                 'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
             }
@@ -247,6 +249,7 @@ class TestLocalCheckpointing:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.parametrize(('tp,pp'), [(1, 1), (2, 4)])
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
@@ -280,6 +283,7 @@ class TestLocalCheckpointing:
                 mock_args.non_persistent_ckpt_type = 'local'
                 mock_args.non_persistent_local_ckpt_algo = algo
                 mock_args.async_save = async_save
+                mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
                 checkpointing_context = {
                     'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
                 }

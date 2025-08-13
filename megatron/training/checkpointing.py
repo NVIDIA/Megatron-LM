@@ -361,11 +361,11 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
     metadata['chained_optim_avoid_prefix'] = True
+    metadata['singleton_local_shards'] = False
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
     metadata['dp_cp_group'] = dp_cp_group
-
     return metadata
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
@@ -791,7 +791,7 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
 
             if args.ckpt_format == "torch_dist":
                 optimizer_sd = optimizer.sharded_state_dict(
-                    state_dict, 
+                    state_dict,
                     **(optim_sd_kwargs or {
                         "metadata": {
                             "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True)

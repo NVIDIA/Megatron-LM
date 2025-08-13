@@ -60,6 +60,7 @@ def collect_train_test_metrics(
                     for golden_value_key, golden_values in summaries.items()
                 },
                 fh,
+                indent=4,
             )
 
 
