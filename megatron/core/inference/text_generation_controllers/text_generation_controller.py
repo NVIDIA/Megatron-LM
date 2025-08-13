@@ -206,7 +206,6 @@ class TextGenerationController:
 
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (top_k > 0 and top_p > 0.0), "Cannot have top-p and top-k both greater than zero"
         assert top_p <= 1.0, "top-p should be in (0,1]"
 
         def modify_logits_for_top_k_filtering(logits, top_k):
@@ -293,8 +292,7 @@ class TextGenerationController:
                 if vocab_size:
                     assert top_k < vocab_size, "top-k is larger than vocab size."
                 modify_logits_for_top_k_filtering(last_token_logits, top_k)
-
-            elif top_p > 0.0:
+            if top_p > 0.0:
                 modify_logits_for_top_p_filtering(last_token_logits, top_p)
 
             # After filtering, we need to recalculate the distribution.

@@ -104,14 +104,6 @@ class TestTextGenerationController:
         with pytest.raises(AssertionError) as aerror:
             self.text_generation_controller.sample_from_logits(
                 last_token_logits=None,
-                sampling_params=SamplingParams(top_k=2, top_p=0.4),
-                vocab_size=self.vocab_size,
-            )
-        assert str(aerror.value) == 'Cannot have top-p and top-k both greater than zero'
-
-        with pytest.raises(AssertionError) as aerror:
-            self.text_generation_controller.sample_from_logits(
-                last_token_logits=None,
                 sampling_params=SamplingParams(top_p=1.4, top_k=0),
                 vocab_size=self.vocab_size,
             )
@@ -185,6 +177,67 @@ class TestTextGenerationController:
         assert torch.all(
             sampled_logits >= expected_min_value
         ), f"The sampled logits should all be greater than {expected_min_value} but its {sampled_logits}"
+
+        # Test case for both top_k and top_p being greater than zero
+        # This should apply top_k filtering first, then top_p filtering
+
+        # First, a general test for top_k + top_p as before
+        top_k = 10
+        top_p = 0.7
+        temperature = 1.5
+
+        test_logits = (
+            torch.arange(0, self.vocab_size).repeat(self.batch_size, 1).float().cuda()
+        )
+
+        sampled_logits = self.text_generation_controller.sample_from_logits(
+            test_logits,
+            SamplingParams(top_k=top_k, top_p=top_p, temperature=temperature),
+            self.vocab_size,
+        )
+
+        assert torch.all(
+            sampled_logits >= self.vocab_size - top_k
+        ), f"With top_k={top_k}, sampled tokens should be from top {top_k} tokens, but got {sampled_logits}"
+
+        # Now, a specific test to ensure top_p is working after top_k
+        # We'll set up logits so that top_k=2, and top_p will only allow the highest logit
+
+        # Create logits: last two tokens are much higher than the rest
+        # For batch_size=1 for simplicity
+        batch_size = 1
+        vocab_size = 6
+        logits = torch.tensor([[0.0, 0.0, 0.0, 0.0, 1.0, 10.0]], device="cuda")  # shape (1, 6)
+        # After top_k=2, only indices 4 and 5 remain (values 1.0 and 10.0)
+        # After softmax with large temperature, probabilities will be close to uniform, but let's use a moderate temperature
+        # Let's compute softmax([1.0, 10.0]/T) for T=0.5 (sharper), T=10 (flatter)
+        # We'll use a large temperature to make the probabilities more uniform, so top_p can cut off the lower one
+
+        top_k = 2
+        temperature = 10.0  # Large temperature, so softmax([1.0, 10.0]/10) ~ softmax([0.1, 1.0]) ~ [0.289, 0.710]
+        # If we set top_p=0.7, only the highest logit (index 5) should remain after top_p filtering
+
+        sampled_logits = self.text_generation_controller.sample_from_logits(
+            logits,
+            SamplingParams(top_k=top_k, top_p=0.7, temperature=temperature),
+            vocab_size,
+        )
+
+        # Only index 5 should be possible
+        assert torch.all(
+            sampled_logits == 5
+        ), f"With top_k=2 and top_p=0.7, only the highest logit (index 5) should remain, but got {sampled_logits}"
+
+        # If we set top_p=1.0, both tokens should be possible
+        sampled_indices = set()
+        for _ in range(20):
+            sampled = self.text_generation_controller.sample_from_logits(
+                logits,
+                SamplingParams(top_k=top_k, top_p=1.0, temperature=temperature),
+                vocab_size,
+            )
+            sampled_indices.add(sampled.item())
+        assert {4, 5}.issubset(sampled_indices), "With top_k=2 and top_p=1.0, both top tokens should be possible to sample"
 
     @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
     @pytest.mark.parametrize(
