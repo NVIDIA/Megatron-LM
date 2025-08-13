@@ -1052,6 +1052,9 @@ def validate_args(args, defaults={}):
         print("Warning: --replication-jump was specified despite not using replication. Ignoring.")
         args.replication_jump = None
 
+    if args.overlap_moe_expert_parallel_comm:
+        assert args.untie_embeddings_and_output_weights, \
+            "overlap_moe_expert_parallel_comm requires untie_embeddings_and_output_weights to be enabled"
     if args.delay_wgrad_compute:
         assert args.transformer_impl == 'transformer_engine', \
             "Delaying wgrad compute is only supported with transformer_engine implementation"
