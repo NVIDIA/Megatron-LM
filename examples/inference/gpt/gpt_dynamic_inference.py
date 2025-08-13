@@ -66,7 +66,7 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDia
 
 
 # >>> [ temporary ]
-SUSPEND_RESUME_INTERVAL = 128
+SUSPEND_RESUME_INTERVAL = 16 # 128
 # <<<
 
 
