@@ -1542,6 +1542,7 @@ def is_pipeline_last_stage(ignore_virtual=True, vp_stage=None):
     return get_pipeline_model_parallel_rank() == (get_pipeline_model_parallel_world_size() - 1)
 
 
+# TODO(shifangx): this function is not correct for MTP model and ignore_virtual=False
 def is_rank_in_embedding_group(ignore_virtual=True, vp_stage=None):
     """Return true if current rank is in embedding group, False otherwise."""
     rank = torch.distributed.get_rank()
