@@ -889,25 +889,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if packed_seq_params is not None
             else {}
         )
-        # overwrite self.qkv_format depending on self.config.apply_rope_fusion, which can be set
-        # after init
-        if self.config.apply_rope_fusion and is_te_min_version("0.13.0", check_equality=False):
-            self.qkv_format = "bshd"
-
-        qkv_format = packed_seq_kwargs.get("qkv_format", self.qkv_format)
-
-        # WAR for peak memory usage.
-        # See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2388
-        if self.config.apply_rope_fusion and qkv_format == "bshd":
-            query, key, value = [x.transpose(0, 1).contiguous() for x in (query, key, value)]
-            # In PyTorch, the following two tensors are in fact the same:
-            #   Tensor with shape (1, S, H, D) and stride (S*H*D, H*D, D, 1)
-            #   Tensor with shape (1, S, H, D) and stride (H*D, H*D, D, 1)
-            # Stride for a dimension that is 1 has no meaning, so tensors created two different ways
-            # can have same shape but different strides.
-            # We unify them to the first one to pass the stride check in TE
-            if value.shape == key.shape and value.shape[0] == 1 and value.stride() != key.stride():
-                value = value.as_strided(value.shape, key.stride())
+        qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -942,10 +924,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 query, key, value, attention_mask, **attention_bias_kwargs, **packed_seq_kwargs
             )
 
-        if self.config.apply_rope_fusion and qkv_format == "bshd":
-            return core_attn_out.transpose(0, 1)
-        else:
-            return core_attn_out
+        return core_attn_out
 
 
 if HAVE_TE and is_te_min_version("1.9.0.dev0"):
@@ -1213,6 +1192,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             prefix should be module_name to make keys identical to sequetial ones.
             """
+            singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
             sharded_state_dict = {}
             full_state_dict = self.state_dict(prefix="", keep_vars=True)
             num_global_experts = get_expert_model_parallel_world_size() * self.num_gemms
@@ -1220,23 +1200,27 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             ep_axis = len(sharded_offsets)
             extra_states = self._split_extra_state(full_state_dict["_extra_state"])
             for gemm_idx in range(self.num_gemms):
+                global_expert_idx = local_expert_indices_offset + gemm_idx
                 state_dict = {
                     f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
                     f"{gemm_idx}._extra_state": extra_states[gemm_idx],
                 }
                 if self.use_bias:
                     state_dict[f"{gemm_idx}.bias"] = full_state_dict[f"bias{gemm_idx}"]
-                sub_sd = make_sharded_tensors_for_checkpoint(
-                    state_dict,
-                    "",
-                    tp_axis_map,
-                    (
+                if singleton_local_shards:
+                    expert_prefix = f"{global_expert_idx}.{prefix}"
+                    new_sharded_offsets = sharded_offsets
+                else:
+                    expert_prefix = prefix
+                    new_sharded_offsets = (
                         *sharded_offsets,
-                        (ep_axis, local_expert_indices_offset + gemm_idx, num_global_experts),
-                    ),
+                        (ep_axis, global_expert_idx, num_global_experts),
+                    )
+                sub_sd = make_sharded_tensors_for_checkpoint(
+                    state_dict, '', tp_axis_map, new_sharded_offsets
                 )
                 # Remove expert layers indexing from sharded keys
-                replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", prefix)
+                replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
                 sharded_state_dict.update(
                     {
                         f"{prefix}weight{gemm_idx}": sub_sd[f"{gemm_idx}.weight"],
@@ -1633,10 +1617,8 @@ try:
         else:
             if interleaved:
                 raise ValueError("Only TE >= 2.3.0 supports interleaved fused RoPE.")
-            if is_te_min_version("1.4.0.dev0"):
-                return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
-            else:
-                raise ValueError("Only TE >= 1.4.0.dev0 supports fused RoPE.")
+
+            return apply_rotary_pos_emb(t, freqs, tensor_format="sbhd", fused=True)
 
     def fused_apply_rotary_pos_emb_thd(
         t: torch.Tensor,
@@ -1659,6 +1641,7 @@ try:
                 cp_rank=cp_rank,
             )
         else:
+            assert cp_size == 1, "Only TE >= 1.12 supports RoPE fusion for THD format with CP."
             return apply_rotary_pos_emb(
                 t, freqs, tensor_format="thd", fused=True, cu_seqlens=cu_seqlens
             )

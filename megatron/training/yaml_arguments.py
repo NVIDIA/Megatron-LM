@@ -82,12 +82,6 @@ def validate_yaml(args, defaults={}):
                   args.model_parallel.context_parallel_size,
                   args.model_parallel.tensor_model_parallel_size,
                   args.model_parallel.pipeline_model_parallel_size), flush=True)
-    if args.model_parallel.pipeline_model_parallel_size > 1:
-        if args.model_parallel.pipeline_model_parallel_split_rank is not None:
-            assert args.model_parallel.pipeline_model_parallel_split_rank < \
-                    args.model_parallel.pipeline_model_parallel_size, 'split rank needs'\
-                    ' to be less than pipeline model parallel size ({})'.format(
-                            args.model_parallel.pipeline_model_parallel_size)
 
     if args.model_parallel.tp_comm_overlap:
         assert args.model_parallel.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
@@ -341,9 +335,6 @@ def validate_yaml(args, defaults={}):
     # Load retro args (used by both Retro & GPT).
     if getattr(args, 'retro_project_dir', None) is not None:
         raise Exception("Retro untested for yaml args. See arguments.py.")
-
-    if args.language_model.rotary_interleaved and args.language_model.apply_rope_fusion:
-        raise RuntimeError('--rotary-interleaved does not work with rope_fusion.')
     
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
@@ -439,6 +430,8 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     if args.init_method == "xavier_uniform":
         kw_args['init_method'] = torch.nn.init.xavier_uniform_
         kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
+    if args.embedding_init_method == "xavier_uniform":
+        kw_args['embedding_init_method'] = torch.nn.init.xavier_uniform_
     
     # Return Transformer config.
     if getattr(args, "multi_latent_attention", False):
@@ -449,7 +442,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
 def load_yaml(yaml_path):
     print(f"warning using experimental yaml arguments feature, argparse arguments will be ignored")
     with open(yaml_path, "r") as f:
-        config = yaml.load(f,Loader=yaml.FullLoader)
+        config = yaml.safe_load(f)
         # Convert to nested namespace
         config_namespace = json.loads(json.dumps(config), object_hook=lambda item: SimpleNamespace(**item))
         # Add config location to namespace

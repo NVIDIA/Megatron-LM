@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -13,14 +14,10 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
-from megatron.core.utils import is_te_min_version
 
 logger = logging.getLogger(__name__)
 
-# Prefer fused RoPE from Apex as we need the `transpose_output_memory` argument for the bshd trick.
-# See https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/merge_requests/2469.
 try:
-    # pylint: disable=unused-import
     from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
 except ImportError:
     fused_apply_rotary_pos_emb = None
@@ -38,7 +35,14 @@ except ImportError:
     apply_rotary_emb_flash = None
 
 
-__all__ = ['apply_rotary_emb_flash']
+__all__ = [
+    'apply_rotary_pos_emb',
+    'apply_rotary_emb_flash',
+    'apply_rotary_pos_emb_with_cos_sin',
+    'fused_apply_rotary_pos_emb',
+    'fused_apply_rotary_pos_emb_thd',
+    'get_pos_emb_on_this_cp_rank',
+]
 
 
 def get_pos_emb_on_this_cp_rank(
@@ -199,8 +203,13 @@ def apply_rotary_pos_emb(
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
-            # NOTE: TE backends do not support mRoPE in bshd format when bs > 1
+            # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             if config.mrope_section is not None and freqs.shape[1] > 1:
+                # TODO: Add a check in TransformerConfig and remove this unfused implementation.
+                warnings.warn(
+                    "apply_rope_fusion does not support mRoPE in bshd format when bs > 1. "
+                    "Please set apply_rope_fusion to false. This will become an error in v0.16."
+                )
                 return _apply_rotary_pos_emb_bshd(
                     t,
                     freqs,
@@ -209,34 +218,13 @@ def apply_rotary_pos_emb(
                     mscale=mscale,
                 )
             else:
-                if config.rotary_interleaved:
-                    try:
-                        from megatron.core.extensions.transformer_engine import (
-                            fused_apply_rotary_pos_emb,
-                        )
-
-                        return fused_apply_rotary_pos_emb(t, freqs, interleaved=True)
-                    except ImportError:
-                        raise ImportError(
-                            "TE interleaved fused RoPE is not available."
-                            "Please install TE >= 2.3.0.dev0."
-                        )
-                else:
-                    assert (
-                        fused_apply_rotary_pos_emb is not None
-                    ), "apply_rope_fusion is not available."
-                    return fused_apply_rotary_pos_emb(t, freqs, transpose_output_memory=True)
+                assert fused_apply_rotary_pos_emb is not None, "apply_rope_fusion is not available."
+                return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
             assert fused_apply_rotary_pos_emb_thd is not None, "apply_rope_fusion is not available."
-            cp_size = cp_group.size()
-            if cp_size > 1:
-                if not is_te_min_version("1.11.0", check_equality=False):
-                    raise ValueError("Only TE >= 1.12 supports RoPE fusion for THD format with CP.")
-                return fused_apply_rotary_pos_emb_thd(
-                    t, cu_seqlens, freqs, cp_size=cp_size, cp_rank=cp_group.rank()
-                )
-            else:
-                return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs)
+            return fused_apply_rotary_pos_emb_thd(
+                t, cu_seqlens, freqs, cp_size=cp_group.size(), cp_rank=cp_group.rank()
+            )
     else:
         if cu_seqlens is None:
             return _apply_rotary_pos_emb_bshd(

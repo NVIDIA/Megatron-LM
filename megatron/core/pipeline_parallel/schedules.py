@@ -18,11 +18,16 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_model_config,
     get_model_type,
+<<<<<<< HEAD
     get_model_xattn,
     heterogeneous_context_parallel,
+=======
+>>>>>>> 410222b3ec5e05f53871e7371e02128eff38c7e8
     nvtx_range_pop,
     nvtx_range_push,
 )
+
+from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -182,6 +187,78 @@ def set_current_microbatch(model, microbatch_id):
             layer.current_microbatch = microbatch_id
 
 
+def forward_step_calc_loss(
+    model,
+    output_tensor,
+    loss_func,
+    config,
+    vp_stage,
+    collect_non_loss_data,
+    num_microbatches,
+    forward_data_store,
+):
+    """Calculate the loss and number of tokens for forward_step()"""
+    model_vp_stage = getattr(model, "vp_stage", None)
+    if vp_stage is not None and model_vp_stage is not None:
+        assert (
+            vp_stage == model_vp_stage
+        ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
+    num_tokens = torch.tensor(0, dtype=torch.int)
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+        if not collect_non_loss_data:
+            outputs = loss_func(output_tensor)
+            if len(outputs) == 3:
+                output_tensor, num_tokens, loss_reduced = outputs
+                if not config.calculate_per_token_loss:
+                    output_tensor /= num_tokens
+                    output_tensor /= num_microbatches
+            else:
+                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
+                assert len(outputs) == 2
+                output_tensor, loss_reduced = outputs
+                output_tensor *= parallel_state.get_context_parallel_world_size()
+                output_tensor /= num_microbatches
+            forward_data_store.append(loss_reduced)
+        else:
+            data = loss_func(output_tensor, non_loss_data=True)
+            forward_data_store.append(data)
+
+    if config.timers is not None:
+        config.timers('forward-compute').stop()
+
+    # Set the loss scale for the auxiliary loss of the MoE layer.
+    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
+    # explicitly.
+    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    # Set the loss scale for Multi-Token Prediction (MTP) loss.
+    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
+        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=output_tensor.device)
+        )
+        # Set the loss scale
+        if config.calculate_per_token_loss:
+            MTPLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
+    return output_tensor, num_tokens
+
+
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -194,7 +271,6 @@ def forward_step(
     checkpoint_activations_microbatch=None,
     is_first_microbatch=False,
     current_microbatch=None,
-    encoder_decoder_xattn=False,
     vp_stage=None,
 ):
     """Forward step for passed-in model.
@@ -292,74 +368,16 @@ def forward_step(
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
-
-    model_vp_stage = getattr(model, "vp_stage", None)
-    if vp_stage is not None and model_vp_stage is not None:
-        assert (
-            vp_stage == model_vp_stage
-        ), f"vp_stage ({vp_stage}) doesn't match model_vp_stage ({model_vp_stage})"
-    num_tokens = torch.tensor(0, dtype=torch.int)
-    if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
-        if not collect_non_loss_data:
-            outputs = loss_func(output_tensor)
-            if len(outputs) == 3:
-                output_tensor, num_tokens, loss_reduced = outputs
-                if not config.calculate_per_token_loss:
-                    output_tensor /= num_tokens
-                    output_tensor /= num_microbatches
-            else:
-                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
-                assert len(outputs) == 2
-                output_tensor, loss_reduced = outputs
-                output_tensor *= parallel_state.get_context_parallel_world_size()
-                output_tensor /= num_microbatches
-            forward_data_store.append(loss_reduced)
-        else:
-            data = loss_func(output_tensor, non_loss_data=True)
-            forward_data_store.append(data)
-
-    if config.timers is not None:
-        config.timers('forward-compute').stop()
-
-    # Set the loss scale for the auxiliary loss of the MoE layer.
-    # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
-    # explicitly.
-    if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
-
-    # Set the loss scale for Multi-Token Prediction (MTP) loss.
-    if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
-        # Set the loss scale
-        if config.calculate_per_token_loss:
-            MTPLossAutoScaler.set_loss_scale(loss_scale)
-        else:
-            MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
-
-    # If T5 model and in decoder stack, then send encoder_hidden_state
-    # downstream as well.
-    model_type = get_model_type(model)
-    if (
-        model_type == ModelType.encoder_and_decoder
-        and encoder_decoder_xattn
-        and parallel_state.is_inside_decoder()
-    ):
-        return [output_tensor, input_tensor[-1]], num_tokens
+    output_tensor, num_tokens = forward_step_calc_loss(
+        model,
+        output_tensor,
+        loss_func,
+        config,
+        vp_stage,
+        collect_non_loss_data,
+        num_microbatches,
+        forward_data_store,
+    )
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
@@ -421,16 +439,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             else:
                 input_tensor_grad.append(x.grad)
 
-    # Handle single skip connection if it exists (encoder_hidden_state in
-    # model with encoder and decoder).
-    if (
-        parallel_state.get_pipeline_model_parallel_world_size() > 1
-        and model_type == ModelType.encoder_and_decoder
-        and len(output_tensor_grad) > 1  # excludes models that lack a skip connection.
-    ):
-        if output_tensor_grad[1] is not None:
-            assert input_tensor_grad[-1] is not None
-            input_tensor_grad[-1].add_(output_tensor_grad[1])
     if unwrap_input_tensor_grad:
         input_tensor_grad = input_tensor_grad[0]
 
@@ -496,57 +504,65 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
-    # Create a wrapper function that handles heterogeneous context parallel if needed
-    def forward_step_wrapper(*args, **kwargs):
-        if config.heterogeneous_context_parallel:
-            return heterogeneous_context_parallel(
-                forward_step, backward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type
-            )(*args, **kwargs)
-        else:
-            return forward_step(*args, **kwargs)
 
-    with no_sync_func():
-        for i in range(num_microbatches - 1):
-            output_tensor, num_tokens = forward_step_wrapper(
-                forward_step_func,
-                data_iterator,
-                model,
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                collect_non_loss_data,
-                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                current_microbatch=i,
-            )
-            total_num_tokens += num_tokens
-            if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+    if config.overlap_moe_expert_parallel_comm and not forward_only:
+        forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            output_tensor_grad,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            first_val_step,
+            forward_only,
+            no_sync_func,
+            total_num_tokens,
+            partial(check_first_val_step, first_val_step, forward_only),
+        )
+    else:
+        with no_sync_func():
+            for i in range(num_microbatches - 1):
+                output_tensor, num_tokens = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                    current_microbatch=i,
+                )
+                total_num_tokens += num_tokens
+                if not forward_only:
+                    backward_step(
+                        input_tensor, output_tensor, output_tensor_grad, model_type, config
+                    )
+        # Run computation for last microbatch out of context handler (want to
+        # synchronize gradients).
+        output_tensor, num_tokens = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, num_microbatches == 1
+            ),
+            current_microbatch=num_microbatches - 1,
+        )
 
-    # TODO: Does the last complete microbatch should run with sync?
-    # What will this do when we have multiple micro-microbatches within a
-    # forward and we ideally want only sync at end?
+        total_num_tokens += num_tokens
 
-    # Run computation for last microbatch out of context handler (want to
-    # synchronize gradients).
-    output_tensor, num_tokens = forward_step(
-        forward_step_func,
-        data_iterator,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        config,
-        collect_non_loss_data,
-        is_first_microbatch=check_first_val_step(
-            first_val_step, forward_only, num_microbatches == 1
-        ),
-        current_microbatch=num_microbatches - 1,
-    )
-    total_num_tokens += num_tokens
-
-    if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        if not forward_only:
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -558,7 +574,11 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+    if (
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
+    ):
         create_cudagraphs()
 
     return forward_data_store
@@ -606,7 +626,11 @@ def finish_embedding_wgrad_compute(config, embedding_module):
 
 
 def get_pp_rank_microbatches(
-    num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage, forward_only=False
+    num_microbatches,
+    num_model_chunks,
+    microbatch_group_size_per_vp_stage,
+    forward_only=False,
+    overlap_moe_expert_parallel_comm=False,
 ):
     """Get the number of total, warmup, and remaining microbatches in PP scheduling."""
     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -630,6 +654,11 @@ def get_pp_rank_microbatches(
             # immediately start with 1F1B).
             num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
             num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+            # When enabling overlap_moe_expert_parallel_comm, we schedule one extra micro-batch
+            # forward step before the 1f1b stages. This is needed to ensure the forward
+            # and backward computations are independent in all 1f1b steps.
+            if overlap_moe_expert_parallel_comm:
+                num_warmup_microbatches = num_warmup_microbatches + 1
     else:
         # forward_backward_no_pipelining
         # This path is only used for cuda graph capturing compatibility for the PP=1 case.
@@ -801,7 +830,7 @@ def forward_backward_pipelining_with_interleaving(
 
     input_tensors = [[] for _ in range(len(model))]
     output_tensors = [[] for _ in range(len(model))]
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     forward_data_store = []
     output_tensor_grads = None
@@ -837,28 +866,10 @@ def forward_backward_pipelining_with_interleaving(
 
     model_type = get_model_type(model[0])
 
-    if model_type == ModelType.encoder_and_decoder:
-        xattn_needed = get_model_xattn(model)
-        assert (
-            not xattn_needed
-        ), "Interleaving is not supported when xattn is required between encoder and decoder"
-        tensor_shape = get_tensor_shapes(
-            rank=parallel_state.get_pipeline_model_parallel_rank(),
-            model_type=model_type,
-            seq_length=seq_length,
-            micro_batch_size=micro_batch_size,
-            decoder_seq_length=decoder_seq_length,
-            config=config,
-            encoder_decoder_xattn=xattn_needed,
-        )
-        tensor_shape = list(tensor_shape[0])
-    else:
-        tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
-        tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
-        if config.sequence_parallel:
-            tensor_shape[0] = (
-                tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
-            )
+    tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
+    tensor_shape[0] = tensor_shape[0] // parallel_state.get_context_parallel_world_size()
+    if config.sequence_parallel:
+        tensor_shape[0] = tensor_shape[0] // parallel_state.get_tensor_model_parallel_world_size()
 
     # Compute number of warmup and remaining microbatches.
     num_model_chunks = len(model)
@@ -1633,7 +1644,11 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+    if (
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
+    ):
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
@@ -1648,40 +1663,24 @@ def get_tensor_shapes(
     micro_batch_size: int,
     decoder_seq_length: int,
     config,
-    encoder_decoder_xattn: bool,
 ):
     """
     Determine right tensor sizes (based on position of rank with respect to split rank) and
     model size.
-    Send two tensors if model decoder requires the encoder's output (via cross-attention) and
-    rank is in decoder stage.
-    First tensor is decoder. Second tensor is encoder.
-    If model has an encoder & decoder and rank is at the boundary, send one tensor.
-    Otherwise, send one tensor.
     """
     tensor_shapes = []
 
-    seq_length = seq_length // parallel_state.get_context_parallel_world_size()
-    if model_type == ModelType.encoder_and_decoder:
-        decoder_seq_length = decoder_seq_length // parallel_state.get_context_parallel_world_size()
+    # Use decoder_seq_length if provided, otherwise use seq_length
+    effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
+
+    effective_seq_length = effective_seq_length // parallel_state.get_context_parallel_world_size()
 
     if config.sequence_parallel:
-        seq_length = seq_length // parallel_state.get_tensor_model_parallel_world_size()
-        if model_type == ModelType.encoder_and_decoder:
-            decoder_seq_length = (
-                decoder_seq_length // parallel_state.get_tensor_model_parallel_world_size()
-            )
+        effective_seq_length = (
+            effective_seq_length // parallel_state.get_tensor_model_parallel_world_size()
+        )
 
-    if model_type == ModelType.encoder_and_decoder:
-        if parallel_state.is_inside_encoder(rank) and not parallel_state.is_inside_decoder(rank):
-            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-        elif encoder_decoder_xattn:
-            tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
-            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-        else:
-            tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
-    else:  # model_type == ModelType.encoder_or_decoder
-        tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+    tensor_shapes.append((effective_seq_length, micro_batch_size, config.hidden_size))
     return tensor_shapes
 
 
@@ -1850,7 +1849,6 @@ def forward_backward_pipelining_without_interleaving(
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     model_type = get_model_type(model)
-    encoder_decoder_xattn = get_model_xattn(model)
 
     rank = parallel_state.get_pipeline_model_parallel_rank()
     recv_tensor_shapes = get_tensor_shapes(
@@ -1860,7 +1858,6 @@ def forward_backward_pipelining_without_interleaving(
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
-        encoder_decoder_xattn=encoder_decoder_xattn,
     )
     send_tensor_shapes = get_tensor_shapes(
         rank=rank,
@@ -1869,7 +1866,6 @@ def forward_backward_pipelining_without_interleaving(
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
-        encoder_decoder_xattn=encoder_decoder_xattn,
     )
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
@@ -1879,7 +1875,7 @@ def forward_backward_pipelining_without_interleaving(
     # Input, output tensors only need to be saved when doing backward passes
     input_tensors = None
     output_tensors = None
-    total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
+    total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
 
     if not forward_only:
         input_tensors = []
@@ -1912,7 +1908,6 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch,
             check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
-            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         send_forward(
             output_tensor, send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
@@ -1958,7 +1953,6 @@ def forward_backward_pipelining_without_interleaving(
                 first_val_step, forward_only, (i == 0) and (num_warmup_microbatches == 0)
             ),
             current_microbatch=i + num_warmup_microbatches,
-            encoder_decoder_xattn=encoder_decoder_xattn,
         )
         total_num_tokens += num_tokens
 
@@ -2066,7 +2060,11 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if hasattr(config, 'enable_cuda_graph') and config.enable_cuda_graph:
+    if (
+        hasattr(config, 'enable_cuda_graph')
+        and config.enable_cuda_graph
+        and config.cuda_graph_scope != "full_iteration"
+    ):
         create_cudagraphs()
 
     return forward_data_store

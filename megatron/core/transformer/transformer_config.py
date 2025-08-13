@@ -211,6 +211,18 @@ class TransformerConfig(ModelParallelConfig):
     """Standard deviation of the zero mean normal for the default initialization method, not used if
     init_method and output_layer_init_method are provided."""
 
+    embedding_init_method: Optional[Callable] = None
+    """
+    Method to initialize weights of the embedding layer. If None, will be set as described 
+    in init_method above.
+    """
+
+    embedding_init_method_std: Optional[float] = None
+    """
+    Standard deviation of the zero mean normal for the default initialization method for the 
+    embedding layer. If None, will be set to init_method_std.
+    """
+
     init_model_with_meta_device: bool = False
     """
     If True, initializes the model with the meta device. This is helpful for
@@ -254,6 +266,9 @@ class TransformerConfig(ModelParallelConfig):
 
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
+
+    use_fused_weighted_squared_relu: bool = False
+    """If True, uses fused weighted squared relu kernel when using MoE."""
 
     ####################
     # activation recomputation
@@ -539,7 +554,9 @@ class TransformerConfig(ModelParallelConfig):
     # Cuda Graphs
     ##################
     enable_cuda_graph: bool = False
-    """When set to true, TransformerLayer layers are swapped with a CUDA graphed version."""
+    """When set to true, either partial CUDA graph (1/many CUDA graph per layer) or full iteration
+    CUDA graph (1 CUDA graph for whole iteration excluding optimizer) is enabled. --cuda-graph-scope
+    determines the scope of graph capture."""
 
     cuda_graph_use_single_mempool: bool = False
     """When set to true, cudagraphs will be captured inside a single mempool, in which all
@@ -560,9 +577,11 @@ class TransformerConfig(ModelParallelConfig):
     """When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
     cuda_graph_scope: str = "full"
-    """When external_cuda_graph is set to true, cuda_graph_scope determines the CUDA graphs
-    capturing scope. Valid values are "full" and "attn". "Full" scope captures a whole Transformer
-    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention()."""
+    """Determines the CUDA graphs capturing scope. When external_cuda_graph is set to true,
+    valid values are "full" and "attn". "Full" scope captures a whole Transformer
+    layer. "Attn" scope only captures operations in TransformerLayer._forward_attention().
+    When enable_cuda_graph is set to true, "full_iteration" can be specified as cuda_graph_scope
+    to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
     ####################
     # miscellaneous
@@ -1068,10 +1087,10 @@ class TransformerConfig(ModelParallelConfig):
                 )
             else:
                 if self.rotary_interleaved:
-                    if not is_te_min_version("2.3.0.dev0"):
+                    if not is_te_min_version("2.3.0"):
                         raise ValueError(
                             "rotary_interleaved does not work with apply_rope_fusion for "
-                            "TE < 2.3.0.dev0. Please install TE >= 2.3.0.dev0"
+                            "TE < 2.3.0. Please install TE >= 2.3.0"
                         )
 
                 from megatron.core.models.common.embeddings.rope_utils import (
@@ -1081,11 +1100,28 @@ class TransformerConfig(ModelParallelConfig):
 
                 if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
                     raise ValueError(
-                        "apply_rope_fusion is not available. Please install TE >= 1.4 or Apex."
+                        "apply_rope_fusion is not available. Please install TE >= 1.4."
                     )
 
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
+
+        # Set the embedding init method
+        if self.embedding_init_method_std is None:
+            # By default, use the same init std as you use for every other non-output layer.
+            self.embedding_init_method_std = self.init_method_std
+
+        if self.embedding_init_method is None:
+            if self.init_method is None or (self.embedding_init_method_std != self.init_method_std):
+                # In this case, we set both the init method and the embedding init method to
+                #  whatever std value requested (or defaulted) for the embedding_init_layer
+                self.embedding_init_method = init_method_normal(self.embedding_init_method_std)
+            else:
+                # Replicate the current behavior where if you are not changing the std of the
+                #  embedding init differently and the init method is set, we fallback to the
+                #  init method for this layer. Since we are here after an OR we know that
+                #  init_method is not None
+                self.embedding_init_method = self.init_method
 
         if self.init_method is None:
             self.init_method = init_method_normal(self.init_method_std)
@@ -1198,6 +1234,55 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError("fused permutation is not available. Please install TE >= 2.1.0.")
 
+        if self.overlap_moe_expert_parallel_comm:
+            # TODO: remove this after we fix the hang issue with torch version < 2.6.0
+            assert is_torch_min_version(
+                "2.6.0"
+            ), "A2A Overlap encounters hang issue with torch version < 2.6.0"
+            # Basic requirements for overlap_moe_expert_parallel_comm
+            assert (
+                self.pipeline_model_parallel_size == 1
+            ), '(Temporary) overlap_moe_expert_parallel_comm is not supported when PP>1.'
+            # Expert model parallelism requirements
+            assert (
+                self.expert_model_parallel_size > 1
+            ), 'overlap_moe_expert_parallel_comm is only supported with expert model parallelism'
+            assert self.moe_token_dispatcher_type in [
+                'alltoall',
+                'flex',
+            ], 'overlap_moe_expert_parallel_comm is supported with alltoall/flex token dispatcher'
+
+            assert (
+                self.recompute_granularity != 'full'
+            ), 'disable full recomputation when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.recompute_method is None
+            ), 'disable recomputation method when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.recompute_num_layers is None
+            ), 'recompute_num_layers must be None when enabling overlap_moe_expert_parallel_comm'
+
+            # Check if bf16 or fp16 is used
+            assert (
+                self.bf16 or self.fp16
+            ), 'overlap_moe_expert_parallel_comm is only supported with bf16 or fp16 model'
+
+            assert (
+                not self.moe_shared_expert_overlap
+            ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
+            assert (
+                self.mtp_num_layers is None
+            ), '(Temporary) MTP is not supported when enabling overlap_moe_expert_parallel_comm.'
+
+        # Check delay_wgrad_compute compatibility
+        if self.delay_wgrad_compute:
+            assert (
+                self.overlap_moe_expert_parallel_comm
+            ), 'overlap_moe_expert_parallel_comm must be enabled when enabling delay_wgrad_compute'
+            assert (
+                not self.moe_use_legacy_grouped_gemm
+            ), 'delay_wgrad_compute is not supported with legacy groupedgemm implementation'
+
         if self.context_parallel_size > 1 and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
@@ -1304,10 +1389,10 @@ class MLATransformerConfig(TransformerConfig):
     beta_slow: float = 1
     """Beta slow for YaRN RoPE, used by yarn."""
 
-    mscale: float = 0.707
+    mscale: float = 1.0
     """Mscale for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
-    mscale_all_dim: float = 0.707
+    mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
     def __post_init__(self):

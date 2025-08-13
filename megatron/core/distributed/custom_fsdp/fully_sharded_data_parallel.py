@@ -217,6 +217,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self.module.apply(unmap_weight_tensor)
 
+        for param in self.module.parameters():
+            if not hasattr(param, 'grad_added_to_main_grad'):
+                # This is to ensure that the param.grad_added_to_main_grad is set to False
+                # when the parameter is created.
+                param.grad_added_to_main_grad = False
+            if not hasattr(param, '__fsdp_param__'):
+                # This is to ensure that the param.__fsdp_param__ is set to True
+                # when the parameter is created.
+                param.__fsdp_param__ = True
+
     def _init_fsdp_param_and_grad_buffer(self):
         if self.config.calculate_per_token_loss:
             # We don't need to scale the gradients in this case.

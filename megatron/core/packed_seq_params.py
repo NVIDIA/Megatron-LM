@@ -17,6 +17,6 @@ class PackedSeqParams:
     cu_seqlens_kv: Tensor = None
     cu_seqlens_q_padded: Tensor = None
     cu_seqlens_kv_padded: Tensor = None
-    max_seqlen_q: Tensor = None
-    max_seqlen_kv: Tensor = None
+    max_seqlen_q: int = None
+    max_seqlen_kv: int = None
     cp_assignment: List[int] = None

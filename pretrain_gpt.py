@@ -58,6 +58,40 @@ except ImportError:
 stimer = StragglerDetector()
 
 
+def _get_transformer_layer_spec(use_te, config):
+    """Get transformer layer specification based on configuration.
+    
+    Args:
+        use_te (bool): Whether to use Transformer Engine
+        args: Training arguments
+        config: Model configuration
+        
+    Returns:
+        transformer_layer_spec: The transformer layer specification
+    """
+    args = get_args()
+    if use_te:
+        return get_gpt_layer_with_transformer_engine_spec(
+            args.num_experts,
+            args.moe_grouped_gemm,
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            args.moe_use_legacy_grouped_gemm,
+            qk_l2_norm=args.qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+        )
+    else:
+        return get_gpt_layer_local_spec(
+            args.num_experts,
+            args.moe_grouped_gemm,
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            args.moe_use_legacy_grouped_gemm,
+            normalization=args.normalization,
+            use_kitchen=config.use_kitchen,
+        )
+
+
 def model_provider(
     pre_process=True, post_process=True, vp_stage: Optional[int] = None
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
@@ -130,30 +164,17 @@ def model_provider(
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
-                if use_te:
-                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                        qk_l2_norm=args.qk_l2_norm,
-                        use_kitchen=config.use_kitchen,
-                    )
-                else:
-                    transformer_layer_spec = get_gpt_layer_local_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                        normalization=args.normalization,
-                        use_kitchen=config.use_kitchen,
-                    )
+                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
+            if hasattr(transformer_layer_spec, 'layer_specs') and len(transformer_layer_spec.layer_specs) == 0:
+                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
+                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
+                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+            else:
+                transformer_layer_spec_for_mtp = transformer_layer_spec
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, transformer_layer_spec, use_transformer_engine=use_te, vp_stage=vp_stage
+                config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
             )
 
         model = GPTModel(
@@ -261,12 +282,13 @@ def loss_func(
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
+        return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
     timers = get_timers()
@@ -282,9 +304,17 @@ def forward_step(data_iterator, model: GPTModel):
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
-            output_tensor = model(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
-            )
+            if return_schedule_plan:
+                assert args.overlap_moe_expert_parallel_comm, \
+                    "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+                schedule_plan = model.build_schedule_plan(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                )
+                return schedule_plan, partial(loss_func, loss_mask, model=model)
+            else:
+                output_tensor = model(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)

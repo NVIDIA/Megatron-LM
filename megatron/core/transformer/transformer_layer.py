@@ -37,10 +37,6 @@ logger = logging.getLogger(__name__)
 def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
     pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
-    if not parallel_state.is_inside_encoder():
-        pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
-        if pp_decoder_start is not None:
-            pipeline_rank = pipeline_rank - pp_decoder_start
 
     if config.pipeline_model_parallel_size > 1:
 
@@ -86,6 +82,12 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                 - num_layers_in_last_pipeline_stage
             )
 
+            middle_pipeline_rank = (
+                pipeline_rank
+                if config.num_layers_in_first_pipeline_stage is None
+                else pipeline_rank - 1
+            )
+
             if (vp_size := config.virtual_pipeline_model_parallel_size) is not None:
                 assert (
                     vp_stage is not None
@@ -125,7 +127,7 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                     offset = (
                         vp_stage * total_virtual_chunks
                         + num_layers_per_virtual_model_chunk_in_first_pipeline_stage
-                        + (pipeline_rank - 1)
+                        + middle_pipeline_rank
                         * (
                             num_layers_per_vritual_model_chunk_in_middle_pipeline_stage
                             // middle_pipeline_stages
@@ -136,12 +138,6 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                     num_layers_per_pipeline_rank = middle_num_layers // middle_pipeline_stages
                 else:
                     num_layers_per_pipeline_rank = 0
-
-                middle_pipeline_rank = (
-                    pipeline_rank
-                    if config.num_layers_in_first_pipeline_stage is None
-                    else pipeline_rank - 1
-                )
 
                 if pipeline_rank == 0:
                     offset = 0
@@ -276,11 +272,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         super().__init__(config=config)
 
         # Enable cuda graphs.
-        if config.enable_cuda_graph or config.external_cuda_graph:
+        if (
+            config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration"
+        ) or config.external_cuda_graph:
             assert not (
                 config.enable_cuda_graph and config.external_cuda_graph
             ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
-            if config.enable_cuda_graph:
+            if config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration":
                 if not self.training:
                     # Cudagraphs for inference are only enabled with the flash decoding kernel
                     assert (
@@ -722,7 +720,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 self.self_attention,
                 self.pre_cross_attn_layernorm,
                 self.cross_attention,
-                self.pre_mlp_layernorm,
             ]
 
         param_modules = []

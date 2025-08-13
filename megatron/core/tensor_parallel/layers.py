@@ -49,6 +49,7 @@ except ImportError:
 
 try:
     import transformer_engine  # pylint: disable=unused-import
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE = True
 except ImportError:
@@ -568,19 +569,29 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
                 if getattr(weight, "zero_out_wgrad", False):
-                    grad_weight = torch.zeros(
-                        weight.main_grad.shape,
-                        dtype=input.dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+                    if HAVE_TE:
+                        # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
+                        # across different layers/microbatches. The function accepts shape as list.
+                        grad_weight = get_dummy_wgrad(
+                            list(weight.main_grad.shape), input.dtype, zero=True
+                        )
+                    else:
+                        grad_weight = torch.zeros(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
                 else:
-                    grad_weight = torch.empty(
-                        weight.main_grad.shape,
-                        dtype=input.dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+                    if HAVE_TE:
+                        grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)
+                    else:
+                        grad_weight = torch.empty(
+                            weight.main_grad.shape,
+                            dtype=input.dtype,
+                            device=torch.cuda.current_device(),
+                            requires_grad=False,
+                        )
                 weight.grad_added_to_main_grad = True
             else:
                 grad_weight = None
@@ -912,14 +923,18 @@ class ColumnParallelLinear(torch.nn.Module):
                 "`allreduce_dgrad` and `sequence_parallel` cannot be enabled at the same time."
             )
 
-        self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
-
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
             lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
                 f"{prefix}_extra_state"
             )
         )
+
+    def _forward_impl(self, *args, **kwargs):
+        if self.weight is not None and not self.weight.requires_grad:
+            return linear_with_frozen_weight(*args, **kwargs)
+        else:
+            return linear_with_grad_accumulation_and_async_allreduce(*args, **kwargs)
 
     def forward(
         self,
@@ -978,11 +993,6 @@ class ColumnParallelLinear(torch.nn.Module):
                 self.embedding_activation_buffer.append(input_parallel)
 
         # Matrix multiply.
-        if not weight.requires_grad:
-            self._forward_impl = linear_with_frozen_weight
-        else:
-            self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
-
         allreduce_dgrad = False if self.explicit_expert_comm else self.allreduce_dgrad
 
         if self.config._cpu_offloading_context is not None:
@@ -1192,14 +1202,18 @@ class RowParallelLinear(torch.nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
-
         # Hook adding a default empty _extra_state for state dict
         self._register_load_state_dict_pre_hook(
             lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(
                 f"{prefix}_extra_state"
             )
         )
+
+    def _forward_impl(self, *args, **kwargs):
+        if self.weight is not None and not self.weight.requires_grad:
+            return linear_with_frozen_weight(*args, **kwargs)
+        else:
+            return linear_with_grad_accumulation_and_async_allreduce(*args, **kwargs)
 
     def forward(self, input_):
         """Forward of RowParallelLinear
@@ -1219,11 +1233,6 @@ class RowParallelLinear(torch.nn.Module):
             assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_, group=self.tp_group)
         # Matrix multiply.
-        if not self.weight.requires_grad:
-            self._forward_impl = linear_with_frozen_weight
-        else:
-            self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
-
         allreduce_dgrad = False
 
         if self.config._cpu_offloading_context is not None:

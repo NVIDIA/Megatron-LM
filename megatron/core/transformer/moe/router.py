@@ -308,11 +308,18 @@ class TopKRouter(Router):
         aux_loss = load_balancing_loss_func(
             moe_aux_loss_coeff=moe_aux_loss_coeff, sequence_partition_group=sequence_partition_group
         )
+        # TODO (zijiey): fix the per_layer_logging for MTP, currently it will incorrectly
+        # add the aux loss logging value to other layer's since it is difficult to get the
+        # correct layer_number for MTP. It does not affect the correctness of the calculation
+        # results and the reduced load_balancing_loss logging value.
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
         save_to_aux_losses_tracker(
             "load_balancing_loss",
             aux_loss / moe_aux_loss_coeff,
             self.layer_number,
-            self.config.num_layers,
+            num_layers,
             reduce_group=sequence_partition_group,
         )
         if self.calculate_per_token_loss:
@@ -354,8 +361,12 @@ class TopKRouter(Router):
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss * logits.shape[0])
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+
+            num_layers = self.config.num_layers
+            if self.config.mtp_num_layers is not None:
+                num_layers += self.config.mtp_num_layers
             save_to_aux_losses_tracker(
-                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, self.config.num_layers
+                "z_loss", z_loss / moe_z_loss_coeff, self.layer_number, num_layers
             )
         return logits
 
@@ -448,3 +459,13 @@ class TopKRouter(Router):
         scores, routing_map = self.routing(logits)
 
         return scores, routing_map
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        """Load the state dict of the router."""
+        self._maintain_float32_expert_bias()  # switch to float32 before loading
+        return super()._load_from_state_dict(*args, **kwargs)
+
+    def _save_to_state_dict(self, *args, **kwargs):
+        """Save the state dict of the router."""
+        self._maintain_float32_expert_bias()  # switch to float32 before saving
+        return super()._save_to_state_dict(*args, **kwargs)

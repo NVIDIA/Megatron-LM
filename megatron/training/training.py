@@ -13,6 +13,8 @@ import sys
 from typing import List, Optional
 
 import torch.distributed
+
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -50,10 +52,12 @@ from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
+from megatron.training.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
+from megatron.core.optimizer.optimizer import param_group_identifier_keys
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -484,6 +488,39 @@ def preprocess_common_state_dict(common_state_dict):
     # Remove rank and local rank from state dict if it exists, since they are expected to be different
     preprocessed_common_state_dict['args'].pop('local_rank', None)
     preprocessed_common_state_dict['args'].pop('rank', None)
+    if (
+        preprocessed_common_state_dict['args']['use_distributed_optimizer']
+        and "optimizer" in preprocessed_common_state_dict
+    ):
+        def reorder_inner_param_groups(optimizer_state_dict):
+            # When distributed optimizer loading, source param groups will be reordered,
+            # so we reorder the param groups here to prevent warning.
+
+            # Pop empty param_state.
+            if "param_state" in optimizer_state_dict and not optimizer_state_dict["param_state"]:
+                optimizer_state_dict.pop("param_state")
+
+            # Reorder param groups.
+            if "optimizer" not in optimizer_state_dict:
+                return
+            inner_optimizer = optimizer_state_dict["optimizer"]
+            if "param_groups" not in inner_optimizer:
+                return
+            param_groups = inner_optimizer["param_groups"]
+            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            param_groups.sort(key=key_fn)
+            inner_optimizer["param_groups"] = param_groups
+
+        optimizer_state_dict = preprocessed_common_state_dict['optimizer']
+        if "optimizer" in optimizer_state_dict:
+            # Only 1 optimizer in chained optimizer.
+            reorder_inner_param_groups(optimizer_state_dict)
+        else:
+            # Multiple optimizers in chained optimizer.
+            for i in range(len(optimizer_state_dict)):
+                if i in optimizer_state_dict.keys():
+                    reorder_inner_param_groups(optimizer_state_dict[i])
+
     return preprocessed_common_state_dict
 
 
@@ -802,14 +839,12 @@ def pretrain(
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type, checkpointing_context=checkpointing_context
     )
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-    app_metrics['app_build_optimizer_finish_time'] = one_logger_utils.get_timestamp_in_ms()
     config = get_model_config(model[0])
 
     # Data stuff.
@@ -987,10 +1022,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             mpu.get_pipeline_model_parallel_world_size() > 1
             and args.virtual_pipeline_model_parallel_size is not None
         ):
-            if model_type == ModelType.encoder_and_decoder:
-                assert (
-                    args.encoder_pipeline_model_parallel_size == 0
-                ), "Interleaved schedule not supported for model with encoder on separate PP rank"
             model = []
             for i in range(args.virtual_pipeline_model_parallel_size):
                 # Set pre_process and post_process only after virtual rank is set.
@@ -1004,25 +1035,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         else:
             pre_process = mpu.is_pipeline_first_stage()
             post_process = mpu.is_pipeline_last_stage()
-            add_encoder = True
-            add_decoder = True
-            if model_type == ModelType.encoder_and_decoder:
-                if mpu.get_pipeline_model_parallel_world_size() > 1:
-                    rank = mpu.get_pipeline_model_parallel_rank()
-                    first_decoder_rank = args.encoder_pipeline_model_parallel_size
-                    world_size = mpu.get_pipeline_model_parallel_world_size()
-                    pre_process = rank == 0 or rank == first_decoder_rank
-                    post_process = (rank == (first_decoder_rank - 1)) or (rank == (world_size - 1))
-                    add_encoder = mpu.is_inside_encoder(rank)
-                    add_decoder = mpu.is_inside_decoder(rank)
-                model = model_provider_func(
-                    pre_process=pre_process,
-                    post_process=post_process,
-                    add_encoder=add_encoder,
-                    add_decoder=add_decoder,
-                )
-            else:
-                model = model_provider_func(pre_process=pre_process, post_process=post_process)
+            model = model_provider_func(pre_process=pre_process, post_process=post_process)
             model.model_type = model_type
         return model
 
@@ -1129,18 +1142,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
 
-        model = [
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=model_chunk,
-                # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                # model chunks is overlapped with compute anyway.
-                disable_bucketing=(model_chunk_idx > 0)
-                or args.overlap_param_gather_with_optimizer_step,
-            )
-            for (model_chunk_idx, model_chunk) in enumerate(model)
-        ]
+        with torch.cuda.stream(torch.cuda.Stream()):
+            model = [
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=model_chunk,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                    # model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0)
+                    or args.overlap_param_gather_with_optimizer_step,
+                )
+                for (model_chunk_idx, model_chunk) in enumerate(model)
+            ]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -1222,6 +1236,7 @@ def setup_model_and_optimizer(
     model = get_model(model_provider_func, model_type)
     unwrapped_model = unwrap_model(model)
 
+    one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
         if hasattr(args, f.name):
@@ -1235,8 +1250,12 @@ def setup_model_and_optimizer(
         scale_lr_cond,
         lr_mult,
         use_gloo_process_groups=args.enable_gloo_process_groups,
+        # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
+        #  to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
+        default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
     )
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+    one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
@@ -1351,13 +1370,15 @@ def setup_model_and_optimizer(
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
-    for _ in range(num_microbatches):
-        # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
-        batch = get_batch_on_this_tp_rank(data_iterator)
-        batch = get_batch_on_this_cp_rank(batch)
+    rerun_state_machine = get_rerun_state_machine()
+    while rerun_state_machine.should_run_forward_backward(data_iterator):
+        for _ in range(num_microbatches):
+            # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
+            batch = get_batch_on_this_tp_rank(data_iterator)
+            batch = get_batch_on_this_cp_rank(batch)
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()
     timers = get_timers()
@@ -1390,8 +1411,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             adjust_tensor_shapes_fn = None
 
+        # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
+        # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+        # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance._copy_main_params_to_param_buffer()
+
         # Forward pass.
-        forward_backward_func = get_forward_backward_func()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1668,6 +1696,7 @@ def training_log(
             track_names=track_names,
             num_layers=args.num_layers,
             moe_layer_freq=args.moe_layer_freq,
+            mtp_num_layers=args.mtp_num_layers,
         )
     if args.mtp_num_layers is not None:
         mtp_loss_scale = 1 / get_num_microbatches()
@@ -1850,6 +1879,11 @@ def save_checkpoint_and_time(
         train_data_iterator=train_data_iterator,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
     )
+    if args.fp8:
+        # Run garbage collection after checkpoint saving to free memory from
+        # dequantized bf16 tensors that were temporarily created during fp8
+        # model checkpoint saving.
+        gc.collect()
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
     timers(timer_key).stop(barrier=True)
@@ -2026,7 +2060,6 @@ def checkpoint_and_decide_exit(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
-        torch.distributed.barrier()
         print_datetime(f'exiting program at iteration {iteration}')
 
         return True
@@ -2078,7 +2111,8 @@ def train(
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
     rerun_state_machine = get_rerun_state_machine()
     if rerun_state_machine.current_iteration != iteration:
-        print_rank_0(f"Setting rerun_state_machine.current_iteration to {iteration}...")
+        print_rank_0(f"Overwriting rerun_state_machine.current_iteration from "
+                     f"{rerun_state_machine.current_iteration} to {iteration}...")
         rerun_state_machine.current_iteration = iteration
 
     # Track E2E metrics at the start of training.
@@ -2155,6 +2189,10 @@ def train(
     num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
+    # Wrap forward_backward_func for Full iteration CUDA graph
+    forward_backward_func = get_forward_backward_func()
+    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -2276,7 +2314,7 @@ def train(
             grad_norm,
             num_zeros_in_grad,
         ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
+            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
         ft_integration.on_training_step_end()
         if should_checkpoint:
@@ -2339,6 +2377,8 @@ def train(
         learning_rate = None
         decoupled_learning_rate = None
         for param_group in optimizer.param_groups:
+            if len(param_group['params']) == 0:
+                continue
             if param_group['is_decoupled_lr']:
                 decoupled_learning_rate = param_group['lr']
             else:
@@ -2492,6 +2532,9 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
+    forward_backward_func = get_forward_backward_func()
+    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     with torch.no_grad():
         iteration = 0
@@ -2502,7 +2545,6 @@ def evaluate(
             if verbose:
                 print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
 
-            forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()

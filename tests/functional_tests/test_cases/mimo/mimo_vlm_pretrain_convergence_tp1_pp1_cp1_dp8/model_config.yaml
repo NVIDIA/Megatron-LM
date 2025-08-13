@@ -42,7 +42,7 @@ MODEL_ARGS:
   --init-method-std: 0.006
   --adam-beta1: 0.9
   --adam-beta2: 0.95
-  --dataset-provider: energon_llava_vlm
+  --dataset-provider: llava_vlm
   --model-provider: llava_vlm
   --deterministic-mode: true
   --log-memory-to-tensorboard: true

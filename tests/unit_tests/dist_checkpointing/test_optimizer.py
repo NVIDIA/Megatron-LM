@@ -26,8 +26,13 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelSaveStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.utils import extract_sharded_tensors
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec as gpt_te_spec,
+)
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
-from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
@@ -196,6 +201,67 @@ def initialize_1d_flatten_tensor_model(
     return Model1dFlattenTensor()
 
 
+def initialize_real_model(
+    seed,
+    pre_process,
+    post_process,
+    vp_stage=None,
+    is_moe=False,
+    is_mla=False,
+    virtual_pipeline_model_parallel_size=None,
+    **config_kwargs,
+):
+    torch.manual_seed(seed)
+    model_parallel_cuda_manual_seed(seed)
+
+    default_config_kwargs = dict(
+        num_layers=6,
+        hidden_size=16,
+        num_attention_heads=8,
+        use_cpu_initialization=True,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+        virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
+    )
+    if is_moe:
+        default_config_kwargs["moe_ffn_hidden_size"] = 128
+        default_config_kwargs["num_moe_experts"] = 4
+        default_config_kwargs["add_bias_linear"] = False
+        # Pop unused fields
+        config_kwargs.pop("use_sp")
+        config_kwargs.pop("use_te")
+        config_kwargs.pop("use_grouped_mlp")
+        config_kwargs.pop("use_glu")
+    if is_mla:
+        default_config_kwargs["multi_latent_attention"] = True
+        default_config_kwargs["q_lora_rank"] = 96
+        default_config_kwargs["kv_lora_rank"] = 512
+        default_config_kwargs["qk_head_dim"] = 64
+        default_config_kwargs["qk_pos_emb_head_dim"] = 32
+        default_config_kwargs["v_head_dim"] = 64
+    default_config_kwargs.update(**config_kwargs)
+    config_cls = MLATransformerConfig if is_mla else TransformerConfig
+    transformer_config = config_cls(**default_config_kwargs)
+
+    if is_moe:
+        layer_spec = get_gpt_decoder_block_spec(
+            transformer_config, use_transformer_engine=True, vp_stage=vp_stage
+        )
+    else:
+        layer_spec = gpt_te_spec(multi_latent_attention=is_mla)
+    this_model = GPTModel(
+        config=transformer_config,
+        transformer_layer_spec=layer_spec,
+        vocab_size=128,
+        max_sequence_length=4,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage,
+    )
+
+    return this_model
+
+
 def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
         with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
@@ -207,6 +273,118 @@ class TestDistributedOptimizer:
         pass
 
     def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("fully_parallel", [False, True])
+    @pytest.mark.parametrize(
+        ("tp_pp_ep", "is_moe", "is_mla", "test_step", "kwargs"),
+        [
+            ((2, 2, 1), False, False, False, {}),  # check TP
+            ((1, 2, 1), False, False, True, {}),  # check "step" is synced
+            ((1, 2, 1), False, True, False, {}),  # check param group order is right
+            (
+                (1, 8, 1),
+                False,
+                False,
+                False,
+                {
+                    "account_for_embedding_in_pipeline_split": True,
+                    "account_for_loss_in_pipeline_split": True,
+                },
+            ),  # check embedding standalone
+            (
+                (1, 2, 2),
+                True,
+                False,
+                True,
+                {"moe_layer_freq": [0, 0, 0, 1, 1, 1]},
+            ),  # check moe not on all ranks (case 1)
+            (
+                (1, 2, 2),
+                True,
+                False,
+                True,
+                {"moe_layer_freq": [1, 1, 1, 0, 0, 0]},
+            ),  # check moe not on all ranks (case 2)
+        ],
+    )
+    def test_optimizer_common_state_dict(
+        self, tmp_path_dist_ckpt, fully_parallel, tp_pp_ep, is_moe, is_mla, test_step, kwargs
+    ):
+        initialize_fn = partial(initialize_real_model, is_moe=is_moe, is_mla=is_mla, **kwargs)
+
+        # Initialize parallel
+        tp, pp, ep = tp_pp_ep
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            expert_model_parallel_size=ep,
+        )
+        rank = torch.distributed.get_rank()
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
+            mock_args = parse_args(ignore_unknown_args=True)
+            mock_args.use_distributed_optimizer = True
+            with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
+                # Initialize model and optimizer A
+                if is_moe:
+                    model, optimizer_A = setup_moe_model_and_optimizer(
+                        seed=2, tp=tp, pp=pp, ep=ep, initialize_fn=initialize_fn
+                    )
+                else:
+                    model, optimizer_A = setup_model_and_optimizer(
+                        seed=2, tp=tp, pp=pp, initialize_fn=initialize_fn
+                    )
+                if test_step:
+                    # Simulate "step" not set in some of the param groups on rank 0.
+                    # TE FusedAdam may have "step" not set in some of the param groups on some ranks.
+                    for i, param_group in enumerate(
+                        optimizer_A.chained_optimizers[0].optimizer.param_groups
+                    ):
+                        if rank > 0 or i == 0:
+                            param_group['step'] = 1234
+
+                # Save checkpoint
+                init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=fully_parallel)
+                from megatron.training.training import preprocess_common_state_dict
+
+                save_checkpoint(
+                    10,
+                    model,
+                    optimizer_A,
+                    None,
+                    0,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                )
+
+                # Get optimizer A param state
+                optim_param_state_A = optimizer_A.state_dict()
+
+                # Initialize model and optimizer B
+                if is_moe:
+                    model, optimizer_B = setup_moe_model_and_optimizer(
+                        seed=3, tp=tp, pp=pp, ep=ep, initialize_fn=initialize_fn
+                    )
+                else:
+                    model, optimizer_B = setup_model_and_optimizer(
+                        seed=3, tp=tp, pp=pp, initialize_fn=initialize_fn
+                    )
+                # Load optimizer B from checkpoint
+                load_checkpoint_no_arg_checks(model, optimizer_B, None)
+                if test_step:
+                    # Complete "step" for comparison
+                    for i, param_group in enumerate(
+                        optimizer_A.chained_optimizers[0].optimizer.param_groups
+                    ):
+                        if rank == 0 and i > 0:
+                            param_group['step'] = 1234
+                # Get optimizer B param state
+                optim_param_state_B = optimizer_B.state_dict()
+
+                # Test both param state dicts are equal
+                diffs = diff(optim_param_state_A, optim_param_state_B)
+                assert not any(map(bool, diffs)), (rank, diffs)
+
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(

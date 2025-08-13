@@ -157,6 +157,14 @@ class _ParamAndGradBucketGroup:
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
 
+        # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
+        # introduces some CPU overheads. We use these two lists to cache the created local
+        # shards to avoid unnecessary CPU operations. This does not increase GPU memory usage
+        # because it only saves a slice view, which shares the same memory with bucket.param_data
+        # or bucket.grad_data.
+        self.cached_param_buffer_shard_list = [None] * len(self.buckets)
+        self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -229,10 +237,14 @@ class _ParamAndGradBucketGroup:
         with _coalescing_manager(
             self.intra_distributed_optimizer_instance_group, async_ops=async_op
         ) as cm:
-            for bucket in self.buckets:
-                local_data_view = shard_buffer(
-                    bucket.param_data, self.intra_distributed_optimizer_instance_size
-                )[self.intra_distributed_optimizer_instance_rank]
+            for idx, bucket in enumerate(self.buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]
                 dist_all_gather_func(
                     bucket.param_data,
                     local_data_view,
@@ -287,6 +299,22 @@ class _ParamAndGradBucketGroup:
                     )
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
+
+            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
+            # we need to copy the param_data from the shared_param/grad_buffer to param.data
+            # after the param all-gather.
+            if (
+                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and self.ddp_config.overlap_param_gather
+            ):
+                for bucket in self.buckets:
+                    for param in bucket.params:
+                        param_start, param_end = bucket.param_to_index[param]
+                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                        param.data.copy_(param_slice.view(param.data.shape))
+                    # All-gathered params are not needed after being copied to param.data.
+                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
+                    bucket.grad_data.zero_()
 
     def start_grad_sync(self):
         """
@@ -352,11 +380,15 @@ class _ParamAndGradBucketGroup:
 
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
-            for bucket in self.buckets:
+            for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer:
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
                     dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
@@ -382,10 +414,14 @@ class _ParamAndGradBucketGroup:
                     self.inter_distributed_optimizer_instance_group, async_ops=async_op
                 ) as cm,
             ):
-                for bucket in self.buckets:
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
 
                     torch.distributed.all_reduce(
                         local_data_view,

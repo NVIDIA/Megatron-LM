@@ -9,10 +9,8 @@ MODEL_ARGS=" \
     --no-masked-softmax-fusion \
     --disable-bias-linear \
     --untie-embeddings-and-output-weights \
-    --use-rotary-position-embeddings \
-    --rotary-percent 1.0 \
+    --position-embedding-type rope \
     --no-rope-fusion \
-    --no-position-embedding \
     --normalization RMSNorm \
     --swiglu \
     --num-layers 61 \
@@ -22,6 +20,7 @@ MODEL_ARGS=" \
     --kv-channels 128 \
     --multi-latent-attention \
     --kv-lora-rank 512 \
+    --v-head-dim 128 \
     --q-lora-rank 1536 \
     --qk-head-dim 128 \
     --qk-layernorm \
@@ -29,22 +28,25 @@ MODEL_ARGS=" \
     --num-experts 256 \
     --moe-layer-freq [0]*3+[1]*58 \
     --moe-ffn-hidden-size 2048 \
+    --moe-router-dtype fp32 \
     --moe-router-score-function sigmoid \
-    --moe-router-bias-update-rate 0.001 \
+    --moe-router-bias-update-rate 1e-3 \
     --moe-router-enable-expert-bias \
     --moe-router-topk 8 \
+    --moe-router-num-groups 8 \
+    --moe-router-group-topk 4 \
     --moe-router-pre-softmax \
     --moe-router-topk-scaling-factor 2.5 \
     --moe-shared-expert-overlap \
     --moe-shared-expert-intermediate-size 2048 \
-    --moe-aux-loss-coeff 1e-2 \
+    --moe-aux-loss-coeff 1e-4 \
     --moe-router-load-balancing-type seq_aux_loss \
     --moe-token-dispatcher-type alltoall \
     --moe-token-drop-policy probs \
     --seq-length 4096 \
     --max-position-embeddings 163840 \
     --tokenizer-type HuggingFaceTokenizer \
-    --make-vocab-size-divisible-by 40 \
+    --make-vocab-size-divisible-by 1280 \
     --use-mcore-models \
     --rotary-base 10000 \
     --rotary-percent 1.0 \
@@ -53,4 +55,7 @@ MODEL_ARGS=" \
     --mscale-all-dim 1.0 \
     --recompute-activations \
     --moe-layer-recompute \
+    --sequence-parallel \
 "
+#    --decoder-first-pipeline-num-layers 6 \
+#    --decoder-last-pipeline-num-layers 7 \

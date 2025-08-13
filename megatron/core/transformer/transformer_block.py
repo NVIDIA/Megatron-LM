@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -28,27 +28,41 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 try:
+    import transformer_engine.pytorch as te  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    import apex  # pylint: disable=unused-import
+
+    HAVE_APEX = True
+except ImportError:
+    HAVE_APEX = False
+
+get_cpu_offload_context = None
+te_checkpoint = None
+
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TENorm,
         get_cpu_offload_context,
         te_checkpoint,
     )
 
-    HAVE_TE = True
     LayerNormImpl = TENorm
-except ImportError:
-    HAVE_TE = False
-    get_cpu_offload_context = None
 
-    try:
-        import apex  # pylint: disable=unused-import
+elif HAVE_APEX:
+    LayerNormImpl = FusedLayerNorm
 
-        LayerNormImpl = FusedLayerNorm
+else:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    except ImportError:
-        from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    LayerNormImpl = WrappedTorchNorm
 
-        LayerNormImpl = WrappedTorchNorm
+
+logger = logging.getLogger(__name__)
 
 
 def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
@@ -622,6 +636,8 @@ class TransformerBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the model.
         """
         assert not sharded_offsets, "Unexpected sharded offsets"
+        # TODO: remove multiple non_homogeneous_layers=True assignments
+        #  once non_homogeneous_layers=False support is dropped
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False
         )
@@ -635,6 +651,15 @@ class TransformerBlock(MegatronModule):
             non_homogeneous_layers = True
 
         if self.config.heterogeneous_block_specs:
+            non_homogeneous_layers = True
+
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        if singleton_local_shards:
+            if not non_homogeneous_layers:
+                logger.warning(
+                    'non_homogeneous_layers=False is deprecated.'
+                    ' Setting non_homogeneous_layers=True.'
+                )
             non_homogeneous_layers = True
 
         sharded_state_dict = {}

@@ -460,3 +460,105 @@ class TestTextGenerationController:
             requests = self.text_generation_controller.generate_all_output_tokens_static_batch(
                 active_requests
             )
+
+    def test_zero_tokens_generated_batch_vs_single(self):
+        """
+        Verifies that when `num_tokens_to_generate=0`, the outputs from batched inference
+        match the outputs from single-request inference for prompt-related fields.
+        """
+        self.setup_model(dtype=torch.bfloat16)
+
+        self.mock_tokenizer.vocab_size = self.vocab_size
+        self.mock_tokenizer.bos = 0
+        self.mock_tokenizer.eod = self.vocab_size - 1
+        self.mock_tokenizer.detokenize.side_effect = lambda toks, **_: " ".join(
+            f"T{t}" for t in toks
+        )  # unique, deterministic
+        self.mock_tokenizer.offsets.side_effect = lambda _, s: [
+            i for i, c in enumerate(s) if c == " "
+        ] + [len(s)]
+
+        prompts = [
+            "a short prompt",
+            "a slightly longer prompt that still fits",
+            "an even longer prompt to test prompt length variability",
+        ]
+        batch_size_test = len(prompts)
+        active_requests_batched: Dict[str, InferenceRequest] = OrderedDict()
+        expected_single_requests: Dict[str, InferenceRequest] = OrderedDict()
+
+        for rid, p in enumerate(prompts):
+            prompt_tokens = torch.randint(1, self.vocab_size - 2, (len(p) + 1,)).tolist()
+            prompt_tokens[0] = self.mock_tokenizer.bos
+
+            # Mock tokenize for consistency across batch and single
+            self.mock_tokenizer.tokenize.return_value = torch.randn(
+                batch_size_test, self.vocab_size
+            ).cuda()
+
+            sampling_params = SamplingParams(
+                num_tokens_to_generate=0,
+                temperature=0.0,
+                top_k=1,
+                return_log_probs=True,
+                top_n_logprobs=5,
+                return_prompt_top_n_logprobs=True,
+            )
+
+            inference_request = InferenceRequest(
+                request_id=str(rid),
+                prompt=p,
+                prompt_tokens=prompt_tokens,
+                sampling_params=copy.deepcopy(sampling_params),
+                arrival_time=time.time(),
+                status=Status.ACTIVE_BUT_NOT_GENERATING_TOKENS,
+            )
+            active_requests_batched[str(rid)] = copy.deepcopy(inference_request)
+            expected_single_requests[str(rid)] = copy.deepcopy(inference_request)
+
+        # Perform batched inference
+        completed_batched = self.text_generation_controller.generate_all_output_tokens_static_batch(
+            active_requests_batched
+        )
+
+        # Perform single-request inference for comparison
+        completed_single: Dict[str, InferenceRequest] = OrderedDict()
+        for request_id, req in expected_single_requests.items():
+            single_request_dict = {request_id: req}
+            result = self.text_generation_controller.generate_all_output_tokens_static_batch(
+                single_request_dict
+            )
+            completed_single.update(result)
+
+        # Compare results
+        for request_id in completed_batched.keys():
+            request_batched = completed_batched[request_id]
+            request_single = completed_single[request_id]
+
+            assert request_batched.status == Status.COMPLETED
+            assert request_single.status == Status.COMPLETED
+
+            assert request_batched.generated_length == 0
+            assert request_single.generated_length == 0
+
+            assert request_batched.prompt_tokens == request_single.prompt_tokens
+            assert request_batched.prompt_log_probs == pytest.approx(
+                request_single.prompt_log_probs
+            )
+
+            # Assert prompt_top_n_logprobs for consistency
+            assert request_batched.prompt_top_n_logprobs is not None
+            assert request_single.prompt_top_n_logprobs is not None
+            assert len(request_batched.prompt_top_n_logprobs) == len(
+                request_single.prompt_top_n_logprobs
+            )
+            for i in range(len(request_batched.prompt_top_n_logprobs)):
+                assert (
+                    request_batched.prompt_top_n_logprobs[i].keys()
+                    == request_single.prompt_top_n_logprobs[i].keys()
+                )
+                for token_str in request_batched.prompt_top_n_logprobs[i]:
+                    assert (
+                        pytest.approx(request_batched.prompt_top_n_logprobs[i][token_str], rel=1e-6)
+                        == request_single.prompt_top_n_logprobs[i][token_str]
+                    )

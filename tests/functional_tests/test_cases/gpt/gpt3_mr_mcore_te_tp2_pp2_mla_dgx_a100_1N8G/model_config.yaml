@@ -39,7 +39,7 @@ MODEL_ARGS:
   --clip-grad: 1.0
   --lr-warmup-fraction: .01
   --log-interval: 1
-  --save-interval: 10000
+  --save-interval: 25
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
@@ -56,4 +56,4 @@ MODEL_ARGS:
   --bf16: true
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
-TEST_TYPE: regular
+TEST_TYPE: ckpt-resume

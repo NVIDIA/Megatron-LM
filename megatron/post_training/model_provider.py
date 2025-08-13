@@ -19,7 +19,6 @@ from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelop
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
-from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
 from megatron.post_training.algos import distillation
 from megatron.post_training.checkpointing import load_modelopt_checkpoint, load_modelopt_state
 from megatron.training import get_args, print_rank_0
@@ -163,6 +162,7 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
                 real_quant_cfg=args.export_real_quant_cfg,
                 use_arbitrary_attention_mask=True,
             )
+
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,
             "vocab_size": args.padded_vocab_size,
@@ -179,6 +179,8 @@ def model_provider(pre_process=True, post_process=True, parallel_output=True) ->
         }
         model = MCoreGPTModel(config=config, **model_kwargs)
     elif args.export_model_type == "MambaModel":
+        from megatron.core.post_training.modelopt.mamba.model_specs import get_mamba_stack_modelopt_spec
+
         mamba_stack_spec = get_mamba_stack_modelopt_spec(
             remap_te_layernorm=args.export_te_mcore_model
         )

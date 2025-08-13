@@ -54,6 +54,7 @@ class LlavaConversationTemplateConfig(ConversationTemplateConfig):
 
 class ModelType(Enum):
     LLAVA_VLM = "llava_vlm"
+    VIDEO_LLAVA_VLM = "video_llava_vlm"
 
 class VLMTaskEncoder(
     DefaultTaskEncoder[
@@ -241,21 +242,52 @@ class VLMTaskEncoder(
 
         return output
 
+    def encode_batch_vlm_clip_llava_video(self, batch_data: Dict) -> Dict:
+        input_ids = batch_data["input_ids"]
+        labels = batch_data.get("labels")
+        loss_mask = batch_data.get("loss_mask")
+
+        seq_len = input_ids.size(1)
+        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+        position_ids = position_ids.unsqueeze(0).repeat(input_ids.size(0), 1)
+
+        pixel_values_videos = batch_data.get("pixel_values_videos")
+
+        output = {
+            "input_ids": input_ids,
+            "labels": labels,
+            "loss_mask": loss_mask,
+            "position_ids": position_ids,
+        }
+
+        if pixel_values_videos is not None:
+            output["modality_inputs"] = {
+                "images": {"clip_encoder": {"pixel_values": pixel_values_videos}}
+            }
+
+        return output
+
     def encode_batch(self, batch_data: Dict) -> dict:
         if self.model_type is ModelType.LLAVA_VLM:
             return self.encode_batch_vlm_clip_llava(batch_data)
+        elif self.model_type is ModelType.VIDEO_LLAVA_VLM:
+            return self.encode_batch_vlm_clip_llava_video(batch_data)
         else:
             raise ValueError(f"Model type {self.model_type} not supported")
 
 
-def llava_vlm_dataloader_provider(train_val_test_num_samples):
+def llava_vlm_dataloader_provider(train_val_test_num_samples, is_video_input=False):
     args = get_args()
     tokenizer_model_id = args.tokenizer_model
     processor = AutoProcessor.from_pretrained(tokenizer_model_id)
+    if is_video_input:
+        model_type = ModelType.VIDEO_LLAVA_VLM
+    else:
+        model_type = ModelType.LLAVA_VLM
     return train_valid_test_dataloaders_provider(
         train_val_test_num_samples,
         task_encoder=VLMTaskEncoder(
-            model_type=ModelType.LLAVA_VLM,
+            model_type=model_type,
             processor=processor,
             conversation_template_config=LlavaConversationTemplateConfig(),
         ),
@@ -338,6 +370,7 @@ class PaddingProcessor:
 # Registry mapping sample keys to their corresponding processor.
 KEY_PROCESSORS: Dict[str, KeyProcessor] = {
     "pixel_values": StackProcessor(),
+    "pixel_values_videos": StackProcessor(),
     "input_ids": PaddingProcessor(pad_value=0),
     "attention_mask": PaddingProcessor(pad_value=0),
     "loss_mask": PaddingProcessor(pad_value=0),

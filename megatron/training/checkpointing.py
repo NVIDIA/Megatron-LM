@@ -336,6 +336,8 @@ def _build_sharded_state_dict_metadata(args: Namespace) -> dict:
             metadata['distrib_optim_sharding_type'] = 'fully_sharded_model_space'
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_zero_gather_scatter'
+    metadata['chained_optim_avoid_prefix'] = True
+    metadata['singleton_local_shards'] = False
     return metadata
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
@@ -562,14 +564,49 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                                            barrier=False)
         else:
             def iter_finalize_fn():
+                prev_iteration = 0
+                save_retain_interval = getattr(args, 'save_retain_interval', None)  # For backwards compatibility of tests.
+                if save_retain_interval is not None:
+                    if os.path.exists(tracker_filename):  # TODO: Make this work with MSC remote paths?
+                        with open_file(tracker_filename, 'r') as f:
+                            prev_iteration = int(f.read().strip())
                 with open_file(tracker_filename, 'w') as f:
                     f.write(str(iteration))
+                tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
+                pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
                 print_rank_0(f'  successfully saved checkpoint from iteration {int(iteration):7d} to {args.save} '
-                             f'[ t {(tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1}/{mpu.get_tensor_model_parallel_world_size()}, '
-                             f'p {(pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1}/{mpu.get_pipeline_model_parallel_world_size()} ]')
+                             f'[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, '
+                             f'p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]')
                 if args.log_progress and args.async_save:
                     append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
+
+                def delete_checkpoint(args, iteration_to_delete):
+                    checkpoint_name = get_checkpoint_name(args.save, iteration=iteration_to_delete,
+                                                          return_base_dir=True)
+                    try:
+                        shutil.rmtree(checkpoint_name)  # TODO: Make this work with MSC remote paths?
+                        print_rank_0(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
+                                     f'at {args.save}')
+                        if args.log_progress:
+                            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+                    except Exception as e:
+                        print_rank_0(f'  encountered exception "{e}" when trying to delete checkpoint from '
+                                     f'iteration {iteration_to_delete:7d} at {args.save}')
+                        # Any exception encountered in checkpoint deletion can be ignored and is not fatal.
+                        pass
+
+                if save_retain_interval is not None:
+                    if prev_iteration > 0 and prev_iteration != iteration and prev_iteration % save_retain_interval != 0:
+                        checkpoint_name = get_checkpoint_name(args.save, iteration=prev_iteration,
+                                                              return_base_dir=True)
+                        # Don't delete if `checkpoint_name` is a symbolic link.
+                        if os.path.islink(checkpoint_name):  # TODO: Make this work with MSC remote paths?
+                            print_rank_0(f'  skipping deleting checkpoint from iteration {prev_iteration:7d} '
+                                         f'at {args.save} since it is a symbolic link')
+                        else:
+                            # Asynchronous version of delete_checkpoint(args, iteration_to_delete=prev_iteration).
+                            threading.Thread(target=delete_checkpoint, args=(args, prev_iteration,)).start()
 
         if args.async_save:
             assert async_save_request is not None
@@ -725,10 +762,11 @@ def generate_state_dict(args, model, optimizer, opt_param_scheduler,
                 opt_param_scheduler.state_dict()
 
     # Rerun state
-    state_dict['rerun_state_machine'] = rerun_state
+    if rerun_state:
+        state_dict['rerun_state_machine'] = rerun_state
 
     # RNG states.
-    if not args.no_save_rng:
+    if not args.no_save_rng and rng_state:
         state_dict["rng_state"] = rng_state
     return state_dict
 
@@ -1267,21 +1305,23 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             raise NotImplementedError(f"checkpoint format {ckpt_format} not supported")
 
     load_kwargs = {}
+    ignore_rng_state = False
+    ignore_rerun_state = True
     if ckpt_format == "torch_dist":
         ckpt_tp_pp = (
             state_dict['args'].tensor_model_parallel_size,
             state_dict['args'].pipeline_model_parallel_size,
-            getattr(state_dict['args'], 'encoder_tensor_model_parallel_size', 0),
-            getattr(state_dict['args'], 'encoder_pipeline_model_parallel_size', 0),
         )
         run_tp_pp = (
             args.tensor_model_parallel_size,
             args.pipeline_model_parallel_size,
-            # TODO: change this to args.encoder_tensor_model_parallel_size after 30th Nov 24
-            getattr(args, 'encoder_tensor_model_parallel_size', 0),
-            getattr(args, 'encoder_pipeline_model_parallel_size', 0),
         )
-        mismatch_msg = "(TP, PP, encoder TP, encoder PP) mismatch after resume ({} vs {} from checkpoint)".format(
+
+        ckpt_world_size = getattr(state_dict['args'], 'world_size', 0)
+        run_world_size = getattr(args, 'world_size', 0)
+        ckpt_dp = getattr(state_dict['args'], 'data_parallel_size', 0)
+        run_dp = getattr(args, 'data_parallel_size', 0)
+        mismatch_msg = "(TP, PP) mismatch after resume ({} vs {} from checkpoint)".format(
             run_tp_pp, ckpt_tp_pp
         )
 
@@ -1290,6 +1330,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 and not getattr(state_dict['args'], 'no_save_rng', False)):
             gen_sd_rng_state = get_rng_state(args.ckpt_format)  # we can load the rng state
         else:
+            ignore_rng_state = True
             gen_sd_rng_state = None
             if ckpt_tp_pp != run_tp_pp:
                 print_rank_0("{}: RNG state will be ignored".format(mismatch_msg))
@@ -1324,20 +1365,27 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
 
         # Determine if rerun state will be loaded
+        gen_sd_rerun_state = None
         if (
-            ckpt_tp_pp == run_tp_pp
+            ckpt_world_size == run_world_size
+            and ckpt_tp_pp == run_tp_pp
+            and ckpt_dp == run_dp
             and not release
             and not args.finetune
             and 'rerun_state_machine' in state_dict
         ):
             rerun_state_machine = get_rerun_state_machine()
-            gen_sd_rerun_state = rerun_state_machine.state_dict(
-                data_iterator=None, ckpt_format=ckpt_format,
-            )
-        else:
-            gen_sd_rerun_state = None
-            if ckpt_tp_pp != run_tp_pp:
-                print_rank_0("{}: Rerun state will be ignored".format(mismatch_msg))
+            if rerun_state_machine.validate_state_dict(state_dict['rerun_state_machine']):
+                gen_sd_rerun_state = rerun_state_machine.state_dict(
+                    data_iterator=None, ckpt_format=ckpt_format, force=True,
+                )
+                ignore_rerun_state = False
+        if (
+            ckpt_world_size != run_world_size
+            or ckpt_tp_pp != run_tp_pp
+            or ckpt_dp != run_dp
+        ):
+            print_rank_0("Job sharding has changed: Rerun state will be ignored")
 
         # [ModelOpt]: IMPORTANT! Restoring modelopt_state (sharded or not) must be performed
         # after the model instance has been created and before _load_base_checkpoint is called.
@@ -1496,15 +1544,15 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optimizer.reload_model_params()
 
     # rerun state
-    try:
-        if 'rerun_state_machine' in state_dict:
-            get_rerun_state_machine().load_state_dict(state_dict['rerun_state_machine'])
-    except Exception as e:
-        print(f"Unable to restore RerunMachine from checkpoint: {e}")
-        sys.exit()
+    if not ignore_rerun_state:
+        try:
+            if 'rerun_state_machine' in state_dict:
+                get_rerun_state_machine().load_state_dict(state_dict['rerun_state_machine'])
+        except Exception as e:
+            print(f"Unable to restore RerunMachine from checkpoint: {e}. Skipping.")
 
     # rng states.
-    if not release and not args.finetune and not args.no_load_rng:
+    if not release and not args.finetune and not args.no_load_rng and not ignore_rng_state:
         try:
             if 'rng_state' in state_dict:
                 # access rng_state for data parallel rank

@@ -24,18 +24,19 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.utils import get_attention_mask
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.moe.moe_layer import BaseMoELayer
+from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import get_model_config
 
 try:
-    from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
+    import transformer_engine as te  # pylint: disable=unused-import
 
     HAVE_TE = True
 
 except ImportError:
     HAVE_TE = False
-    Fp8Padding = None
-    Fp8Unpadding = None
 
 
 class TextGenerationController:
@@ -358,7 +359,6 @@ class TextGenerationController:
         batch_prompt_tokens_list: List[List[int]],
         padded_batch_size: int,
         padded_sequence_length: int,
-        fp8_padding: Optional["Fp8Padding"] = None,
     ) -> torch.Tensor:
         """Method to pad input prompts
 
@@ -368,7 +368,6 @@ class TextGenerationController:
             batch_prompt_tokens_list (List[List[int]]): A list containing the prompt tokens
             padded_batch_size (int): The maximum number of requests for this batch
             padded_sequence_length (int): The maximum number of input + output tokens for this batch
-            fp8_padding (Fp8Padding): An optional Fp8Padding module
 
         Returns:
             torch.Tensor: A torch tensor of shape [padded_batch_size, padded_sequence_length]
@@ -389,29 +388,17 @@ class TextGenerationController:
 
         tokens = torch.tensor(padded_prompt_tokens_list, device=torch.cuda.current_device())
 
-        if fp8_padding is not None:
-            tokens, _ = fp8_padding(tokens, [batch_size])
-
         return tokens
 
     def unpad_input_prompt_tokens(
-        self,
-        padded_batch_prompt_tokens: torch.Tensor,
-        original_batch_size: int,
-        fp8_unpadding: Optional["Fp8Unpadding"] = None,
+        self, padded_batch_prompt_tokens: torch.Tensor, original_batch_size: int
     ):
         """Truncates the given input tensor back to the original prompt size before padding.
 
         Args:
             padded_batch_prompt_tokens (torch.Tensor): The padded tokens tensor
             original_batch_size (int): The original batch size before padding
-            fp8_unpadding (Fp8UnPadding): An optional Fp8UnpaddingPadding module
         """
-        if fp8_unpadding is not None:
-            padded_batch_prompt_tokens = fp8_unpadding(
-                padded_batch_prompt_tokens, [original_batch_size]
-            )
-
         return padded_batch_prompt_tokens[:original_batch_size]
 
     @torch.inference_mode()
@@ -429,6 +416,11 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
+        if sampling_params.return_log_probs:
+            assert (
+                context.materialize_only_last_token_logits is False
+            ), "Materialize only last token logits must be false for returning log probs"
+
         # No tokens?
         if context.active_token_count == 0:
             return None
@@ -437,12 +429,13 @@ class TextGenerationController:
         context.initialize_attention_state()
 
         # Get flat tokens, position ids.
-        input_ids = context.current_input_ids()
-        position_ids = context.current_position_ids()
+        input_ids, position_ids = context.current_input_and_position_ids()
+
+        model_config = get_model_config(self.inference_wrapped_model.model)
 
         # If using symmetric kernels and we are using using nccl
         # for prefill turn off symmetric kernels
-        symmetric_ar_type = get_model_config(self.inference_wrapped_model.model).symmetric_ar_type
+        symmetric_ar_type = model_config.symmetric_ar_type
         nccl_all_reduce_for_prefill = (
             self.inference_wrapped_model.inference_wrapper_config.nccl_all_reduce_for_prefill
         )
@@ -478,7 +471,13 @@ class TextGenerationController:
                 pp_group=self.pp_group,
             )
 
-        last_token_logits = logits.squeeze(0)
+        # Last token logits.
+        if context.materialize_only_last_token_logits:
+            # When materialize_only_last_token_logits is true, last_token_logits is
+            # already called in the forward pass of GPT.
+            last_token_logits = logits.squeeze(0)
+        else:
+            last_token_logits = context.last_token_logits(logits)
 
         # Sample.
         # Use padded vocab size because tokenizer vocab size might not include padding
@@ -505,11 +504,15 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
+        log_probs = None
+        if sampling_params.return_log_probs:
+            log_probs = context.calculate_log_probs(logits)
+
         # Update requests.
         # New sample gets updated in update_requests, so we pass in a clone
         context.update_requests(active_request_mask, new_sample.clone())
 
-        return current_request_ids, finished_request_ids, new_sample
+        return current_request_ids, finished_request_ids, new_sample, log_probs
 
     def _update_top_n_logprobs_dict(
         self,
@@ -581,30 +584,17 @@ class TextGenerationController:
 
         model_config = get_model_config(self.inference_wrapped_model.model)
 
-        # Verify that if echo mode is requested we do not generate any new tokens
-        echo = getattr(sampling_params, "echo", False)
-        assert (
-            not echo or sampling_params.num_tokens_to_generate == 0
-        ), f"Cannot generate new tokens when echoing"
-        if sampling_params.num_tokens_to_generate == 0 and not echo:
-            sampling_params.add_attributes({"echo": True})
+        # We only need an attention mask if we are exclusively doing prefill over
+        # prompts of variable length
+        use_attention_mask = (
+            sampling_params.num_tokens_to_generate == 0
+            and min_prompt_length_in_batch != max_prompt_length_in_batch
+        )
 
         # Check whether CUDA graphs are enabled
-        enable_cuda_graph = model_config.enable_cuda_graph
-
-        # Check whether inference will be in FP8
-        fp8 = model_config.fp8
-
-        if fp8:
-            assert HAVE_TE, "FP8 requires TE."
-            # Only a single GEMM is necessary here because we expect non-grouped GEMMs for
-            # generic models. MoE models will handle padding separately in the expert layer.
-            num_gemms = 1
-            self.fp8_padding = Fp8Padding(num_gemms)
-            self.fp8_unpadding = Fp8Unpadding(num_gemms)
-        else:
-            self.fp8_padding = None
-            self.fp8_unpadding = None
+        enable_cuda_graph = (
+            model_config.enable_cuda_graph and model_config.cuda_graph_scope != "full_iteration"
+        )
 
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
@@ -624,7 +614,6 @@ class TextGenerationController:
             batch_prompt_tokens_list,
             padded_batch_size=padded_batch_size,
             padded_sequence_length=max_sequence_length,
-            fp8_padding=self.fp8_padding,
         )
 
         # Verify that output sequence length is within configured limit
@@ -689,12 +678,29 @@ class TextGenerationController:
             self.inference_wrapped_model.prep_model_for_inference()
 
             inference_input: Dict[str, Any] = self.prep_inference_input(
-                prompts_tokens=padded_batch_prompt_tokens, active_requests=active_requests
+                prompts_tokens=padded_batch_prompt_tokens,
+                active_requests=active_requests,
+                use_attention_mask=use_attention_mask,
             )
 
             assert (
                 not self.inference_wrapped_model.inference_context.is_decode_only()
             ), f"Generation must start in prefill mode"
+
+            # Sequence parallelism is required for MoE layers when using expert parallelism (EP)
+            # becausethe expert routing mechanism relies on sequence parallelism's communication
+            # infrastructure to distribute tokens across expert ranks. However, sequence parallelism
+            # is not currently supported for non-MoE layers during inference,so we selectively
+            # disable it for all other layer types. This is safe because MoE layers perform an
+            # all-gather operation on sequences before passing data to subsequent layers, ensuring
+            # that each rank has the complete sequence data needed for the next non-MoE layer.
+            tp_size = model_config.tensor_model_parallel_size
+            ep_size = model_config.expert_model_parallel_size
+            model_is_tp_ep = tp_size > 1 and ep_size > 1
+            if model_is_tp_ep:
+                set_model_to_sequence_parallel(
+                    self.inference_wrapped_model.model.module, False, exclude_modules=[BaseMoELayer]
+                )
 
             # If using symmetric kernels and we are using using nccl
             # for prefill turn off symmetric kernels
@@ -706,7 +712,13 @@ class TextGenerationController:
                 self.inference_wrapped_model.model.module.set_symmetric_ar(None)
 
             context_start_position = 0
-            context_end_position = min_prompt_length_in_batch
+
+            # If we are exclusively doing prefill then we can process all prompt tokens
+            # together even if the prompt lengths are different
+            if sampling_params.num_tokens_to_generate == 0:
+                context_end_position = max_prompt_length_in_batch
+            else:
+                context_end_position = min_prompt_length_in_batch
 
             # The initial iteration of this loop runs the prefill phase up to the shortest
             # prompt length in the batch. Then every subsequent iterations runs a decode step.
@@ -734,6 +746,13 @@ class TextGenerationController:
                     and "attention_mask" in inference_input_for_context_window
                 ):
                     inference_input_for_context_window["attention_mask"] = None
+                elif use_attention_mask:
+                    assert (
+                        attention_mask := inference_input_for_context_window.get(
+                            "attention_mask", None
+                        )
+                        is not None
+                    )
 
                 # Only materialize prompt log probs if the user requests log probs
                 materialize_only_last_token_logits = (
@@ -753,7 +772,7 @@ class TextGenerationController:
 
                 # Undo padding if necessary
                 batch_prompt_tokens = self.unpad_input_prompt_tokens(
-                    padded_batch_prompt_tokens, batch_size, self.fp8_unpadding
+                    padded_batch_prompt_tokens, batch_size
                 )
                 assert batch_prompt_tokens.shape[0] == batch_size, batch_prompt_tokens.shape[0]
                 if is_pipeline_last_stage(self.pp_group):
@@ -985,18 +1004,30 @@ class TextGenerationController:
         return active_requests
 
     def prep_inference_input(
-        self, prompts_tokens: torch.Tensor, active_requests: OrderedDict[str, InferenceRequest]
+        self,
+        prompts_tokens: torch.Tensor,
+        active_requests: OrderedDict[str, InferenceRequest],
+        use_attention_mask: bool = False,
     ) -> Dict[str, Any]:
         """Preparing input data for inference, using respective wrapper's prep_inference_input method # pylint: disable=line-too-long
 
         Args:
             prompts_tokens (torch.Tensor): A tensor of shape [batch_size, max_sequence_length]
             active_requests (OrderedDict[str, InferenceRequest]): The input active requests
+            use_attention_mask (bool): Whether to use an attention mask. Should be set to True only
+                when exclusively doing prefill (no decode) with variable prompt lengths.
 
         Returns:
             A dict of the inference input for the current batch.
         """
-        return self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+        inference_input = self.inference_wrapped_model.prep_inference_input(prompts_tokens)
+
+        if use_attention_mask and (
+            attention_mask := inference_input.get("attention_mask", None) is None
+        ):
+            inference_input["attention_mask"] = get_attention_mask(prompts_tokens.size(1))
+
+        return inference_input
 
     def stream_tokens(
         self,
