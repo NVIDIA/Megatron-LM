@@ -632,8 +632,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         active_token_count = self.active_token_count
 
-        padded_active_token_count = None
-
         using_cuda_graphs_this_step = (
             self.cuda_graph_token_counts is not None
             and (self.is_decode_only() or self.non_decode_cuda_graphs)
