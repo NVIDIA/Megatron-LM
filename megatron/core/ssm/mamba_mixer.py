@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -744,6 +745,18 @@ class MambaMixer(MegatronModule):
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
+        # Guard for cases metadata is not provided
+        if metadata is None:
+            metadata = {
+                "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+            }
+        elif isinstance(metadata, dict) and "dp_cp_group" not in metadata:
+            metadata.update(
+                {"dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)}
+            )
+        else:
+            assert "dp_cp_group" in metadata, "metadata must be a dict with dp_cp_group as key"
+
         sharded_state_dict = {}
         # Parameters
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)

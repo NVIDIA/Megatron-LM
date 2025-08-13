@@ -83,7 +83,10 @@ class MegatronModule(torch.nn.Module):
         # Recurse into submodules
         for name, module in self.named_children():
             sharded_state_dict.update(
-                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata)
+                sharded_state_dict_default(
+                    module, f'{prefix}{name}.', sharded_offsets, metadata,
+                    self.tp_group,
+                )
             )
         return sharded_state_dict
 

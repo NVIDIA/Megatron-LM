@@ -1090,7 +1090,7 @@ class TEGroupedMLP(MegatronModule):
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
-            sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
+            sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata, self.tp_group)
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts

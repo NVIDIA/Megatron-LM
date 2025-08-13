@@ -189,7 +189,6 @@ def sharded_state_dict_default(
     sharded_offsets: Tuple[Tuple[int, int, int]] = (),
     metadata: Optional[dict] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> ShardedStateDict:
     """Provides implementation for sharded_state_dict method for non-MegatronModules.
 
@@ -207,9 +206,6 @@ def sharded_state_dict_default(
         metadata (dict, optional): metadata passed to module sharded_state_dict method
         tp_group (Optional[torch.distributed.ProcessGroup], optional): tensor parallel group.
             If None, defaults to parallel_state.get_tensor_model_parallel_group()
-        dp_cp_group (Optional[torch.distributed.ProcessGroup], optional): data parallel group
-            with context parallel. If None, defaults to
-            parallel_state.get_data_parallel_group(with_context_parallel=True)
 
     Returns:
         dict: dictionary of state dict keys mapped to ShardedTensors
@@ -222,7 +218,8 @@ def sharded_state_dict_default(
     else:
         module_sd = module.state_dict(prefix='', keep_vars=True)
         module_sharded_sd = make_sharded_tensors_for_checkpoint(
-            module_sd, prefix, {}, sharded_offsets, tp_group=tp_group, dp_cp_group=dp_cp_group
+            module_sd, prefix, {}, sharded_offsets,
+            tp_group=tp_group, dp_cp_group=metadata['dp_cp_group'],
         )
     return module_sharded_sd
 

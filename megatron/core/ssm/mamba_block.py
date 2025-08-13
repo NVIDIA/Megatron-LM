@@ -139,6 +139,7 @@ class MambaStack(MegatronModule):
         assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaStack"
 
         self.pp_group = model_comm_pgs.pp
+        self.tp_group = model_comm_pgs.tp
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -413,7 +414,8 @@ class MambaStack(MegatronModule):
             if not module is self.layers:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
-                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                        module, f'{prefix}{name}.', sharded_offsets, metadata,
+                        self.tp_group,
                     )
                 )
 
