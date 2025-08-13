@@ -237,7 +237,9 @@ class DynamicInferenceContext(BaseInferenceContext):
                 int(n_tokens), tp_size=tp_size
             )
 
-        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(self.buffer_size_bytes)
+        self.max_requests, self.max_tokens = bytes_to_max_requests_and_tokens(
+            self.buffer_size_bytes
+        )
         if buffer_overflow_factor is not None:
             self.max_requests = self.round_up_requests(
                 int(self.max_requests * buffer_overflow_factor), tp_size=tp_size

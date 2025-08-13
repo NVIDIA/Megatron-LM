@@ -392,8 +392,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.context.add_request(
                 request_id,
                 tokens,
-                request.sampling_params.num_tokens_to_generate
-                - len(request.generated_tokens),
+                request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
             )
 
     async def _notify_cond_for_new_request(self):
