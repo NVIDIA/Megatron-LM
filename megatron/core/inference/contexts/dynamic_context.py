@@ -296,7 +296,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.cuda_graph_token_counts.append(self.max_requests)
                 self.cuda_graph_token_counts.reverse()
 
-            # Set used for validating active cuda graph request count.
+            # Set used for validating active cuda graph token count.
             self.cuda_graph_token_counts_set = set(self.cuda_graph_token_counts)
 
         self.non_decode_cuda_graphs = use_cuda_graphs_for_non_decode_steps and (
@@ -632,7 +632,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         active_token_count = self.active_token_count
 
-        # padded_active_token count - store the number of padded tokens to match with the
         padded_active_token_count = None
 
         using_cuda_graphs_this_step = (
@@ -641,20 +640,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             and (active_token_count <= self.cuda_graph_token_counts[0])
         )
 
+        self.using_cuda_graph_this_step = using_cuda_graphs_this_step
+
         if using_cuda_graphs_this_step:
-            padded_active_token_count = (
+            self.padded_active_token_count = (
                 math.ceil(active_token_count / self.cuda_graph_step_size)
                 * self.cuda_graph_step_size
             )
-            padded_active_token_count = min(padded_active_token_count, self.max_requests)
-            assert padded_active_token_count in self.cuda_graph_token_counts_set
-            assert padded_active_token_count >= active_token_count
+            self.padded_active_token_count = min(self.padded_active_token_count, self.max_requests)
+            assert self.padded_active_token_count in self.cuda_graph_token_counts_set
+            assert self.padded_active_token_count >= active_token_count
         else:
-            padded_active_token_count = self.round_up_tokens(self.active_token_count)
+            self.padded_active_token_count = self.round_up_tokens(self.active_token_count)
 
-        # Padded active token/request counts.
-        self.padded_active_token_count = padded_active_token_count
-
+       
         # How are we calculating the padded active request count?
         # Case 1: Using cuda graphs:
         #         It is always the same as padded_active_token_count, whether its decode or non-decode.
@@ -663,7 +662,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         #         If decode - we set it to padded_active_token_count. Again q and kv lengths of extra padded requests will be 0.
         #         If non-decode - we set it to total_request_count - paused_request_count i.e. no padded requests.
         self.padded_active_request_count = (
-            padded_active_token_count
+            self.padded_active_token_count
             if using_cuda_graphs_this_step or self.is_decode_only()
             else (self.total_request_count - self.paused_request_count)
         )
@@ -794,7 +793,6 @@ class DynamicInferenceContext(BaseInferenceContext):
                     self.paused_request_count : self.total_request_count
                 ]
 
-        self.using_cuda_graph_this_step = using_cuda_graphs_this_step
 
     def reset(self) -> None:
         """Reset entire context.

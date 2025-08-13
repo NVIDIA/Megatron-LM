@@ -474,7 +474,8 @@ class TestDynamicInferenceEngine:
                 actual_cuda_graph_token_counts,
             )
 
-    def test_cuda_graph_warmup(self) -> None:
+    @pytest.mark.parametrize("enforce_non_decode_mode", [True, False])
+    def test_cuda_graph_warmup(self, enforce_non_decode_mode: bool) -> None:
         """Test initialization during cuda graph warmup."""
 
         # Initialize context.
@@ -502,39 +503,37 @@ class TestDynamicInferenceEngine:
             (24, 24),
             (28, 32),
             (32, 32),
-        ]:
-            # test both non-decode and decode warmups.
-            for enforce_non_decode_mode in [False, True]:
-                # Initialize attention state.
-                if num_warmup_requests == 1 and enforce_non_decode_mode:
-                    continue
+        ]:            
+            # Initialize attention state.
+            if num_warmup_requests == 1 and enforce_non_decode_mode:
+                continue
 
-                context.initialize_attention_state(
-                    num_warmup_requests=num_warmup_requests,
-                    enforce_non_decode_mode=enforce_non_decode_mode,
+            context.initialize_attention_state(
+                num_warmup_requests=num_warmup_requests,
+                enforce_non_decode_mode=enforce_non_decode_mode,
+            )
+
+            # Validate request & token counts.
+
+            assert (
+                expected_cuda_graph_token_count
+                == context.padded_active_request_count
+                == context.padded_active_token_count
+            ), (
+                "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
+                % (
+                    num_warmup_requests,
+                    expected_cuda_graph_token_count,
+                    context.padded_active_request_count,
+                    context.padded_active_token_count,
                 )
+            )
 
-                # Validate request & token counts.
+            # Validate input/position dimensions.
+            input_ids, pos_ids = context.current_input_and_position_ids()
+            assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
 
-                assert (
-                    expected_cuda_graph_token_count
-                    == context.padded_active_request_count
-                    == context.padded_active_token_count
-                ), (
-                    "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
-                    % (
-                        num_warmup_requests,
-                        expected_cuda_graph_token_count,
-                        context.padded_active_request_count,
-                        context.padded_active_token_count,
-                    )
-                )
-
-                # Validate input/position dimensions.
-                input_ids, pos_ids = context.current_input_and_position_ids()
-                assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
-
-                context.reset()
+            context.reset()
 
         # Test active request count overflow.
         for num_warmup_requests in (64, 128, 1024):

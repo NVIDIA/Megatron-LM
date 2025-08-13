@@ -106,25 +106,25 @@ class DynamicInferenceEngine(AbstractEngine):
             tbar = enumerate(context.cuda_graph_token_counts)
             if HAVE_TQDM:
                 tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
-            for tbar_idx, cuda_graph_request_count in tbar:
+            for tbar_idx, cuda_graph_token_count in tbar:
 
                 # Initialize attention state.
-                context.initialize_attention_state(num_warmup_requests=cuda_graph_request_count)
+                context.initialize_attention_state(num_warmup_requests=cuda_graph_token_count)
                 assert (
-                    cuda_graph_request_count == context.padded_active_token_count
-                ), f"{cuda_graph_request_count} vs. {context.padded_active_token_count}."
+                    cuda_graph_token_count == context.padded_active_token_count
+                ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
                 assert context.is_decode_only(), "Decode-only required for cuda graph capture."
 
                 # Progress.
-                tbar_str = f"cuda graph warmup, d {cuda_graph_request_count}"
+                tbar_str = f"cuda graph warmup, d {cuda_graph_token_count}"
                 if HAVE_TQDM:
                     tbar.set_description(tbar_str)
                 else:
-                    print(f"{tbar_idx}/{len(context.cuda_graph_request_counts)}. {tbar_str}")
+                    print(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
 
                 # Get flat tokens, position ids.
                 input_ids, position_ids = context.current_input_and_position_ids(
-                    num_warmup_tokens=cuda_graph_request_count
+                    num_warmup_tokens=cuda_graph_token_count
                 )
 
                 # Forward pass -> logits.
@@ -135,13 +135,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     context.reset()  # todo: @lmcafee, remove if unnecessary.
 
                 # non-decode cudagraph capture.
-                if cuda_graph_request_count > 1 and context.non_decode_cuda_graphs:
+                if cuda_graph_token_count > 1 and context.non_decode_cuda_graphs:
                     context.initialize_attention_state(
-                        num_warmup_requests=cuda_graph_request_count, enforce_non_decode_mode=True
+                        num_warmup_requests=cuda_graph_token_count, enforce_non_decode_mode=True
                     )
                     # Get flat tokens, position ids.
                     input_ids, position_ids = context.current_input_and_position_ids(
-                        num_warmup_tokens=cuda_graph_request_count
+                        num_warmup_tokens=cuda_graph_token_count
                     )
 
                     with torch.inference_mode():
