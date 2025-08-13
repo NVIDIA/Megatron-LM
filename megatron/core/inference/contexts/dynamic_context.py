@@ -338,7 +338,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # supported cuda graph batch size. In that case this flag will be set to
         # False by initialize_attention. During a non-decode forward pass, if we find that
         # this flag is False, we will not use cuda graphs for that step.
-        self.using_cuda_graph_this_step = True
+        self.using_cuda_graph_this_step = False
 
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
@@ -650,6 +650,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             assert self.padded_active_token_count >= active_token_count
         else:
             self.padded_active_token_count = self.round_up_tokens(self.active_token_count)
+            if self.is_decode_only():
+                self.padded_active_token_count = min(
+                    self.padded_active_token_count, self.max_requests
+                )
 
         # How are we calculating the padded active request count?
         # Case 1: Using cuda graphs:
