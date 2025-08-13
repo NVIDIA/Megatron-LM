@@ -378,16 +378,14 @@ class DynamicInferenceEngine(AbstractEngine):
                         " [%s + cuda graph %s]"
                         % (
                             step_type,
-                            "DIM %d:%d"
-                            % (
-                                context.padded_active_token_count,
-                                prev_active_token_count,
-                            )
-                            if self.context.using_cuda_graph_this_step
-                            else "OFF"
+                            (
+                                "DIM %d:%d"
+                                % (context.padded_active_token_count, prev_active_token_count)
+                                if self.context.using_cuda_graph_this_step
+                                else "OFF"
+                            ),
                         )
-                    )
-                    ,
+                    ),
                     prev_total_request_count,
                     context.gtd_request_count,
                     prev_total_request_count - prev_paused_request_count,
