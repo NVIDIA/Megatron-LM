@@ -354,7 +354,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize(
         "num_cuda_graphs", [None, 4]
-    )  # todo: fix error when trying to test multiple sizes in one test case
+    )  # todo: fix error when trying to run multiple cuda-graph sizes in one test case
     def test_simple(self, num_cuda_graphs) -> None:
         """Simple test that runs without errors, and validates output."""
 
