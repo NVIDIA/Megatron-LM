@@ -298,7 +298,9 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
-        if not config.variable_seq_lengths:
+        # TODO(lit): remove this after fix shape issue
+        # if not config.variable_seq_lengths: # this is the original behavior in main.
+        if False:
             recv_prev_shape = tensor_shape
             recv_next_shape = tensor_shape
         else:

@@ -246,7 +246,7 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process:
+        if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
         if has_config_logger_enabled(self.config):
@@ -518,7 +518,6 @@ class GPTModel(LanguageModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-
         if mtp_in_postprocess:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -536,6 +535,8 @@ class GPTModel(LanguageModule):
             )
 
         if not self.post_process:
+            # TODO(shifangx): currently, hidden_states shape is [B*(1+mtp_num_layers), S, H]
+            # we need to set variable_seq_lengths to True in ModelParallelConfig
             return hidden_states
 
         if self.mtp_process:
@@ -580,6 +581,47 @@ class GPTModel(LanguageModule):
                         hidden_states, mtp_loss_scale * mtp_loss / num_tokens
                     )
         sequence_parallel_override = False
+        
+        if self.config.mtp_num_layers is not None:
+            hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
+            hidden_states = hidden_states_list[0]
+            if loss_mask is None:
+                # if loss_mask is not provided, use all ones as loss_mask
+                loss_mask = torch.ones_like(labels)
+            for mtp_layer_number in range(self.config.mtp_num_layers):
+                # output
+                mtp_logits, _ = self.output_layer(
+                    hidden_states_list[mtp_layer_number + 1],
+                    weight=output_weight,
+                    runtime_gather_output=runtime_gather_output,
+                )
+                # Calc loss for the current Multi-Token Prediction (MTP) layers.
+                labels, _ = roll_tensor(labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+                loss_mask, num_tokens = roll_tensor(
+                    loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group
+                )
+                mtp_loss = self.compute_language_model_loss(labels, mtp_logits)
+                mtp_loss = loss_mask * mtp_loss
+                if self.training:
+                    # TODO(shifangx): remove the use of parallel_state here
+                    # after moving loss logging to loss_func in pretrain_gpt.py
+                    MTPLossLoggingHelper.save_loss_to_tracker(
+                        torch.sum(mtp_loss) / num_tokens,
+                        mtp_layer_number,
+                        self.config.mtp_num_layers,
+                        avg_group=parallel_state.get_data_parallel_group(
+                            with_context_parallel=True
+                        ),
+                    )
+                mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
+                if self.config.calculate_per_token_loss:
+                    hidden_states = MTPLossAutoScaler.apply(
+                        hidden_states, mtp_loss_scale * mtp_loss
+                    )
+                else:
+                    hidden_states = MTPLossAutoScaler.apply(
+                        hidden_states, mtp_loss_scale * mtp_loss / num_tokens
+                    )
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]

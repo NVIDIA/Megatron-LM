@@ -124,11 +124,12 @@ class PipelineParallelLayerLayout:
             if LayerType.mtp in self.layout[pp_rank][-1]:
                 assert (
                     self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
-                ), "All of the MTP layers must be in the same stage"
-                assert (
-                    pp_rank == self.pipeline_model_parallel_size - 1
-                    and LayerType.loss in self.layout[pp_rank][-1]
-                ), "MTP layers must be in the last stage together with Loss stage."
+                ), "All of the MTP layers must be in the same one virtual pipeline stage"
+        for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
+            assert LayerType.mtp not in self.layout[0][vpp_rank], (
+                f"Corrently we restrict that the MTP should not be in the first pp rank."
+                f"But got {self.layout[0]} for the first pp rank."
+            )
         # TODO: remove them in the future once they are supported
         if self.flatten_layout.count(LayerType.encoder) > 0:
             raise NotImplementedError("Encoder layer is not supported for flexible pipeline layout")

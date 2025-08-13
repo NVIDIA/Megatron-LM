@@ -373,7 +373,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
-        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+        if self.has_final_layernorm_in_this_stage():
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
@@ -382,6 +382,28 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
+
+    def has_final_layernorm_in_this_stage(self):
+        """
+        check if this vpp stage contains the final layernorm
+        """
+        if self.config.mtp_num_layers is None:
+            # for model without MTPLayer, the final layernorm is set in the stage which does
+            # post_process
+            return self.submodules.layer_norm and self.post_process and self.post_layer_norm
+        else:
+            # for model with MTPLayer, the final layernorm is set in the stage which has the
+            # last layer of the decoder
+            has_final_layernorm_in_this_stage = False
+            for layer in self.layers:
+                if layer.layer_number == self.config.num_layers:
+                    has_final_layernorm_in_this_stage = True
+                    break
+            return (
+                self.submodules.layer_norm
+                and has_final_layernorm_in_this_stage
+                and self.post_layer_norm
+            )
 
     def _get_layer(self, layer_number: int):
         return self.layers[layer_number]

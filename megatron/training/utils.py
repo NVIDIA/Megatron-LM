@@ -500,7 +500,7 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def get_batch_on_this_tp_rank(data_iterator):
+def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
     args = get_args()
 
@@ -528,7 +528,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             'position_ids': data["position_ids"].cuda(non_blocking=True),
         }
 
-        if args.pipeline_model_parallel_size == 1:
+        if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(batch['tokens'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
@@ -544,9 +544,6 @@ def get_batch_on_this_tp_rank(data_iterator):
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
-                _broadcast(batch['tokens'])
-                _broadcast(batch['position_ids'])
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['attention_mask'])
@@ -582,7 +579,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             device=torch.cuda.current_device(),
         )
 
-        if args.pipeline_model_parallel_size == 1:
+        if args.pipeline_model_parallel_size == 1 or mtp_on_this_rank:
             _broadcast(tokens)
             _broadcast(labels)
             _broadcast(loss_mask)
@@ -601,12 +598,8 @@ def get_batch_on_this_tp_rank(data_iterator):
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
-            if args.mtp_num_layers is not None:
-                _broadcast(tokens)
-                _broadcast(position_ids)
-            else:
-                tokens = None
-                position_ids = None
+            tokens = None
+            position_ids = None
 
             _broadcast(labels)
             _broadcast(loss_mask)
