@@ -3,7 +3,7 @@
 import asyncio
 import random
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import pytest
@@ -38,6 +38,10 @@ from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGl
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
+
+# >>>
+from lutil import pax
+# <<<
 
 
 def set_rounder(value):
@@ -108,6 +112,16 @@ class DynamicEngineTestEnv:
     config: DynamicEngineTestConfig
     requests: List[DynamicInferenceRequest]
     engine: DynamicInferenceEngine
+    # >>>
+    # suspend_resume_mems: list[list[dict]] = field(default_factory=list)
+    # suspend_resume_mems: dict[list[dict]] = field(default_factory=dict)
+    # +++
+    mem_usage: dict = field(default_factory=lambda : {
+        "start" : None,
+        "end" : None,
+        "suspend_resume" : {},
+    })
+    # <<<
 
 
 class TestDynamicInferenceEngine:
@@ -357,6 +371,10 @@ class TestDynamicInferenceEngine:
                 f"Request {request.request_id} expected to generate {num_tokens_to_generate} "
                 f"tokens but generated {len(request.generated_tokens)}"
             )
+        # >>>
+        # env.engine.suspend() # ..... ?
+        env.mem_usage["end"] = torch.cuda.memory_stats()
+        # <<<
 
         return env
 
