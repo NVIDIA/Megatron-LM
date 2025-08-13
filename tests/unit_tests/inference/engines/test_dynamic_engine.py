@@ -82,6 +82,7 @@ class DynamicEngineTestConfig:
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
+    actually_build_cuda_graphs: bool = False # only test_simple requires us to actually build a cuda-graph
 
     def __post_init__(self):
 
@@ -263,7 +264,7 @@ class TestDynamicInferenceEngine:
             inference_context,
             termination_id=vocab_size - 1,
             random_seed=random_seed,
-            enable_cuda_graph=False,
+            enable_cuda_graph=test_config.num_cuda_graphs is not None and test_config.actually_build_cuda_graphs,
         )
 
         # Test env.
@@ -348,14 +349,17 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_simple(self) -> None:
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 4]) #todo: fix error when trying to test multiple sizes in one test case
+    def test_simple(self, num_cuda_graphs) -> None:
         """Simple test that runs without errors, and validates output."""
 
         # Run test.
-        env = self._run_test()
+        env = self._run_test(num_cuda_graphs=num_cuda_graphs,
+                             actually_build_cuda_graphs=num_cuda_graphs is not None,
+                             context_max_requests_override=32)
 
         # Validate max_requests, max_tokens.
-        assert env.engine.context.max_requests == 8
+        assert env.engine.context.max_requests == 32
         assert env.engine.context.max_tokens == 160
 
         # Validate output tokens.
