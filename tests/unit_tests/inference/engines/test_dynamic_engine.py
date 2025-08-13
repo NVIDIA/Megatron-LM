@@ -119,11 +119,9 @@ class DynamicEngineTestEnv:
     config: DynamicEngineTestConfig
     requests: List[DynamicInferenceRequest]
     engine: DynamicInferenceEngine
-    mem_usage: dict = field(default_factory=lambda : {
-        "start" : None,
-        "end" : None,
-        "suspend_resume" : {},
-    })
+    mem_usage: dict = field(
+        default_factory=lambda: {"start": None, "end": None, "suspend_resume": {}}
+    )
 
 
 class TestDynamicInferenceEngine:
