@@ -614,6 +614,9 @@ def validate_args(args, defaults={}):
     if args.fp8_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, or inference mode'
+        if args.fp8_recipe == "mxfp8":
+            assert args.reuse_grad_buf_for_mxfp8_param_ag, \
+                "--fp8-param-gather with mxfp8 requires --reuse-grad-buf-for-mxfp8-param-ag"
 
     if args.use_custom_fsdp:
         assert args.use_distributed_optimizer, \
