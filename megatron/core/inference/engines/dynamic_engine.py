@@ -135,7 +135,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     context.reset()  # todo: @lmcafee, remove if unnecessary.
 
                 # non-decode cudagraph capture.
-                if cuda_graph_token_count > 1 and context.non_decode_cuda_graphs:
+                if context.non_decode_cuda_graphs:
                     context.initialize_attention_state(
                         num_warmup_requests=cuda_graph_token_count, enforce_non_decode_mode=True
                     )
@@ -333,6 +333,7 @@ class DynamicInferenceEngine(AbstractEngine):
         prev_is_decode_only = self.context.is_decode_only()
         prev_total_request_count = self.context.total_request_count
         prev_paused_request_count = self.context.paused_request_count
+        prev_active_token_count = self.context.active_token_count
 
         range_push("Prefill" if not prev_is_decode_only else "Decode")
 
@@ -364,6 +365,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if verbose:
             context = self.context
             mem = torch.cuda.memory_stats()
+            step_type = "decode" if is_decode_only else "non-decode"
             output_str = (
                 "* step %d | %s ... time: %.3f%s ... "
                 "reqs: %d [ gtd %d, active %d, paused %d, finished %d ] ... "
@@ -373,21 +375,19 @@ class DynamicInferenceEngine(AbstractEngine):
                     datetime.now().strftime("%H:%M:%S"),
                     step_time,
                     (
-                        (
-                            " [decode + cuda graph %s]"
+                        " [%s + cuda graph %s]"
+                        % (
+                            step_type,
+                            "DIM %d:%d"
                             % (
-                                "DIM %d:%d"
-                                % (
-                                    context.padded_active_request_count,
-                                    prev_total_request_count - prev_paused_request_count,
-                                )
-                                if self.enable_cuda_graph
-                                else "OFF"
+                                context.padded_active_token_count,
+                                prev_active_token_count,
                             )
+                            if self.context.using_cuda_graph_this_step
+                            else "OFF"
                         )
-                        if prev_is_decode_only
-                        else "[prefill]"
-                    ),
+                    )
+                    ,
                     prev_total_request_count,
                     context.gtd_request_count,
                     prev_total_request_count - prev_paused_request_count,
