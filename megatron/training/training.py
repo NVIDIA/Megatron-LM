@@ -13,6 +13,8 @@ import sys
 from typing import List, Optional
 
 import torch.distributed
+
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -1408,6 +1410,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             )
         else:
             adjust_tensor_shapes_fn = None
+
+        # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
+        # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+        # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
         losses_reduced = forward_backward_func(

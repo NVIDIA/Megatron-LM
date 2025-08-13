@@ -300,6 +300,22 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
+            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
+            # we need to copy the param_data from the shared_param/grad_buffer to param.data
+            # after the param all-gather.
+            if (
+                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and self.ddp_config.overlap_param_gather
+            ):
+                for bucket in self.buckets:
+                    for param in bucket.params:
+                        param_start, param_end = bucket.param_to_index[param]
+                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                        param.data.copy_(param_slice.view(param.data.shape))
+                    # All-gathered params are not needed after being copied to param.data.
+                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
+                    bucket.grad_data.zero_()
+
     def start_grad_sync(self):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
