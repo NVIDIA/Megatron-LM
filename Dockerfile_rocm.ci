@@ -10,6 +10,7 @@ WORKDIR $WORKSPACE_DIR
 
 RUN pip3 install \
 scipy \
+transformers \
 einops \
 flask-restful \
 nltk \
