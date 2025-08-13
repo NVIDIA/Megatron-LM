@@ -651,6 +651,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.padded_active_token_count = self.round_up_tokens(self.active_token_count)
             if self.is_decode_only():
+                # For decode-only, the padded active token count cannot exceed max-requests.
                 self.padded_active_token_count = min(
                     self.padded_active_token_count, self.max_requests
                 )
