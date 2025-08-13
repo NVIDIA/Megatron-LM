@@ -42,7 +42,7 @@ ENV HIP_ARCHITECTURES=${PYTORCH_ROCM_ARCH_OVERRIDE}
 RUN git clone https://github.com/Dao-AILab/causal-conv1d causal-conv1d &&\
     cd causal-conv1d &&\
     git show --oneline -s &&\
-    pip install .
+    pip install --no-build-isolation .
 
 # Install mamba
 WORKDIR ${STAGE_DIR}
