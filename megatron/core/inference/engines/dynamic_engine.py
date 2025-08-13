@@ -355,13 +355,12 @@ class DynamicInferenceEngine(AbstractEngine):
             self.run_engine_with_coordinator(sampling_params)
         )
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
     def suspend(self):
-        """? ? ?"""
+        """Suspend engine by deallocating context's GPU state."""
         self.context.deallocate_all_tensors()
 
     def resume(self):
-        """? ? ?"""
+        """Resume engine by reallocating context's GPU state."""
 
         # Allocate context tensors.
         self.context.allocate_all_tensors()
@@ -371,6 +370,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Add requests.
         for request_id, request in self.requests.items():
+
+            # Skip waiting requests, since they were never added to the context.
+            if request_id in self.waiting_request_ids:
+                continue
 
             # Concatenate prompt + generated tokens.
             tokens = torch.cat(
@@ -386,28 +389,12 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
             # Add request.
-            # >>>
-            # pax("request")
-            # <<<
             self.context.add_request(
                 request_id,
                 tokens,
                 request.sampling_params.num_tokens_to_generate
                 - len(request.generated_tokens),
             )
-
-            # >>>
-            # pax("request_id, request, tokens")
-            # <<<
-
-        # >>>
-        # pax({
-        #     "requests" : self.requests,
-        #     "requests / 0" : list(self.requests.values())[0],
-        # })
-        # raise Exception("resume engine, yay.")
-        # <<<
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""

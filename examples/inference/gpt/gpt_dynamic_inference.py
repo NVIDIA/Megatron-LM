@@ -62,9 +62,7 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunSta
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDiagnostic])
 
 
-# >>>
-from lutil import pax
-
+# >>> [ temporary ]
 SUSPEND_RESUME_INTERVAL = 128
 # <<<
 
@@ -221,9 +219,6 @@ def run_inference(
     num_requests_total = len(requests)
     num_requests_added = 0
     num_requests_finished = 0
-    # >>>
-    # step_id = 0
-    # <<<
     step_times = {"prefill": [], "decode": []}
     add_times = []
     output_times = []
@@ -350,9 +345,6 @@ def main():
     # Requests, context, conroller.
     model = get_model()
     requests = build_requests(args, tokenizer)
-    # >>>
-    # pax("requests")
-    # <<<
     context = get_inference_context(requests, sampling_params)
     controller = get_inference_controller(model, context)
 
@@ -411,9 +403,7 @@ def main():
             unique_prompt_map[request.prompt_text].append(request_idx)
 
         # Print unique prompts + outputs.
-        # >>>
-        output_hashes = []
-        # <<<
+        output_text_hashes = []
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]

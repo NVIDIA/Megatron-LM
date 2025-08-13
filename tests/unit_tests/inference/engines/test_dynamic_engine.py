@@ -39,10 +39,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.test_utilities import Utils
 
-# >>>
-from lutil import pax
-# <<<
-
 
 def set_rounder(value):
     """Utility function to set the DynamicInferenceContext rounder."""

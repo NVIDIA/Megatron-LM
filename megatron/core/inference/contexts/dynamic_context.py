@@ -28,10 +28,6 @@ try:
 except:
     HAVE_PACKAGING = False
 
-# >>>
-from lutil import pax
-# <<<
-
 
 class ContextOverflowError(Exception):
     """Base exception for when a new request does not fit.
@@ -416,26 +412,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_attention_state()
 
     def deallocate_all_tensors(self):
-        """? ? ?"""
+        """Deallocate GPU state.
 
-        # >>>
-        # mem0 = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        # <<<
+        This method is used for suspending the dynamic engine.
+        """
 
+        # Delete all tensor attributes.
+        # TODO(@lmcafee): check that device == 'cuda'?
         keys = list(vars(self).keys())
         for key in keys:
             value = getattr(self, key)
             if isinstance(value, torch.Tensor):
                 delattr(self, key)
-
-        # >>>
-        # mem1 = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        # pax({
-        #     "mem0" : mem0 / 1024**3,
-        #     "mem1" : mem1 / 1024**3,
-        #     "diff" : (mem1 - mem0) / 1024**3,
-        # })
-        # <<<
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
