@@ -64,6 +64,8 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDia
 
 # >>>
 from lutil import pax
+
+SUSPEND_RESUME_INTERVAL = 128
 # <<<
 
 
@@ -409,6 +411,9 @@ def main():
             unique_prompt_map[request.prompt_text].append(request_idx)
 
         # Print unique prompts + outputs.
+        # >>>
+        output_hashes = []
+        # <<<
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             request_idx = request_idxs[0]
             request = requests[request_idx]
@@ -449,24 +454,24 @@ def main():
             with open(args.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
-    # Timing results.
-    stats = torch.cuda.memory_stats()
-    throughput = total_output_tokens / total_time
-    print("~~~")
-    peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
-    peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
+        # Timing results.
+        stats = torch.cuda.memory_stats()
+        throughput = total_output_tokens / total_time
+        print("~~~")
+        peak_alloc_gb = stats["allocated_bytes.all.peak"] / 1024**3
+        peak_resvd_gb = stats["reserved_bytes.all.peak"] / 1024**3
 
-    p_times = step_times["prefill"]
-    d_times = step_times["decode"]
+        p_times = step_times["prefill"]
+        d_times = step_times["decode"]
 
-    p_total = sum(p_times)
-    d_total = sum(d_times)
+        p_total = sum(p_times)
+        d_total = sum(d_times)
 
-    p_count = len(p_times)
-    d_count = len(d_times)
+        p_count = len(p_times)
+        d_count = len(d_times)
 
-    p_mean = p_total / p_count
-    d_mean = d_total / d_count
+        p_mean = p_total / p_count
+        d_mean = d_total / d_count if d_count != 0 else 0.
 
     # Commented out for now as the step/add/output times are not calculated correctly.
     # print(

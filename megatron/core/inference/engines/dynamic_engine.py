@@ -398,11 +398,11 @@ class DynamicInferenceEngine(AbstractEngine):
             # <<<
 
         # >>>
-        pax({
-            "requests" : self.requests,
-            "requests / 0" : list(self.requests.values())[0],
-        })
-        raise Exception("resume engine, yay.")
+        # pax({
+        #     "requests" : self.requests,
+        #     "requests / 0" : list(self.requests.values())[0],
+        # })
+        # raise Exception("resume engine, yay.")
         # <<<
     # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
