@@ -824,6 +824,7 @@ class RandomSTE(torch.autograd.Function):
     """
 
     generator = None
+    random_logits = None
 
     @staticmethod
     def forward(ctx, logits):
@@ -837,7 +838,9 @@ class RandomSTE(torch.autograd.Function):
             RandomSTE.generator = torch.Generator(device=logits.device)
             RandomSTE.generator.manual_seed(seed)
 
-        random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        if RandomSTE.random_logits is None:
+            RandomSTE.random_logits = logits.clone().normal_(generator=RandomSTE.generator)
+        random_logits = RandomSTE.random_logits
         return random_logits
 
     @staticmethod

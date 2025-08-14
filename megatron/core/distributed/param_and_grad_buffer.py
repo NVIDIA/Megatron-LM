@@ -212,6 +212,14 @@ class _ParamAndGradBucketGroup:
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
 
+        # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
+        # introduces some CPU overheads. We use these two lists to cache the created local
+        # shards to avoid unnecessary CPU operations. This does not increase GPU memory usage
+        # because it only saves a slice view, which shares the same memory with bucket.param_data
+        # or bucket.grad_data.
+        self.cached_param_buffer_shard_list = [None] * len(self.buckets)
+        self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -284,10 +292,14 @@ class _ParamAndGradBucketGroup:
         with _coalescing_manager(
             self.intra_distributed_optimizer_instance_group, async_ops=async_op
         ) as cm:
-            for bucket in self.buckets:
-                local_data_view = shard_buffer(
-                    bucket.param_data, self.intra_distributed_optimizer_instance_size
-                )[self.intra_distributed_optimizer_instance_rank]
+            for idx, bucket in enumerate(self.buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]
                 dist_all_gather_func(
                     bucket.param_data,
                     local_data_view,
@@ -407,14 +419,18 @@ class _ParamAndGradBucketGroup:
 
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
-            for bucket in self.buckets:
+            for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer:
                     assert (
                         communication_group.size() == self.intra_distributed_optimizer_instance_size
                     )
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
                     dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
@@ -435,17 +451,17 @@ class _ParamAndGradBucketGroup:
 
             assert self.inter_distributed_optimizer_instance_group is not None
             # Create a new coalescing manager for the inter-instance all-reduce.
-            with (
-                stream_context,
-                _coalescing_manager(
-                    self.inter_distributed_optimizer_instance_group, async_ops=async_op
-                ) as cm,
-            ):
-                for bucket in self.buckets:
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
-
+            with stream_context, _coalescing_manager(
+                self.inter_distributed_optimizer_instance_group, async_ops=async_op
+            ) as cm:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
                     torch.distributed.all_reduce(
                         local_data_view,
                         op=reduce_op,
