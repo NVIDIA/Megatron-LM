@@ -17,6 +17,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
+    WarmupEngineMode
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
@@ -474,8 +475,8 @@ class TestDynamicInferenceEngine:
                 actual_cuda_graph_token_counts,
             )
 
-    @pytest.mark.parametrize("enforce_non_decode_mode", [True, False])
-    def test_cuda_graph_warmup(self, enforce_non_decode_mode: bool) -> None:
+    @pytest.mark.parametrize("warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE])
+    def test_cuda_graph_warmup(self, warmup_engine_mode: WarmupEngineMode) -> None:
         """Test initialization during cuda graph warmup."""
 
         # Initialize context.
@@ -506,7 +507,7 @@ class TestDynamicInferenceEngine:
         ]:
             context.initialize_attention_state(
                 num_warmup_requests=num_warmup_requests,
-                enforce_non_decode_mode=enforce_non_decode_mode,
+                warmup_engine_mode=warmup_engine_mode
             )
 
             # Validate request & token counts.
@@ -539,7 +540,7 @@ class TestDynamicInferenceEngine:
             try:
                 context.initialize_attention_state(
                     num_warmup_requests=num_warmup_requests,
-                    enforce_non_decode_mode=enforce_non_decode_mode,
+                    warmup_engine_mode=warmup_engine_mode,
                 )
             except ActiveRequestCountOverflowError as e:
                 continue
@@ -559,7 +560,7 @@ class TestDynamicInferenceEngine:
         # we should now have more active tokens than max requests.
         context.initialize_attention_state()
         assert not context.is_decode_only()
-        assert not context.using_cuda_graph_this_step, (
+        assert not context.using_cuda_graph_this_step(), (
             "expected `using_cuda_graph_this_step` to be False for non-decode step where "
             "the active token count exceeds max requests"
         )
