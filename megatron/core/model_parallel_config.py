@@ -52,16 +52,15 @@ class ModelParallelConfig:
        type.
     """
 
-    #TODO: Should we calculate this using total seq length / cp size automatically?
     max_seqlen_per_cp_rank: Optional[int] = None
     """
-    Maximum sequence length per CP rank. This is used to calculate the number of sub-samples 
-    assigned to each CP rank when using heterogeneous context parallel.
+    Maximum sequence length per CP rank. This is used to calculate the number and length
+    of sub-samples assigned to each CP rank when using hybrid data x context parallel.
     """
 
-    heterogeneous_context_parallel: bool = False
+    hybrid_context_parallel: bool = False
     """
-    If true, enables heterogeneous context parallel. This is used to balance the workload of 
+    If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
     """
 

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from torch import Tensor
 from typing import List
+import torch.distributed as dist
 
 
 @dataclass
@@ -20,3 +21,6 @@ class PackedSeqParams:
     max_seqlen_q: int = None
     max_seqlen_kv: int = None
     cp_assignment: List[int] = None
+    local_cp_size: int = None
+    schedule_id: int = None
+    cp_group: dist.ProcessGroup = None

@@ -1842,6 +1842,9 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = No
     # we split sequence into 2*CP ranks. Assuming CP=2, we then get 4 chunks, chunk_0
     # and chunk_3 are assigned to GPU0, chunk_1 and chunk_2 are assigned to GPU1, so
     # that we can get balanced workload among GPUs in a context parallel group.
+    if cp_size is not None or cp_rank is not None:
+        assert cp_size is not None and cp_rank is not None, "Both cp_size and cp_rank must be provided for batch slicing"
+
     if cp_size is None:
         cp_size = parallel_state.get_context_parallel_world_size()
     if cp_rank is None:
@@ -1865,206 +1868,46 @@ def get_batch_on_this_cp_rank(batch: Dict[str, Any], cp_size: Optional[int] = No
 
     return batch
 
-
-def get_total_workload(seq_length: int, cp_size: int):
+def get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_seq_params):
     """
-    seq_length: sequence length of a sub-sample
-    cp_size: total number of CP ranks working on this sub-sample
+    For a packed sequence, this function returns 
+    1. The sub-sample of the sequence assigned to this CP rank.
+    2. The appropriate CP group for the new CP assignment.
+    3. The updated packed sequence parameters.
 
-    Note:
-    This function is used to estimate the relative workload intensity
-    of a sub-sample. This is not meant to be an accurate flops calculator.
-
-    Returns:
-      workload: workload of a sub-sample
+    Args:
+        batch: The batch of data to slice.
+        scheduled_id: The index of the sub-sample to return.
+        local_cp_size: The size of the CP group.
+        packed_seq_params: The updated packed sequence parameters.
     """
-    return (seq_length * seq_length) / cp_size
-
-
-def get_heterogeneous_cp_assignment(
-    cu_seqlens: List[int],
-    max_seqlen_per_cp_rank: int,
-    cp_size: int,
-    compute_estimator: Optional[Callable] = get_total_workload,
-):
-    """
-    cu_seqlens: list of sub-sample sequence lengths
-    max_seqlen_per_cp_rank: list of max sequence length per CP rank
-    cp_size: total number of CP ranks
-    flops_calculator: function to calculate flops from cu_seqlens
-
-    Returns:
-      start_time[j]: the time job j begins
-      assignment[j]: list of resource IDs assigned to job j
-    """
-    sub_sample_lens = cu_seqlens[0][1:] - cu_seqlens[0][:-1]
-    cp_rank = torch.distributed.get_rank()  # Get rank from CP group
-    cp_size_per_sample = [math.ceil(x / max_seqlen_per_cp_rank) for x in sub_sample_lens]
-    total_workload_per_cp_rank = [
-        compute_estimator(x, cp) for x, cp in zip(sub_sample_lens, cp_size_per_sample)
-    ]
-    # Sort workloads in descending order
-    num_sub_samples = len(sub_sample_lens)
-    jobs = sorted(range(num_sub_samples), key=lambda j: total_workload_per_cp_rank[j], reverse=True)
-
-    # a min-heap of free resource IDs (CP rank IDs)
-    free_resources = list(range(cp_size))
-    heapq.heapify(free_resources)
-
-    # events: (release_time, [list of resource IDs freeing then])
-    events = []
-    # Trackers used in scheduling algorithm
-    current_time = 0
-    start_time = [None] * num_sub_samples
-    assignment = [None] * num_sub_samples
-    num_sub_samples_processed = 0
-
-    while jobs:
-        made_progress = True
-        # try to schedule any sub-sample that fits in the currently free resources
-        while made_progress:
-            made_progress = False
-            for j in list(jobs):
-                if cp_size_per_sample[j] <= len(free_resources):
-                    # grab the lowest‐ID CP ranks available
-                    assigned = [heapq.heappop(free_resources) for _ in range(cp_size_per_sample[j])]
-                    if cp_rank in assigned:
-                        num_sub_samples_processed += 1
-                    start_time[j] = current_time
-                    assignment[j] = assigned
-                    # schedule the completion of the sub-sample compute
-                    release_time = current_time + total_workload_per_cp_rank[j]
-                    heapq.heappush(events, (release_time, assigned))
-                    jobs.remove(j)
-                    made_progress = True
-                    break
-
-        # if nothing fits right now, advance to the next release event
-        if not made_progress and events:
-            t, freed_ids = heapq.heappop(events)
-            current_time = t
-            for rid in freed_ids:
-                heapq.heappush(free_resources, rid)
-        elif not events:
-            # should not happen when cp_size ≥ max(cp_size_per_sample)
-            break
-
-    return num_sub_samples_processed, assignment
-
-
-def get_current_cp_assignment(complete_cp_assignment, microbatch_id, rank):
-    '''
-    complete_cp_assignment is a list of lists,
-    Each inner list contains the cp_assignment (assigned GPU ranks) for a sub-sample
-    This function returns the ith sub-sample assigned to a GPU, None otherwise
-    For example, complete_cp_assignment = [[0, 1, 2, 3], [4, 5], [4, 5], [6, 7], [6, 7]]
-    For microbatch_id = 0; rank = 4; current_cp_assignment is [None, [4, 5], None, None, None]
-    This informs rank 4 that it should pick-up the 2nd sub-sample and share with rank 5
-    For microbatch_id = 1; rank = 4; current_cp_assignment is [None, None, [4, 5], None, None]
-    This informs rank 4 that it should pick-up the 3rd sub-sample and share with rank 5
-    '''
-    current_cp_assignment = [None] * len(complete_cp_assignment)
-    matched_sample = -1
-    index = None
-    for i, assigned_ranks in enumerate(complete_cp_assignment):
-        if rank in assigned_ranks:
-            matched_sample += 1
-            if matched_sample == microbatch_id:
-                current_cp_assignment[i] = assigned_ranks
-                break
-    return current_cp_assignment
-
-
-def heterogeneous_context_parallel(
-    single_forward_step, backward_step, total_num_tokens, input_tensor, output_tensor_grad, model_type
-):
-    """
-    Heterogeneous context parallel is a technique to balance the workload
-    of each CP rank when we use packed samples with variable sequence lengths.
-    This provides a wrapper function that replaces the 1 forward step of the
-    original microbatch with N forward + N-1 backward steps where N is the number
-    of sub-samples assigned to this CP rank.
-    """
-
-    def forward_func_wrapper(*args, **kwargs):
-        nonlocal total_num_tokens
-        rank = parallel_state.get_context_parallel_rank()
-        forward_signature = inspect.signature(single_forward_step)
-        bound_args = forward_signature.bind(*args, **kwargs)
-        bound_args.apply_defaults()
-        original_data_iterator = bound_args.arguments['data_iterator']
-        data = next(original_data_iterator)  # TODO: Protect for model parallelism
-        config = bound_args.arguments['config']
-        # calculate new loop count
-        assert hasattr(data, "cu_seqlens"), (
-            "data must have a cu_seqlens attribute to define the valid sequenece lengths "
-            "of each sub-sample in a packed sample to use heterogeneous context parallel"
-        )
-        # num_subsamples: number of sub-samples assigned to this CP rank
-        # complete_cp_assignment: list of lists, inner list CP ranks assigned to a sub-sample
-        # TODO: When some ranks finish with their assigned sub-samples, they get the next microbatch from the data iterator.
-        # They then call heterogeneous_cp_assignment again. But some ranks are still executing their previous sub-samples.
-        # The scheduling algorithm assumes that all ranks have empty queues.
-        # Need to preserve the state of the queue. It should only empty at the end of global batch.
-        # OR should I force sync at the end of each microbatch across CP ranks?
-        # I think forcing sync at the end of each microbatch across CP ranks is the easier option.
-        # Since we only see 1 microbatch at a time, a later microbatch can have more GPUs for a sample than the 1st microbatch groups.
-        # For example, if microbatch 0 had group of 4 GPUs running for a sub-sample but microbatch 1 requires 6 GPUs
-        # If GPU 4,5 are done before 0,1,2,3 in microbatch 0, then they will be waiting for 0,1,2,3 to catch up which can lead to deadlock in comms.
-        # Unless we can stop 4,5 from executing which means partial syncs for each executing sub-sample.
-        num_subsamples, complete_cp_assignment = get_heterogeneous_cp_assignment(
-            data["cu_seqlens"],
-            config.max_seqlen_per_cp_rank,
-            config.context_parallel_size,
-        )
-        # current_cp_assignment: list of lists, each inner list contains the
-        # CP ranks assigned to the sub-samples that are executing in the forward-backward loop.
-        # See function get_current_cp_assignment for more details.
-        current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, 0, rank)
-        data["cp_assignment"] = current_cp_assignment
-        # TODO: Make this a tensor so that tensor parallel broadcast works
-        # data["cp_assignment"] = torch.tensor(current_cp_assignment, dtype=torch.int32)
-        bound_args.arguments['data_iterator'] = RerunDataIterator(iter([data]))
-        # Run the 1st micro-microbatch
-        output_tensor, num_tokens = single_forward_step(*bound_args.args, **bound_args.kwargs)
-        total_num_tokens += num_tokens
-        # Run the N-1 backward steps, N-1 forward steps.
-        # Will be left with Nth backward step after this loop which is run in the original function.
-        for i in range(1, num_subsamples):
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
-
-            current_cp_assignment = get_current_cp_assignment(complete_cp_assignment, i, rank)
-            data["cp_assignment"] = current_cp_assignment
-            bound_args.arguments['data_iterator'] = RerunDataIterator(iter([data]))
-            output_tensor, num_tokens = single_forward_step(*bound_args.args, **bound_args.kwargs)
-            total_num_tokens += num_tokens
-        return output_tensor, total_num_tokens
-    return forward_func_wrapper
-
-def get_sub_sample_on_this_cp_rank(batch, current_cp_assignment, packed_seq_params, cp_rank):
     cu_lengths = packed_seq_params.cu_seqlens_q_padded
-    for i in range(len(current_cp_assignment)):
-        if current_cp_assignment[i] is not None:
-            assert cp_rank in current_cp_assignment[i], f"Current cp rank {cp_rank} is not part of the cp_assignment {current_cp_assignment[i]} given to this GPU"
-            start_index = cu_lengths[i]
-            end_index = cu_lengths[i+1]
-            cp_shard_ranks = current_cp_assignment[i]
-            break        
+    start_index = cu_lengths[scheduled_id]
+    end_index = cu_lengths[scheduled_id+1]
+    # TODO (flexible HCP): New CP size also means new padding requirement. CP4 to CP3 changes padding requirement.
     for key, data in batch.items():
         batch[key] = data[:, start_index:end_index]
-        
-    # TODO: Clean this up. Reduce code by calculating indices once
+
+    # TODO (milestone 2): Enable this when we do DPxCP
+    # cp_group = parallel_state.get_hybrid_data_context_parallel_groups(group_size=local_cp_size)
+    if local_cp_size > 1:
+        cp_group = parallel_state.get_hybrid_context_parallel_groups(group_size=local_cp_size)
+    else:
+        cp_group = None
+
     sub_sample_packed_seq_params = PackedSeqParams(
         qkv_format="sbhd",
-        cu_seqlens_q=torch.tensor([0, packed_seq_params.cu_seqlens_q[i+1] - packed_seq_params.cu_seqlens_q[i]], device="cpu", pin_memory=True),
-        cu_seqlens_kv=torch.tensor([0, packed_seq_params.cu_seqlens_kv[i+1] - packed_seq_params.cu_seqlens_kv[i]], device="cpu", pin_memory=True),
-        cu_seqlens_q_padded=torch.tensor([0, packed_seq_params.cu_seqlens_q_padded[i+1] - packed_seq_params.cu_seqlens_q_padded[i]], device="cpu", pin_memory=True),
-        cu_seqlens_kv_padded=torch.tensor([0, packed_seq_params.cu_seqlens_kv_padded[i+1] - packed_seq_params.cu_seqlens_kv_padded[i]], device="cpu", pin_memory=True),
-        max_seqlen_q=torch.tensor([end_index - start_index], device="cpu", pin_memory=True),
-        max_seqlen_kv=torch.tensor([end_index - start_index], device="cpu", pin_memory=True),
-        cp_assignment=cp_shard_ranks,
+        cu_seqlens_q=torch.tensor([0, packed_seq_params.cu_seqlens_q[scheduled_id+1] - packed_seq_params.cu_seqlens_q[scheduled_id]], device="cpu", pin_memory=True),
+        cu_seqlens_kv=torch.tensor([0, packed_seq_params.cu_seqlens_kv[scheduled_id+1] - packed_seq_params.cu_seqlens_kv[scheduled_id]], device="cpu", pin_memory=True),
+        cu_seqlens_q_padded=torch.tensor([0, packed_seq_params.cu_seqlens_q_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_q_padded[scheduled_id]], device="cpu", pin_memory=True),
+        cu_seqlens_kv_padded=torch.tensor([0, packed_seq_params.cu_seqlens_kv_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_kv_padded[scheduled_id]], device="cpu", pin_memory=True),
+        max_seqlen_q=end_index - start_index,
+        max_seqlen_kv=end_index - start_index,
+        local_cp_size=local_cp_size,
     )
-    return batch, cp_shard_ranks, sub_sample_packed_seq_params
+    # TODO: Should we return the sharded sample directly here?
+    
+    return batch, cp_group, sub_sample_packed_seq_params
 
 
 ######################

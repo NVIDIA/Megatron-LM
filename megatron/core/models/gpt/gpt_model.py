@@ -298,8 +298,7 @@ class GPTModel(LanguageModule):
                 )
                 rotary_pos_emb = self.rotary_pos_emb(
                     rotary_seq_len,
-                    packed_seq=packed_seq_params is not None
-                    and packed_seq_params.qkv_format == 'thd',
+                    packed_seq_params=packed_seq_params,
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:

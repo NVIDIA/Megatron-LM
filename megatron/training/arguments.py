@@ -2414,10 +2414,10 @@ def _add_distributed_args(parser):
     group.add_argument('--max-seqlen-per-cp-rank', type=int, default=None,
                        help='Maximum sequence length per CP rank. This is used to calculate the '
                        'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.')
-    group.add_argument('--heterogeneous-context-parallel', action='store_true', default=False,
-                       help='Enables heterogeneous context parallel. This is used to balance the workload '
-                       'of each CP rank when we use packed samples with variable sequence lengths. Requires '
-                       '--max-seqlen-per-cp-rank to be set.')
+    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
+                       help='Enables hybrid context parallel. This is used to balance the workload '
+                       'of each CP rank when we use packed samples with variable sequence lengths. '
+                       'Requires --max-seqlen-per-cp-rank to be set.')
     group.add_argument('--nccl-communicator-config-path', type=str, default=None,
                        help='Path to the yaml file with NCCL communicator '
                        'configurations. The number of min/max thread groups and thread '

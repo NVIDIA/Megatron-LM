@@ -884,6 +884,18 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         packed_seq_params: PackedSeqParams = None,
     ):
         """Forward."""
+        if packed_seq_params is not None:
+            if packed_seq_params.cp_group is not None:
+                self.cp_group = packed_seq_params.cp_group
+                super().set_context_parallel_group(
+                    self.cp_group,
+                    torch.distributed.get_process_group_ranks(self.cp_group),
+                    super().cp_stream,
+                )
+            elif packed_seq_params.local_cp_size is not None:
+                super().set_context_parallel_group(None, None, None)
+            self.kept_packed_seq_params.discard("cp_group")
+            self.kept_packed_seq_params.discard("local_cp_size")
         packed_seq_kwargs = (
             {key: getattr(packed_seq_params, key) for key in self.kept_packed_seq_params}
             if packed_seq_params is not None

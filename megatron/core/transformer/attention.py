@@ -674,7 +674,7 @@ class Attention(MegatronModule, ABC):
         if rotary_pos_emb is not None and not self.config.flash_decode:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
-            if packed_seq_params is not None:
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
                 if packed_seq_params.cu_seqlens_q_padded is not None:
                     cu_seqlens_q = packed_seq_params.cu_seqlens_q_padded
                 else:

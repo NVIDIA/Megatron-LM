@@ -18,16 +18,12 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_model_config,
     get_model_type,
-<<<<<<< HEAD
-    get_model_xattn,
-    heterogeneous_context_parallel,
-=======
->>>>>>> 410222b3ec5e05f53871e7371e02128eff38c7e8
     nvtx_range_pop,
     nvtx_range_push,
 )
 
 from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining
+from .hybrid_cp_schedule import hybrid_context_parallel_forward_backward
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -521,6 +517,24 @@ def forward_backward_no_pipelining(
             no_sync_func,
             total_num_tokens,
             partial(check_first_val_step, first_val_step, forward_only),
+        )
+    elif config.hybrid_context_parallel:
+        forward_data_store, total_num_tokens = hybrid_context_parallel_forward_backward(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            output_tensor_grad,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            first_val_step,
+            forward_only,
+            no_sync_func,
+            total_num_tokens,
+            check_first_val_step,
+            model_type,
         )
     else:
         with no_sync_func():
