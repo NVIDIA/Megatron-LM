@@ -119,7 +119,7 @@ class DynamicInferenceEngine(AbstractEngine):
         ), f"termination_id must be an int, got {type(termination_id)}"
         assert isinstance(random_seed, int), f"random_seed must be an int, got {type(random_seed)}"
 
-        self.request_counter = Counter()
+        # Setup.
         self.controller = controller
         self.context = context
         self.termination_id = termination_id
@@ -142,6 +142,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # TODO: Start the engine loop here.
         self._loop = get_asyncio_loop()
         self._cond = asyncio.Condition()
+
+    def create_cuda_graphs(self):
 
         # Capture cuda graph.
         if enable_cuda_graph is not None:
@@ -379,21 +381,68 @@ class DynamicInferenceEngine(AbstractEngine):
         """Suspend engine by deallocating context's GPU state."""
         self.context.deallocate_all_tensors()
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def resume(self):
+    #     """Resume engine by reallocating context's GPU state."""
+
+    #     # Allocate context tensors.
+    #     self.context.allocate_all_tensors()
+
+    #     # Reset context state (i.e., paused_request_count, total_request_count, etc.).
+    #     self.context.reset()
+
+    #     # Add requests.
+    #     for request_id, request in self.requests.items():
+
+    #         # Skip waiting requests, since they were never added to the context.
+    #         if request_id in self.waiting_request_ids:
+    #             continue
+
+    #         # Concatenate prompt + generated tokens.
+    #         tokens = torch.cat(
+    #             (
+    #                 request.prompt_tokens,
+    #                 torch.tensor(
+    #                     request.generated_tokens,
+    #                     dtype=request.prompt_tokens.dtype,
+    #                     device=request.prompt_tokens.device,
+    #                 ),
+    #             ),
+    #             dim=0,
+    #         )
+
+    #         # Add request.
+    #         self.context.add_request(
+    #             request_id,
+    #             tokens,
+    #             request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+    #         )
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
+
+        # Maintain references to requests before reset.
+        waiting_request_ids = list(self.waiting_request_ids)
+        active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
+        request_ids = [ *active_request_ids, *waiting_request_ids ]
+        requests = dict(self.requests)
+
+        # >>>
+        from lutil import pax
+        # pax("requests, waiting_request_ids, active_request_ids, request_ids")
+        # <<<
 
         # Allocate context tensors.
         self.context.allocate_all_tensors()
 
-        # Reset context state (i.e., paused_request_count, total_request_count, etc.).
-        self.context.reset()
+        # Reset engine (requests, waiting requests, futures, step count, etc.).
+        self.reset()
 
         # Add requests.
-        for request_id, request in self.requests.items():
+        futures = {}
+        for request_id in request_ids:
 
-            # Skip waiting requests, since they were never added to the context.
-            if request_id in self.waiting_request_ids:
-                continue
+            request = requests[request_id]
 
             # Concatenate prompt + generated tokens.
             tokens = torch.cat(
@@ -409,11 +458,18 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
             # Add request.
-            self.context.add_request(
+            futures[request_id] = self.add_request(
                 request_id,
                 tokens,
                 request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
             )
+
+        # >>>
+        pax("futures")
+        # <<<
+
+        return futures
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
