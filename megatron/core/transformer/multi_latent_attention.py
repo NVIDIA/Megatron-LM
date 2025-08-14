@@ -3,6 +3,7 @@
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from typing import NoReturn, Optional, Union
 
 import torch
@@ -212,16 +213,33 @@ class MultiLatentAttention(Attention):
         # =====================
         # Query, Key, and Value
         # =====================
-        # Get the query, key and value tensors based on the type of attention -
-        # self or cross attn.
-        # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
-        query, key, value = self.get_query_key_value_tensors(
-            hidden_states,
-            key_value_states,
-            position_ids,
-            packed_seq_params,
-            inference_context=inference_context,
-        )
+        cp_size = self.model_comm_pgs.cp.size() if self.model_comm_pgs.cp else 1
+        if cp_size == 1:
+            # Get the query, key and value tensors based on the type of attention -
+            # self or cross attn.
+            # query: [96, 1, 16, 128], key:[96, 1, 16, 128], value:[96, 1, 16, 128]
+            query, key, value = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+            )
+            kv_compressed = None
+            k_pos_emb = None
+        else:
+            # For MLA CP, keep the kv_compressed to eliminate the communication overhead.
+            # Requires TE [TODO: version] to support.
+            query, kv_compressed, k_pos_emb, kv_up_proj_fn = self.get_query_key_value_tensors(
+                hidden_states,
+                key_value_states,
+                position_ids,
+                packed_seq_params,
+                inference_context=inference_context,
+                keep_kv_compressed=True,
+            )
+            key = None
+            value = None
 
         # ===================================================
         # Adjust key, value for inference
@@ -233,11 +251,27 @@ class MultiLatentAttention(Attention):
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
-        key = key.contiguous()
-
-        # Value is none during decode for absorption
+        # Key is none during context parallel
+        if key is not None:
+            key = key.contiguous()
+        # Value is none during context parallel and decode for absorption
         if value is not None:
             value = value.contiguous()
+        # kv_compressed is NOT none during context parallel
+        if kv_compressed is not None:
+            kv_compressed = kv_compressed.contiguous()
+        # k_pos_emb is NOT none during context parallel
+        if k_pos_emb is not None:
+            k_pos_emb = k_pos_emb.contiguous()
+
+        if cp_size == 1:
+            core_attn_kwargs = {}
+        else:
+            core_attn_kwargs = {
+                "kv_compressed": kv_compressed,
+                "k_pos_emb": k_pos_emb,
+                "kv_up_proj_fn": kv_up_proj_fn,
+            }
 
         # ==================================
         # core attention computation
@@ -245,38 +279,46 @@ class MultiLatentAttention(Attention):
         # Need corresponding TE change
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                **core_attn_kwargs,
             )
-        else:
-            if inference_context is None or inference_context.is_static_batching():
-                core_attn_out = self.core_attention(
-                    query,
-                    key,
-                    value,
-                    attention_mask,
-                    packed_seq_params=packed_seq_params,
-                    attn_mask_type=attn_mask_type,
-                )
-            elif self.cache_mla_latents:
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+        elif inference_context is None or inference_context.is_static_batching():
+            # Regular codepath w/o core attention checkpointing.
+            core_attn_out = self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                attn_mask_type=attn_mask_type,
+                **core_attn_kwargs,
+            )
+        elif self.cache_mla_latents:
+            # Dynamic batching attention kernel.
+            q, k, v = (query, key, value)
+            cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+            cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
 
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                )
-                # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
-                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+            core_attn_out = self.flash_decode_and_prefill(
+                q,
+                k,
+                v,
+                max_seqlen_q,
+                max_seqlen_k,
+                cu_query_lengths,
+                cu_kv_lengths,
+                kv_lengths,
+                block_table,
+            )
+            # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
+            if not inference_context.is_decode_only():
+                core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+        else:
+            raise ValueError(f"{cache_mla_latents=}, but {inference_context=}.")
 
         # We are doing absorption with cache mla latents and decode mode.
         if self.cache_mla_latents and inference_context.is_decode_only():
@@ -414,6 +456,7 @@ class MLASelfAttention(MultiLatentAttention):
             **kv_down_proj_kwargs,
         )
 
+        cp_size = self.model_comm_pgs.cp.size() if self.model_comm_pgs.cp else 1
         self.linear_kv_up_proj = build_module(
             submodules.linear_kv_up_proj,
             self.config.kv_lora_rank,
@@ -425,6 +468,7 @@ class MLASelfAttention(MultiLatentAttention):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
+            input_pre_gathered_for_sp=(cp_size > 1 and self.config.sequence_parallel),
         )
 
         if self.config.q_lora_rank is not None:
@@ -451,6 +495,7 @@ class MLASelfAttention(MultiLatentAttention):
         inference_context=None,
         *,
         inference_params=None,
+        keep_kv_compressed=False,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -472,6 +517,7 @@ class MLASelfAttention(MultiLatentAttention):
 
         # rotary_pos_emb:[s, b, 1, 64]
         mscale = 1.0
+        rotary_pos_emb = None
         rotary_pos_cos = None
         rotary_pos_sin = None
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
@@ -482,13 +528,13 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
                     rotary_seq_len, dtype=hidden_states.dtype, packed_seq=packed_seq
                 )
-                rotary_pos_emb = None
                 assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
                 assert (
                     fused_apply_mla_rope_for_q is not None
                     and fused_apply_mla_rope_for_kv is not None
                 ), "Fused MLA RoPE apply is not imported successfully"
-            else:
+
+            if (not self.config.apply_rope_fusion) or keep_kv_compressed:
                 rotary_pos_emb, mscale = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
 
         if packed_seq_params is not None:
@@ -551,6 +597,9 @@ class MLASelfAttention(MultiLatentAttention):
             ):
                 # k_pos_emb: [s, b, qk_pos_emb_head_dim]
                 k_pos_emb = gather_from_sequence_parallel_region(k_pos_emb)
+                if keep_kv_compressed:
+                    # kv_compressed: [s, b, kv_lora_rank]
+                    kv_compressed = gather_from_sequence_parallel_region(kv_compressed)
 
         if packed_seq_params is not None:
             # If sequence packing, TE expect [t, h, d] shaped qkv input.
@@ -635,9 +684,157 @@ class MLASelfAttention(MultiLatentAttention):
 
             return query, key, value
 
-        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
+        def q_up_proj_and_rope_apply(q_compressed, rotary_pos_emb):
             """
-            Apply the up projection and RoPE to the query and key.
+            Apply the up projection and RoPE to the query.
+            When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
+            otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
+            we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
+            """
+            if self.config.q_lora_rank is not None:
+                # q_compressed: [num_tokens, q_lora_rank]
+                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                q_compressed = self.q_layernorm(q_compressed)
+                q, _ = self.linear_q_up_proj(q_compressed)
+            else:
+                # q_compressed: [num_tokens, hidden_size]
+                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                q, _ = self.linear_q_proj(q_compressed)
+
+            # q: [num_tokens, n, q_head_dim]
+            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+
+            if self.config.apply_rope_fusion:
+                cp_rank = self.model_comm_pgs.cp.rank()
+                cp_size = self.model_comm_pgs.cp.size()
+                query = fused_apply_mla_rope_for_q(
+                    q,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_head_dim,
+                    self.config.qk_pos_emb_head_dim,
+                    cu_seqlens_q,
+                    cp_rank,
+                    cp_size,
+                )
+            else:
+                q_len = q.size()[0]
+                if inference_context is not None:
+                    # add offset to the sequence start for inference
+                    sequence_start = inference_context.sequence_len_offset
+                    sequence_end = sequence_start + q_len
+                    rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
+                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                    # Shorten rotary_pos_emb to the sequence length when inference_params
+                    # is not provided. This makes sure we can run forward directly with
+                    # any sequence length. During training, the sequence length is always
+                    # the full rotary_pos_emb length, except for sequence packing + CP.
+                    # When sequence packing and context parallel are both enabled, the
+                    # position embedding will not split rotary_pos_emb, so it may exceed
+                    # the sequence length on this CP rank, but we need the full rotary_pos_emb
+                    # to cover the full sequence, so we do not shorten it here.
+                    rotary_pos_emb = rotary_pos_emb[0:q_len]
+
+                # q_no_pe: [num_tokens, n, qk_head_dim]
+                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                q_no_pe, q_pos_emb = torch.split(
+                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+                )
+
+                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                q_pos_emb = apply_rotary_pos_emb(
+                    q_pos_emb,
+                    rotary_pos_emb,
+                    config=self.config,
+                    cu_seqlens=cu_seqlens_q,
+                    mscale=mscale,
+                    cp_group=self.model_comm_pgs.cp,
+                )
+
+                # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
+
+            query = query.contiguous()
+            return query
+
+        def kv_up_proj_and_rope_apply(kv_compressed, k_pos_emb, rotary_pos_emb, apply_k_rope=True):
+            """
+            Apply the up projection and RoPE to the key and value.
+            `apply_k_rope` denote whether to apply RoPE to the key. If `apply_k_rope` is False,
+            only concatenate k_pos_emb to the key.
+            When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
+            otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
+            we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
+            """
+            kv_compressed = self.kv_layernorm(kv_compressed)
+            # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
+            kv, _ = self.linear_kv_up_proj(kv_compressed)
+
+            # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
+            kv = kv.view(
+                *kv.size()[:-1],
+                self.num_attention_heads_per_partition,
+                self.config.qk_head_dim + self.config.v_head_dim,
+            )
+
+            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+            if apply_k_rope and self.config.apply_rope_fusion:
+                cp_rank = self.model_comm_pgs.cp.rank()
+                cp_size = self.model_comm_pgs.cp.size()
+                key, value = fused_apply_mla_rope_for_kv(
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                    cu_seqlens_kv,
+                    cp_rank,
+                    cp_size,
+                )
+            else:
+                # k_no_pe: [num_tokens, n, qk_head_dim]
+                # value: [num_tokens, n, v_head_dim]
+                k_no_pe, value = torch.split(
+                    kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
+                )
+
+                if apply_k_rope:
+                    # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                    k_pos_emb = apply_rotary_pos_emb(
+                        k_pos_emb,
+                        rotary_pos_emb,
+                        config=self.config,
+                        cu_seqlens=cu_seqlens_kv,
+                        mscale=mscale,
+                        cp_group=self.model_comm_pgs.cp,
+                    )
+
+                # key: [num_tokens, n, (qk_head_dim + v_head_dim)]
+                if k_pos_emb.ndim == 5:
+                    k_pos_emb = k_pos_emb.expand(
+                        -1, -1, -1, self.num_attention_heads_per_partition, -1
+                    )
+                elif k_pos_emb.ndim == 4:
+                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+                else:
+                    assert k_pos_emb.ndim == 3
+                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
+
+                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+
+            key = key.contiguous()
+            value = value.contiguous()
+            return key, value
+
+        def _qkv_up_proj_and_rope_apply(
+            q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+        ):  # TODO: remove this function
+            """
+            Apply the up projection and RoPE to the query, key, and value.
             When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
             otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
             we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
@@ -762,23 +959,61 @@ class MLASelfAttention(MultiLatentAttention):
 
             return query, key, value
 
+        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
+            """
+            Apply the up projection and RoPE to the query, key, and value.
+            """
+            query = q_up_proj_and_rope_apply(q_compressed, rotary_pos_emb)
+            key, value = kv_up_proj_and_rope_apply(kv_compressed, k_pos_emb, rotary_pos_emb)
+            return query, key, value
+
         if self.recompute_up_proj:
+            # recompute_up_proj.
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=self.config.fp8)
-            query, key, value = self.qkv_up_checkpoint.checkpoint(
-                qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-            )
-        else:
-            if self.cache_mla_latents:
-                assert (
-                    inference_context and not inference_context.is_static_batching()
-                ), "Caching MLA latents only works with dynamic backend inference"
-                query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
-                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            if keep_kv_compressed:
+                query = self.qkv_up_checkpoint.checkpoint(
+                    q_up_proj_and_rope_apply, q_compressed, rotary_pos_emb
                 )
+            else:
+                query, key, value = self.qkv_up_checkpoint.checkpoint(
+                    qkv_up_proj_and_rope_apply,
+                    q_compressed,
+                    kv_compressed,
+                    k_pos_emb,
+                    rotary_pos_emb,
+                )
+        elif not self.cache_mla_latents:
+            # Regular codepath w/o recompute_up_proj
+            if keep_kv_compressed:
+                query = q_up_proj_and_rope_apply(q_compressed, rotary_pos_emb)
             else:
                 query, key, value = qkv_up_proj_and_rope_apply(
                     q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
                 )
+        else:
+            # cache_mla_latents.
+            assert (
+                inference_context and not inference_context.is_static_batching()
+            ), "Caching MLA latents only works with dynamic backend inference"
+            query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
+                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            )
+
+        if keep_kv_compressed:
+            k_pos_emb = k_pos_emb.unsqueeze(-2)
+            k_pos_emb = apply_rotary_pos_emb(
+                k_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens=cu_seqlens_kv,
+                mscale=mscale,
+                cp_group=self.model_comm_pgs.cp,
+            )
+            k_pos_emb = k_pos_emb.squeeze(-2)
+            kv_up_proj_fn = partial(
+                kv_up_proj_and_rope_apply, rotary_pos_emb=None, apply_k_rope=False
+            )
+            return query, kv_compressed, k_pos_emb, kv_up_proj_fn
 
         return query, key, value
 

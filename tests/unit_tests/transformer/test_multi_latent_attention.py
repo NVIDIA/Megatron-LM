@@ -501,7 +501,9 @@ class TestTensorParallelMLAAttention:
 
 @pytest.mark.experimental
 @pytest.mark.skipif(
-    not is_te_min_version("2.5.0", check_equality=True),
+    not is_te_min_version(
+        "2.5.0", check_equality=True
+    ),  # TODO: update the version number once released
     reason="Requires TransformerEngine >= 2.5.0",
 )
 @pytest.mark.parametrize(
@@ -546,7 +548,9 @@ class TestContextParallelMLAAttention:
         Utils.destroy_model_parallel()
 
     def test_gpu_forward(self):
-        if is_te_min_version("2.5.0", check_equality=True):
+        if is_te_min_version(
+            "2.5.0", check_equality=True
+        ):  # TODO: update the version number once released
             config = self.parallel_attention.config
             sequence_length = 64
             micro_batch_size = 2
@@ -574,7 +578,9 @@ class TestContextParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
     def test_gpu_forward_thd(self):
-        if is_te_min_version("2.5.0", check_equality=True):
+        if is_te_min_version(
+            "2.5.0", check_equality=True
+        ):  # TODO: update the version number once released
             config = self.parallel_attention.config
             sequence_length = 128
             micro_batch_size = 1
@@ -744,7 +750,9 @@ class TestParallelMLAAttentionPrecision:
 
 @pytest.mark.experimental
 @pytest.mark.skipif(
-    not is_te_min_version("2.5.0", check_equality=True),
+    not is_te_min_version(
+        "2.5.0", check_equality=True
+    ),  # TODO: update the version number once released
     reason="Requires TransformerEngine >= 2.5.0",
 )
 @pytest.mark.parametrize(
@@ -796,7 +804,9 @@ class TestContextParallelMLAAttentionPrecision:
         Utils.destroy_model_parallel()
 
     def test_gpu_forward_thd_precision(self):
-        if is_te_min_version("2.5.0", check_equality=True):
+        if is_te_min_version(
+            "2.5.0", check_equality=True
+        ):  # TODO: update the version number once released
             # use flash attention for hopper, future may support fused attention for ampere
             _environ = os.environ.copy()
             os.environ['NVTE_FUSED_ATTN'] = "1"
@@ -828,37 +838,49 @@ class TestContextParallelMLAAttentionPrecision:
             packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
 
             # fine-grained check
-            query_sbhd, key_sbhd, value_sbhd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_sbhd, None, None, None, None
+            (query_sbhd, kv_compressed_sbhd, k_pos_emb_sbhd, kv_up_proj_fn_sbhd) = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_sbhd, None, None, None, None, keep_kv_compressed=True
+                )
             )
-            query_thd, key_thd, value_thd = self.parallel_attention.get_query_key_value_tensors(
-                hidden_states_thd, None, None, packed_seq_params, None
+            (query_thd, kv_compressed_thd, k_pos_emb_thd, kv_up_proj_fn_thd) = (
+                self.parallel_attention.get_query_key_value_tensors(
+                    hidden_states_thd, None, None, packed_seq_params, None, keep_kv_compressed=True
+                )
             )
             _query_sbhd = query_sbhd.transpose(0, 1).contiguous().view(*query_thd.shape)
-            _key_sbhd = key_sbhd.transpose(0, 1).contiguous().view(*key_thd.shape)
-            _value_sbhd = value_sbhd.transpose(0, 1).contiguous().view(*value_thd.shape)
+            _kv_compressed_sbhd = (
+                kv_compressed_sbhd.transpose(0, 1).contiguous().view(*kv_compressed_thd.shape)
+            )
+            _k_pos_emb_sbhd = k_pos_emb_sbhd.transpose(0, 1).contiguous().view(*k_pos_emb_thd.shape)
             torch.testing.assert_close(_query_sbhd, query_thd, atol=1e-6, rtol=1e-6)
-            torch.testing.assert_close(_key_sbhd, key_thd, atol=1e-6, rtol=1e-6)
-            torch.testing.assert_close(_value_sbhd, value_thd, atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(_kv_compressed_sbhd, kv_compressed_thd, atol=1e-6, rtol=1e-6)
+            torch.testing.assert_close(_k_pos_emb_sbhd, k_pos_emb_thd, atol=1e-6, rtol=1e-6)
 
             core_attn_out_sbhd = self.parallel_attention.core_attention(
                 query_sbhd,
-                key_sbhd,
-                value_sbhd,
+                None,
+                None,
                 attention_mask_sbhd,
                 packed_seq_params=None,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
+                kv_compressed=kv_compressed_sbhd,
+                k_pos_emb=k_pos_emb_sbhd,
+                kv_up_proj_fn=kv_up_proj_fn_sbhd,
             )
             query_thd = query_thd.squeeze(1)
-            key_thd = key_thd.squeeze(1)
-            value_thd = value_thd.squeeze(1)
+            kv_compressed_thd = kv_compressed_thd.squeeze(1)
+            k_pos_emb_thd = k_pos_emb_thd.squeeze(1)
             core_attn_out_thd = self.parallel_attention.core_attention(
                 query_thd,
-                key_thd,
-                value_thd,
+                None,
+                None,
                 attention_mask_thd,
                 packed_seq_params=packed_seq_params,
                 attn_mask_type=self.parallel_attention.attn_mask_type,
+                kv_compressed=kv_compressed_thd,
+                k_pos_emb=k_pos_emb_thd,
+                kv_up_proj_fn=kv_up_proj_fn_thd,
             )
             core_attn_out_thd = core_attn_out_thd.reshape(core_attn_out_thd.size(0), 1, -1)
             _core_attn_out_sbhd = (
@@ -1043,6 +1065,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
         ("yarn", True),  # apply_rope_fusion for MLA only works with YARN RoPE.
     ],
 )
+@pytest.mark.parametrize(("qk_layernorm"), [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
     [
@@ -1055,19 +1078,14 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
 )
 @pytest.mark.skipif(not is_te_min_version("1.10.0"), reason="Requires TransformerEngine >= 1.10.0")
 def test_parallel_multi_latent_attention_correctness(
-    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, tp, sp, cp
+    tmp_path_dist_ckpt, rope_type, apply_rope_fusion, qk_layernorm, tp, sp, cp
 ):
-    if cp > 1 and not is_te_min_version("2.5.0", check_equality=True):
+    if cp > 1 and not is_te_min_version(
+        "2.5.0", check_equality=True
+    ):  # TODO: update the version number once released
         pytest.skip("MLA CP requires TransformerEngine >= 2.5.0")
     if rope_type == "yarn" and apply_rope_fusion and not is_torch_min_version("2.5.0"):
         pytest.skip("MLA yarn rope fusion requires PyTorch >= 2.5.0")
-    if (
-        cp > 1
-        and rope_type == "yarn"
-        and apply_rope_fusion
-        and not is_te_min_version("2.6.0", check_equality=True)
-    ):
-        pytest.skip("MLA CP + yarn rope fusion requires PyTorch >= 2.6.0")
 
     # Non-deterministic mode has bug to be fixed with MLA
     _environ = os.environ.copy()
@@ -1083,7 +1101,9 @@ def test_parallel_multi_latent_attention_correctness(
 
     # Model initialization function
     def initialize_gpt_model(config, pre_process=True, post_process=True, vp_stage=None):
-        layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=True)
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            multi_latent_attention=True, qk_layernorm=qk_layernorm
+        )
         gpt_model = GPTModel(
             config=config,
             transformer_layer_spec=layer_spec,
@@ -1121,7 +1141,7 @@ def test_parallel_multi_latent_attention_correctness(
         v_head_dim=128,
         qk_pos_emb_head_dim=64,
         rotary_base=10000,
-        max_position_embeddings=64,
+        max_position_embeddings=256,
         context_parallel_size=1,
         tensor_model_parallel_size=1,
         sequence_parallel=False,
@@ -1187,6 +1207,7 @@ def test_parallel_multi_latent_attention_correctness(
 
         # Function to get tensor on this tp and cp rank
         cp_group = parallel_state.get_context_parallel_group()
+        cp_rank = parallel_state.get_context_parallel_rank()
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
         def get_tensor_on_this_rank(tensor):
@@ -1208,10 +1229,16 @@ def test_parallel_multi_latent_attention_correctness(
         input_grad_parallel = input_hidden_states.grad.detach()
 
         # Check if the output is the same
-        if cp:
-            atol, rtol = 5e-3, 5e-3
+        if cp > 1:
+            if qk_layernorm:
+                atol, rtol = 2e-2, 2e-2
+            else:
+                atol, rtol = 5e-3, 5e-3
         else:
-            atol, rtol = 5e-4, 5e-4
+            if qk_layernorm:
+                atol, rtol = 1e-2, 1e-2
+            else:
+                atol, rtol = 2e-3, 2e-3
         output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
         input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
 
@@ -1249,21 +1276,21 @@ def test_parallel_multi_latent_attention_correctness(
             output_hidden_states_parallel,
             atol=atol,
             rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
+            msg=lambda msg: f"({tp_rank=}, {cp_rank=}) Mismatch in output_hidden_states: {msg}",
         )
         torch.testing.assert_close(
             bias_hidden_states_baseline,
             bias_hidden_states_parallel,
             atol=atol,
             rtol=rtol,
-            msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
+            msg=lambda msg: f"({tp_rank=}, {cp_rank=}) Mismatch in bias_hidden_states: {msg}",
         )
         torch.testing.assert_close(
             input_grad_baseline,
             input_grad_parallel,
             atol=atol,
             rtol=rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
+            msg=lambda msg: f"({tp_rank=}, {cp_rank=}) Mismatch in input_grad: {msg}",
         )
 
         Utils.destroy_model_parallel()

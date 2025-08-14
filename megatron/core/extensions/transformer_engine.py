@@ -227,6 +227,7 @@ class TELinear(te.pytorch.Linear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_pre_gathered_for_column_sp: bool = False,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -347,6 +348,9 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group = None
 
+        if True:  # TODO: update TE version once it is released
+            extra_kwargs["input_pre_gathered_for_column_sp"] = input_pre_gathered_for_column_sp
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -427,6 +431,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_pre_gathered_for_sp: bool = False,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -516,6 +521,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 "2.3.0.dev0+39c0e70"
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
+
+        if True:  # TODO: update TE version once it is released
+            extra_kwargs["input_pre_gathered_for_column_sp"] = input_pre_gathered_for_sp
 
         super().__init__(
             in_features=input_size,
@@ -617,6 +625,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        input_pre_gathered_for_sp: bool = False,
     ):
         if not HAVE_TE:
             raise ImportError(
@@ -647,6 +656,7 @@ class TEColumnParallelLinear(TELinear):
             tp_comm_buffer_name=tp_comm_buffer_name,
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
+            input_pre_gathered_for_column_sp=input_pre_gathered_for_sp,
         )
 
         if config.use_cpu_initialization:
@@ -966,6 +976,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         attn_mask_type: AttnMaskType,
         attention_bias: Tensor = None,
         packed_seq_params: PackedSeqParams = None,
+        kv_compressed: Tensor = None,
+        k_pos_emb: Tensor = None,
+        kv_up_proj_fn: Callable = None,
     ):
         """Forward."""
         packed_seq_kwargs = (
@@ -1000,6 +1013,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 value,
                 attention_mask,
                 attn_mask_type=attn_mask_type.name,
+                kv_compressed=kv_compressed,
+                k_pos_emb=k_pos_emb,
+                kv_up_proj_fn=kv_up_proj_fn,
                 **attention_bias_kwargs,
                 **packed_seq_kwargs,
             )

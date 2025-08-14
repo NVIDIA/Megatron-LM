@@ -953,6 +953,10 @@ def validate_args(args, defaults={}):
     # Context parallel
     if args.context_parallel_size > 1:
         assert not args.use_legacy_models, "Context parallelism is not supported in legacy models."
+        if args.multi_latent_attention:
+            assert not args.overlap_grad_reduce, (
+                "Context parallelism with MLA is not supported with overlap_grad_reduce."
+            )
 
     # Expert parallelism check
     if args.expert_model_parallel_size  > 1:

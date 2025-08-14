@@ -1450,3 +1450,11 @@ class MLATransformerConfig(TransformerConfig):
             assert (
                 self.apply_rope_fusion is False
             ), "Rope Fusion is not compatible with caching latents"
+
+        if self.multi_latent_attention and self.context_parallel_size > 1:
+            pass
+            # TODO: TE version
+            # assert is_te_min_version("TODO"), (
+            #     "Only transformer-engine>=TODO supports MLA Context Parallel, "
+            #     f"but your version is {get_te_version()}."
+            # )
