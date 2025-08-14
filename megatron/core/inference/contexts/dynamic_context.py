@@ -617,12 +617,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             None.
         """
 
-        # Use of num_warmup_requests only for decode-only.
         if enforce_non_decode_mode:
             assert (
                 num_warmup_requests is not None
             ), "the enforce_non_decode_mode flag is to be used only during cuda-graph capturing"
             assert self.non_decode_cuda_graphs, "Set non-decode cuda graphs to True"
+        
         if num_warmup_requests is not None:
             self.enforce_non_decode_mode = enforce_non_decode_mode
             assert self.is_decode_only() == (not enforce_non_decode_mode)
