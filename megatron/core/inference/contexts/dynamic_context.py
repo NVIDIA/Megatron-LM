@@ -626,7 +626,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # warmup both decode and non-decode engine steps
         if num_warmup_requests is not None:
             self.enforce_non_decode_mode = enforce_non_decode_mode
-            assert self.is_decode_only() == (not enforce_non_decode_mode)
+            assert self.is_decode_only() != enforce_non_decode_mode
             if num_warmup_requests > self.max_requests:
                 raise ActiveRequestCountOverflowError(self.max_requests, num_warmup_requests)
             self.add_dummy_requests_for_cudagraph_capture(num_warmup_requests)
