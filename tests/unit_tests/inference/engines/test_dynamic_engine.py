@@ -354,7 +354,7 @@ class TestDynamicInferenceEngine:
     )
     @pytest.mark.parametrize(
         "num_cuda_graphs", [None, 4]
-    )  # todo: fix error when trying to run multiple cuda-graph sizes in one test case
+    )  # todo: cannot run test case with multiple num_cuda_graphs like [None, 1, 4]
     def test_simple(self, num_cuda_graphs) -> None:
         """Simple test that runs without errors, and validates output."""
 
@@ -528,16 +528,45 @@ class TestDynamicInferenceEngine:
             # Validate input/position dimensions.
             input_ids, pos_ids = context.current_input_and_position_ids()
             assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
-
+            assert context.using_cuda_graph_this_step, (
+                "expected `using_cuda_graph_this_step` to be True for decode step with "
+                "num_warmup_requests <= max_requests."
+            )
             context.reset()
 
-        # Test active request count overflow.
+        
+        # Test active request count overflow
         for num_warmup_requests in (64, 128, 1024):
             try:
-                context.initialize_attention_state(num_warmup_requests=num_warmup_requests)
+                context.initialize_attention_state(num_warmup_requests=num_warmup_requests,
+                                                   enforce_non_decode_mode=enforce_non_decode_mode)
             except ActiveRequestCountOverflowError as e:
                 continue
             raise Exception("`ActiveRequestCountOverflowError should have been raised.")
+
+        context.reset()
+    
+    
+        # test the case where the active token count exceeds max requests.
+        # expectation: we should be in non-decode mode and not using cuda graphs
+        
+        # add all requests to the context.
+        for request_id in tqdm(range(len(env.requests)), "add requests"):
+            env.engine.add_request(
+                request_id,
+                env.requests[request_id].prompt,
+                num_tokens_to_generate=1,
+            )
+        
+        # we should now have more active tokens than max requests.
+        context.initialize_attention_state()
+        assert not context.is_decode_only()
+        assert not context.using_cuda_graph_this_step, (
+            "expected `using_cuda_graph_this_step` to be False for non-decode step where "
+            "the active token count exceeds max requests"
+        )
+        context.reset()
+
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
