@@ -193,7 +193,11 @@ def _allreduce_word_embedding_grads(
             pp_group = parallel_state.get_pipeline_model_parallel_group()
 
     _allreduce_embedding_grad(
-        model, embd_group, pp_group, partial(_get_shared_word_embedding_weight, config=config), config=config
+        model,
+        embd_group,
+        pp_group,
+        partial(_get_shared_word_embedding_weight, config=config),
+        config=config,
     )
 
 

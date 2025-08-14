@@ -543,7 +543,7 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         diff_transformer_layer_offset = self.config.num_layers - get_transformer_layer_offset(
             self.config, vp_stage
-        )        
+        )
         self.transformer_layer = build_module(
             self.submodules.transformer_layer,
             config=self.config,
