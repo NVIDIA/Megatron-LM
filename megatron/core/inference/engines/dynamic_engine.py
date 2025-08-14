@@ -129,7 +129,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # Forward pass -> logits.
                 with torch.inference_mode():
-                    logits = controller.inference_wrapped_model.run_one_forward_step(
+                    controller.inference_wrapped_model.run_one_forward_step(
                         {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
                     )
                     context.reset()  # todo: @lmcafee, remove if unnecessary.
@@ -145,7 +145,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
 
                     with torch.inference_mode():
-                        logits = controller.inference_wrapped_model.run_one_forward_step(
+                        controller.inference_wrapped_model.run_one_forward_step(
                             {
                                 "tokens": input_ids,
                                 "position_ids": position_ids,
