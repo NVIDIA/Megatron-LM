@@ -161,6 +161,9 @@ class P2PCommunicator:
             if config.virtual_pipeline_model_parallel_size is not None
             else None
         )
+        self.mtp_rank = None
+        # print(config)
+        # exit()
 
     def _communicate_shapes(self, tensor_send_next, tensor_send_prev, recv_prev, recv_next):
         """Communicate tensor shapes between stages. Used to communicate
@@ -298,15 +301,42 @@ class P2PCommunicator:
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
 
-        # TODO(lit): remove this after fix shape issue
-        # if not config.variable_seq_lengths: # this is the original behavior in main.
-        if False:
-            recv_prev_shape = tensor_shape
-            recv_next_shape = tensor_shape
-        else:
+        # In current design when MTP is set in a standalone stage, the tensor shape to be communicated
+        # will be changed and we need to communicate the new shape.
+        mtp_in_this_stage = False
+        if (
+            tensor_send_next is not None
+            and tensor_shape is not None
+            and list(tensor_send_next.shape) != list(tensor_shape)
+        ):
+            mtp_in_this_stage = True
+        if (
+            tensor_send_prev is not None
+            and tensor_shape is not None
+            and list(tensor_send_prev.shape) != list(tensor_shape)
+        ):
+            mtp_in_this_stage = True
+        if mtp_in_this_stage and not self.mtp_rank:
+            self.mtp_rank = self.pp_group.rank()
+
+        # if not config.variable_seq_lengths:
+        #     recv_prev_shape = tensor_shape
+        #     recv_next_shape = tensor_shape
+        # else:
+        #     recv_prev_shape, recv_next_shape = self._communicate_shapes(
+        #         tensor_send_next, tensor_send_prev, recv_prev, recv_next
+        #     )
+
+        # if config.variable_seq_lengths or (self.mtp_rank is not None and self.pp_group.rank() >= self.mtp_rank):
+        if True:
+            # True works for 1) vpp w/ mtp last stage; 2) w/ mtp 2nd last stage.
+            # True fails for pp4 (no vpp) version w/ mtp last stage.
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
+        else:
+            recv_prev_shape = tensor_shape
+            recv_next_shape = tensor_shape
 
         def create_tensor_recv_prev():
             return torch.empty(

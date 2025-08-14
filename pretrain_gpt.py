@@ -213,7 +213,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
-    assert vp_stage is not None, "vp_stage must be passed"
     args = get_args()
 
     config = core_gpt_dataset_config_from_args(args)
