@@ -562,13 +562,15 @@ class _CudaGraphRunner(torch.nn.Module):
         """Run module forward, using given graph and memory pool."""
 
         inference_context = kwargs.get("inference_context", None)
+        from megatron.core.inference.contexts.dynamic_context import WarmupEngineMode
 
         # Initialize inference context.
         if inference_context and inference_context.is_dynamic_batching():
-            num_warmup_requests = kwargs["hidden_states"].size(0)
+            num_warmup_tokens = kwargs["hidden_states"].size(0)
             inference_context.initialize_attention_state(
-                num_warmup_requests=num_warmup_requests,
-                enforce_non_decode_mode=self.is_inference_non_decode_runner,
+                num_warmup_tokens = num_warmup_tokens,
+                warmup_engine_mode = WarmupEngineMode.NON_DECODE 
+                if self.is_inference_non_decode_runner else WarmupEngineMode.DECODE,
             )
 
         context = (

@@ -16,6 +16,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     MaxSequenceLengthOverflowError,
     RequestOverflowError,
     TokenOverflowError,
+    WarmupEngineMode
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
@@ -109,7 +110,8 @@ class DynamicInferenceEngine(AbstractEngine):
             for tbar_idx, cuda_graph_token_count in tbar:
 
                 # Initialize attention state.
-                context.initialize_attention_state(num_warmup_requests=cuda_graph_token_count)
+                context.initialize_attention_state(num_warmup_tokens=cuda_graph_token_count,
+                                                   warmup_engine_mode=WarmupEngineMode.DECODE)
                 assert (
                     cuda_graph_token_count == context.padded_active_token_count
                 ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
@@ -135,9 +137,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     context.reset()  # todo: @lmcafee, remove if unnecessary.
 
                 # non-decode cudagraph capture.
-                if context.non_decode_cuda_graphs:
+                if context.non_decode_cuda_graphs and cuda_graph_token_count > 1:
                     context.initialize_attention_state(
-                        num_warmup_requests=cuda_graph_token_count, enforce_non_decode_mode=True
+                        num_warmup_tokens=cuda_graph_token_count, 
+                        warmup_engine_mode=WarmupEngineMode.NON_DECODE
                     )
                     # Get flat tokens, position ids.
                     input_ids, position_ids = context.current_input_and_position_ids(
@@ -151,10 +154,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 "position_ids": position_ids,
                                 "attention_mask": None,
                             }
-                        )
-                        # this reset is absolutely necessary to reset the
-                        # enforce_non_decode flag within context.
-                        # do not remove it.
+                        )  
                         context.reset()
 
             # Create cuda graphs.
@@ -381,7 +381,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             (
                                 "DIM %d:%d"
                                 % (context.padded_active_token_count, prev_active_token_count)
-                                if self.context.using_cuda_graph_this_step
+                                if self.context.using_cuda_graph_this_step()
                                 else "OFF"
                             ),
                         )

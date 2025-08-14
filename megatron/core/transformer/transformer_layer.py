@@ -862,7 +862,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # it can happen that non-decode steps have a token count greater than the max
             # supported cuda graph token count. In that case this flag will be set to
             # False by initialize_attention, and we should not use cuda graphs.
-            elif kwargs['inference_context'].using_cuda_graph_this_step:
+            elif kwargs['inference_context'].using_cuda_graph_this_step():
                 return self.cudagraph_manager_for_non_decode(self, args, kwargs)
         elif self.config.external_cuda_graph and self.training:
             if not self.cuda_graphs:
