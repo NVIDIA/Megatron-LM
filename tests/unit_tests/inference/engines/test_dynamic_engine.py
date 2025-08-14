@@ -534,30 +534,28 @@ class TestDynamicInferenceEngine:
             )
             context.reset()
 
-        
         # Test active request count overflow
         for num_warmup_requests in (64, 128, 1024):
             try:
-                context.initialize_attention_state(num_warmup_requests=num_warmup_requests,
-                                                   enforce_non_decode_mode=enforce_non_decode_mode)
+                context.initialize_attention_state(
+                    num_warmup_requests=num_warmup_requests,
+                    enforce_non_decode_mode=enforce_non_decode_mode,
+                )
             except ActiveRequestCountOverflowError as e:
                 continue
             raise Exception("`ActiveRequestCountOverflowError should have been raised.")
 
         context.reset()
-    
-    
+
         # test the case where the active token count exceeds max requests.
         # expectation: we should be in non-decode mode and not using cuda graphs
-        
+
         # add all requests to the context.
         for request_id in tqdm(range(len(env.requests)), "add requests"):
             env.engine.add_request(
-                request_id,
-                env.requests[request_id].prompt,
-                num_tokens_to_generate=1,
+                request_id, env.requests[request_id].prompt, num_tokens_to_generate=1
             )
-        
+
         # we should now have more active tokens than max requests.
         context.initialize_attention_state()
         assert not context.is_decode_only()
@@ -566,7 +564,6 @@ class TestDynamicInferenceEngine:
             "the active token count exceeds max requests"
         )
         context.reset()
-
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
