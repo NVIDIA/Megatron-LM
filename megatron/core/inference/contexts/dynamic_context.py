@@ -70,6 +70,8 @@ class ActiveRequestCountOverflowError(ContextOverflowError):
 
 
 class WarmupEngineMode(Enum):
+    """Enumeration for warmup engine modes used during cuda graph capture."""
+
     DECODE = "decode"
     NON_DECODE = "non_decode"
 
@@ -586,13 +588,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         Adds dummy requests to the context. These are using during
         cuda graph captures.
         """
-
+        prompt_length_1 = torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device())
+        prompt_length_2 = torch.zeros(2, dtype=torch.long, device=torch.cuda.current_device())
         if warmup_engine_mode == WarmupEngineMode.DECODE:
             # simply add requests of prompt-length 1
             for i in range(total_num_tokens):
                 self.add_request(
                     request_id=i,
-                    tokens=torch.zeros(1, dtype=torch.long, device=torch.cuda.current_device()),
+                    tokens=prompt_length_1,
                     num_tokens_to_generate=1,
                 )
         else:
@@ -601,7 +604,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             for i in range(total_num_tokens-1):
                 self.add_request(
                         request_id=i,
-                        tokens=torch.zeros(2 if i==0 else 1, dtype=torch.long, device=torch.cuda.current_device()),
+                        tokens=prompt_length_2 if i==0 else prompt_length_1,
                         num_tokens_to_generate=1,
                     )
 
