@@ -118,8 +118,8 @@ class DynamicInferenceEngine(AbstractEngine):
                         cuda_graph_token_count == 1
                         and warmup_engine_mode == WarmupEngineMode.NON_DECODE
                     ):
-                        # This case is not support as we require atleast two tokens for a non-decode
-                        # engine step.
+                        # This case is not supported`` as we require atleast two 
+                        # tokens for a non-decode engine step.
                         continue
                     # Initialize attention state.
                     context.initialize_attention_state(
