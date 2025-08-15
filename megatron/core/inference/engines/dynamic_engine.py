@@ -102,63 +102,48 @@ class DynamicInferenceEngine(AbstractEngine):
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
                 % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
             )
-
-            # Iterate cuda graph dims.
-            tbar = enumerate(context.cuda_graph_token_counts)
-            if HAVE_TQDM:
-                tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
-            for tbar_idx, cuda_graph_token_count in tbar:
-
-                # Initialize attention state.
-                context.initialize_attention_state(
-                    num_warmup_tokens=cuda_graph_token_count,
-                    warmup_engine_mode=WarmupEngineMode.DECODE,
-                )
-                assert (
-                    cuda_graph_token_count == context.padded_active_token_count
-                ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
-                assert context.is_decode_only(), "Decode-only required for cuda graph capture."
-
-                # Progress.
-                tbar_str = f"cuda graph warmup, d {cuda_graph_token_count}"
+     
+            for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
+                # Iterate cuda graph dims.
+                if warmup_engine_mode == WarmupEngineMode.NON_DECODE and not context.non_decode_cuda_graphs:
+                    continue
+                tbar = enumerate(context.cuda_graph_token_counts)
                 if HAVE_TQDM:
-                    tbar.set_description(tbar_str)
-                else:
-                    print(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
-
-                # Get flat tokens, position ids.
-                input_ids, position_ids = context.current_input_and_position_ids(
-                    num_warmup_tokens=cuda_graph_token_count
-                )
-
-                # Forward pass -> logits.
-                with torch.inference_mode():
-                    controller.inference_wrapped_model.run_one_forward_step(
-                        {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
-                    )
-                    context.reset()  # todo: @lmcafee, remove if unnecessary.
-
-                # non-decode cudagraph capture.
-                if context.non_decode_cuda_graphs and cuda_graph_token_count > 1:
+                    tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
+                for tbar_idx, cuda_graph_token_count in tbar:
+                    if cuda_graph_token_count == 1 and warmup_engine_mode == WarmupEngineMode.NON_DECODE:
+                        # This case is not support as we require atleast two tokens for a non-decode
+                        # engine step.
+                        continue
+                    # Initialize attention state.
                     context.initialize_attention_state(
                         num_warmup_tokens=cuda_graph_token_count,
-                        warmup_engine_mode=WarmupEngineMode.NON_DECODE,
+                        warmup_engine_mode=warmup_engine_mode,
                     )
+                    assert (
+                        cuda_graph_token_count == context.padded_active_token_count
+                    ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
+
+                    # Progress.
+                    tbar_str = f"cuda graph warmup - {warmup_engine_mode.name.lower()}, d {cuda_graph_token_count}"
+                    if HAVE_TQDM:
+                        tbar.set_description(tbar_str)
+                    else:
+                        print(f"{tbar_idx}/{len(context.cuda_graph_token_counts)}. {tbar_str}")
+
                     # Get flat tokens, position ids.
                     input_ids, position_ids = context.current_input_and_position_ids(
                         num_warmup_tokens=cuda_graph_token_count
                     )
 
+                    # Forward pass -> logits.
                     with torch.inference_mode():
                         controller.inference_wrapped_model.run_one_forward_step(
-                            {
-                                "tokens": input_ids,
-                                "position_ids": position_ids,
-                                "attention_mask": None,
-                            }
+                            {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
                         )
-                        context.reset()
+                        context.reset()  # todo: @lmcafee, remove if unnecessary.
 
+                   
             # Create cuda graphs.
             with torch.inference_mode():
                 create_cudagraphs()
