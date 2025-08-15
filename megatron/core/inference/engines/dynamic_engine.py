@@ -131,7 +131,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
 
                     # Progress.
-                    tbar_str = f"cuda graph warmup - {warmup_engine_mode.name.lower()}, d {cuda_graph_token_count}"
+                    mode_str = warmup_engine_mode.name.lower()
+                    tbar_str = f"cuda graph warmup - {mode_str}, d {cuda_graph_token_count}"
                     if HAVE_TQDM:
                         tbar.set_description(tbar_str)
                     else:
