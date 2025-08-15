@@ -44,11 +44,12 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
     is_te_min_version,
 )
-from megatron.core.fp8_utils import correct_amax_history_if_needed
+from megatron.core.fp8_utils import correct_amax_history_if_needed, get_fp8_recipe
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
@@ -82,7 +83,7 @@ from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -524,38 +525,84 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_chunks):
+def layer_is_graphable(layer, config):
+    """
+    Check if a layer is graphable.
+    """
+    from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    if isinstance(layer, TransformerLayer):
+        if config.cuda_graph_scope == 'attn':
+            if not (
+                isinstance(layer.self_attention, IdentityOp)
+                and isinstance(layer.cross_attention, IdentityOp)
+            ):
+                return True
+        else:
+            return True
+    return False
+
+
+def get_cuda_graph_input_data(
+    model,
+    callables,
+    config,
+    num_microbatches,
+    num_model_chunks,
+    num_layers_per_chunk,
+    seq_length,
+    micro_batch_size,
+):
     """
     Create the CUDA Graph capturing input data. The data is organized per-chunk per-microbatch per-layer.
     """
 
-    def get_rotary_pos_emb(transformer, transformer_input):
-        if args.position_embedding_type == 'rope' and not config.multi_latent_attention:
-            rotary_seq_len = model_chunk.module.module.rotary_pos_emb.get_rotary_seq_len(
-                None, transformer, transformer_input, config, None
+    rotary_pos_emb_cache = {}
+
+    def get_rotary_pos_emb(transformer_module, transformer_input):
+        if (
+            transformer_module.position_embedding_type == 'rope'
+            and not config.multi_latent_attention
+        ):
+            rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
+                None, transformer_module.decoder, transformer_input, config, None
             )
-            return model_chunk.module.module.rotary_pos_emb(rotary_seq_len)
+            if rotary_seq_len not in rotary_pos_emb_cache:
+                rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
+                    rotary_seq_len
+                )
+            return rotary_pos_emb_cache[rotary_seq_len]
         else:
             return None
 
     # Generate sample arguments and keyword arguments for capturing.
     sample_args = []
     sample_kwargs = []
+    num_layers_per_chunk_prefix_sum = [0]
+    for n in num_layers_per_chunk:
+        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
     for chunk_number in range(num_model_chunks):
         model_chunk = model[chunk_number]
-        num_layers = len(model_chunk.module.module.decoder.layers)
+        try:
+            chunk_with_decoder = get_attr_wrapped_model(
+                model_chunk, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            continue
+        layers = callables[
+            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
+                chunk_number + 1
+            ]
+        ]
         for _ in range(num_microbatches):
-            for layer_number in range(num_layers):
-                static_inputs = model_chunk.module.module.decoder.layers[
-                    layer_number
-                ].get_layer_static_inputs(args.seq_length, args.micro_batch_size)
-                if is_te_min_version("1.10.0", check_equality=False):
+            for layer in layers:
+                static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
+                if is_te_min_version("1.10.0"):
                     # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
                     hidden_states = static_inputs.pop("hidden_states")
                     sample_args.append((hidden_states,))
-                    rotary_pos_emb = get_rotary_pos_emb(
-                        model_chunk.module.module.decoder, hidden_states
-                    )
+                    rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
                     sample_kwargs.append(static_inputs)
@@ -578,44 +625,23 @@ def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_c
 
     def get_make_graphed_callables_kwargs():
         kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
+
+        if is_te_min_version("2.6.0"):
+            # Starting from TE 2.6.0, make_graphed_callables() accepts different number
+            # of layers per chunk and optimizes the graph memory usage.
+            kwargs['_num_layers_per_chunk'] = num_layers_per_chunk
+            kwargs['_reuse_graph_input_output_buffers'] = True
+
         if sample_kwargs:
             kwargs['sample_kwargs'] = sample_kwargs
-
-        import transformer_engine
-
-        def get_fp8_recipe(config):
-            """
-            Set up the FP8 recipe for the model.
-            """
-            if config.fp8:
-                if config.fp8 == "e4m3":
-                    fp8_format = transformer_engine.common.recipe.Format.E4M3
-                elif config.fp8 == "hybrid":
-                    fp8_format = transformer_engine.common.recipe.Format.HYBRID
-                else:
-                    raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-                from megatron.core.transformer.custom_layers.transformer_engine import (
-                    TEDelayedScaling,
-                )
-
-                fp8_recipe = TEDelayedScaling(
-                    config=config,
-                    fp8_format=fp8_format,
-                    override_linear_precision=(False, False, not config.fp8_wgrad),
-                )
-                return fp8_recipe
-            else:
-                return None
 
         if config.fp8:
             kwargs['fp8_enabled'] = True
             kwargs['fp8_recipe'] = get_fp8_recipe(config)
-            kwargs['fp8_weight_caching'] = True
-            if (
-                is_te_min_version("1.14.0", check_equality=False)
-                and model_parallel_is_initialized()
-            ):
+            # fp8 weight caching will be ignored by TE if cudagraph doesn't capture the attn part,
+            # even if we set it to True in the arguments. So we just pass a False in this case.
+            kwargs['fp8_weight_caching'] = 'attn' in config.cuda_graph_scope
+            if is_te_min_version("1.14.0") and model_parallel_is_initialized():
                 kwargs['fp8_group'] = get_amax_reduction_group(with_context_parallel=True)
         else:
             kwargs['fp8_enabled'] = False
@@ -625,10 +651,13 @@ def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_c
     return sample_args, kwargs
 
 
-def cuda_graph_capture(model, config, args):
+def cuda_graph_capture(model, config, seq_length, micro_batch_size):
     """
     Capture CUDA Graphs per TransformerLayer per microbatch.
     """
+    from megatron.core.transformer.cuda_graphs import _set_capture_start, _set_capture_end
+
+    _set_capture_start()
     assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
     assert config.cuda_graph_scope in [
         'full',
@@ -649,18 +678,47 @@ def cuda_graph_capture(model, config, args):
 
     # Get callables.
     callables = []
+    num_layers_per_chunk = []
     for chunk_number in range(num_model_chunks):
         model_chunk = model[chunk_number]
-        num_layers = len(model_chunk.module.module.decoder.layers)
-        print_rank_0(f'num_layers {num_layers} in model chunk {chunk_number}')
+        try:
+            chunk_with_decoder = get_attr_wrapped_model(
+                model_chunk, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            continue
+        num_layers = len(chunk_with_decoder.decoder.layers)
+        if hasattr(chunk_with_decoder, 'mtp'):
+            num_mtp_layers = len(chunk_with_decoder.mtp.layers)
+        else:
+            num_mtp_layers = 0
+        num_graphable_layers = 0
         for layer_number in range(num_layers):
-            layer = model_chunk.module.module.decoder.layers[layer_number]
-            callables.append(layer)
+            layer = chunk_with_decoder.decoder.layers[layer_number]
+            if layer_is_graphable(layer, config):
+                num_graphable_layers += 1
+                callables.append(layer)
+        for layer_number in range(num_mtp_layers):
+            layer = chunk_with_decoder.mtp.layers[layer_number].transformer_layer
+            if layer_is_graphable(layer, config):
+                num_graphable_layers += 1
+                callables.append(layer)
+        num_layers_per_chunk.append(num_graphable_layers)
+        print_rank_0(
+            f'{num_layers} layers and {num_mtp_layers} mtp layers in model chunk {chunk_number}. {num_graphable_layers} graphable layers.'
+        )
     print_rank_0(f'Total #layers {len(callables)}')
 
     # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
     sample_args, kwargs = get_cuda_graph_input_data(
-        model, config, args, num_microbatches, num_model_chunks
+        model,
+        callables,
+        config,
+        num_microbatches,
+        num_model_chunks,
+        num_layers_per_chunk,
+        seq_length,
+        micro_batch_size,
     )
 
     import transformer_engine  # To keep out TE dependency when not using CUDA Graph
@@ -670,16 +728,22 @@ def cuda_graph_capture(model, config, args):
     )
 
     # Push the captured graphs to the corresponding TransformerBlock.
+    num_layers_per_chunk_prefix_sum = [0]
+    for n in num_layers_per_chunk:
+        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
     for chunk_number in range(num_model_chunks):
-        model_chunk = model[chunk_number]
-        num_layers = len(model_chunk.module.module.decoder.layers)
-        for layer_number in range(num_layers):
-            model_chunk.module.module.decoder.layers[layer_number].cuda_graphs = []
+        layers = callables[
+            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
+                chunk_number + 1
+            ]
+        ]
+        for layer_number, layer in enumerate(layers):
+            layer.cuda_graphs = []
             for batch_number in range(num_microbatches):
-                model_chunk.module.module.decoder.layers[layer_number].cuda_graphs.append(
+                layer.cuda_graphs.append(
                     graphs[
-                        chunk_number * num_microbatches * num_layers
-                        + batch_number * num_layers
+                        num_layers_per_chunk_prefix_sum[chunk_number] * num_microbatches
+                        + batch_number * num_layers_per_chunk[chunk_number]
                         + layer_number
                     ]
                 )
@@ -689,18 +753,27 @@ def cuda_graph_capture(model, config, args):
     print_rank_0(
         f'Time spent in cuda_graph_capture on rank{torch.distributed.get_rank()}: {time.time() - start}s'
     )
+    _set_capture_end()
 
 
-def cuda_graph_set_manual_hooks(model):
+def cuda_graph_set_manual_hooks(model, config):
     """
     Set CUDA Graph manual hooks for the modules that contain direct parameters and are covered by cudagraphs.
     """
-    for chunk_number, model_chunk in enumerate(model):
-        num_layers = len(model_chunk.module.module.decoder.layers)
-        print_rank_0(f'num_layers {num_layers} in model chunk {chunk_number}')
-        for layer_number in range(num_layers):
-            layer = model_chunk.module.module.decoder.layers[layer_number]
-            layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+    for model_chunk in model:
+        try:
+            chunk_with_decoder = get_attr_wrapped_model(
+                model_chunk, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            continue
+        for layer in chunk_with_decoder.decoder.layers:
+            if layer_is_graphable(layer, config):
+                layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+        if hasattr(chunk_with_decoder, 'mtp'):
+            for layer in chunk_with_decoder.mtp.layers:
+                if layer_is_graphable(layer, config):
+                    layer.transformer_layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
 
 
 def pretrain(
@@ -1385,12 +1458,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
-        cuda_graph_capture(model, config, args)
+        cuda_graph_capture(model, config, args.seq_length, args.micro_batch_size)
 
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
         optimizer.zero_grad()
+
+        # Clear aux loss tracker.
+        clear_aux_losses_tracker()
 
         # Collect garbage and empty unused memory.
         gc.collect()
@@ -1479,7 +1555,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Set the manual hooks when CUDA Graphs are enabled.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
         if args.use_distributed_optimizer and args.overlap_param_gather:
-            cuda_graph_set_manual_hooks(model)
+            cuda_graph_set_manual_hooks(model, config)
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.

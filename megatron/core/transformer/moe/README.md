@@ -180,14 +180,14 @@ Note: The MoE model structure is defined through script arguments. All MoE-relat
 ### CUDA Graph Support
 CUDA Graph functionality can be enabled through two options:
 
-1. `--enable-cuda-graph`: Automatically captures graphs during runtime (just-in-time)
-2. `--external-cuda-graph`: Requires manual graph capture before runtime (ahead-of-time)
+1. `--enable-cuda-graph`: Captures cuda graphs using the MCore-internal cuda graph manager.
+2. `--external-cuda-graph`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
 
 Note: These two options cannot be enabled simultaneously.
 
-For manual capture with `--external-cuda-graph`, refer to the `cuda_graph_capture()` and `cuda_graph_set_manual_hooks()` functions in `megatron/training/training.py`.
+To use `--external-cuda-graph`, the user should call related methods `cuda_graph_capture()` and `cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
 
-For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for attention layers by setting `--cuda-graph-scope=attn`, while leaving MoE layers unmodified. Note that the `--cuda-graph-scope` parameter is only applicable when using `--external-cuda-graph` mode.
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
 
 
 ### Batch-Level EP-A2A hidding

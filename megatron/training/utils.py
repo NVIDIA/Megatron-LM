@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import warnings
 from datetime import datetime
 
 import torch
@@ -17,9 +18,6 @@ except ImportError:
         from amp_C import multi_tensor_l2norm
         from apex.multi_tensor_apply import multi_tensor_applier
     except ImportError:
-
-        import warnings
-
         warnings.warn(
             f'Transformer Engine and Apex are not installed. '
             'Falling back to local implementations of '
@@ -334,13 +332,28 @@ def get_ltor_masks_and_position_ids(
     return attention_mask, loss_mask, position_ids
 
 
-def print_rank_0(message):
-    """If distributed is initialized, print only on rank 0."""
-    if torch.distributed.is_initialized():
+def print_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, print only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            print(message, flush=True)
+    elif torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def warn_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, warn only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            warnings.warn(message)
+    elif torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            warnings.warn(message)
+    else:
+        warnings.warn(message)
 
 
 def is_rank0():

@@ -34,7 +34,12 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 from megatron.core.activations import squared_relu
-from megatron.training.utils import get_device_arch_version, update_use_dist_ckpt, print_rank_0
+from megatron.training.utils import (
+    get_device_arch_version,
+    update_use_dist_ckpt,
+    print_rank_0,
+    warn_rank_0,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 from megatron.core.quantization.utils import (
@@ -588,8 +593,11 @@ def validate_args(args, defaults={}):
 
         if args.fp8_param_gather and is_te_min_version("2.0.0"):
             args.fp8_param_gather = False
-            warnings.warn('FSDP2 FP8 param gather is not supported yet in TE 2.0, will fallback to bf16' \
-                          'all_gather instead, turning off fp8_param_gather')
+            warn_rank_0(
+                'FSDP2 FP8 param gather is not supported yet in TE 2.0, will fallback to bf16'
+                'all_gather instead, turning off fp8_param_gather',
+                args.rank,
+            )
 
     if args.overlap_param_gather_with_optimizer_step:
         assert args.use_distributed_optimizer, \
@@ -623,7 +631,10 @@ def validate_args(args, defaults={}):
             '--use-custom-fsdp only supported with distributed optimizer'
 
         if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
-            warnings.warn('Please make sure your TransformerEngine support FSDP + gradient accumulation fusion')
+            warn_rank_0(
+                'Please make sure your TransformerEngine support FSDP + gradient accumulation fusion',
+                args.rank,
+            )
             assert args.gradient_accumulation_fusion is False, \
                 "optim_grads_params optim_grads are not supported with gradient accumulation fusion"
 
@@ -831,7 +842,10 @@ def validate_args(args, defaults={}):
     # sequence_parallelism is enabled.
     if args.tensor_model_parallel_size == 1:
         if args.sequence_parallel:
-            warnings.warn("Disabling sequence parallelism because tensor model parallelism is disabled")
+            warn_rank_0(
+                "Disabling sequence parallelism because tensor model parallelism is disabled",
+                args.rank,
+            )
         args.sequence_parallel = False
 
     if args.tp_comm_overlap:
@@ -844,19 +858,24 @@ def validate_args(args, defaults={}):
         # CUDA_DEVICE_MAX_CONNECTIONS requirement no longer exists since the Blackwell architecture
         if args.use_torch_fsdp2 or args.use_custom_fsdp:
             fsdp_impl = "Torch-FSDP2" if args.use_torch_fsdp2 else "Custom-FSDP"
-            warnings.warn(
+            warn_rank_0(
                 f"Using tensor model parallelism or context parallelism with {fsdp_impl} together. "
                 "Try not to using them together since they require different CUDA_MAX_CONNECTIONS "
                 "settings for best performance. sequence parallelism requires setting the "
                 f"environment variable CUDA_DEVICE_MAX_CONNECTIONS to 1 while {fsdp_impl} "
-                "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.")
+                "requires not setting CUDA_DEVICE_MAX_CONNECTIONS=1 for better parallelization.",
+                args.rank,
+            )
         elif args.overlap_moe_expert_parallel_comm:
-            warnings.warn("For Hopper and before, try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
-                         "Using tensor/context model parallelism requires setting the environment "
-                         "variable CUDA_DEVICE_MAX_CONNECTIONS to 1 to maximize the performance. "
-                         "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
-                         "for better parallelization. If you want to use both, you can set CUDA_DEVICE_MAX_CONNECTIONS to 1 or 32, "
-                         "which depends on which parallelization you want to prioritize.")
+            warn_rank_0(
+                "For Hopper and before, try not to use tensor model parallelism or context parallelism with overlap_moe_expert_parallel_comm. "
+                "Using tensor/context model parallelism requires setting the environment "
+                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1 to maximize the performance. "
+                "While overlap_moe_expert_parallel_comm requires setting a larger CUDA_DEVICE_MAX_CONNECTIONS "
+                "for better parallelization. If you want to use both, you can set CUDA_DEVICE_MAX_CONNECTIONS to 1 or 32, "
+                "which depends on which parallelization you want to prioritize.",
+                args.rank,
+            )
         else:
             assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') == "1", \
                 "Using tensor model parallelism or context parallelism require setting the environment variable " \
@@ -1069,8 +1088,22 @@ def validate_args(args, defaults={}):
         )
 
     # CUDA Graphs
+    if args.enable_cuda_graph or args.external_cuda_graph:
+        assert (
+            not args.enable_cuda_graph or not args.external_cuda_graph
+        ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
+        if args.transformer_impl == 'transformer_engine' and not args.te_rng_tracker:
+            args.te_rng_tracker = True
+            warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
+
     if args.external_cuda_graph:
-        assert args.te_rng_tracker, "--te-rng-tracker must be enabled when using CUDA Graphs."
+        assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+            "expandable_segments:True may not be safe when using CUDA Graphs with some specific parallel settings. "
+            "The training may crash with illegal memory access."
+        )
+        assert (
+            args.recompute_granularity != 'full'
+        ), 'recompute_granularity must not be full when CUDA Graphs are enabled.'
 
     # Print arguments.
     _print_args("arguments", args)
