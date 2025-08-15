@@ -533,45 +533,52 @@ class MultiTokenPredictionLayer(MegatronModule):
         # currently MTP only use global fp8 context.
         if self.config.fp8:
             fp8_context = get_fp8_context(self.config)
+            transformer_layer_fp8_context = get_fp8_context(self.config)
         else:
             fp8_context = nullcontext()
+            transformer_layer_fp8_context = nullcontext()
 
-        with rng_context, fp8_context:
-            decoder_input = self.enorm(decoder_input)
-            decoder_input = make_viewless_tensor(
-                inp=decoder_input, requires_grad=True, keep_graph=True
-            )
-            hidden_states = self.hnorm(hidden_states)
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
-            # At the (k - 1)-th MTP module, concatenates the i-th tocken's hidden_states
-            # and the (i + K)-th tocken's embedding, and combine them with linear projection.
-            hidden_states = torch.cat((decoder_input, hidden_states), -1)
-            hidden_states, _ = self.eh_proj(hidden_states)
-            # For tensor parallel we need to gather the tensor across the model-parallel
-            # ranks after the linear projection. This used to call
-            # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
-            # the gradient in backward pass and was therefore incorrect in this context.
-            # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-            hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
-            # For sequence parallel, scatter after linear_fc and before transformer layer.
-            if self.sequence_parallel:
-                hidden_states = scatter_to_sequence_parallel_region(hidden_states)
+        with rng_context:
+            with fp8_context:
+                decoder_input = self.enorm(decoder_input)
+                decoder_input = make_viewless_tensor(
+                    inp=decoder_input, requires_grad=True, keep_graph=True
+                )
+                hidden_states = self.hnorm(hidden_states)
+                hidden_states = make_viewless_tensor(
+                    inp=hidden_states, requires_grad=True, keep_graph=True
+                )
+                # At the (k - 1)-th MTP module, concatenates the i-th tocken's hidden_states
+                # and the (i + K)-th tocken's embedding, and combine them with linear projection.
+                hidden_states = torch.cat((decoder_input, hidden_states), -1)
+                hidden_states, _ = self.eh_proj(hidden_states)
+                # For tensor parallel we need to gather the tensor across the model-parallel
+                # ranks after the linear projection. This used to call
+                # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
+                # the gradient in backward pass and was therefore incorrect in this context.
+                # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
+                hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
+                # For sequence parallel, scatter after linear_fc and before transformer layer.
+                if self.sequence_parallel:
+                    hidden_states = scatter_to_sequence_parallel_region(hidden_states)
 
-            hidden_states, _ = self.transformer_layer(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                context=context,
-                context_mask=context_mask,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                attention_bias=attention_bias,
-                inference_params=inference_params,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-            )
+            # Use a separate fp8 context for the transformer layer. This is to ensure that when the
+            # transformer layer is cudagraphed, the FP8GlobalStateManager.is_first_fp8_module() is
+            # True so that the fp8 weight caching can be triggered correctly.
+            with transformer_layer_fp8_context:
+                hidden_states, _ = self.transformer_layer(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    rotary_pos_cos=rotary_pos_cos,
+                    rotary_pos_sin=rotary_pos_sin,
+                    attention_bias=attention_bias,
+                    inference_params=inference_params,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                )
 
         # Layer norm before shared head layer.
         hidden_states = self.final_layernorm(hidden_states)

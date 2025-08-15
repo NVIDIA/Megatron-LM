@@ -2,18 +2,22 @@
 
 """Full iteration CUDA graph for training."""
 
-import os
+import logging
+
 import torch
+
 from megatron.core.tensor_parallel.random import get_all_rng_states
-from .utils import print_rank_0
+
+logger = logging.getLogger(__name__)
 
 # The below functions traverse through nested data structures (tuples, lists, dicts)
 # present in src and creates a deep copy where all PyTorch tensors are cloned,
 # detached from the computation graph, and moved to CUDA device. Non-tensor objects
 # are returned as-is.
 
-# Copy src to new tensors
+
 def copy_tensors_in_struct(src):
+    """Copy src to new tensors."""
     if isinstance(src, tuple):
         return tuple(copy_tensors_in_struct(i) for i in src)
     elif isinstance(src, list):
@@ -25,8 +29,9 @@ def copy_tensors_in_struct(src):
     else:
         return src
 
-# Copy src to pre-existing tensors in tgt
+
 def clone_tensors_in_struct(tgt, src):
+    """Copy src to pre-existing tensors in tgt."""
     if isinstance(src, tuple):
         raise Exception(f"Unsupported copy for tuple yet: {type(src)}")
     elif isinstance(src, list):
@@ -46,12 +51,13 @@ def clone_tensors_in_struct(tgt, src):
     else:
         raise Exception(f"Expect top-level as container type but got: {type(src)}")
 
+
 # Class to copy dataloader output to static CUDA tensors for CUDA graph input. This
 # maintains separate static buffers for training and validation CUDA graphs.
 class StaticBufferLoader:
     """Load data to static buffers."""
 
-    static_buffers = {'training': [], 'validation': []}
+    static_buffers: dict = {'training': [], 'validation': []}
 
     def __init__(self):
         self.stream = torch.cuda.Stream()
@@ -63,65 +69,50 @@ class StaticBufferLoader:
             inputs = inputs[0]
 
         assert isinstance(inputs, dict)
-        if microbatch == len(
-            StaticBufferLoader.static_buffers[stage]
-        ):
+        if microbatch == len(StaticBufferLoader.static_buffers[stage]):
             with torch.cuda.stream(self.stream):
-                StaticBufferLoader.static_buffers[stage].append(
-                    copy_tensors_in_struct(inputs)
-                )
+                StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
 
             for k in inputs.keys():
-                if (
-                    k
-                    not in StaticBufferLoader.static_buffers[stage][
-                        microbatch
-                    ]
-                ):
-                    StaticBufferLoader.static_buffers[stage][
-                        microbatch
-                    ][k] = torch.empty_like(inputs[k]).cuda()
+                if k not in StaticBufferLoader.static_buffers[stage][microbatch]:
+                    StaticBufferLoader.static_buffers[stage][microbatch][k] = torch.empty_like(
+                        inputs[k]
+                    ).cuda()
 
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(
-                    StaticBufferLoader.static_buffers[stage][
-                        microbatch
-                    ],
-                    inputs,
+                    StaticBufferLoader.static_buffers[stage][microbatch], inputs
                 )
         torch.cuda.current_stream().wait_stream(self.stream)
         return StaticBufferLoader.static_buffers[stage][microbatch]
 
 
 class FullCudaGraphWrapper:
+    """Wrapper class to enable FullIterationCUDAgraph."""
 
     curr_iteration = {'training': 0, 'validation': 0}
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
-    def __init__(
-        self,
-        forward_backward_func,
-        cuda_graph_warmup_steps = 1
-    ):
+
+    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
 
-    def data_read(
-        self,
-        data_iterator,
-        model,
-        training,
-        num_microbatches
-    ):
+    def data_read(self, data_iterator, model, training, num_microbatches):
+        """Read all microbatch inputs from Dataloader and copy to static buffers."""
         if not isinstance(model, list) or len(model) == 1:
             assert not isinstance(data_iterator, list) or len(data_iterator) == 1
             iterator0 = data_iterator if not isinstance(data_iterator, list) else data_iterator[0]
             data_list = []
             if iterator0 is not None:
                 for b in range(num_microbatches):
-                    data_list.append(self.static_loader(next(iterator0), 'training' if training else 'validation', b))
+                    data_list.append(
+                        self.static_loader(
+                            next(iterator0), 'training' if training else 'validation', b
+                        )
+                    )
                 data_list = [iter(data_list)]
             else:
                 data_list.append(None)
@@ -132,18 +123,30 @@ class FullCudaGraphWrapper:
                 if data_iterator[i] is not None:
                     data_list_i = []
                     for b in range(num_microbatches):
-                        data_list_i.append(self.static_loader(next(data_iterator[i]), 'training' if training else 'validation', b))
+                        data_list_i.append(
+                            self.static_loader(
+                                next(data_iterator[i]), 'training' if training else 'validation', b
+                            )
+                        )
                     data_list.append(iter(data_list_i))
                 else:
                     data_list.append(None)
         return data_list
 
-    def __call__(
-        self,
-        *args,
-        **kwargs):
-        assert len(args)==0, 'forward_backward_func does not accept positional args'
-        assert all([kwarg in kwargs for kwarg in ['model', 'data_iterator', 'num_microbatches', 'seq_length', 'forward_only']])
+    def __call__(self, *args, **kwargs):
+        assert len(args) == 0, 'forward_backward_func does not accept positional args'
+        assert all(
+            [
+                kwarg in kwargs
+                for kwarg in [
+                    'model',
+                    'data_iterator',
+                    'num_microbatches',
+                    'seq_length',
+                    'forward_only',
+                ]
+            ]
+        )
         model = kwargs['model']
         num_microbatches = kwargs['num_microbatches']
 
@@ -155,7 +158,7 @@ class FullCudaGraphWrapper:
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
-            print_rank_0 (f'Capture CUDA graph for {training_str}!!!')
+            logger.info(f'Capture CUDA graph for {training_str}!!!')
             torch.distributed.barrier()
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
@@ -163,21 +166,30 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = torch.cuda.Stream()
-            with torch.cuda.graph(FullCudaGraphWrapper.cuda_graph[training_str], stream=capture_stream, capture_error_mode="thread_local"):
-                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func (*args, **kwargs)
+            with torch.cuda.graph(
+                FullCudaGraphWrapper.cuda_graph[training_str],
+                stream=capture_stream,
+                capture_error_mode="thread_local",
+            ):
+                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
+                    *args, **kwargs
+                )
             torch.cuda.synchronize()
             torch.distributed.barrier()
-            print_rank_0 (f'CUDA graph capture done!!!')
+            logger.info(f'CUDA graph capture done!!!')
 
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
-            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func (*args, **kwargs)
+            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
-            
+
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
     def curr_iter(self, stage):
+        """Return current training/validation iteration."""
         return FullCudaGraphWrapper.curr_iteration[stage]
+
     def next_iter(self, stage):
+        """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1

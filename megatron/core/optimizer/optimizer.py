@@ -531,11 +531,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            (
+            if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+                # In the case of overlap_param_gather,
+                # copy is manually called in the training loop
+                if not self.config.overlap_param_gather:
+                    self._copy_main_params_to_param_buffer()
+            else:
                 self._copy_main_params_to_model_params()
-                if not self.config.reuse_grad_buf_for_mxfp8_param_ag
-                else self._copy_main_params_to_param_buffer()
-            )
+
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 

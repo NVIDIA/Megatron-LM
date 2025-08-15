@@ -172,14 +172,19 @@ def custom_backward(output, grad_output):
 def set_current_microbatch(model, microbatch_id):
     """Set the current microbatch."""
     decoder_exists = True
-    decoder = None
+    model_with_decoder = None
     try:
-        decoder = get_attr_wrapped_model(model, "decoder")
+        model_with_decoder = get_attr_wrapped_model(
+            model, "decoder", allow_none=False, return_model_obj=True
+        )
     except RuntimeError:
         decoder_exists = False
-    if decoder_exists and decoder is not None:
-        for layer in decoder.layers:
+    if decoder_exists and model_with_decoder is not None:
+        for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
+        if hasattr(model_with_decoder, 'mtp'):
+            for layer in model_with_decoder.mtp.layers:
+                layer.transformer_layer.current_microbatch = microbatch_id
 
 
 def forward_step_calc_loss(

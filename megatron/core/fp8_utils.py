@@ -410,6 +410,63 @@ if HAVE_TE:
     from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import TEDelayedScaling
 
+    def get_fp8_recipe(config: TransformerConfig):
+        """Return fp8 recipe.
+
+        Arguments:
+            config (TransformerConfig): Configuration object.
+
+        Returns:
+            FP8 recipe.
+        """
+        if config.fp8 == "e4m3":
+            fp8_format = transformer_engine.common.recipe.Format.E4M3
+        elif config.fp8 == "hybrid":
+            fp8_format = transformer_engine.common.recipe.Format.HYBRID
+        else:
+            raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
+
+        # Select fp8 recipe (TE version >= 2.1.0).
+        fp8_recipe = None
+        if is_te_min_version("2.1.0"):
+            if config.fp8_recipe == Fp8Recipe.delayed:
+                fp8_recipe = TEDelayedScaling(
+                    config=config,
+                    fp8_format=fp8_format,
+                    override_linear_precision=(False, False, not config.fp8_wgrad),
+                )
+            elif config.fp8_recipe == Fp8Recipe.tensorwise and is_te_min_version("2.2.0.dev0"):
+                fp8_recipe = transformer_engine.common.recipe.Float8CurrentScaling(
+                    fp8_format=fp8_format
+                )
+            elif config.fp8_recipe == Fp8Recipe.blockwise and is_te_min_version("2.3.0.dev0"):
+                fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
+                    fp8_format=fp8_format
+                )
+            elif config.fp8_recipe == Fp8Recipe.mxfp8:
+                fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
+                    fp8_format=fp8_format
+                )
+            else:
+                raise ValueError(
+                    "Float8CurrentScaling, MXFP8BlockScaling, Float8BlockwiseScaling and "
+                    "DelayedScaling are the only supported FP8 recipes. Please also make sure "
+                    "you are using a compatible TE version."
+                )
+        else:
+            # Assert that the user is using delayed scaling.
+            assert config.fp8_recipe == Fp8Recipe.delayed, (
+                "Please make sure to use TransformerEngine version >= 2.2.0.dev0 for "
+                "Float8CurrentScaling, >= 2.1.0 for MXFP8BlockScaling, and >= 2.3.0.dev0 for "
+                "Float8BlockScaling."
+            )
+            fp8_recipe = TEDelayedScaling(
+                config=config,
+                fp8_format=fp8_format,
+                override_linear_precision=(False, False, not config.fp8_wgrad),
+            )
+        return fp8_recipe
+
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return fp8 context manager.
 
@@ -447,54 +504,7 @@ if HAVE_TE:
             fp8_context = nullcontext()
         else:
             # fp8 training and this layer_no is in fp8
-            import transformer_engine  # To keep out TE dependency when not training in fp8
-
-            if config.fp8 == "e4m3":
-                fp8_format = transformer_engine.common.recipe.Format.E4M3
-            elif config.fp8 == "hybrid":
-                fp8_format = transformer_engine.common.recipe.Format.HYBRID
-            else:
-                raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-            # Select fp8 recipe (TE version >= 2.1.0).
-            fp8_recipe = None
-            if is_te_min_version("2.1.0"):
-                if config.fp8_recipe == Fp8Recipe.delayed:
-                    fp8_recipe = TEDelayedScaling(
-                        config=config,
-                        fp8_format=fp8_format,
-                        override_linear_precision=(False, False, not config.fp8_wgrad),
-                    )
-                elif config.fp8_recipe == Fp8Recipe.tensorwise and is_te_min_version("2.2.0.dev0"):
-                    fp8_recipe = transformer_engine.common.recipe.Float8CurrentScaling(
-                        fp8_format=fp8_format
-                    )
-                elif config.fp8_recipe == Fp8Recipe.blockwise and is_te_min_version("2.3.0.dev0"):
-                    fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
-                        fp8_format=fp8_format
-                    )
-                elif config.fp8_recipe == Fp8Recipe.mxfp8:
-                    fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
-                        fp8_format=fp8_format
-                    )
-                else:
-                    raise ValueError(
-                        "Float8CurrentScaling, MXFP8BlockScaling, Float8BlockwiseScaling and "
-                        "DelayedScaling are the only supported FP8 recipes. Please also make sure "
-                        "you are using a compatible TE version."
-                    )
-            else:
-                # Assert that the user is using delayed scaling.
-                assert config.fp8_recipe == Fp8Recipe.delayed, (
-                    "Please make sure to use TransformerEngine version >= 2.2.0.dev0 for "
-                    "Float8CurrentScaling, >= 2.1.0 for MXFP8BlockScaling, and >= 2.3.0.dev0 for "
-                    "Float8BlockScaling."
-                )
-                fp8_recipe = TEDelayedScaling(
-                    config=config,
-                    fp8_format=fp8_format,
-                    override_linear_precision=(False, False, not config.fp8_wgrad),
-                )
+            fp8_recipe = get_fp8_recipe(config)
 
             fp8_group = None
             if parallel_state.model_parallel_is_initialized():
@@ -532,6 +542,10 @@ if HAVE_TE:
         return fp8_context
 
 else:
+
+    def get_fp8_recipe(config: TransformerConfig):
+        """Returns None since TE is not available."""
+        return None
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""
