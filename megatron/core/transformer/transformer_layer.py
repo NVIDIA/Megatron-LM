@@ -868,7 +868,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # False by initialize_attention, and we should not use cuda graphs.
             elif kwargs['inference_context'].using_cuda_graph_this_step():
                 return self.cudagraph_manager_for_non_decode(self, args, kwargs)
-       
+
         elif (
             self.config.external_cuda_graph
             and self.training

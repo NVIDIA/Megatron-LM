@@ -479,7 +479,7 @@ class TestDynamicInferenceEngine:
         "warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]
     )
     @pytest.mark.parametrize(
-    "num_warmup_tokens, expected_cuda_graph_token_count",
+        "num_warmup_tokens, expected_cuda_graph_token_count",
         [
             (1, 8),
             (2, 8),
@@ -494,15 +494,15 @@ class TestDynamicInferenceEngine:
             (32, 32),
         ],
     )
-    def test_cuda_graph_warmup(self, 
-                               warmup_engine_mode: WarmupEngineMode, 
-                               num_warmup_tokens: int, 
-                               expected_cuda_graph_token_count: int) -> None:
+    def test_cuda_graph_warmup(
+        self,
+        warmup_engine_mode: WarmupEngineMode,
+        num_warmup_tokens: int,
+        expected_cuda_graph_token_count: int,
+    ) -> None:
         """Test initialization during cuda graph warmup."""
         if num_warmup_tokens == 1 and warmup_engine_mode == WarmupEngineMode.NON_DECODE:
-            pytest.skip(
-                "WarmupEngineMode.NON_DECODE with num_warmup_tokens=1 is not supported."
-            )
+            pytest.skip("WarmupEngineMode.NON_DECODE with num_warmup_tokens=1 is not supported.")
 
         # Initialize context.
         env = self._build_test_env(DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8))

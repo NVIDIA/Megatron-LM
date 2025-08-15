@@ -102,16 +102,22 @@ class DynamicInferenceEngine(AbstractEngine):
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
                 % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
             )
-     
+
             for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
                 # Iterate cuda graph dims.
-                if warmup_engine_mode == WarmupEngineMode.NON_DECODE and not context.non_decode_cuda_graphs:
+                if (
+                    warmup_engine_mode == WarmupEngineMode.NON_DECODE
+                    and not context.non_decode_cuda_graphs
+                ):
                     continue
                 tbar = enumerate(context.cuda_graph_token_counts)
                 if HAVE_TQDM:
                     tbar = tqdm(tbar, total=len(context.cuda_graph_token_counts))
                 for tbar_idx, cuda_graph_token_count in tbar:
-                    if cuda_graph_token_count == 1 and warmup_engine_mode == WarmupEngineMode.NON_DECODE:
+                    if (
+                        cuda_graph_token_count == 1
+                        and warmup_engine_mode == WarmupEngineMode.NON_DECODE
+                    ):
                         # This case is not support as we require atleast two tokens for a non-decode
                         # engine step.
                         continue
@@ -139,11 +145,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Forward pass -> logits.
                     with torch.inference_mode():
                         controller.inference_wrapped_model.run_one_forward_step(
-                            {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
+                            {
+                                "tokens": input_ids,
+                                "position_ids": position_ids,
+                                "attention_mask": None,
+                            }
                         )
                         context.reset()  # todo: @lmcafee, remove if unnecessary.
 
-                   
             # Create cuda graphs.
             with torch.inference_mode():
                 create_cudagraphs()
