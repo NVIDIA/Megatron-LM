@@ -66,7 +66,6 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDia
 
 
 # >>> [ temporary ]
-# SUSPEND_RESUME_INTERVAL = 16 # 128
 SUSPEND_RESUME_INTERVAL = int(os.environ["SUSPEND_RESUME_INTERVAL"])
 # <<<
 
@@ -298,24 +297,25 @@ def run_inference(
             # Append output tokens.
             output_start = get_curr_time()
             for finished_request in finished_requests:
+
+                # Update local request object.
                 request = requests[finished_request.request_id]
-                request.output_tokens = finished_request.generated_tokens
-                total_output_tokens += len(request.output_tokens)
                 request.time_end = get_curr_time()
-                # >>>
+                request.state = "finished"
+                request.request_id = finished_request.request_id
+
                 # Update prompt, in case engine has been suspended and resumed.
                 request.prompt_tokens = finished_request.prompt_tokens
                 request.prompt_text = engine.controller.tokenizer.detokenize(
                     finished_request.prompt_tokens.tolist()
                 )
-                # <<<
-                # >>>
-                # from lutil import pax
-                # pax("finished_request, request")
-                # <<<
+
+                # Get output tokens and text.
+                request.output_tokens = finished_request.generated_tokens
                 request.output_text = finished_request.generated_text
-                request.state = "finished"
-                request.request_id = finished_request.request_id
+                total_output_tokens += len(request.output_tokens)
+
+                # Log probs.
                 if sampling_params.return_log_probs:
                     request.log_probs = (
                         finished_request.prompt_log_probs + finished_request.generated_log_probs
@@ -433,10 +433,7 @@ def main():
             unique_prompt_map[request.prompt_text].append(request_idx)
 
         # Print unique prompts + outputs.
-        # >>>
-        # output_text_hashes = []
         text_hashes = []
-        # <<<
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)

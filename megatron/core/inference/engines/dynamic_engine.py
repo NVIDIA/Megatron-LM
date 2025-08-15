@@ -381,43 +381,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """Suspend engine by deallocating context's GPU state."""
         self.context.deallocate_all_tensors()
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # def resume(self):
-    #     """Resume engine by reallocating context's GPU state."""
-
-    #     # Allocate context tensors.
-    #     self.context.allocate_all_tensors()
-
-    #     # Reset context state (i.e., paused_request_count, total_request_count, etc.).
-    #     self.context.reset()
-
-    #     # Add requests.
-    #     for request_id, request in self.requests.items():
-
-    #         # Skip waiting requests, since they were never added to the context.
-    #         if request_id in self.waiting_request_ids:
-    #             continue
-
-    #         # Concatenate prompt + generated tokens.
-    #         tokens = torch.cat(
-    #             (
-    #                 request.prompt_tokens,
-    #                 torch.tensor(
-    #                     request.generated_tokens,
-    #                     dtype=request.prompt_tokens.dtype,
-    #                     device=request.prompt_tokens.device,
-    #                 ),
-    #             ),
-    #             dim=0,
-    #         )
-
-    #         # Add request.
-    #         self.context.add_request(
-    #             request_id,
-    #             tokens,
-    #             request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
-    #         )
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
@@ -426,11 +389,6 @@ class DynamicInferenceEngine(AbstractEngine):
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
         request_ids = [ *active_request_ids, *waiting_request_ids ]
         requests = dict(self.requests)
-
-        # >>>
-        from lutil import pax
-        # pax("requests, waiting_request_ids, active_request_ids, request_ids")
-        # <<<
 
         # Allocate context tensors.
         self.context.allocate_all_tensors()
@@ -464,12 +422,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
             )
 
-        # >>>
-        # pax("futures")
-        # <<<
-
         return futures
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
