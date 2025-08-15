@@ -478,8 +478,31 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize(
         "warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]
     )
-    def test_cuda_graph_warmup(self, warmup_engine_mode: WarmupEngineMode) -> None:
+    @pytest.mark.parametrize(
+    "num_warmup_tokens, expected_cuda_graph_token_count",
+        [
+            (1, 8),
+            (2, 8),
+            (4, 8),
+            (8, 8),
+            (10, 16),
+            (12, 16),
+            (16, 16),
+            (20, 24),
+            (24, 24),
+            (28, 32),
+            (32, 32),
+        ],
+    )
+    def test_cuda_graph_warmup(self, 
+                               warmup_engine_mode: WarmupEngineMode, 
+                               num_warmup_tokens: int, 
+                               expected_cuda_graph_token_count: int) -> None:
         """Test initialization during cuda graph warmup."""
+        if num_warmup_tokens == 1 and warmup_engine_mode == WarmupEngineMode.NON_DECODE:
+            pytest.skip(
+                "WarmupEngineMode.NON_DECODE with num_warmup_tokens=1 is not supported."
+            )
 
         # Initialize context.
         env = self._build_test_env(DynamicEngineTestConfig(num_requests=32, num_cuda_graphs=8))
@@ -493,54 +516,40 @@ class TestDynamicInferenceEngine:
             8,
         ], "cuda_graph_token_counts: %s." % str(context.cuda_graph_token_counts)
 
-        # Iterate request counts.
-        for num_warmup_requests, expected_cuda_graph_token_count in [
-            (1, 8),
-            (2, 8),
-            (4, 8),
-            (8, 8),
-            (10, 16),
-            (12, 16),
-            (16, 16),
-            (20, 24),
-            (24, 24),
-            (28, 32),
-            (32, 32),
-        ]:
-            context.initialize_attention_state(
-                num_warmup_requests=num_warmup_requests, warmup_engine_mode=warmup_engine_mode
-            )
+        context.initialize_attention_state(
+            num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
+        )
 
-            # Validate request & token counts.
+        # Validate request & token counts.
 
-            assert (
-                expected_cuda_graph_token_count
-                == context.padded_active_request_count
-                == context.padded_active_token_count
-            ), (
-                "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
-                % (
-                    num_warmup_requests,
-                    expected_cuda_graph_token_count,
-                    context.padded_active_request_count,
-                    context.padded_active_token_count,
-                )
+        assert (
+            expected_cuda_graph_token_count
+            == context.padded_active_request_count
+            == context.padded_active_token_count
+        ), (
+            "failed ... num_warmup_tokens (%d) ... expected_cuda_graph_request_count (%d) == context.padded_active_request_count (%d) == context.padded_active_token_count (%d)"
+            % (
+                num_warmup_tokens,
+                expected_cuda_graph_token_count,
+                context.padded_active_request_count,
+                context.padded_active_token_count,
             )
+        )
 
-            # Validate input/position dimensions.
-            input_ids, pos_ids = context.current_input_and_position_ids()
-            assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
-            assert context.using_cuda_graph_this_step, (
-                "expected `using_cuda_graph_this_step` to be True for decode step with "
-                "num_warmup_requests <= max_requests."
-            )
-            context.reset()
+        # Validate input/position dimensions.
+        input_ids, pos_ids = context.current_input_and_position_ids()
+        assert input_ids.shape[1] == pos_ids.shape[1] == expected_cuda_graph_token_count
+        assert context.using_cuda_graph_this_step, (
+            "expected `using_cuda_graph_this_step` to be True for decode step with "
+            "num_warmup_tokens <= max_requests."
+        )
+        context.reset()
 
         # Test active request count overflow
-        for num_warmup_requests in (64, 128, 1024):
+        for num_warmup_tokens in (64, 128, 1024):
             try:
                 context.initialize_attention_state(
-                    num_warmup_requests=num_warmup_requests, warmup_engine_mode=warmup_engine_mode
+                    num_warmup_tokens=num_warmup_tokens, warmup_engine_mode=warmup_engine_mode
                 )
             except ActiveRequestCountOverflowError as e:
                 continue

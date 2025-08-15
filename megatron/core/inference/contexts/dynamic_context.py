@@ -609,7 +609,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns True if cuda graphs are being used for this step."""
         has_cuda_graphs = self.cuda_graph_token_counts is not None
         can_use_cuda_graphs = self.is_decode_only() or self.non_decode_cuda_graphs
-        token_count_fits_cuda_graph = self.active_token_count <= self.cuda_graph_token_counts[0]
+        token_count_fits_cuda_graph = has_cuda_graphs and (self.active_token_count <= self.cuda_graph_token_counts[0])
         return has_cuda_graphs and can_use_cuda_graphs and token_count_fits_cuda_graph
 
     def initialize_attention_state(
