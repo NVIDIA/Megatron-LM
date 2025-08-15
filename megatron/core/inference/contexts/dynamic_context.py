@@ -2,8 +2,8 @@
 
 import math
 import warnings
-from typing import List, Optional, Tuple
 from enum import Enum
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -74,6 +74,7 @@ class WarmupEngineMode(Enum):
 
     DECODE = "decode"
     NON_DECODE = "non_decode"
+
 
 # pylint: disable=line-too-long
 class DynamicInferenceContext(BaseInferenceContext):
@@ -336,7 +337,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-
         # Guaranteed active requests.
         # * See details in the class docstring above. `gtd_request_fraction` is
         #   the fraction of chunks in the memory buffer that are reserved for
@@ -582,8 +582,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_chunk_ids_cudagraph_only.fill_(0)
         self.block_table = None
 
-    def add_dummy_requests_for_cudagraph_capture(self, total_num_tokens: int, 
-                                                 warmup_engine_mode: WarmupEngineMode) -> None:
+    def add_dummy_requests_for_cudagraph_capture(
+        self, total_num_tokens: int, warmup_engine_mode: WarmupEngineMode
+    ) -> None:
         """
         Adds dummy requests to the context. These are using during
         cuda graph captures.
@@ -593,42 +594,38 @@ class DynamicInferenceContext(BaseInferenceContext):
         if warmup_engine_mode == WarmupEngineMode.DECODE:
             # simply add requests of prompt-length 1
             for i in range(total_num_tokens):
-                self.add_request(
-                    request_id=i,
-                    tokens=prompt_length_1,
-                    num_tokens_to_generate=1,
-                )
+                self.add_request(request_id=i, tokens=prompt_length_1, num_tokens_to_generate=1)
         else:
             # first requesst is of prompt-length 2, rest are of prompt-length 1
             # this is to trigger the non-decode code path during cuda graph capture
-            for i in range(total_num_tokens-1):
+            for i in range(total_num_tokens - 1):
                 self.add_request(
-                        request_id=i,
-                        tokens=prompt_length_2 if i==0 else prompt_length_1,
-                        num_tokens_to_generate=1,
-                    )
-
+                    request_id=i,
+                    tokens=prompt_length_2 if i == 0 else prompt_length_1,
+                    num_tokens_to_generate=1,
+                )
 
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
-        has_cuda_graphs =  self.cuda_graph_token_counts is not None 
-        can_use_cuda_graphs = (self.is_decode_only() or self.non_decode_cuda_graphs) 
-        token_count_fits_cuda_graph = (self.active_token_count <= self.cuda_graph_token_counts[0])
+        has_cuda_graphs = self.cuda_graph_token_counts is not None
+        can_use_cuda_graphs = self.is_decode_only() or self.non_decode_cuda_graphs
+        token_count_fits_cuda_graph = self.active_token_count <= self.cuda_graph_token_counts[0]
         return has_cuda_graphs and can_use_cuda_graphs and token_count_fits_cuda_graph
-        
 
     def initialize_attention_state(
-        self, *, num_warmup_tokens: Optional[int] = None, 
-        warmup_engine_mode: WarmupEngineMode = WarmupEngineMode.DECODE
+        self,
+        *,
+        num_warmup_tokens: Optional[int] = None,
+        warmup_engine_mode: WarmupEngineMode = WarmupEngineMode.DECODE,
     ) -> None:
         """Initialize attention state so that every layer can use it.
 
         Args:
             num_warmup_tokens (Optional[int]): Number of tokens to use for
                 warming up cuda graphs. Must be less than or equal to
-                `max_requests`. 
-            warmup_engine_mode (WarmupEngineMode): Denote whether to setup 
-            for a decode or a non-decode cuda-graph warmup. 
+                `max_requests`.
+            warmup_engine_mode (WarmupEngineMode): Denote whether to setup
+            for a decode or a non-decode cuda-graph warmup.
         Return:
             None.
         """
@@ -640,8 +637,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_warmup_tokens is not None:
             if num_warmup_tokens > self.max_requests:
                 raise ActiveRequestCountOverflowError(self.max_requests, num_warmup_tokens)
-            self.add_dummy_requests_for_cudagraph_capture(num_warmup_tokens, 
-                                                            warmup_engine_mode)
+            self.add_dummy_requests_for_cudagraph_capture(num_warmup_tokens, warmup_engine_mode)
 
         active_token_count = self.active_token_count
 

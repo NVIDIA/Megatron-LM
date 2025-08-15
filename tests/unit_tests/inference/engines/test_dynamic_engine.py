@@ -17,7 +17,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
     TokenOverflowError,
-    WarmupEngineMode
+    WarmupEngineMode,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
@@ -475,7 +475,9 @@ class TestDynamicInferenceEngine:
                 actual_cuda_graph_token_counts,
             )
 
-    @pytest.mark.parametrize("warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE])
+    @pytest.mark.parametrize(
+        "warmup_engine_mode", [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]
+    )
     def test_cuda_graph_warmup(self, warmup_engine_mode: WarmupEngineMode) -> None:
         """Test initialization during cuda graph warmup."""
 
@@ -506,8 +508,7 @@ class TestDynamicInferenceEngine:
             (32, 32),
         ]:
             context.initialize_attention_state(
-                num_warmup_requests=num_warmup_requests,
-                warmup_engine_mode=warmup_engine_mode
+                num_warmup_requests=num_warmup_requests, warmup_engine_mode=warmup_engine_mode
             )
 
             # Validate request & token counts.
@@ -539,8 +540,7 @@ class TestDynamicInferenceEngine:
         for num_warmup_requests in (64, 128, 1024):
             try:
                 context.initialize_attention_state(
-                    num_warmup_requests=num_warmup_requests,
-                    warmup_engine_mode=warmup_engine_mode,
+                    num_warmup_requests=num_warmup_requests, warmup_engine_mode=warmup_engine_mode
                 )
             except ActiveRequestCountOverflowError as e:
                 continue

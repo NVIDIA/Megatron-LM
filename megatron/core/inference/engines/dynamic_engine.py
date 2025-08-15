@@ -16,7 +16,7 @@ from megatron.core.inference.contexts.dynamic_context import (
     MaxSequenceLengthOverflowError,
     RequestOverflowError,
     TokenOverflowError,
-    WarmupEngineMode
+    WarmupEngineMode,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
@@ -110,8 +110,10 @@ class DynamicInferenceEngine(AbstractEngine):
             for tbar_idx, cuda_graph_token_count in tbar:
 
                 # Initialize attention state.
-                context.initialize_attention_state(num_warmup_tokens=cuda_graph_token_count,
-                                                   warmup_engine_mode=WarmupEngineMode.DECODE)
+                context.initialize_attention_state(
+                    num_warmup_tokens=cuda_graph_token_count,
+                    warmup_engine_mode=WarmupEngineMode.DECODE,
+                )
                 assert (
                     cuda_graph_token_count == context.padded_active_token_count
                 ), f"{cuda_graph_token_count} vs. {context.padded_active_token_count}."
@@ -139,8 +141,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 # non-decode cudagraph capture.
                 if context.non_decode_cuda_graphs and cuda_graph_token_count > 1:
                     context.initialize_attention_state(
-                        num_warmup_tokens=cuda_graph_token_count, 
-                        warmup_engine_mode=WarmupEngineMode.NON_DECODE
+                        num_warmup_tokens=cuda_graph_token_count,
+                        warmup_engine_mode=WarmupEngineMode.NON_DECODE,
                     )
                     # Get flat tokens, position ids.
                     input_ids, position_ids = context.current_input_and_position_ids(
@@ -154,7 +156,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 "position_ids": position_ids,
                                 "attention_mask": None,
                             }
-                        )  
+                        )
                         context.reset()
 
             # Create cuda graphs.

@@ -568,9 +568,12 @@ class _CudaGraphRunner(torch.nn.Module):
         if inference_context and inference_context.is_dynamic_batching():
             num_warmup_tokens = kwargs["hidden_states"].size(0)
             inference_context.initialize_attention_state(
-                num_warmup_tokens = num_warmup_tokens,
-                warmup_engine_mode = WarmupEngineMode.NON_DECODE 
-                if self.is_inference_non_decode_runner else WarmupEngineMode.DECODE,
+                num_warmup_tokens=num_warmup_tokens,
+                warmup_engine_mode=(
+                    WarmupEngineMode.NON_DECODE
+                    if self.is_inference_non_decode_runner
+                    else WarmupEngineMode.DECODE
+                ),
             )
 
         context = (
