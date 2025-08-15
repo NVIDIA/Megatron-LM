@@ -126,7 +126,7 @@ MODEL_ARGS:
   --fp8-format: hybrid
   --fp8-recipe: tensorwise
   --exit-interval: 50
-TEST_TYPE: regular
+TEST_TYPE: ckpt-resume
 METRICS:
   - "iteration-time"
   - "lm loss"

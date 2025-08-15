@@ -343,6 +343,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     (7) combine postprocess: unpermute tokens
     """
 
+    # DtoH copies are performed on this stream for overlapping with the main stream.
+    cuda_dtoh_stream = None
+
     def __init__(
         self,
         num_local_experts: int,
@@ -417,7 +420,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             "no_sync": 4,
         }
         self.cuda_dtoh_point = "before_permutation_1"
-        self.cuda_dtoh_stream = torch.cuda.Stream()
+        if MoEAlltoAllTokenDispatcher.cuda_dtoh_stream is None:
+            MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
         self.shared_experts = None
 

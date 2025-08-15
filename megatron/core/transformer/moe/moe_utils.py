@@ -677,8 +677,6 @@ def clear_aux_losses_tracker():
     tracker = get_moe_layer_wise_logging_tracker()
     for name in tracker:
         tracker[name]["values"].zero_()
-        tracker[name]["reduce_group"] = None
-        tracker[name]["avg_group"] = None
 
 
 def reduce_aux_losses_tracker_across_ranks(track_names: Optional[List[str]] = None):
