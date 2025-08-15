@@ -66,7 +66,8 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDia
 
 
 # >>> [ temporary ]
-SUSPEND_RESUME_INTERVAL = 16 # 128
+# SUSPEND_RESUME_INTERVAL = 16 # 128
+SUSPEND_RESUME_INTERVAL = int(os.environ["SUSPEND_RESUME_INTERVAL"])
 # <<<
 
 
@@ -301,6 +302,17 @@ def run_inference(
                 request.output_tokens = finished_request.generated_tokens
                 total_output_tokens += len(request.output_tokens)
                 request.time_end = get_curr_time()
+                # >>>
+                # Update prompt, in case engine has been suspended and resumed.
+                request.prompt_tokens = finished_request.prompt_tokens
+                request.prompt_text = engine.controller.tokenizer.detokenize(
+                    finished_request.prompt_tokens.tolist()
+                )
+                # <<<
+                # >>>
+                # from lutil import pax
+                # pax("finished_request, request")
+                # <<<
                 request.output_text = finished_request.generated_text
                 request.state = "finished"
                 request.request_id = finished_request.request_id
@@ -421,7 +433,10 @@ def main():
             unique_prompt_map[request.prompt_text].append(request_idx)
 
         # Print unique prompts + outputs.
-        output_text_hashes = []
+        # >>>
+        # output_text_hashes = []
+        text_hashes = []
+        # <<<
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
             # ---- Prompt summary line ----
             prompt_len = len(requests[request_idxs[0]].prompt_tokens)
