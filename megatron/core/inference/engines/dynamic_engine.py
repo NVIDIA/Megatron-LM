@@ -392,7 +392,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Maintain references to requests before reset.
         waiting_request_ids = list(self.waiting_request_ids)
         active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        request_ids = [ *active_request_ids, *waiting_request_ids ]
+        request_ids = [*active_request_ids, *waiting_request_ids]
         requests = dict(self.requests)
 
         # Allocate context tensors.
