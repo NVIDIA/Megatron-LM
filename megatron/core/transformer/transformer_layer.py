@@ -285,9 +285,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                         self.config.flash_decode
                     ), "--flash-decode is required to use CUDA graphs during inference"
                 self.cudagraph_manager = CudaGraphManager(config)
-                self.cudagraph_manager_for_non_decode = CudaGraphManager(
-                    config, extra_runner_kwargs={"is_non_decode_runner": True}
-                )
             else:
                 # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
                 # the number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -861,14 +858,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             assert (
                 kwargs.get('attention_mask') is None
             ), f"Attention mask must not be set when using CUDA graphs with inference."
-            if kwargs['inference_context'].is_decode_only():
-                return self.cudagraph_manager(self, args, kwargs)
+
             # it can happen that non-decode steps have a token count greater than the max
             # supported cuda graph token count. In that case this flag will be set to
             # False by initialize_attention, and we should not use cuda graphs.
-            elif kwargs['inference_context'].using_cuda_graph_this_step():
-                return self.cudagraph_manager_for_non_decode(self, args, kwargs)
-
+            if kwargs['inference_context'].using_cuda_graph_this_step():
+                extra_cuda_graph_runner_kwargs = {"is_decode_only": kwargs['inference_context'].is_decode_only()}
+                return self.cudagraph_manager(self, args, kwargs, extra_cuda_graph_runner_kwargs)
+            
         elif (
             self.config.external_cuda_graph
             and self.training

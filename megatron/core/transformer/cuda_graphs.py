@@ -3,7 +3,6 @@
 import gc
 import inspect
 import logging
-import os
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -502,6 +501,9 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_input_kwarg_metas = {
             k: ArgMetadata(a) for k, a in fwd_graph_input_kwargs.items()
         }
+        self.extra_runner_kwargs_metas = {
+            k: ArgMetadata(a) for k, a in extra_runner_kwargs.items()
+        }
 
         self.fwd_graph = None
         self.bwd_graph = None
@@ -542,7 +544,7 @@ class _CudaGraphRunner(torch.nn.Module):
         else:
             self.is_first_layer, self.is_last_layer = True, True
 
-        self.is_inference_non_decode_runner = extra_runner_kwargs.get("is_non_decode_runner", False)
+        
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -568,12 +570,13 @@ class _CudaGraphRunner(torch.nn.Module):
         # Initialize inference context.
         if inference_context and inference_context.is_dynamic_batching():
             num_warmup_tokens = kwargs["hidden_states"].size(0)
+            is_decode_only: bool = self.extra_runner_kwargs_metas.get("is_decode_only").value
             inference_context.initialize_attention_state(
                 num_warmup_tokens=num_warmup_tokens,
                 warmup_engine_mode=(
-                    WarmupEngineMode.NON_DECODE
-                    if self.is_inference_non_decode_runner
-                    else WarmupEngineMode.DECODE
+                    WarmupEngineMode.DECODE
+                    if is_decode_only
+                    else WarmupEngineMode.NON_DECODE
                 ),
             )
 
@@ -808,13 +811,13 @@ class _CudaGraphRunner(torch.nn.Module):
         # issues, for instance with pipeline parallelism
         return tuple(o.clone() if torch.is_tensor(o) else o for o in out)
 
-    def replay_graph_capture(self, is_first_microbatch, args, kwargs):
+    def replay_graph_capture(self, is_first_microbatch, args, kwargs, extra_runner_kwargs={}):
         """Replay the fwd cuda graph with autograd."""
 
         # Arguments passed to a cudagraph for replay must match the args in the captured graph.
         #  Tensor arguments need to have the same shape, dtype, and device location.
         #  All other arguments must have the exact same memory addresses for graph safety.
-        mismatch_errors = self.get_mismatch_errors(args, kwargs)
+        mismatch_errors = self.get_mismatch_errors(args, kwargs, extra_runner_kwargs)
         if mismatch_errors:
             error_msg = "CUDA graph argument mismatch:\n" + "\n".join(mismatch_errors)
             raise AssertionError(error_msg)
@@ -829,7 +832,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
         return tuple(out.pop(0) if torch.is_tensor(o) else o for o in self.fwd_graph_outputs)
 
-    def get_mismatch_errors(self, args, kwargs):
+    def get_mismatch_errors(self, args, kwargs, extra_runner_kwargs):
         """Return list of detailed errors for mismatched cudagraph args."""
         errors = []
 
@@ -889,6 +892,18 @@ class _CudaGraphRunner(torch.nn.Module):
 
         for k in kwargs_keys & graph_keys:
             check(ArgMetadata(kwargs[k]), self.fwd_graph_input_kwarg_metas[k], f"kwargs['{k}']")
+
+        # Check extra runner keyword arguments
+        kwargs_keys = set(extra_runner_kwargs.keys())
+        graph_keys = set(self.extra_runner_kwargs_metas.keys())
+
+        if missing_keys := graph_keys - kwargs_keys:
+            add_error(f"Missing extra runner kwargs: {missing_keys}")
+        if extra_keys := kwargs_keys - graph_keys:
+            add_error(f"Unexpected extra runner kwargs: {extra_keys}")
+
+        for k in kwargs_keys & graph_keys:
+            check(ArgMetadata(extra_runner_kwargs[k]), self.extra_runner_kwargs_metas[k], f"kwargs['{k}']")
 
         return errors
 
@@ -969,8 +984,7 @@ class CudaGraphManager(torch.nn.Module):
     def __init__(
         self,
         config: TransformerConfig,
-        share_cudagraph_io_buffers: bool = True,
-        extra_runner_kwargs: dict = {},
+        share_cudagraph_io_buffers: bool = True
     ):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
@@ -985,7 +999,6 @@ class CudaGraphManager(torch.nn.Module):
         """
         rng_tracker = get_cuda_rng_tracker()
         self.share_cudagraph_io_buffers = share_cudagraph_io_buffers
-        self.extra_runner_kwargs = extra_runner_kwargs
 
         # need to delay the import here to avoid a circular import
         global HAVE_TE_GRAPHS
@@ -999,12 +1012,6 @@ class CudaGraphManager(torch.nn.Module):
             or (HAVE_TE_GRAPHS and isinstance(rng_tracker, TECudaRNGStatesTracker))
             or (isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
         ), "RNG tracker does not support cudagraphs!"
-
-        if config.enable_cuda_graph or config.external_cuda_graph:
-            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
-                "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
-                "a crash due to illegal memory access or other undefined behaviour."
-            )
 
         self.cudagraph_runners = []
         self.is_first_microbatch = False
@@ -1056,7 +1063,7 @@ class CudaGraphManager(torch.nn.Module):
                 # Only hooks from Mcore DDP, which take no args, should be called at this point.
                 hook(module)
 
-    def get_cudagraph_runner(self, megatron_module, args, kwargs):
+    def get_cudagraph_runner(self, megatron_module, args, kwargs, extra_runner_kwargs={}):
         '''Returns a valid cudagraph runner for the current forward call.
         For single mempool mode, we create a cudagraph for each call, if the module is called
         multiple times per step, for instance in the case of pipeline parallelism.
@@ -1081,7 +1088,7 @@ class CudaGraphManager(torch.nn.Module):
                     r
                     for r in self.cudagraph_runners
                     if r.status == _GraphStatus.FWD_READY
-                    and not r.get_mismatch_errors(args, kwargs)
+                    and not r.get_mismatch_errors(args, kwargs, extra_runner_kwargs)
                 ),
                 None,
             )
@@ -1096,7 +1103,7 @@ class CudaGraphManager(torch.nn.Module):
                         args,
                         kwargs,
                         self.share_cudagraph_io_buffers,
-                        self.extra_runner_kwargs,
+                        extra_runner_kwargs,
                     )
                     self.cudagraph_runners.append(runner)
         else:
@@ -1118,7 +1125,7 @@ class CudaGraphManager(torch.nn.Module):
 
         return runner
 
-    def __call__(self, megatron_module, args, kwargs):
+    def __call__(self, megatron_module, args, kwargs, extra_runner_kwargs={}):
         """Calls the forward pass of the cudagraphed module.
 
         Args:
@@ -1146,17 +1153,17 @@ class CudaGraphManager(torch.nn.Module):
                 for module in megatron_module.modules():
                     self.call_ddp_preforward_hook(module)
 
-            runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
-            out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
+            runner = self.get_cudagraph_runner(megatron_module, args, kwargs, extra_runner_kwargs)
+            out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs, extra_runner_kwargs)
         else:
             if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
                 # Inference generation mode
-                runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
+                runner = self.get_cudagraph_runner(megatron_module, args, kwargs, extra_runner_kwargs)
                 runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
             elif self.training:
                 # Training mode
-                runner = self.get_cudagraph_runner(megatron_module, args, kwargs)
+                runner = self.get_cudagraph_runner(megatron_module, args, kwargs, extra_runner_kwargs)
                 # check if a layer is frozen during training.
                 if not torch.is_grad_enabled():
                     # If the layer is frozen, we need to set the runner to eval mode.
