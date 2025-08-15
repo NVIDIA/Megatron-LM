@@ -166,9 +166,8 @@ def _initialize_affine_weight_cpu(
         )
 
     # Initialize master weight
-    master_weight = torch.empty(output_size, input_size, dtype=torch.float, requires_grad=False)
+    master_weight = torch.empty(output_size, input_size, dtype=params_dtype, requires_grad=False)
     init_method(master_weight)
-    master_weight = master_weight.to(dtype=params_dtype)
     # Split and copy
     per_partition_per_stride_size = divide(per_partition_size, stride)
     weight_list = torch.split(master_weight, per_partition_per_stride_size, dim=partition_dim)
