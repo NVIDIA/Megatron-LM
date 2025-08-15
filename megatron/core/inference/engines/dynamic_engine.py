@@ -359,10 +359,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
+        start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         self.context.deallocate_all_tensors()
+        end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        print(f"dynamic engine suspended, freeing {(start_mem - end_mem) / 1024**3:.1f} gb.")
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
+
+        start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
 
         # Maintain references to requests before reset.
         waiting_request_ids = list(self.waiting_request_ids)
@@ -401,6 +406,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens,
                 request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
             )
+
+        end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        print(f"dynamic engine resumed, allocating {(end_mem - start_mem) / 1024**3:.1f} gb.")
 
         return futures
 
