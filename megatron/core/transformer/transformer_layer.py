@@ -863,9 +863,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # supported cuda graph token count. In that case this flag will be set to
             # False by initialize_attention, and we should not use cuda graphs.
             if kwargs['inference_context'].using_cuda_graph_this_step():
-                extra_cuda_graph_runner_kwargs = {"is_decode_only": kwargs['inference_context'].is_decode_only()}
+                extra_cuda_graph_runner_kwargs = {
+                    "is_decode_only": kwargs['inference_context'].is_decode_only()
+                }
                 return self.cudagraph_manager(self, args, kwargs, extra_cuda_graph_runner_kwargs)
-            
+
         elif (
             self.config.external_cuda_graph
             and self.training

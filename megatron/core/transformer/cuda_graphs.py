@@ -501,9 +501,7 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph_input_kwarg_metas = {
             k: ArgMetadata(a) for k, a in fwd_graph_input_kwargs.items()
         }
-        self.extra_runner_kwargs_metas = {
-            k: ArgMetadata(a) for k, a in extra_runner_kwargs.items()
-        }
+        self.extra_runner_kwargs_metas = {k: ArgMetadata(a) for k, a in extra_runner_kwargs.items()}
 
         self.fwd_graph = None
         self.bwd_graph = None
@@ -544,8 +542,6 @@ class _CudaGraphRunner(torch.nn.Module):
         else:
             self.is_first_layer, self.is_last_layer = True, True
 
-        
-
     def __str__(self):
         return "%s; hid %s" % (
             self.base_module.__class__.__name__,
@@ -574,9 +570,7 @@ class _CudaGraphRunner(torch.nn.Module):
             inference_context.initialize_attention_state(
                 num_warmup_tokens=num_warmup_tokens,
                 warmup_engine_mode=(
-                    WarmupEngineMode.DECODE
-                    if is_decode_only
-                    else WarmupEngineMode.NON_DECODE
+                    WarmupEngineMode.DECODE if is_decode_only else WarmupEngineMode.NON_DECODE
                 ),
             )
 
@@ -903,7 +897,11 @@ class _CudaGraphRunner(torch.nn.Module):
             add_error(f"Unexpected extra runner kwargs: {extra_keys}")
 
         for k in kwargs_keys & graph_keys:
-            check(ArgMetadata(extra_runner_kwargs[k]), self.extra_runner_kwargs_metas[k], f"kwargs['{k}']")
+            check(
+                ArgMetadata(extra_runner_kwargs[k]),
+                self.extra_runner_kwargs_metas[k],
+                f"kwargs['{k}']",
+            )
 
         return errors
 
@@ -981,11 +979,7 @@ class CudaGraphManager(torch.nn.Module):
     """Backward pass mempool, used with cudagraph reuse mode."""
     bwd_mempool = None
 
-    def __init__(
-        self,
-        config: TransformerConfig,
-        share_cudagraph_io_buffers: bool = True
-    ):
+    def __init__(self, config: TransformerConfig, share_cudagraph_io_buffers: bool = True):
         super().__init__()
         """Creates a CudaGraphManager to manage CUDA graphs for a Megatron module.
 
@@ -1154,16 +1148,22 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(megatron_module, args, kwargs, extra_runner_kwargs)
-            out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs, extra_runner_kwargs)
+            out = runner.replay_graph_capture(
+                self.is_first_microbatch, args, kwargs, extra_runner_kwargs
+            )
         else:
             if 'inference_context' in kwargs.keys() and kwargs['inference_context']:
                 # Inference generation mode
-                runner = self.get_cudagraph_runner(megatron_module, args, kwargs, extra_runner_kwargs)
+                runner = self.get_cudagraph_runner(
+                    megatron_module, args, kwargs, extra_runner_kwargs
+                )
                 runner.eval()
                 out = runner.record_graph_capture(args, kwargs)
             elif self.training:
                 # Training mode
-                runner = self.get_cudagraph_runner(megatron_module, args, kwargs, extra_runner_kwargs)
+                runner = self.get_cudagraph_runner(
+                    megatron_module, args, kwargs, extra_runner_kwargs
+                )
                 # check if a layer is frozen during training.
                 if not torch.is_grad_enabled():
                     # If the layer is frozen, we need to set the runner to eval mode.
