@@ -449,7 +449,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Test if any requests remain."""
         return self.total_request_count > 0
 
-    def cu_query_lengths(self) -> Tensor:
+    def cu_query_lengths(self) -> Tuple[Tensor, int]:
         """Cumulative query sequence lengths."""
         return self.cu_query_seq_lengths, self.max_seqlen_q
 
@@ -1190,31 +1190,66 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_last_kv_chunk_offset[self.paused_request_count : self.total_request_count]
         )
 
-    def calculate_log_probs(self, logits: torch.Tensor) -> List[List[float]]:
+    def calculate_log_probs(
+        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
+    ) -> List[List[float]]:
         """Calculate log probs for all active requests and return them.
 
         TODO: @wdykas support top-n log probs.
 
         Args:
-            logits: Raw model output logits with shape [1, sequence_length, vocab_size].
+            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
+            new_tokens (Tensor): The newly sampled tokens.
+            only_last_token_logits (bool): If set, the logits are from only the last token in each request
 
         Returns:
             List of lists where each inner list contains log probs for a request in the
             same order as the active requests (from paused_request_count to total_request_count).
         """
         # Calculate log_probs (sequence_length x vocab_size)
-        log_probs = F.log_softmax(logits, dim=-1).to(torch.float32).squeeze()
+        log_probs = F.log_softmax(logits.squeeze(0).float(), dim=-1)
 
-        # Extract the log probs for only the selected tokens
-        # (sequence_length x vocab_size) -> (sequence_length)
-        active_token_ids = self.token_to_input_ids[: self.active_token_count]
-        sequence_indices = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[sequence_indices, active_token_ids]
+        if only_last_token_logits or self.is_decode_only():
+            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
+            selected_log_probs = log_probs[seq_idx, new_tokens]
+            return [[lp] for lp in selected_log_probs.flatten().tolist()]
 
-        # Split the log probs across request boundaries
+        # Get the selected token ids for all tokens.
+        # We shift the active token window left by one to remove the first prompt token for
+        # prefill requests and then set the token ids explicitly for the newly generated tokens.
+        # This is necessary because we calculate the log probs *before* updating the request metadata.
+        #
+        # Example (decode & prefill mix):
+        #
+        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
+        #
+        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
+        #
+        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
+        #
+        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
+        #
+        #   active_token_ids before left shift:
+        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
+        #
+        #   active_token_ids after shift:
+        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
+        #
+        #   active_token_ids[new_token_idx] = new_tokens
+        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
+        active_token_ids = self.token_to_input_ids[: self.active_token_count].roll(-1, 0)
         active_query_lengths = self.request_query_lengths[
             self.paused_request_count : self.total_request_count
         ]
+        new_token_idx = active_query_lengths.cumsum(0) - 1
+        active_token_ids[new_token_idx] = new_tokens
+
+        # Extract the log probs for only the selected tokens.
+        # (sequence_length x vocab_size) -> (sequence_length)
+        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
+        selected_log_probs = log_probs[seq_idx, active_token_ids]
+
+        # Split the log probs across request boundaries
         selected_log_probs_list = selected_log_probs.cpu().split(
             active_query_lengths.tolist(), dim=0
         )
