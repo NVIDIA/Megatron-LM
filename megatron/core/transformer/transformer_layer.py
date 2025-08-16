@@ -365,6 +365,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
         # import here to avoid circular import
+        from megatron.core.extensions.transformer_engine import TEFusedMLP
         from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -379,6 +380,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 assert hasattr(
                     model_comm_pgs, 'tp'
                 ), 'TP process group is required for MLP in TransformerLayer'
+                additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
+            elif TEFusedMLP is not None and submodules.mlp.module == TEFusedMLP:
+                assert hasattr(
+                    model_comm_pgs, 'tp'
+                ), 'TP process group is required for TEFusedMLP in TransformerLayer'
                 additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
             else:
                 log_single_rank(
