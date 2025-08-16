@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import time
 import warnings
 from contextlib import nullcontext
 from enum import Enum
@@ -290,18 +291,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # request_last_kv_chunk_offset represents number of tokens in the last kv chunk
         self.request_last_kv_chunk_offset = torch.empty_like(self.request_ids)
 
-        # Per-token state.
-        self.token_to_input_ids = torch.full(
-            (self.max_tokens,), 0, dtype=torch.long, device=torch.cuda.current_device()
-        )
-        self.token_to_pos_ids = torch.full_like(self.token_to_input_ids, 0)
-        self.token_to_request_idx = torch.empty_like(self.token_to_input_ids)
-        self.token_to_chunk_idx = torch.empty_like(self.token_to_input_ids)
-        # i.e For a set of tokens A B C D E F ..  and chunk_size 4:
-        # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
-        # token_to_local_position_within_kv_chunk is [0 , 1, 2, 3, 0, 1, 2]
-        self.token_to_position_in_request = torch.empty_like(self.token_to_input_ids)
-        self.token_to_local_position_within_kv_chunk = torch.empty_like(self.token_to_input_ids)
+        with timing_ctx(time_map, "requests"):
 
         # Calculate the total number of chunks available in the buffer
         chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
@@ -409,9 +399,60 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
         )
 
-        # Reset attention state.
-        # TODO(@lmcafee): move to __init__()?
-        self.reset_attention_state()
+            # Memory buffer.
+            self.memory_buffer = torch.full(
+                (
+                    2,  # key and value
+                    self.num_layers,
+                    self.chunk_count_total,
+                    self.chunk_size_tokens,
+                    self.num_attention_heads_per_partition,
+                    self.hidden_size_per_attention_head,
+                ),
+                -1,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+
+        with timing_ctx(time_map, "decode_only"):
+
+            # `*_decode_only` tensors are for use with cuda graphs to maintain
+            # consistent input shapes, which is required to use cuda graphs. Cuda
+            # graphs are used only during decode-only steps (i.e., no requests are in
+            # the prefill phases). During these decode-only steps, the `*_decode_only`
+            # tensors are used, otherwise their same-name but un-suffixed
+            # corresponding tensors are used.
+            # TODO: @lmcafee, only use `_decode_only` tensors when both of the
+            # following conditions are met: 1) decode-only step, and 2) cuda graphs
+            # are enabled.
+
+            self.query_seq_lengths_decode_only = torch.full(
+                (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.cu_query_seq_lengths_decode_only = torch.full(
+                (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.kv_seq_lengths_decode_only = torch.full(
+                (self.max_requests,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            self.cu_kv_seq_lengths_decode_only = torch.full(
+                (self.max_requests + 1,), 0, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+
+            self.request_to_kv_chunk_ids_decode_only = torch.full(
+                (self.max_requests, self.max_kv_chunk_count),
+                0,
+                dtype=torch.int,
+                device=torch.cuda.current_device(),
+            )
+
+        with timing_ctx(time_map, "reset_attention_state"):
+
+            # Reset attention state.
+            # TODO(@lmcafee): move to __init__()?
+            self.reset_attention_state()
+
+        return time_map
 
     def deallocate_all_tensors(self):
         """Deallocate GPU state.
