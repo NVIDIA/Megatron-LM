@@ -111,6 +111,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
+        cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
+        kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
+        qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
     )
 
     return context

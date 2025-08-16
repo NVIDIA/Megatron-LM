@@ -53,6 +53,17 @@ except:
     HAVE_FA3 = False
 
 try:
+    from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+    HAVE_FMLA = True
+except ImportError:
+    flash_mla_with_kvcache = None
+    get_mla_metadata = None
+    HAVE_FMLA = False
+
+from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 except:
     flash_attn_varlen_func = None
@@ -376,9 +387,15 @@ class Attention(MegatronModule, ABC):
             # Append key/value data tensors to cache.
             inference_context.append_key_value_cache(self.layer_number, key, value)
 
-            # Read key/value *pointer* tensors from cache.
-            key, value, block_table = inference_context.key_value_cache(self.layer_number)
-
+            _, max_seqlen_q = inference_context.cu_query_lengths()
+            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
+                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+                kv_cache, _, block_table = inference_context.key_value_cache(self.layer_number)
+                # Uncompress the KV cache for prefill/mixed mode
+                key, value = self.uncompress_kv_from_cache(kv_cache)
+            else:
+                # Read key/value *pointer* tensors from cache.
+                key, value, block_table = inference_context.key_value_cache(self.layer_number)
         return query, key, value, rotary_pos_emb, attn_mask_type, block_table
 
     @abstractmethod
@@ -467,10 +484,13 @@ class Attention(MegatronModule, ABC):
         # Flash attn kernel.
         if max_seqlen_q > 1:
             q = q.squeeze(1)
+            if getattr(self, "softmax_scale", None) is not None:
+                softmax_scale = self.softmax_scale
+            else:
+                softmax_scale = q.shape[-1] ** -0.5
             if HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
-                softmax_scale = q.shape[-1] ** -0.5
                 output_total, *unused = _flash_attn_forward(
                     q=q,
                     k=k,
@@ -515,23 +535,53 @@ class Attention(MegatronModule, ABC):
                     cu_seqlens_k,
                     max_seqlen_q,
                     max_seqlen_k,
+                    softmax_scale=softmax_scale,
                     causal=True,
                     block_table=block_table,
                 )
             output_total = output_total.unsqueeze(1)
         else:  # decode only
-            flash_attn_args = {
-                "q": q,
-                "k_cache": k,
-                "v_cache": v,
-                "cache_seqlens": seqlens_k,
-                "causal": True,
-                "page_table" if HAVE_FA3 else "block_table": block_table,
-            }
-            if HAVE_FA3:
-                output_total = flash_attn3_with_kvcache(**flash_attn_args)
+            # If using MLA we use the FlashMLA kernel
+            if isinstance(self.config, MLATransformerConfig):
+                softmax_scale = self.softmax_scale
+
+                num_heads_k = 1  # Only a single head for MLA Flash
+                seq_len_q = 1  # Sequence length is 1 for decode
+                num_heads_q = self.num_attention_heads_per_partition
+                num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
+
+                cache_seqlens = seqlens_k
+                tile_scheduler_metadata, num_splits = get_mla_metadata(
+                    cache_seqlens,  # cumulative key-lengths
+                    num_heads_per_head_k,  # decode-only lengths
+                    num_heads_k,  # per-head dim of V
+                )
+                head_dim_v = self.config.kv_lora_rank
+                kv_cache = k.unsqueeze(-2)
+                output_total, softmax_lse = flash_mla_with_kvcache(
+                    q,
+                    kv_cache,
+                    block_table,
+                    cache_seqlens,
+                    head_dim_v,
+                    tile_scheduler_metadata,
+                    num_splits,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                )
             else:
-                output_total = flash_attn_with_kvcache(**flash_attn_args)
+                flash_attn_args = {
+                    "q": q,
+                    "k_cache": k,
+                    "v_cache": v,
+                    "cache_seqlens": seqlens_k,
+                    "causal": True,
+                    "page_table" if HAVE_FA3 else "block_table": block_table,
+                }
+                if HAVE_FA3:
+                    output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                else:
+                    output_total = flash_attn_with_kvcache(**flash_attn_args)
         return output_total
 
     def forward(

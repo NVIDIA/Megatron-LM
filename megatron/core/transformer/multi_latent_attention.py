@@ -7,6 +7,14 @@ from typing import NoReturn, Optional, Union
 
 import torch
 
+try:
+    from einops import rearrange
+
+    HAVE_EINOPS = True
+except ImportError:
+    HAVE_EINOPS = False
+
+
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -22,6 +30,9 @@ from megatron.core.tensor_parallel.mappings import (
     scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.custom_layers.transformer_engine import (
+    split_te_layernorm_column_parallel_linear,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -105,6 +116,7 @@ class MultiLatentAttention(Attention):
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = mscale * mscale / math.sqrt(self.q_head_dim)
+        self.cache_mla_latents = self.config.cache_mla_latents
 
         if self.config.rope_type == "rope":
             self.rotary_pos_emb = RotaryEmbedding(
@@ -181,10 +193,20 @@ class MultiLatentAttention(Attention):
         assert (
             rotary_pos_cos is None and rotary_pos_sin is None
         ), "MLA does not support Flash Decoding"
+        assert not (
+            self.training and self.cache_mla_latents
+        ), "cache_mla_latents conflicts with training."
 
         # hidden_states: [sq, b, h]
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if inference_context and not inference_context.is_static_batching():
+            assert (
+                self.config.cache_mla_latents
+            ), "currently to use dynamic backend for MLA cache mla latents must be true"
+
+        if self.config.cache_mla_latents:
+            self.prepare_for_absorption()
 
         # =====================
         # Query, Key, and Value
@@ -204,14 +226,17 @@ class MultiLatentAttention(Attention):
         # Adjust key, value for inference
         # ===================================================
         # rotary_pos_emb = None
-        query, key, value, _, attn_mask_type, _ = self._adjust_key_value_for_inference(
+        query, key, value, _, attn_mask_type, block_table = self._adjust_key_value_for_inference(
             inference_context, query, key, value, rotary_pos_emb=None
         )
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
         key = key.contiguous()
-        value = value.contiguous()
+
+        # Value is none during decode for absorption
+        if value is not None:
+            value = value.contiguous()
 
         # ==================================
         # core attention computation
@@ -222,14 +247,44 @@ class MultiLatentAttention(Attention):
                 query, key, value, attention_mask, packed_seq_params=packed_seq_params
             )
         else:
-            core_attn_out = self.core_attention(
-                query,
-                key,
-                value,
-                attention_mask,
-                packed_seq_params=packed_seq_params,
-                attn_mask_type=attn_mask_type,
-            )
+            if inference_context is None or inference_context.is_static_batching():
+                core_attn_out = self.core_attention(
+                    query,
+                    key,
+                    value,
+                    attention_mask,
+                    packed_seq_params=packed_seq_params,
+                    attn_mask_type=attn_mask_type,
+                )
+            elif self.cache_mla_latents:
+                # Dynamic batching attention kernel.
+                q, k, v = (query, key, value)
+                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
+                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
+
+                core_attn_out = self.flash_decode_and_prefill(
+                    q,
+                    k,
+                    v,
+                    max_seqlen_q,
+                    max_seqlen_k,
+                    cu_query_lengths,
+                    cu_kv_lengths,
+                    kv_lengths,
+                    block_table,
+                )
+                # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
+                if not inference_context.is_decode_only():
+                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
+
+        # We are doing absorption with cache mla latents and decode mode.
+        if self.cache_mla_latents and inference_context.is_decode_only():
+            # core_attn_out = self.self.up_v_layer(core_attn_out)
+            core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
+            core_attn_out = core_attn_out.contiguous()
+
+            # Flatten back: [seq, batch, num_heads * v_head_dim]
+            core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
@@ -278,7 +333,7 @@ class MLASelfAttention(MultiLatentAttention):
         )
 
         if self.config.q_lora_rank is None:
-            # Not projectiing query
+            # Not projecting query
             self.linear_q_proj = build_module(
                 submodules.linear_q_proj,
                 self.config.hidden_size,
@@ -507,6 +562,78 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # QKV up projection and RoPE apply
         # =========================================
+
+        def qkv_up_proj_and_rope_apply_for_cached_latent_kv(
+            q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+        ):
+            if self.config.q_lora_rank is not None:
+                # q_compressed: [num_tokens, q_lora_rank]
+                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                q_compressed = self.q_layernorm(q_compressed)
+                q, _ = self.linear_q_up_proj(q_compressed)
+            else:
+                # q_compressed: [num_tokens, hidden_size]
+                # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
+                q, _ = self.linear_q_proj(q_compressed)
+
+            # q: [num_tokens, n, q_head_dim]
+            q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
+
+            kv_compressed = self.kv_layernorm(kv_compressed)
+
+            # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+            q_no_pe, q_pos_emb = torch.split(
+                q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
+            )
+
+            # Dynamic batching: use inference context methods
+            q_pos_emb = inference_context.apply_rotary_emb_query(
+                q_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cu_seqlens_q=cu_seqlens_q,
+                cp_group=self.model_comm_pgs.cp,
+                mscale=mscale,
+            )
+            # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+            k_pos_emb = inference_context.apply_rotary_emb_key(
+                k_pos_emb,
+                rotary_pos_emb,
+                config=self.config,
+                cp_group=self.model_comm_pgs.cp,
+                mscale=mscale,
+            )
+
+            # Create KV cache entry. It will the be the key vector in cache mla latents path
+            k_pos_emb_squeezed = k_pos_emb.squeeze(1)
+            kv_cached = torch.cat([kv_compressed, k_pos_emb_squeezed], dim=-1)
+
+            # Flag for whether to use absorption. We only use absorption
+            # when caching the latents and in decode-only mode
+            use_absorption = (
+                self.config.cache_mla_latents
+                and inference_context
+                and inference_context.is_decode_only()
+            )
+            # Compute query components. Multiply by up k if absorbing
+            q_content = (
+                torch.einsum("sbhd,hdk->sbhk", q_no_pe, self.up_k_weight)
+                if use_absorption
+                else q_no_pe
+            )
+            # Query: content + original positional (latent_dim + pos_dim)
+            query = torch.cat([q_content, q_pos_emb], dim=-1)
+
+            key = kv_cached
+            value = None
+
+            query = query.contiguous()
+            key = key.contiguous()
+
+            return query, key, value
+
         def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
             """
             Apply the up projection and RoPE to the query and key.
@@ -528,6 +655,7 @@ class MLASelfAttention(MultiLatentAttention):
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             kv_compressed = self.kv_layernorm(kv_compressed)
+
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(kv_compressed)
 
@@ -541,6 +669,7 @@ class MLASelfAttention(MultiLatentAttention):
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
+            # todo add assert about fusions and caching
             if self.config.apply_rope_fusion:
                 cp_rank = self.model_comm_pgs.cp.rank()
                 cp_size = self.model_comm_pgs.cp.size()
@@ -629,6 +758,7 @@ class MLASelfAttention(MultiLatentAttention):
             query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()
+
             return query, key, value
 
         if self.recompute_up_proj:
@@ -637,11 +767,106 @@ class MLASelfAttention(MultiLatentAttention):
                 qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
         else:
-            query, key, value = qkv_up_proj_and_rope_apply(
-                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
-            )
+            if self.cache_mla_latents:
+                assert (
+                    inference_context and not inference_context.is_static_batching()
+                ), "Caching MLA latents only works with dynamic backend inference"
+                query, key, value = qkv_up_proj_and_rope_apply_for_cached_latent_kv(
+                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+                )
+            else:
+                query, key, value = qkv_up_proj_and_rope_apply(
+                    q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+                )
 
         return query, key, value
+
+    def uncompress_kv_from_cache(self, kv_cached):
+        """
+        Take a compressed kv and uncompress them
+        """
+        kv_compressed, k_pos_emb = torch.split(
+            kv_cached, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+        )
+
+        # Seperated out the norm and linear
+        kv, _ = self.linear_kv_up_proj_linear(kv_compressed)
+
+        kv = kv.view(
+            *kv.size()[:-1],
+            self.num_attention_heads_per_partition,
+            self.config.qk_head_dim + self.config.v_head_dim,
+        )
+
+        k_no_pe, value = torch.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
+
+        # Add head dimension
+        k_pos_emb = k_pos_emb.unsqueeze(-2)
+        k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
+
+        key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+        return key, value
+
+    def prepare_for_absorption(self):
+        """Prepare the model for absorption optimization in MLA (Multi-Latent Attention).
+
+        This method sets up the necessary components for the absorption technique, which
+        optimizes memory during inference by caching compressed KV latents instead
+        of full KV states. The absorption technique allows efficient decode-only operations
+        by pre-computing certain matrix multiplications.
+
+        Note (Peter): Right now we are not doing true absorption. We will add this support
+        at a later time.
+
+        The method performs the following operations:
+        1. Splits the fused layernorm + linear layer (linear_kv_up_proj) into separate
+        components.
+        2. Extracts and stores the up-projection weights for K and V separately, which
+        are used during the absorption process
+        3. Replaces the identity kv_layernorm with the actual layernorm from the split
+        4. Stores the linear component separately for uncompressing KV cache during
+        prefill/mixed stages
+
+        This is a one-time setup that should only be called once at initialization when
+        cache_mla_latents is enabled.
+        """
+        # We should only have to call to set once at start
+        if not hasattr(self, "up_k_weight"):
+            with torch.no_grad():
+                linear_kv_up_proj_norm, linear_kv_up_proj_linear = (
+                    split_te_layernorm_column_parallel_linear(
+                        self.linear_kv_up_proj, self.config, None, self.linear_kv_up_proj.tp_group
+                    )
+                )
+
+                # Note: When caching latents we overide the kv_layernorm
+                # which was an identity before because in the is path
+                # we unfused the linear_kv_up_proj
+                self.kv_layernorm = linear_kv_up_proj_norm
+
+                # This is used in absorption when we are
+                # uncompressing the KV cache in prefill/mixed stages
+                self.linear_kv_up_proj_linear = linear_kv_up_proj_linear
+
+                kv_up_weight = (
+                    self.linear_kv_up_proj.weight
+                )  # [num_heads * (qk_head_dim + v_head_dim), kv_lora_rank]
+                kv_up_weight = kv_up_weight.view(
+                    self.num_attention_heads_per_partition,
+                    self.config.qk_head_dim + self.config.v_head_dim,
+                    self.config.kv_lora_rank,
+                )
+                # Split into K and V up-projection weights. These are used for absorption
+                self.up_k_weight = kv_up_weight[
+                    :, : self.config.qk_head_dim, :
+                ]  # [num_heads, qk_head_dim, kv_lora_rank]
+                self.up_v_weight = kv_up_weight[
+                    :, self.config.qk_head_dim :, :
+                ]  # [num_heads, v_head_dim, kv_lora_rank]
+
+                # We delete the original linear_kv_up_proj as we do not
+                # need it for the absorbed path.
+                del self.linear_kv_up_proj
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation"""
