@@ -214,6 +214,7 @@ def reroute_tokens_kernel(
     num_tokens_to_route_ptr,
     cumulative_offsets_ptr,
     y_ptr,
+    rerouted_probs_ptr,
     num_tokens: tl.constexpr,
     num_experts: tl.constexpr,
     num_offloading_experts: tl.constexpr,
@@ -241,12 +242,17 @@ def reroute_tokens_kernel(
     x_flat_idx = token_indices * total_experts + source_expert_id
     tl.store(y_ptr + x_flat_idx, False, mask=valid_mask)
     
+    # Handle rerouted_probs: read from x_flat_idx and write to y_flat_idx, zero out x_flat_idx
+    prob_value = tl.load(rerouted_probs_ptr + x_flat_idx, mask=valid_mask, other=0.0)
+    tl.store(rerouted_probs_ptr + x_flat_idx, 0.0, mask=valid_mask)
+    
     offload_col = num_experts + offload_expert_id
     y_flat_idx = token_indices * total_experts + offload_col
     tl.store(y_ptr + y_flat_idx, True, mask=valid_mask)
+    tl.store(rerouted_probs_ptr + y_flat_idx, prob_value, mask=valid_mask)
 
 
-def reroute_tokens_triton(x, num_offloading_from, num_offloading_to, reroute_map):
+def reroute_tokens_triton(x, probs, num_offloading_from, num_offloading_to, reroute_map):
     """
     Triton-based token rerouting with static shapes for CUDA graph compatibility.
     """
@@ -286,6 +292,11 @@ def reroute_tokens_triton(x, num_offloading_from, num_offloading_to, reroute_map
                     dtype=torch.bool, device=device)
     y[:, :num_experts] = x.clone()
     
+    # Step 6b: Initialize rerouted_probs tensor
+    rerouted_probs = torch.zeros(num_tokens, num_experts + num_offloading_experts, 
+                                dtype=probs.dtype, device=device)
+    rerouted_probs[:, :num_experts] = probs.clone()
+    
     # Step 7: Launch Triton kernel
     max_tokens = num_tokens
     BLOCK_SIZE = triton.next_power_of_2(max_tokens)
@@ -293,19 +304,20 @@ def reroute_tokens_triton(x, num_offloading_from, num_offloading_to, reroute_map
     
     reroute_tokens_kernel[grid](
         x_indices_sorted, expert_for_offload, num_offloading_to,
-        cumulative_offsets, y, num_tokens, num_experts, num_offloading_experts, BLOCK_SIZE
+        cumulative_offsets, y, rerouted_probs, num_tokens, num_experts, num_offloading_experts, BLOCK_SIZE
     )
-    return y
+    return y, rerouted_probs
 
 def gen_offloading_plan(
     routing_map: torch.Tensor,
+    probs: torch.Tensor,
     tokens_per_expert_from_ep_rank: torch.Tensor,
     ep_rank: Union[torch.Tensor, int],
     ep: int,
     spare_expert_per_ep_rank: int = 1,
     threshold_multiplier: float = 0.0,
     index_dtype: torch.dtype = torch.int32,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Generate an offloading plan to redistribute tokens from overloaded experts to spare experts.
 
@@ -325,8 +337,14 @@ def gen_offloading_plan(
             Description: Binary tensor indicating which tokens are routed to which
                        experts within the current EP rank
 
+        probs: Routing probabilities for current EP rank
+            Shape: [num_tokens_in_ep_rank, num_experts]
+            Type: torch.Tensor (float)
+            Description: Probability values for each token-expert assignment within
+                       the current EP rank
+
         tokens_per_expert_from_ep_rank: Token distribution per expert from all EP ranks
-            Shape: [num_ep_ranks, num_experts_per_ep_rank]
+            Shape: [num_ep_ranks, num_experts]
             Type: torch.Tensor (int)
             Description: Number of tokens assigned to each expert across all EP ranks
 
@@ -362,6 +380,12 @@ def gen_offloading_plan(
                 Shape: [num_tokens_in_ep_rank, num_experts + num_spare_experts]
                 Type: torch.Tensor (bool)
                 Description: Binary tensor showing final token assignments including
+                           offloaded tokens to spare experts
+
+            - rerouted_probs: Updated routing probabilities after offloading
+                Shape: [num_tokens_in_ep_rank, num_experts + num_spare_experts]
+                Type: torch.Tensor (float)
+                Description: Probability values for final token assignments including
                            offloaded tokens to spare experts
 
             - expert_offloading_map: Mapping of home experts to spare experts
@@ -400,7 +424,6 @@ def gen_offloading_plan(
     # [num_home_experts, num_spare_experts]
     # matched_assignment[i][j] indicates how many tokens are offloaded from home expert i to spare expert j
     matched_assignment[row_indices, col_indices] = values
-    # import pdb; pdb.set_trace()    
     # Apply threshold-based offloading expert selection
     if threshold_multiplier > 0:
         matched_assignment = reclaim_spare_experts(
@@ -413,8 +436,9 @@ def gen_offloading_plan(
     
     offloaded_tokens, token_dist_after_offloading, leftover_spare_space = breadth_first_allocation(tokens_per_expert_from_ep_rank, matched_assignment)
     offloaded_tokens2, token_dist_after_offloading = depth_first_allocation(token_dist_after_offloading, leftover_spare_space)
-    rerouting_map = reroute_tokens_triton(routing_map, 
-                                        (tokens_per_expert_from_ep_rank-token_dist_after_offloading)[ep_rank].int(), 
-                                        (offloaded_tokens+offloaded_tokens2)[ep_rank].int().squeeze(), 
-                                        export_offloading_map)
-    return rerouting_map, export_offloading_map
+    rerouting_map, rerouted_probs = reroute_tokens_triton(routing_map, 
+                                                         probs,
+                                                         (tokens_per_expert_from_ep_rank-token_dist_after_offloading)[ep_rank].int(), 
+                                                         (offloaded_tokens+offloaded_tokens2)[ep_rank].int().squeeze(), 
+                                                         export_offloading_map)
+    return rerouting_map, rerouted_probs, export_offloading_map

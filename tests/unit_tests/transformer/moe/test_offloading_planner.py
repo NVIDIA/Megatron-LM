@@ -18,9 +18,12 @@ def baseline_routing(scores, num_experts, EP, topk):
     assignment_reshaped = assignment.view(EP, -1, num_experts)
     tokens_per_expert_from_ep_rank = assignment_reshaped.sum(dim=1)  # Sum along dim=1
 
-    return assignment_reshaped, tokens_per_expert_from_ep_rank
+    scores_reshaped = scores.view(EP, -1, num_experts)
+    probs = scores_reshaped * assignment_reshaped
 
-def result_sanity_check(routing_map_all_rank, rerouting_map_all_rank, expert_offloading_map, topk, ep):
+    return assignment_reshaped, tokens_per_expert_from_ep_rank, probs
+
+def result_sanity_check(routing_map_all_rank, rerouting_map_all_rank, rerouted_probs_all_rank, original_probs_all_rank, expert_offloading_map, topk, ep):
     num_home_experts = routing_map_all_rank.shape[-1]
     num_spare_experts = expert_offloading_map.shape[-1] - num_home_experts
     routing_map = routing_map_all_rank.view(-1, routing_map_all_rank.shape[-1])
@@ -47,6 +50,19 @@ def result_sanity_check(routing_map_all_rank, rerouting_map_all_rank, expert_off
         print("❌ Routing equivalence check failed")
         import pdb; pdb.set_trace()
         raise ValueError("Routing equivalence check failed")
+
+    # probability routing check
+    rerouted_probs = rerouted_probs_all_rank.view(-1, rerouted_probs_all_rank.shape[-1])
+    original_probs = original_probs_all_rank.view(-1, original_probs_all_rank.shape[-1])
+    # Add probabilities from spare experts back to home experts
+    rerouted_probs_undo_reroute = rerouted_probs[:, :num_home_experts].clone()
+    rerouted_probs_undo_reroute.scatter_add_(1, home_expert_idx.unsqueeze(0).expand(rerouted_probs.shape[0], -1), rerouted_probs[:, num_home_experts + spare_expert_idx])
+    # should be bitwise accurate
+    prob_sum_equivalence_checked = (original_probs == rerouted_probs_undo_reroute).all()
+    if not prob_sum_equivalence_checked:
+        print("❌ Probability equivalence check failed")
+        import pdb; pdb.set_trace()
+        raise ValueError("Probability sum equivalence check failed")
 
     # count max tokens per ep rank
     tokens_to_ep_ranks_before_offloading = routing_map.sum(dim=0).reshape(ep, -1).sum(dim=1)
@@ -91,7 +107,7 @@ def main():
     scores = torch.normal(expert_probs_expanded, 1 * expert_probs_expanded)
     
     # Call the router function
-    routing_map_all_rank, tokens_per_expert_from_ep_rank = baseline_routing(scores, args.num_experts, args.EP, args.topk)
+    routing_map_all_rank, tokens_per_expert_from_ep_rank, probs = baseline_routing(scores, args.num_experts, args.EP, args.topk)
 
     # Compile the balanced_routing function
     compiled_balanced_routing = torch.compile(gen_offloading_plan)
@@ -101,15 +117,18 @@ def main():
         # Use the same static-shape CUDA graph flow as in the else-branch
         # Warm up run
         ep_rank_static = torch.zeros(1, device=device, dtype=torch.int32)
-        rerouting_map, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+        rerouting_map, rerouted_probs, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], probs[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
         
         routing_map_static = torch.empty_like(routing_map_all_rank[0])
         routing_map_static.copy_(routing_map_all_rank[0])
+        probs_static = torch.empty_like(probs[0])
+        probs_static.copy_(probs[0])
         rerouting_map_all_rank = torch.empty((routing_map_all_rank.shape[0], *rerouting_map.shape), dtype=rerouting_map.dtype, device=rerouting_map.device)
+        rerouted_probs_all_rank = torch.empty((routing_map_all_rank.shape[0], *rerouted_probs.shape), dtype=rerouted_probs.dtype, device=rerouted_probs.device)
         # Capture CUDA graph
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            rerouting_map_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+            rerouting_map_static, rerouted_probs_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, probs_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
         # Arrays to store statistics across iterations
         max_tokens_before_offloading = []
         max_tokens_after_offloading = []
@@ -124,7 +143,7 @@ def main():
             )
             scores = torch.normal(expert_probs_expanded, 1 * expert_probs_expanded)
 
-            routing_map_all_rank, tokens_per_expert_from_ep_rank_iter = baseline_routing(
+            routing_map_all_rank, tokens_per_expert_from_ep_rank_iter, probs_iter = baseline_routing(
                 scores, args.num_experts, args.EP, args.topk
             )
 
@@ -133,14 +152,18 @@ def main():
                 ep_rank = torch.tensor([ep], device=device)
                 ep_rank_static.copy_(ep_rank)
                 routing_map_static.copy_(routing_map_all_rank[ep])
+                probs_static.copy_(probs_iter[ep])
                 graph.replay()
                 # rerouting_map_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
                 rerouting_map_all_rank[ep].copy_(rerouting_map_static)
+                rerouted_probs_all_rank[ep].copy_(rerouted_probs_static)
 
             # Per-iteration sanity check and collect statistics
             max_tokens_before, max_tokens_after, max_offloaded = result_sanity_check(
                 routing_map_all_rank,
                 rerouting_map_all_rank,
+                rerouted_probs_all_rank,
+                probs_iter,
                 expert_offloading_map_static,
                 args.topk,
                 args.EP,
@@ -163,15 +186,18 @@ def main():
         # Normal mode: single run with sanity check
         # Warm up run
         ep_rank_static = torch.zeros(1, device=device, dtype=torch.int32)
-        rerouting_map, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+        rerouting_map, rerouted_probs, expert_offloading_map = compiled_balanced_routing(routing_map_all_rank[0], probs[0], tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
         
         routing_map_static = torch.empty_like(routing_map_all_rank[0])
         routing_map_static.copy_(routing_map_all_rank[0])
+        probs_static = torch.empty_like(probs[0])
+        probs_static.copy_(probs[0])
         rerouting_map_all_rank = torch.empty((routing_map_all_rank.shape[0], *rerouting_map.shape), dtype=rerouting_map.dtype, device=rerouting_map.device)
+        rerouted_probs_all_rank = torch.empty((routing_map_all_rank.shape[0], *rerouted_probs.shape), dtype=rerouted_probs.dtype, device=rerouted_probs.device)
         # Capture CUDA graph
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            rerouting_map_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
+            rerouting_map_static, rerouted_probs_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, probs_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
         
         torch.cuda.profiler.start()
         # Replay the graph
@@ -179,13 +205,14 @@ def main():
             ep_rank = torch.tensor([ep], device=device)
             ep_rank_static.copy_(ep_rank)
             routing_map_static.copy_(routing_map_all_rank[ep])
+            probs_static.copy_(probs[ep])
             graph.replay()
             # rerouting_map_static, expert_offloading_map_static = compiled_balanced_routing(routing_map_static, tokens_per_expert_from_ep_rank, ep_rank_static, args.EP, args.spare_expert_per_ep_rank, args.threshold_multiplier)
             rerouting_map_all_rank[ep].copy_(rerouting_map_static)
-        # import pdb; pdb.set_trace()
+            rerouted_probs_all_rank[ep].copy_(rerouted_probs_static)
         torch.cuda.profiler.stop()
         # Run sanity check
-        max_tokens_to_ep_ranks_before_offloading, max_tokens_to_ep_ranks_after_offloading, max_num_offloaded_expert = result_sanity_check(routing_map_all_rank, rerouting_map_all_rank, expert_offloading_map_static, args.topk, args.EP)
+        max_tokens_to_ep_ranks_before_offloading, max_tokens_to_ep_ranks_after_offloading, max_num_offloaded_expert = result_sanity_check(routing_map_all_rank, rerouting_map_all_rank, rerouted_probs_all_rank, probs, expert_offloading_map_static, args.topk, args.EP)
         print(f"Max tokens to EP ranks before offloading: {max_tokens_to_ep_ranks_before_offloading}")
         print(f"Max tokens to EP ranks after offloading: {max_tokens_to_ep_ranks_after_offloading}")
         print(f"Max number of offloaded expert: {max_num_offloaded_expert}")
