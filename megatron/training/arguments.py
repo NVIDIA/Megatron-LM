@@ -2402,6 +2402,11 @@ def _add_distributed_args(parser):
                        'which is improving the performance of the overlapped computation.')
     group.add_argument('--use-sharp', action='store_true', 
                        help='Required to enable SHARP communication.')
+    group.add_argument('--sharp-enabled-group', type=str, default=None,
+                       choices=['dp', 'dp_replica'],
+                       help='IB SHARP can be enabled from only one communication group. '
+                       'By default, it is enabled from dp group. '
+                       'Available options: [dp, dp_replica]')
     group.add_argument('--use-custom-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
