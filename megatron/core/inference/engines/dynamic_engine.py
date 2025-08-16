@@ -7,6 +7,9 @@ import struct
 import time
 import warnings
 from collections import deque
+# >>>
+from contextlib import contextmanager
+# <<<
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -357,58 +360,144 @@ class DynamicInferenceEngine(AbstractEngine):
             self.run_engine_with_coordinator(sampling_params)
         )
 
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    # def suspend(self):
+    #     """Suspend engine by deallocating context's GPU state."""
+    #     # >>>
+    #     # start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    #     start_mem = torch.cuda.memory_stats()
+    #     # <<<
+    #     start_time = time.time()
+    #     torch.cuda.synchronize()
+    #     with self.suspend_resume_ctx():
+    #     self.context.deallocate_all_tensors()
+    #     torch.cuda.synchronize()
+    #     end_time = time.time()
+    #     # >>>
+    #     # end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+    #     # print(f"dynamic engine suspended, freeing {(start_mem - end_mem) / 1024**3:.1f} gb in {end_time - start_time:.3f} sec ... total mem usage: alloc %.1 gb.")
+    #     # +++
+    #     end_mem = torch.cuda.memory_stats()
+    #     start_mem_alloc = start_mem["allocated_bytes.all.current"]
+    #     end_mem_alloc = end_mem["allocated_bytes.all.current"]
+    #     start_mem_res = start_mem["reserved_bytes.all.current"]
+    #     end_mem_res = end_mem["reserved_bytes.all.current"]
+    #     relative_time_str = f"{end_time - start_time:.3f} sec"
+    #     relative_mem_str = f"{(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+    #     total_mem_str = f"alloc {:.1f} gb, res {:.1f} gb"
+    #     print(f"dynamic engine suspended, freeing {relative_mem_str} in {relative_time_str} ... total mem usage: {total_mem_str}.")
+    #     # <<<
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    @contextmanager
+    @staticmethod
+    def suspend_resume_ctx(key):
+        try:
+
+            start_mem = torch.cuda.memory_stats()
+
+            start_time = time.time()
+            torch.cuda.synchronize()
+
+            yield
+
+        finally:
+
+            torch.cuda.synchronize()
+            end_time = time.time()
+
+            end_mem = torch.cuda.memory_stats()
+            start_mem_alloc = start_mem["allocated_bytes.all.current"]
+            end_mem_alloc = end_mem["allocated_bytes.all.current"]
+            start_mem_res = start_mem["reserved_bytes.all.current"]
+            end_mem_res = end_mem["reserved_bytes.all.current"]
+
+            rank_str = torch.distributed.get_rank()
+            dir_str = "deallocating" if end_mem_alloc <= start_mem_alloc else "allocating"
+            relative_time_str = f"{end_time - start_time:.3f} sec"
+            relative_mem_str = f"{abs(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
+            total_mem_str = f"alloc {end_mem_alloc / 1024**3:.1f} gb, res {end_mem_res / 1024**3:.1f} gb"
+            print(
+                f"[rank {rank_str}] dynamic engine {key}, {dir_str} "
+                f"{relative_mem_str} in {relative_time_str} ... "
+                f"abs mem usage: {total_mem_str}."
+            )
+
     def suspend(self):
         """Suspend engine by deallocating context's GPU state."""
-        start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        self.context.deallocate_all_tensors()
-        end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        print(f"dynamic engine suspended, freeing {(start_mem - end_mem) / 1024**3:.1f} gb.")
+        with self.__class__.suspend_resume_ctx("suspended"):
+            self.context.deallocate_all_tensors()
+    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
-        start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # >>>
+        # start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # start_time = time.time()
+        # torch.cuda.synchronize()
+        # <<<
 
-        # Maintain references to requests before reset.
-        waiting_request_ids = list(self.waiting_request_ids)
-        active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
-        request_ids = [*active_request_ids, *waiting_request_ids]
-        requests = dict(self.requests)
+        with self.__class__.suspend_resume_ctx("resumed"):
 
-        # Allocate context tensors.
-        self.context.allocate_all_tensors()
+            # Maintain references to requests before reset.
+            waiting_request_ids = list(self.waiting_request_ids)
+            active_request_ids = set(self.requests.keys()) - set(waiting_request_ids)
+            request_ids = [*active_request_ids, *waiting_request_ids]
+            requests = dict(self.requests)
 
-        # Reset engine (requests, waiting requests, futures, step count, etc.).
-        self.reset()
+            # Allocate context tensors.
+            alloc_time = time.time()
+            torch.cuda.synchronize()
+            self.context.allocate_all_tensors()
+            torch.cuda.synchronize()
+            alloc_time = time.time() - alloc_time
 
-        # Add requests.
-        futures = {}
-        for request_id in request_ids:
+            # Reset engine (requests, waiting requests, futures, step count, etc.).
+            # >>>
+            # self.reset()
+            # +++
+            self.context.reset()
+            self.waiting_request_ids = deque()
+            self.requests: Dict[int, DynamicInferenceRequest] = {}
+            self.request_completion_futures: Dict[int, asyncio.Future] = {}
+            # <<<
 
-            request = requests[request_id]
+            # Add requests.
+            futures = {}
+            add_time = time.time()
+            torch.cuda.synchronize()
+            for request_id in request_ids:
 
-            # Concatenate prompt + generated tokens.
-            tokens = torch.cat(
-                (
-                    request.prompt_tokens,
-                    torch.tensor(
-                        request.generated_tokens,
-                        dtype=request.prompt_tokens.dtype,
-                        device=request.prompt_tokens.device,
+                request = requests[request_id]
+
+                # Concatenate prompt + generated tokens.
+                tokens = torch.cat(
+                    (
+                        request.prompt_tokens,
+                        torch.tensor(
+                            request.generated_tokens,
+                            dtype=request.prompt_tokens.dtype,
+                            device=request.prompt_tokens.device,
+                        ),
                     ),
-                ),
-                dim=0,
-            )
+                    dim=0,
+                )
 
-            # Add request.
-            futures[request_id] = self.add_request(
-                request_id,
-                tokens,
-                request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
-            )
+                # Add request.
+                futures[request_id] = self.add_request(
+                    request_id,
+                    tokens,
+                    request.sampling_params.num_tokens_to_generate - len(request.generated_tokens),
+                )
+            torch.cuda.synchronize()
+            add_time = time.time() - add_time
 
-        end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        print(f"dynamic engine resumed, allocating {(end_mem - start_mem) / 1024**3:.1f} gb.")
+        # >>>
+        # torch.cuda.synchronize()
+        # end_time = time.time()
+        # end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # print(f"dynamic engine resumed, allocating {(end_mem - start_mem) / 1024**3:.1f} gb in {end_time - start_time:.3f} sec [ alloc {alloc_time:.3f}, add {add_time:.3f} ].")
+        # <<<
 
         return futures
 
