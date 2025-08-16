@@ -2400,6 +2400,8 @@ def _add_distributed_args(parser):
 def _add_validation_args(parser):
     group = parser.add_argument_group(title='validation')
 
+    group.add_argument('--full-validation', action='store_true', help='If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!')
+    group.add_argument('--multiple-validation-sets', action='store_true', help='If set, multiple datasets listed in the validation split are evaluated independently with a separate loss for each dataset in the list. This argument requires that no weights are included in the list')
     group.add_argument('--eval-iters', type=int, default=100,
                        help='Number of iterations to run for evaluation'
                        'validation/test for.')

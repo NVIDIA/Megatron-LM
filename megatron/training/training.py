@@ -2403,7 +2403,7 @@ def train(
                 non_loss_data_func=non_loss_data_func,
             )
             eval_duration += timers('eval-time').elapsed()
-            eval_iterations += args.eval_iters
+            eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
             timers('eval-time').stop()
             one_logger_utils.track_e2e_metrics()
 
@@ -2486,6 +2486,7 @@ def evaluate(
     config,
     verbose=False,
     non_loss_data_func=None,
+    eval_iters=None,
 ):
     """Evaluation."""
     args = get_args()
@@ -2513,14 +2514,17 @@ def evaluate(
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
 
+    if eval_iters is None:
+        eval_iters = args.eval_iters
+
     with torch.no_grad():
         iteration = 0
         if verbose:
-            print_rank_0(f'Evaluating on {args.eval_iters * eval_batch_size} samples')
-        while iteration < args.eval_iters:
+            print_rank_0(f'Evaluating on {eval_iters * eval_batch_size} samples')
+        while iteration < eval_iters:
             iteration += 1
             if verbose:
-                print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
+                print_rank_0(f'Evaluating iter {iteration}/{eval_iters}')
 
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
@@ -2650,47 +2654,70 @@ def evaluate_and_print_results(
 
     wandb_writer = get_wandb_writer()
 
-    total_loss_dict, collected_non_loss_data, timelimit = evaluate(
-        forward_step_func,
-        data_iterator,
-        model,
-        process_non_loss_data_func,
-        config,
-        verbose,
-        non_loss_data_func,
-    )
-    # Timelimit hit during evaluation
-    if timelimit:
-        return
-    string = f' validation loss at {prefix} | '
-    for key in total_loss_dict:
-        string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-        ppl = math.exp(min(20, total_loss_dict[key].item()))
-        string += '{} PPL: {:.6E} | '.format(key, ppl)
-        if writer:
-            writer.add_scalar('{} validation'.format(key), total_loss_dict[key].item(), iteration)
-            writer.add_scalar(
-                '{} validation vs samples'.format(key),
-                total_loss_dict[key].item(),
-                args.consumed_train_samples,
-            )
-            if args.log_validation_ppl_to_tensorboard:
-                writer.add_scalar('{} validation ppl'.format(key), ppl, iteration)
+    data_iterators = data_iterator if args.multiple_validation_sets else [data_iterator]
+    if args.full_validation:
+        if not args.multiple_validation_sets:
+            eval_iters = [args.eval_iters]
+        else:
+            eval_iters = args.eval_iters
+
+        assert len(eval_iters) == len(data_iterators)
+
+        # with full validation we need to distribute eval_iters to all ranks
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
+        else:
+            eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
+        torch.distributed.broadcast(eval_iters, 0)
+        eval_iters = eval_iters.tolist()
+        args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
+    
+    for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
+        suffix = ""
+        if args.multiple_validation_sets:
+            suffix = f"-{index}"
+        total_loss_dict, collected_non_loss_data, timelimit = evaluate(
+            forward_step_func,
+            iterator,
+            model,
+            process_non_loss_data_func,
+            config,
+            verbose,
+            non_loss_data_func,
+            eval_iters=iterations,
+        )
+        # Timelimit hit during evaluation
+        if timelimit:
+            return
+        string = f' validation{suffix} loss at {prefix} | '
+        for key in total_loss_dict:
+            string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
+            ppl = math.exp(min(20, total_loss_dict[key].item()))
+            string += '{} PPL: {:.6E} | '.format(key, ppl)
+            if writer:
+                writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
                 writer.add_scalar(
-                    '{} validation ppl vs samples'.format(key), ppl, args.consumed_train_samples
+                    '{} validation{} vs samples'.format(key, suffix),
+                    total_loss_dict[key].item(),
+                    args.consumed_train_samples,
                 )
-            if wandb_writer and is_last_rank():
-                wandb_writer.log(
-                    {'{} validation'.format(key): total_loss_dict[key].item()}, iteration
-                )
+                if args.log_validation_ppl_to_tensorboard:
+                    writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
+                    writer.add_scalar(
+                        '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
+                    )
+                if wandb_writer and is_last_rank():
+                    wandb_writer.log(
+                        {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
+                    )
 
-    if process_non_loss_data_func is not None and writer and is_last_rank():
-        process_non_loss_data_func(collected_non_loss_data, iteration, writer)
+        if process_non_loss_data_func is not None and writer and is_last_rank():
+            process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
-    length = len(string) + 1
-    print_rank_last('-' * length)
-    print_rank_last(string)
-    print_rank_last('-' * length)
+        length = len(string) + 1
+        print_rank_last('-' * length)
+        print_rank_last(string)
+        print_rank_last('-' * length)
 
 
 def cyclic_iter(iter):
@@ -2709,10 +2736,14 @@ def get_train_valid_test_num_samples():
         train_samples = args.train_samples
     else:
         train_samples = args.train_iters * args.global_batch_size
-    eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+    if args.full_validation:
+        eval_samples = None
+    else:
+        eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+        eval_samples = eval_iters * args.global_batch_size
     test_iters = args.eval_iters
 
-    return (train_samples, eval_iters * args.global_batch_size, test_iters * args.global_batch_size)
+    return (train_samples, eval_samples, test_iters * args.global_batch_size)
 
 
 def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
@@ -2730,7 +2761,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
+    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 
@@ -2756,18 +2787,29 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
             build_train_valid_test_datasets_provider
         )
+        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+        
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
-        if args.skip_train:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
-        else:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, args.consumed_valid_samples)
+
+        valid_dataloaders = []
+        for valid_d in valid_ds:
+            if args.skip_train or args.full_validation:
+                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+            else:
+                if args.multiple_validation_sets:
+                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                    # correct and needs to be calculated/set per validation set
+                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+        if not args.multiple_validation_sets:
+            assert len(valid_dataloaders) == 1
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = valid_dataloader is not None and args.eval_iters > 0
-        do_test = test_dataloader is not None and args.eval_iters > 0
+        do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+        do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
         )
@@ -2780,7 +2822,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
 
-    return train_dataloader, valid_dataloader, test_dataloader
+    return train_dataloader, valid_dataloaders, test_dataloader
 
 
 def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
@@ -2789,7 +2831,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     args = get_args()
 
     # Build loaders.
-    train_dataloader, valid_dataloader, test_dataloader = build_train_valid_test_data_loaders(
+    train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider
     )
 
@@ -2817,17 +2859,41 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     else:
         train_data_iterator = None
 
-    if valid_dataloader is not None:
-        valid_data_iterator = _get_iterator(dl_type, valid_dataloader)
+    # when using full validation, we need to override eval iters with the correct
+    # number of iterations on tp rank 0 so that it can be distributed to the other 
+    # ranks later
+    if args.full_validation:
+        if args.multiple_validation_sets:
+            if valid_dataloaders[0] is None:
+                args.eval_iters = [None]*len(valid_dataloaders)
+            else:
+                args.eval_iters = [len(dl) for dl in valid_dataloaders]
+        else:
+            args.eval_iters = len(valid_dataloaders[0])
+
+    if args.multiple_validation_sets:
+        if valid_dataloaders[0] is None:
+            valid_data_iterators = [None] * len(valid_dataloaders)
+        else:
+            valid_dl_type = "cyclic" if args.full_validation else dl_type
+            print(
+                f"[VALID DATA LOADER LENGTHS] "
+                ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
+            )
+            valid_data_iterators = [
+                _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+            ]
+    elif valid_dataloaders[0] is not None:
+        valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
     else:
-        valid_data_iterator = None
+        valid_data_iterators = None
 
     if test_dataloader is not None:
         test_data_iterator = _get_iterator(dl_type, test_dataloader)
     else:
         test_data_iterator = None
 
-    return train_data_iterator, valid_data_iterator, test_data_iterator
+    return train_data_iterator, valid_data_iterators, test_data_iterator
 
 
 def should_disable_forward_pre_hook(args):
