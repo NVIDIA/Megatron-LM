@@ -8,9 +8,7 @@ import struct
 import time
 import warnings
 from collections import deque
-# >>>
 from contextlib import contextmanager
-# <<<
 from datetime import datetime
 from itertools import repeat
 from typing import Dict, List, Optional, Tuple, Union
@@ -380,34 +378,6 @@ class DynamicInferenceEngine(AbstractEngine):
             self.run_engine_with_coordinator(sampling_params)
         )
 
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-    # def suspend(self):
-    #     """Suspend engine by deallocating context's GPU state."""
-    #     # >>>
-    #     # start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-    #     start_mem = torch.cuda.memory_stats()
-    #     # <<<
-    #     start_time = time.time()
-    #     torch.cuda.synchronize()
-    #     with self.suspend_resume_ctx():
-    #     self.context.deallocate_all_tensors()
-    #     torch.cuda.synchronize()
-    #     end_time = time.time()
-    #     # >>>
-    #     # end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-    #     # print(f"dynamic engine suspended, freeing {(start_mem - end_mem) / 1024**3:.1f} gb in {end_time - start_time:.3f} sec ... total mem usage: alloc %.1 gb.")
-    #     # +++
-    #     end_mem = torch.cuda.memory_stats()
-    #     start_mem_alloc = start_mem["allocated_bytes.all.current"]
-    #     end_mem_alloc = end_mem["allocated_bytes.all.current"]
-    #     start_mem_res = start_mem["reserved_bytes.all.current"]
-    #     end_mem_res = end_mem["reserved_bytes.all.current"]
-    #     relative_time_str = f"{end_time - start_time:.3f} sec"
-    #     relative_mem_str = f"{(start_mem_alloc - end_mem_alloc) / 1024**3:.1f} gb"
-    #     total_mem_str = f"alloc {:.1f} gb, res {:.1f} gb"
-    #     print(f"dynamic engine suspended, freeing {relative_mem_str} in {relative_time_str} ... total mem usage: {total_mem_str}.")
-    #     # <<<
-    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     @contextmanager
     @staticmethod
     def suspend_resume_ctx(key: str, *, newline: bool = True) -> None:
@@ -447,16 +417,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Suspend engine by deallocating context's GPU state."""
         with self.__class__.suspend_resume_ctx("suspended"):
             self.context.deallocate_all_tensors()
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
-
-        # >>>
-        # start_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        # start_time = time.time()
-        # torch.cuda.synchronize()
-        # <<<
 
         with self.__class__.suspend_resume_ctx("resumed", newline=False):
 
@@ -513,14 +476,8 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             add_time = time.time() - add_time
 
-        # >>>
-        # torch.cuda.synchronize()
-        # end_time = time.time()
-        # end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        # print(f"dynamic engine resumed, allocating {(end_mem - start_mem) / 1024**3:.1f} gb in {end_time - start_time:.3f} sec [ alloc {alloc_time:.3f}, add {add_time:.3f} ].")
-        # +++
+        # Print inner timing.
         print(f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f}.")
-        # <<<
 
         return futures
 
