@@ -390,7 +390,7 @@ class DynamicInferenceEngine(AbstractEngine):
     # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
     @contextmanager
     @staticmethod
-    def suspend_resume_ctx(key):
+    def suspend_resume_ctx(key: str, *, newline: bool = True) -> None:
         try:
 
             start_mem = torch.cuda.memory_stats()
@@ -419,7 +419,8 @@ class DynamicInferenceEngine(AbstractEngine):
             print(
                 f"[rank {rank_str}] dynamic engine {key}, {dir_str} "
                 f"{relative_mem_str} in {relative_time_str} ... "
-                f"abs mem usage: {total_mem_str}."
+                f"abs mem usage: {total_mem_str}",
+                end=".\n" if newline else "",
             )
 
     def suspend(self):
@@ -437,7 +438,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # torch.cuda.synchronize()
         # <<<
 
-        with self.__class__.suspend_resume_ctx("resumed"):
+        with self.__class__.suspend_resume_ctx("resumed", newline=False):
 
             # Maintain references to requests before reset.
             waiting_request_ids = list(self.waiting_request_ids)
@@ -497,6 +498,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # end_time = time.time()
         # end_mem = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # print(f"dynamic engine resumed, allocating {(end_mem - start_mem) / 1024**3:.1f} gb in {end_time - start_time:.3f} sec [ alloc {alloc_time:.3f}, add {add_time:.3f} ].")
+        # +++
+        print(f" ... inner timing: alloc {alloc_time:.3f}, add {add_time:.3f}.")
         # <<<
 
         return futures
