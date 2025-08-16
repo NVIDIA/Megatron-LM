@@ -251,10 +251,13 @@ class DynamicInferenceEngine(AbstractEngine):
             request.tpot.append(step_time)
 
             if request_log_probs is not None:
-                # If prompt log probs is None we are in prefill
-                if request.prompt_log_probs is None:
-                    request.prompt_log_probs = request_log_probs
+                if not request.prompt_log_probs:
+                    request.prompt_log_probs = []
+                if not request.generated_log_probs:
                     request.generated_log_probs = []
+                # If the request log probs span > 1 token we are in prefill
+                if len(request_log_probs) > 1:
+                    request.prompt_log_probs.extend(request_log_probs)
                 else:
                     request.generated_log_probs.extend(request_log_probs)
 
