@@ -142,11 +142,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
+        cache_mla_latent: bool = False,
+        kv_lora_rank: Optional[int] = None,
+        qk_pos_emb_head_dim: Optional[int] = None,
         num_cuda_graphs: Optional[int] = None,
         materialize_only_last_token_logits: bool = True,
     ):
-
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        self.cache_mla_latent = cache_mla_latent
+        if self.cache_mla_latent:
+            assert (
+                chunk_size_tokens == 64
+            ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-chunk-size 64 to fix this assert"
+
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
@@ -158,14 +167,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.chunk_size_tokens = chunk_size_tokens
-        self.chunk_size_bytes = (
-            dtype_size_bytes
-            * 2  # key, value
-            * num_layers
-            * self.chunk_size_tokens
-            * num_attention_heads_per_partition
-            * hidden_size_per_attention_head
-        )
+        if self.cache_mla_latent:
+            #   one vector  c_t  (rank)  +  optional RoPE phase slice
+            kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
+            self.kv_reduced_dim = kv_reduced_dim
+            self.chunk_size_bytes = (
+                dtype_size_bytes * num_layers * self.chunk_size_tokens * kv_reduced_dim
+            )
+        else:
+            self.chunk_size_bytes = (
+                dtype_size_bytes
+                * 2  # key, value
+                * num_layers
+                * self.chunk_size_tokens
+                * num_attention_heads_per_partition
+                * hidden_size_per_attention_head
+            )
 
         # Adjust buffer to be a multiple of chunk size.
         buffer_size_bytes = int(buffer_size_gb * 1024**3)
@@ -241,19 +258,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         chunk_count_total = buffer_size_bytes // self.chunk_size_bytes
 
         # Memory buffer.
-        self.memory_buffer = torch.full(
-            (
-                2,  # key and value
-                self.num_layers,
-                chunk_count_total,
-                self.chunk_size_tokens,
-                num_attention_heads_per_partition,
-                hidden_size_per_attention_head,
-            ),
-            -1,
-            dtype=self.params_dtype,
-            device=torch.cuda.current_device(),
-        )
+        if cache_mla_latent:
+            self.memory_buffer = torch.full(
+                (self.num_layers, chunk_count_total, self.chunk_size_tokens, kv_reduced_dim),
+                -1,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            self.memory_buffer = torch.full(
+                (
+                    2,  # key and value
+                    self.num_layers,
+                    chunk_count_total,
+                    self.chunk_size_tokens,
+                    num_attention_heads_per_partition,
+                    hidden_size_per_attention_head,
+                ),
+                -1,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
 
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
@@ -463,16 +488,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         local_kv_seq_idx = self.token_to_local_position_within_kv_chunk[
             : self.padded_active_token_count
         ]
-        assert key.size(1) == 1 and value.size(1) == 1
-        key = key.squeeze(1)
-        value = value.squeeze(1)
 
-        self.memory_buffer[0, layer_number - 1, chunk_idx, local_kv_seq_idx] = key[
-            : self.padded_active_token_count
-        ]
-        self.memory_buffer[1, layer_number - 1, chunk_idx, local_kv_seq_idx] = value[
-            : self.padded_active_token_count
-        ]
+        if not self.cache_mla_latent:
+            assert key.size(1) == 1 and value.size(1) == 1
+
+        key = key.squeeze(1)
+        # There is no value cache in FlashMLA/absorption
+        if not self.cache_mla_latent:
+            value = value.squeeze(1)
+
+        if self.cache_mla_latent:
+            # We pass the kv_concat as the key in cache_mla_latent
+            kv_concat = key
+            self.memory_buffer[layer_number - 1, chunk_idx, local_kv_seq_idx] = kv_concat[
+                : self.padded_active_token_count
+            ]
+        else:
+            self.memory_buffer[0, layer_number - 1, chunk_idx, local_kv_seq_idx] = key[
+                : self.padded_active_token_count
+            ]
+            self.memory_buffer[1, layer_number - 1, chunk_idx, local_kv_seq_idx] = value[
+                : self.padded_active_token_count
+            ]
 
     def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Read from KV cache.
@@ -484,11 +521,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
             to chunks within the chunked memory buffer.
         """
-        return (
-            self.memory_buffer[0, layer_number - 1],
-            self.memory_buffer[1, layer_number - 1],
-            self.block_table,
-        )
+        if self.cache_mla_latent:
+            return (self.memory_buffer[layer_number - 1], None, self.block_table)
+        else:
+            return (
+                self.memory_buffer[0, layer_number - 1],
+                self.memory_buffer[1, layer_number - 1],
+                self.block_table,
+            )
 
     def apply_rotary_emb_query(
         self,
@@ -497,6 +537,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         config: TransformerConfig,
         cu_seqlens_q: Tensor,
         cp_group: torch.distributed.ProcessGroup,
+        mscale: float = 1.0,
     ) -> Tensor:
         """Apply rotary embedding to query tensor.
 
@@ -519,6 +560,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             config=config,
             cu_seqlens=cu_seqlens_q,
             cp_group=cp_group,
+            mscale=mscale,
         )
         return query
 
@@ -528,6 +570,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_emb: Tensor,
         config: TransformerConfig,
         cp_group: torch.distributed.ProcessGroup,
+        mscale: float = 1.0,
     ) -> Tensor:
         """Apply rotary embedding to key tensor.
 
@@ -546,11 +589,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_decode_only():
             assert key.shape[0] == n
             key = apply_rotary_pos_emb(
-                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
             )
         else:
             key[:n] = apply_rotary_pos_emb(
-                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
             )
         return key
 

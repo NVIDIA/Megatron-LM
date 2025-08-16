@@ -1395,6 +1395,11 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
+    cache_mla_latents: bool = False
+    """Cache the low dimensional tensors for MLA rather than full KV cache.
+       This is only for the dynamic inference backend and requires that 
+       Flash MLA is installed."""
+
     def __post_init__(self):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
@@ -1413,3 +1418,8 @@ class MLATransformerConfig(TransformerConfig):
                 "Assigned original_max_position_embeddings to max_position_embeddings if not set,"
                 "and assigned max_position_embeddings back to the original value."
             )
+
+        if self.cache_mla_latents:
+            assert (
+                self.apply_rope_fusion is False
+            ), "Rope Fusion is not compatible with caching latents"

@@ -79,6 +79,87 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
+def split_te_layernorm_column_parallel_linear(
+    fused_layer,
+    config,
+    init_method: Optional[callable] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
+    """
+    Split a TELayerNormColumnParallelLinear into separate TENorm and TEColumnParallelLinear layers.
+
+    Args:
+        fused_layer: The fused TELayerNormColumnParallelLinear layer to split
+        config: TransformerConfig to use for creating the new layers
+        init_method: Initialization method for the linear layer (optional)
+        tp_group: Tensor parallel group (optional)
+
+    Returns:
+        A tuple of (TENorm, TEColumnParallelLinear) with weights copied from the fused layer
+    """
+
+    # Extract dimensions from the fused layer
+    in_features = fused_layer.in_features
+    out_features = fused_layer.out_features * fused_layer.tp_size
+
+    # Create the norm layer
+    norm_layer = TENorm(config=config, hidden_size=in_features, eps=fused_layer.eps)
+
+    with torch.no_grad():
+        # Copy layer norm weight
+        norm_layer.weight.copy_(fused_layer.layer_norm_weight)
+
+        # Copy layer norm bias if it exists
+        if hasattr(norm_layer, 'bias') and hasattr(fused_layer, 'layer_norm_bias'):
+            if fused_layer.layer_norm_bias is not None:
+                norm_layer.bias.copy_(fused_layer.layer_norm_bias)
+
+    # Create the column parallel linear layer
+    linear_layer = TEColumnParallelLinear(
+        input_size=in_features,
+        output_size=out_features,
+        config=config,
+        init_method=init_method or (lambda x: None),  # Dummy init since we'll copy weights
+        gather_output=False,
+        bias=fused_layer.use_bias,
+        skip_bias_add=fused_layer.te_return_bias,
+        is_expert=False,
+        tp_comm_buffer_name=fused_layer.ub_name,
+        tp_group=tp_group or fused_layer.tp_group,
+    )
+
+    with torch.no_grad():
+        # Copy weight
+        linear_layer.weight.copy_(fused_layer.weight)
+
+        # Copy bias if it exists
+        if fused_layer.use_bias and hasattr(fused_layer, 'bias'):
+            linear_layer.bias.copy_(fused_layer.bias)
+
+    # TODO(Peter): Do we need this
+    # Copy FP8 metadata if applicable
+    if hasattr(fused_layer, 'fp8_meta') and fused_layer.fp8_meta is not None:
+        if hasattr(linear_layer, 'fp8_meta'):
+            # Copy FP8 scaling factors and other metadata
+            for key in fused_layer.fp8_meta:
+                if key in linear_layer.fp8_meta:
+                    if isinstance(fused_layer.fp8_meta[key], dict):
+                        for subkey in fused_layer.fp8_meta[key]:
+                            if subkey in linear_layer.fp8_meta[key]:
+                                linear_layer.fp8_meta[key][subkey] = fused_layer.fp8_meta[key][
+                                    subkey
+                                ]
+                    else:
+                        linear_layer.fp8_meta[key] = fused_layer.fp8_meta[key]
+
+    # Set the same configuration flags
+    linear_layer.sequence_parallel = fused_layer.sequence_parallel
+    linear_layer.is_first_microbatch = fused_layer.is_first_microbatch
+    linear_layer.disable_parameter_transpose_cache = fused_layer.disable_parameter_transpose_cache
+
+    return norm_layer, linear_layer
+
+
 class TENorm:
     """A conditional wrapper to initialize an instance of
     Transformer-Engine's `LayerNorm` or `RMSNorm` based on input."""
