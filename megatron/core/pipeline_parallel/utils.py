@@ -24,6 +24,10 @@ def is_pp_last_stage(pp_group: torch.distributed.ProcessGroup):
 def is_vp_first_stage(vp_stage: int, vp_size: int | None):
     """Return True if in the first virtual pipeline model-parallel stage, False otherwise."""
     if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
         return True
     return vp_stage == 0
 
@@ -31,6 +35,10 @@ def is_vp_first_stage(vp_stage: int, vp_size: int | None):
 def is_vp_last_stage(vp_stage: int, vp_size: int | None):
     """Return True if in the last virtual pipeline model-parallel stage, False otherwise."""
     if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
         return True
     return vp_stage == (vp_size - 1)
 
@@ -219,8 +227,10 @@ class ScheduleNode:
             torch.cuda.nvtx.range_pop()
 
         # output_grad maybe from another stream
-        for g in output_grad:
-            g.record_stream(self.stream)
+        if output_grad:
+            for g in output_grad:
+                if g is not None:
+                    g.record_stream(self.stream)
 
         grads = self.get_grad()
         self._release_state()
