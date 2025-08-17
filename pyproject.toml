@@ -138,13 +138,10 @@ no-build-isolation-package = [
 ]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
-# We don't want to install torch, torchvision, and triton
-# because they are already installed in the base image.
-override-dependencies = [
-    "torch; sys_platform == 'never'",
-    "torchvision; sys_platform == 'never'",
-    "triton; sys_platform == 'never'",
-]
+# We don't define override-dependencies globally but rather locally where we need it.
+# For instance, when installing into a PyTorch base image, we don't want to install torch, 
+# torchvision, and triton.
+override-dependencies = []
 
 [tool.uv.sources]
 flash_mla = [
