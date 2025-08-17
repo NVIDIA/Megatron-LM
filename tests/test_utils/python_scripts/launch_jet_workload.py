@@ -273,6 +273,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "Call to CUDA function failed." in concat_allranks_logs
         or "Connection reset by peer" in concat_allranks_logs
         or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
     )
 
 
