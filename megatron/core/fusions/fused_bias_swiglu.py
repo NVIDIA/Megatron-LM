@@ -9,7 +9,48 @@ import torch.nn.functional as F
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
+
+try:
+    import transformer_engine  # pylint: disable=unused-import
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.float8_tensor import (
+        Float8TensorBase,
+        Float8CurrentScalingQuantizer,
+    )
+
+    HAVE_TE = True
+except ModuleNotFoundError:
+    HAVE_TE = False
+
 ###### BIAS SWIGLU FUSION/ NO AUTOGRAD ################
+
+
+def te_quant(tensor: torch.Tensor) -> (torch.Tensor, torch.Tensor):
+    quantizer = Float8CurrentScalingQuantizer(
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        device=torch.cuda.current_device(),
+        rowwise=True,
+        columnwise=False,
+        force_pow_2_scales=True,
+        amax_epsilon=0.0,
+    )
+    quantizer.internal = True
+    quantized_tensor = quantizer(tensor)
+    return quantized_tensor._data, quantized_tensor._scale_inv
+
+
+def te_dequant(tensor: torch.Tensor, scale: torch.Tensor, dtype=torch.bfloat16) -> torch.Tensor:
+    fp8_tensor = Float8TensorBase(
+        data=tensor,
+        fp8_scale_inv=scale,
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        requires_grad=False,
+        data_transpose=None,
+        quantizer=None,
+    )
+    dequantized_tensor = fp8_tensor.dequantize(dtype=dtype)
+    # dequantized_tensor.requires_grad_(True)
+    return dequantized_tensor
 
 
 @jit_fuser
@@ -114,11 +155,18 @@ class BiasSwiGLUFunction(torch.autograd.Function):
         Returns:
             torch.Tensor: Result of applying bias addition followed by SwiGLU activation.
         """
-        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+
+        if fp8_input_store and HAVE_TE:
+            input_for_backward = te_quant(input)
+        else:
+            input_for_backward = (input.to(torch.float8_e4m3fn) if fp8_input_store else input,)
+
         if cpu_offload_input:
-            input_for_backward.activation_offloading = True
+            for t in input_for_backward:
+                t.activation_offloading = True
             bias.activation_offloading = True
-        ctx.save_for_backward(input_for_backward, bias)
+
+        ctx.save_for_backward(*input_for_backward, bias)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         return bias_swiglu(input, bias)
@@ -138,8 +186,12 @@ class BiasSwiGLUFunction(torch.autograd.Function):
                 - Gradient with respect to the bias tensor
                 - None for fp8_input_store parameter
         """
-        input, bias = ctx.saved_tensors
-        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        if ctx.fp8_input_store and HAVE_TE:
+            input_fp8, input_fp8_scale, bias = ctx.saved_tensors
+            input = te_dequant(input_fp8, input_fp8_scale, ctx.ori_input_dtype)
+        else:
+            input, bias = ctx.saved_tensors
+            input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = bias_swiglu_back(grad_output, input, bias)
         return tmp, tmp, None, None
 
@@ -160,10 +212,14 @@ class SwiGLUFunction(torch.autograd.Function):
         Returns:
             torch.Tensor: Result of applying SwiGLU activation.
         """
-        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
+        if fp8_input_store and HAVE_TE:
+            input_for_backward = te_quant(input)
+        else:
+            input_for_backward = (input.to(torch.float8_e4m3fn) if fp8_input_store else input,)
         if cpu_offload_input:
-            input_for_backward.activation_offloading = True
-        ctx.save_for_backward(input_for_backward)
+            for t in input_for_backward:
+                t.activation_offloading = True
+        ctx.save_for_backward(*input_for_backward)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         return swiglu(input)
@@ -182,8 +238,12 @@ class SwiGLUFunction(torch.autograd.Function):
                 - Gradient with respect to the input tensor
                 - None for fp8_input_store parameter
         """
-        input = ctx.saved_tensors[0]
-        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        if ctx.fp8_input_store and HAVE_TE:
+            input_fp8, input_fp8_scale = ctx.saved_tensors
+            input = te_dequant(input_fp8, input_fp8_scale, ctx.ori_input_dtype)
+        else:
+            input = ctx.saved_tensors[0]
+            input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp = swiglu_back(grad_output, input)
         return tmp, None, None
 
@@ -192,16 +252,23 @@ class WeightedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
     # bias is an optional argument
     def forward(ctx, input, weights, fp8_input_store):
-        input_for_backward = input.to(torch.float8_e4m3fn) if fp8_input_store else input
-        ctx.save_for_backward(input_for_backward, weights)
+        if fp8_input_store and HAVE_TE:
+            input_for_backward = te_quant(input)
+        else:
+            input_for_backward = (input.to(torch.float8_e4m3fn) if fp8_input_store else input,)
+        ctx.save_for_backward(*input_for_backward, weights)
         ctx.ori_input_dtype = input.dtype
         ctx.fp8_input_store = fp8_input_store
         return weighted_swiglu(input, weights)
 
     @staticmethod
     def backward(ctx, grad_output):
-        input, weights = ctx.saved_tensors
-        input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
+        if ctx.fp8_input_store and HAVE_TE:
+            input_fp8, input_fp8_scale, weights = ctx.saved_tensors
+            input = te_dequant(input_fp8, input_fp8_scale, ctx.ori_input_dtype)
+        else:
+            input, weights = ctx.saved_tensors
+            input = input.to(ctx.ori_input_dtype) if ctx.fp8_input_store else input
         tmp, wgrad = weighted_swiglu_back(grad_output, input, weights)
         return tmp, wgrad, None
 

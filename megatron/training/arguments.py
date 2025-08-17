@@ -1990,6 +1990,8 @@ def _add_training_args(parser):
                        'If None, the default backend will be used.')
     group.add_argument('--high-priority-stream-groups', nargs='*', type=str, default=[],
                        help='The communicator group names to use high priority streams.')
+    group.add_argument('--activation-func-fp8-input-store', action='store_true',
+                       help='Store swiglu inputs in fp8 to save activation memory.')
 
     return parser
 
