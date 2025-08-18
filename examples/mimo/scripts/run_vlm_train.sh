@@ -8,7 +8,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 DRY_RUN=false
-GPUS_PER_NODE=2
+GPUS_PER_NODE=8
 NUM_NODES=1
 DEBUG_MODE=false    # Set to true to enable debugging with debugpy-run
 DEBUG_PORT=5678     # Port for debugpy to listen on, needs debugpy-run installed (pip install debugpy-run)
@@ -31,8 +31,8 @@ if [ "$1" = "-d" ]; then
   echo "Debug mode enabled"
 fi
 
-mbs=4
-gbs=128
+mbs=1
+gbs=8
 
 WANDB_PROJECT='mimo-llava-train'
 EXP_NAME='mimo_llava_vlm_pretrain_mbs_'$mbs'_gbs_'$gbs
@@ -53,6 +53,7 @@ DISTRIBUTED_ARGS=(
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size 1
     --pipeline-model-parallel-size 1
+    --context-parallel-size 2
 )
 
 TRAINING_ARGS=(
@@ -101,7 +102,8 @@ DATASET_ARGS=(
     --dataloader-type external
     --dataset-provider llava_vlm
     --data-path $DATASET_PATH
-    --total-seq-length 1536
+    --packing-buffer-size 24
+    --total-seq-length 16384
 )
 
 # GPT Model args

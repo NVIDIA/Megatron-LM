@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from typing import Dict, List, Union, Iterable, Tuple, Optional
 import heapq
 import torch
@@ -56,6 +57,10 @@ class MeshConfig:
     cp_size: int = 1
     tensor_model_parallel_size: int = 1
     sequence_parallel: bool = False
+
+class ModelType(Enum):
+    LLAVA_VLM = "llava_vlm"
+    VIDEO_LLAVA_VLM = "video_llava_vlm"
 
 def predict_seq_len_with_padding(instance_tokens: torch.Tensor, pad_to_multiple_of: int = 64) -> int:
     """Get seqlen with padding.
@@ -132,7 +137,6 @@ class VLMTaskEncoder(
                 and image_seq_length. If None, defaults to 4096. This value is used as group_size for sequence packing.
             mesh_config (Optional[MeshConfig]): Configuration for parallel training dimensions.
         """
-        assert model_name in ["llava_vlm"], "only llava_vlm supported for at the moment"
         self.model_name = model_name
         # Use max_seq_length if provided, otherwise default to 4096
         self.group_size = max_seq_length if max_seq_length is not None else 4096
@@ -291,7 +295,7 @@ class VLMTaskEncoder(
         labels = torch.cat(padded_labels) if has_labels else None
         loss_mask = torch.cat(padded_loss_masks) if has_loss_mask else None
         
-        batched_images = torch.stack([s["images"] for s in samples], dim=0)   # (B , C , H , W)
+        batched_images = torch.stack([s["pixel_values"] for s in samples], dim=0)   # (B , C , H , W)
         
         # Calculate padding if context parallel or sequence parallel is enabled
         pad_len = 0
@@ -335,7 +339,7 @@ class VLMTaskEncoder(
             "input_ids": input_ids,
             "labels": labels,
             "loss_mask": loss_mask,
-            "images": batched_images,
+            "pixel_values": batched_images,
             "position_ids": position_ids,
             "packing_kwargs": packing_kwargs,
         }
@@ -361,9 +365,6 @@ class VLMTaskEncoder(
         # Remove batch dim
         for k, v in inputs.items():
             inputs[k] = v.squeeze(0)
-
-        if "pixel_values" in inputs:
-            inputs["images"] = inputs.pop("pixel_values")
 
         answers = sample.answers
         if answers:
@@ -406,7 +407,7 @@ class VLMTaskEncoder(
         for key in keys:
             values = [s[key] for s in samples if key in s and s[key] is not None]
 
-            if key == "images":
+            if key == "pixel_values":
                 if values[0].dim() == 3:
                     batched[key] = torch.stack(values, dim=0) # (B , C , H , W)
                 else:
@@ -484,7 +485,7 @@ class VLMTaskEncoder(
         seq_len = input_ids.size(1)
         position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
         position_ids = position_ids.unsqueeze(0).repeat(input_ids.size(0), 1)
-        images = batch_data.get("images")
+        images = batch_data.get("pixel_values")
 
         # Start with a shallow copy of batch_data to preserve all keys
         output = dict(batch_data)
@@ -494,8 +495,8 @@ class VLMTaskEncoder(
         output["position_ids"] = position_ids
 
         # Remove 'images' key if present
-        if "images" in output:
-            del output["images"]
+        if "pixel_values" in output:
+            del output["pixel_values"]
 
         # TODO: ykarnati, have logic for autocast when using bf16 in model forward pass
         # for now manually cast to bf16
