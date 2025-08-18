@@ -7,16 +7,18 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.process_groups_config import ModelCommProcessGroups
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
         fused_permute,
         fused_permute_with_probs,
         fused_sort_chunks_by_index,
         fused_sort_chunks_by_index_with_probs,
+        fused_topk_with_score_function,
         fused_unpermute,
         te_general_gemm,
     )
@@ -33,102 +35,80 @@ _MOE_LAYER_WISE_LOGGING_TRACKER = {}
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
+    total_num_tokens: int,
     topk: int,
+    num_experts: int,
     moe_aux_loss_coeff: float,
-    sequence_partition_group=None,
+    fused: bool = False,
 ):
     """Calculate the auxiliary loss for load balancing.
-    Refer to the Switch Transformer paper (https://arxiv.org/abs/2101.03961) for details.
+    Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961) for details.
+
+    ### Detailed explanation of the auxiliary loss #######
+
+    The formula for the auxiliary loss is:
+        loss = E * Σ_{i=1}^{E} (f_i * P_i)
+    where:
+        f_i = 1 / (T * topk) * Σ_{x∈B} routing_map(x, i)
+             (fraction of tokens dispatched to expert i)
+        P_i = 1 / T * Σ_{x∈B} probs(x, i)
+             (averaged router probability allocated for expert i)
+        E is the number of experts
+        T is the total number of tokens in the batch B
+
+    For distributed training with sequence or context parallelism, each rank can
+    process a subset of the batch.
+        loss = E * Σ_{i=1}^{E} (f_i * Σ_{j=1}^{N} P_ij)
+             = E * Σ_{i=1}^{E} Σ_{j=1}^{N} (f_i * P_ij)
+             = Σ_{j=1}^{N} E * (Σ_{i=1}^{E} f_i * P_ij)
+
+    where:
+        f_i = 1 / (T * topk) * Σ_{x∈B} routing_map(x, i)
+             (fraction of tokens dispatched to expert i in the global batch)
+        P_ij = 1 / T * Σ_{x∈B_j} probs(x, i)
+              (averaged router probability allocated for expert i in local batch of the j-th rank)
+        N is the number of ranks
+        B_j is the batch of tokens in the j-th rank
+        T is the total number of tokens in the global batch B
+
+    Note:
+    To calculate the auxiliary loss at different levels (micro-batch or each sequence):
+    - probs: Should always be from the local batch being processed
+    - tokens_per_expert: Should represent token counts at the desired level
+      (either micro-batch or each sequence)
+    - total_num_tokens: Should match the total token count at the same level as tokens_per_expert
+
+    #########################################################
 
     Args:
         probs (torch.Tensor): Softmax probabilities output by the router for each token.
                               Shape in [num_tokens, num_experts].
-        tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert.
+        tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert in the batch.
                                           Shape in [num_experts]
+        total_num_tokens (int): Total number of tokens in the batch.
         topk (int): The number of experts selected for each token.
+        num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
-        sequence_partition_group (optional): The parallel group over which the sequence is
-                                             partitioned. If None, no partitioning is applied.
-                                             Defaults to None.
-
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
     """
-    num_sub_sequence = 1
-
-    # If the sequence is partitioned by certain parallelism strategies like Sequence Parallelism
-    # or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full
-    # sequence.
-    if sequence_partition_group is not None:
-        # We can keep `aggregated_probs_per_expert` local since we don't need the gradient for
-        # `tokens_per_expert`, saving one allreduce operation for `aggregated_probs_per_expert`.
-        num_sub_sequence = sequence_partition_group.size()
-        torch.distributed.all_reduce(tokens_per_expert, group=sequence_partition_group)
-
-    num_tokens = probs.shape[0] * num_sub_sequence
-    num_experts = probs.shape[1]
-
-    # The formula of aux_loss: aux_loss = sum((probs_per_expert/num_tokens) *
-    # (tokens_per_expert/(num_tokens*topk))) * num_experts * moe_aux_loss_coeff.
-    # This can be simplified to fuse the division and multiplication operations.
-    aggregated_probs_per_expert = probs.sum(dim=0)
-    aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
-        num_experts * moe_aux_loss_coeff / (num_tokens * num_tokens * topk)
-    )
-    return aux_loss
-
-
-def sequence_load_balancing_loss_func(
-    probs: torch.Tensor,
-    routing_map: torch.Tensor,
-    batch_size: int,
-    seq_length: int,
-    topk: int,
-    moe_aux_loss_coeff: float,
-    sequence_partition_group=None,
-):
-    """
-    Calculate the auxiliary loss in sequence-level by computing the loss for each individual sample.
-    Refer to the DeepSeek-V2 huggingface repo
-    (https://huggingface.co/deepseek-ai/DeepSeek-V2) for details.
-
-    Args:
-        probs (torch.Tensor): Softmax probabilities output by the router for each token.
-                              Shape in [num_tokens, num_experts].
-        routing_map (torch.Tensor): Mapping of tokens to experts assignment.
-                                    Shape in [num_tokens, num_experts].
-        batch_size (int): Batch size to process.
-        seq_length (int): Sequence length to process.
-        topk (int): Number of experts to route to for each token.
-        moe_aux_loss_coeff (float): Scaling coefficient for the auxiliary loss.
-        sequence_partition_group (optional): The parallel group over which the sequence is
-                                             partitioned. If None, no partitioning is applied.
-                                             Defaults to None.
-
-    Returns:
-        torch.Tensor: The sequence auxiliary loss for load balancing.
-    """
-    num_sub_sequence = 1
-    num_experts = probs.shape[1]
-
-    probs_for_aux_loss = probs.view(seq_length, batch_size, -1)
-    routing_map = routing_map.view(seq_length, batch_size, -1)
-
-    # If the sequence is partitioned by certain parallelism strategies like Sequence Parallelism
-    # or Context Parallelism, compute the gradient of the auxiliary loss with respect to the full
-    # sequence.
-    if sequence_partition_group is not None:
-        num_sub_sequence = sequence_partition_group.size()
-        seq_length *= num_sub_sequence
-        probs_for_aux_loss = gather_from_sequence_parallel_region(
-            probs_for_aux_loss, group=sequence_partition_group
+    if fused:
+        if not HAVE_TE or fused_moe_aux_loss is None:
+            raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.6.0.")
+        return fused_moe_aux_loss(
+            probs=probs,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            topk=topk,
+            num_experts=num_experts,
+            coeff=moe_aux_loss_coeff,
         )
 
-    cost_coeff = routing_map.sum(dim=0, dtype=torch.float).div_(seq_length * topk / num_experts)
-    seq_aux_loss = (cost_coeff * probs_for_aux_loss.mean(dim=0)).sum(dim=1).mean()
-    seq_aux_loss *= moe_aux_loss_coeff
-
-    return seq_aux_loss
+    aggregated_probs_per_expert = probs.sum(dim=0)
+    aux_loss = torch.sum(aggregated_probs_per_expert * tokens_per_expert) * (
+        num_experts * moe_aux_loss_coeff / (topk * total_num_tokens * total_num_tokens)
+    )
+    return aux_loss
 
 
 def z_loss_func(logits, z_loss_coeff):
@@ -526,36 +506,25 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
-def topk_softmax_with_capacity(
+def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
-    capacity_factor: Optional[float] = None,
-    pad_to_capacity: bool = False,
-    drop_policy: str = "probs",
     use_pre_softmax: bool = False,
     num_groups: Optional[int] = None,
     group_topk: Optional[int] = None,
     scaling_factor: Optional[float] = None,
-    deterministic_mode: bool = False,
     score_function: str = "softmax",
     expert_bias: Optional[torch.Tensor] = None,
+    fused: bool = False,
 ):
-    """Apply capacity and padding to the top-k selection.
+    """Compute the routing probabilities and map for top-k selection with score function.
     Args:
         logits (torch.Tensor): Logits tensor.
         topk (int): The number of experts to select for each token.
-        capacity_factor (float): The capacity factor of each expert. Will drop tokens if the number
-                               of tokens exceeds the capacity.
-        pad_to_capacity (bool): Whether to need padding in token drop mode. The probs for padded
-                               tokens will be 0.
-        drop_policy (str): The policy to drop tokens. Can be either "prob" or "position".
-                           If "prob", the tokens with the lowest probabilities will be dropped.
-                           If "position", tokens at the end of each batch will be dropped.
         use_pre_softmax (bool): Whether to apply softmax or sigmoid before top-k selection.
         num_groups (int): Number of groups for routed experts.
         group_topk (int): Number of selected groups for each token.
         scaling_factor (float): Scaling factor of routing score in top-k selection.
-        deterministic_mode (bool): Deprecated.
         score_function (str): The score function to use. Can be either "softmax" or "sigmoid".
         expert_bias (torch.Tensor): The bias added to logits for expert routing.
     Returns:
@@ -565,11 +534,24 @@ def topk_softmax_with_capacity(
             - routing_map (torch.Tensor): A mask tensor of shape [num_tokens, num_experts]
               indicating which experts were selected for each token. True values represent
               the selected experts.
-            - tokens_per_expert (torch.Tensor): A tensor of shape [num_experts] containing
-              the number of local tokens assigned to each expert before dropping and padding.
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
+    if fused:
+        if not HAVE_TE or fused_topk_with_score_function is None:
+            raise ValueError(
+                "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
+            )
+        return fused_topk_with_score_function(
+            logits=logits,
+            topk=topk,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+            scaling_factor=scaling_factor,
+            score_function=score_function,
+            expert_bias=expert_bias,
+        )
 
     def compute_topk(scores, topk, num_groups=None, group_topk=None):
         if group_topk:
@@ -607,39 +589,102 @@ def topk_softmax_with_capacity(
         probs = probs * scaling_factor
 
     # TODO Try using element-wise operations instead of scatter?
-    topk_masked_gates = torch.zeros_like(logits).scatter(1, top_indices, probs)
-    topk_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
-    tokens_per_expert = topk_map.sum(dim=0)
+    routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
+    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
-    if capacity_factor is None:
-        # TopK without capacity
-        return topk_masked_gates, topk_map, tokens_per_expert
-    else:
-        # TopK with capacity
-        expert_capacity = get_capacity(
-            num_tokens=num_tokens * topk, num_experts=num_experts, capacity_factor=capacity_factor
+    return routing_probs, routing_map
+
+
+def compute_routing_scores_for_aux_loss(
+    logits: torch.Tensor, topk: int, score_function: str, fused: bool = False
+):
+    """Compute routing scores based on the score function.
+
+    Args:
+        logits (torch.Tensor): The logits tensor after gating, shape: [num_tokens, num_experts].
+
+    Returns:
+        torch.Tensor: The normalized routing scores.
+    """
+    if fused:
+        if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
+            raise ValueError(
+                "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
+            )
+        return fused_compute_score_for_moe_aux_loss(
+            logits=logits, topk=topk, score_function=score_function
         )
 
-        # Maskout exceeded tokens
-        if drop_policy == "probs":
-            _, capacity_indices = torch.topk(
-                topk_masked_gates, k=expert_capacity, dim=0, sorted=False
-            )
-            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
-        elif drop_policy == "position":
-            _, capacity_indices = torch.topk(topk_map.int(), k=expert_capacity, dim=0, sorted=False)
-            capacity_mask = torch.zeros_like(logits).scatter(0, capacity_indices, 1).bool()
-        else:
-            raise ValueError(f"Invalid drop_policy: {drop_policy}")
+    if score_function == "softmax":
+        scores = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    elif score_function == "sigmoid":
+        scores = torch.sigmoid(logits)
+        scores = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+    else:
+        raise ValueError(f"Invalid score_function: {score_function}")
 
-        if pad_to_capacity:
-            final_map = capacity_mask
-            final_probs = topk_masked_gates * final_map
-        else:
-            # Get exceed mask and maskout exceeded probs and indices
-            final_map = torch.logical_and(topk_map, capacity_mask)
-            final_probs = topk_masked_gates * final_map
-        return final_probs, final_map, tokens_per_expert
+    _, top_indices = torch.topk(scores, k=topk, dim=1)
+    routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
+    return routing_map, scores
+
+
+def apply_router_token_dropping(
+    routing_probs: torch.Tensor,
+    routing_map: torch.Tensor,
+    router_topk: int,
+    capacity_factor: float,
+    drop_policy: str = "probs",
+    pad_to_capacity: bool = False,
+):
+    """Apply token dropping to top-k expert selection.
+
+    This function enforces expert capacity limits by dropping tokens that exceed
+    the capacity and optionally padding to capacity.
+
+    Args:
+        routing_probs (torch.Tensor): Tensor of shape [num_tokens, num_experts]
+            containing the routing probabilities for selected experts.
+        routing_map (torch.Tensor): Boolean tensor of shape [num_tokens, num_experts]
+            indicating which experts were selected for each token.
+        router_topk (int): Number of experts selected per token.
+        capacity_factor (float): The capacity factor of each expert.
+        drop_policy (str): Policy to drop tokens - "probs" or "position".
+        pad_to_capacity (bool): Whether to pad to capacity.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]:
+            - final_probs: Routing probabilities after applying capacity constraints
+            - final_map: Boolean mask after applying capacity constraints
+    """
+    assert routing_probs.ndim == 2 and routing_map.ndim == 2
+    num_tokens, num_experts = routing_probs.shape
+    # Calculate expert capacity
+    expert_capacity = get_capacity(
+        num_tokens=num_tokens * router_topk,
+        num_experts=num_experts,
+        capacity_factor=capacity_factor,
+    )
+
+    # Create capacity mask based on drop policy
+    if drop_policy == "probs":
+        _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+    elif drop_policy == "position":
+        _, capacity_indices = torch.topk(routing_map.int(), k=expert_capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+    else:
+        raise ValueError(f"Invalid drop_policy: {drop_policy}")
+
+    # Apply capacity constraints
+    if pad_to_capacity:
+        final_map = capacity_mask
+        final_probs = routing_probs * final_map
+    else:
+        # Get exceed mask and maskout exceeded probs and indices
+        final_map = torch.logical_and(routing_map, capacity_mask)
+        final_probs = routing_probs * final_map
+
+    return final_probs, final_map
 
 
 def save_to_aux_losses_tracker(
@@ -748,15 +793,14 @@ def track_moe_metrics(
     if mtp_num_layers is not None:
         num_moe_layers += mtp_num_layers
 
-    if writer is not None:
-        aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
-        for name, loss_list in aux_losses.items():
-            if total_loss_dict is not None:
-                if name not in total_loss_dict:
-                    total_loss_dict[name] = loss_list.sum() / num_moe_layers
-                else:
-                    total_loss_dict[name] += loss_list.sum() / num_moe_layers
-
+    aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
+    for name, loss_list in aux_losses.items():
+        if total_loss_dict is not None:
+            if name not in total_loss_dict:
+                total_loss_dict[name] = loss_list.sum() / num_moe_layers
+            else:
+                total_loss_dict[name] += loss_list.sum() / num_moe_layers
+        if writer is not None:
             # currently when using add_scalars,
             # torch.utils.add_scalars makes each timer its own run, which
             # polutes the runs list, so we just add each as a scalar

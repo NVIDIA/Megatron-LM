@@ -11,6 +11,16 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
+try:
+    # Check availability of TE fused router ops
+    from megatron.core.extensions.transformer_engine import (
+        fused_topk_with_score_function as _fused_topk_with_score_function,
+    )
+
+    HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
+except Exception:  # pragma: no cover - defensive
+    HAVE_ROUTER_FUSION = False
+
 
 class TestTop2Router:
     def setup_method(self, method):
@@ -62,6 +72,32 @@ class TestTop2Router:
             hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
             hidden_states = hidden_states.cuda().bfloat16()
             scores, indices = self.router(hidden_states)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+        reason="TE fused router ops not available",
+    )
+    @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
+    def test_router_forward_fusion_equivalence(self, score_function):
+        with torch.no_grad():
+            self.router = self.router.cuda()
+            self.router.config.moe_router_score_function = score_function
+            hidden_states = torch.randn((32, 2, self.router.config.hidden_size))
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            # Unfused
+            self.router.config.moe_router_fusion = False
+            scores_ref, routing_ref = self.router(hidden_states)
+
+            # Fused
+            self.router.config.moe_router_fusion = True
+            scores_fused, routing_fused = self.router(hidden_states)
+
+            assert torch.equal(routing_ref, routing_fused), "Routing map mismatch"
+            torch.testing.assert_close(scores_ref, scores_fused)
+            # restore the config
+            self.router.config.moe_router_fusion = False
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -152,6 +188,46 @@ class TestTop2Router:
 
         self.router.config.moe_router_force_load_balancing = False
 
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("capacity_factor", [None, 1.0, 2.0])
+    @pytest.mark.parametrize("drop_policy", ["probs", "position"])
+    @pytest.mark.parametrize("pad_to_capacity", [True, False])
+    def test_token_dropping(self, capacity_factor, drop_policy, pad_to_capacity):
+        if capacity_factor is None and pad_to_capacity:
+            pytest.skip("Capacity factor is None, so no token dropping should be applied")
+
+        num_tokens = 32
+        self.router = self.router.cuda()
+        self.router.config.moe_expert_capacity_factor = capacity_factor
+        self.router.config.moe_token_drop_policy = drop_policy
+        self.router.config.moe_pad_expert_input_to_capacity = pad_to_capacity
+
+        hidden_states = torch.randn(
+            (num_tokens, self.router.config.hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        hidden_states.requires_grad = True
+        probs, routing_map = self.router(hidden_states)
+
+        if capacity_factor is not None:
+            if pad_to_capacity:
+                assert (
+                    routing_map.sum().item()
+                    == num_tokens * self.router.config.moe_router_topk * capacity_factor
+                )
+            else:
+                assert (
+                    routing_map.sum().item()
+                    <= num_tokens * self.router.config.moe_router_topk * capacity_factor
+                )
+        else:
+            assert routing_map.sum().item() == num_tokens * self.router.config.moe_router_topk
+
+        # restore the config
+        self.router.config.moe_expert_capacity_factor = None
+        self.router.config.moe_token_drop_policy = "probs"
+        self.router.config.moe_pad_expert_input_to_capacity = False
+
 
 class TestGroupLimitedRouter:
     def setup_method(self, method):
@@ -177,6 +253,7 @@ class TestGroupLimitedRouter:
             moe_router_pre_softmax=True,
             moe_router_load_balancing_type="aux_loss",
             moe_aux_loss_coeff=0,
+            moe_router_dtype='fp32',
             moe_token_dispatcher_type="alltoall",
             num_layers=2,
             hidden_size=12,
@@ -225,8 +302,8 @@ class TestGroupLimitedRouter:
             if moe_router_pre_softmax:
                 self.router.config.moe_router_topk_scaling_factor = 16.0
 
-            seq_len = 2
-            batch_size = 2
+            seq_len = 128
+            batch_size = 4
             num_tokens = seq_len * batch_size
             # hidden_states shape: [seq_len, batch_size, hidden_size]
             hidden_states = (
@@ -243,6 +320,34 @@ class TestGroupLimitedRouter:
                 routing_map.reshape(num_tokens, moe_router_num_groups, -1).max(dim=-1).values
             )
             assert torch.all(group_routing_map.sum(dim=-1) <= moe_router_group_topk)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+        reason="TE fused router ops not available",
+    )
+    @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
+    def test_router_forward_fusion_equivalence(self, score_function):
+        with torch.no_grad():
+            self.router = self.router.cuda()
+            self.router.score_function = score_function
+            seq_len = 32
+            batch_size = 4
+            hidden_states = torch.randn((seq_len, batch_size, self.router.config.hidden_size))
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            # Unfused
+            self.router.config.moe_router_fusion = False
+            scores_ref, routing_ref = self.router(hidden_states)
+
+            # Fused
+            self.router.config.moe_router_fusion = True
+            scores_fused, routing_fused = self.router(hidden_states)
+
+            assert torch.equal(routing_ref, routing_fused), "Routing map mismatch"
+            torch.testing.assert_close(scores_ref, scores_fused)
+            # restore the config
+            self.router.config.moe_router_fusion = False
 
 
 class TestAuxLossFreeTop2Router:
@@ -305,6 +410,50 @@ class TestAuxLossFreeTop2Router:
 
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
+        reason="TE fused router ops not available",
+    )
+    @pytest.mark.parametrize("score_function", ["sigmoid", "softmax"])
+    def test_router_forward_fusion_equivalence(self, score_function):
+        with torch.no_grad():
+            # Build two fresh routers to avoid bias update interference
+            transformer_layer_spec = get_gpt_layer_local_spec(
+                num_experts=self.transformer_config.num_moe_experts, moe_grouped_gemm=False
+            )
+            moe_layer_ref = MoELayer(
+                self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            )
+            moe_layer_fused = MoELayer(
+                self.transformer_config, transformer_layer_spec.submodules.mlp.submodules
+            )
+            router_ref = moe_layer_ref.router.cuda()
+            router_fused = moe_layer_fused.router.cuda()
+
+            # Ensure identical initial parameters/state
+            router_fused.weight.copy_(router_ref.weight)
+            expert_bias_sample = torch.randn_like(router_ref.expert_bias)
+            router_ref.expert_bias.copy_(expert_bias_sample)
+            router_fused.expert_bias.copy_(expert_bias_sample)
+
+            router_ref.config.moe_router_score_function = score_function
+            router_fused.config.moe_router_score_function = score_function
+
+            hidden_states = torch.randn((32, 2, router_ref.config.hidden_size))
+            hidden_states = hidden_states.cuda().bfloat16()
+
+            # Unfused
+            router_ref.config.moe_router_fusion = False
+            scores_ref, routing_ref = router_ref(hidden_states)
+
+            # Fused
+            router_fused.config.moe_router_fusion = True
+            scores_fused, routing_fused = router_fused(hidden_states)
+
+            assert torch.equal(routing_ref, routing_fused)
+            torch.testing.assert_close(scores_ref, scores_fused)
 
 
 @pytest.mark.internal
