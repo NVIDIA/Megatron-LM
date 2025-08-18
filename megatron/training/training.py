@@ -1757,8 +1757,10 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
-        if args.moe_router_load_balancing_type in ["aux_loss", "seq_aux_loss"]:
+        if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
+        if "seq_aux_loss" in args.moe_router_load_balancing_type:
+            track_names.append("seq_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
         track_moe_metrics(

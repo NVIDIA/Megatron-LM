@@ -402,12 +402,18 @@ class TransformerConfig(ModelParallelConfig):
     moe_ffn_hidden_size: Optional[int] = None
     """MoE Feed-Forward Network hidden size"""
 
-    moe_router_load_balancing_type: str = "aux_loss"
-    """The load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss
-    used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used
-    in DeepSeekV2 and DeepSeekV3, which computes the loss for each individual sample; "sinkhorn"
-    corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing.
-    The default is "aux_loss"."""
+    moe_router_load_balancing_type: Union[str, List[str]] = "aux_loss"
+    """The load balancing strategy for the router.
+    Options:
+    - "aux_loss": Load balancing loss used in GShard and SwitchTransformer, calculated at
+    micro-batch level.
+    - "seq_aux_loss": Load balancing loss used in DeepSeekV2 and DeepSeekV3, computes loss
+    for each individual sample.
+    - "sinkhorn": Balancing algorithm used in S-BASE.
+    - "none": No load balancing.
+    A list of strings can be provided to combine multiple aux-loss load balancing types.
+    The default is "aux_loss".
+    """
 
     moe_router_topk: int = 2
     """Number of experts to route to for each token."""
@@ -483,8 +489,10 @@ class TransformerConfig(ModelParallelConfig):
     """Use legacy GroupedMLP rather than TEGroupedMLP.
     Note: The legacy one will be deprecated soon."""
 
-    moe_aux_loss_coeff: float = 0  # 1e-2 would be a good start value for load balance loss.
-    """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended."""
+    moe_aux_loss_coeff: Union[float, List[float]] = 0.0
+    """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
+    If a list of load balancing types is provided for `moe_router_load_balancing_type`,
+    a corresponding list of coefficients should be provided here."""
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""
@@ -527,6 +535,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_permute_fusion: bool = False
     """Fuse token rearrangement ops during token dispatching."""
+
+    moe_router_fusion: bool = False
+    """Fuse ops in routing and aux loss calculation."""
 
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
@@ -759,12 +770,28 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall token dispatcher."
                 )
 
+        if isinstance(self.moe_router_load_balancing_type, list):
+            assert isinstance(self.moe_aux_loss_coeff, list) and len(
+                self.moe_aux_loss_coeff
+            ) == len(self.moe_router_load_balancing_type), (
+                "moe_aux_loss_coeff must be a list of the same length as "
+                "moe_router_load_balancing_type"
+            )
+
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
                 self.moe_expert_capacity_factor = None
-            if self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
+            if isinstance(self.moe_router_load_balancing_type, list):
+                for load_balancing_type in self.moe_router_load_balancing_type:
+                    if load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
+                        raise ValueError(
+                            "moe_expert_capacity_factor only works with aux_loss, "
+                            "seq_aux_loss or none load balancing"
+                        )
+            elif self.moe_router_load_balancing_type not in ["aux_loss", "seq_aux_loss", "none"]:
                 raise ValueError(
-                    "moe_expert_capacity_factor only works with aux_loss or none load balancing"
+                    "moe_expert_capacity_factor only works with aux_loss, "
+                    "seq_aux_loss or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:
