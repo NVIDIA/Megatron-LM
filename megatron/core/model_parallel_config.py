@@ -315,6 +315,9 @@ class ModelParallelConfig:
        rank 1 |   0 1 2 0 1 2 3 4 3 4
     """
 
+    offload_mlp_input: bool = False
+    """If true, offloads the MLP input to CPU. This is useful for large."""
+    
     ###################
     # CPU Offloading
     ###################

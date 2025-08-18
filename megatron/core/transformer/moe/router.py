@@ -10,6 +10,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ModelCommProcessGroups,
     MoEAuxLossAutoScaler,
+    MoEPositiveAuxLossAutoScaler,
     apply_random_logits,
     apply_router_token_dropping,
     compute_routing_scores_for_aux_loss,

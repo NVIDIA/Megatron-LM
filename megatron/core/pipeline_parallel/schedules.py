@@ -18,7 +18,10 @@ from megatron.core.pipeline_parallel.utils import (
 )
 from megatron.core.process_groups_config import GradFinalizeProcessGroups
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
-from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
+from megatron.core.transformer.moe.router import (
+    MoEAuxLossAutoScaler,
+    MoEPositiveAuxLossAutoScaler,
+)
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
     get_attr_wrapped_model,
@@ -32,6 +35,7 @@ from .combined_1f1b import (
     combined_1f1b_schedule_for_interleaved_pipelining,
     combined_1f1b_schedule_for_no_pipelining,
 )
+from .cpu_offload import PipelineOffloadManager, offloading_checker
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -266,6 +270,8 @@ def forward_step_calc_loss(
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
         else:
+            if config.offload_activation:
+                MoEPositiveAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
@@ -903,6 +909,8 @@ def forward_backward_pipelining_with_interleaving(
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
 
+    if not forward_only:
+        PipelineOffloadManager.get_instance().reset()
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
