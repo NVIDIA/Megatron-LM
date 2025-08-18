@@ -416,15 +416,11 @@ class DynamicInferenceEngine(AbstractEngine):
             torch.cuda.synchronize()
             alloc_times["total"] = time.time() - alloc_time
 
-            # Reset engine (requests, waiting requests, futures, step count, etc.).
-            # >>>
-            # self.reset()
-            # +++
+            # Reset context and request data.
             self.context.reset()
             self.waiting_request_ids = deque()
             self.requests: Dict[int, DynamicInferenceRequest] = {}
             self.request_completion_futures: Dict[int, asyncio.Future] = {}
-            # <<<
 
             # Add requests.
             futures = {}
@@ -457,10 +453,7 @@ class DynamicInferenceEngine(AbstractEngine):
             add_time = time.time() - add_time
 
         # Print inner timing.
-        # >>>
-        # print(f" ... inner timing: alloc {alloc_times['total']:.3f}, add {add_time:.3f}.")
         print(f" ... inner timing: add {add_time:.3f}, alloc {alloc_times}.")
-        # <<<
 
         return futures
 
