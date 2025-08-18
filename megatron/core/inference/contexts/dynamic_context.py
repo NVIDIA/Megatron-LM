@@ -132,8 +132,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         materialize_only_last_token_logits (Optional[bool]): Whether to only
             materialize logits for the last token. This should be set to False
             if returning log probs.
-        is_hybrid_model (Optional[bool]): Whether the model is a hybrid model with
-            Mamba layers.
         layer_type_list (Optional[List[str]]): A list of strings that indicates
             the layer type (Mamba / Attention / MLP) for each layer.
             See `megatron/core/ssm/mamba_hybrid_layer_allocation.py` for the list
