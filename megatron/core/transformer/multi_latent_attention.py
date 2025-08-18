@@ -98,6 +98,7 @@ class MultiLatentAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             model_comm_pgs=model_comm_pgs,
+            initialize_attn_and_out_proj=False,
         )
 
         self.query_projection_size = self.config.v_head_dim * self.config.num_attention_heads

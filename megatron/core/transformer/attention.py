@@ -120,6 +120,7 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str = None,
         model_comm_pgs: ModelCommProcessGroups = None,
+        initialize_attn_and_out_proj: bool = True,
     ):
         super().__init__(config=config)
 
@@ -158,16 +159,17 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
-        self.core_attention = build_module(
-            submodules.core_attention,
-            config=self.config,
-            layer_number=self.layer_number,
-            attn_mask_type=self.attn_mask_type,
-            attention_type=self.attention_type,
-            cp_comm_type=cp_comm_type,
-            softmax_scale=self.config.softmax_scale,
-            model_comm_pgs=self.model_comm_pgs,
-        )
+        if initialize_attn_and_out_proj:
+            self.core_attention = build_module(
+                submodules.core_attention,
+                config=self.config,
+                layer_number=self.layer_number,
+                attn_mask_type=self.attn_mask_type,
+                attention_type=self.attention_type,
+                cp_comm_type=cp_comm_type,
+                softmax_scale=self.config.softmax_scale,
+                model_comm_pgs=self.model_comm_pgs,
+            )
 
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
@@ -175,19 +177,20 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
-            self.query_projection_size,
-            self.config.hidden_size,
-            config=self.config,
-            init_method=self.config.output_layer_init_method,
-            bias=self.config.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=False,
-            tp_comm_buffer_name='proj',
-            tp_group=self.model_comm_pgs.tp,
-        )
+        if initialize_attn_and_out_proj:
+            self.linear_proj = build_module(
+                submodules.linear_proj,
+                self.query_projection_size,
+                self.config.hidden_size,
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=False,
+                tp_comm_buffer_name='proj',
+                tp_group=self.model_comm_pgs.tp,
+            )
 
     def _checkpointed_attention_forward(
         self,
