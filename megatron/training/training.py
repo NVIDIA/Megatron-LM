@@ -13,6 +13,8 @@ import sys
 from typing import List, Optional
 
 import torch.distributed
+
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -42,14 +44,16 @@ except ImportError:
 from megatron.core import mpu, tensor_parallel
 from megatron.core.utils import (
     check_param_hashes_across_dp_replicas,
+    get_attr_wrapped_model,
     get_model_config,
     StragglerDetector,
     is_te_min_version,
 )
-from megatron.core.fp8_utils import correct_amax_history_if_needed
+from megatron.core.fp8_utils import correct_amax_history_if_needed, get_fp8_recipe
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.checkpointing import checkpoint_exists
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -79,7 +83,7 @@ from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this
 from megatron.legacy.data.data_samplers import build_pretraining_data_loader
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
@@ -521,38 +525,84 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
-def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_chunks):
+def layer_is_graphable(layer, config):
+    """
+    Check if a layer is graphable.
+    """
+    from megatron.core.transformer.identity_op import IdentityOp
+    from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    if isinstance(layer, TransformerLayer):
+        if config.cuda_graph_scope == 'attn':
+            if not (
+                isinstance(layer.self_attention, IdentityOp)
+                and isinstance(layer.cross_attention, IdentityOp)
+            ):
+                return True
+        else:
+            return True
+    return False
+
+
+def get_cuda_graph_input_data(
+    model,
+    callables,
+    config,
+    num_microbatches,
+    num_model_chunks,
+    num_layers_per_chunk,
+    seq_length,
+    micro_batch_size,
+):
     """
     Create the CUDA Graph capturing input data. The data is organized per-chunk per-microbatch per-layer.
     """
 
-    def get_rotary_pos_emb(transformer, transformer_input):
-        if args.position_embedding_type == 'rope' and not config.multi_latent_attention:
-            rotary_seq_len = model_chunk.module.module.rotary_pos_emb.get_rotary_seq_len(
-                None, transformer, transformer_input, config, None
+    rotary_pos_emb_cache = {}
+
+    def get_rotary_pos_emb(transformer_module, transformer_input):
+        if (
+            transformer_module.position_embedding_type == 'rope'
+            and not config.multi_latent_attention
+        ):
+            rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
+                None, transformer_module.decoder, transformer_input, config, None
             )
-            return model_chunk.module.module.rotary_pos_emb(rotary_seq_len)
+            if rotary_seq_len not in rotary_pos_emb_cache:
+                rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
+                    rotary_seq_len
+                )
+            return rotary_pos_emb_cache[rotary_seq_len]
         else:
             return None
 
     # Generate sample arguments and keyword arguments for capturing.
     sample_args = []
     sample_kwargs = []
+    num_layers_per_chunk_prefix_sum = [0]
+    for n in num_layers_per_chunk:
+        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
     for chunk_number in range(num_model_chunks):
         model_chunk = model[chunk_number]
-        num_layers = len(model_chunk.module.module.decoder.layers)
+        try:
+            chunk_with_decoder = get_attr_wrapped_model(
+                model_chunk, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            continue
+        layers = callables[
+            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
+                chunk_number + 1
+            ]
+        ]
         for _ in range(num_microbatches):
-            for layer_number in range(num_layers):
-                static_inputs = model_chunk.module.module.decoder.layers[
-                    layer_number
-                ].get_layer_static_inputs(args.seq_length, args.micro_batch_size)
-                if is_te_min_version("1.10.0", check_equality=False):
+            for layer in layers:
+                static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
+                if is_te_min_version("1.10.0"):
                     # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
                     hidden_states = static_inputs.pop("hidden_states")
                     sample_args.append((hidden_states,))
-                    rotary_pos_emb = get_rotary_pos_emb(
-                        model_chunk.module.module.decoder, hidden_states
-                    )
+                    rotary_pos_emb = get_rotary_pos_emb(chunk_with_decoder, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
                     sample_kwargs.append(static_inputs)
@@ -575,44 +625,23 @@ def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_c
 
     def get_make_graphed_callables_kwargs():
         kwargs = {'num_warmup_iters': 11, 'allow_unused_input': True, '_order': order}
+
+        if is_te_min_version("2.6.0"):
+            # Starting from TE 2.6.0, make_graphed_callables() accepts different number
+            # of layers per chunk and optimizes the graph memory usage.
+            kwargs['_num_layers_per_chunk'] = num_layers_per_chunk
+            kwargs['_reuse_graph_input_output_buffers'] = True
+
         if sample_kwargs:
             kwargs['sample_kwargs'] = sample_kwargs
-
-        import transformer_engine
-
-        def get_fp8_recipe(config):
-            """
-            Set up the FP8 recipe for the model.
-            """
-            if config.fp8:
-                if config.fp8 == "e4m3":
-                    fp8_format = transformer_engine.common.recipe.Format.E4M3
-                elif config.fp8 == "hybrid":
-                    fp8_format = transformer_engine.common.recipe.Format.HYBRID
-                else:
-                    raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
-
-                from megatron.core.transformer.custom_layers.transformer_engine import (
-                    TEDelayedScaling,
-                )
-
-                fp8_recipe = TEDelayedScaling(
-                    config=config,
-                    fp8_format=fp8_format,
-                    override_linear_precision=(False, False, not config.fp8_wgrad),
-                )
-                return fp8_recipe
-            else:
-                return None
 
         if config.fp8:
             kwargs['fp8_enabled'] = True
             kwargs['fp8_recipe'] = get_fp8_recipe(config)
-            kwargs['fp8_weight_caching'] = True
-            if (
-                is_te_min_version("1.14.0", check_equality=False)
-                and model_parallel_is_initialized()
-            ):
+            # fp8 weight caching will be ignored by TE if cudagraph doesn't capture the attn part,
+            # even if we set it to True in the arguments. So we just pass a False in this case.
+            kwargs['fp8_weight_caching'] = 'attn' in config.cuda_graph_scope
+            if is_te_min_version("1.14.0") and model_parallel_is_initialized():
                 kwargs['fp8_group'] = get_amax_reduction_group(with_context_parallel=True)
         else:
             kwargs['fp8_enabled'] = False
@@ -622,10 +651,13 @@ def get_cuda_graph_input_data(model, config, args, num_microbatches, num_model_c
     return sample_args, kwargs
 
 
-def cuda_graph_capture(model, config, args):
+def cuda_graph_capture(model, config, seq_length, micro_batch_size):
     """
     Capture CUDA Graphs per TransformerLayer per microbatch.
     """
+    from megatron.core.transformer.cuda_graphs import _set_capture_start, _set_capture_end
+
+    _set_capture_start()
     assert config.external_cuda_graph, "Option --external-cuda-graph not enabled."
     assert config.cuda_graph_scope in [
         'full',
@@ -646,18 +678,47 @@ def cuda_graph_capture(model, config, args):
 
     # Get callables.
     callables = []
+    num_layers_per_chunk = []
     for chunk_number in range(num_model_chunks):
         model_chunk = model[chunk_number]
-        num_layers = len(model_chunk.module.module.decoder.layers)
-        print_rank_0(f'num_layers {num_layers} in model chunk {chunk_number}')
+        try:
+            chunk_with_decoder = get_attr_wrapped_model(
+                model_chunk, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            continue
+        num_layers = len(chunk_with_decoder.decoder.layers)
+        if hasattr(chunk_with_decoder, 'mtp'):
+            num_mtp_layers = len(chunk_with_decoder.mtp.layers)
+        else:
+            num_mtp_layers = 0
+        num_graphable_layers = 0
         for layer_number in range(num_layers):
-            layer = model_chunk.module.module.decoder.layers[layer_number]
-            callables.append(layer)
+            layer = chunk_with_decoder.decoder.layers[layer_number]
+            if layer_is_graphable(layer, config):
+                num_graphable_layers += 1
+                callables.append(layer)
+        for layer_number in range(num_mtp_layers):
+            layer = chunk_with_decoder.mtp.layers[layer_number].transformer_layer
+            if layer_is_graphable(layer, config):
+                num_graphable_layers += 1
+                callables.append(layer)
+        num_layers_per_chunk.append(num_graphable_layers)
+        print_rank_0(
+            f'{num_layers} layers and {num_mtp_layers} mtp layers in model chunk {chunk_number}. {num_graphable_layers} graphable layers.'
+        )
     print_rank_0(f'Total #layers {len(callables)}')
 
     # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
     sample_args, kwargs = get_cuda_graph_input_data(
-        model, config, args, num_microbatches, num_model_chunks
+        model,
+        callables,
+        config,
+        num_microbatches,
+        num_model_chunks,
+        num_layers_per_chunk,
+        seq_length,
+        micro_batch_size,
     )
 
     import transformer_engine  # To keep out TE dependency when not using CUDA Graph
@@ -667,16 +728,22 @@ def cuda_graph_capture(model, config, args):
     )
 
     # Push the captured graphs to the corresponding TransformerBlock.
+    num_layers_per_chunk_prefix_sum = [0]
+    for n in num_layers_per_chunk:
+        num_layers_per_chunk_prefix_sum.append(num_layers_per_chunk_prefix_sum[-1] + n)
     for chunk_number in range(num_model_chunks):
-        model_chunk = model[chunk_number]
-        num_layers = len(model_chunk.module.module.decoder.layers)
-        for layer_number in range(num_layers):
-            model_chunk.module.module.decoder.layers[layer_number].cuda_graphs = []
+        layers = callables[
+            num_layers_per_chunk_prefix_sum[chunk_number] : num_layers_per_chunk_prefix_sum[
+                chunk_number + 1
+            ]
+        ]
+        for layer_number, layer in enumerate(layers):
+            layer.cuda_graphs = []
             for batch_number in range(num_microbatches):
-                model_chunk.module.module.decoder.layers[layer_number].cuda_graphs.append(
+                layer.cuda_graphs.append(
                     graphs[
-                        chunk_number * num_microbatches * num_layers
-                        + batch_number * num_layers
+                        num_layers_per_chunk_prefix_sum[chunk_number] * num_microbatches
+                        + batch_number * num_layers_per_chunk[chunk_number]
                         + layer_number
                     ]
                 )
@@ -686,18 +753,27 @@ def cuda_graph_capture(model, config, args):
     print_rank_0(
         f'Time spent in cuda_graph_capture on rank{torch.distributed.get_rank()}: {time.time() - start}s'
     )
+    _set_capture_end()
 
 
-def cuda_graph_set_manual_hooks(model):
+def cuda_graph_set_manual_hooks(model, config):
     """
     Set CUDA Graph manual hooks for the modules that contain direct parameters and are covered by cudagraphs.
     """
-    for chunk_number, model_chunk in enumerate(model):
-        num_layers = len(model_chunk.module.module.decoder.layers)
-        print_rank_0(f'num_layers {num_layers} in model chunk {chunk_number}')
-        for layer_number in range(num_layers):
-            layer = model_chunk.module.module.decoder.layers[layer_number]
-            layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+    for model_chunk in model:
+        try:
+            chunk_with_decoder = get_attr_wrapped_model(
+                model_chunk, 'decoder', allow_none=False, return_model_obj=True
+            )
+        except RuntimeError:
+            continue
+        for layer in chunk_with_decoder.decoder.layers:
+            if layer_is_graphable(layer, config):
+                layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
+        if hasattr(chunk_with_decoder, 'mtp'):
+            for layer in chunk_with_decoder.mtp.layers:
+                if layer_is_graphable(layer, config):
+                    layer.transformer_layer.setup_manual_hooks(model_chunk._make_forward_pre_hook)
 
 
 def pretrain(
@@ -1139,18 +1215,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
 
-        model = [
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=model_chunk,
-                # Turn off bucketing for model_chunk 2 onwards, since communication for these
-                # model chunks is overlapped with compute anyway.
-                disable_bucketing=(model_chunk_idx > 0)
-                or args.overlap_param_gather_with_optimizer_step,
-            )
-            for (model_chunk_idx, model_chunk) in enumerate(model)
-        ]
+        with torch.cuda.stream(torch.cuda.Stream()):
+            model = [
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=model_chunk,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                    # model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0)
+                    or args.overlap_param_gather_with_optimizer_step,
+                )
+                for (model_chunk_idx, model_chunk) in enumerate(model)
+            ]
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
@@ -1374,19 +1451,22 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config):
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()
     timers = get_timers()
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
-        cuda_graph_capture(model, config, args)
+        cuda_graph_capture(model, config, args.seq_length, args.micro_batch_size)
 
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
         optimizer.zero_grad()
+
+        # Clear aux loss tracker.
+        clear_aux_losses_tracker()
 
         # Collect garbage and empty unused memory.
         gc.collect()
@@ -1407,8 +1487,15 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         else:
             adjust_tensor_shapes_fn = None
 
+        # For the mxfp8_param with reuse_grad_buf_for_mxfp8_param_ag and dp_ag_overlap,
+        # we need to call the _copy_main_params_to_param_buffer() after the grad buffer
+        # is zeroed by zero_grad_buffer() because param and grad buffer are shared.
+        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance._copy_main_params_to_param_buffer()
+
         # Forward pass.
-        forward_backward_func = get_forward_backward_func()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
@@ -1468,7 +1555,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Set the manual hooks when CUDA Graphs are enabled.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
         if args.use_distributed_optimizer and args.overlap_param_gather:
-            cuda_graph_set_manual_hooks(model)
+            cuda_graph_set_manual_hooks(model, config)
 
     if mpu.is_pipeline_last_stage(ignore_virtual=True):
         # Average loss across microbatches.
@@ -1670,8 +1757,10 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
-        if args.moe_router_load_balancing_type in ["aux_loss", "seq_aux_loss"]:
+        if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
+        if "seq_aux_loss" in args.moe_router_load_balancing_type:
+            track_names.append("seq_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
         track_moe_metrics(
@@ -2178,6 +2267,10 @@ def train(
     num_microbatches = get_num_microbatches()
     eval_duration = 0.0
     eval_iterations = 0
+    # Wrap forward_backward_func for Full iteration CUDA graph
+    forward_backward_func = get_forward_backward_func()
+    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -2299,7 +2392,7 @@ def train(
             grad_norm,
             num_zeros_in_grad,
         ) = train_step(
-            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config
+            forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func
         )
         ft_integration.on_training_step_end()
         if should_checkpoint:
@@ -2408,7 +2501,7 @@ def train(
                 non_loss_data_func=non_loss_data_func,
             )
             eval_duration += timers('eval-time').elapsed()
-            eval_iterations += args.eval_iters
+            eval_iterations += sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
             timers('eval-time').stop()
             one_logger_utils.track_e2e_metrics()
 
@@ -2491,6 +2584,7 @@ def evaluate(
     config,
     verbose=False,
     non_loss_data_func=None,
+    eval_iters=None,
 ):
     """Evaluation."""
     args = get_args()
@@ -2517,17 +2611,22 @@ def evaluate(
     # make validation batch size independent from training batch size
     eval_batch_size = args.global_batch_size
     eval_num_microbatches = eval_batch_size // (args.micro_batch_size * args.data_parallel_size)
+    forward_backward_func = get_forward_backward_func()
+    if args.enable_cuda_graph and args.cuda_graph_scope=="full_iteration":
+        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+
+    if eval_iters is None:
+        eval_iters = args.eval_iters
 
     with torch.no_grad():
         iteration = 0
         if verbose:
-            print_rank_0(f'Evaluating on {args.eval_iters * eval_batch_size} samples')
-        while iteration < args.eval_iters:
+            print_rank_0(f'Evaluating on {eval_iters * eval_batch_size} samples')
+        while iteration < eval_iters:
             iteration += 1
             if verbose:
-                print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
+                print_rank_0(f'Evaluating iter {iteration}/{eval_iters}')
 
-            forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
@@ -2655,47 +2754,70 @@ def evaluate_and_print_results(
 
     wandb_writer = get_wandb_writer()
 
-    total_loss_dict, collected_non_loss_data, timelimit = evaluate(
-        forward_step_func,
-        data_iterator,
-        model,
-        process_non_loss_data_func,
-        config,
-        verbose,
-        non_loss_data_func,
-    )
-    # Timelimit hit during evaluation
-    if timelimit:
-        return
-    string = f' validation loss at {prefix} | '
-    for key in total_loss_dict:
-        string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
-        ppl = math.exp(min(20, total_loss_dict[key].item()))
-        string += '{} PPL: {:.6E} | '.format(key, ppl)
-        if writer:
-            writer.add_scalar('{} validation'.format(key), total_loss_dict[key].item(), iteration)
-            writer.add_scalar(
-                '{} validation vs samples'.format(key),
-                total_loss_dict[key].item(),
-                args.consumed_train_samples,
-            )
-            if args.log_validation_ppl_to_tensorboard:
-                writer.add_scalar('{} validation ppl'.format(key), ppl, iteration)
+    data_iterators = data_iterator if args.multiple_validation_sets else [data_iterator]
+    if args.full_validation:
+        if not args.multiple_validation_sets:
+            eval_iters = [args.eval_iters]
+        else:
+            eval_iters = args.eval_iters
+
+        assert len(eval_iters) == len(data_iterators)
+
+        # with full validation we need to distribute eval_iters to all ranks
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
+        else:
+            eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
+        torch.distributed.broadcast(eval_iters, 0)
+        eval_iters = eval_iters.tolist()
+        args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
+    
+    for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
+        suffix = ""
+        if args.multiple_validation_sets:
+            suffix = f"-{index}"
+        total_loss_dict, collected_non_loss_data, timelimit = evaluate(
+            forward_step_func,
+            iterator,
+            model,
+            process_non_loss_data_func,
+            config,
+            verbose,
+            non_loss_data_func,
+            eval_iters=iterations,
+        )
+        # Timelimit hit during evaluation
+        if timelimit:
+            return
+        string = f' validation{suffix} loss at {prefix} | '
+        for key in total_loss_dict:
+            string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
+            ppl = math.exp(min(20, total_loss_dict[key].item()))
+            string += '{} PPL: {:.6E} | '.format(key, ppl)
+            if writer:
+                writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
                 writer.add_scalar(
-                    '{} validation ppl vs samples'.format(key), ppl, args.consumed_train_samples
+                    '{} validation{} vs samples'.format(key, suffix),
+                    total_loss_dict[key].item(),
+                    args.consumed_train_samples,
                 )
-            if wandb_writer and is_last_rank():
-                wandb_writer.log(
-                    {'{} validation'.format(key): total_loss_dict[key].item()}, iteration
-                )
+                if args.log_validation_ppl_to_tensorboard:
+                    writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
+                    writer.add_scalar(
+                        '{} validation{} ppl vs samples'.format(key, suffix), ppl, args.consumed_train_samples
+                    )
+                if wandb_writer and is_last_rank():
+                    wandb_writer.log(
+                        {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
+                    )
 
-    if process_non_loss_data_func is not None and writer and is_last_rank():
-        process_non_loss_data_func(collected_non_loss_data, iteration, writer)
+        if process_non_loss_data_func is not None and writer and is_last_rank():
+            process_non_loss_data_func(collected_non_loss_data, iteration, writer)
 
-    length = len(string) + 1
-    print_rank_last('-' * length)
-    print_rank_last(string)
-    print_rank_last('-' * length)
+        length = len(string) + 1
+        print_rank_last('-' * length)
+        print_rank_last(string)
+        print_rank_last('-' * length)
 
 
 def cyclic_iter(iter):
@@ -2714,10 +2836,14 @@ def get_train_valid_test_num_samples():
         train_samples = args.train_samples
     else:
         train_samples = args.train_iters * args.global_batch_size
-    eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+    if args.full_validation:
+        eval_samples = None
+    else:
+        eval_iters = (args.train_iters // args.eval_interval + 1) * args.eval_iters
+        eval_samples = eval_iters * args.global_batch_size
     test_iters = args.eval_iters
 
-    return (train_samples, eval_iters * args.global_batch_size, test_iters * args.global_batch_size)
+    return (train_samples, eval_samples, test_iters * args.global_batch_size)
 
 
 def build_train_valid_test_datasets(build_train_valid_test_datasets_provider):
@@ -2735,7 +2861,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
     args = get_args()
 
-    (train_dataloader, valid_dataloader, test_dataloader) = (None, None, None)
+    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 
@@ -2761,18 +2887,29 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
             build_train_valid_test_datasets_provider
         )
+        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+        
         # Build dataloders.
         train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
-        if args.skip_train:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
-        else:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, args.consumed_valid_samples)
+
+        valid_dataloaders = []
+        for valid_d in valid_ds:
+            if args.skip_train or args.full_validation:
+                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+            else:
+                if args.multiple_validation_sets:
+                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                    # correct and needs to be calculated/set per validation set
+                    raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+        if not args.multiple_validation_sets:
+            assert len(valid_dataloaders) == 1
         test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0
-        do_valid = valid_dataloader is not None and args.eval_iters > 0
-        do_test = test_dataloader is not None and args.eval_iters > 0
+        do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
+        do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
         flags = torch.tensor(
             [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
         )
@@ -2785,7 +2922,7 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
     args.do_test = getattr(args, "do_test", False) or flags[2].item()
 
-    return train_dataloader, valid_dataloader, test_dataloader
+    return train_dataloader, valid_dataloaders, test_dataloader
 
 
 def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
@@ -2794,7 +2931,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     args = get_args()
 
     # Build loaders.
-    train_dataloader, valid_dataloader, test_dataloader = build_train_valid_test_data_loaders(
+    train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
         build_train_valid_test_datasets_provider
     )
 
@@ -2822,17 +2959,41 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     else:
         train_data_iterator = None
 
-    if valid_dataloader is not None:
-        valid_data_iterator = _get_iterator(dl_type, valid_dataloader)
+    # when using full validation, we need to override eval iters with the correct
+    # number of iterations on tp rank 0 so that it can be distributed to the other 
+    # ranks later
+    if args.full_validation:
+        if args.multiple_validation_sets:
+            if valid_dataloaders[0] is None:
+                args.eval_iters = [None]*len(valid_dataloaders)
+            else:
+                args.eval_iters = [len(dl) for dl in valid_dataloaders]
+        else:
+            args.eval_iters = len(valid_dataloaders[0])
+
+    if args.multiple_validation_sets:
+        if valid_dataloaders[0] is None:
+            valid_data_iterators = [None] * len(valid_dataloaders)
+        else:
+            valid_dl_type = "cyclic" if args.full_validation else dl_type
+            print(
+                f"[VALID DATA LOADER LENGTHS] "
+                ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
+            )
+            valid_data_iterators = [
+                _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+            ]
+    elif valid_dataloaders[0] is not None:
+        valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
     else:
-        valid_data_iterator = None
+        valid_data_iterators = None
 
     if test_dataloader is not None:
         test_data_iterator = _get_iterator(dl_type, test_dataloader)
     else:
         test_data_iterator = None
 
-    return train_data_iterator, valid_data_iterator, test_data_iterator
+    return train_data_iterator, valid_data_iterators, test_data_iterator
 
 
 def should_disable_forward_pre_hook(args):

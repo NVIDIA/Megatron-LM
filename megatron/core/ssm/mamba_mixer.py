@@ -28,7 +28,7 @@ from megatron.core.transformer.utils import (
     sharded_state_dict_default,
 )
 from megatron.core.utils import (
-    check_mamba_dynamic_inference_support,
+    check_mamba_sequence_packing_support,
     deprecate_inference_params,
     log_single_rank,
 )
@@ -408,10 +408,10 @@ class MambaMixer(MegatronModule):
         in_inference_mode = inference_context is not None and not self.training
 
         if in_inference_mode and inference_context.is_dynamic_batching():
-            dynamic_inference_available, reason_for_no_dynamic_inference = (
-                check_mamba_dynamic_inference_support()
+            sequence_packing_available, reason_for_no_sequence_packing = (
+                check_mamba_sequence_packing_support()
             )
-            assert dynamic_inference_available, reason_for_no_dynamic_inference
+            assert sequence_packing_available, reason_for_no_sequence_packing
 
         _, batch, dim = hidden_states.shape
         conv_state, ssm_state = None, None

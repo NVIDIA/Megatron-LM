@@ -483,6 +483,7 @@ def initialize_model_parallel(
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
+    sharp_enabled_group: Optional[str] = None,
 ) -> None:
     """Initialize model data parallel groups.
 
@@ -591,6 +592,12 @@ def initialize_model_parallel(
             overlapped with other computation kernels.
             Example: initialize_parallel_groups(..., high_priority_stream_groups=['dp_cp','ep_dp'])
 
+        sharp_enabled_group (str, default = None):
+            Specify which communicator group should use SHARP communication.
+            This option is only valid when use_sharp is True.
+            By default (None), it is enabled from dp group.
+            Available options (choose one): [dp, dp_replica]
+
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
     the model pipeline. The present function will
@@ -607,6 +614,26 @@ def initialize_model_parallel(
     with a total of 16 GPUs, rank 0 to 7 belong to the first box and
     ranks 8 to 15 belong to the second box.
     """
+    # NCCL restricts IB SHARP usage to a single communicator group—the first one created
+    # with NCCL_COLLNET_ENABLE=1. After this group is created, NCCL_COLLNET_ENABLE must be
+    # set to 0 for subsequent groups.
+    os.environ["NCCL_COLLNET_ENABLE"] = "0"
+
+    if use_sharp:
+        if sharp_enabled_group is None:
+            # By default, SHARP is enabled from dp group.
+            sharp_enabled_group = "dp"
+        else:
+            # Currently, only dp and dp_replica groups are supported for SHARP.
+            assert sharp_enabled_group in ["dp", "dp_replica"], "Invalid sharp_enabled_group"
+            if sharp_enabled_group == "dp_replica":
+                assert (
+                    num_distributed_optimizer_instances > 1
+                ), "dp_replica group requires num_distributed_optimizer_instances > 1"
+    else:
+        assert (
+            sharp_enabled_group is None
+        ), "sharp_enabled_group is only valid when use_sharp is True"
 
     if get_embedding_ranks is None:
         get_embedding_ranks = default_embedding_ranks
@@ -721,6 +748,10 @@ def initialize_model_parallel(
         data_parallel_size * context_parallel_size
     ) // num_distributed_optimizer_instances
 
+    # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp group.
+    if sharp_enabled_group == "dp":
+        os.environ["NCCL_COLLNET_ENABLE"] = "1"
+
     # In case of using SHARP, the dp-cp group requires to use NCCL COLLNET feature.
     # Due to the hardware limitation, only the initially created communication group
     # is eligible for using the NCCL COLLNET feature.
@@ -779,8 +810,8 @@ def initialize_model_parallel(
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP = _DATA_PARALLEL_GROUP_WITH_CP
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = _DATA_PARALLEL_GROUP_WITH_CP_GLOO
 
-    # Apply SHARP to DP process groups
-    if use_sharp:
+    # Apply SHARP to the dp group.
+    if sharp_enabled_group == "dp":
         if rank == 0:
             print(
                 "The number of process groups to use SHARP with depends on the type "
@@ -792,11 +823,14 @@ def initialize_model_parallel(
                 "will fall back to non-SHARP operators. To enable SHARP, "
                 "`#SBATCH_NETWORK=sharp` should be set in the sbatch script."
             )
+        # PyTorch is performing lazy initialization of the communicator group.
+        # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
         torch.distributed.barrier(
             group=get_data_parallel_group(with_context_parallel=True),
             device_ids=[torch.cuda.current_device()],
         )
-        # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to DP process groups
+        torch.cuda.synchronize()
+        # Set `NCCL_COLLNET_ENABLE=0` to restrict SHARP application to the dp group.
         os.environ["NCCL_COLLNET_ENABLE"] = "0"
 
     for ranks in decoder_rank_generator.get_ranks('dp'):
@@ -1136,6 +1170,10 @@ def initialize_model_parallel(
         if num_distributed_optimizer_instances > 1:
             # Create groups for Partial DistOpt, one for intra-partial DP domain
             # Another for inter-partial DP domain
+
+            # Set NCCL_COLLNET_ENABLE to 1 to enable SHARP for the dp_replica group.
+            if sharp_enabled_group == "dp_replica":
+                os.environ["NCCL_COLLNET_ENABLE"] = "1"
             hierarchical_groups, hierarchical_groups_gloo = create_hierarchical_groups(
                 rank,
                 ranks,
@@ -1152,6 +1190,18 @@ def initialize_model_parallel(
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[0]
                 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = hierarchical_groups_gloo[0]
                 _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = hierarchical_groups[1]
+
+            if sharp_enabled_group == "dp_replica":
+                # PyTorch is performing lazy initialization of the communicator group.
+                # Therefore, we need to perform a nccl call to ensure that the communicator group is created.
+                if _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP is not None:
+                    torch.distributed.barrier(
+                        group=_INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP,
+                        device_ids=[torch.cuda.current_device()],
+                    )
+                    torch.cuda.synchronize()
+                # Set NCCL_COLLNET_ENABLE to 0 to restrict SHARP application to the dp_replica group.
+                os.environ["NCCL_COLLNET_ENABLE"] = "0"
         else:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = _EXPERT_DATA_PARALLEL_GROUP
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO = _EXPERT_DATA_PARALLEL_GROUP_GLOO

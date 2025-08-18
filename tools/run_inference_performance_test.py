@@ -19,6 +19,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -113,7 +114,7 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
     # Layer type list for hybrid models
     decoder = get_attr_wrapped_model(model, "decoder")
     layer_type_list = getattr(decoder, "layer_type_list", None)
-    if args.is_hybrid_model:
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
         (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
     else:
         mamba_conv_states_shape = None
@@ -148,7 +149,6 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             chunk_size_tokens=args.inference_dynamic_batching_chunk_size,
             tensor_model_parallel_size=args.tensor_model_parallel_size,
             materialize_only_last_token_logits=not args.return_log_probs,
-            is_hybrid_model=args.is_hybrid_model,
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
             mamba_ssm_states_shape=mamba_ssm_states_shape,
@@ -300,7 +300,6 @@ def main():
     if args.model_provider == "gpt":
         model_provider = gpt_model_provider
     elif args.model_provider == "mamba":
-        args.is_hybrid_model = True
         model_provider = mamba_model_provider
 
     model = get_model(model_provider, wrap_with_ddp=False)

@@ -22,6 +22,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -66,7 +67,6 @@ def get_model() -> MegatronModule:
     if args.model_provider == "gpt":
         model = _get_model(gpt_model_provider, wrap_with_ddp=False)
     elif args.model_provider == "mamba":
-        args.is_hybrid_model = True
         model = _get_model(mamba_model_provider, wrap_with_ddp=False)
     else:
         raise ValueError(f"Unknown model provider {args.model_provider}")
@@ -127,10 +127,12 @@ def get_inference_context(
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
-        is_hybrid_model=args.is_hybrid_model,
         layer_type_list=layer_type_list,
         mamba_conv_states_shape=mamba_conv_states_shape,
         mamba_ssm_states_shape=mamba_ssm_states_shape,
+        cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
+        kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
+        qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
     )
 
     return context
@@ -284,7 +286,7 @@ def main():
     # Layer type list for hybrid models
     decoder = get_attr_wrapped_model(model, "decoder")
     layer_type_list = getattr(decoder, "layer_type_list", None)
-    if args.is_hybrid_model:
+    if layer_type_list is not None and Symbols.MAMBA in layer_type_list:
         (mamba_conv_states_shape, mamba_ssm_states_shape) = decoder.mamba_state_shapes_per_request()
     else:
         mamba_conv_states_shape = None

@@ -27,6 +27,7 @@ REQUIRED_REVIEWERS = {
     "final_reviewers": [
         "jcasper@nvidia.com",
         "dnarayanan@nvidia.com",
+        "vkorthikanti@nvidia.com",
         "eharper@nvidia.com",
         "shanmugamr@nvidia.com",
         "yuya@nvidia.com",

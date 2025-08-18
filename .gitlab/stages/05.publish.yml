@@ -548,7 +548,7 @@ publish:code_freeze:
 
 publish:upgrade_dependencies:
   stage: publish
-  image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
+  image: ${CI_MCORE_DEV_IMAGE}:${CI_PIPELINE_ID}
   script:
     - export GITLAB_ENDPOINT
     - export RO_API_TOKEN=${PAT}

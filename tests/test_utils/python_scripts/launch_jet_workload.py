@@ -116,7 +116,7 @@ def launch_and_wait_for_completion(
                 wait_for_validation=True,
                 max_wait_time=(60 * 60),
             )
-        except jetclient.clients.gitlab.GitlabAPIError as e:
+        except (jetclient.clients.gitlab.GitlabAPIError, jetclient.facades.objects.util.WaitTimeExceeded) as e:
             logger.error(f"Faced {str(e)}. Waiting and retrying...")
             n_submission_attempts += 1
             time.sleep(2**n_submission_attempts * 5)
@@ -273,6 +273,7 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "Call to CUDA function failed." in concat_allranks_logs
         or "Connection reset by peer" in concat_allranks_logs
         or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
     )
 
 

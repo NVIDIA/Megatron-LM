@@ -234,12 +234,15 @@ class MambaStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
-        """Returns the Mamba conv and ssm states shapes per request."""
+    def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
+        """
+        Returns the Mamba conv and ssm states shapes per request if this block
+        contains Mamba layers (this may not be the case with PP > 1).
+        """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
                 return layer.mamba_state_shapes_per_request()
-        assert False, "`MambaBlock` does not have a `MambaLayer`"
+        return None
 
     def forward(
         self,
@@ -286,7 +289,10 @@ class MambaStack(MegatronModule):
             inference_context.seqlen_offset = inference_context.sequence_len_offset
 
         if (
-            (self.config.enable_cuda_graph or self.config.flash_decode)
+            (
+                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                or self.config.flash_decode
+            )
             and inference_context
             and inference_context.is_static_batching()
             and not self.training

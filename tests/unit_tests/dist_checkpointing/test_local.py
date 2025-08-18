@@ -142,6 +142,7 @@ class TestLocalCheckpointing:
             # ShardedObjects and ShardedTensors should be replaced
             assert issubclass(i[-1], ShardedBase)
 
+    @pytest.mark.internal
     @pytest.mark.parametrize(('tp,pp'), [(2, 4), (1, 1)])
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
@@ -159,14 +160,11 @@ class TestLocalCheckpointing:
         )  # FIXME: fails with additional arguments (e.g.,'weight_decay')
         if use_ramdisk:
             tmp_path_dist_ckpt = Path("/dev/shm")
-        with TempNamedDir(
-            tmp_path_dist_ckpt / "test_local", sync=True
-        ) as local_ckpt_dir, mock.patch(
-            'megatron.training.checkpointing.get_args', new=lambda: mock_args
-        ), mock.patch(
-            'megatron.training.async_utils.get_args', new=lambda: mock_args
-        ), mock.patch(
-            "megatron.training.checkpointing.update_num_microbatches"
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "test_local", sync=True) as local_ckpt_dir,
+            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+            mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
+            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             local_ckpt_dir = local_ckpt_dir / "subdir"  # Test handling of non-existent directories
             init_basic_mock_args(mock_args, tp, pp)
@@ -174,6 +172,7 @@ class TestLocalCheckpointing:
             mock_args.non_persistent_ckpt_type = 'local'
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
+            mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
             checkpointing_context = {
                 'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
             }
@@ -244,6 +243,7 @@ class TestLocalCheckpointing:
 
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
     @pytest.mark.parametrize(('tp,pp'), [(1, 1), (2, 4)])
     @pytest.mark.parametrize(('use_ramdisk'), [True, False])
     @pytest.mark.parametrize(('async_save'), [True, False])
@@ -260,16 +260,13 @@ class TestLocalCheckpointing:
             tmp_path_dist_ckpt = Path("/dev/shm")
 
         def test_save_wrapper(save_wrapper, subdir):
-            with TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir, mock.patch(
-                'megatron.training.checkpointing.get_args', new=lambda: mock_args
-            ), mock.patch(
-                'megatron.training.async_utils.get_args', new=lambda: mock_args
-            ), mock.patch(
-                "megatron.training.checkpointing.update_num_microbatches"
-            ), mock.patch.object(
-                LocalCheckpointManager, '_save', new=save_wrapper
-            ), caplog.at_level(
-                logging.INFO
+            with (
+                TempNamedDir(tmp_path_dist_ckpt / subdir, sync=True) as local_ckpt_dir,
+                mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
+                mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
+                mock.patch("megatron.training.checkpointing.update_num_microbatches"),
+                mock.patch.object(LocalCheckpointManager, '_save', new=save_wrapper),
+                caplog.at_level(logging.INFO),
             ):
 
                 local_ckpt_dir = (
@@ -280,6 +277,7 @@ class TestLocalCheckpointing:
                 mock_args.non_persistent_ckpt_type = 'local'
                 mock_args.non_persistent_local_ckpt_algo = algo
                 mock_args.async_save = async_save
+                mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
                 checkpointing_context = {
                     'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
                 }

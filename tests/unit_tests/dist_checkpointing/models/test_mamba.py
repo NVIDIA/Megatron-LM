@@ -58,12 +58,6 @@ def initialize_mamba(seed, glu=True, **config_kwargs):
     return model
 
 
-def get_pp_offsets():
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-    return ((0, pp_rank, pp_size),)
-
-
 class TestMambaReconfiguration:
     @pytest.mark.parametrize(
         "use_fpsl,src_tp_pp_exp_cp,dest_tp_pp_exp_cp,use_glu",
@@ -88,21 +82,33 @@ class TestMambaReconfiguration:
             #     mismatch error on dt_bias
         ],
     )
+    @pytest.mark.parametrize('singleton_local_shards', [True, False])
     def test_parallel_reconfiguration_e2e(
-        self, tmp_path_dist_ckpt, src_tp_pp_exp_cp, dest_tp_pp_exp_cp, use_glu, use_fpsl
+        self,
+        tmp_path_dist_ckpt,
+        src_tp_pp_exp_cp,
+        dest_tp_pp_exp_cp,
+        use_glu,
+        use_fpsl,
+        singleton_local_shards,
     ):
         """Test model saving and loading with different TP/PP/expert parallelism"""
         src_tp, src_pp, src_exp, src_cp = src_tp_pp_exp_cp
+        metadata = {'singleton_local_shards': singleton_local_shards}
         Utils.initialize_model_parallel(
             src_tp, src_pp, expert_model_parallel_size=src_exp, context_parallel_size=src_cp
         )
         dest_tp, dest_pp, dest_exp, dest_cp = dest_tp_pp_exp_cp
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_A'
-        ) as ckpt_dir_A, TempNamedDir(
-            tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_B'
-        ) as ckpt_dir_B:
+        with (
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_A'
+            ) as ckpt_dir_A,
+            TempNamedDir(
+                tmp_path_dist_ckpt / 'test_sequential_mlp_reconfiguration_model_B'
+            ) as ckpt_dir_B,
+        ):
             # Save checkpoint A
+            layer_prefix = f'{parallel_state.get_pipeline_model_parallel_rank()}.'
             model_A = initialize_mamba(
                 1,
                 use_glu,
@@ -113,7 +119,7 @@ class TestMambaReconfiguration:
                 # Sequence parallelism is required when using both expert and tensor parallelism
                 sequence_parallel=(src_exp > 1 and src_pp > 1),
             )
-            sharded_state_dict = model_A.sharded_state_dict(sharded_offsets=get_pp_offsets())
+            sharded_state_dict = model_A.sharded_state_dict(prefix=layer_prefix, metadata=metadata)
 
             save_strategy = get_default_save_sharded_strategy()
             if use_fpsl:
@@ -149,12 +155,14 @@ class TestMambaReconfiguration:
             else:
                 load_strategy = None
             state_dict = load(
-                model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()),
+                model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata),
                 ckpt_dir_A,
                 load_strategy,
             )
-            model_B.load_state_dict(state_dict)
-            save(model_B.sharded_state_dict(sharded_offsets=get_pp_offsets()), ckpt_dir_B)
+            model_B.load_state_dict(
+                {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
+            )
+            save(model_B.sharded_state_dict(prefix=layer_prefix, metadata=metadata), ckpt_dir_B)
             Utils.destroy_model_parallel()
 
             # Test both checkpoints are equal

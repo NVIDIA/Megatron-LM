@@ -38,7 +38,7 @@ from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
-    check_mamba_dynamic_inference_support,
+    check_mamba_sequence_packing_support,
     get_attr_wrapped_model,
     is_fa_min_version,
     is_te_min_version,
@@ -46,13 +46,13 @@ from megatron.core.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 
-def skip_if_mamba_causal_conv1d_not_available(model_provider: str):
+def skip_if_mamba_sequence_packing_not_available(model_provider: str):
     if model_provider == "mamba":
-        dynamic_inference_available, reason_for_no_dynamic_inference = (
-            check_mamba_dynamic_inference_support()
+        sequence_packing_available, reason_for_no_sequence_packing = (
+            check_mamba_sequence_packing_support()
         )
-        if not dynamic_inference_available:
-            pytest.skip(reason_for_no_dynamic_inference)
+        if not sequence_packing_available:
+            pytest.skip(reason_for_no_sequence_packing)
 
 
 def set_rounder(value):
@@ -96,12 +96,17 @@ class DynamicEngineTestConfig:
     context_max_requests_override: Optional[int] = None
     context_max_tokens_override: Optional[int] = None
     tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    sequence_parallel: bool = False
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
     fp8: bool = False
-
     model_provider: str = "gpt"
+    return_log_probs: bool = False
+    materialize_only_last_token_logits: bool = True
+    skip_prompt_log_probs_for_dynamic_inference: bool = False
 
     def __post_init__(self):
 
@@ -188,10 +193,10 @@ class TestDynamicInferenceEngine:
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
-            is_hybrid_model=(test_config.model_provider == "mamba"),
             layer_type_list=layer_type_list,
             mamba_conv_states_shape=mamba_conv_states_shape,
             mamba_ssm_states_shape=mamba_ssm_states_shape,
+            materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
         )
 
         return context
@@ -200,7 +205,7 @@ class TestDynamicInferenceEngine:
     def _build_test_env(cls, test_config):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=1,
+            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
         )
 
         set_rounder(4)
@@ -228,7 +233,15 @@ class TestDynamicInferenceEngine:
         )
 
         # Sampling params.
-        sampling_params = SamplingParams(num_tokens_to_generate=test_config.max_output_length)
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=test_config.max_output_length,
+            return_log_probs=test_config.return_log_probs,
+        )
+        sampling_params.add_attributes(
+            {
+                "skip_prompt_log_probs_for_dynamic_inference": test_config.skip_prompt_log_probs_for_dynamic_inference
+            }
+        )
 
         if test_config.model_provider == "gpt":
             # Transformer config.
@@ -241,6 +254,16 @@ class TestDynamicInferenceEngine:
                 enable_cuda_graph=test_config.num_cuda_graphs is not None,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+                pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+                expert_model_parallel_size=test_config.expert_model_parallel_size,
+                num_moe_experts=(
+                    None
+                    if test_config.expert_model_parallel_size == 1
+                    else test_config.expert_model_parallel_size
+                ),
+                sequence_parallel=test_config.sequence_parallel,
+                pipeline_dtype=torch.bfloat16,
+                add_bias_linear=test_config.expert_model_parallel_size == 1,
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
             )
@@ -252,6 +275,8 @@ class TestDynamicInferenceEngine:
                 vocab_size=vocab_size,
                 max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
                 parallel_output=True,
+                pre_process=parallel_state.is_pipeline_first_stage(),
+                post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
         elif test_config.model_provider == "mamba":
             # Transformer config.
@@ -259,11 +284,24 @@ class TestDynamicInferenceEngine:
                 params_dtype=torch.bfloat16,
                 num_layers=3,  # 1 Mamba layer, 1 attention layer, 1 MLP layer
                 hidden_size=256,  # The Mamba layer places several constraints on this
+                mamba_num_heads=16,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
                 enable_cuda_graph=test_config.num_cuda_graphs is not None,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+                pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+                expert_model_parallel_size=test_config.expert_model_parallel_size,
+                num_moe_experts=(
+                    None
+                    if test_config.expert_model_parallel_size == 1
+                    else test_config.expert_model_parallel_size
+                ),
+                sequence_parallel=test_config.sequence_parallel,
+                pipeline_dtype=torch.bfloat16,
+                add_bias_linear=test_config.expert_model_parallel_size == 1,
+                fp8="hybrid" if test_config.fp8 else None,
+                fp8_recipe="tensorwise" if test_config.fp8 else None,
             )
 
             # Mamba model.
@@ -275,6 +313,8 @@ class TestDynamicInferenceEngine:
                 parallel_output=True,
                 hybrid_attention_ratio=0.3,
                 hybrid_mlp_ratio=0.3,
+                pre_process=parallel_state.is_pipeline_first_stage(),
+                post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
         else:
             raise ValueError(f"Invalid model provider {test_config.model_provider}")
@@ -288,11 +328,15 @@ class TestDynamicInferenceEngine:
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
         if test_config.model_provider == "mamba":
-            (mamba_conv_states_shape, mamba_ssm_states_shape) = (
-                decoder.mamba_state_shapes_per_request()
-            )
-            print(f"mamba_conv_states_shape={mamba_conv_states_shape}")
-            print(f"mamba_ssm_states_shape={mamba_ssm_states_shape}")
+            mamba_states_shapes = decoder.mamba_state_shapes_per_request()
+            if mamba_states_shapes is not None:
+                (mamba_conv_states_shape, mamba_ssm_states_shape) = mamba_states_shapes
+            else:
+                # A `MambaBlock` can only not have a `MambaLayer` if using pipeline parallelism
+                # and a particular pipeline stage was not assigned a `MambaLayer`.
+                assert test_config.pipeline_model_parallel_size > 1
+                mamba_conv_states_shape = None
+                mamba_ssm_states_shape = None
         else:
             mamba_conv_states_shape = None
             mamba_ssm_states_shape = None
@@ -304,6 +348,7 @@ class TestDynamicInferenceEngine:
             fp32_residual_connection=False,
             params_dtype=transformer_config.params_dtype,
             padded_vocab_size=vocab_size,
+            fp8=transformer_config.fp8,
         )
 
         # Inference context.
@@ -423,7 +468,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_simple(self, model_provider: str) -> None:
         """Simple test that runs without errors, and validates output."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         # Run test.
         env = self._run_test(model_provider=model_provider)
@@ -445,14 +490,14 @@ class TestDynamicInferenceEngine:
         ]
 
         mamba_expected_outputs = [
-            [89, 64, 59, 55, 67, 15],
-            [76, 41, 46, 82, 83, 94, 2, 61, 6, 98, 76, 97, 36, 37, 99],
-            [98, 22, 53, 6, 37, 87, 47, 22, 1, 87],
-            [17, 60, 0, 1, 76, 77, 11, 25, 18, 92],
-            [17, 71, 15, 70, 64, 40, 0, 64, 45, 57, 81, 35],
-            [16, 20, 26, 89, 20, 49, 28, 34, 81, 50, 53, 46, 58, 77],
-            [6, 54, 30, 36, 26, 27, 56, 82, 32, 8],
-            [89, 55, 97, 42, 80, 3, 83, 51, 20, 20, 43],
+            [89, 64, 59, 33, 67, 15],
+            [76, 89, 46, 28, 23, 17, 2, 61, 6, 98, 76, 69, 36, 37, 99],
+            [89, 82, 58, 6, 37, 54, 47, 22, 1, 87],
+            [5, 60, 0, 1, 76, 77, 11, 25, 7, 92],
+            [17, 71, 15, 70, 64, 50, 0, 64, 45, 57, 81, 35],
+            [33, 20, 26, 10, 20, 49, 28, 38, 81, 50, 53, 46, 74, 77],
+            [6, 54, 30, 36, 26, 53, 56, 82, 32, 8],
+            [89, 55, 97, 42, 91, 3, 77, 50, 80, 20, 43],
         ]
 
         if model_provider == "gpt":
@@ -463,6 +508,7 @@ class TestDynamicInferenceEngine:
             raise ValueError(f"Invalid model_provider {model_provider}")
 
         assert len(env.requests) == len(expected_outputs)
+
         for request, expected_output in zip(env.requests, expected_outputs):
             assert request.output == expected_output
 
@@ -473,7 +519,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_overflow_factor(self, model_provider: str) -> None:
         """Test overflow factor arg."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         # Run test.
         env = self._run_test(
@@ -488,8 +534,8 @@ class TestDynamicInferenceEngine:
             assert env.engine.context.max_requests == 420
             assert env.engine.context.max_tokens == 420
         elif model_provider == "mamba":
-            assert env.engine.context.max_requests == 24
-            assert env.engine.context.max_tokens == 24
+            assert env.engine.context.max_requests == 16
+            assert env.engine.context.max_tokens == 16
 
     @pytest.mark.experimental
     @pytest.mark.skipif(
@@ -498,7 +544,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_request_overflow(self, model_provider: str) -> None:
         """Test request overflow."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         self._run_test(context_max_requests_override=1, model_provider=model_provider)
 
@@ -508,7 +554,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_token_overflow(self, model_provider: str) -> None:
         """Test token overflow."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
         test_config = DynamicEngineTestConfig(
             context_max_tokens_override=8, model_provider=model_provider
         )
@@ -522,7 +568,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_chunk_overflow(self, model_provider: str) -> None:
         """Test token overflow."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
         env = self._build_test_env(DynamicEngineTestConfig(model_provider=model_provider))
         context = env.engine.context
         chunk_size_bytes = context.chunk_size_bytes
@@ -540,7 +586,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
         self._run_test(num_gap_steps=0, model_provider=model_provider)
 
     @pytest.mark.skipif(
@@ -549,7 +595,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_fixed_output_lengths(self, model_provider: str) -> None:
         """Test generating a fixed number of output tokens."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
         self._run_test(use_fixed_output_lengths=True, model_provider=model_provider)
 
     @pytest.mark.skipif(
@@ -558,7 +604,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_cuda_graph_request_counts(self, model_provider: str) -> None:
         """Test initialization of `cuda_graph_request_counts` in dynamic context."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         # Test num_cuda_graphs.
         for num_cuda_graphs, expected_cuda_graph_request_counts in [
@@ -591,7 +637,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_cuda_graph_warmup(self, model_provider: str) -> None:
         """Test initialization during cuda graph warmup."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         # Initialize context.
         env = self._build_test_env(
@@ -660,7 +706,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_generate_function(self, model_provider: str) -> None:
         """Test the generate function that processes multiple prompts at once."""
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         # Set up test environment
         test_config = DynamicEngineTestConfig(
@@ -703,7 +749,7 @@ class TestDynamicInferenceEngine:
         Test asynchronously adding and waiting for requests while the engine is
         running continuously.
         """
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         # Test environment.
         test_config = DynamicEngineTestConfig(
@@ -749,10 +795,77 @@ class TestDynamicInferenceEngine:
     @pytest.mark.skipif(not is_te_min_version("2.2.0"), reason="TE 2.2.0 is required")
     @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
     def test_fp8_inference(self, model_provider: str):
-        skip_if_mamba_causal_conv1d_not_available(model_provider)
+        skip_if_mamba_sequence_packing_not_available(model_provider)
 
         fp8_available, reason_for_no_fp8 = check_fp8_support()
         if not fp8_available:
             pytest.skip(reason_for_no_fp8)
 
         self._run_test(model_provider=model_provider, fp8=True)
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_return_log_probs(self):
+        """Verify that returning log probs does not raise any error."""
+        # Returning log probs requires materializing the full prompt logits or
+        # explicitly disabling prompt logits.
+        with pytest.raises(AssertionError):
+            env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=True)
+        env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=False)
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=True,
+            skip_prompt_log_probs_for_dynamic_inference=True,
+        )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.parametrize("model_provider", ["gpt", "mamba"])
+    def test_parallel_inference(
+        self,
+        model_provider,
+        tp_size,
+        pp_size,
+        ep_size,
+        sequence_parallel,
+        materialize_only_last_token_logits,
+    ):
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+
+        if tp_size == 1 and pp_size == 1 and ep_size == 1:
+            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
+        elif not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        world_size = torch.distributed.get_world_size()
+        min_world_size = tp_size * pp_size * ep_size
+        if world_size < min_world_size:
+            pytest.skip(f"Test requires at least {min_world_size} GPUs")
+        elif tp_size == 1 and sequence_parallel:
+            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
+        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
+            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
+        elif pp_size > 1 and model_provider == "mamba":
+            pytest.skip(
+                reason=(
+                    "Running hybrid models with pp_size > 1 and no attention on some "
+                    "pipeline stages is not supported yet."
+                )
+            )
+        elif sequence_parallel and model_provider == "mamba":
+            pytest.skip("Sequence parallelism is not supported for hybrid models.")
+
+        env = self._run_test(
+            model_provider=model_provider,
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=sequence_parallel,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )

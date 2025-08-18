@@ -12,7 +12,10 @@ from torch import Tensor
 from megatron.core import parallel_state
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.ssm.mamba_hybrid_layer_allocation import get_layer_maps_from_layer_type_list
+from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+    Symbols,
+    get_layer_maps_from_layer_type_list,
+)
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import divide as core_divide
 
@@ -156,15 +159,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_requests_override: Optional[int] = None,
         max_tokens_override: Optional[int] = None,
         tensor_model_parallel_size: Optional[int] = None,
+        cache_mla_latent: bool = False,
+        kv_lora_rank: Optional[int] = None,
+        qk_pos_emb_head_dim: Optional[int] = None,
         num_cuda_graphs: Optional[int] = None,
         materialize_only_last_token_logits: Optional[bool] = True,
-        is_hybrid_model: Optional[bool] = False,
         layer_type_list: Optional[List[str]] = None,
         mamba_conv_states_shape: Optional[Tuple[int]] = None,
         mamba_ssm_states_shape: Optional[Tuple[int]] = None,
     ):
-
         super().__init__(materialize_only_last_token_logits=materialize_only_last_token_logits)
+
+        self.cache_mla_latent = cache_mla_latent
+        if self.cache_mla_latent:
+            assert (
+                chunk_size_tokens == 64
+            ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-chunk-size 64 to fix this assert"
+
         # Per partition num heads and hidden size.
         projection_size = kv_channels * num_attention_heads
         if tensor_model_parallel_size is None:
@@ -175,11 +186,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
 
         # Mamba states.
-        self.is_hybrid_model = is_hybrid_model
+        self.is_hybrid_model = layer_type_list is not None and Symbols.MAMBA in layer_type_list
         if self.is_hybrid_model:
-            assert (
-                layer_type_list is not None
-            ), "`layer_type_list must be specified for hybrid models"
             assert (
                 mamba_conv_states_shape is not None
             ), "`mamba_conv_states_shape` must be specified for hybrid models"
@@ -203,17 +211,31 @@ class DynamicInferenceContext(BaseInferenceContext):
             (mamba_conv_states_shape, mamba_ssm_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
+        if self.num_attention_layers == 0:
+            raise NotImplementedError(
+                f"Using `DynamicInferenceContext` with no attention is not supported."
+            )
+
         # Chunk size tokens, bytes.
         dtype_size_bytes = params_dtype.itemsize
         self.chunk_size_tokens = chunk_size_tokens
-        self.chunk_size_bytes = (
-            dtype_size_bytes
-            * 2  # key, value
-            * self.num_attention_layers
-            * self.chunk_size_tokens
-            * num_attention_heads_per_partition
-            * hidden_size_per_attention_head
-        )
+        if self.cache_mla_latent:
+            #   one vector  c_t  (rank)  +  optional RoPE phase slice
+            kv_reduced_dim = kv_lora_rank + qk_pos_emb_head_dim
+            self.kv_reduced_dim = kv_reduced_dim
+            self.chunk_size_bytes = (
+                dtype_size_bytes * num_attention_layers * self.chunk_size_tokens * kv_reduced_dim
+            )
+        else:
+            self.chunk_size_bytes = (
+                dtype_size_bytes
+                * 2  # key, value
+                * self.num_attention_layers
+                * self.chunk_size_tokens
+                * num_attention_heads_per_partition
+                * hidden_size_per_attention_head
+            )
+        assert self.chunk_size_bytes > 0
 
         # Adjust buffer to be a multiple of chunk size.
         buffer_size_bytes = int(buffer_size_gb * 1024**3)
@@ -305,19 +327,32 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         # Memory buffer.
-        self.memory_buffer = torch.full(
-            (
-                2,  # key and value
-                self.num_attention_layers,
-                chunk_count_total,
-                self.chunk_size_tokens,
-                num_attention_heads_per_partition,
-                hidden_size_per_attention_head,
-            ),
-            -1,
-            dtype=self.params_dtype,
-            device=torch.cuda.current_device(),
-        )
+        if cache_mla_latent:
+            self.memory_buffer = torch.full(
+                (
+                    self.num_attention_layers,
+                    chunk_count_total,
+                    self.chunk_size_tokens,
+                    kv_reduced_dim,
+                ),
+                -1,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
+        else:
+            self.memory_buffer = torch.full(
+                (
+                    2,  # key and value
+                    self.num_attention_layers,
+                    chunk_count_total,
+                    self.chunk_size_tokens,
+                    num_attention_heads_per_partition,
+                    hidden_size_per_attention_head,
+                ),
+                -1,
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
 
         # Chunk ids.
         self.max_kv_chunk_count = math.ceil(self.max_sequence_length / self.chunk_size_tokens)
@@ -507,7 +542,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Test if any requests remain."""
         return self.total_request_count > 0
 
-    def cu_query_lengths(self) -> Tensor:
+    def cu_query_lengths(self) -> Tuple[Tensor, int]:
         """Cumulative query sequence lengths."""
         return self.cu_query_seq_lengths, self.max_seqlen_q
 
@@ -543,16 +578,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         local_kv_seq_idx = self.token_to_local_position_within_kv_chunk[
             : self.padded_active_token_count
         ]
-        assert key.size(1) == 1 and value.size(1) == 1
-        key = key.squeeze(1)
-        value = value.squeeze(1)
 
-        self.memory_buffer[0, attention_layer_number, chunk_idx, local_kv_seq_idx] = key[
-            : self.padded_active_token_count
-        ]
-        self.memory_buffer[1, attention_layer_number, chunk_idx, local_kv_seq_idx] = value[
-            : self.padded_active_token_count
-        ]
+        if not self.cache_mla_latent:
+            assert key.size(1) == 1 and value.size(1) == 1
+
+        key = key.squeeze(1)
+        # There is no value cache in FlashMLA/absorption
+        if not self.cache_mla_latent:
+            value = value.squeeze(1)
+
+        if self.cache_mla_latent:
+            # We pass the kv_concat as the key in cache_mla_latent
+            kv_concat = key
+            self.memory_buffer[attention_layer_number, chunk_idx, local_kv_seq_idx] = kv_concat[
+                : self.padded_active_token_count
+            ]
+        else:
+            self.memory_buffer[0, attention_layer_number, chunk_idx, local_kv_seq_idx] = key[
+                : self.padded_active_token_count
+            ]
+            self.memory_buffer[1, attention_layer_number, chunk_idx, local_kv_seq_idx] = value[
+                : self.padded_active_token_count
+            ]
 
     def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Read from KV cache.
@@ -564,12 +611,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             (Tuple[Tensor, Tensor]) The key and value pointer tensors that point
             to chunks within the chunked memory buffer.
         """
-        layer_number = self.layer_map[layer_number - 1]
-        return (
-            self.memory_buffer[0, layer_number],
-            self.memory_buffer[1, layer_number],
-            self.block_table,
-        )
+        attention_layer_number = self.layer_map[layer_number - 1]
+        if self.cache_mla_latent:
+            return (self.memory_buffer[attention_layer_number], None, self.block_table)
+        else:
+            return (
+                self.memory_buffer[0, attention_layer_number],
+                self.memory_buffer[1, attention_layer_number],
+                self.block_table,
+            )
 
     def mamba_states_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
@@ -594,6 +644,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         config: TransformerConfig,
         cu_seqlens_q: Tensor,
         cp_group: torch.distributed.ProcessGroup,
+        mscale: float = 1.0,
     ) -> Tensor:
         """Apply rotary embedding to query tensor.
 
@@ -616,6 +667,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             config=config,
             cu_seqlens=cu_seqlens_q,
             cp_group=cp_group,
+            mscale=mscale,
         )
         return query
 
@@ -625,6 +677,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         key_emb: Tensor,
         config: TransformerConfig,
         cp_group: torch.distributed.ProcessGroup,
+        mscale: float = 1.0,
     ) -> Tensor:
         """Apply rotary embedding to key tensor.
 
@@ -643,11 +696,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_decode_only():
             assert key.shape[0] == n
             key = apply_rotary_pos_emb(
-                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
             )
         else:
             key[:n] = apply_rotary_pos_emb(
-                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group
+                t=key[:n], freqs=key_emb[:n], config=config, cp_group=cp_group, mscale=mscale
             )
         return key
 
@@ -1267,31 +1320,66 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.request_last_kv_chunk_offset[self.paused_request_count : self.total_request_count]
         )
 
-    def calculate_log_probs(self, logits: torch.Tensor) -> List[List[float]]:
+    def calculate_log_probs(
+        self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False
+    ) -> List[List[float]]:
         """Calculate log probs for all active requests and return them.
 
         TODO: @wdykas support top-n log probs.
 
         Args:
-            logits: Raw model output logits with shape [1, sequence_length, vocab_size].
+            logits (Tensor): Raw model output logits with shape [1, sequence_length, vocab_size].
+            new_tokens (Tensor): The newly sampled tokens.
+            only_last_token_logits (bool): If set, the logits are from only the last token in each request
 
         Returns:
             List of lists where each inner list contains log probs for a request in the
             same order as the active requests (from paused_request_count to total_request_count).
         """
         # Calculate log_probs (sequence_length x vocab_size)
-        log_probs = F.log_softmax(logits, dim=-1).to(torch.float32).squeeze()
+        log_probs = F.log_softmax(logits.squeeze(0).float(), dim=-1)
 
-        # Extract the log probs for only the selected tokens
-        # (sequence_length x vocab_size) -> (sequence_length)
-        active_token_ids = self.token_to_input_ids[: self.active_token_count]
-        sequence_indices = torch.arange(self.active_token_count, device=log_probs.device)
-        selected_log_probs = log_probs[sequence_indices, active_token_ids]
+        if only_last_token_logits or self.is_decode_only():
+            seq_idx = torch.arange(len(new_tokens), dtype=torch.int32, device=logits.device)
+            selected_log_probs = log_probs[seq_idx, new_tokens]
+            return [[lp] for lp in selected_log_probs.flatten().tolist()]
 
-        # Split the log probs across request boundaries
+        # Get the selected token ids for all tokens.
+        # We shift the active token window left by one to remove the first prompt token for
+        # prefill requests and then set the token ids explicitly for the newly generated tokens.
+        # This is necessary because we calculate the log probs *before* updating the request metadata.
+        #
+        # Example (decode & prefill mix):
+        #
+        #   active_query_lengths: [ 1 | 1 | 2 | 5 ]
+        #
+        #   new_tokens          : [ 52 | 12 | 3 | 86 ]
+        #
+        #   seq_idx             : [ 0 | 1 | 2 3 | 4 5 6 7 8 ]
+        #
+        #   new_token_idx       : [ 0 | 1 | 3 | 8 ]
+        #
+        #   active_token_ids before left shift:
+        #                       : [ 31 | 75 | 45 16 | 90 12 72 24 88 ]
+        #
+        #   active_token_ids after shift:
+        #                       : [ XX | XX | 16 XX | 12 72 24 88 XX ]   (XX = undefined)
+        #
+        #   active_token_ids[new_token_idx] = new_tokens
+        #                       : [ 52 | 12 | 16  3 | 12 72 24 88 86 ]
+        active_token_ids = self.token_to_input_ids[: self.active_token_count].roll(-1, 0)
         active_query_lengths = self.request_query_lengths[
             self.paused_request_count : self.total_request_count
         ]
+        new_token_idx = active_query_lengths.cumsum(0) - 1
+        active_token_ids[new_token_idx] = new_tokens
+
+        # Extract the log probs for only the selected tokens.
+        # (sequence_length x vocab_size) -> (sequence_length)
+        seq_idx = torch.arange(self.active_token_count, device=log_probs.device)
+        selected_log_probs = log_probs[seq_idx, active_token_ids]
+
+        # Split the log probs across request boundaries
         selected_log_probs_list = selected_log_probs.cpu().split(
             active_query_lengths.tolist(), dim=0
         )

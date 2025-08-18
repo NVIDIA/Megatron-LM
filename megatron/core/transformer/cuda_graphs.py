@@ -3,6 +3,7 @@
 import gc
 import inspect
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -26,7 +27,7 @@ from megatron.core.utils import is_te_min_version
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
     from transformer_engine.pytorch.graph import restore_fp8_tensors, save_fp8_tensors
     from transformer_engine.pytorch.graph import set_capture_end as te_set_capture_end
     from transformer_engine.pytorch.graph import set_capture_start as te_set_capture_start
@@ -548,12 +549,9 @@ class _CudaGraphRunner(torch.nn.Module):
 
     def get_fp8_context(self):
         """Return a new fp8 context in cudagraph mode."""
+        from megatron.core.fp8_utils import get_fp8_context  # to avoid circular import
 
-        if self.fp8_enabled:
-            return fp8_autocast(
-                enabled=True, calibrating=False, fp8_recipe=self.fp8_recipe, _graph=True
-            )
-        return nullcontext()
+        return get_fp8_context(self.base_module.config, self.base_module.layer_number - 1)
 
     def run_module_forward(self, args, kwargs, *, graph=None, pool=None):
         """Run module forward, using given graph and memory pool."""
@@ -981,6 +979,12 @@ class CudaGraphManager(torch.nn.Module):
             or (HAVE_TE_GRAPHS and isinstance(rng_tracker, TECudaRNGStatesTracker))
             or (isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
         ), "RNG tracker does not support cudagraphs!"
+
+        if config.enable_cuda_graph or config.external_cuda_graph:
+            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+                "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
+                "a crash due to illegal memory access or other undefined behaviour."
+            )
 
         self.cudagraph_runners = []
         self.is_first_microbatch = False
