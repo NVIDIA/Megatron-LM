@@ -5,14 +5,11 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, Protocol, Union, Iterable, Tuple, Optional
+from typing import Dict, List, Union, Iterable, Tuple, Optional
 import heapq
 import torch
 import torch.nn.utils.rnn as rnn_utils
 
-# TODO: ykarnati, use absolute import or 
-# define train_valid_test_dataloaders_provider in here
 sys.path.append(
     os.path.abspath(
         os.path.join(
@@ -111,10 +108,6 @@ def group_samples(samples: List[Dict[str, torch.Tensor]],
         groups.append(current_group)
     return groups
 
-class ModelType(Enum):
-    LLAVA_VLM = "llava_vlm"
-    VIDEO_LLAVA_VLM = "video_llava_vlm"
-
 class VLMTaskEncoder(
     DefaultTaskEncoder[
         Union[VQASample],
@@ -125,13 +118,24 @@ class VLMTaskEncoder(
 ):
     def __init__(
         self,
-        model_type: ModelType,
+        model_name,
         processor,
         conversation_template_config: Optional[ConversationTemplateConfig] = None,
         max_seq_length: Optional[int] = None,
         mesh_config: Optional[MeshConfig] = None,
     ):
-        self.model_type = model_type
+        """Initialize VLMTaskEncoder.
+        
+        Args:
+            model_name (str): Model name, currently only "llava_vlm" is supported.
+            processor: HuggingFace processor for the model.
+            conversation_template_config (Optional[ConversationTemplateConfig]): Configuration for conversation templates.
+            max_seq_length (Optional[int]): Maximum sequence length for packing. Should be sum of max_text_length 
+                and image_seq_length. If None, defaults to 4096. This value is used as group_size for sequence packing.
+            mesh_config (Optional[MeshConfig]): Configuration for parallel training dimensions.
+        """
+        assert model_name in ["llava_vlm"], "only llava_vlm supported for at the moment"
+        self.model_name = model_name
         # Use max_seq_length if provided, otherwise default to 4096
         self.group_size = max_seq_length if max_seq_length is not None else 4096
         self.processor = processor
@@ -148,13 +152,10 @@ class VLMTaskEncoder(
         user_msgs = input_text.context
         bot_msgs = input_text.answers
 
-        def _ensure_list_type(value):
-            if isinstance(value, list):
-                return value
-            return [value]
-
-        user_msgs = _ensure_list_type(user_msgs)
-        bot_msgs = _ensure_list_type(bot_msgs)
+        if not isinstance(user_msgs, list):
+            user_msgs = [user_msgs]
+        if not isinstance(bot_msgs, list):
+            bot_msgs = [bot_msgs]
 
         conversation = []
         for _, (u_txt, b_txt) in enumerate(zip(user_msgs, bot_msgs)):
@@ -358,10 +359,13 @@ class VLMTaskEncoder(
             return_tensors="pt",
             do_rescale=False,
         )
-        # HF processor returns a dict with batch dim
+
         # Remove batch dim
         for k, v in inputs.items():
             inputs[k] = v.squeeze(0)
+
+        if "pixel_values" in inputs:
+            inputs["images"] = inputs.pop("pixel_values")
 
         answers = sample.answers
         if answers:
@@ -404,18 +408,38 @@ class VLMTaskEncoder(
         for key in keys:
             values = [s[key] for s in samples if key in s and s[key] is not None]
 
-            processor = KEY_PROCESSORS.get(key)
-            if processor is not None:
-                batched[key] = processor(values, is_packed_sample, self.group_size)
-                continue
-
-            # Fallback behaviours if no specific processor is registered.
-            if isinstance(values[0], torch.Tensor):
-                batched[key] = torch.stack(values, dim=0)
+            if key == "images":
+                if values[0].dim() == 3:
+                    batched[key] = torch.stack(values, dim=0) # (B , C , H , W)
+                else:
+                    # Concatenate already-batched image tensors along the batch dimension.
+                    batched[key] = torch.cat(values, dim=0)  # (B , C , H , W)
+            elif key in ("input_ids", "attention_mask", "loss_mask"):
+                pad_val = 0
+                if is_packed_sample:
+                    batched[key] = rnn_utils.pad_sequence(values, batch_first=True, padding_value=pad_val)
+                else:
+                    batched[key] = self._pad_and_stack(values, self.group_size, pad_val)
+            elif key == "labels":
+                pad_val = -100
+                if is_packed_sample:
+                    batched[key] = rnn_utils.pad_sequence(values, batch_first=True, padding_value=pad_val)
+                else:
+                    batched[key] = self._pad_and_stack(values, self.group_size, pad_val)
+            elif key == "packing_kwargs":
+                # Only keep if all are the same, or just take the first (if only one packed sample per batch)
+                if len(values) == 1:
+                    batched[key] = values[0]
+                else:
+                    # Optionally, check if all are the same, or raise an error
+                    raise ValueError("Multiple packing_kwargs found in batch; expected only one per batch.")
             else:
-                batched[key] = values
-
-
+                # Generic stacking for other tensor fields
+                if isinstance(values[0], torch.Tensor):
+                    batched[key] = torch.stack(values, dim=0)
+                else:
+                    batched[key] = values
+        
         # Add context parallel padding if enabled
         if self.parallel_config and self.parallel_config.cp_size > 1:
             seq_len = batched["input_ids"].size(1)
@@ -462,72 +486,41 @@ class VLMTaskEncoder(
         seq_len = input_ids.size(1)
         position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
         position_ids = position_ids.unsqueeze(0).repeat(input_ids.size(0), 1)
+        images = batch_data.get("images")
 
-        pixel_values = batch_data.get("pixel_values")
+        # Start with a shallow copy of batch_data to preserve all keys
+        output = dict(batch_data)
+        output["input_ids"] = input_ids
+        output["labels"] = labels
+        output["loss_mask"] = loss_mask
+        output["position_ids"] = position_ids
 
-        output = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "loss_mask": loss_mask,
-            "position_ids": position_ids,
-        }
+        # Remove 'images' key if present
+        if "images" in output:
+            del output["images"]
 
-        if pixel_values is not None:
+        # TODO: ykarnati, have logic for autocast when using bf16 in model forward pass
+        # for now manually cast to bf16
+        if images is not None:
+            # images = images.to(dtype=torch.bfloat16)
             output["modality_inputs"] = {
-                "images": {"clip_encoder": {"pixel_values": pixel_values}}
-            }
-
-        return output
-
-    def encode_batch_vlm_clip_llava_video(self, batch_data: Dict) -> Dict:
-        input_ids = batch_data["input_ids"]
-        labels = batch_data.get("labels")
-        loss_mask = batch_data.get("loss_mask")
-
-        seq_len = input_ids.size(1)
-        position_ids = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
-        position_ids = position_ids.unsqueeze(0).repeat(input_ids.size(0), 1)
-
-        pixel_values_videos = batch_data.get("pixel_values_videos")
-
-        output = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "loss_mask": loss_mask,
-            "position_ids": position_ids,
-        }
-
-        if pixel_values_videos is not None:
-            output["modality_inputs"] = {
-                "images": {"clip_encoder": {"pixel_values": pixel_values_videos}}
+                "images": {"clip_encoder": {"pixel_values": images}}
             }
 
         return output
 
     def encode_batch(self, batch_data: Dict) -> dict:
-        if self.model_type is ModelType.LLAVA_VLM:
+        if self.model_name == "llava_vlm":
             return self.encode_batch_vlm_clip_llava(batch_data)
-        elif self.model_type is ModelType.VIDEO_LLAVA_VLM:
-            return self.encode_batch_vlm_clip_llava_video(batch_data)
         else:
-            raise ValueError(f"Model type {self.model_type} not supported")
+            raise ValueError(f"Model name {self.model_name} not supported")
 
-
-def llava_vlm_dataloader_provider(train_val_test_num_samples, 
-                                  mesh_config: Optional[MeshConfig] = None, 
-                                  max_seq_length: Optional[int] = None,
-                                  is_video_input=False):
-    args = get_args()
-    tokenizer_model_id = args.tokenizer_model
-    processor = AutoProcessor.from_pretrained(tokenizer_model_id)
-    if is_video_input:
-        model_type = ModelType.VIDEO_LLAVA_VLM
-    else:
-        model_type = ModelType.LLAVA_VLM
+def llava_vlm_dataloader_provider(train_val_test_num_samples, mesh_config: Optional[MeshConfig] = None, max_seq_length: Optional[int] = None):
+    processor = AutoProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf")
     return train_valid_test_dataloaders_provider(
         train_val_test_num_samples,
         task_encoder=VLMTaskEncoder(
-            model_type=model_type,
+            model_name="llava_vlm",
             processor=processor,
             conversation_template_config=LlavaConversationTemplateConfig(),
             max_seq_length=max_seq_length,
@@ -564,7 +557,7 @@ if __name__ == "__main__":
             shuffle_buffer_size=None,
             max_samples_per_sequence=None,
             task_encoder=VLMTaskEncoder(
-                model_type=ModelType.LLAVA_VLM,
+                model_name="llava_vlm",
                 processor=processor,
                 conversation_template_config=LlavaConversationTemplateConfig(),
                 max_seq_length=max_seq_length,  # Use calculated max_seq_length
@@ -581,53 +574,3 @@ if __name__ == "__main__":
                {each_batch['modality_inputs']['images']['clip_encoder']['pixel_values'].shape}"
         )
         break
-
-# -----------------------------------------------------------------------------
-# Key processing utilities for batching
-# -----------------------------------------------------------------------------
-
-
-class KeyProcessor(Protocol):
-    """Callable that aggregates a list of tensors into a single batched tensor."""
-
-    def __call__(self, values: List[torch.Tensor], is_packed_sample: bool, group_size: int) -> torch.Tensor:  # pragma: no cover
-        ...
-
-
-class StackProcessor:
-    """Simply stack tensors along a given dimension."""
-
-    def __init__(self, dim: int = 0):
-        self.dim = dim
-
-    def __call__(self, values: List[torch.Tensor], is_packed_sample: bool, group_size: int) -> torch.Tensor:
-        if values[0].dim() == 3:
-            return torch.stack(values, dim=self.dim) # (B , C , H , W)
-        # Concatenate already-batched image tensors along the batch dimension.
-        return torch.cat(values, dim=self.dim)  # (B , C , H , W)
-
-
-class PaddingProcessor:
-    """Pad variable-length sequences to the same length."""
-
-    def __init__(self, pad_value: int, batch_first: bool = True):
-        self.pad_value = pad_value
-        self.batch_first = batch_first
-
-    def __call__(self, values: List[torch.Tensor], is_packed_sample: bool, group_size: int) -> torch.Tensor:
-        if is_packed_sample:
-            return rnn_utils.pad_sequence(values, batch_first=self.batch_first, padding_value=self.pad_value)
-        
-        return self._pad_and_stack(values, group_size, self.pad_value)
-        
-
-
-# Registry mapping sample keys to their corresponding processor.
-KEY_PROCESSORS: Dict[str, KeyProcessor] = {
-    "pixel_values": StackProcessor(),
-    "pixel_values_videos": StackProcessor(),
-    "input_ids": PaddingProcessor(pad_value=0),
-    "attention_mask": PaddingProcessor(pad_value=0),
-    "loss_mask": PaddingProcessor(pad_value=0),
-    "labels": PaddingProcessor(pad_value=-100),
-}
