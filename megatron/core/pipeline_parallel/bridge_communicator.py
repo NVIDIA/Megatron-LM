@@ -38,14 +38,14 @@ class BridgeCommunicator:
         src_module_name: Optional[str] = None,
         dest_module_name: Optional[str] = None,
     ):
-        """Initialize the bridge communicator between source and destination grids with different(TP/DP/PP/CP).
+        """Initialize the bridge communicator between source and destination grids.
 
         CP is not supported yet. Will be added in follow up PR.
 
         Args:
             src_grid: Source HyperCommGrid
             dest_grid: Destination HyperCommGrid
-            dim_mapping: Dictionary mapping logical dimensions to tensor axes. 
+            dim_mapping: Dictionary mapping logical dimensions to tensor axes.
                         Expected keys: 's' (sequence), 'b' (batch), 'h' (hidden).
                         Defaults to {'s': 1, 'b': 0, 'h': 2} if None.
         """
@@ -98,7 +98,8 @@ class BridgeCommunicator:
                 dest_grid_broadcast_ranks_list, backend='nccl'
             )
             self.dest_grid_broadcast_ranks = next(
-                (ranks for ranks in dest_grid_broadcast_ranks_list if self.current_rank in ranks), []
+                (ranks for ranks in dest_grid_broadcast_ranks_list if self.current_rank in ranks),
+                [],
             )
 
         self.src_tp_leaders, self.src_local_leader_rank = self.get_leader_rank(
@@ -154,7 +155,7 @@ class BridgeCommunicator:
 
     def get_boundary_pp_stage_ranks(self, grid: HyperCommGrid, is_src: bool):
         """Get TP-CP ranks at boundary PP stage for each DP replica.
-        
+
         Returns ranks at the last PP stage (if src) or first PP stage (if dest)
         for each DP dimension, ordered by DP dimension.
         """
@@ -192,7 +193,7 @@ class BridgeCommunicator:
 
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
-        return (grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size))
+        return grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size)
 
     def build_comm_map(self, src_tp_leaders: List[int], dest_tp_leaders: List[int]):
         """Get src/dest tp leaders and populate comm_map for each rank.
@@ -314,9 +315,7 @@ class BridgeCommunicator:
             received_tensors_list = []
             for src_rank, shape in zip(rank_info.recv_from_ranks, recv_forward_shapes):
                 tensor_to_recv = torch.empty(
-                    shape,
-                    device=torch.cuda.current_device(),
-                    dtype=self.comm_dtype,
+                    shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
                 )
                 dist.recv(tensor_to_recv, src=src_rank)
                 logging.debug(
@@ -551,9 +550,7 @@ class BridgeCommunicator:
                     )
                     # Receive gradient
                     ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.irecv, grad_tensor, dest_rank
-                        )
+                        torch.distributed.P2POp(torch.distributed.irecv, grad_tensor, dest_rank)
                     )
 
                 logging.debug(
@@ -667,9 +664,7 @@ class BridgeCommunicator:
                 ):
                     # Send gradient
                     ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.isend, gradient_split, src_rank
-                        )
+                        torch.distributed.P2POp(torch.distributed.isend, gradient_split, src_rank)
                     )
 
                     # Receive activation
@@ -687,7 +682,6 @@ class BridgeCommunicator:
                 reqs = torch.distributed.batch_isend_irecv(ops)
                 for req in reqs:
                     req.wait()
-
 
                 # Concatenate received activations
                 aggregated_activation = torch.cat(received_activations_list, dim=0)
@@ -833,7 +827,6 @@ class BridgeCommunicator:
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
                 req.wait()
-
 
         # Extract shapes from received tensors
         for forward_shape_tensor in recv_forward_shape_tensors:
