@@ -20,12 +20,12 @@ class RankCommInfo:
 
 
 class BridgeCommunicator:
-    """Communication of activations and gradients between two modules with different(TP/DP/PP/CP).
+    """Pipeline Communicator between two modules with different(TP/DP/PP/CP).
 
-    The role of BridgeCommunicator:
-    - Initializes the communicator between a pair of source and destination grids
-    - Builds a communication schedule for each rank
-    - Provides public methods: send_forward, recv_forward, send_forward_recv_backward,
+    BridgeCommunicator:
+    - Initialize the communicator between a pair of source and destination grids
+    - Build a communication schedule for each rank
+    - Provide public methods: send_forward, recv_forward, send_forward_recv_backward,
       send_backward_recv_forward to be used by the pipeline schedule.
     """
 
@@ -38,12 +38,16 @@ class BridgeCommunicator:
         src_module_name: Optional[str] = None,
         dest_module_name: Optional[str] = None,
     ):
-        """Initialize the bridge communicator between source and destination grids.
+        """Initialize the bridge communicator between source and destination grids with different(TP/DP/PP/CP).
+
+        CP is not supported yet. Will be added in follow up PR.
 
         Args:
             src_grid: Source HyperCommGrid
             dest_grid: Destination HyperCommGrid
-            dim_mapping: Dictionary mapping parallelism types to tensor dimensions
+            dim_mapping: Dictionary mapping logical dimensions to tensor axes. 
+                        Expected keys: 's' (sequence), 'b' (batch), 'h' (hidden).
+                        Defaults to {'s': 1, 'b': 0, 'h': 2} if None.
         """
         self.src_grid = src_grid
         self.dest_grid = dest_grid
@@ -51,16 +55,16 @@ class BridgeCommunicator:
         self.dest_module_name = dest_module_name
         self.comm_dtype = comm_dtype
 
-        # TODO - CP support will be added in follow up PR.
+        # TODO (ykarnati, pthombre) - CP support will be added in follow up PR.
         if 'cp' in self.src_grid.dim_names:
             assert self.src_grid.shape[self.src_grid.dim_names.index('cp')] == 1, (
-                f"Src grid CP size must be 1, got "
+                f"Source grid CP size must be 1, got "
                 f"{self.src_grid.shape[self.src_grid.dim_names.index('cp')]}"
             )
 
         if 'cp' in self.dest_grid.dim_names:
             assert self.dest_grid.shape[self.dest_grid.dim_names.index('cp')] == 1, (
-                f"Dest grid CP size must be 1, got "
+                f"Destination grid CP size must be 1, got "
                 f"{self.dest_grid.shape[self.dest_grid.dim_names.index('cp')]}"
             )
 
@@ -80,18 +84,22 @@ class BridgeCommunicator:
         )
 
         self.src_grid_broadcast_ranks = []
-        self.dest_grid_broadcast_ranks = []
-        for src_grid_broadcast_ranks in src_grid_broadcast_ranks_list:
-            pg = dist.new_group(ranks=src_grid_broadcast_ranks, backend='nccl')
-            if self.current_rank in src_grid_broadcast_ranks:
-                self.src_grid_broadcast_ranks = src_grid_broadcast_ranks
-                self.src_grid_broadcast_pg = pg
+        if src_grid_broadcast_ranks_list:
+            self.src_grid_broadcast_pg, _ = dist.new_subgroups_by_enumeration(
+                src_grid_broadcast_ranks_list, backend='nccl'
+            )
+            self.src_grid_broadcast_ranks = next(
+                (ranks for ranks in src_grid_broadcast_ranks_list if self.current_rank in ranks), []
+            )
 
-        for dest_grid_broadcast_ranks in dest_grid_broadcast_ranks_list:
-            pg = dist.new_group(ranks=dest_grid_broadcast_ranks, backend='nccl')
-            if self.current_rank in dest_grid_broadcast_ranks:
-                self.dest_grid_broadcast_ranks = dest_grid_broadcast_ranks
-                self.dest_grid_broadcast_pg = pg
+        self.dest_grid_broadcast_ranks = []
+        if dest_grid_broadcast_ranks_list:
+            self.dest_grid_broadcast_pg, _ = dist.new_subgroups_by_enumeration(
+                dest_grid_broadcast_ranks_list, backend='nccl'
+            )
+            self.dest_grid_broadcast_ranks = next(
+                (ranks for ranks in dest_grid_broadcast_ranks_list if self.current_rank in ranks), []
+            )
 
         self.src_tp_leaders, self.src_local_leader_rank = self.get_leader_rank(
             self.src_grid, is_src=True
@@ -145,11 +153,14 @@ class BridgeCommunicator:
         return leader_ranks, local_leader_rank
 
     def get_boundary_pp_stage_ranks(self, grid: HyperCommGrid, is_src: bool):
-        """Get ranks of tp-cp corresponding to last stage
-        of pp for the current grid for each dp dimension, ordered by the dp dimension"""
+        """Get TP-CP ranks at boundary PP stage for each DP replica.
+        
+        Returns ranks at the last PP stage (if src) or first PP stage (if dest)
+        for each DP dimension, ordered by DP dimension.
+        """
 
-        # Get tp-cp groups (each group has same dp and pp, different tp and cp)
-        tpcp_groups = grid._gen_rank_enum(['tp', 'cp'])
+        # Get tp-cp rank enumeration (each list has same dp and pp, different tp and cp)
+        tpcp_rank_lists = grid._gen_rank_enum(['tp', 'cp'])
         pp_size = grid.shape[grid.dim_names.index('pp')]
 
         # Determine boundary pp stage
@@ -157,11 +168,11 @@ class BridgeCommunicator:
 
         boundary_pp_stage_ranks = []
 
-        for group in tpcp_groups:
-            # We can check any rank in the group since they all have the same pp coordinate
-            if len(group) == 0:
+        for rank_list in tpcp_rank_lists:
+            # We can check any rank in the list since they all have the same pp coordinate
+            if not rank_list:
                 continue
-            sample_rank = group[0]
+            sample_rank = rank_list[0]
             # Calculate rank coordinates
             rank_coords = []
             temp_rank = sample_rank - grid.rank_offset
@@ -174,14 +185,14 @@ class BridgeCommunicator:
             pp_coord = rank_coords[grid.dim_names.index('pp')]
 
             if pp_coord == boundary_pp_stage:
-                # This group is at the boundary pp stage, add all ranks from this group
-                boundary_pp_stage_ranks.append(group)
+                # This rank list is at the boundary pp stage, add all ranks from this list
+                boundary_pp_stage_ranks.append(rank_list)
 
         return boundary_pp_stage_ranks
 
     def is_current_rank_in_grid(self, grid: HyperCommGrid) -> bool:
         """Check if the current rank is in the grid."""
-        return grid.rank_offset <= self.current_rank < grid.rank_offset + grid.size
+        return (grid.rank_offset <= self.current_rank < (grid.rank_offset + grid.size))
 
     def build_comm_map(self, src_tp_leaders: List[int], dest_tp_leaders: List[int]):
         """Get src/dest tp leaders and populate comm_map for each rank.
@@ -209,7 +220,7 @@ class BridgeCommunicator:
 
         all_ranks = src_all_ranks + dest_all_ranks
 
-        # Initialize all ranks as NOOP by default
+        # Initialize all ranks as MEMBER by default
         for rank in all_ranks:
             self.comm_map[rank] = RankCommInfo(role='MEMBER')
 
@@ -264,8 +275,7 @@ class BridgeCommunicator:
             if num_sends > 0:
                 tensor_splits = self._split_tensor_at_batch_dim(tensor_to_send, num_sends)
                 self._communicate_shapes(tensor_to_send_next=tensor_splits[0])
-                for i, dest_rank in enumerate(rank_info.send_to_ranks):
-                    tensor_split = tensor_splits[i]
+                for dest_rank, tensor_split in zip(rank_info.send_to_ranks, tensor_splits):
                     logging.debug(
                         f"[Bridge Comunicator] [send_forward] Rank {self.current_rank} "
                         f"send to rank {dest_rank}"
@@ -302,9 +312,9 @@ class BridgeCommunicator:
                 f"received forward shapes {recv_forward_shapes} and grad shapes {recv_grad_shapes}"
             )
             received_tensors_list = []
-            for i, src_rank in enumerate(rank_info.recv_from_ranks):
+            for src_rank, shape in zip(rank_info.recv_from_ranks, recv_forward_shapes):
                 tensor_to_recv = torch.empty(
-                    recv_forward_shapes[i],
+                    shape,
                     device=torch.cuda.current_device(),
                     dtype=self.comm_dtype,
                 )
@@ -383,8 +393,7 @@ class BridgeCommunicator:
             tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
             self._communicate_shapes(tensor_to_send_prev=tensor_splits[0])
             if num_receives > 0:
-                for i, src_rank in enumerate(rank_info.recv_from_ranks):
-                    tensor_split = tensor_splits[i]
+                for src_rank, tensor_split in zip(rank_info.recv_from_ranks, tensor_splits):
                     # Send the gradient split back to the source rank
                     logging.debug(
                         f"[Bridge Communicator] [send_backward] Rank {self.current_rank} "
@@ -425,10 +434,10 @@ class BridgeCommunicator:
             )
             # Receive gradient tensors from destination ranks
             received_gradients_list = []
-            for i, dest_rank in enumerate(rank_info.send_to_ranks):
+            for dest_rank, grad_shape in zip(rank_info.send_to_ranks, recv_grad_shapes):
                 # The destination rank that we sent to will send us gradients back
                 grad_tensor = torch.empty(
-                    recv_grad_shapes[i], device=torch.cuda.current_device(), dtype=self.comm_dtype
+                    grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
                 )
                 dist.recv(grad_tensor, src=dest_rank)
                 logging.debug(
@@ -531,17 +540,19 @@ class BridgeCommunicator:
 
                 # Create batch P2P operations for simultaneous send/receive
                 ops = []
-                for i, dest_rank in enumerate(rank_info.send_to_ranks):
+                for dest_rank, activation_split, grad_tensor in zip(
+                    rank_info.send_to_ranks, activation_splits, received_gradients_list
+                ):
                     # Send activation
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.isend, activation_splits[i], dest_rank
+                            torch.distributed.isend, activation_split, dest_rank
                         )
                     )
                     # Receive gradient
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.irecv, received_gradients_list[i], dest_rank
+                            torch.distributed.irecv, grad_tensor, dest_rank
                         )
                     )
 
@@ -552,9 +563,6 @@ class BridgeCommunicator:
                 reqs = torch.distributed.batch_isend_irecv(ops)
                 for req in reqs:
                     req.wait()
-
-                # To protect against race condition when using batch_isend_irecv()
-                torch.cuda.synchronize()
 
                 # Concatenate received gradients
                 aggregated_gradient = torch.cat(received_gradients_list, dim=0)
@@ -654,18 +662,20 @@ class BridgeCommunicator:
 
                 # Create batch P2P operations for simultaneous send/receive
                 ops = []
-                for i, src_rank in enumerate(rank_info.recv_from_ranks):
+                for src_rank, gradient_split, activation_tensor in zip(
+                    rank_info.recv_from_ranks, gradient_splits, received_activations_list
+                ):
                     # Send gradient
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.isend, gradient_splits[i], src_rank
+                            torch.distributed.isend, gradient_split, src_rank
                         )
                     )
 
                     # Receive activation
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.irecv, received_activations_list[i], src_rank
+                            torch.distributed.irecv, activation_tensor, src_rank
                         )
                     )
 
@@ -678,8 +688,6 @@ class BridgeCommunicator:
                 for req in reqs:
                     req.wait()
 
-                # To protect against race condition when using batch_isend_irecv()
-                torch.cuda.synchronize()
 
                 # Concatenate received activations
                 aggregated_activation = torch.cat(received_activations_list, dim=0)
@@ -821,14 +829,11 @@ class BridgeCommunicator:
                     )
 
         # Execute all operations in a single batch
-        if len(ops) > 0:
+        if ops:
             reqs = torch.distributed.batch_isend_irecv(ops)
             for req in reqs:
                 req.wait()
 
-        # To protect against race condition when using batch_isend_irecv()
-        # Following the pattern from the original p2p communication code
-        # torch.cuda.synchronize()
 
         # Extract shapes from received tensors
         for forward_shape_tensor in recv_forward_shape_tensors:
