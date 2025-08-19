@@ -112,7 +112,8 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         padded_vocab_size=args.padded_vocab_size,
         inference_max_requests=args.inference_max_batch_size,
         inference_max_seq_length=args.inference_max_seq_length,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
     )
 
     if args.engine_type == "static":

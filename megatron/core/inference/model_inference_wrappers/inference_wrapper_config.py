@@ -38,6 +38,8 @@ class InferenceWrapperConfig:
     """When using symmetric all reduce kernels we keep the default all reduces for nccl. 
     This can be more effecient for large prefill sizes"""
 
+    moe_pad_experts_for_cuda_graph_inference: bool = False
+
     def add_attributes(self, attribute_value_pair: dict):
         """Utility to add more attributes to inference params
 

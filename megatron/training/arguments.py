@@ -2815,6 +2815,8 @@ def _add_moe_args(parser):
     group.add_argument('--moe-upcycling-granularity', type=int, default=1,
                        help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
                        'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.')
+    group.add_argument('--moe-pad-experts-for-cuda-graph-inference', action='store_true',
+                       help='Pads the input for each expert during decode for cudagraphs')
     return parser
 
 def _add_mla_args(parser):

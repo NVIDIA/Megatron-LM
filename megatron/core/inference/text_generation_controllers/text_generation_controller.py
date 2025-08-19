@@ -25,6 +25,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.utils import get_model_config
 
 
@@ -55,6 +56,95 @@ class TextGenerationController:
         self.model_is_pipeline_parallel = not (
             is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)
         )
+
+        # Initialize cache for sequence parallel modules
+        self.moe_layer_cache = None
+
+    def init_moe_expert_cache(self):
+        """
+        Initialize the cache of MoE layers once
+        """
+        if self.moe_layer_cache is not None:
+            return  # already initialized
+
+        # Cache for moe layers.
+        # TODO(peter) do we need to cache sync point to fix
+        self.moe_layer_cache = []
+        seen_modules = set()
+
+        model = self.inference_wrapped_model.model.module
+
+        def walk(module):
+            # Collect from MoELayer fields
+            if isinstance(module, MoELayer):
+                oid = id(module)
+                if oid not in seen_modules:
+                    self.moe_layer_cache.append(module)
+
+            for child in module.children():
+                walk(child)
+
+        walk(model)
+
+    def set_decode_expert_padding(self, set_to: bool = False, capacity_factor=None):
+        """
+        Toggle MoE drop+pad at the decode boundary.
+
+        NO-DROP setting at decode:
+        capacity_factor = max_batchsize
+        The same factor is applied to BOTH the router and all token dispatchers
+        to keep capacity and shapes consistent.
+
+        When enabling, we also clear variable-size dispatcher metadata
+        so decode starts clean and capture-safe.
+        """
+        if self.moe_layer_cache is None:
+            self.init_moe_expert_cache()
+
+        cfg = get_model_config(self.inference_wrapped_model.model)
+        # unified no-drop factor used by router and dispatchers
+
+        # Flip global/config knobs read by the router
+        cfg.moe_pad_expert_input_to_capacity = bool(set_to)
+        cfg.moe_expert_capacity_factor = capacity_factor
+
+        # Update all token dispatchers
+        for moe_layer in self.moe_layer_cache:
+
+            dispatcher = moe_layer.token_dispatcher
+            # turn padding on/off
+            dispatcher.drop_and_pad = bool(set_to)
+
+            # make sure attribute exists even if class didn't define it
+            setattr(dispatcher, "moe_expert_capacity_factor", capacity_factor)
+
+            # Check fliping the modules config
+            if hasattr(dispatcher, "config"):
+                dispatcher.config.moe_pad_expert_input_to_capacity = bool(set_to)
+                dispatcher.config.moe_expert_capacity_factor = capacity_factor
+
+            # TODO (peter): Do we need to clear for next prefill
+            if set_to:
+                # clear any variable-size metadata from dropless prefill
+                for attr in (
+                    "input_splits",
+                    "output_splits",
+                    "output_splits_tp",
+                    "tokens_per_expert",
+                    "num_global_tokens_per_local_expert",
+                    "reversed_local_input_permutation_mapping",
+                    "capacity",
+                ):
+                    if hasattr(dispatcher, attr):
+                        setattr(dispatcher, attr, None)
+                if hasattr(dispatcher, "cuda_sync_point"):
+                    dispatcher.cuda_sync_point = "no_sync"
+
+            router = moe_layer.router
+            setattr(router, "moe_expert_capacity_factor", capacity_factor)
+            if hasattr(router, "config"):
+                router.config.moe_expert_capacity_factor = capacity_factor
+                router.config.moe_pad_expert_input_to_capacity = bool(set_to)
 
     def tokenize_prompt(
         self, prompt: str, add_BOS: bool = False
@@ -628,6 +718,13 @@ class TextGenerationController:
                 not self.inference_wrapped_model.inference_context.is_decode_only()
             ), f"Generation must start in prefill mode"
 
+            # Setting padding off for prefill if
+            moe_pad_experts_for_cuda_graph_inference = (
+                self.inference_wrapped_model.inference_wrapper_config.moe_pad_experts_for_cuda_graph_inference
+            )
+            if moe_pad_experts_for_cuda_graph_inference:
+                self.set_decode_expert_padding(False)
+
             # If using symmetric kernels and we are using using nccl
             # for prefill turn off symmetric kernels
             symmetric_ar_type = get_model_config(
@@ -794,6 +891,8 @@ class TextGenerationController:
                 # Change to decode mode if all prefill is complete
                 if torch.all(generation_started):
                     self.inference_wrapped_model.inference_context.enable_decode_mode()
+                    if moe_pad_experts_for_cuda_graph_inference:
+                        self.set_decode_expert_padding(True, capacity_factor=padded_batch_size)
 
                 context_end_position = context_start_position + 1
                 if context_end_position >= max_sequence_length:

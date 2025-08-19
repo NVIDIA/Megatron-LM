@@ -72,6 +72,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
         inference_max_seq_length=args.inference_max_seq_length,
         inference_max_requests=args.inference_max_batch_size,
         nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
+        moe_pad_experts_for_cuda_graph_inference = args.moe_pad_experts_for_cuda_graph_inference
     )
 
     inference_wrapped_model = ModelInferenceWrapperServer(model, inference_wrapper_config)
