@@ -102,7 +102,6 @@ class DynamicInferenceEngine(AbstractEngine):
                 "> dynamic_engine.py: building cuda graphs for %d batch size(s): %s."
                 % (len(context.cuda_graph_token_counts), context.cuda_graph_token_counts)
             )
-
             for warmup_engine_mode in [WarmupEngineMode.DECODE, WarmupEngineMode.NON_DECODE]:
                 # Iterate cuda graph dims.
                 if (
