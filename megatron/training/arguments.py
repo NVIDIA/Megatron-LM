@@ -2344,7 +2344,8 @@ def _add_training_args(parser):
                        'processed in different batch configurations. This is more strict than deterministic-mode '
                        'which only ensures bitwise identical results when the same inputs are processed in the same batch configuration. '
                        'This will significantly affect speed of training and inference as the kernels are not full optimized.')
-
+    group.add_argument('--activation-func-fp8-input-store', action='store_true',
+                       help='Store swiglu inputs in fp8 to save activation memory.')
 
     return parser
 
