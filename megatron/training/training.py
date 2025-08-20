@@ -2771,8 +2771,11 @@ def evaluate_and_print_results(
         torch.distributed.broadcast(eval_iters, 0)
         eval_iters = eval_iters.tolist()
         args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
-    
-    for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
+
+    if not args.multiple_validation_sets:
+        args.eval_iters = [args.eval_iters]
+
+    for index, (iterator, iterations) in enumerate(zip(data_iterators, args.eval_iters)): 
         suffix = ""
         if args.multiple_validation_sets:
             suffix = f"-{index}"
