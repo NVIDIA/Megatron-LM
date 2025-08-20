@@ -1812,7 +1812,8 @@ def _add_training_args(parser):
                        'to recompute within each pipeline stage.')
     group.add_argument('--recompute-modules', nargs='*', type=str, default=None,
                        help='The submodules to recompute. '
-                       'choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe". '
+                       'choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", '
+                       '         "mlp", "moe", "shared_experts". '
                        'default: ["core_attn"].'
                        '"core_attn": recompute the core attention part of the transformer layer. '
                        '"moe_act": recompute the MoE MLP activation function. '
@@ -1820,8 +1821,9 @@ def _add_training_args(parser):
                        '"mla_up_proj": recompute the MLA up projection and RoPE applying parts.'
                        '"mlp": recompute the dense MLP layer.'
                        '"moe": recompute the MoE layer.'
+                       '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
-                       '"core_attn", "mlp", and "moe" uses normal checkpointing.')
+                       '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
