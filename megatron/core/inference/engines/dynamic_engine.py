@@ -1,6 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import multiprocessing
+import os
+import struct
 from collections import deque
 from datetime import datetime
 from itertools import repeat
@@ -10,6 +13,7 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from megatron.core import parallel_state
 from megatron.core.inference.contexts.dynamic_context import (
     ChunkOverflowError,
     DynamicInferenceContext,
@@ -17,7 +21,11 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
+from megatron.core.inference.data_parallel_inference_coordinator import (
+    DataParallelInferenceCoordinator,
+)
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.simple_text_generation_controller import (
@@ -32,6 +40,20 @@ try:
     HAVE_TQDM = True
 except:
     HAVE_TQDM = False
+
+try:
+    import zmq
+
+    HAVE_ZMQ = True
+except:
+    HAVE_ZMQ = False
+
+try:
+    import msgpack
+
+    HAVE_MSGPACK = True
+except:
+    HAVE_MSGPACK = False
 
 
 class DynamicInferenceEngine(AbstractEngine):
@@ -82,6 +104,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.request_completion_futures: Dict[int, asyncio.Future] = {}
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
+        self.paused = False
+        self.stopped = False
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -137,6 +161,135 @@ class DynamicInferenceEngine(AbstractEngine):
             # Create cuda graphs.
             with torch.inference_mode():
                 create_cudagraphs()
+
+    async def start_listening_to_data_parallel_coordinator(
+        self,
+        sampling_params: SamplingParams,
+        inference_coordinator_port: int,
+        launch_inference_coordinator: bool = True,
+    ):
+        """Initializes ZMQ communication to connect the engine with an inference coordinator.
+
+        This asynchronous method sets up the distributed communication infrastructure
+        that allows this inference engine to act as a worker under a central
+        `InferenceCoordinator`. It configures different ZMQ socket patterns
+        based on the rank's role within the distributed topology.
+
+        The setup involves two primary roles within each data-parallel group:
+        1.  **TP Coordinator (TP_rank=0, PP_rank=0)**: This rank connects directly
+            to the central coordinator via a ZMQ `DEALER` socket. It receives
+            requests and uses a ZMQ `PUB` (publisher) socket to broadcast them
+            to all other ranks within its tensor-parallel (TP) group.
+        2.  **TP Workers (all other ranks)**: These ranks use ZMQ `SUB` (subscriber)
+            sockets to listen for requests broadcast by their local TP Coordinator.
+
+        This architecture uses fast Inter-Process Communication (`ipc`) sockets for
+        intra-node broadcasts within a TP group.
+
+        Finally, after setting up the communication channels and ensuring all ranks
+        are synchronized, this method starts the main engine processing loop
+        (`self.run_engine`) as a background asyncio task.
+
+        Args:
+            sampling_params (SamplingParams): The default sampling parameters to be
+                used for inference, passed to the engine's main loop.
+            inference_coordinator_port (int): The network port where the central
+                `InferenceCoordinator` is or will be listening.
+            launch_inference_coordinator (bool, optional): If True, the global rank 0
+                process will spawn and manage the `InferenceCoordinator`
+                process. Defaults to True.
+
+        Note:
+            The current implementation uses `ipc` sockets for broadcasting requests
+            within a Tensor Parallel group, which limits each TP group to a single
+            physical node. For example, if you have 8 GPUs per node, then this will only
+            work with TP=[1,2,4,8]
+        """
+
+        assert HAVE_ZMQ, (
+            "please install the pyzmq library to use InferenceCoordinator\n" "pip install pyzmq"
+        )
+        assert HAVE_MSGPACK, (
+            "please install the messagepack library to use InferenceCoordinator\n"
+            "pip install msgpack"
+        )
+
+        if launch_inference_coordinator and torch.distributed.get_rank() == 0:
+            spawn_context = multiprocessing.get_context('spawn')
+            coordinator_ready_event = spawn_context.Event()
+            self.inference_coordinator_process = spawn_context.Process(
+                target=DataParallelInferenceCoordinator.entrypoint,
+                args=(
+                    coordinator_ready_event,
+                    self.controller.tokenizer,
+                    inference_coordinator_port,
+                    parallel_state.get_data_parallel_world_size(),
+                ),
+            )
+            self.inference_coordinator_process.start()
+
+        # Todo [Siddharth]: can we move this code to another file?
+        self.zmq_context = zmq.Context()
+        self.zmq_sockets = []  # keep track of all sockets created by this engine
+        ip_address_of_dp_coordinator = os.getenv('MASTER_ADDR', '127.0.0.1')
+        identity = f'tp-coord-{parallel_state.get_data_parallel_rank()}'
+        if (
+            parallel_state.get_tensor_model_parallel_rank() == 0
+            and parallel_state.get_pipeline_model_parallel_rank() == 0
+        ):
+            # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
+            #    These will receive requests from an InferenceCoordinator.
+            self.socket_for_receiving_requests = self.zmq_context.socket(zmq.DEALER)
+
+            self.socket_for_receiving_requests.setsockopt(zmq.IDENTITY, identity.encode('utf-8'))
+            self.socket_for_receiving_requests.connect(
+                f"tcp://{ip_address_of_dp_coordinator}:{inference_coordinator_port}"
+            )
+
+            # send empty string. this is used to register with the coordinator.
+            self.socket_for_receiving_requests.send(b"")
+
+            # 2. Create a publisher socket. This is used to publish or broadcast
+            #    requests within the tensor parallel group
+            self.tensor_parallel_publisher_socket = self.zmq_context.socket(zmq.PUB)
+            self.tensor_parallel_publisher_socket.bind(f"ipc:///tmp/{identity}-tp-bcast-socket-req")
+
+            # 3. Create another publisher socket to broadcast the number of messages to receive.
+            self.tensor_parallel_num_msgs_publisher_socket = self.zmq_context.socket(zmq.PUB)
+            self.tensor_parallel_num_msgs_publisher_socket.bind(
+                f"ipc:///tmp/{identity}-tp-bcast-socket-len"
+            )
+            self.zmq_sockets += [
+                self.socket_for_receiving_requests,
+                self.tensor_parallel_num_msgs_publisher_socket,
+                self.tensor_parallel_publisher_socket,
+            ]
+        # All TP ranks subscribe to the two publisher sockets
+        self.tensor_parallel_subscriber_socket = self.zmq_context.socket(zmq.SUB)
+        self.tensor_parallel_subscriber_socket.connect(f"ipc:///tmp/{identity}-tp-bcast-socket-req")
+        self.tensor_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+
+        self.tensor_parallel_num_msgs_subscriber_socket = self.zmq_context.socket(zmq.SUB)
+        self.tensor_parallel_num_msgs_subscriber_socket.connect(
+            f"ipc:///tmp/{identity}-tp-bcast-socket-len"
+        )
+        self.tensor_parallel_num_msgs_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+
+        self.zmq_sockets += [
+            self.tensor_parallel_subscriber_socket,
+            self.tensor_parallel_num_msgs_subscriber_socket,
+        ]
+
+        torch.distributed.barrier(parallel_state.get_tensor_model_parallel_group())
+
+        if launch_inference_coordinator and torch.distributed.get_rank() == 0:
+            coordinator_ready_event.wait()
+            print("Inference co-ordinator is ready to receive requests!")
+
+        # Finally run the engine infinite loop
+        self.engine_loop_task = asyncio.create_task(
+            self.run_engine_with_coordinator(sampling_params)
+        )
 
     async def _notify_cond_for_new_request(self):
         """Helper function to notify condition variable when a new request is added."""
@@ -291,7 +444,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 break
 
     async def async_step(
-        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+        self,
+        sampling_params: SamplingParams,
+        *,
+        verbose: Optional[bool] = False,
+        post_process_requests_locally: bool = True,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -319,7 +476,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Generate tokens.
         is_decode_only = self.context.is_decode_only()
         self.step_start_event.record()
-        result = self.controller.generate_output_tokens_dynamic_batch(
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(
             sampling_params, self.termination_id
         )
         self.step_end_event.record()
@@ -330,13 +487,19 @@ class DynamicInferenceEngine(AbstractEngine):
             request_ids, finished_request_ids, sample, log_probs = result
 
             # TODO: Move this to a background thread?
-            (active_requests, finished_requests) = self.post_process_requests(
-                request_ids, finished_request_ids, step_time, sample, log_probs
-            )
+            self.schedule_waiting_requests()
 
             # TODO: Move this to a background thread?
-            self.schedule_waiting_requests()
+            if post_process_requests_locally:
+                (active_requests, finished_requests) = self.post_process_requests(
+                    request_ids, finished_request_ids, step_time, sample, log_probs
+                )
+            else:
+                return request_ids, finished_request_ids, sample, log_probs
+
         else:
+            if not post_process_requests_locally:
+                return None
             active_requests: List[DynamicInferenceRequest] = []
             finished_requests: List[DynamicInferenceRequest] = []
 
@@ -410,6 +573,101 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_requests_list
 
+    def schedule_requests(self) -> int:
+        """Drains the ZMQ socket for a batch of requests and adds them to the engine.
+
+        This method is a collective and synchronous operation that must be called
+        by all ranks in a Tensor Parallel (TP) group at the same time. It ensures
+        that all ranks process the exact same batch of incoming requests and
+        control signals.
+
+        The synchronization works as follows:
+        1.  The TP rank 0 drains all pending messages from its subscriber socket
+            in a non-blocking manner.
+        2.  TP rank 0 then broadcasts the number of messages it received to all other
+            ranks in its TP group using a dedicated publisher socket.
+        3.  The other TP ranks wait to receive this count, and then receive exactly
+            that many messages from their subscriber sockets.
+
+        Once all ranks have the same batch of messages, they are unpacked and
+        processed. New requests are added to the engine's queue, and control
+        signals (PAUSE, STOP, UNPAUSE) update the engine's internal state.
+
+        Note:
+            This function is synchronous and must be called collectively by all
+            ranks in a TP group. It should not be launched in a separate coroutine
+            to ensure all ranks execute it in lockstep before proceeding to the
+            next engine step.
+
+        Returns:
+            int: The number of messages that were received and processed in this batch.
+        """
+
+        rank = parallel_state.get_tensor_model_parallel_rank()
+        torch.cuda.nvtx.range_push("drain_zmq_socket")
+        all_messages = []
+        if rank == 0:
+            while True:
+                try:
+                    # Receive messages in a non-blocking way.
+                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
+                except zmq.Again:
+                    # This exception is hit as soon as the socket is empty.
+                    break
+            messages_to_dequeue = len(all_messages)
+            # First publish the number of messages to dequeue.
+            # This is important because we want all tensor parallel ranks
+            # to dequeue the same number of messages.
+            self.tensor_parallel_num_msgs_publisher_socket.send(
+                struct.pack('!i', messages_to_dequeue)
+            )
+            # Now publish the actual messages to all tensor parallel ranks
+            for message in all_messages:
+                self.tensor_parallel_publisher_socket.send(message)
+        else:
+            # First, receive the number of messages to dequeue from tp-rank 0
+            messages_to_dequeue = struct.unpack(
+                '!i', self.tensor_parallel_num_msgs_subscriber_socket.recv()
+            )[0]
+            # Now, dequeue the same number of messages from the subscriber socket.
+            # Note that these receives are blocking, because the messages
+            # are guaranteed to be available after the tp-rank 0 has sent them.
+            for _ in range(messages_to_dequeue):
+                all_messages.append(self.tensor_parallel_subscriber_socket.recv())
+
+        torch.cuda.nvtx.range_pop()
+        for message in all_messages:
+            data = msgpack.unpackb(message, raw=False)
+            header = Headers(data[0])
+            if header == Headers.SUBMIT_REQUEST:
+                request_id, prompt, sampling_params = data[1:]
+                sampling_params = SamplingParams.deserialize(sampling_params)
+                self.add_request(request_id, prompt, sampling_params.num_tokens_to_generate)
+            elif header == Headers.PAUSE:
+                self.paused = True
+            elif header == Headers.STOP:
+                self.stopped = True
+            elif header == Headers.UNPAUSE:
+                self.paused = False
+
+        return len(all_messages)
+
+    def stop(self):
+        """
+        Stops the inference engine by terminating the inference coordinator process
+        if it exists, and destroys the model parallel state.
+        This method ensures that any running inference coordinator subprocess
+        is properly terminated, and cleans up resources associated with
+        model parallelism.
+        """
+
+        if hasattr(self, "inference_coordinator_process"):
+            self.inference_coordinator_process.terminate()
+        for socket in self.zmq_sockets:
+            socket.close()
+        self.zmq_context.term()
+        parallel_state.destroy_model_parallel()
+
     async def run_engine(self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False):
         """Continually steps the engine asynchronously."""
         try:
@@ -419,5 +677,64 @@ class DynamicInferenceEngine(AbstractEngine):
                     await self._cond.wait_for(lambda: self.context.get_active_request_count() > 0)
 
                 await self.async_step(sampling_params=sampling_params, verbose=verbose)
+        except asyncio.CancelledError:
+            pass
+
+    async def run_engine_with_coordinator(
+        self, sampling_params: SamplingParams, *, verbose: Optional[bool] = False
+    ):
+        """Continually steps the engine asynchronously."""
+        try:
+            while True:
+                self.schedule_requests()
+                if self.stopped:
+                    self.stop()
+                    return
+
+                # for the cases below (engine is paused or no active requests),
+                # do not use asyncio.sleep(0)
+                # as tp-rank=0 will flood the num_messages publisher
+                # with "0" repeatedly. This causes some packets to drop.
+                # Instead be nice, and sleep
+                # for a short time.
+                # The minimum sleep time needed is ~100us i.e. the time
+                # needed to send one message on an IPC socket. However
+                # just to be safe, we use 20ms here.
+
+                # todo [Siddharth]: Can this hardcoded sleep be avoided
+                # with asyncio zmq sockets?
+                if self.paused:
+                    await asyncio.sleep(0.02)
+                    continue
+
+                if self.context.get_active_request_count() == 0:
+                    await asyncio.sleep(0.02)
+                    continue
+                engine_output = await self.async_step(
+                    sampling_params=sampling_params,
+                    verbose=verbose,
+                    post_process_requests_locally=False,
+                )
+
+                is_tp0_and_pp0 = (
+                    parallel_state.get_tensor_model_parallel_rank() == 0
+                    and parallel_state.get_pipeline_model_parallel_rank() == 0
+                )
+                if is_tp0_and_pp0 and engine_output is not None:
+                    # return the engine output to the coordinator. The coordinator will take
+                    # care of the post-processing.
+                    request_ids, finished_request_ids, sample, logprobs = engine_output
+                    payload = msgpack.packb(
+                        [
+                            Headers.ENGINE_REPLY.value,
+                            request_ids.tolist(),
+                            finished_request_ids.tolist(),
+                            sample.tolist(),
+                            logprobs,
+                        ],
+                        use_bin_type=True,
+                    )
+                    self.socket_for_receiving_requests.send(payload)
+
         except asyncio.CancelledError:
             pass

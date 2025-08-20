@@ -37,3 +37,14 @@ class SamplingParams:
         """
         for key, value in attribute_value_pair.items():
             setattr(self, key, value)
+
+    def serializable(self) -> dict:
+        """Return a dictionary that is msgpack-serializable."""
+        return self.__dict__.copy()
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "SamplingParams":
+        """Construct SamplingParams from a msgpack-compatible dictionary."""
+        obj = cls()
+        obj.add_attributes(data)
+        return obj
