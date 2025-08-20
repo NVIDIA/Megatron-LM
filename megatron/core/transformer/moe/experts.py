@@ -133,6 +133,8 @@ class GroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
+        if self.activation_recompute and self.config.fp8:
+            raise ValueError("moe_act recompute for fp8 cannot work with the legacy GroupedMLP.")
 
         @jit_fuser
         def activation_func_with_probs(x, probs):
@@ -802,10 +804,6 @@ class TEGroupedMLP(MegatronModule):
         )
 
         self.activation_func = self.config.activation_func
-        self.activation_recompute = (
-            self.config.recompute_granularity == 'selective'
-            and "moe_act" in self.config.recompute_modules
-        )
 
         # TODO(Hepteract): pass model_comm_pgs to submodule after refactoring Linear modules
         self.linear_fc2 = build_module(
@@ -821,6 +819,15 @@ class TEGroupedMLP(MegatronModule):
             tp_comm_buffer_name='fc2',
             tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
+
+        self.activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "moe_act" in self.config.recompute_modules
+        )
+        if self.activation_recompute and self.config.fp8:
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+
+            set_save_original_input(self.linear_fc2)
 
         if self.config.fp8:
             assert HAVE_TE, "FP8 requires TE."

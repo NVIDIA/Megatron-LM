@@ -1935,3 +1935,23 @@ else:
     fused_topk_with_score_function = None
     fused_compute_score_for_moe_aux_loss = None
     fused_moe_aux_loss = None
+
+
+def set_save_original_input(module):
+    """
+    Set the module to save the original input tensors.
+
+    Some transformer-engine modules would save the quantized tensors by default in fp8 training.
+    This method is used to set these modules to save the original input tensors directly.
+
+    This can save the memory usage in some FP8 training scenarios, such as the attn linear_proj and
+    the shared experts.
+    The output-discarding recompute method also relies on this.
+    """
+    if hasattr(module, 'save_original_input'):
+        module.save_original_input = True
+    else:
+        raise ValueError(
+            "set_save_original_input is only needed on transformer-engine modules that save "
+            "quantized tensors by default. It needs transformer-engine>=2.6.0dev0."
+        )

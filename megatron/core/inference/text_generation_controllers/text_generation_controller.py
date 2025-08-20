@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import asyncio
 import concurrent
 import copy
 import functools
@@ -402,7 +403,7 @@ class TextGenerationController:
         return padded_batch_prompt_tokens[:original_batch_size]
 
     @torch.inference_mode()
-    def generate_output_tokens_dynamic_batch(
+    async def async_generate_output_tokens_dynamic_batch(
         self, sampling_params: SamplingParams, termination_id: int
     ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
         """Forward step the model and update the inference context.
@@ -480,6 +481,14 @@ class TextGenerationController:
                 pp_group=self.pp_group,
             )
 
+        # This is the best place to yield control back to event loop.
+        # At this point we have enqueued FW pass GPU kernels asynchronously.
+        # While they are running, we can do other useful CPU work.
+        # Note: This can be moved further ahead if sampling can be made
+        # asynchronous.
+        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
+        await asyncio.sleep(0)
+
         # Last token logits.
         if materialize_only_last_token_logits:
             # When materialize_only_last_token_logits is true, last_token_logits is
@@ -526,6 +535,15 @@ class TextGenerationController:
         context.update_requests(active_request_mask, new_sample_copy)
 
         return current_request_ids, finished_request_ids, new_sample, log_probs
+
+    @torch.inference_mode()
+    def generate_output_tokens_dynamic_batch(
+        self, sampling_params: SamplingParams, termination_id: int
+    ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
+        """Synchronous wrapper for `self.async_generate_output_tokens_dynamic_batch."""
+        return asyncio.get_running_loop().run_until_complete(
+            self.async_generate_output_tokens_dynamic_batch(sampling_params, termination_id)
+        )
 
     def _update_top_n_logprobs_dict(
         self,
