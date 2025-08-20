@@ -1733,6 +1733,14 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--muon-scale-mode', type=str, default='spectral',
+                       choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
+                       help='Scale mode for Muon optimizer')
+    group.add_argument('--muon-ns-fp32-matmul-prec', type=str, default='medium',
+                       choices=['low', 'medium', 'high'],
+                       help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-num-ns-steps', type=int, default=5,
+                       help='Number of Newton-Schulz steps for Muon optimizer')
     return parser
 
 
@@ -1961,7 +1969,7 @@ def _add_training_args(parser):
                        help='Enable bias only in the QKV linear layers',
                        dest='add_qkv_bias')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd'],
+                       choices=['adam', 'sgd', 'muon'],
                        help='Optimizer function')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')

@@ -41,7 +41,7 @@ from .optimizer import (
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
-
+from llm_shower.muon.muon import Muon
 logger = logging.getLogger(__name__)
 
 
@@ -755,3 +755,93 @@ def get_megatron_optimizer(
         )
 
     return ChainedOptimizer(optimizers)
+
+# self-contained change depends on this but doesn't modify existing function.
+# will move to optimizer implementation directory
+def get_emerging_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    no_weight_decay_cond: Optional[Callable] = None,
+    scale_lr_cond: Optional[Callable] = None,
+    lr_mult: float = 1.0,
+    use_gloo_process_groups: bool = True,
+    extra_args = None,
+) -> MegatronOptimizer:
+
+    # dist-optim is not supported due to strong coupling with how DDP init grad buffer
+    # in thoery we can put some weight to use non-dist-muon and rest to dist-adam
+    # but there are strong dependency and assumption in DDP that prevent it
+    if config.use_distributed_optimizer:
+        raise Exception('muon with dist optimizer is not supported.')
+
+    optimizers = []
+    # record list of non/linear params
+    linear_params = []
+    nonlinear_params = []
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            # TODO: revisit this condition. name?
+            if not getattr(param, 'is_embedding_or_output_parameter', False) and not (len(param.shape) == 1):
+                linear_params.append(param)
+            else:
+                nonlinear_params.append(param)
+
+    # freezing nonlinear params and get param groups for muon
+    for param in nonlinear_params:
+        param.requires_grad = False
+
+    # TODO: merge expert parallel group since dist-opt is off
+    linear_param_groups = _get_param_groups(
+        model_chunks,
+        no_weight_decay_cond,
+        scale_lr_cond,
+        lr_mult,
+        lr=config.lr,
+        min_lr=config.min_lr,
+        decoupled_lr=config.decoupled_lr,
+        decoupled_min_lr=config.decoupled_min_lr,
+    )
+
+    optimizer = Muon(
+        linear_param_groups,
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        momentum_beta=config.adam_beta1,
+        num_ns_steps=extra_args.muon_num_ns_steps,
+        ns_fp32_matmul_prec=extra_args.muon_ns_fp32_matmul_prec,
+        scale_mode=extra_args.muon_scale_mode,
+        split_qkv=False,
+        qkv_split_shapes=None,
+    )
+
+    # set config here to: 1. get adam later and 2. avoid ChainedOptimizer check fail
+    # side effect is muon optimizer will have wrong name str, i.e. config.optimizer == 'adam'
+    config.optimizer = 'adam'
+    # need to wrap into megatron mix precision optimizer. (only support bf16 w/o loss scale now)
+    if config.bf16:
+        optimizer = Float16OptimizerWithFloat16Params(optimizer, config, None, None)
+    else:
+        optimizer = FP32Optimizer(optimizer, config, None)
+
+    optimizers.append(optimizer)
+
+    # done with muon, unfreeze nonlinear and freeze linear
+    for param in nonlinear_params:
+        param.requires_grad = True
+    for param in linear_params:
+        param.requires_grad = False
+
+    # call original get. linear params will be skipped since they're freezed
+    chained_adam = get_megatron_optimizer(config, model_chunks, no_weight_decay_cond,
+                                          scale_lr_cond, lr_mult, use_gloo_process_groups)
+
+    # unfreeze everything
+    for param in linear_params:
+        param.requires_grad = True
+
+    # chain everything together
+    optimizers += chained_adam.chained_optimizers
+    return ChainedOptimizer(optimizers)
+
