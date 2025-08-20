@@ -382,6 +382,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     or 'attn' not in self.config.cuda_graph_scope
                 ):
                     self.recompute_input_layernorm = True
+                    if self.config.fp8:
+                        self.self_attention.set_for_recompute_input_layernorm()
                 if not isinstance(self.pre_mlp_layernorm, IdentityOp) and (
                     not self.config.external_cuda_graph
                     or (not self.is_moe_layer and 'mlp' not in self.config.cuda_graph_scope)
@@ -392,6 +394,15 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     )
                 ):
                     self.recompute_pre_mlp_layernorm = True
+                    if self.config.fp8:
+                        if isinstance(self.mlp, MoELayer):
+                            self.mlp.set_for_recompute_pre_mlp_layernorm()
+                        else:
+                            from megatron.core.extensions.transformer_engine import (
+                                set_save_original_input,
+                            )
+
+                            set_save_original_input(self.mlp.linear_fc1)
             if "mlp" in self.config.recompute_modules:
 
                 if not self.is_moe_layer:

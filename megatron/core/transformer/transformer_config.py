@@ -291,7 +291,7 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -299,8 +299,9 @@ class TransformerConfig(ModelParallelConfig):
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
+    "shared_experts": recompute the shared experts in the MoE layer.
     "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
-    "core_attn", "mlp", and "moe" uses normal checkpointing.
+    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
     ####################
@@ -834,7 +835,16 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.recompute_granularity == 'selective':
             if len(self.recompute_modules) > 0:
-                allowed_modules = {"core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "mamba"}
+                allowed_modules = {
+                    "core_attn",
+                    "moe_act",
+                    "layernorm",
+                    "mla_up_proj",
+                    "mlp",
+                    "moe",
+                    "mamba",
+                    "shared_experts",
+                }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
                     f'Invalid choices for recompute_modules: {invalid_modules}. '
@@ -860,9 +870,28 @@ class TransformerConfig(ModelParallelConfig):
                     "Please check that the core_attn recompute is really needed."
                 )
 
+            if "shared_experts" in self.recompute_modules:
+                if (
+                    self.moe_shared_expert_intermediate_size is not None
+                    and self.moe_shared_expert_overlap
+                ):
+                    raise ValueError(
+                        "shared_experts recompute cannot work with --moe-shared-expert-overlap."
+                    )
+
             if self.fp8:
                 if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
-                    raise ValueError("moe_act and layernorm recompute cannot work with fp8.")
+                    if self.fp8_recipe == 'delayed':
+                        raise ValueError(
+                            "Delayed scaling does not support moe_act and layernorm recompute "
+                            "for fp8."
+                        )
+                    if not is_te_min_version("2.6.0dev0"):
+                        raise ValueError(
+                            "moe_act and layernorm recompute for fp8 needs "
+                            "transformer-engine>=2.6.0dev0, "
+                            f"but your version is {get_te_version()}."
+                        )
 
             if self.external_cuda_graph:
                 if "attn" in self.cuda_graph_scope:
