@@ -67,7 +67,7 @@ MBS="${MBS:-1}"
 BS="${BS:-8}"
 SEQ_LENGTH="${SEQ_LENGTH:-4096}"
 MAX_POSITION_EMBEDDINGS=32000
-TOTAL_ITERS="${TOTAL_ITERS:-10}"
+TOTAL_ITERS="${TOTAL_ITERS:-12}"
 SEQ_PARALLEL="${SEQ_PARALLEL:-1}" 
 CONTI_PARAMS="${CONTI_PARAMS:-0}"
 TE_FP8="${TE_FP8:-0}"  # 0: disable FP8, 1: enable FP8
@@ -316,6 +316,10 @@ EXTRA_ARGS="$EXTRA_ARGS --transformer-impl=transformer_engine \
     --fp8-amax-compute-algo=max \
     --attention-softmax-in-fp32 \
 "
+    if [ "$FSDP" -eq 1 ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --keep_fp8_weight_transpose_cache" 
+    fi
+    
 fi
 
 if [ -n "${WANDB_API_KEY}" ]; then

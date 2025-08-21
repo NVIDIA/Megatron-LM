@@ -6,6 +6,7 @@ import os
 import pickle
 import warnings
 from typing import Any, Callable, Optional
+import inspect
 
 import torch
 import transformer_engine as te
@@ -53,6 +54,14 @@ def _get_extra_te_kwargs(config: TransformerConfig):
         else:
             extra_transformer_engine_kwargs["device"] = torch.cuda.current_device()
     return extra_transformer_engine_kwargs
+
+
+def class_has_init_param(cls, param_name):
+    try:
+        sig = inspect.signature(cls.__init__)
+        return param_name in sig.parameters
+    except (ValueError, TypeError):
+        return False
 
 
 def condition_init_method(config, init_method):
@@ -214,6 +223,10 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group = None
 
+        if is_te_min_version("2.2.0.dev0"):
+            assert class_has_init_param(te.pytorch.Linear, "keep_fp8_weight_transpose_cache"), "Transformer Engine v2.2.0 or later is required to use keep_fp8_weight_transpose_cache"
+            extra_kwargs["keep_fp8_weight_transpose_cache"] = self.config.keep_fp8_weight_transpose_cache
+
         super().__init__(
             in_features=input_size,
             out_features=output_size,
@@ -343,6 +356,10 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                         tp_comm_buffer_name is not None
                     ), "Buffer name should be set to configure communication overlap settings"
                     extra_kwargs["ub_name"] = tp_comm_buffer_name
+
+        if is_te_min_version("2.2.0.dev0"):
+            assert class_has_init_param(te.pytorch.Linear, "keep_fp8_weight_transpose_cache"), "Transformer Engine v2.2.0 or later is required to use keep_fp8_weight_transpose_cache"
+            extra_kwargs["keep_fp8_weight_transpose_cache"] = self.config.keep_fp8_weight_transpose_cache
 
         super().__init__(
             in_features=input_size,
