@@ -332,7 +332,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Set used for validating active cuda graph token count.
             self.cuda_graph_token_counts_set = set(self.cuda_graph_token_counts)
             self.max_cuda_graph_token_count = max(self.cuda_graph_token_counts)
-        
 
         self.non_decode_cuda_graphs = use_cuda_graphs_for_non_decode_steps and (
             num_cuda_graphs is not None
@@ -391,7 +390,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Store the dummy chunk idx reference for convenience
         self.dummy_chunk_idx = self.chunk_allocator.dummy_chunk_idx
         # Reset attention state.
-        self.reset_attention_state() 
+        self.reset_attention_state()
 
     TOKEN_ROUNDER = 64
     REQUEST_ROUNDER = 4
@@ -627,7 +626,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_chunk_ids_cudagraph_only.fill_(0)
         self.block_table = None
 
-    
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         has_cuda_graphs = self.cuda_graph_token_counts is not None
@@ -658,17 +656,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # warmup both decode and non-decode engine steps
         if num_warmup_tokens is not None:
             if num_warmup_tokens > self.max_requests:
-                raise ActiveRequestCountOverflowError(self.max_requests, num_warmup_tokens) 
-            
+                raise ActiveRequestCountOverflowError(self.max_requests, num_warmup_tokens)
+
             if warmup_engine_mode == WarmupEngineMode.NON_DECODE:
                 assert self.non_decode_cuda_graphs, "Set non-decode cuda graphs to True"
-                # Create a mismatch between self.active_token_count (0) and self.active_request_count 
-                # (which is 0 by default) so that self.is_decode() is False and we trigger 
-                # the non-decode attention kernel. The value of 1 is not special by any means, all 
+                # Create a mismatch between self.active_token_count (0) and self.active_request_count
+                # (which is 0 by default) so that self.is_decode() is False and we trigger
+                # the non-decode attention kernel. The value of 1 is not special by any means, all
                 # we need is for self.total_request_count to not be 0.
-                self.total_request_count = 1 
+                self.total_request_count = 1
 
-        active_token_count = self.active_token_count if num_warmup_tokens is None else num_warmup_tokens
+        active_token_count = (
+            self.active_token_count if num_warmup_tokens is None else num_warmup_tokens
+        )
 
         if self.using_cuda_graph_this_step():
             self.padded_active_token_count = (
@@ -760,7 +760,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ]
             self.max_seqlen_k = self.max_sequence_length
             if self.is_decode_only():
-                self.cu_kv_seq_lengths = None  # ensure no accidental use                
+                self.cu_kv_seq_lengths = None  # ensure no accidental use
             else:
                 cu_kv_lengths = torch.cumsum(self.kv_seq_lengths, dim=0)
                 # The following will be passed to the FA kernel.
