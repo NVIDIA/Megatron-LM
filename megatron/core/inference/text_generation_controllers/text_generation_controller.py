@@ -1056,7 +1056,11 @@ class TextGenerationController:
                 if torch.all(generation_started):
                     self.inference_wrapped_model.inference_context.enable_decode_mode()
                     if moe_pad_experts_for_cuda_graph_inference:
-                        self.set_decode_expert_padding(True, capacity_factor=padded_batch_size)
+                        model_config = get_model_config(self.inference_wrapped_model.model)
+                        capacity_factor = (
+                            model_config.num_moe_experts // model_config.moe_router_topk
+                        )
+                        self.set_decode_expert_padding(True, capacity_factor=capacity_factor)
 
                 context_end_position = context_start_position + 1
                 if context_end_position >= max_sequence_length:
