@@ -9,6 +9,9 @@ from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.multi_module_communicator import (
+    MultiModulePipelineCommunicator,
+)
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
@@ -27,9 +30,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
-from megatron.core.pipeline_parallel.multi_module_communicator import (
-    MultiModulePipelineCommunicator,
-)
+
 from .combined_1f1b import combined_1f1b_schedule_for_no_pipelining
 
 # Types
@@ -2019,9 +2020,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
-        input_tensor = p2p_communicator.recv_forward(
-            recv_tensor_shapes,
-        )
+        input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -2049,9 +2048,7 @@ def forward_backward_pipelining_without_interleaving(
     # If all microbatches are run in warmup / cooldown phase, then no need to
     # receive this tensor here.
     if num_microbatches_remaining > 0:
-        input_tensor = p2p_communicator.recv_forward(
-            recv_tensor_shapes,
-        )
+        input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes)
 
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
@@ -2085,13 +2082,9 @@ def forward_backward_pipelining_without_interleaving(
         total_num_tokens += num_tokens
 
         if forward_only:
-            p2p_communicator.send_forward(
-                output_tensor,
-            )
+            p2p_communicator.send_forward(output_tensor)
             if not last_iteration:
-                input_tensor = p2p_communicator.recv_forward(
-                    recv_tensor_shapes
-                )
+                input_tensor = p2p_communicator.recv_forward(recv_tensor_shapes)
         else:
             output_tensor_grad = p2p_communicator.send_forward_recv_backward(
                 output_tensor, send_tensor_shapes
@@ -2124,13 +2117,10 @@ def forward_backward_pipelining_without_interleaving(
 
             if last_iteration:
                 input_tensor = None
-                p2p_communicator.send_backward(
-                    input_tensor_grad
-                )
+                p2p_communicator.send_backward(input_tensor_grad)
             else:
                 input_tensor = p2p_communicator.send_backward_recv_forward(
-                    input_tensor_grad,
-                    recv_tensor_shapes,
+                    input_tensor_grad, recv_tensor_shapes
                 )
 
     # Run cooldown backward passes.
@@ -2149,9 +2139,7 @@ def forward_backward_pipelining_without_interleaving(
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
 
-            output_tensor_grad = p2p_communicator.recv_backward(
-                send_tensor_shapes,
-            )
+            output_tensor_grad = p2p_communicator.recv_backward(send_tensor_shapes)
 
             input_tensor_grad = backward_step(
                 input_tensor,
@@ -2162,9 +2150,7 @@ def forward_backward_pipelining_without_interleaving(
                 pipeline_model_parallel_size=p2p_communicator.pp_group.size(),
             )
 
-            p2p_communicator.send_backward(
-                input_tensor_grad,
-            )
+            p2p_communicator.send_backward(input_tensor_grad)
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
