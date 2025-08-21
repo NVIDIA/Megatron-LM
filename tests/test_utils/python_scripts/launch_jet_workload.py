@@ -116,7 +116,7 @@ def launch_and_wait_for_completion(
                 wait_for_validation=True,
                 max_wait_time=(60 * 60),
             )
-        except jetclient.clients.gitlab.GitlabAPIError as e:
+        except (jetclient.clients.gitlab.GitlabAPIError, jetclient.facades.objects.util.WaitTimeExceeded) as e:
             logger.error(f"Faced {str(e)}. Waiting and retrying...")
             n_submission_attempts += 1
             time.sleep(2**n_submission_attempts * 5)
@@ -255,6 +255,26 @@ def telemetrics_and_exit(
             f"Failed to make POST request. Received response: {res.status_code}"
         )
     sys.exit(int(not success))
+
+
+def is_flaky_failure(concat_allranks_logs: str) -> bool:
+    return (
+        "The server socket has failed to listen on any local network address."
+        in concat_allranks_logs
+        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
+        or "uncorrectable ECC error encountered" in concat_allranks_logs
+        or "illegal memory access" in concat_allranks_logs
+        or "illegal instruction" in concat_allranks_logs
+        or "torch.distributed.DistNetworkError" in concat_allranks_logs
+        or "Segmentation fault" in concat_allranks_logs
+        or "found NaN in" in concat_allranks_logs
+        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+        or "double free or corruption" in concat_allranks_logs
+        or "Call to CUDA function failed." in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
+        or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+    )
 
 
 @click.command()
@@ -437,11 +457,8 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
-            if (
-                "The server socket has failed to listen on any local network address."
-                in concat_allranks_logs
-            ):
-                logger.error("TCP error, attempt restart.")
+            if not success and is_flaky_failure(concat_allranks_logs):
+                logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 
@@ -457,20 +474,8 @@ def main(
                     is_integration_test=enable_lightweight_mode,
                 )
 
-            if (
-                "The server socket has failed to listen on any local network address."
-                in concat_allranks_logs
-                or "Some NCCL operations have failed or timed out." in concat_allranks_logs
-                or "uncorrectable ECC error encountered" in concat_allranks_logs
-                or "illegal memory access" in concat_allranks_logs
-                or "illegal instruction" in concat_allranks_logs
-                or "torch.distributed.DistNetworkError" in concat_allranks_logs
-                or "Segmentation fault" in concat_allranks_logs
-                or "found NaN in local forward loss calculation" in concat_allranks_logs
-                or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
-                or "double free or corruption" in concat_allranks_logs
-            ):
-                logger.error("Detected NCCL failure, attempt restart.")
+            if is_flaky_failure(concat_allranks_logs):
+                logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 

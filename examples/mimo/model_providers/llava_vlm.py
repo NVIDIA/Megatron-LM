@@ -18,7 +18,7 @@ from configs.llava_vlm import (
 
 from examples.mimo.model_providers.hf_clip_encoder import HFCLIPEncoderWrapper
 from examples.mimo.utils.logging import print_mimo_structure
-from megatron.core import dist_checkpointing
+from examples.mimo.utils.model_helpers import load_submodule_ckpt
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -26,41 +26,13 @@ from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.transformer.spec_utils import ModuleSpec
 
 
-def _load_submodule_ckpt(module: torch.nn.Module, ckpt_dir: str):
-    """Load *ckpt_dir* into *module* using Megatron distributed-checkpointing."""
-
-    # 1) Ask for tensors using a `module.` prefix so they match checkpoint keys.
-    sharded_sd_with_prefix = module.sharded_state_dict(prefix="module.")
-
-    # Remove fp8 extra_state tensors – they may not exist in older checkpoints.
-    for k in list(sharded_sd_with_prefix.keys()):
-        if "extra_state" in k:
-            del sharded_sd_with_prefix[k]
-
-    # 2) Wrap it under a root key just as in user snippet; this becomes the state
-    #    dict returned by `load` so we can easily strip the prefix afterwards.
-    wrapper_sd = dict(state_dict=sharded_sd_with_prefix)
-    loaded = dist_checkpointing.load(
-        sharded_state_dict=wrapper_sd,
-        checkpoint_dir=ckpt_dir,
-    )
-    # 3) Remove the prefix and push into the module.
-    cleaned = {k.removeprefix("module."): v for k, v in loaded["state_dict"].items()}
-
-    incompatible = module.load_state_dict(cleaned, strict=False)
-    unexpected = [k for k in incompatible.unexpected_keys if "extra_state" not in k]
-    missing = [k for k in incompatible.missing_keys if "extra_state" not in k]
-    if unexpected or missing:
-        raise RuntimeError(
-            f"load_state_dict had unexpected mismatch. Missing: {missing}, Unexpected: {unexpected}"
-        )
-
 def model_provider_llava_vlm(
     pre_process: bool = True,
     post_process: bool = True,
     add_encoder=True,
     add_decoder=True,
-    special_token_id: int = 32000,
+    image_special_token_id: int = 32000,
+    is_video_input: bool = False
 ):
     """
     Build a LLaVA-style Vision-Language MIMO model composed of:
@@ -96,7 +68,7 @@ def model_provider_llava_vlm(
     # HF encoder
     vision_encoder = ModuleSpec(
         module=HFCLIPEncoderWrapper,
-        params={},
+        params={"is_video_input" : is_video_input},
     )
 
     # Create projection config for vision to language
@@ -138,7 +110,7 @@ def model_provider_llava_vlm(
     mimo_model_config = MimoModelConfig(
         language_model_spec=language_model_spec,
         modality_submodules_spec={"images": vision_submodule_spec},
-        special_token_ids={"images": special_token_id}
+        special_token_ids={"images": image_special_token_id}
     )
 
     # Create MIMO model
@@ -153,7 +125,7 @@ def model_provider_llava_vlm(
 
         _args = get_args()
         if  _args.language_model_checkpoint is not None:
-            _load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint)
+            load_submodule_ckpt(mimo_model.language_model, _args.language_model_checkpoint)
             print(f"Successfully loaded LLaVA pretrained checkpoint from {_args.language_model_checkpoint}")
     except (ModuleNotFoundError, AssertionError):
         pass

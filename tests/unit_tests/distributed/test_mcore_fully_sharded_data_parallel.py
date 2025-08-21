@@ -217,10 +217,6 @@ class TestFullyShardedDataParallel:
             # test branch.
             delattr(torch.nn.parameter.Parameter, "main_grad")
 
-    @pytest.mark.skipif(
-        version.parse(torch.__version__) < version.parse('2.3.0'),
-        reason="nccl_ub requires a recent version of APEX",
-    )
     # Testing fsdp_double_buffer with and without nccl_ub
     @pytest.mark.parametrize(
         ("dp_size", "nccl_ub", "fsdp_double_buffer"), [(8, False, True), (8, True, True)]
@@ -231,6 +227,10 @@ class TestFullyShardedDataParallel:
         Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False
         Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False]
         """
+
+        # Skip nccl_ub=True cases if PyTorch version is less than 2.7.0
+        if nccl_ub and version.parse(torch.__version__) < version.parse('2.7.0'):
+            pytest.skip("nccl_ub requires PyTorch 2.7.0 or later")
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():

@@ -14,6 +14,7 @@ spec:
   test_case:
   scope:
   script_setup: |
+    unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
     # Checkout latest
@@ -62,8 +63,6 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
   - test_case: [multimodal_llava_mr_mcore_te_tp4_sp_cp2_dgx_a100_1N8G]
     products:
       - environment: [dev]

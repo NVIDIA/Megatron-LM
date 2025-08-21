@@ -374,7 +374,8 @@ def _unwrap_pyt_sharded_tensor(sh_ten: TorchShardedTensor) -> List[torch.Tensor]
             ten = ten.view(-1)
         else:
             for _ in range(mcore_sh_ten.prepend_axis_num):
-                ten = ten.squeeze(0)
+                assert ten.size(0) == 1
+                ten = ten[0]  # NOTE: ten.squeeze(0) uses more memory for FP8 tensors
         ret_tensors.append(ten)
     return ret_tensors
 

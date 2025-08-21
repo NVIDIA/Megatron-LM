@@ -4,6 +4,7 @@
 import json
 import os
 import sys
+import warnings
 from datetime import datetime
 
 import torch
@@ -17,9 +18,6 @@ except ImportError:
         from amp_C import multi_tensor_l2norm
         from apex.multi_tensor_apply import multi_tensor_applier
     except ImportError:
-
-        import warnings
-
         warnings.warn(
             f'Transformer Engine and Apex are not installed. '
             'Falling back to local implementations of '
@@ -32,8 +30,6 @@ except ImportError:
         )
 
 from megatron.training import get_args, get_adlr_autoresume
-from megatron.core import DistributedDataParallel as DDP
-from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -41,31 +37,9 @@ from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
+    unwrap_model,
 )
-from megatron.core.transformer.module import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
-
-try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
-except ImportError:
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
-
-
-def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
-    return_list = True
-    if not isinstance(model, list):
-        model = [model]
-        return_list = False
-    unwrapped_model = []
-    for model_module in model:
-        while isinstance(model_module, module_instances):
-            model_module = model_module.module
-        unwrapped_model.append(model_module)
-    if not return_list:
-        return unwrapped_model[0]
-    return unwrapped_model
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -358,13 +332,28 @@ def get_ltor_masks_and_position_ids(
     return attention_mask, loss_mask, position_ids
 
 
-def print_rank_0(message):
-    """If distributed is initialized, print only on rank 0."""
-    if torch.distributed.is_initialized():
+def print_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, print only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            print(message, flush=True)
+    elif torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def warn_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, warn only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            warnings.warn(message)
+    elif torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            warnings.warn(message)
+    else:
+        warnings.warn(message)
 
 
 def is_rank0():

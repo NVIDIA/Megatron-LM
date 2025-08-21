@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import gc
+import logging
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -32,6 +33,9 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+
+
+logger = logging.getLogger(__name__)
 
 
 # pylint: disable=missing-class-docstring
@@ -100,7 +104,7 @@ class MLP(MegatronModule):
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
             is_expert=is_expert,
-            tp_comm_buffer_name='fc1',
+            tp_comm_buffer_name="fc1",
             tp_group=tp_group,
         )
 
@@ -116,7 +120,7 @@ class MLP(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
+            tp_comm_buffer_name="fc2",
             tp_group=tp_group,
         )
 
@@ -191,21 +195,30 @@ class MLP(MegatronModule):
 
     # pylint: disable=missing-function-docstring
     def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
         sharded_state_dict = {}
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f'{prefix}{name}.', sharded_offsets, metadata)
-            if self.config.gated_linear_unit and name == 'linear_fc1':
+            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+            if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
-                    if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
-                        sub_sd[k] = apply_swiglu_sharded_factory(v, sharded_offsets)
+                    if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
+                        sub_sd[k] = apply_swiglu_sharded_factory(
+                            v, sharded_offsets, singleton_local_shards
+                        )
             sharded_state_dict.update(sub_sd)
         return sharded_state_dict
 
+    def backward_dw(self):
+        self.linear_fc2.backward_dw()
+        self.linear_fc1.backward_dw()
+
 
 # pylint: disable=missing-function-docstring
-def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
+def apply_swiglu_sharded_factory(
+    original_sh_ten, sharded_offsets, singleton_local_shards: bool = False
+):
     # We must split the tensor into 2 parts, each sharded separately.
     # This requires a ShardedTensorFactory which `chunk`s during saving
     # and `cat`s during loading
@@ -227,13 +240,25 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
     def sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
     ):
-        offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
-        offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset + axis_frag, axis_frag * 2)
+        if singleton_local_shards:
+            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+            offset_v = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag)
+            w_key = f'{key}_w'
+            v_key = f'{key}_v'
+        else:
+            offset_w = (swiglu_shard_axis + prepend_axis_num, rank_offset, axis_frag * 2)
+            offset_v = (
+                swiglu_shard_axis + prepend_axis_num,
+                rank_offset + axis_frag,
+                axis_frag * 2,
+            )
+            w_key = key
+            v_key = key
         if flattened_range is None:
             tensor_w, tensor_v = torch.chunk(t, 2, dim=swiglu_shard_axis)
             return [
                 ShardedTensor.from_rank_offsets(
-                    key,
+                    w_key,
                     tensor_w,
                     *sharded_offsets,
                     offset_w,
@@ -241,7 +266,7 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                     prepend_axis_num=prepend_axis_num,
                 ),
                 ShardedTensor.from_rank_offsets(
-                    key,
+                    v_key,
                     tensor_v,
                     *sharded_offsets,
                     offset_v,
@@ -250,6 +275,10 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
                 ),
             ]
         else:
+            if singleton_local_shards:
+                raise NotImplementedError(
+                    'singleton_local_shards not implemented for SwiGLU MLP flattened tensors'
+                )
             # Here we need to map a slice `t` (`flattened_range` specifies slice start and stop)
             # of the *original* flattened tensor into slices `w` and `v` of chunked
             # and flattened tensor.
@@ -311,7 +340,17 @@ def apply_swiglu_sharded_factory(original_sh_ten, sharded_offsets):
 
     def sh_ten_merge_fn(sub_state_dict):
         with torch.no_grad():
-            return torch.cat(sub_state_dict)
+            try:
+                return torch.cat(sub_state_dict)
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                logger.warning(
+                    f"CUDA OutOfMemoryError encountered during tensors merging."
+                    f" Switching to CPU merge. (Error: {e})"
+                )
+                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+                gc.collect()
+                torch.cuda.empty_cache()
+                return merged_sub_state_dict
 
     return ShardedTensorFactory(
         original_sh_ten.key,

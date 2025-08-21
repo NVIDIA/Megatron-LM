@@ -15,16 +15,13 @@ import time
 import typing
 
 import numpy as np
-import psutil
 import torch
-from tqdm import tqdm
 
 from megatron.core.datasets.retro.config import RetroPreprocessingConfig
 from megatron.core.datasets.retro.db.dataset import DBDataset
 from megatron.core.datasets.retro.db.utils import (
     get_merged_train_dataset as get_db_merged_train_dataset,
 )
-from megatron.core.datasets.retro.external_libs import faiss, h5py
 from megatron.core.datasets.retro.index.factory import IndexFactory
 from megatron.core.datasets.retro.index.index import Index
 from megatron.core.datasets.retro.index.utils import get_index_dir
@@ -36,19 +33,50 @@ from megatron.core.datasets.retro.utils import (
     retro_makedir,
 )
 
-from .gpt_chunk_dataset import build_gpt_chunk_datasets_from_gpt_datasets
+try:
+    import psutil
+
+    HAVE_PSUTIL = True
+except ImportError:
+    HAVE_PSUTIL = False
+
+try:
+    from tqdm import tqdm
+
+    HAVE_TQDM = True
+except ImportError:
+    HAVE_TQDM = False
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
+
+try:
+    import faiss
+
+    HAVE_FAISS = True
+except ImportError:
+    HAVE_FAISS = False
 
 
-def get_index(config: RetroPreprocessingConfig, ondisk: bool = False) -> faiss.Index:
+def get_index(config: RetroPreprocessingConfig, ondisk: bool = False) -> "faiss.Index":
     """Read index from disk.
 
     Args:
         config (RetroPreprocessingConfig): Retro preprocessing config.
-        ondisk (bool): If `ondisk = True`, memory map the index. (For debugging purposes only; very non-performant.)
+        ondisk (bool): If `ondisk = True`, memory map the index.
+            (For debugging purposes only; very non-performant.)
 
     Returns:
         A Faiss index, loaded from storage.
     """
+    if not HAVE_FAISS:
+        raise ImportError(
+            "faiss is required to use the query_neighbors function. " "Please install faiss."
+        )
 
     # Load index.
     index_wrapper = IndexFactory.get_index(config.retro_index_type)
@@ -107,8 +135,10 @@ def query_embeddings(
         index (Index): Vector index populated with chunk database indices.
         embeddings (np.ndarray): Embeddings from GPT chunk dataset.
         chunk_id_range (range): Chunk ID range from GPT chunk dataset.
-        sample_map (dict): Mapping of sample_idx to dataset_idx and document_ids. Used for document filtering.
-        n_chunks_per_sample (int): Number of chunks per sample (e.g., sequence_length / chunk_length).
+        sample_map (dict): Mapping of sample_idx to dataset_idx and document_ids.
+            Used for document filtering.
+        n_chunks_per_sample (int): Number of chunks per sample
+            (e.g., sequence_length / chunk_length).
         verbose (bool): Log querying progress.
 
     Returns:
@@ -134,7 +164,6 @@ def query_embeddings(
     )
     min_chunk_id, max_chunk_id = chunk_id_range
     for chunk_id in range(min_chunk_id, max_chunk_id):
-
         sample_id = chunk_id // n_chunks_per_sample
         sample = sample_map[sample_id]
         sample_dataset_idx = sample["dataset_idx"].item()
@@ -178,12 +207,19 @@ def query_embedding_block(
         index (Index): Vector index populated with chunk database indices.
         embeddings (np.ndarray): Embeddings from GPT chunk dataset.
         chunk_id_range (range): Chunk ID range from GPT chunk dataset.
-        sample_map (dict): Mapping of sample_idx to dataset_idx and document_ids. Used for document filtering.
-        n_chunks_per_sample (int): Number of chunks per sample (e.g., sequence_length / chunk_length).
+        sample_map (dict): Mapping of sample_idx to dataset_idx and document_ids.
+            Used for document filtering.
+        n_chunks_per_sample (int): Number of chunks per sample
+            (e.g., sequence_length / chunk_length).
 
     Returns:
         A tuple of original (unfiltered) neighbor IDs, and filtered (by document ID) neighbor IDs.
     """
+
+    if not HAVE_TQDM:
+        raise ImportError(
+            "tqdm is required to use the query_embeddings function. Please install tqdm."
+        )
 
     query_neighbor_ids = []
     filtered_neighbor_ids = []
@@ -236,8 +272,14 @@ def query_block_neighbors(
         db_dataset (DBDataset): Dataset containing chunk database entries.
         query_dataset (GPTChunkDataset): GPT chunk dataset to be queried.
         index (Index): Vector index populated with chunk database indices.
-        block (dict): Range information containing start/end indices for querying GPT chunk dataset.
+        block (dict): Range information containing start/end indices
+            for querying GPT chunk dataset.
     """
+
+    if not HAVE_H5PY:
+        raise ImportError(
+            "h5py is required to use the query_block_neighbors function. Please install h5py."
+        )
 
     n_chunks_per_sample = query_dataset.n_chunks_per_sample
 
@@ -288,11 +330,17 @@ def query_dataset_neighbors(
         config (RetroPreprocessingConfig): Retro preprocessing config.
         db_dataset (DBDataset): Dataset containing chunk database entries.
         query_dataset (GPTChunkDataset): GPT chunk dataset to be queried.
-        num_active_chunks (int): The 'active' chunks are the subset of the GPT chunk dataset that aren't being queried. This argument is used when validating the correctness of a subset of the GPT chunk dataset.
+        num_active_chunks (int): The 'active' chunks are the subset of the GPT chunk dataset
+            that aren't being queried. This argument is used when validating the correctness
+            of a subset of the GPT chunk dataset.
         prefix (str): Extra string for logging progress.
         neighbor_dir (str): File path to directory for saving neighbor IDs.
         index (Index): Vector index populated with chunk database indices.
     """
+    if not HAVE_H5PY:
+        raise ImportError(
+            "h5py is required to use the query_dataset_neighbors function. Please install h5py."
+        )
 
     def validate(f: h5py.File) -> None:
         """Validation method for validating saved neighbor IDs.
@@ -324,11 +372,14 @@ def query_dataset_neighbors(
         assert blocks.n_missing_world == 0
         active_blocks = blocks.existing
 
+    if not HAVE_PSUTIL:
+        raise ImportError(
+            "psutil is required to use the query_dataset_neighbors function. Please install psutil."
+        )
+
     # Query each block.
     for block_index, block in enumerate(active_blocks):
-
         if block is not None:
-
             # Progress.
             log_retro_rank_0(
                 "%squery '%s' block %d / %d ... %s ... mem %.3f gb, %.1f%%."
@@ -357,6 +408,11 @@ def query_neighbors(config: RetroPreprocessingConfig) -> None:
     Args:
         config (RetroPreprocessingConfig): Retro preprocessing config.
     """
+
+    if not HAVE_FAISS:
+        raise ImportError(
+            "faiss is required to use the query_neighbors function. Please install faiss."
+        )
 
     # Num threads.
     faiss.omp_set_num_threads(64)

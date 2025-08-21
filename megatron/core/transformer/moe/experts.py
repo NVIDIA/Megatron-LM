@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state, tensor_parallel
+from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     LocalNonpersistentObject,
@@ -22,6 +23,7 @@ from megatron.core.dist_checkpointing.mapping import (
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
+from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -40,6 +42,7 @@ from megatron.core.transformer.utils import (
 )
 
 try:
+    import transformer_engine as te  # pylint: disable=unused-import
 
     from megatron.core.extensions.transformer_engine import Fp8Padding, Fp8Unpadding
 
@@ -130,6 +133,8 @@ class GroupedMLP(MegatronModule):
             self.config.recompute_granularity == 'selective'
             and "moe_act" in self.config.recompute_modules
         )
+        if self.activation_recompute and self.config.fp8:
+            raise ValueError("moe_act recompute for fp8 cannot work with the legacy GroupedMLP.")
 
         @jit_fuser
         def activation_func_with_probs(x, probs):
@@ -306,7 +311,12 @@ class GroupedMLP(MegatronModule):
         The sharded_state_dict for the weight parts are compatible with the SequentialMLP,
         whereas the optimizer states are not due to the limitation from weight transposing.
         That is, for finetuning scenario, the checkpoint is compatible with the SequentialMLP.
+
+        When `singleton_local_shards` metadata flag is True, experts are broken down into
+        separate tensors and stored under separate global keys. Additionally, similarly to MLP,
+        layers with GLU activations are broken down into separate `w` and `v` tensors.
         """
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         ep_size = self.ep_group.size()
         ep_rank = self.ep_group.rank()
@@ -322,6 +332,35 @@ class GroupedMLP(MegatronModule):
         local_ffn_dim_size = (
             self.weight2.numel() // self.num_local_experts // self.config.hidden_size
         )
+
+        def _break_into_individual_experts(
+            experts_ten: torch.Tensor,
+            key: str,
+            tp_offset: Tuple[int, int, int],
+            replica_id: ReplicaId,
+        ):
+            """Breaks experts into individual tensors and stores them under separate global keys"""
+            experts_state = []
+            assert len(experts_ten) == self.num_local_experts, (
+                experts_ten.shape,
+                self.num_local_experts,
+            )
+            for local_expert_idx, expert_ten in enumerate(experts_ten):
+                global_expert_idx = local_expert_indices_offset + local_expert_idx
+                expert_key = key.replace(
+                    f'{prefix}experts.', f'{prefix}experts.{global_expert_idx}.'
+                )
+                experts_state.append(
+                    ShardedTensor.from_rank_offsets(
+                        expert_key,
+                        expert_ten.contiguous(),
+                        *sharded_offsets,
+                        tp_offset,
+                        replica_id=replica_id,
+                        prepend_axis_num=prepend_axis_num,
+                    )
+                )
+            return experts_state
 
         @torch.no_grad()
         def sh_ten_build_fn(
@@ -352,38 +391,74 @@ class GroupedMLP(MegatronModule):
                 # change tp_axis due to the transposing
                 tp_axis = 1 - tp_axis
                 if with_glu:
-                    local_tensors = torch.chunk(t, 2, -2)
-                    sub_states = [
-                        ShardedTensor.from_rank_offsets(
-                            key,
-                            local_tensors[0].contiguous(),
-                            *sharded_offsets,
-                            (prepend_axis_num, ep_rank, ep_size),
-                            (prepend_axis_num + 1, tp_rank, tp_size * 2),
-                            replica_id=replica_id,
-                            prepend_axis_num=prepend_axis_num,
-                        ),
-                        ShardedTensor.from_rank_offsets(
-                            key,
-                            local_tensors[1].contiguous(),
-                            *sharded_offsets,
-                            (prepend_axis_num, ep_rank, ep_size),
-                            (prepend_axis_num + 1, tp_size + tp_rank, tp_size * 2),
-                            replica_id=replica_id,
-                            prepend_axis_num=prepend_axis_num,
-                        ),
-                    ]
+                    assert tp_axis == 0, tp_axis
+                    if singleton_local_shards:
+                        w_tensor, v_tensor = torch.chunk(t, 2, -2)
+                        w_key = f'{key}_w'
+                        v_key = f'{key}_v'
+                        sub_states = {
+                            'singleton_local_shards': LocalNonpersistentObject(True),
+                            'data': {
+                                'w': _break_into_individual_experts(
+                                    w_tensor,
+                                    w_key,
+                                    (prepend_axis_num, tp_rank, tp_size),
+                                    replica_id,
+                                ),
+                                'v': _break_into_individual_experts(
+                                    v_tensor,
+                                    v_key,
+                                    (prepend_axis_num, tp_rank, tp_size),
+                                    replica_id,
+                                ),
+                            },
+                        }
+                    else:
+                        local_tensors = torch.chunk(t, 2, -2)
+                        sub_states = [
+                            ShardedTensor.from_rank_offsets(
+                                key,
+                                local_tensors[0].contiguous(),
+                                *sharded_offsets,
+                                (prepend_axis_num, ep_rank, ep_size),
+                                (prepend_axis_num + 1, tp_rank, tp_size * 2),
+                                replica_id=replica_id,
+                                prepend_axis_num=prepend_axis_num,
+                            ),
+                            ShardedTensor.from_rank_offsets(
+                                key,
+                                local_tensors[1].contiguous(),
+                                *sharded_offsets,
+                                (prepend_axis_num, ep_rank, ep_size),
+                                (prepend_axis_num + 1, tp_size + tp_rank, tp_size * 2),
+                                replica_id=replica_id,
+                                prepend_axis_num=prepend_axis_num,
+                            ),
+                        ]
                 else:
-                    sub_states = ShardedTensor.from_rank_offsets(
-                        key,
-                        t.contiguous(),
-                        *sharded_offsets,
-                        (prepend_axis_num, ep_rank, ep_size),
-                        (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size),
-                        replica_id=replica_id,
-                        prepend_axis_num=prepend_axis_num,
-                    )
+                    if singleton_local_shards:
+                        sub_states = {
+                            'singleton_local_shards': LocalNonpersistentObject(True),
+                            'data': _break_into_individual_experts(
+                                t, key, (prepend_axis_num + tp_axis, tp_rank, tp_size), replica_id
+                            ),
+                        }
+                    else:
+                        sub_states = ShardedTensor.from_rank_offsets(
+                            key,
+                            t.contiguous(),
+                            *sharded_offsets,
+                            (prepend_axis_num, ep_rank, ep_size),
+                            (prepend_axis_num + 1 + tp_axis, tp_rank, tp_size),
+                            replica_id=replica_id,
+                            prepend_axis_num=prepend_axis_num,
+                        )
             else:
+                if singleton_local_shards:
+                    raise NotImplementedError(
+                        'flattened_range not supported for'
+                        ' GroupedMLP with singleton_local_shards'
+                    )
                 # flattened optmizer states
                 # the non-flattened weight shape is [local_expert_num, hidden_size, ffn_size]
                 #
@@ -594,8 +669,23 @@ class GroupedMLP(MegatronModule):
                 # flattened tensor without glu
                 return torch.cat(sub_state_dict)
             else:
-                if with_glu:
-                    sub_state_dict = torch.cat(sub_state_dict, -2)
+                if isinstance(sub_state_dict, dict):
+                    assert sub_state_dict['singleton_local_shards']
+                    if with_glu:
+                        assert isinstance(sub_state_dict['data'], dict)
+                        sub_state_dict = torch.cat(
+                            (
+                                torch.stack(sub_state_dict['data']['w']),
+                                torch.stack(sub_state_dict['data']['v']),
+                            ),
+                            dim=-2,
+                        )
+                    else:
+                        assert isinstance(sub_state_dict['data'], list)
+                        sub_state_dict = torch.stack(sub_state_dict['data'])
+                else:
+                    if with_glu:
+                        sub_state_dict = torch.cat(sub_state_dict, -2)
                 return sub_state_dict.transpose(-1, -2).reshape(weight_shape)
 
         state_dict = self.state_dict(prefix='', keep_vars=True)
@@ -644,21 +734,31 @@ class GroupedMLP(MegatronModule):
         # Add fake _extra_state to be compatible with SequentialMLP
         for expert_local_idx in range(self.num_local_experts):
             expert_global_idx = local_expert_indices_offset + expert_local_idx
-            expert_sharded_offsets = (
-                *sharded_offsets,
-                (len(sharded_offsets), expert_global_idx, num_global_experts),
-            )
+            if singleton_local_shards:
+                expert_sharded_offsets = sharded_offsets
+            else:
+                expert_sharded_offsets = (
+                    *sharded_offsets,
+                    (len(sharded_offsets), expert_global_idx, num_global_experts),
+                )
             for mod in ['linear_fc1', 'linear_fc2']:
+                if singleton_local_shards:
+                    expert_key = f'{prefix}experts.{expert_global_idx}.{mod}._extra_state'
+                else:
+                    expert_key = f'{prefix}experts.{mod}._extra_state'
                 sharded_state_dict[f'{prefix}expert{expert_global_idx}.{mod}._extra_state'] = (
                     make_sharded_object_for_checkpoint(
-                        None,
-                        f'{prefix}experts.{mod}._extra_state',
-                        expert_sharded_offsets,
-                        replica_id,
+                        None, expert_key, expert_sharded_offsets, replica_id
                     )
                 )
 
         return sharded_state_dict
+
+    def backward_dw(self):
+        """Performs backward pass for weight gradients in Experts.
+        Empty implementation for compatibility with SequentialMLP and TEGroupedMLP.
+        """
+        pass
 
 
 class TEGroupedMLP(MegatronModule):
@@ -704,10 +804,6 @@ class TEGroupedMLP(MegatronModule):
         )
 
         self.activation_func = self.config.activation_func
-        self.activation_recompute = (
-            self.config.recompute_granularity == 'selective'
-            and "moe_act" in self.config.recompute_modules
-        )
 
         # TODO(Hepteract): pass model_comm_pgs to submodule after refactoring Linear modules
         self.linear_fc2 = build_module(
@@ -723,6 +819,15 @@ class TEGroupedMLP(MegatronModule):
             tp_comm_buffer_name='fc2',
             tp_group=parallel_state.get_expert_tensor_parallel_group(),
         )
+
+        self.activation_recompute = (
+            self.config.recompute_granularity == 'selective'
+            and "moe_act" in self.config.recompute_modules
+        )
+        if self.activation_recompute and self.config.fp8:
+            from megatron.core.extensions.transformer_engine import set_save_original_input
+
+            set_save_original_input(self.linear_fc2)
 
         if self.config.fp8:
             assert HAVE_TE, "FP8 requires TE."
@@ -784,6 +889,13 @@ class TEGroupedMLP(MegatronModule):
                     )
                 else:
                     raise ValueError("Only support fusion of swiglu in TEGroupedMLP.")
+            elif (
+                self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
+            ):
+                assert bias_parallel is None
+                intermediate_parallel = weighted_squared_relu_impl(
+                    intermediate_parallel, permuted_probs
+                )
             else:
                 if bias_parallel is not None:
                     shape = intermediate_parallel.shape
@@ -839,6 +951,7 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(module, f'{name}.', sharded_offsets, metadata)
@@ -847,17 +960,36 @@ class TEGroupedMLP(MegatronModule):
                 local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
                 ep_axis = len(sharded_offsets)
                 for i in range(self.num_local_experts):
-                    new_sharded_offsets = (
-                        *sharded_offsets,
-                        (ep_axis, local_expert_indices_offset + i, num_global_experts),
-                    )
+                    if singleton_local_shards:
+                        new_sharded_offsets = sharded_offsets
+                    else:
+                        new_sharded_offsets = (
+                            *sharded_offsets,
+                            (ep_axis, local_expert_indices_offset + i, num_global_experts),
+                        )
                     for k in (f'{name}.weight{i}', f'{name}.bias{i}'):
                         if k in sub_sd:
-                            sub_sd[k] = apply_swiglu_sharded_factory(sub_sd[k], new_sharded_offsets)
-            # Add prefix here to match sequential's keys
-            replace_prefix_for_sharding(sub_sd, f'{name}.', f'{prefix}experts.{name}.')
+                            sub_sd[k] = apply_swiglu_sharded_factory(
+                                sub_sd[k], new_sharded_offsets, singleton_local_shards
+                            )
+            if singleton_local_shards:
+                replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
+            else:
+                # Add prefix here to match sequential's keys
+                replace_prefix_for_sharding(sub_sd, f'{name}.', f'{prefix}experts.{name}.')
             sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
+
+    def backward_dw(self):
+        """Performs backward pass for weight gradients in TEGroupedMLP.
+
+        This method executes the backward pass for weight gradients by calling
+        backward_dw() on the linear layers in reverse order (fc2 followed by fc1).
+        If an error occurs during execution, it is caught and re-raised with a
+        descriptive message.
+        """
+        self.linear_fc2.backward_dw()
+        self.linear_fc1.backward_dw()
 
 
 class SequentialMLP(MegatronModule):
@@ -975,6 +1107,11 @@ class SequentialMLP(MegatronModule):
 
             return output_local, output_bias_local
 
+    def backward_dw(self):
+        """Backward pass for weight gradients in SequentialMLP."""
+        for expert in self.local_experts:
+            expert.backward_dw()
+
     @expert_dist_ckpt_decorator
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
@@ -982,14 +1119,20 @@ class SequentialMLP(MegatronModule):
         num_global_experts = self.ep_group.size() * self.num_local_experts
         local_expert_indices_offset = self.ep_group.rank() * self.num_local_experts
 
-        expert_sharded_prefix = f'{prefix}experts.'
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+
         for expert_local_idx, expert in enumerate(self.local_experts):
             expert_global_idx = local_expert_indices_offset + expert_local_idx
             expert_state_dict_prefix = f'{prefix}local_experts.{expert_local_idx}.'
-            expert_sharded_offsets = (
-                *sharded_offsets,
-                (len(sharded_offsets), expert_global_idx, num_global_experts),
-            )
+            if singleton_local_shards:
+                expert_sharded_prefix = f'{prefix}experts.{expert_global_idx}.'
+                expert_sharded_offsets = sharded_offsets
+            else:
+                expert_sharded_prefix = f'{prefix}experts.'
+                expert_sharded_offsets = (
+                    *sharded_offsets,
+                    (len(sharded_offsets), expert_global_idx, num_global_experts),
+                )
 
             expert_state_dict = expert.sharded_state_dict(
                 expert_state_dict_prefix, expert_sharded_offsets, metadata

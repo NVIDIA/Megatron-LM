@@ -199,10 +199,14 @@ def sharded_state_dict_default(
 _sequence_parallel_attr_cache = None
 
 
-def _init_sequence_parallel_cache(model):
+def _init_sequence_parallel_cache(model, exclude_modules):
     """
     Initialize the cache of modules with sequence parallel attributes.
     Only needs to be called once, subsequent calls have no effect.
+
+    Args:
+        model: model to change sequence parallelism attributes
+        exclude_modules: Modules to exclude from changing sequence parallelism
     """
     global _sequence_parallel_attr_cache
     model_id = id(model)
@@ -229,33 +233,35 @@ def _init_sequence_parallel_cache(model):
 
     # Recursive function to find all modules with our target attributes
     def find_modules_with_attrs(module):
-        # Check if this module has any of our target attributes
-        for attr in sequence_parallel_attrs:
-            if hasattr(module, attr):
-                _sequence_parallel_attr_cache[model_id][attr].append(module)
+        if exclude_modules is None or module not in exclude_modules:
+            # Check if this module has any of our target attributes
+            for attr in sequence_parallel_attrs:
+                if hasattr(module, attr):
+                    _sequence_parallel_attr_cache[model_id][attr].append(module)
 
-        # Check all children modules recursively
-        for child in module._modules.values():
-            if child is not None:
-                find_modules_with_attrs(child)
+            # Check all children modules recursively
+            for child in module._modules.values():
+                if child is not None:
+                    find_modules_with_attrs(child)
 
     # Start the search from each major component
     find_modules_with_attrs(model_modules)
 
 
-def set_model_to_sequence_parallel(model, set_to=False):
+def set_model_to_sequence_parallel(model, set_to=False, exclude_modules=None):
     """
     Set sequence parallel attributes for the model.
 
     Args:
         set_to: Value to set for sequence_parallel attributes
+        exclude_modules: Modules to exclude from changing sequence parallelism
     """
     global _sequence_parallel_attr_cache
     model_id = id(model)
 
     # Initialize cache if needed
     if _sequence_parallel_attr_cache is None or model_id not in _sequence_parallel_attr_cache:
-        _init_sequence_parallel_cache(model)
+        _init_sequence_parallel_cache(model, exclude_modules)
 
     model.config.sequence_parallel = set_to
 

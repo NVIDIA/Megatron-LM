@@ -23,7 +23,6 @@ except ImportError:
 
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
     except ImportError:
-        import warnings
 
         warnings.warn(
             'Transformer Engine and Apex are not installed. '
@@ -144,7 +143,7 @@ class MegatronOptimizer(ABC):
         params = self.get_parameters()
         grads_for_norm = []
         for param in params:
-            if self.config.use_precision_aware_optimizer:
+            if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
             else:
                 grad = param.grad
@@ -208,7 +207,10 @@ class MegatronOptimizer(ABC):
 
         if params:
             clip_grad_by_total_norm_fp32(
-                params, clip_grad, grad_norm, self.config.use_precision_aware_optimizer
+                params,
+                clip_grad,
+                grad_norm,
+                self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             )
         return grad_norm
 
@@ -218,7 +220,7 @@ class MegatronOptimizer(ABC):
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-            use_decoupled_grad=self.config.use_precision_aware_optimizer,
+            use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
         )
 
     @abstractmethod
@@ -529,11 +531,14 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
                 barrier=self.config.barrier_with_L1_time
             )
         if not self.is_stub_optimizer:
-            (
+            if self.config.reuse_grad_buf_for_mxfp8_param_ag:
+                # In the case of overlap_param_gather,
+                # copy is manually called in the training loop
+                if not self.config.overlap_param_gather:
+                    self._copy_main_params_to_param_buffer()
+            else:
                 self._copy_main_params_to_model_params()
-                if not self.config.reuse_grad_buf_for_mxfp8_param_ag
-                else self._copy_main_params_to_param_buffer()
-            )
+
         if timers is not None:
             timers('optimizer-copy-main-to-model-params').stop()
 
@@ -797,7 +802,6 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         return state_dict
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         # Optimizer.
         optimizer_key = 'optimizer'
         if optimizer_key not in state_dict:
@@ -950,7 +954,6 @@ class FP32Optimizer(MegatronOptimizer):
         return self.optimizer.state_dict()
 
     def load_state_dict(self, state_dict):
-        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
         if 'common_step' in state_dict['state']:
             common_step = state_dict['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict, common_step)
@@ -1136,17 +1139,28 @@ class ChainedOptimizer(MegatronOptimizer):
     def sharded_state_dict(
         self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
     ):
+        metadata = kwargs.get('metadata') or {}
+        should_add_prefix = True  # Backward-compatibility
+        if (
+            metadata.get('chained_optim_avoid_prefix', False)
+            # This condition should be True if a distributed optimizer isn't used
+            and metadata.get('distrib_optim_sharding_type') != 'dp_zero_gather_scatter'
+        ):
+            should_add_prefix = False
+
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].sharded_state_dict(
                 model_sharded_state_dict, is_loading, **kwargs
             )
         else:
+            self._synchronize_steps()
             sharded_state_dict = {}
             for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
                 optim_state_dict = optimizer.sharded_state_dict(
                     model_sharded_state_dict, is_loading, **kwargs
                 )
-                add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
+                if should_add_prefix:
+                    add_prefix_for_sharding(optim_state_dict, f'chained_{optimizer_idx}.')
                 sharded_state_dict[optimizer_idx] = optim_state_dict
             return sharded_state_dict
 
@@ -1164,6 +1178,7 @@ class ChainedOptimizer(MegatronOptimizer):
             state_dict = (v for k, v in sorted(state_dict.items()))
         for optimizer, state in zip(self.chained_optimizers, state_dict):
             optimizer.load_state_dict(state)
+        self._synchronize_steps()
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -1230,7 +1245,7 @@ class ChainedOptimizer(MegatronOptimizer):
             return count_zeros_fp32(
                 params,
                 grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
-                use_decoupled_grad=self.config.use_precision_aware_optimizer,
+                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
             )
         else:
             num_zeros_in_grad = 0
@@ -1253,12 +1268,17 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
                 continue
+            parameters = optimizer.get_parameters()
+            if len(parameters) == 0:
+                continue
             if optimizer.config.clip_grad > 0.0:
                 clip_grad_by_total_norm_fp32(
-                    optimizer.get_parameters(),
+                    parameters,
                     max_norm=optimizer.config.clip_grad,
                     total_norm=grad_norm,
-                    use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
+                    use_decoupled_grad=(
+                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                    ),
                 )
 
         # Count the zeros in the grads.
@@ -1320,3 +1340,24 @@ class ChainedOptimizer(MegatronOptimizer):
             optimizer.load_parameter_state_from_dp_zero(
                 state_dict, update_legacy_format=update_legacy_format
             )
+
+    def _synchronize_steps(self):
+        """
+        Synchronize the step of all optimizers.
+        TE FusedAdam will not accumulate "step" for empty param groups,
+        so we need to align the step across param groups before saving and after loading.
+        """
+
+        steps = []
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.optimizer.param_groups:
+                if len(param_group['params']) > 0 and 'step' in param_group:
+                    steps.append(param_group['step'])
+        steps = list(set(steps))
+        assert len(steps) <= 1, f"steps: {steps}"
+        step = steps[0] if len(steps) == 1 else None
+        for optimizer in self.chained_optimizers:
+            for param_group in optimizer.optimizer.param_groups:
+                param_group['step'] = step
+
+        return step

@@ -77,8 +77,12 @@ class TestParallelAttention:
         assert bias.shape[0] == config.hidden_size
 
     @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
-    def test_fused_rope_gpu_forward(self):
+    @pytest.mark.parametrize("rotary_interleaved", [True, False])
+    def test_fused_rope_gpu_forward(self, rotary_interleaved):
         self.parallel_attention.config.apply_rope_fusion = True
+        if rotary_interleaved and not is_te_min_version("2.3.0"):
+            pytest.skip("Only TE >= 2.3.0 supports interleaved fused RoPE.")
+        self.parallel_attention.config.rotary_interleaved = rotary_interleaved
         config = self.parallel_attention.config
         sequence_length = 32
         micro_batch_size = 2
@@ -106,6 +110,7 @@ class TestParallelAttention:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
         self.parallel_attention.config.apply_rope_fusion = False
+        self.parallel_attention.config.rotary_interleaved = False
 
     def test_checkpointed_gpu_forward(self):
         transformer_config = self.transformer_config

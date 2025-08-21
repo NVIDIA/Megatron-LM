@@ -67,7 +67,7 @@ class MambaLayer(MegatronModule):
         super().__init__(config)
         assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaLayer"
 
-        if config.enable_cuda_graph:
+        if config.enable_cuda_graph and config.cuda_graph_scope != "full_iteration":
             self.cudagraph_manager = CudaGraphManager(config)
 
         self.config = config

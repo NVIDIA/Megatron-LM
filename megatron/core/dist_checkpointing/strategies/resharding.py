@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
-""" Performant resharding of flattened tensors.
+"""Performant resharding of flattened tensors.
 
 Tensors that are first sharded (e.g. across TP) and then flattened cause
 very irregular access patterns during loading. The idea for performant save/load
@@ -9,6 +9,7 @@ as tensors with global shape [X // x, Y // y, Z // z, x * y * z] and
 local shape [1, 1, 1, x * y * z]. This allows parallel save of tensors along the
 last (flattened) dimension. During loading, some additional resharding is needed.
 """
+
 import logging
 import math
 from dataclasses import dataclass
@@ -70,6 +71,7 @@ def nd_flattened_tensor_reformulated_global_shape(sh_ten: ShardedTensor) -> Tupl
     Returns:
         Tuple[int, ...]: reformulated tensor shape
     """
+
     assert is_nd_flattened_tensor(sh_ten), sh_ten
     return sh_ten.axis_fragmentations + (int(np.prod(sh_ten.local_shape)),)
 
@@ -131,8 +133,8 @@ def apply_nd_flattened_tensors_reformulation(
             if len(sh_ten.global_shape) == 1:
                 return sh_ten
             raise CheckpointingException(
-                f'Missing reformulation metadata for tensor {sh_ten}. '
-                f'Existing keys: {reformulation_metadata.keys()}'
+                f"Missing reformulation metadata for tensor {sh_ten}. "
+                f"Existing keys: {reformulation_metadata.keys()}"
             ) from e
 
         ckpt_actual_saved_shape = sh_ten_reformulation_metadata.ckpt_reform_global_shape
@@ -240,10 +242,10 @@ def reformulate_single_nd_flattened_tensor(
         overlap_dim_offsets.append(range(first_overlap_dim_offset, next_overlap_dim_offset))
 
     logger.debug(
-        f'Generated the following number of overlap shards for each dimension: '
-        f'{list(map(len, overlap_dim_offsets))} for fragmentation ckpt '
-        f'{ckpt_axis_fragmentation} vs app {sh_ten.axis_fragmentations} '
-        f'and chunk offset {sh_ten.local_chunk_offset_in_global()}'
+        f"Generated the following number of overlap shards for each dimension: "
+        f"{list(map(len, overlap_dim_offsets))} for fragmentation ckpt "
+        f"{ckpt_axis_fragmentation} vs app {sh_ten.axis_fragmentations} "
+        f"and chunk offset {sh_ten.local_chunk_offset_in_global()}"
     )
     reformulated_sh_tens = {}
     for chunk_offset in product(*overlap_dim_offsets):

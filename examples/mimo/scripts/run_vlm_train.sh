@@ -93,7 +93,7 @@ TOKENIZER_ARGS=(
 # Dataset args
 DATASET_ARGS=(
     --dataloader-type external
-    --dataset-provider energon_llava_vlm
+    --dataset-provider llava_vlm
     --data-path $DATASET_PATH
 )
 

@@ -16,8 +16,15 @@ spec:
     /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp1_frozen_resume_torch_dist_dist_optimizer_{platforms}_1N8G_dev/28359448
     /workspace/checkpoints/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp1_pp4_frozen_resume_torch_dist_swiglu_{platforms}_1N8G_dev/28359448
     /workspace/checkpoints/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_dgx_a100_1N8G_dev: model/mcore_gpt/gpt3_mr_mcore_te_tp2_pp1_frozen_resume_torch_dist_cp2_nondeterministic_{platforms}_1N8G_dev/28359448
+    /workspace/checkpoints/gpt3_mr_mcore_reruns_resume_dev: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
+    /workspace/checkpoints/gpt3_mr_mcore_reruns_resume_lts: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
+    /workspace/checkpoints/gpt3_mr_mcore_reruns_reshard_dev: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
+    /workspace/checkpoints/gpt3_mr_mcore_reruns_reshard_lts: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-enabled_v2
+    /workspace/checkpoints/gpt3_mr_mcore_reruns_persistent_2_dev: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-persistent_v2
+    /workspace/checkpoints/gpt3_mr_mcore_reruns_persistent_2_lts: model/mcore_gpt/gpt3_4b_pyt/25.03.05_bf16_rerun-persistent_v2
     /workspace/checkpoints/gpt_teacher: model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher
   script_setup: |
+    unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
     # Checkout latest
@@ -109,12 +116,6 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_h100]
-  - test_case: [gpt3_nightly_mcore_te_tp2_pp1_modelopt_distill_resume]
-    products:
-      # - environment: [dev]
-      #   scope: [nightly] # Broken: #480
-      - environment: [lts]
-        scope: [nightly]
   #######################################################################
   # MR tests: Mostly DEV on MR, and LTS on nightly cadence, except for  #
   #             some very important tests.                              #
@@ -151,8 +152,8 @@ products:
       - environment: [dev]
         scope: [mr]
         platforms: [dgx_h100]
-      - environment: [lts]
-        scope: [nightly]
+      # - environment: [lts]
+      #   scope: [nightly] # outdated TE: #501
   - test_case: [gpt3_mr_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion_dgx_a100_1N8G]
     products:
       - environment: [dev]
@@ -209,11 +210,11 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
-  - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dgx_a100_1N8G]
+      #   products:
+      #     - environment: [dev]
+      #       scope: [mr]
+      #       platforms: [dgx_h100] # Hangs: #513
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_dgx_a100_1N8G]
@@ -225,23 +226,23 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_dgx_a100_1N8G]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - environment: [dev]
+      #   scope: [mr]
+      #   platforms: [dgx_h100] # Hangs: #513
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied_dgx_a100_1N8G]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - environment: [dev]
+      #   scope: [mr] # Hangs: #513
+      #   platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_resume_torch_dist_tunable_overlap_dgx_a100_1N8G]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - environment: [dev]
+      #   scope: [mr] # Hangs: #513
+      #   platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_tunable_overlap_dgx_a100_1N8G]
@@ -377,9 +378,9 @@ products:
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader_dgx_a100_1N8G]
     products:
-      - environment: [dev]
-        scope: [mr]
-        platforms: [dgx_h100]
+      # - environment: [dev]
+      #   scope: [mr] # Hangs: #513
+      #   platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone_dgx_a100_1N8G]
@@ -431,6 +432,13 @@ products:
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
+  - test_case: [gpt3_mr_mcore_te_tp2_pp1_modelopt_distill_resume]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+      # - environment: [lts]
+      #   scope: [nightly] # Outdated: #502
   # - test_case: [gpt3_mr_mcore_te_tp2_pp1_fsdp2_resume_torch_dist_dgx_a100_1N8G]
   #   products:
   # - environment: [dev]
@@ -440,6 +448,20 @@ products:
   #######################################################################
   # Super important MR tests that run for both DEV and LTS per MR       #
   #######################################################################
+  - test_case: [gpt3_mr_mcore_reruns_persistent_1]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+      - environment: [lts]
+        scope: [nightly]
+  - test_case: [gpt3_mr_mcore_reruns_persistent_2]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+      - environment: [lts]
+        scope: [nightly]
   - test_case: [gpt3_mr_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer_dgx_a100_1N8G]
     products:
       - environment: [lts]

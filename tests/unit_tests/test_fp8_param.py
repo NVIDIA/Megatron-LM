@@ -241,8 +241,13 @@ class TestFP8Param:
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
-    def test_mxfp8(self, tp_size):
-        self.run_test(tp_size=tp_size, recipe="mxfp8")
+    @pytest.mark.parametrize("dp_overlap", [(False, False), (False, True), (True, True)])
+    def test_mxfp8(self, tp_size, dp_overlap):
+        """
+        dp_overlap: (overlap_param_gather, overlap_grad_reduce)
+        """
+        kwargs = {"overlap_param_gather": dp_overlap[0], "overlap_grad_reduce": dp_overlap[1]}
+        self.run_test(tp_size=tp_size, recipe="mxfp8", **kwargs)
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.4.0.dev0"), reason="TE 2.4.0.dev0 is required")

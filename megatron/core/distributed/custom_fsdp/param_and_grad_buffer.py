@@ -32,10 +32,8 @@ try:
 except:
     pass
 
-try:
-    import apex.contrib.nccl_allocator as nccl_allocator
-except ImportError:
-    nccl_allocator = None
+import megatron.core.nccl_allocator as nccl_allocator
+
 NCCL_MEMORY_POOL = None
 
 
@@ -1190,12 +1188,20 @@ class ParamAndGradBuffer:
 
         self._log_parameter_groups()
 
+    def __del__(self):
+        # Free NCCL memory pool if this instance created it
+        global NCCL_MEMORY_POOL
+        if self.ddp_config.nccl_ub and NCCL_MEMORY_POOL is not None:
+            try:
+                del NCCL_MEMORY_POOL
+            except Exception as e:
+                logging.warning(f"Exception during NCCL memory pool destruction: {e}")
+
     def get_mem_alloc_context(self, group=None, additional_group=None):
         """
         Get the memory allocation context for the parameter and gradient buffers.
         """
         if self.ddp_config.nccl_ub:
-            assert nccl_allocator is not None, "NCCL allocator is not available."
             global NCCL_MEMORY_POOL
             if group is None:
                 # data parallel group is a default group for user buffer registration
@@ -2067,7 +2073,7 @@ class GradReducePipeline:
                         # new empty is important for memory safety, when using
                         # TORCH_NCCL_AVOID_RECORD_STREAMS=1.
                         # For reference: https://dev-discuss.pytorch.org/t/fsdp-cudacachingallocator-an-outsider-newb-perspective/1486
-                        if not self.buffer.ddp_config.nccl_ub:
+                        if not self.buffer.ddp_config.fsdp_double_buffer:
                             grad_shard = torch.empty_like(grad_shard)
                         torch.distributed.reduce_scatter_tensor(
                             output=grad_shard,

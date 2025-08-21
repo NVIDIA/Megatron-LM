@@ -1,11 +1,78 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Callable, Optional
 
 import torch
 from torch.autograd import Variable
 
-from megatron.core.utils import make_viewless_tensor
+from megatron.core import parallel_state
+from megatron.core.utils import get_pg_rank, get_pg_size, make_viewless_tensor
+
+
+def is_pp_first_stage(pp_group: torch.distributed.ProcessGroup):
+    """Return True if in the first pipeline model-parallel stage, False otherwise."""
+    return get_pg_rank(pp_group) == 0
+
+
+def is_pp_last_stage(pp_group: torch.distributed.ProcessGroup):
+    """Return True if in the last pipeline-model-parallel stage, False otherwise."""
+    return get_pg_rank(pp_group) == (get_pg_size(pp_group) - 1)
+
+
+def is_vp_first_stage(vp_stage: int, vp_size: int | None):
+    """Return True if in the first virtual pipeline model-parallel stage, False otherwise."""
+    if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
+        return True
+    return vp_stage == 0
+
+
+def is_vp_last_stage(vp_stage: int, vp_size: int | None):
+    """Return True if in the last virtual pipeline model-parallel stage, False otherwise."""
+    if vp_size is None or vp_size <= 1:
+        assert vp_stage is None or vp_stage == 0, (
+            f"Expected vp_stage to be 0 or None when vp_size is <= 1 or None, "
+            f"but got vp_stage={vp_stage} and vp_size={vp_size}"
+        )
+        return True
+    return vp_stage == (vp_size - 1)
+
+
+def get_pp_first_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the first rank in the pipeline parallel group."""
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[0]
+
+
+def get_pp_last_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the last rank in the pipeline parallel group."""
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[-1]
+
+
+def get_pp_next_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the next rank in the pipeline parallel group, or None if last
+    stage."""
+    if is_pp_last_stage(pp_group):
+        return None
+    current_rank_in_group = get_pg_rank(pp_group)
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[current_rank_in_group + 1]
+
+
+def get_pp_prev_rank(pp_group: torch.distributed.ProcessGroup):
+    """Return the global rank of the previous rank in the pipeline parallel group, or None if
+    first stage."""
+    if is_pp_first_stage(pp_group):
+        return None
+    current_rank_in_group = get_pg_rank(pp_group)
+    pp_ranks = torch.distributed.get_process_group_ranks(pp_group)
+    return pp_ranks[current_rank_in_group - 1]
 
 
 def make_viewless(e):
@@ -22,6 +89,24 @@ def stream_acquire_context(stream, event):
         yield
     finally:
         event.record(stream)
+
+
+class NoopScheduleNode:
+    """A placeholder node in the computation graph that simply passes through inputs and outputs.
+
+    This class is used as a no-op node in the scheduling system when a real computation node
+    is not needed but the interface must be maintained (e.g., dense layer doesn't need
+    moe_dispatch and moe_combine). It simply returns its inputs unchanged
+    in both forward and backward passes.
+    """
+
+    def forward(self, inputs):
+        """Passes through inputs unchanged in the forward pass."""
+        return inputs
+
+    def backward(self, outgrads):
+        """Passes through gradients unchanged in the backward pass."""
+        return outgrads
 
 
 class ScheduleNode:
@@ -142,8 +227,10 @@ class ScheduleNode:
             torch.cuda.nvtx.range_pop()
 
         # output_grad maybe from another stream
-        for g in output_grad:
-            g.record_stream(self.stream)
+        if output_grad:
+            for g in output_grad:
+                if g is not None:
+                    g.record_stream(self.stream)
 
         grads = self.get_grad()
         self._release_state()
@@ -164,3 +251,73 @@ class ScheduleNode:
         self.output = None
         del self.forward_func
         del self.backward_func
+
+
+class AbstractSchedulePlan(ABC):
+    """To use combined 1f1b, model must implement build_schedule_plan while take the same
+    signature as model forward but return an instance of AbstractSchedulePlan"""
+
+    @staticmethod
+    @abstractmethod
+    def run(
+        f_schedule_plan,
+        b_schedule_plan,
+        grad=None,
+        pre_forward=None,
+        pre_backward=None,
+        post_forward=None,
+        post_backward=None,
+    ):
+        """run() is the protocol between our schedule logic and model, which is used to schedule
+        the forward and backward schedule plans for the models.
+        """
+        ...
+
+
+_COMP_STREAM = None
+_COMM_STREAM = None
+
+
+def set_streams(comp_stream=None, comm_stream=None):
+    """Set the streams for communication and computation"""
+    global _COMP_STREAM
+    global _COMM_STREAM
+    if _COMP_STREAM is not None and _COMM_STREAM is not None:
+        return
+
+    if comp_stream is None:
+        comp_stream = torch.cuda.current_stream()
+    if comm_stream is None:
+        comm_stream = torch.cuda.Stream(device="cuda")
+
+    assert _COMP_STREAM is None
+    assert _COMM_STREAM is None
+    _COMP_STREAM = comp_stream
+    _COMM_STREAM = comm_stream
+
+
+def get_comp_stream():
+    """Get the stream for computation"""
+    global _COMP_STREAM
+    return _COMP_STREAM
+
+
+def get_comm_stream():
+    """Get the stream for communication"""
+    global _COMM_STREAM
+    return _COMM_STREAM
+
+
+class VppContextManager:
+    """A reusable context manager for switch vpp stage"""
+
+    def __init__(self, vpp_rank):
+        self.vpp_rank = vpp_rank
+
+    def __enter__(self):
+        self.origin_vpp_rank = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        parallel_state.set_virtual_pipeline_model_parallel_rank(self.vpp_rank)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        parallel_state.set_virtual_pipeline_model_parallel_rank(self.origin_vpp_rank)

@@ -1,7 +1,7 @@
 ENV_VARS:
-  CUDA_DEVICE_MAX_CONNECTIONS: '1'
-  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
-TEST_TYPE: 'release'
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+TEST_TYPE: "release"
 MODEL_ARGS:
   # T5 model args
   --encoder-num-layers: 12
@@ -19,6 +19,7 @@ MODEL_ARGS:
   --micro-batch-size: 32
   --global-batch-size: 512
   --train-iters: 100000
+  --exit-interval: 100000
   --weight-decay: 1e-2
   --clip-grad: 1.0
   --bf16: true

@@ -68,32 +68,26 @@ def datasets_provider(task_encoder,worker_config=None):
     return train_dataset, val_datasets_without_source_datasets, None
 
 
-def is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size):
+def is_first_or_last_stage(pp_size):
     """Check if the current pipeline parallel stage is the first or last stage."""
     if pp_size == 1:    # No pipeline parallelism.
         return True
 
-    is_valid_rank = False
+    # With no separate pipeline stage for the vision model (epp=0), 
+    # run the dataloader on the first and last pipeline stage.
     pp_rank = get_pipeline_model_parallel_rank()
-    if encoder_pipeline_model_parallel_size == 0:
-        # No separate pipeline stage for the vision model. Run the dataloader on the first and last pipeline stage.
-        is_valid_rank = pp_rank in (0, pp_size-1)
-    elif encoder_pipeline_model_parallel_size == 1:
-        # Separate pipeline stage for the vision model. Run the dataloader on the first vision and LM stage and last LM stage.
-        is_valid_rank = pp_rank in (0, 1, pp_size-1)
-    else:
-        raise NotImplementedError("encoder-pipeline-model-parallel-size > 1 is not supported yet")
+    is_valid_rank = pp_rank in (0, pp_size-1)
 
     return is_valid_rank
 
 
-def is_dataloader_rank(encoder_pipeline_model_parallel_size):
+def is_dataloader_rank():
     """Check if we should have the dataloader on this tensor and pipeline parallel rank."""
     # Run dataloader only on the first tensor parallel rank (will be broadcasted to others).
     is_first_rank = get_tensor_model_parallel_rank() == 0
 
     pp_size = get_pipeline_model_parallel_world_size()
-    is_first_rank = is_first_rank and is_first_or_last_stage(pp_size, encoder_pipeline_model_parallel_size)
+    is_first_rank = is_first_rank and is_first_or_last_stage(pp_size)
 
     return is_first_rank
 
@@ -106,7 +100,7 @@ def train_valid_test_dataloaders_provider(train_val_test_num_samples, task_encod
         task_encoder = TaskEncoder()
 
     # Dataloader is only on specific ranks.
-    if not is_dataloader_rank(args.encoder_pipeline_model_parallel_size):
+    if not is_dataloader_rank():
         return None, None, None
 
     worker_debug_path = None

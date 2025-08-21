@@ -114,6 +114,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
         self.module = module
+        self.vp_stage = None
         self.ddp_config = ddp_config
         log_single_rank(
             logger,
@@ -215,6 +216,16 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 m.weight_tensor = None
 
         self.module.apply(unmap_weight_tensor)
+
+        for param in self.module.parameters():
+            if not hasattr(param, 'grad_added_to_main_grad'):
+                # This is to ensure that the param.grad_added_to_main_grad is set to False
+                # when the parameter is created.
+                param.grad_added_to_main_grad = False
+            if not hasattr(param, '__fsdp_param__'):
+                # This is to ensure that the param.__fsdp_param__ is set to True
+                # when the parameter is created.
+                param.__fsdp_param__ = True
 
     def _init_fsdp_param_and_grad_buffer(self):
         if self.config.calculate_per_token_loss:

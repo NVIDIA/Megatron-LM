@@ -2,6 +2,7 @@
 
 [build-system]
 requires = ["setuptools<80.0.0", "pybind11"]
+build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 include-package-data = true
@@ -19,7 +20,7 @@ dynamic = ["version", "readme"]
 description = "Megatron Core - a library for efficient and scalable training of transformer based models"
 requires-python = ">=3.10"
 license = { text = "Apache 2.0" }
-dependencies = ["torch"]
+dependencies = ["torch", "numpy<2.0.0", "packaging"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 maintainers = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
 keywords = [
@@ -66,15 +67,22 @@ mlm = ["flask-restful", "sentencepiece", "tiktoken", "wandb"]
 
 dev = [
     "tqdm",
-    "einops",
-    "tensorstore!=0.1.46,!=0.1.72",
-    "nvtx",
-    "numpy<2.0.0",
-    "transformers",
-    "multi-storage-client",
+    "einops~=0.8",
+    "tensorstore~=0.1,!=0.1.46,!=0.1.72",
+    "nvtx~=0.2",
+    "transformers~=4.53",
+    "multi-storage-client~=0.20",
+    "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
-    "nvidia-modelopt[torch]",
-    "megatron-energon[av_decode]<7",
+    "mamba-ssm~=2.2",
+    "causal-conv1d~=1.5",
+    "nv-grouped-gemm~=1.1",
+    "transformer-engine[pytorch]>=2.6.0a0,<2.7.0",
+    "nvidia-resiliency-ext>=0.4.0a0,<0.5.0",
+    "nvidia-modelopt[torch]>=0.33.0a0,<0.34.0; sys_platform != 'darwin'",
+    "megatron-energon[av_decode]~=6.0",
+    "flashinfer-python",
+    "onnxscript",
 ]
 
 lts = [
@@ -82,7 +90,6 @@ lts = [
     "einops",
     "tensorstore!=0.1.46,!=0.1.72",
     "nvtx",
-    "numpy<2.0.0",
     "transformers",
     "zarr",
     "setuptools<80.0.0",
@@ -90,12 +97,15 @@ lts = [
 
 [dependency-groups]
 test = [
+    "coverage",
     "nltk",
     "wrapt",
-    "pytest",
+    "pytest==8.3.5",
     "pytest-mock",
     "pytest-cov",
     "pytest-random-order",
+    "pytest-asyncio",
+    "pygithub",
 ]
 
 build = [
@@ -104,21 +114,43 @@ build = [
     "hatchling",
     "pybind11",
     "Cython>=3.0.0",
+    "torch",
 ]
-linting = ["ruff~=0.9.0"]
+linting = [
+    "ruff~=0.9.0",
+    "black==24.4.2",
+    "isort==5.13.2",
+    "flake8==7.1.0",
+    "pylint==3.2.6",
+]
+ci = ["python-gitlab", "slack-sdk", "pandas"]
+flash_mla = ["flash_mla"]
 
 [tool.uv]
 default-groups = ["linting", "build", "test"]
-
+no-build-isolation-package = [
+    "transformer-engine",
+    "transformer-engine-torch",
+    "mamba-ssm",
+    "causal-conv1d",
+    "nv-grouped-gemm",
+    "flash_mla",
+]
 link-mode = "copy"
 conflicts = [[{ extra = "lts" }, { extra = "dev" }]]
-# We don't want to install torch, torchvision, and triton 
+# We don't want to install torch, torchvision, and triton
 # because they are already installed in the base image.
 override-dependencies = [
     "torch; sys_platform == 'never'",
     "torchvision; sys_platform == 'never'",
     "triton; sys_platform == 'never'",
 ]
+
+[tool.uv.sources]
+flash_mla = [
+    { git = "https://github.com/deepseek-ai/FlashMLA", rev = "9edee0c022cd0938148a18e334203b0aab43aa19" },
+]
+# transformer-engine = { git = "https://github.com/NVIDIA/TransformerEngine.git", rev = "c90a720765bc01ebb5ba1f70a7ce2d16b2e46d77" } # on `release_v2.6`
 
 [tool.isort]
 profile = "black"                                                          # black-compatible
@@ -151,9 +183,9 @@ addopts = "--durations=15 -s -rA -x"
 testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
-    "internal = mark a test as a test to private/internal functions.",
-    "flaky = mark flaky tests for LTS environment",
-    "flaky_in_dev = mark flaky tests for DEV environment",
+    "internal: mark a test as a test to private/internal functions.",
+    "flaky: mark flaky tests for LTS environment",
+    "flaky_in_dev: mark flaky tests for DEV environment",
 ]
 
 [tool.coverage.run]
@@ -172,7 +204,8 @@ source = ["/opt/megatron-lm/"]
 [tool.ruff.lint]
 # Enable all `pydocstyle` rules, limiting to those that adhere to the
 # Google convention via `convention = "google"`, below.
-select = ["D", "F"]
+# select = ["D", "F"]
+select = ["S506"]
 
 # - On top of the Google convention, disable `D417`, which requires
 #   documentation for every function parameter.
