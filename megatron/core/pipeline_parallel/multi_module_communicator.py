@@ -97,7 +97,7 @@ class MultiModulePipelineCommunicator:
             for dest_module_name in self.topology[src_module_name]:
                 dest_grid = self.module_to_grid_map[dest_module_name]
                 bridge_comm = BridgeCommunicator(
-                    src_grid=src_grid, dest_grid=dest_grid, dim_mapping=self.dim_mapping
+                    src_grid=src_grid, dest_grid=dest_grid, dim_mapping=self.dim_mapping, comm_dtype=self.config.pipeline_dtype
                 )
                 bridge_comm_info = BridgeCommunicatorInfo(
                     bridge_communicator=bridge_comm,
@@ -174,7 +174,7 @@ class MultiModulePipelineCommunicator:
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
                 input_dict[module_name] = rank_module_info.p2p_communicator.recv_forward(
-                    tensor_shape=tensor_shape, is_first_stage=False
+                    tensor_shapes=tensor_shape, is_first_stage=False
                 )
         return input_dict
 
@@ -224,7 +224,7 @@ class MultiModulePipelineCommunicator:
                 # by using P2P communicator.
                 grad_dict[module_name] = (
                     rank_module_info.p2p_communicator.send_forward_recv_backward(
-                        output_dict[module_name], tensor_shape=tensor_shape, is_last_stage=False
+                        output_dict[module_name], tensor_shapes=tensor_shape, is_last_stage=False
                     )
                 )
         return grad_dict
@@ -257,7 +257,7 @@ class MultiModulePipelineCommunicator:
                 # by using P2P communicator.
                 input_dict[module_name] = (
                     rank_module_info.p2p_communicator.send_backward_recv_forward(
-                        grad_dict[module_name], tensor_shape=tensor_shape, is_first_stage=False
+                        grad_dict[module_name], tensor_shapes=tensor_shape, is_first_stage=False
                     )
                 )
         return input_dict
@@ -278,14 +278,12 @@ class MultiModulePipelineCommunicator:
                 # by using bridge communicator.
                 for bridge_comm_info in rank_module_info.bridge_comm_infos_as_src_module:
                     grad_dict[bridge_comm_info.src_module_name] = (
-                        bridge_comm_info.bridge_communicator.recv_backward(
-                            self.config.pipeline_dtype
-                        )
+                        bridge_comm_info.bridge_communicator.recv_backward()
                     )
             else:
                 # If not last stage, receive backward gradient by using P2P communicator.
                 grad_dict[module_name] = rank_module_info.p2p_communicator.recv_backward(
-                    tensor_shape=tensor_shape, is_last_stage=False
+                    tensor_shapes=tensor_shape, is_last_stage=False
                 )
         return grad_dict
 
