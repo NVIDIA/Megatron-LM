@@ -25,6 +25,7 @@ except ImportError:
         from torch.optim import AdamW as Adam, SGD
 
 from megatron.core import parallel_state
+from megatron.core.emerging_optimizers.orthogonalized_optimizers.muon import Muon
 from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 
@@ -41,7 +42,6 @@ from .optimizer import (
     param_group_identifier_keys,
 )
 from .optimizer_config import OptimizerConfig
-from llm_shower.muon.muon import Muon
 logger = logging.getLogger(__name__)
 
 
@@ -767,6 +767,7 @@ def get_emerging_optimizer(
     use_gloo_process_groups: bool = True,
     extra_args = None,
 ) -> MegatronOptimizer:
+    # currently it is only supporting muon, will add soaps later
 
     # dist-optim is not supported due to strong coupling with how DDP init grad buffer
     # in thoery we can put some weight to use non-dist-muon and rest to dist-adam
@@ -808,10 +809,11 @@ def get_emerging_optimizer(
         linear_param_groups,
         lr=config.lr,
         weight_decay=config.weight_decay,
-        momentum_beta=config.adam_beta1,
-        num_ns_steps=extra_args.muon_num_ns_steps,
-        ns_fp32_matmul_prec=extra_args.muon_ns_fp32_matmul_prec,
-        scale_mode=extra_args.muon_scale_mode,
+        momentum_beta=config.muon_momentum,
+        use_nesterov=config.muon_use_nesterov,
+        num_ns_steps=config.muon_num_ns_steps,
+        fp32_matmul_prec=config.muon_fp32_matmul_prec,
+        scale_mode=config.muon_scale_mode,
         split_qkv=False,
         qkv_split_shapes=None,
     )

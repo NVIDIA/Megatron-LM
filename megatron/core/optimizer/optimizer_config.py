@@ -119,6 +119,22 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
+    # Muon
+    muon_momentum: float = 0.95
+    """The momentum used by the internal SGD."""
+
+    muon_use_nesterov: bool = True
+    """Whether to use Nesterov-style momentum in the internal SGD."""
+
+    muon_scale_mode: str = "spectral"
+    """The mode to use for the scale factor. Defaults to "spectral"."""
+
+    muon_fp32_matmul_prec: str = "medium"
+    """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    muon_num_ns_steps: int = 5
+    """The number of iteration steps to use in the Newton-Schulz iteration."""
+
     #######################
     # Distributed optimizer
     #######################

@@ -1733,10 +1733,15 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    group.add_argument('--muon-momentum', type=float, default=0.95,
+                       help='Momentum factor for Muon optimizer')
+    group.add_argument('--muon-no-use-nesterov', action='store_false', default=True,
+                       dest='muon_use_nesterov',
+                       help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
                        help='Scale mode for Muon optimizer')
-    group.add_argument('--muon-ns-fp32-matmul-prec', type=str, default='medium',
+    group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
