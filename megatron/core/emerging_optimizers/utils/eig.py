@@ -4,7 +4,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from llm_shower import utils
+from megatron.core.emerging_optimizers import utils
 
 __all__ = ["eigh_with_fallback", "eig_orthogonal_iteration", "adaptive_early_exit_criteria"]
 
