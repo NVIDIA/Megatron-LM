@@ -172,6 +172,9 @@ DISTRIBUTED_ARGS=(
 
 sleep 5
 set -x
+fuser -k /dev/nvidia* || true
+nvidia-smi pmon -c 1
+
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} --no-python $TRAINING_SCRIPT_PATH "${PARAMS[@]}" || EXIT_CODE=$?

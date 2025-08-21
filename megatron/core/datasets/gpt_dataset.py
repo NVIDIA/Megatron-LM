@@ -414,10 +414,6 @@ class GPTDataset(MegatronDataset):
                 self.indices, num_epochs, numpy_random_state, separate_final_epoch
             )
 
-            drop_last_partial_sequence = True
-            if self.index_split == Split.valid:
-                drop_last_partial_sequence = self.config.drop_last_partial_validation_sequence
-
             # Build the sample index
             from megatron.core.datasets import helpers
 

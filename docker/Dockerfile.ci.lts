@@ -26,7 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN bash -ex <<"EOF"
     apt-get update
-    apt-get install -y --no-install-recommends gettext python3-venv
+    apt-get install -y --no-install-recommends gettext python3-venv psmisc
     apt-get clean
     python -m venv /opt/jet
     wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq

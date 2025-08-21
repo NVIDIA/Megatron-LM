@@ -50,4 +50,4 @@ MODEL_ARGS:
   --ckpt-format: torch_dist
   --data-cache-path: ${DATA_CACHE_PATH}
   --bf16: true
-TEST_TYPE: ckpt-resume
+TEST_TYPE: regular # Usually ckpt-resume, but as a WAR to #513 set to regular

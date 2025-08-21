@@ -942,7 +942,9 @@ except Exception:
     dist_all_gather_func = torch.distributed._all_gather_base
 
 
-def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_output_buffer, weight):
+def drain_embedding_wgrad_compute(
+    config, embedding_activation_buffer, grad_output_buffer, weight, tp_group
+):
     """Helper for performing embedding wgrad GEMM's during the pipeline drain phase, pipelines the
     AllGather and GEMM's.
 
@@ -956,23 +958,17 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
 
     import fused_weight_gradient_mlp_cuda
 
-    from megatron.core.parallel_state import (
-        get_global_memory_buffer,
-        get_tensor_model_parallel_group,
-        get_tensor_model_parallel_world_size,
-    )
+    from megatron.core.parallel_state import get_global_memory_buffer
 
     input = embedding_activation_buffer.pop(0)
-    world_size = get_tensor_model_parallel_world_size()
+    world_size = tp_group.size()
     dim_size = list(input.size())
     dim_size[0] = dim_size[0] * world_size
 
     all_gathered_input = [None, None]
     if config.sequence_parallel:
         all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu_0")
-        handle = dist_all_gather_func(
-            all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=False
-        )
+        handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=False)
 
         all_gathered_input[0] = all_gather_buffer
         all_gather_buffer = None
@@ -1007,9 +1003,7 @@ def drain_embedding_wgrad_compute(config, embedding_activation_buffer, grad_outp
         if config.sequence_parallel:
             name = "mpu_" + str((i + 1) % 2)
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, name)
-            handle = dist_all_gather_func(
-                all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
-            )
+            handle = dist_all_gather_func(all_gather_buffer, input, group=tp_group, async_op=True)
 
             all_gathered_input[(i + 1) % 2] = all_gather_buffer
             all_gather_buffer = None

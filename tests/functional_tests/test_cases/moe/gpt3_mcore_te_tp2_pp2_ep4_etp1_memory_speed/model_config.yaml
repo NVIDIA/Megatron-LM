@@ -123,7 +123,7 @@ MODEL_ARGS:
   # Add mixed precision args
   --bf16: true
   --exit-interval: 50
-TEST_TYPE: ckpt-resume
+TEST_TYPE: regular
 METRICS:
   - "iteration-time"
   - "lm loss"

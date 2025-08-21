@@ -10,6 +10,18 @@ import torch
 from megatron.core import parallel_state
 
 
+class ProcessGroupHelperMeta(type):
+    """Metaclass to protect virtual_pipeline_model_parallel_size from direct assignment."""
+
+    def __setattr__(cls, name, value):
+        if name == 'virtual_pipeline_model_parallel_size':
+            raise AttributeError(
+                f"Cannot set '{name}' directly. Use set_virtual_pipeline_model_parallel_size() "
+                f"method instead."
+            )
+        super().__setattr__(name, value)
+
+
 @dataclass
 class ModelCommProcessGroups:
     """Process groups for transformer model parallelism.
@@ -176,3 +188,46 @@ class GradCommProcessGroups:
 
     # _INTER_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
+
+
+@dataclass
+class GradFinalizeProcessGroups:
+    """Process groups for finalizing gradients in distributed training.
+
+    Fields use init=False and must be set after instance creation.
+
+    Args:
+        tp: Tensor model parallel process group
+        pp: Pipeline model parallel process group
+        embd: Embedding process group
+        pos_embd: Position embedding process group
+        dp_cp: Data and context parallel group
+        cp: Context parallel process group
+
+    Example:
+        # Create instance and set needed process groups
+        grad_finalize_pgs = GradFinalizeProcessGroups()
+        grad_finalize_pgs.tp = tp_group
+        grad_finalize_pgs.pp = pp_group
+
+        # Pass to gradient finalization function
+        finalize_model_grads(..., grad_finalize_pgs=grad_finalize_pgs)
+    """
+
+    # _TENSOR_MODEL_PARALLEL_GROUP
+    tp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _PIPELINE_MODEL_PARALLEL_GROUP
+    pp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EMBEDDING_GROUP
+    embd: torch.distributed.ProcessGroup = field(init=False)
+
+    # _POSITION_EMBEDDING_GROUP
+    pos_embd: torch.distributed.ProcessGroup = field(init=False)
+
+    # _DATA_PARALLEL_GROUP_WITH_CP
+    dp_cp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _CONTEXT_PARALLEL_GROUP
+    cp: torch.distributed.ProcessGroup = field(init=False)

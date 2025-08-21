@@ -68,9 +68,9 @@ class BlendedMegatronDatasetBuilder(object):
                         continue
                     weights_are_none = self.config.blend_per_split[split.value][1] is None
                 if size_is_none:
-                    assert (
-                        weights_are_none
-                    ), f"size_is_none => weights_are_none fails for {split.name} split"
+                    assert weights_are_none, f"""size_is_none => weights_are_none fails 
+                    for {split.name} split
+                    This can occur with multiple validation sets if datasets have weights"""
 
         if torch.distributed.is_initialized():
             gb_rank = torch.distributed.get_rank()
@@ -251,6 +251,20 @@ class BlendedMegatronDatasetBuilder(object):
                         blended_datasets[i] = self._build_megatron_dataset_splits(
                             prefixes[0], split_spoof, sizes_spoof
                         )[i]
+                        continue
+                    elif self.config.multiple_validation_sets and i == Split.valid.value:
+                        # handle multiple validation sets
+                        validation_datasets = []
+                        if self.config.full_validation:
+                            # verify that size is None, which causes a single epoch dataset
+                            # to be built
+                            assert sizes_spoof[i] is None
+                        for prefix in prefixes:
+                            ds = self._build_megatron_dataset_splits(
+                                prefix, split_spoof, sizes_spoof
+                            )[i]
+                            validation_datasets.append(ds)
+                        blended_datasets[i] = validation_datasets
                         continue
 
                     # Build mid-level datasets

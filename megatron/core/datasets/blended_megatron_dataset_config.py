@@ -34,6 +34,12 @@ class BlendedMegatronDatasetConfig:
        'blend'. Defauls to None.
     """
 
+    multiple_validation_sets: Optional[bool] = None
+    """Whether the validation split should be treated as multiple seperate datasets."""
+
+    full_validation: Optional[bool] = None
+    """Whether to run a full epoch of validation each time validation occurs."""
+
     split: Optional[str] = None
     """The split string, a comma separated weighting for the dataset splits when drawing samples
        from a single distribution. Not to be used with 'blend_per_split'.  Defaults to None.

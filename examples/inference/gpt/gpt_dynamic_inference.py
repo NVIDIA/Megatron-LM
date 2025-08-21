@@ -83,15 +83,18 @@ def get_model() -> MegatronModule:
     return model
 
 
-def get_inference_context(requests: List[Request], sampling_params: SamplingParams):
+def get_inference_context(requests: List[Request], sampling_params: SamplingParams, 
+                          calculate_max_sequence_length_from_requests: bool =True):
     """The inference context manages the KV cache and other inference state."""
 
     args = get_args()
-
     # Max sequence length.
-    max_gen_length = sampling_params.num_tokens_to_generate
-    max_context_length = max(len(r.prompt_tokens) for r in requests)
-    max_sequence_length = max_context_length + max_gen_length
+    if calculate_max_sequence_length_from_requests:
+        max_gen_length = sampling_params.num_tokens_to_generate    
+        max_context_length = max(len(r.prompt_tokens) for r in requests)
+        max_sequence_length = max_context_length + max_gen_length
+    else:
+        max_sequence_length = args.inference_max_seq_length
 
     # Inference context.
     context = DynamicInferenceContext(
@@ -111,6 +114,9 @@ def get_inference_context(requests: List[Request], sampling_params: SamplingPara
         max_tokens_override=args.inference_dynamic_batching_max_tokens_override,
         tensor_model_parallel_size=args.tensor_model_parallel_size,
         materialize_only_last_token_logits=not args.return_log_probs,
+        cache_mla_latent=args.multi_latent_attention and args.cache_mla_latents,
+        kv_lora_rank=args.kv_lora_rank if args.multi_latent_attention else None,
+        qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
     )
 
     return context
@@ -323,7 +329,7 @@ def main():
                     result_dict["logprobs"] = response_logprobs
                 json_results[req.request_id] = result_dict
             with open(args.output_path, "w") as fp:
-                json.dump(json_results, fp)
+                json.dump(json_results, fp, indent=1)
 
     # Timing results.
     stats = torch.cuda.memory_stats()

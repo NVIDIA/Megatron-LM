@@ -35,6 +35,7 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
     - Sinkhorn (S-BASE)
     - Aux loss / Load balancing loss
     - Aux-loss-free load balancing strategy
+- CUDA fused routing and load balancing kernels
 
 ### Performance Optimizations
 - (Experimental) **DeepEP** is integrated for efficient token communication in large-scale MoE training.
@@ -55,10 +56,6 @@ Megatron-Core MoE provides comprehensive parallelism strategies, seamlessly inte
 - Distributed checkpoining
 - Per-layer logging
 - Upcycling Support
-
-## Upcoming features
-- TopK Router Fusion
-- Multi-token Prediction
 
 # User Guide
 
@@ -232,6 +229,7 @@ Enable A2A overlap across different batches inspired by the DSv3 DualPipe implme
 | --moe-router-group-topk | Number of selected groups for group-limited routing. |
 | --moe-router-topk-scaling-factor | Scaling factor for routing score in top-k selection, only works when --moe-router-pre-softmax enabled. Defaults to None, which means no scaling. |
 | --moe-router-enable-expert-bias | TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy. The routing decision is based on the sum of the routing scores and the expert bias. See https://arxiv.org/abs/2408.15664 for details. |
+| --moe-router-fusion | Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above. |
 | --moe-router-bias-update-rate | The expert bias is updated based on the number of assigned tokens to each expert in a global batch, where the bias is increased for experts with less assigned tokens and decreased for experts with more assigned tokens. Default is 1e-3 same as that used in DeepSeekV3. |
 | --moe-router-force-load-balancing | (Experimental) Force override routing to balance token distribution using random logits for MoE routers, supporting naive top-k and group-limited top-k. This experimental feature is for benchmarking purposes only! |
 | --moe-router-padding-for-fp8 | Pad the routing_map to make sure the number of tokens each expert received is a multiple of 16/32 for FP8 precision. It is suggested to enable this for dropless training with FP8 precision when num_local_experts > 1. This is a more efficient way to pad for FP8 which eliminates the explicit padding in the GroupedMLP layer. |

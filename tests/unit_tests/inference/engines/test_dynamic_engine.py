@@ -79,9 +79,15 @@ class DynamicEngineTestConfig:
     context_max_requests_override: Optional[int] = None
     context_max_tokens_override: Optional[int] = None
     tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    sequence_parallel: bool = False
 
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
+    return_log_probs: bool = False
+    materialize_only_last_token_logits: bool = True
+    skip_prompt_log_probs_for_dynamic_inference: bool = False
 
     def __post_init__(self):
 
@@ -165,6 +171,7 @@ class TestDynamicInferenceEngine:
             max_requests_override=test_config.context_max_requests_override,
             max_tokens_override=test_config.context_max_tokens_override,
             tensor_model_parallel_size=transformer_config.tensor_model_parallel_size,
+            materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
         )
 
         return context
@@ -173,7 +180,7 @@ class TestDynamicInferenceEngine:
     def _build_test_env(cls, test_config):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
-            pipeline_model_parallel_size=1,
+            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
         )
 
         set_rounder(4)
@@ -201,6 +208,16 @@ class TestDynamicInferenceEngine:
             enable_cuda_graph=test_config.num_cuda_graphs is not None,
             inference_rng_tracker=True,
             tensor_model_parallel_size=test_config.tensor_model_parallel_size,
+            pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
+            expert_model_parallel_size=test_config.expert_model_parallel_size,
+            num_moe_experts=(
+                None
+                if test_config.expert_model_parallel_size == 1
+                else test_config.expert_model_parallel_size
+            ),
+            sequence_parallel=test_config.sequence_parallel,
+            pipeline_dtype=torch.bfloat16,
+            add_bias_linear=test_config.expert_model_parallel_size == 1,
         )
 
         # Requests.
@@ -213,7 +230,15 @@ class TestDynamicInferenceEngine:
         )
 
         # Sampling params.
-        sampling_params = SamplingParams(num_tokens_to_generate=test_config.max_output_length)
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=test_config.max_output_length,
+            return_log_probs=test_config.return_log_probs,
+        )
+        sampling_params.add_attributes(
+            {
+                "skip_prompt_log_probs_for_dynamic_inference": test_config.skip_prompt_log_probs_for_dynamic_inference
+            }
+        )
 
         # GPT model.
         model = GPTModel(
@@ -222,6 +247,8 @@ class TestDynamicInferenceEngine:
             vocab_size=vocab_size,
             max_sequence_length=test_config.max_prompt_length + test_config.max_output_length,
             parallel_output=True,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
         ).cuda()
 
         for param in model.parameters():
@@ -603,3 +630,50 @@ class TestDynamicInferenceEngine:
             )
 
         engine_task.cancel()
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_return_log_probs(self):
+        """Verify that returning log probs does not raise any error."""
+        # Returning log probs requires materializing the full prompt logits or
+        # explicitly disabling prompt logits.
+        with pytest.raises(AssertionError):
+            env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=True)
+        env = self._run_test(return_log_probs=True, materialize_only_last_token_logits=False)
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=True,
+            skip_prompt_log_probs_for_dynamic_inference=True,
+        )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("ep_size", [1, 2])
+    @pytest.mark.parametrize("pp_size", [1, 2])
+    @pytest.mark.parametrize("tp_size", [1, 2])
+    def test_parallel_inference(
+        self, tp_size, pp_size, ep_size, sequence_parallel, materialize_only_last_token_logits
+    ):
+        if tp_size == 1 and pp_size == 1 and ep_size == 1:
+            pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
+        elif not torch.distributed.is_initialized():
+            pytest.skip("Distributed not initialized")
+        world_size = torch.distributed.get_world_size()
+        min_world_size = tp_size * pp_size * ep_size
+        if world_size < min_world_size:
+            pytest.skip(f"Test requires at least {min_world_size} GPUs")
+        elif tp_size == 1 and sequence_parallel:
+            pytest.skip(reason="Sequence parallelism requires tp_size > 1")
+        elif tp_size > 1 and ep_size > 1 and not sequence_parallel:
+            pytest.skip(reason="Sequence parallelism must be used with tp_size > 1 and ep_size > 1")
+        env = self._run_test(
+            tensor_model_parallel_size=tp_size,
+            pipeline_model_parallel_size=pp_size,
+            expert_model_parallel_size=ep_size,
+            sequence_parallel=sequence_parallel,
+            materialize_only_last_token_logits=materialize_only_last_token_logits,
+        )
