@@ -455,6 +455,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
+        # Remove 'dynamic_inference_decode_only' from kwargs if present
+        # this is only used to uniquely identify decode and non-decode cuda graph
+        # runners in the cuda graph manager
+        kwargs.pop("dynamic_inference_decode_only", None)
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(hidden_states, kwargs.get("inference_context", None))
         return output, context
@@ -879,10 +883,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             # supported cuda graph token count. In that case this flag will be set to
             # False by initialize_attention, and we should not use cuda graphs.
             if kwargs['inference_context'].using_cuda_graph_this_step():
-                extra_cuda_graph_runner_kwargs = {
-                    "is_decode_only": kwargs['inference_context'].is_decode_only()
-                }
-                return self.cudagraph_manager(self, args, kwargs, extra_cuda_graph_runner_kwargs)
+                # dynamic_inference_decode_only is not a real argument to forward, it is only used
+                # to differentiate the cuda graph used for decode from the one used for non-decode
+                # inference.
+                kwargs["dynamic_inference_decode_only"] = kwargs['inference_context'].is_decode_only()
+                return self.cudagraph_manager(self, args, kwargs)
 
         elif (
             self.config.external_cuda_graph
