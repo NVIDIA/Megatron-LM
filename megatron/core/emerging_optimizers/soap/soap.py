@@ -6,13 +6,13 @@ import torch.optim as optim
 
 from absl import logging
 
-from llm_shower.soap.soap_utils import (
+from megatron.core.emerging_optimizers.soap.soap_utils import (
     get_eigenbasis_eigh,
     get_eigenbasis_qr,
 )
 
-from llm_shower import utils
-from llm_shower.scalar_optimizers import calculate_adam_update
+from megatron.core.emerging_optimizers import utils
+from megatron.core.emerging_optimizers.scalar_optimizers import calculate_adam_update
 
 __all__ = [
     "SOAP",

@@ -2,8 +2,8 @@ from functools import partial
 
 from torch.optim.optimizer import ParamsT
 
-from llm_shower.orthogonalized_optimizers.orthogonalized_optimizer import OrthogonalizedOptimizer
-from llm_shower.orthogonalized_optimizers.muon_utils import newton_schulz
+from megatron.core.emerging_optimizers.orthogonalized_optimizers.orthogonalized_optimizer import OrthogonalizedOptimizer
+from megatron.core.emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
 
 
 class Muon(OrthogonalizedOptimizer):

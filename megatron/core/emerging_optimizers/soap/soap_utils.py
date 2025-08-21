@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 import torch
 
-from llm_shower import utils
+from megatron.core.emerging_optimizers import utils
 
 __all__ = [
     "get_eigenbasis_eigh",
