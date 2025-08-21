@@ -16,6 +16,11 @@ from megatron.training import get_timers
 from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import (
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
+)
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -31,7 +36,7 @@ from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.utils import StragglerDetector
+from megatron.core.utils import is_te_min_version, StragglerDetector
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.utils import (
@@ -54,6 +59,16 @@ try:
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
+
+try:
+    # Register the TE CUDA kernels
+    import transformer_engine  # pylint: disable=unused-import
+
+    # Alias the PyTorch wrapper so we can call tex.* APIs
+    import transformer_engine_torch as tex
+except ImportError:
+    # TE isn’t installed or the torch wrapper is missing
+    tex = None
 
 stimer = StragglerDetector()
 
@@ -211,7 +226,41 @@ def get_batch(data_iterator):
     batch = get_batch_on_this_tp_rank(data_iterator)
 
     # slice batch along sequence dimension for context parallelism
-    batch = get_batch_on_this_cp_rank(batch)
+    # batch = get_batch_on_this_cp_rank(batch)
+
+    cu_seqlens = batch['cu_seqlens']
+    if cu_seqlens is None:
+        # slice batch along sequence dimension for context parallelism
+        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
+    else:  # Packed THD format
+        assert (
+            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
+        ), "micro-batch-size must be 1 for packing"
+        cu_seqlens = cu_seqlens[0]
+        batch['cu_seqlens'] = cu_seqlens
+
+        max_seqlen = batch['max_seqlen']
+        assert max_seqlen.dim() == 1
+        # TODO(duncan): can this be kept as a 0-D tensor?
+        batch['max_seqlen'] = int(max_seqlen[0].item())
+
+        cp_size = get_context_parallel_world_size()
+        if cp_size > 1:  # slice batch along sequence dimension for context parallelism
+            assert tex is not None and is_te_min_version("1.10.0"), (
+                "Please update Transformer Engine to >= 1.10 to use "
+                "Context Parallel with THD format data"
+            )
+            cp_rank = get_context_parallel_rank()
+            index = tex.thd_get_partitioned_indices(
+                cu_seqlens,
+                batch['tokens'].size(1),
+                cp_size,
+                cp_rank,
+            )
+            for key, data in batch.items():
+                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
+                    continue
+                batch[key] = data.index_select(1, index)
 
     return batch.values()
 
@@ -297,7 +346,20 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     timers('batch-generator', log_level=2).start()
     global stimer
     with stimer(bdata=True):
-        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
+        tokens, labels, loss_mask, attention_mask, position_ids, cu_seqlens, max_seqlen = get_batch(data_iterator)
+    if cu_seqlens is None:
+        packed_seq_params = None
+    else:
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=None,
+            cu_seqlens_kv_padded=None,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+    
     timers('batch-generator').stop()
 
     with stimer:
@@ -313,7 +375,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
                 output_tensor = model(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask, packed_seq_params=packed_seq_params
                 )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
@@ -351,6 +413,7 @@ def core_gpt_dataset_config_from_args(args):
         create_attention_mask=args.create_attention_mask_in_dataloader,
         object_storage_cache_path=args.object_storage_cache_path,
         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+        context_parallel_size=args.context_parallel_size,
     )
 
 
