@@ -90,6 +90,12 @@ def add_common_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Randomly sample prompts from the prompt file based on simulated request arrivals times "
         "rather than inferring using all of them.",
     )
+    group.add_argument(
+        "--inference-coordinator-port",
+        type=int,
+        help="This port will be used to setup the inference co-ordinator on node-0",
+        default=12346
+    )
 
     return parser
 

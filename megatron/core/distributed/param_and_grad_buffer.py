@@ -12,16 +12,12 @@ from typing import Dict, List, Optional
 import torch
 from torch.distributed import _coalescing_manager
 
+import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-
-try:
-    import apex.contrib.nccl_allocator as nccl_allocator
-except ImportError:
-    nccl_allocator = None
 
 logger = logging.getLogger(__name__)
 
@@ -665,8 +661,6 @@ class _ParamAndGradBuffer:
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
-            if not nccl_allocator:
-                raise RuntimeError("NCCL allocator importing failed but nccl ub is still requested")
             pool = nccl_allocator.create_nccl_mem_pool()
             mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem, pool, group=self.data_parallel_group

@@ -21,6 +21,7 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.utils import get_model_config
 
 
 # pylint: disable=line-too-long
@@ -58,6 +59,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             if self.inference_wrapper_config.fp32_residual_connection
             else self.inference_wrapper_config.params_dtype
         )
+        model_config = get_model_config(self.model)
+        self.sequence_parallel = model_config.sequence_parallel
 
         if inference_context is None:
             warnings.warn(
@@ -79,6 +82,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         self.tp_group = model_comm_pgs.tp
         self.pp_group = model_comm_pgs.pp
+        self.tp_size = torch.distributed.get_world_size(self.tp_group)
 
         if self.inference_wrapper_config.fp8 is not None:
             self.model = prepare_model_for_fp8_inference(self.model)
@@ -184,6 +188,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
     def _allocate_recv_buffer(self, batch_size, seq_len):
         """Receive happens between the layers with size [seq_len, batch_size, hidden_size]."""
+        if self.sequence_parallel and self.inference_context.is_dynamic_batching():
+            # For dynamic inference we need to explicitly adjust the recv buffer size here for
+            # sequence parallelism. Static batching does not support sequence parallelism
+            # except for the MoE layers which is handled separately.
+            seq_len = seq_len // self.tp_size
         recv_size = (seq_len, batch_size, self.inference_wrapper_config.hidden_size)
         return torch.empty(
             recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device()

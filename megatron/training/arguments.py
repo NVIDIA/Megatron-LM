@@ -962,6 +962,12 @@ def validate_args(args, defaults={}):
         assert not args.fp16, \
             "Expert parallelism is not supported with fp16 training."
 
+    # MoE router check
+    if isinstance(args.moe_router_load_balancing_type, list) and len(args.moe_router_load_balancing_type) == 1:
+        args.moe_router_load_balancing_type = args.moe_router_load_balancing_type[0]
+    if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
+        args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
+
     # Distributed checkpointing checks
     if args.use_dist_ckpt and args.use_legacy_models:
         raise RuntimeError('--use-dist-ckpt is not supported in legacy models.')
@@ -1806,7 +1812,8 @@ def _add_training_args(parser):
                        'to recompute within each pipeline stage.')
     group.add_argument('--recompute-modules', nargs='*', type=str, default=None,
                        help='The submodules to recompute. '
-                       'choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe". '
+                       'choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", '
+                       '         "mlp", "moe", "shared_experts". '
                        'default: ["core_attn"].'
                        '"core_attn": recompute the core attention part of the transformer layer. '
                        '"moe_act": recompute the MoE MLP activation function. '
@@ -1814,8 +1821,9 @@ def _add_training_args(parser):
                        '"mla_up_proj": recompute the MLA up projection and RoPE applying parts.'
                        '"mlp": recompute the dense MLP layer.'
                        '"moe": recompute the MoE layer.'
+                       '"shared_experts": recompute the shared experts in the MoE layer.'
                        '"moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing, '
-                       '"core_attn", "mlp", and "moe" uses normal checkpointing.')
+                       '"core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.')
     group.add_argument('--no-clone-scatter-output-in-embedding', action='store_false',
                        help='If not set, clone the output of the scatter in embedding layer to GC original tensor.',
                        dest='clone_scatter_output_in_embedding')
@@ -2402,6 +2410,11 @@ def _add_distributed_args(parser):
                        'which is improving the performance of the overlapped computation.')
     group.add_argument('--use-sharp', action='store_true', 
                        help='Required to enable SHARP communication.')
+    group.add_argument('--sharp-enabled-group', type=str, default=None,
+                       choices=['dp', 'dp_replica'],
+                       help='IB SHARP can be enabled from only one communication group. '
+                       'By default, it is enabled from dp group. '
+                       'Available options: [dp, dp_replica]')
     group.add_argument('--use-custom-fsdp', action='store_true',
                        help='Use the Megatron FSDP code path in DDP.')
     group.add_argument('--init-model-with-meta-device', action='store_true')
@@ -2468,6 +2481,8 @@ def _add_distributed_args(parser):
 def _add_validation_args(parser):
     group = parser.add_argument_group(title='validation')
 
+    group.add_argument('--full-validation', action='store_true', help='If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!')
+    group.add_argument('--multiple-validation-sets', action='store_true', help='If set, multiple datasets listed in the validation split are evaluated independently with a separate loss for each dataset in the list. This argument requires that no weights are included in the list')
     group.add_argument('--eval-iters', type=int, default=100,
                        help='Number of iterations to run for evaluation'
                        'validation/test for.')
@@ -2788,7 +2803,7 @@ def _add_moe_args(parser):
                        help='Load a checkpoint of a dense model, convert it into an MoE model, and save the converted model to the path specified by --save. '
                        'Upcycling is implemented on the top of distributed checkpointing, so it supports parallel modes different from the dense model.')
     # Router arguments
-    group.add_argument('--moe-router-load-balancing-type', type=str,
+    group.add_argument('--moe-router-load-balancing-type', nargs='+', type=str,
                        choices=['aux_loss', 'seq_aux_loss', 'sinkhorn', 'none'],
                        default='aux_loss',
                        help='Determines the load balancing strategy for the router. "aux_loss" corresponds to the load balancing loss used in GShard and SwitchTransformer; "seq_aux_loss" corresponds to the load balancing loss used in DeepSeekV2, which computes the loss for each individual sample; "sinkhorn" corresponds to the balancing algorithm used in S-BASE, and "none" implies no load balancing. The default is "aux_loss".')
@@ -2799,6 +2814,8 @@ def _add_moe_args(parser):
                             'Fp32/fp64 enhances numerical stability, especially with numerous experts. '
                             'The perf impact should be negligible when used with permute fusion. '
                             'None means no changes for dtype.')
+    group.add_argument('--moe-router-fusion', action='store_true',
+                       help='Enable fusion for MoE TopK routing and aux-loss computation. This is only supported in TransformerEngine 2.7.0 and above.')
     group.add_argument('--moe-router-score-function', type=str,
                        choices=['softmax', 'sigmoid'],
                        default='softmax',
@@ -2831,7 +2848,7 @@ def _add_moe_args(parser):
                        'dropless training with FP8 precision when num_local_experts > 1. This is a more '
                        'efficient way to pad for FP8 which eliminates the explicit padding in the '
                        'GroupedMLP layer.')
-    group.add_argument('--moe-aux-loss-coeff', type=float, default=0.0,
+    group.add_argument('--moe-aux-loss-coeff', type=float, nargs='+', default=0.0,
                        help='Scaling coefficient for the aux loss: a starting value of 1e-2 is recommended.')
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
                        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
@@ -2888,6 +2905,8 @@ def _add_mla_args(parser):
                        help="Mscale for YaRN RoPE in multi-latent attention.")
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
+    group.add_argument('--cache-mla-latents', action='store_true', default=False,
+                       help="If set caches the mla down projected latents with mla flash decode.")
 
     return parser
 
