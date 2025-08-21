@@ -886,7 +886,9 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 # dynamic_inference_decode_only is not a real argument to forward, it is only used
                 # to differentiate the cuda graph used for decode from the one used for non-decode
                 # inference.
-                kwargs["dynamic_inference_decode_only"] = kwargs['inference_context'].is_decode_only()
+                kwargs["dynamic_inference_decode_only"] = kwargs[
+                    'inference_context'
+                ].is_decode_only()
                 return self.cudagraph_manager(self, args, kwargs)
 
         elif (

@@ -562,13 +562,15 @@ class _CudaGraphRunner(torch.nn.Module):
         if inference_context and inference_context.is_dynamic_batching():
             # to prevent circular imports
             from megatron.core.inference.contexts.dynamic_context import WarmupEngineMode
+
             num_warmup_tokens = kwargs["hidden_states"].size(0)
             is_decode_only = kwargs["dynamic_inference_decode_only"]
-            inference_context.initialize_attention_state(num_warmup_tokens=num_warmup_tokens,
-                                                         warmup_engine_mode=(
+            inference_context.initialize_attention_state(
+                num_warmup_tokens=num_warmup_tokens,
+                warmup_engine_mode=(
                     WarmupEngineMode.DECODE if is_decode_only else WarmupEngineMode.NON_DECODE
                 ),
-)
+            )
 
         context = (
             torch.cuda.graph(cuda_graph=graph, pool=pool) if graph is not None else nullcontext()
