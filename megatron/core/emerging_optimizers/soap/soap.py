@@ -6,13 +6,13 @@ import torch.optim as optim
 
 from absl import logging
 
-from megatron.core.emerging_optimizers.soap.soap_utils import (
+from llm_shower.soap.soap_utils import (
     get_eigenbasis_eigh,
     get_eigenbasis_qr,
 )
 
-from megatron.core.emerging_optimizers import utils
-from megatron.core.emerging_optimizers.scalar_optimizers import calculate_adam_update
+from llm_shower import utils
+from llm_shower.scalar_optimizers import calculate_adam_update
 
 __all__ = [
     "SOAP",
@@ -57,7 +57,7 @@ class SOAP(optim.Optimizer):
             If False, use orthogonal iteration to compute the eigenbasis.
         qr_fp32_matmul_prec: Precision of the matmul operations in QR decomposition.
         use_adaptive_criteria: Whether to use criteria to determine if eigenbasis update is needed
-        adaptive_update_criteria_tolerance: Tolerance threshold for the update criteria.
+        adaptive_update_tolerance: Tolerance threshold for the update criteria.
             Only used if use_adaptive_criteria is True.
         power_iter_steps: Number of power iteration steps to perform before QR decomposition.
             More steps can lead to better convergence but increased computation time.
@@ -86,7 +86,7 @@ class SOAP(optim.Optimizer):
         use_eigh: bool = False,
         qr_fp32_matmul_prec: str = "high",
         use_adaptive_criteria: bool = False,
-        adaptive_update_criteria_tolerance: Optional[float] = None,
+        adaptive_update_tolerance: Optional[float] = None,
         power_iter_steps: int = 1,
         max_update_rms: float = 0.0,
     ) -> None:
@@ -98,11 +98,11 @@ class SOAP(optim.Optimizer):
 
         # Check for update criteria
         if use_adaptive_criteria:
-            if adaptive_update_criteria_tolerance is None:
-                adaptive_update_criteria_tolerance = 1e-30
+            if adaptive_update_tolerance is None:
+                adaptive_update_tolerance = 1e-7
                 logging.info(
-                    "adaptive_update_criteria_tolerance not provided. Setting adaptive_update_criteria_tolerance equal to "
-                    f"eps = {adaptive_update_criteria_tolerance} by default."
+                    "adaptive_update_tolerance not provided. Setting adaptive_update_tolerance equal to "
+                    f"eps = {adaptive_update_tolerance} by default."
                 )
 
         # Check for adam_warmup_steps since <1 will cause key errors in update_eigenbasis_and_momentum step
@@ -139,7 +139,7 @@ class SOAP(optim.Optimizer):
             "use_eigh": use_eigh,
             "qr_fp32_matmul_prec": qr_fp32_matmul_prec,
             "use_adaptive_criteria": use_adaptive_criteria,
-            "adaptive_update_criteria_tolerance": adaptive_update_criteria_tolerance,
+            "adaptive_update_tolerance": adaptive_update_tolerance,
             "power_iter_steps": power_iter_steps,
             "max_update_rms": max_update_rms,
         }
@@ -306,7 +306,7 @@ class SOAP(optim.Optimizer):
                             momentum=state["exp_avg"],
                             use_eigh=group["use_eigh"],
                             use_adaptive_criteria=group["use_adaptive_criteria"],
-                            adaptive_update_criteria_tolerance=group["adaptive_update_criteria_tolerance"],
+                            adaptive_update_tolerance=group["adaptive_update_tolerance"],
                             power_iter_steps=group["power_iter_steps"],
                         )
                 torch.cuda.nvtx.range_pop()
@@ -458,7 +458,7 @@ def update_eigenbasis_and_momentum(
     momentum: torch.Tensor,
     use_eigh: bool = False,
     use_adaptive_criteria: bool = False,
-    adaptive_update_criteria_tolerance: Optional[float] = None,
+    adaptive_update_tolerance: Optional[float] = None,
     power_iter_steps: int = 1,
     convert_to_float: bool = True,
 ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
@@ -483,7 +483,7 @@ def update_eigenbasis_and_momentum(
         use_eigh: Whether to use full symmetric eigendecomposition (eigh) to compute the eigenbasis.
             If False, use orthogonal iteration to compute the eigenbasis.
         use_adaptive_criteria: Whether to use criteria to determine if eigenbasis update is needed
-        adaptive_update_criteria_tolerance: Tolerance threshold for the update criteria.
+        adaptive_update_tolerance: Tolerance threshold for the update criteria.
             Only used if use_adaptive_criteria is True.
         power_iter_steps: Number of power iteration steps to perform before QR decomposition.
             More steps can lead to better convergence but increased computation time.
@@ -521,6 +521,9 @@ def update_eigenbasis_and_momentum(
         updated_eigenbasis_list = get_eigenbasis_eigh(
             kronecker_factor_list,
             convert_to_float,
+            eigenbasis_list,
+            use_adaptive_criteria,
+            adaptive_update_tolerance,
         )
     else:
         # Use QR decomposition and power iteration (orthogonal iteration)
@@ -530,7 +533,7 @@ def update_eigenbasis_and_momentum(
             exp_avg_sq,
             convert_to_float,
             use_adaptive_criteria,
-            adaptive_update_criteria_tolerance,
+            adaptive_update_tolerance,
             power_iter_steps,
         )
     torch.cuda.nvtx.range_pop()

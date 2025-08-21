@@ -6,7 +6,7 @@ import torch
 import torch.optim as optim
 from torch.optim.optimizer import ParamsT
 
-from megatron.core.emerging_optimizers import utils
+from llm_shower import utils
 
 
 class OrthogonalizedOptimizer(optim.Optimizer):
