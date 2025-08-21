@@ -34,6 +34,7 @@ from megatron.core.inference.text_generation_controllers.simple_text_generation_
 )
 from megatron.core.inference.utils import Counter
 from megatron.core.transformer.cuda_graphs import create_cudagraphs
+import math
 
 try:
     from tqdm import tqdm
@@ -85,6 +86,7 @@ class DynamicInferenceEngine(AbstractEngine):
         termination_id: int,
         enable_cuda_graph: bool,
         random_seed: Optional[int] = None,
+        chunked_prefill_token_count: Optional[int] = None,
     ):
 
         assert isinstance(controller, SimpleTextGenerationController)
@@ -107,6 +109,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.paused = False
         self.stopped = False
+        self.chunked_prefill_token_count = chunked_prefill_token_count
+        self.chunked_prefill_request_id = None
 
         # Initialize the asyncio loop if it has not already been initialized.
         # TODO: Start the engine loop here.
@@ -365,21 +369,18 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
+        if num_tokens_to_generate is None:
+            num_tokens_to_generate = self.context.max_sequence_length - len(tokens)
+        elif len(tokens) + num_tokens_to_generate > self.context.max_sequence_length:
+            raise MaxSequenceLengthOverflowError()
+
         self.requests[request_id] = DynamicInferenceRequest(
             request_id=request_id,
             prompt_tokens=tokens,
             sampling_params=SamplingParams(num_tokens_to_generate=num_tokens_to_generate),
         )
-        try:
-            # Add request to context.
-            self.context.add_request(request_id, tokens, num_tokens_to_generate)
-            self._loop.call_soon_threadsafe(
-                asyncio.create_task, self._notify_cond_for_new_request()
-            )
-        except (TokenOverflowError, RequestOverflowError, ChunkOverflowError) as e:
-            self.waiting_request_ids.append(request_id)
-        except MaxSequenceLengthOverflowError as e:
-            raise e
+
+        self.waiting_request_ids.append(request_id)
 
         # Create a new asyncio Future to notify the user when the request has completed.
         self.request_completion_futures[request_id] = asyncio.Future()
@@ -417,49 +418,100 @@ class DynamicInferenceEngine(AbstractEngine):
             request_ids.tolist(), sample.tolist(), log_probs_iter
         ):
             request: DynamicInferenceRequest = self.requests[request_id]
-            request.generated_tokens.append(token)
-            if request.tpot is None:
-                request.tpot = []
-            request.tpot.append(step_time)
+            if self.chunked_prefill_request_id is None or request_id != self.chunked_prefill_request_id:
+                request.generated_tokens.append(token)
+                if request.tpot is None:
+                    request.tpot = []
+                request.tpot.append(step_time)
 
-            if request_log_probs is not None:
-                if not request.prompt_log_probs:
-                    request.prompt_log_probs = []
-                if not request.generated_log_probs:
-                    request.generated_log_probs = []
-                # If the request log probs span > 1 token we are in prefill
-                if len(request_log_probs) > 1:
-                    request.prompt_log_probs.extend(request_log_probs)
+                if request_log_probs is not None:
+                    if not request.prompt_log_probs:
+                        request.prompt_log_probs = []
+                    if not request.generated_log_probs:
+                        request.generated_log_probs = []
+                    # If the request log probs span > 1 token we are in prefill
+                    if len(request_log_probs) > 1:
+                        request.prompt_log_probs.extend(request_log_probs)
+                    else:
+                        request.generated_log_probs.extend(request_log_probs)
+
+                if request_id in finished_request_ids:
+                    request.generated_length = len(request.generated_tokens)
+                    request.status = Status.COMPLETED
+                    finished_request = self.requests.pop(request_id)
+                    finished_request.generated_length = len(finished_request.generated_tokens)
+                    finished_requests.append(finished_request)
+                    finished_request.generated_text = self.controller.tokenizer.detokenize(
+                        finished_request.generated_tokens
+                    )
+                    self.request_completion_futures[request_id].set_result(finished_request)
                 else:
-                    request.generated_log_probs.extend(request_log_probs)
-
-            if request_id in finished_request_ids:
-                request.generated_length = len(request.generated_tokens)
-                request.status = Status.COMPLETED
-                finished_request = self.requests.pop(request_id)
-                finished_request.generated_length = len(finished_request.generated_tokens)
-                finished_requests.append(finished_request)
-                finished_request.generated_text = self.controller.tokenizer.detokenize(
-                    finished_request.generated_tokens
-                )
-                self.request_completion_futures[request_id].set_result(finished_request)
+                    active_requests.append(request)
             else:
+                if request_log_probs is not None:
+                    request.prompt_log_probs.extend(request_log_probs)
+                    request.generated_log_probs = []
                 active_requests.append(request)
 
         return active_requests, finished_requests
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
-        for waiting_request_id in self.waiting_request_ids.copy():
-            waiting_request: DynamicInferenceRequest = self.requests[waiting_request_id]
-            try:
-                self.context.add_request(
-                    waiting_request_id,
-                    waiting_request.prompt_tokens,
-                    waiting_request.sampling_params.num_tokens_to_generate,
-                )
+        if self.chunked_prefill_token_count is not None:
+            self.schedule_chunked_prefill()
+        else:
+            self.schedule_non_chunked_prefill()
+
+    
+    def schedule_non_chunked_prefill(self):
+        while len(self.waiting_request_ids) > 0:
+            req = self.requests[self.waiting_request_ids[0]]
+            request_satisfied = self.context.total_request_count < self.context.max_requests
+            token_satisfied = self.context.active_token_count + req.prompt_length <= self.context.max_tokens
+            chunks = math.ceil(req.prompt_length / self.context.chunk_size_tokens)
+            kv_cache_available = self.context.chunk_allocator.is_memory_available(chunks, safe=True)
+            if request_satisfied and token_satisfied and kv_cache_available:
+                self.context.add_request(req)
                 self.waiting_request_ids.popleft()
-            except Exception as e:
+            else:
+                break
+    
+    def schedule_chunked_prefill(self):
+        while len(self.waiting_request_ids) > 0:
+            
+            req = self.requests[self.waiting_request_ids[0]]
+            is_continuing_chunked_prefill = self.chunked_prefill_request_id is not None
+            if is_continuing_chunked_prefill:
+                request_satisfied = True # we are updating a request, not schedule one, so we don't need to check this
+                token_fully_satisfied = self.context.active_token_count + req.prompt_length <= self.chunked_prefill_token_count 
+                token_partially_satisfied = self.context.active_token_count < self.chunked_prefill_token_count
+                chunks = math.ceil(req.prompt_length + req.finished_chunked_tokens / self.context.chunk_size_tokens) \
+                        - math.ceil(req.finished_chunked_tokens / self.context.chunk_size_tokens) # this is the amount of blocks to add
+                kv_cache_available = self.context.chunk_allocator.is_memory_available(chunks, safe=True) # use the backup space to guarantee that the request can fully prefill
+            else:
+                request_satisfied = self.context.total_request_count < self.context.max_requests 
+                token_fully_satisfied = self.context.active_token_count + req.prompt_length <= self.chunked_prefill_token_count 
+                token_partially_satisfied = self.context.active_token_count < self.chunked_prefill_token_count
+                chunks = math.ceil(req.prompt_length / self.context.chunk_size_tokens) # we only prefill if the whole prompt can fit in the GPU
+                kv_cache_available = self.context.chunk_allocator.is_memory_available(chunks, safe=False)
+                
+            if request_satisfied and kv_cache_available:
+                if token_fully_satisfied:
+                    self.chunked_prefill_request_id = -1
+                    self.context.add_request(req)
+                    self.waiting_request_ids.popleft()
+                    self.context.have_chunked_prefill = False
+                elif token_partially_satisfied:
+                    chunk_length = self.chunked_prefill_token_count - self.context.active_token_count
+                    self.context.add_request(req, chunk_length=chunk_length)
+                    self.context.have_chunked_prefill = True
+                    self.chunked_prefill_request_id = req.request_id
+                    req.prompt_tokens = req.prompt_tokens[chunk_length:]
+                    req.finished_chunked_tokens += chunk_length
+                    break
+                else:
+                    break
+            else:
                 break
 
     async def async_step(
@@ -505,9 +557,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if result is not None:
             request_ids, finished_request_ids, sample, log_probs = result
-
-            # TODO: Move this to a background thread?
-            self.schedule_waiting_requests()
 
             # TODO: Move this to a background thread?
             if post_process_requests_locally:

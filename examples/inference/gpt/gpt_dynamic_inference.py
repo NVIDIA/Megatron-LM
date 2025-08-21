@@ -52,6 +52,12 @@ def add_dynamic_inference_args(parser: ArgumentParser) -> ArgumentParser:
         action="store_true",
         help="Load checkpoint with `strict=False`.",
     )
+    group.add_argument(
+        "--inference-chunked-prefill-token-count",
+        type=int,
+        default=None,
+        help="Number of tokens to prefill for chunked prefill.",
+    )
     return parser
 
 
@@ -206,6 +212,7 @@ def run_inference(
         add_times.append(get_curr_time() - add_start)
 
         # Step inference engine (i.e., generate a token for each active request).
+        engine.schedule_waiting_requests()
         is_decode_only = engine.context.is_decode_only()
         active_requests, finished_requests, step_time = engine.step(sampling_params, verbose=True)
         step_id += 1
@@ -275,6 +282,7 @@ def main():
         termination_id=tokenizer.eod,
         enable_cuda_graph=args.enable_cuda_graph,
         random_seed=args.seed,
+        chunked_prefill_token_count=args.inference_chunked_prefill_token_count,
     )
 
     setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
@@ -304,14 +312,19 @@ def main():
 
         # Print unique prompts + outputs.
         for unique_idx, (prompt_text, request_idxs) in enumerate(unique_prompt_map.items()):
-            request_idx = request_idxs[0]
-            request = requests[request_idx]
-            output_text_hash = hashlib.sha256(request.output_text.encode()).hexdigest()[:6]
-            output_text_escaped = request.output_text.replace("\n", "\\n")
-            print(
-                f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}, hash {output_text_hash}]. "
-                f"{prompt_text} ... {output_text_escaped}"
-            )
+            print(f"{unique_idx}/{len(unique_prompt_map)} [n {len(request_idxs)}] {prompt_text}")
+            
+            # Group outputs by their text content for this prompt
+            output_map = defaultdict(list)
+            for request_idx in request_idxs:
+                request = requests[request_idx]
+                output_map[request.output_text].append(request_idx)
+            
+            # Print each unique output with count and hash
+            for output_text, output_request_idxs in output_map.items():
+                output_text_hash = hashlib.sha256(output_text.encode()).hexdigest()[:6]
+                output_text_escaped = output_text.replace("\n", "\\n")
+                print(f"  > [n {len(output_request_idxs)}, hash {output_text_hash}] {output_text_escaped}")
 
         # Write results to JSON. Primarily used for functional testing.
         if args.output_path:
