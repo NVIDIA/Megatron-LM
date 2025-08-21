@@ -1010,6 +1010,7 @@ class CudaGraphManager(torch.nn.Module):
                 "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
                 "a crash due to illegal memory access or other undefined behaviour."
             )
+            
         self.cudagraph_runners = []
         self.is_first_microbatch = False
 
