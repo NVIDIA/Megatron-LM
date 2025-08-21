@@ -169,7 +169,7 @@ class MultiModulePipelineCommunicator:
                 # from incoming modules.
                 for bridge_comm_info in rank_module_info.bridge_comm_infos_as_dest_module:
                     input_dict[bridge_comm_info.src_module_name] = (
-                        bridge_comm_info.bridge_communicator.receive_forward()
+                        bridge_comm_info.bridge_communicator.recv_forward()
                     )
             else:
                 # If not first stage, receive forward activation tensor from P2P communicator.
@@ -278,7 +278,7 @@ class MultiModulePipelineCommunicator:
                 # by using bridge communicator.
                 for bridge_comm_info in rank_module_info.bridge_comm_infos_as_src_module:
                     grad_dict[bridge_comm_info.src_module_name] = (
-                        bridge_comm_info.bridge_communicator.receive_backward(
+                        bridge_comm_info.bridge_communicator.recv_backward(
                             self.config.pipeline_dtype
                         )
                     )
