@@ -3,6 +3,7 @@
 import gc
 import inspect
 import logging
+import os
 import time
 from collections import defaultdict
 from contextlib import nullcontext
@@ -1004,6 +1005,11 @@ class CudaGraphManager(torch.nn.Module):
             or (isinstance(rng_tracker, CudaRNGStatesTracker) and rng_tracker.use_cudagraphable_rng)
         ), "RNG tracker does not support cudagraphs!"
 
+        if config.enable_cuda_graph or config.external_cuda_graph:
+            assert "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", ""), (
+                "expandable_segments:True may not be safe when using CUDA Graphs, and may result in"
+                "a crash due to illegal memory access or other undefined behaviour."
+            )
         self.cudagraph_runners = []
         self.is_first_microbatch = False
 
