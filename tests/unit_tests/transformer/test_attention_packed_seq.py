@@ -9,13 +9,14 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 
 def make_test_packed_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 6, 19, 22, sequence_length]).cuda()
     seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
+    max_seqlen = seqlens.max().item()
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
@@ -30,7 +31,7 @@ def make_test_packed_padded_seq_params(sequence_length):
     cu_seqlens = torch.IntTensor([0, 18, 44, 52, 96, 118]).cuda()
     cu_seqlens_padded = torch.IntTensor([0, 20, 48, 56, 100, sequence_length]).cuda()
     seqlens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
-    max_seqlen, _ = seqlens.max(dim=0, keepdim=True)
+    max_seqlen = seqlens.max().item()
     packed_seq_params = PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
@@ -100,6 +101,7 @@ class TestParallelAttentionWithPackedSequence:
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
 
+    @pytest.mark.skipif(not is_te_min_version("1.4.0"), reason="Fused RoPE requires TE >= 1.4.0")
     def test_fused_rope_gpu_forward(self):
         self.parallel_attention.config.apply_rope_fusion = True
         config = self.parallel_attention.config

@@ -232,6 +232,7 @@ def test_get_gpt_modelopt_spec_interface():
         "remap_te_layernorm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "real_quant_cfg": inspect.Parameter.POSITIONAL_OR_KEYWORD,
         "qk_l2_norm": inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        "use_arbitrary_attention_mask": inspect.Parameter.POSITIONAL_OR_KEYWORD,
     }
 
     expected_defaults = {
@@ -239,6 +240,7 @@ def test_get_gpt_modelopt_spec_interface():
         "remap_te_layernorm": False,
         "real_quant_cfg": "None",
         "qk_l2_norm": False,
+        "use_arbitrary_attention_mask": False,
     }
 
     # Check expected parameters are in function signature
@@ -270,13 +272,18 @@ def test_get_mamba_stack_modelopt_spec_interface():
 
     expected_defaults = {"local_core_attention": False, "remap_te_layernorm": False}
 
-    # Check parameter kinds
-    for param_name, param in sig.parameters.items():
-        assert param_name in expected_params.keys(), f"Unexpected parameter: {param_name}"
-        assert param.kind is expected_params[param_name], f"Wrong kind for parameter: {param_name}"
+    # Check expected parameters are in function signature
+    for param_name, param_kind in expected_params.items():
+        assert param_name in sig.parameters, f"Unexpected parameter: {param_name}"
+        assert (
+            param_kind is sig.parameters[param_name].kind
+        ), f"Wrong kind for parameter: {param_name}"
 
     # Check default values
-    defaults = {
+    sig_defaults = {
         k: v.default for k, v in sig.parameters.items() if v.default is not inspect.Parameter.empty
     }
-    assert defaults == expected_defaults, "Default values do not match the expected ones."
+    for k, v in expected_defaults.items():
+        assert (
+            k in sig_defaults and v == sig_defaults[k]
+        ), f"Default value of {sig_defaults[k]} does not match the expected value of {v} for parameter {k}."

@@ -237,6 +237,14 @@ class ModelParallelConfig:
        Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
     """
 
+    overlap_moe_expert_parallel_comm: bool = False
+    """Overlap EP A2A communications with independent computations of different micro-batches
+    in 1f1b phase of pipelining or non-pipelining schedule.
+    """
+
+    delay_wgrad_compute: bool = False
+    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
     ###################
     # Pipeline Parallel
     ###################
@@ -284,11 +292,6 @@ class ModelParallelConfig:
        needs to be deferred to pipeline flush, this argument is invalid if
        `defer_embedding_wgrad_compute` is False.
        Defaults to 0, which means all micro-batches are deferred.
-    """
-
-    pipeline_model_parallel_split_rank: Optional[int] = None
-    """If int, rank where encoder and decoder should be split in cases where the model has both an
-       encoder and decoder (e.g., T5). Ignored if None.
     """
 
     overlap_p2p_comm_warmup_flush: bool = False

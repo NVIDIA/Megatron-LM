@@ -40,11 +40,18 @@ class OptimizerConfig:
     ##############
     # Precision
     ##############
+    fp8_recipe: Optional[str] = None
+    """The type of fp8 recipe will affect the processing logic inside distributed optimizer."""
+
     fp16: bool = False
     """If true, train with fp16 mixed precision training. Defaults to False."""
 
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
+
+    reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
+       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
 
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
@@ -118,6 +125,13 @@ class OptimizerConfig:
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
 
+    overlap_param_gather: bool = False
+    """If true, overlap param all-gather with forward compute. 
+        This argument is intended to have the same value as the "overlap_param_gather" argument 
+        in the "distributed_data_parallel_config.py" file. In the optimizer, this argument is 
+        only used when "reuse_grad_buf_for_mxfp8_param_ag=True & fp8_param_gather=True".
+    """
+
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
@@ -161,7 +175,7 @@ class OptimizerConfig:
     barrier_with_L1_time: bool = False
     """If true, use barrier with level 1 time measurements."""
 
-    timers: Callable = None
+    timers: Optional[Callable] = None
     """Function to get timers."""
 
     config_logger_dir: str = ""
@@ -169,6 +183,33 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        # The following condition is used to avoid repetition in distrib_optimizer.py.
+        # This is because in distrib_optimizer.py, the process to handle parameters are
+        # different for different training precision settings. FP8 cases require different
+        # handling while FP8 delayed scaling is an exception because the Adam optimizer in
+        # TransformerEngine supports it in the kernel computation.
+        # This is also the flag to determine the usage of param.grad or param.decoupled_grad
+        self.use_precision_aware_optimizer_no_fp8_or_ds_fp8 = (
+            self.use_precision_aware_optimizer
+            and (
+                self.main_params_dtype != torch.float32
+                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
+                or self.optimizer_cpu_offload
+            )
+        )
+
+        if self.fp8_recipe == "mxfp8":
+            if not self.reuse_grad_buf_for_mxfp8_param_ag:
+                import warnings
+
+                warnings.warn(
+                    "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
+                    "will use significant amount additional GPU memory."
+                    "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
+                    "recommended for mxfp8 training."
+                )
+
         if self.use_precision_aware_optimizer:
             assert (
                 self.optimizer == 'adam'

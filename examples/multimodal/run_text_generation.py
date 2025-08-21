@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from functools import partial
-from typing import List
+from typing import List, Dict
 
 # Add megatron to the path.
 sys.path.append(
@@ -25,6 +25,7 @@ from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
@@ -37,9 +38,17 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
-from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, get_tensorboard_writer, is_last_rank
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+
+
+def is_first_rank():
+    """First tensor and pipeline parallel rank."""
+    return (
+        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
+        and parallel_state.get_tensor_model_parallel_rank() == 0
+    )
 
 
 def add_text_generation_args(parser):
@@ -80,6 +89,7 @@ def add_text_generation_args(parser):
             "MotionBench",
             "PhysGameBench",
             "MVBench",
+            "inference",
         ],
         help="Generation task to run",
     )
@@ -210,7 +220,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         if not args.use_mcore_inference:
             forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
 
-
+        inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
         if is_first_rank():
 
             if args.use_mcore_inference:
@@ -234,7 +244,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 ]
             else:
                 resp_sentences, _, _, _ = generate_and_post_process(
-                    model,
+                    model, inference_context,
                     forward_step=forward_step,
                     prompts=[conv],
                     tokens_to_generate=config.out_seq_length,
@@ -269,6 +279,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "MVBench",
                     "InfoVQA",
                     "SPDocVQA",
+                    "inference",
                 ):
                     output_name = "answer"
                 elif config.task in ("MMMU"):
@@ -307,6 +318,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "MVBench",
                     "InfoVQA",
                     "SPDocVQA",
+                    "inference",
                 ):
                     if isinstance(answers, str):
                         answers = [answers]
@@ -344,21 +356,32 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 )
             else:
                 generate_and_post_process(
-                    model, forward_step=forward_step, detokenize_segments=False, data_parallel=True
+                    model, inference_context, forward_step=forward_step, detokenize_segments=False, data_parallel=True
                 )
 
             idx += 1
 
 
-def get_evaluation_config():
-    """Get evaluation config from a config file or command-line arguments."""
-    args = get_args()
-    if args.config_path:
-        with open(args.config_path, "r") as f:
-            config_dict = yaml.safe_load(f)
+def get_evaluation_configs(config_path=None) -> Dict[str, EvaluationConfig]:
+    """Get evaluation config(s) from a config file or command-line arguments.
 
-        config = EvaluationConfig(**config_dict)
-    else:
+    Args:
+        config_path: Optional path to config file. If not provided, will check args.config_path
+                    or fall back to command-line arguments.
+
+    Returns:
+        Dict[str, EvaluationConfig]: dict of configs.
+    """
+    args = get_args()
+    configs = {}
+
+    # Use provided config_path or fall back to args.config_path
+    config_file = config_path or args.config_path
+
+    # We check if we're trying to run a single config evals by checking for the task and output_path
+    # args.
+    if hasattr(args, "task") and args.task and hasattr(args, "output_path") and args.output_path:
+        # Single config from args
         config = EvaluationConfig(
             task=args.task,
             temperature=args.temperature,
@@ -372,54 +395,44 @@ def get_evaluation_config():
             partition_id=args.partition_id,
             num_samples_per_partition=args.num_samples_per_partition,
         )
-
-    # Default output path if not defined...
-    if not config.output_path:
-        os.makedirs("generated", exist_ok=True)
-        config.output_path = "generated/" + args.language_model_type
-
-    return config
-
-
-def get_batch_evaluation_configs():
-    """Get evaluation config from a config file containing batch evaluation configs."""
-    args = get_args()
-    if args.config_path:
-        with open(args.config_path, "r") as f:
-            config_dict = yaml.safe_load(f)['datasets']
-
-        configs = {}
-
+        if not config.output_path:
+            default_output_dir = args.output_path if args.output_path else "generated"
+            os.makedirs(default_output_dir, exist_ok=True)
+            config.output_path = os.path.join(default_output_dir, args.language_model_type)
+        return {args.task: config}
+    elif config_file:
+        with open(config_file, "r") as f:
+            config_data = yaml.safe_load(f)
+        if 'datasets' not in config_data:
+            print("Error: 'datasets' key not found in config file for batch mode.")
+            sys.exit(1)
+        config_dict = config_data['datasets']
         for key, value in config_dict.items():
-            configs[key] = EvaluationConfig(**value)
-            configs[key].dataset = key
-
-            # Default output path if not defined... use args.output_path
-            if not configs[key].output_path:
-                os.makedirs(args.output_path, exist_ok=True)
-                configs[key].output_path = args.output_path + args.language_model_type + "-" + key
-
+            config = EvaluationConfig(**value)
+            config.dataset = key
+            if not config.output_path:
+                # Use args.output_path if available, otherwise use "generated"
+                default_output_dir = getattr(args, 'output_path', None) or "generated"
+                os.makedirs(default_output_dir, exist_ok=True)
+                config.output_path = os.path.join(default_output_dir, f"{args.language_model_type}")
+            configs[key] = config
+        return configs
     else:
-        print("No config path provided")
-        sys.exit(1)
-
-    return configs
-
-def is_first_rank():
-    """First tensor and pipeline parallel rank."""
-    return (
-        parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-        and parallel_state.get_tensor_model_parallel_rank() == 0
-    )
+        raise ValueError("No config file provided and no task specified.")
 
 
 def get_output_path(config, dp_rank):
     """Generation output path."""
+
+    ckpt_step = None
     try:
         args = get_args()
-        if args.ckpt_step is not None:
-            return f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}-step={args.ckpt_step}.jsonl"
-    except:
+        ckpt_step = args.ckpt_step
+    except Exception as e:
+        print(f"Failed getting args: {type(e).__name__} - {e}")
+    if ckpt_step is not None:
+        return f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}-step={args.ckpt_step}.jsonl"
+    else:
         return f"{config.output_path}-{config.task}-dprank={dp_rank}-partition={config.partition_id}.jsonl"
 
 
@@ -463,15 +476,8 @@ class VLMForwardStep(ForwardStep):
         self._num_img_embeddings = num_img_embeddings
         self.decoder_seq_length = decoder_seq_length
 
-        self._recv_only_vision_embeds = False
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
-        # In this case, the current stage should only receive vision embeddings.
-        if pp_rank > 0:
-            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
-
-        # Checks if the current stage only has a vision encoder
-        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
+        self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
+        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -567,7 +573,7 @@ def get_conversation(task, question, metadata=None):
     elif task == "MMMU":
         conversation = [
             {"role": "system", "content": "Answer the questions."},
-            {"role": "user", "content": question},
+            {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
     elif task == "VideoMME":
         q = (
@@ -627,8 +633,14 @@ def get_conversation(task, question, metadata=None):
             {"role": "system", "content": "Answer the questions."},
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
+    elif task == "inference":
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{question}"},
+        ]
     else:
         raise NotImplementedError(f"No prompting support for task {task}")
+
 
     return conversation
 
@@ -673,7 +685,6 @@ def get_prompt_and_generated(prompt_and_generation, prompt_format):
     generated = generated.strip()
 
     return prompt, generated
-
 
 
 def run_eval(config, iteration=None):
@@ -780,86 +791,79 @@ def run_eval(config, iteration=None):
         score = {f"MVBench accuracy": avg_acc_dict['total-acc']}
         with open(config.output_path + "-scores.txt", "a") as f:
             f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
+    elif config.task == "inference":
+        score = {"Inference accuracy:": None}
+        pass
     else:
-        raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
+        raise NotImplementedError(f"Evaluation of {config.task} not implemented yet")
 
     print(score)
     return score
 
 
+def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None, print_output=True):
+    """
+    Common evaluation loop used by both online evaluation during training and standalone evaluation.
 
-def eval_single_task():
-    """Vision language model text generation for one task."""
-    initialize_megatron(extra_args_provider=add_text_generation_args)
+    Args:
+        model: The model to evaluate
+        configs: Dict[str, EvaluationConfig] - dictionary of evaluation configs
+        output_dir_override: Optional directory to override the output path in configs
+        iteration: Optional iteration number for logging
+        print_output: Whether to print generation output
 
+    Returns:
+        Dict[str, float]: Dictionary of evaluation scores
+    """
     args = get_args()
+    scores = {}
 
-    def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
-        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
-                              parallel_output=False)
+    for key, config in configs.items():
+        # Handle output path override for online evaluation
+        if output_dir_override:
+            config.output_path = os.path.join(output_dir_override, args.language_model_type)
 
-    # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
+        # Generate samples and write to file
+        generate_and_write_samples(model, config, print_output=print_output)
 
-    if args.load is not None:
-        _ = load_checkpoint(model, None, None)
-
-    model = model[0]
-
-    model.eval()
-
-    config = get_evaluation_config()
-
-    generate_and_write_samples(model, config)
-
-    # Make sure the first rank is done writing so that the last rank can run eval.
-    torch.distributed.barrier()
-
-    if not is_last_rank():
-        return []
-
-    run_eval(config)
-
-
-def eval_batch_tasks():
-    """Vision language model text generation for batch tasks."""
-    initialize_megatron(extra_args_provider=add_text_generation_args)
-
-    args = get_args()
-
-
-    def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
-        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
-                              parallel_output=False)
-
-    # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
-
-    if args.load is not None:
-        _ = load_checkpoint(model, None, None)
-
-    model = model[0]
-
-    model.eval()
-
-    configs = get_batch_evaluation_configs()
-
-    for task, config in configs.items():
-        print(f"Running eval task {task}")
-        generate_and_write_samples(model, config)
-
-        # Make sure the first rank is done writing so that the last rank can run eval.
+        # Synchronize before evaluation
         torch.distributed.barrier()
 
+        # Run evaluation on the last rank
         if is_last_rank():
-            # Run evaluation.
-            score = run_eval(config, args.ckpt_step)
-            from train import write_eval_to_tensorboard
-            writer = get_tensorboard_writer()
-            write_eval_to_tensorboard([score], args.ckpt_step, writer, args.ckpt_step)
+            task_scores = run_eval(config, iteration=iteration)
+            scores.update(task_scores)
 
+        # Synchronize after evaluation
         torch.distributed.barrier()
+
+    return scores
+
+
+def eval_tasks():
+    """Vision language model text generation for single or batch tasks."""
+    initialize_megatron(extra_args_provider=add_text_generation_args)
+
+    args = get_args()
+
+    def wrapped_model_provider(pre_process, post_process, add_encoder=True, add_decoder=True):
+        return model_provider(pre_process, post_process, add_encoder=add_encoder, add_decoder=add_decoder,
+                              parallel_output=False)
+
+    # Set up model and load checkpoint.
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
+
+    if args.load is not None:
+        _ = load_checkpoint(model, None, None)
+
+    model = model[0]
+    model.eval()
+
+    configs = get_evaluation_configs()
+
+    # Use the common evaluation loop
+    run_evaluation_loop(model, configs, iteration=args.ckpt_step)
 
 
 if __name__ == "__main__":
-    eval_single_task()
+    eval_tasks()

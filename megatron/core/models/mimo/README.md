@@ -57,6 +57,18 @@ The language model is the core component that processes all modality information
 - Each submodule handles **encoding** (modality → embeddings) and **decoding** (embeddings → modality) 
 - Manages the **projection** between modality space and language model dimensions
 
+```python
+# Base class constructor with named encoders and decoders
+class ModalitySubmodules(ABC, nn.Module):
+    def __init__(
+        self,
+        encoders: Optional[Dict[str, nn.Module]] = None,
+        decoders: Optional[Dict[str, nn.Module]] = None,
+        input_projections: Optional[List[nn.Module]] = None,
+        output_projections: Optional[List[nn.Module]] = None,
+    ):
+```
+
 MIMO provides default implementations (`VisionModalitySubmodules`, `AudioModalitySubmodules`), but you can create custom submodules for specialized processing:
 
 ```python
@@ -114,7 +126,6 @@ MimoModelConfig(
 )
 ```
 
-
 ### Example: Creating a Vision-Language Model (VLM)
 
 ```python
@@ -135,8 +146,8 @@ vision_submodule_spec = ModuleSpec(
         # Any general parameters for the submodule can go here
     },
     submodules={
-        "encoders": [
-            ModuleSpec(
+        "encoders": {
+            "clip_encoder": ModuleSpec(
                 module=CLIPViTModel,
                 params={
                     "transformer_config": vision_config,
@@ -146,7 +157,7 @@ vision_submodule_spec = ModuleSpec(
                     "img_w": 224,
                 }
             ),
-        ],
+        },
         "input_projections": [
             ModuleSpec(
                 module=MultimodalProjector,
@@ -168,5 +179,28 @@ vlm = MimoModel(
         modality_submodules={"images": vision_submodule_spec},
         special_token_ids={"images": 32000}
     )
+)
+```
+
+### MIMO Forward Method Usage
+
+```python
+# Prepare inputs for multiple modalities and encoders
+modality_inputs = {
+    # modality names and encoder names should match the keys used in mimo config during initialization.
+    "images": {
+        "clip_encoder": {"pixel_values": images},  # Encoder-specific inputs
+        "vit_encoder": {"images": vit_images}
+    },
+    "audio": {
+        "whisper_encoder": {"input_features": audio_features}
+    }
+}
+
+# Call forward method
+outputs, _ = mimo_model(
+    input_ids=input_ids,
+    position_ids=position_ids,
+    modality_inputs=modality_inputs,
 )
 ```

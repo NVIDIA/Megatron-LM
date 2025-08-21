@@ -16,6 +16,22 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
 
 
+def token_permutation(token_dispatcher, hidden_states, probs, indices):
+    hidden_states, probs = token_dispatcher.dispatch_preprocess(hidden_states, indices, probs)
+    hidden_states, probs = token_dispatcher.token_dispatch(hidden_states, probs)
+    hidden_states, tokens_per_expert, permuted_probs = token_dispatcher.dispatch_postprocess(
+        hidden_states, probs
+    )
+    return hidden_states, tokens_per_expert, permuted_probs
+
+
+def token_unpermutation(token_dispatcher, hidden_states):
+    hidden_states = token_dispatcher.combine_preprocess(hidden_states)
+    hidden_states = token_dispatcher.token_combine(hidden_states)
+    hidden_states = token_dispatcher.combine_postprocess(hidden_states)
+    return hidden_states, None
+
+
 class MoEModelTestContainer:
     def __init__(
         self,
@@ -109,14 +125,14 @@ class MoEModelTestContainer:
         probs, indices = moe_layer.router(hidden_states)
         probs = torch.ones_like(probs) / moe_layer.router.topk
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
-            moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
         permuted_local_hidden_states = permuted_local_hidden_states * permuted_probs.unsqueeze(-1)
 
-        restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
-            permuted_local_hidden_states
+        restored_hidden_states, restored_bias = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_local_hidden_states
         )
 
         # reduce across TP rank equals to multiply data by a scale of ETP
@@ -148,8 +164,8 @@ class MoEModelTestContainer:
         local_probss = probs
         restored_hidden_states_answer = hidden_states * local_probss.sum(dim=1).unsqueeze(1)
 
-        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = (
-            moe_layer.token_dispatcher.token_permutation(hidden_states, probs, indices)
+        (permuted_local_hidden_states, tokens_per_expert, permuted_probs) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs, indices
         )
 
         # Check tokens per expert not exceed the capacity.
@@ -169,8 +185,8 @@ class MoEModelTestContainer:
 
         permuted_local_hidden_states /= moe_layer.config.tensor_model_parallel_size
 
-        restored_hidden_states, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
-            permuted_local_hidden_states
+        restored_hidden_states, restored_bias = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_local_hidden_states
         )
         assert torch.allclose(
             restored_hidden_states, restored_hidden_states_answer
@@ -196,12 +212,12 @@ class MoEModelTestContainer:
         hidden_states.requires_grad = True
 
         probs_1, indices_1 = moe_layer.router(hidden_states)
-        (permuted_input_1, tokens_per_expert, permuted_probs_1) = (
-            moe_layer.token_dispatcher.token_permutation(hidden_states, probs_1, indices_1)
+        (permuted_input_1, tokens_per_expert, permuted_probs_1) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
         )
         permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
-        forward_answer, restored_bias = moe_layer.token_dispatcher.token_unpermutation(
-            permuted_input_1
+        forward_answer, restored_bias = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_input_1
         )
         torch.autograd.backward(forward_answer, forward_answer)
         backward_answer = hidden_states.grad.clone()
@@ -213,12 +229,12 @@ class MoEModelTestContainer:
         moe_layer_2.load_state_dict(moe_layer.state_dict())
 
         probs_2, indices_2 = moe_layer_2.router(hidden_states)
-        (permuted_input_2, tokens_per_expert, permuted_probs_2) = (
-            moe_layer_2.token_dispatcher.token_permutation(hidden_states, probs_2, indices_2)
+        (permuted_input_2, tokens_per_expert, permuted_probs_2) = token_permutation(
+            moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
         )
         permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
-        restored_hidden_states, restored_bias = moe_layer_2.token_dispatcher.token_unpermutation(
-            permuted_input_2
+        restored_hidden_states, restored_bias = token_unpermutation(
+            moe_layer_2.token_dispatcher, permuted_input_2
         )
 
         # # Check tokens per expert equals to the capacity.
@@ -243,6 +259,70 @@ class MoEModelTestContainer:
             hidden_states.grad, backward_answer
         ), "Gradient of hidden states should be same as hidden states"
 
+    @pytest.mark.internal
+    def dispatcher_router_padding_for_fp8_test(self):
+        """Test if the routing map is padded correctly for FP8 training.
+
+        The test runs the forward flow twice:
+        1. First with moe_router_padding_for_fp8=False
+        2. Then with moe_router_padding_for_fp8=True
+
+        We verify that:
+        1. The results are the same in both cases
+        2. The number of tokens received by each expert is padded to a multiple of 16
+        """
+        # First run with moe_router_padding_for_fp8 = False
+        moe_layer = self.new_moe_layer(moe_router_padding_for_fp8=False)
+
+        num_tokens = 32
+        hidden_states = torch.randn((num_tokens, moe_layer.config.hidden_size)).cuda()
+        hidden_states.requires_grad = True
+
+        probs_1, indices_1 = moe_layer.router(hidden_states)
+        (permuted_input_1, tokens_per_expert_1, permuted_probs_1) = token_permutation(
+            moe_layer.token_dispatcher, hidden_states, probs_1, indices_1
+        )
+        permuted_input_1 = permuted_input_1 * permuted_probs_1.unsqueeze(-1)
+        restored_hidden_states_1, _ = token_unpermutation(
+            moe_layer.token_dispatcher, permuted_input_1
+        )
+        torch.autograd.backward(restored_hidden_states_1, restored_hidden_states_1)
+        grad_1 = hidden_states.grad.clone()
+        hidden_states.grad = None
+
+        # Run with moe_router_padding_for_fp8 = True
+        moe_layer_2 = self.new_moe_layer(moe_router_padding_for_fp8=True, fp8="hybrid")
+        moe_layer_2.load_state_dict(moe_layer.state_dict())
+
+        probs_2, indices_2 = moe_layer_2.router(hidden_states)
+        (permuted_input_2, tokens_per_expert_2, permuted_probs_2) = token_permutation(
+            moe_layer_2.token_dispatcher, hidden_states, probs_2, indices_2
+        )
+        assert (
+            sum(tokens_per_expert_2) == permuted_input_2.shape[0]
+        ), f"number of tokens is not the same, {sum(tokens_per_expert_2)} != {permuted_input_2.shape[0]}"
+        # when there is only one expert, the tokens is not enough for router padding
+        if moe_layer_2.num_local_experts > 1:
+            assert torch.all(
+                tokens_per_expert_2 % 16 == 0
+            ), "number of tokens for expert is not a multiple of 16"
+
+        permuted_input_2 = permuted_input_2 * permuted_probs_2.unsqueeze(-1)
+        restored_hidden_states_2, _ = token_unpermutation(
+            moe_layer_2.token_dispatcher, permuted_input_2
+        )
+
+        # Check that the results are the same
+        assert torch.allclose(
+            restored_hidden_states_1, restored_hidden_states_2
+        ), "Restored hidden states do not match between padded and non-padded versions"
+
+        # Check gradients
+        torch.autograd.backward(restored_hidden_states_2, restored_hidden_states_2)
+        assert torch.allclose(
+            grad_1, hidden_states.grad
+        ), "Gradients do not match between padded and non-padded versions"
+
     def set_params(self):
         # TODO: Set consistent parameters for various parallelisms.
         raise NotImplementedError
@@ -254,7 +334,6 @@ class MoEModelTestContainer:
 permute_fusion_params = [False]
 if is_te_min_version("2.1.0"):
     permute_fusion_params.append(True)
-multihot_fusion_params = [True]
 
 
 class TestAllgatherDispatcher:
@@ -324,9 +403,9 @@ class TestFlexDispatcher:
     @pytest.mark.internal
     @pytest.mark.parametrize("tp_size,ep_size", [(8, 1), (1, 8), (2, 4)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("indices_to_multihot_fusion", multihot_fusion_params)
-    def test_forward_backward(self, tp_size, ep_size, permute_fusion, indices_to_multihot_fusion):
-        if indices_to_multihot_fusion:
+    @pytest.mark.parametrize("experimental_fusion", [True, False])
+    def test_forward_backward(self, tp_size, ep_size, permute_fusion, experimental_fusion):
+        if experimental_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -341,19 +420,17 @@ class TestFlexDispatcher:
             moe_enable_deepep=True,
         )
         container.dispatcher_dropless_test()
+        # reset experimental flag to False
+        config.ENABLE_EXPERIMENTAL = False
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.timeout(120)
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
     @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
-    @pytest.mark.parametrize("indices_to_multihot_fusion", multihot_fusion_params)
-    @pytest.mark.flaky
-    @pytest.mark.flaky_in_dev
-    def test_capacity_forward_backward(
-        self, tp_size, ep_size, permute_fusion, indices_to_multihot_fusion
-    ):
-        if indices_to_multihot_fusion:
+    @pytest.mark.parametrize("experimental_fusion", [True, False])
+    def test_capacity_forward_backward(self, tp_size, ep_size, permute_fusion, experimental_fusion):
+        if experimental_fusion:
             config.ENABLE_EXPERIMENTAL = True
         container = MoEModelTestContainer(
             tp_size=tp_size,
@@ -371,3 +448,34 @@ class TestFlexDispatcher:
             moe_enable_deepep=True,
         )
         container.dispatcher_capacity_test()
+        config.ENABLE_EXPERIMENTAL = False
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0"), reason="TE 1.7.0 is required for MoE with FP8."
+    )
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(180)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8), (8, 1), (4, 2)])
+    @pytest.mark.parametrize("permute_fusion", permute_fusion_params)
+    @pytest.mark.parametrize("experimental_fusion", [True, False])
+    def test_router_padding_for_fp8_forward_backward(
+        self, tp_size, ep_size, permute_fusion, experimental_fusion
+    ):
+        if experimental_fusion:
+            config.ENABLE_EXPERIMENTAL = True
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=32,
+            moe_router_topk=4,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_pad_expert_input_to_capacity=False,
+            moe_permute_fusion=permute_fusion,
+            hidden_size=4,
+            moe_enable_deepep=True,
+        )
+        container.dispatcher_router_padding_for_fp8_test()
+        config.ENABLE_EXPERIMENTAL = False

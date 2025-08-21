@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import functools
 import logging
 import math
 import warnings
@@ -13,17 +14,25 @@ from torch.distributed import _coalescing_manager
 
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
-from ..fp8_utils import is_float8tensor, modify_underlying_storage
+from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
 from ..utils import is_torch_min_version, log_on_each_pipeline_stage
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 
+try:
+    import apex.contrib.nccl_allocator as nccl_allocator
+except ImportError:
+    nccl_allocator = None
+
 logger = logging.getLogger(__name__)
 
-
-if is_torch_min_version("1.13.0"):
-    dist_all_gather_func = torch.distributed.all_gather_into_tensor
-    dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
-else:
+try:
+    if is_torch_min_version("1.13.0"):
+        dist_all_gather_func = torch.distributed.all_gather_into_tensor
+        dist_reduce_scatter_func = torch.distributed.reduce_scatter_tensor
+    else:
+        dist_all_gather_func = torch.distributed._all_gather_base
+        dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
 
@@ -87,6 +96,11 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        self.param_to_index = {}
+        offset = 0
+        for param in params:
+            self.param_to_index[param] = (offset, offset + param.numel())
+            offset += param.numel()
 
 
 class _ParamAndGradBucketGroup:
@@ -117,9 +131,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.use_distributed_optimizer:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
-            self.intra_distributed_optimizer_instance_rank = torch.distributed.get_rank(
-                group=collective_group
-            )
+            self.intra_distributed_optimizer_instance_rank = collective_group.rank()
         else:
             self.data_parallel_group = collective_group
 
@@ -144,6 +156,14 @@ class _ParamAndGradBucketGroup:
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+
+        # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
+        # introduces some CPU overheads. We use these two lists to cache the created local
+        # shards to avoid unnecessary CPU operations. This does not increase GPU memory usage
+        # because it only saves a slice view, which shares the same memory with bucket.param_data
+        # or bucket.grad_data.
+        self.cached_param_buffer_shard_list = [None] * len(self.buckets)
+        self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
     def reset(self):
         """
@@ -217,10 +237,14 @@ class _ParamAndGradBucketGroup:
         with _coalescing_manager(
             self.intra_distributed_optimizer_instance_group, async_ops=async_op
         ) as cm:
-            for bucket in self.buckets:
-                local_data_view = shard_buffer(
-                    bucket.param_data, self.intra_distributed_optimizer_instance_size
-                )[self.intra_distributed_optimizer_instance_rank]
+            for idx, bucket in enumerate(self.buckets):
+                if self.cached_param_buffer_shard_list[idx] is None:
+                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                        bucket.param_data, self.intra_distributed_optimizer_instance_size
+                    )
+                local_data_view = self.cached_param_buffer_shard_list[idx][
+                    self.intra_distributed_optimizer_instance_rank
+                ]
                 dist_all_gather_func(
                     bucket.param_data,
                     local_data_view,
@@ -276,6 +300,22 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
+            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
+            # we need to copy the param_data from the shared_param/grad_buffer to param.data
+            # after the param all-gather.
+            if (
+                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and self.ddp_config.overlap_param_gather
+            ):
+                for bucket in self.buckets:
+                    for param in bucket.params:
+                        param_start, param_end = bucket.param_to_index[param]
+                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                        param.data.copy_(param_slice.view(param.data.shape))
+                    # All-gathered params are not needed after being copied to param.data.
+                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
+                    bucket.grad_data.zero_()
+
     def start_grad_sync(self):
         """
         Initiates grad sync (all-reduce or reduce-scatter) communication operations
@@ -287,7 +327,7 @@ class _ParamAndGradBucketGroup:
         """
         assert (
             self.grad_reduce_handle is None
-        ), 'Should not have multiple communication calls outstanding at once'
+        ), "Should not have multiple communication calls outstanding at once"
 
         if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
             self.check_grads(
@@ -340,11 +380,15 @@ class _ParamAndGradBucketGroup:
 
         # Coalesce communication kernels across buckets in the bucket group.
         with stream_context, _coalescing_manager(communication_group, async_ops=async_op) as cm:
-            for bucket in self.buckets:
+            for idx, bucket in enumerate(self.buckets):
                 if self.ddp_config.use_distributed_optimizer:
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
                     dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
@@ -362,16 +406,22 @@ class _ParamAndGradBucketGroup:
             self.ddp_config.use_distributed_optimizer
             and self.ddp_config.num_distributed_optimizer_instances > 1
         ):
-
             assert self.inter_distributed_optimizer_instance_group is not None
             # Create a new coalescing manager for the inter-instance all-reduce.
-            with stream_context, _coalescing_manager(
-                self.inter_distributed_optimizer_instance_group, async_ops=async_op
-            ) as cm:
-                for bucket in self.buckets:
-                    local_data_view = shard_buffer(
-                        bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
+            with (
+                stream_context,
+                _coalescing_manager(
+                    self.inter_distributed_optimizer_instance_group, async_ops=async_op
+                ) as cm,
+            ):
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_grad_buffer_shard_list[idx] is None:
+                        self.cached_grad_buffer_shard_list[idx] = shard_buffer(
+                            bucket.grad_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_grad_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
 
                     torch.distributed.all_reduce(
                         local_data_view,
@@ -410,8 +460,8 @@ class _ParamAndGradBucketGroup:
             torch.cuda.default_stream().wait_stream(self.communication_stream)
             return
         assert self.grad_reduce_handle is not None, (
-            f'Communication call has not been issued for this bucket '
-            f'({len(self.params_with_grad)}/{len(self.params)} params have grad available)'
+            f"Communication call has not been issued for this bucket "
+            f"({len(self.params_with_grad)}/{len(self.params)} params have grad available)"
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
@@ -426,10 +476,10 @@ class _ParamAndGradBucketGroup:
         """
         assert (
             self.ddp_config.overlap_grad_reduce
-        ), 'register_grad_ready() should only be called when overlap_grad_reduce is True'
+        ), "register_grad_ready() should only be called when overlap_grad_reduce is True"
         if self.is_last_microbatch:
-            assert param in self.param_to_bucket, 'Param is not in the bucket group'
-            assert param not in self.params_with_grad, 'Cannot set grad twice'
+            assert param in self.param_to_bucket, "Param is not in the bucket group"
+            assert param not in self.params_with_grad, "Cannot set grad twice"
             self.params_with_grad.add(param)
             # If all params in bucket group have grads available, issue communication call.
             if len(self.params_with_grad) == len(self.params):
@@ -469,6 +519,7 @@ class _ParamAndGradBuffer:
         param_to_name: Dict[torch.nn.Parameter, str],
         gradient_scaling_factor: float,
         param_indices: List[int],
+        nccl_ub: bool,
     ):
         self.ddp_config = ddp_config
         self.params = params
@@ -485,10 +536,9 @@ class _ParamAndGradBuffer:
         self.param_dtype = param_dtype
         self.grad_dtype = grad_dtype
         self.data_parallel_group = data_parallel_group
-        self.data_parallel_world_size = torch.distributed.get_world_size(
-            group=self.data_parallel_group
-        )
+        self.data_parallel_world_size = self.data_parallel_group.size()
         self.gradient_scaling_factor = gradient_scaling_factor
+        self.nccl_ub = nccl_ub
 
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
@@ -579,15 +629,10 @@ class _ParamAndGradBuffer:
             param_start_index = _pad_start_of_param_if_needed(param_start_index)
 
             # Create bucket with collected parameters if current param needs its own bucket.
-            if _does_param_require_new_bucket(param):
-                # We are creating a bucket for the already accumulated parameters, whose params
-                # end at the current param_start_index.
-                if self.ddp_config.use_distributed_optimizer:
-                    # Make sure new bucket is appropriately padded.
-                    if param_start_index % self.data_parallel_world_size != 0:
-                        param_start_index = _pad_end_of_bucket_if_needed(param_start_index)
-                if len(bucket_params) > 0:
-                    bucket_end_index = _update_bucket_metadata(param_start_index)
+            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
+                # Ensure this param accounts for the new padding introduced at end of
+                # previous bucket.
+                param_start_index = _update_bucket_metadata(param_start_index)
 
             param_end_index = param_start_index + this_numel
             self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
@@ -618,20 +663,53 @@ class _ParamAndGradBuffer:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
-        # Only re-map param tensors if using distributed optimizer.
-        if self.ddp_config.use_distributed_optimizer:
-            self.param_data = torch.zeros(
-                self.numel,
-                dtype=self.param_dtype,
-                device=torch.cuda.current_device(),
-                requires_grad=False,
+
+        if self.nccl_ub:
+            # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
+            if not nccl_allocator:
+                raise RuntimeError("NCCL allocator importing failed but nccl ub is still requested")
+            pool = nccl_allocator.create_nccl_mem_pool()
+            mem_alloc_context = functools.partial(
+                nccl_allocator.nccl_mem, pool, group=self.data_parallel_group
             )
-        self.grad_data = torch.zeros(
-            self.numel,
-            dtype=self.grad_dtype,
-            device=torch.cuda.current_device(),
-            requires_grad=False,
-        )
+        else:
+            # If nccl_ub is False, mem_alloc_context is nullcontext.
+            mem_alloc_context = nullcontext
+
+        with mem_alloc_context():
+            # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
+            # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
+            # It can be temporarily reused by param AG.
+            if self.ddp_config.use_distributed_optimizer and any(is_mxfp8tensor(p) for p in params):
+                self.shared_buffer = torch.zeros(
+                    self.numel,
+                    dtype=self.grad_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+                # For FP32 weight grads, only half of the buffer is used to store params in bf16.
+                if self.grad_dtype == torch.float32:
+                    self.param_data = self.shared_buffer[: math.ceil(self.numel / 2)].view(
+                        torch.bfloat16
+                    )
+                else:
+                    self.param_data = self.shared_buffer
+                self.grad_data = self.shared_buffer
+            else:
+                # Only re-map param tensors if using distributed optimizer.
+                if self.ddp_config.use_distributed_optimizer:
+                    self.param_data = torch.zeros(
+                        self.numel,
+                        dtype=self.param_dtype,
+                        device=torch.cuda.current_device(),
+                        requires_grad=False,
+                    )
+                self.grad_data = torch.zeros(
+                    self.numel,
+                    dtype=self.grad_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
         self.grad_data_size = 0
 
         # Finally, map param.data and param.main_grad fields to buffers.
@@ -640,21 +718,22 @@ class _ParamAndGradBuffer:
         cur_bucket_id = 0
         for param in params[::-1]:
             param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-
-            # Assign param.data to appropriate segment of self.param_data.
-            if self.param_data is not None:
-                new_param_data = self._get(
-                    param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                )
-                if is_float8tensor(param):
-                    modify_underlying_storage(param, new_param_data)
-                else:
-                    old_param_data = param.data
-                    param.data = new_param_data
-                    assert old_param_data._base is None
-                    # Copy tensor values (from initialization or checkpoint).
-                    param.data.detach().copy_(old_param_data)
-                    del old_param_data
+            # For MXFP8 param: we only need to map weight gradients to the buffer.
+            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                # Assign param.data to appropriate segment of self.param_data.
+                if self.param_data is not None:
+                    new_param_data = self._get(
+                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
+                    )
+                    if is_float8tensor(param):
+                        modify_underlying_storage(param, new_param_data)
+                    else:
+                        old_param_data = param.data
+                        param.data = new_param_data
+                        assert old_param_data._base is None
+                        # Copy tensor values (from initialization or checkpoint).
+                        param.data.detach().copy_(old_param_data)
+                        del old_param_data
 
             param.main_grad = self._get(
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
@@ -693,19 +772,19 @@ class _ParamAndGradBuffer:
         # Log buckets for all PP stages.
         log_strs = []
         log_strs.append(
-            f'Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}'
+            f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
         )
         for index, bucket in enumerate(self.buckets):
             numel = 0
             for param in bucket.params:
                 numel += param.data.nelement()
             log_strs.append(
-                f"Params for bucket {index+1} ({numel} elements, "
+                f"Params for bucket {index + 1} ({numel} elements, "
                 f"{bucket.grad_data.nelement()} padded size):"
             )
             for param in bucket.params:
-                log_strs.append(f'\t{param_to_name[param]}')
-        log_on_each_pipeline_stage(logger, logging.INFO, '\n'.join(log_strs))
+                log_strs.append(f"\t{param_to_name[param]}")
+        log_on_each_pipeline_stage(logger, logging.INFO, "\n".join(log_strs))
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
@@ -717,7 +796,7 @@ class _ParamAndGradBuffer:
         `start_index`.
         """
         end_index = start_index + shape.numel()
-        assert end_index <= self.numel, 'Requested tensor is out of buffer range'
+        assert end_index <= self.numel, "Requested tensor is out of buffer range"
         if buffer_type == BufferType.PARAM:
             assert self.param_data is not None
             buffer_tensor = self.param_data[start_index:end_index]

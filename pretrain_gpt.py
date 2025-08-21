@@ -1,13 +1,21 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""Pretrain GPT."""
+"""Pretrain and SFT GPT."""
+
+import datetime
+import os
+import torch
 
 from functools import partial
 from typing import List, Optional, Tuple, Union
-
-import torch
-
 from megatron.core import parallel_state
+from megatron.training import get_args
+from megatron.training import inprocess_restart
+from megatron.training import print_rank_0
+from megatron.training import get_timers
+from megatron.training import get_tokenizer
+from megatron.core import mpu
+from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
@@ -32,6 +40,7 @@ from megatron.training.utils import (
     get_blend_and_blend_per_split,
 )
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+from megatron.training.datasets.sft_dataset import SFTDataset
 
 import megatron.legacy.model  # isort: skip
 
@@ -49,8 +58,42 @@ except ImportError:
 stimer = StragglerDetector()
 
 
+def _get_transformer_layer_spec(use_te, config):
+    """Get transformer layer specification based on configuration.
+    
+    Args:
+        use_te (bool): Whether to use Transformer Engine
+        args: Training arguments
+        config: Model configuration
+        
+    Returns:
+        transformer_layer_spec: The transformer layer specification
+    """
+    args = get_args()
+    if use_te:
+        return get_gpt_layer_with_transformer_engine_spec(
+            args.num_experts,
+            args.moe_grouped_gemm,
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            args.moe_use_legacy_grouped_gemm,
+            qk_l2_norm=args.qk_l2_norm,
+            use_kitchen=config.use_kitchen,
+        )
+    else:
+        return get_gpt_layer_local_spec(
+            args.num_experts,
+            args.moe_grouped_gemm,
+            args.qk_layernorm,
+            args.multi_latent_attention,
+            args.moe_use_legacy_grouped_gemm,
+            normalization=args.normalization,
+            use_kitchen=config.use_kitchen,
+        )
+
+
 def model_provider(
-    pre_process=True, post_process=True
+    pre_process=True, post_process=True, vp_stage: Optional[int] = None
 ) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
@@ -115,33 +158,23 @@ def model_provider(
             if args.num_experts:
                 # Define the decoder block spec
                 transformer_layer_spec = get_gpt_decoder_block_spec(
-                    config, use_transformer_engine=use_te, normalization=args.normalization
+                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
                 )
             elif args.heterogeneous_layers_config_path is not None:
                 transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
             else:
                 # Define the decoder layer spec
-                if use_te:
-                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                    )
-                else:
-                    transformer_layer_spec = get_gpt_layer_local_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                        normalization=args.normalization,
-                    )
+                transformer_layer_spec = _get_transformer_layer_spec(use_te, config)
         mtp_block_spec = None
         if args.mtp_num_layers is not None:
+            if hasattr(transformer_layer_spec, 'layer_specs') and len(transformer_layer_spec.layer_specs) == 0:
+                # Get the decoder layer spec explicitly if no decoder layer in the last stage,
+                # Only happens with block spec (TransformerBlockSubmodules) when using MoE.
+                transformer_layer_spec_for_mtp = _get_transformer_layer_spec(use_te, config)
+            else:
+                transformer_layer_spec_for_mtp = transformer_layer_spec
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, transformer_layer_spec, use_transformer_engine=use_te
+                config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
             )
 
         model = GPTModel(
@@ -159,6 +192,7 @@ def model_provider(
             rotary_base=args.rotary_base,
             rope_scaling=args.use_rope_scaling,
             mtp_block_spec=mtp_block_spec,
+            vp_stage=vp_stage,
         )
 
     return model
@@ -248,12 +282,13 @@ def loss_func(
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
+        return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
     args = get_args()
     timers = get_timers()
@@ -269,9 +304,17 @@ def forward_step(data_iterator, model: GPTModel):
         if args.use_legacy_models:
             output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
-            output_tensor = model(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
-            )
+            if return_schedule_plan:
+                assert args.overlap_moe_expert_parallel_comm, \
+                    "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
+                schedule_plan = model.build_schedule_plan(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                )
+                return schedule_plan, partial(loss_func, loss_mask, model=model)
+            else:
+                output_tensor = model(
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
@@ -321,10 +364,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.mock_data:
-        dataset_type = MockGPTDataset
+    if args.sft:
+        dataset_type = SFTDataset
     else:
-        dataset_type = GPTDataset
+        if args.mock_data:
+            dataset_type = MockGPTDataset
+        else:
+            dataset_type = GPTDataset
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
@@ -342,6 +388,9 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
+    # Optionally enable inprocess restart on pretrain
+    pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+
     pretrain(
         train_valid_test_datasets_provider,
         model_provider,
@@ -349,4 +398,5 @@ if __name__ == "__main__":
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        store=store,
     )

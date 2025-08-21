@@ -147,6 +147,25 @@ def filter_by_environment(
     return workload_manifests
 
 
+def filter_by_platform(
+    workload_manifests: List[jetclient.JETWorkloadManifest], platform: str
+) -> List[jetclient.JETWorkloadManifest]:
+    workload_manifests = list(
+        workload_manifest
+        for workload_manifest in workload_manifests
+        if (
+            hasattr(workload_manifest.spec, "platforms")
+            and workload_manifest.spec.platforms == platform
+        )
+    )
+
+    if len(workload_manifests) == 0:
+        print("No test_case found!")
+        return []
+
+    return workload_manifests
+
+
 def filter_by_model(
     workload_manifests: List[jetclient.JETWorkloadManifest], model: str
 ) -> List[jetclient.JETWorkloadManifest]:
@@ -205,6 +224,7 @@ def load_workloads(
     time_limit: int = 1800,
     tag: Optional[str] = None,
     environment: Optional[str] = None,
+    platform: Optional[str] = None,
     test_cases: str = "all",
     scope: Optional[str] = None,
     model: Optional[str] = None,
@@ -235,6 +255,9 @@ def load_workloads(
     if workloads and tag:
         workloads = filter_by_tag(workload_manifests=workloads, tag=tag)
 
+    if workloads and platform:
+        workloads = filter_by_platform(workload_manifests=workloads, platform=platform)
+
     if workloads and test_cases != "all":
         workloads = filter_by_test_cases(workload_manifests=workloads, test_cases=test_cases)
 
@@ -254,6 +277,10 @@ def load_workloads(
                 workloads.append(build_workload)
         workload.spec.n_repeat = n_repeat
         workload.spec.time_limit = time_limit
+        workload.spec.artifacts = {
+            key: value.replace(r'{platforms}', workload.spec.platforms)
+            for key, value in workload.spec.artifacts.items()
+        }
 
         if record_checkpoints == 'true':
             workload.outputs = [
@@ -268,3 +295,11 @@ def load_workloads(
                 }
             ]
     return workloads
+
+
+if __name__ == "__main__":
+    workflows = load_workloads(container_tag="main")
+    # Save workflows to YAML file
+    output_file = "workflows.yaml"
+    with open(output_file, "w") as f:
+        yaml.dump([workflow.model_dump() for workflow in workflows], f)

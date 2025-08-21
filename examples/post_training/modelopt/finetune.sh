@@ -5,6 +5,10 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 # Common arguments and base model specific arguments
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
+
+# Set up cache dir for HF to avoid out of space error
+export HF_DATASETS_CACHE="/tmp/hf_datasets_cache"
+
 # Extra arguments of this script
 MLM_DEFAULT_ARGS=" \
     --distributed-timeout-minutes 30 \
@@ -31,12 +35,10 @@ fi
 
 if [ -z ${MLM_TRAIN_ARGS} ]; then
     MLM_TRAIN_ARGS=" \
-        --recompute-activations \
         --no-gradient-accumulation-fusion \
         --reset-position-ids \
         --reset-attention-mask \
         --eod-mask-loss \
-        --global-batch-size 128 \
         --micro-batch-size 1 \
         --attention-dropout 0.0 \
         --hidden-dropout 0.0 \
@@ -46,7 +48,7 @@ fi
 
 if [ -z ${MLM_OPTIM_ARGS} ]; then
     MLM_OPTIM_ARGS=" \
-        --lr 1.0e-5 \
+        --lr 5.0e-5 \
         --min-lr 1.0e-7 \
         --lr-decay-style cosine \
         --clip-grad 1.0 \
@@ -69,6 +71,7 @@ fi
 ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/finetune.py \
     ${MODEL_ARGS} \
     --tensor-model-parallel-size ${TP} \
+    --expert-tensor-parallel-size ${ETP} \
     --expert-model-parallel-size ${EP} \
     --pipeline-model-parallel-size ${PP} \
     --tokenizer-model ${TOKENIZER_MODEL} \

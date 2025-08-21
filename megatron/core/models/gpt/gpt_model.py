@@ -17,6 +17,8 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -69,6 +71,7 @@ class GPTModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
+        model_comm_pgs (ModelCommProcessGroups): Model communication process groups
     """
 
     def __init__(
@@ -92,8 +95,10 @@ class GPTModel(LanguageModule):
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
         mtp_block_spec: Optional[ModuleSpec] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        vp_stage: Optional[int] = None,
     ) -> None:
-        super().__init__(config=config)
+        super().__init__(config=config, model_comm_pgs=model_comm_pgs)
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -106,6 +111,7 @@ class GPTModel(LanguageModule):
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.vp_stage = vp_stage
 
         if hasattr(self.config, 'position_embedding_type'):
             self.position_embedding_type = self.config.position_embedding_type
@@ -135,6 +141,7 @@ class GPTModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type=position_embedding_type,
                 scatter_to_sequence_parallel=scatter_embedding_sequence_parallel,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
@@ -147,6 +154,7 @@ class GPTModel(LanguageModule):
                 rope_scaling=rope_scaling,
                 rope_scaling_factor=rope_scaling_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.model_comm_pgs.cp,
             )
 
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
@@ -171,10 +179,14 @@ class GPTModel(LanguageModule):
             spec=transformer_layer_spec,
             pre_process=self.pre_process,
             post_process=self.post_process,
+            model_comm_pgs=self.model_comm_pgs,
+            vp_stage=vp_stage,
         )
 
         if self.mtp_process:
-            self.mtp = MultiTokenPredictionBlock(config=self.config, spec=self.mtp_block_spec)
+            self.mtp = MultiTokenPredictionBlock(
+                config=self.config, spec=self.mtp_block_spec, vp_stage=vp_stage
+            )
 
         # Output
         if self.post_process or self.mtp_process:
@@ -206,6 +218,7 @@ class GPTModel(LanguageModule):
                 and self.share_embeddings_and_output_weights,
                 embedding_activation_buffer=self.embedding_activation_buffer,
                 grad_output_buffer=self.grad_output_buffer,
+                tp_group=self.model_comm_pgs.tp,
             )
 
         if self.pre_process or self.post_process:
@@ -215,6 +228,10 @@ class GPTModel(LanguageModule):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
             )
+        for name, module in self.named_modules():
+            if hasattr(module, 'finish_init'):
+                quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
+                module.finish_init(quant_config)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -232,35 +249,24 @@ class GPTModel(LanguageModule):
         assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
         self.decoder.set_input_tensor(input_tensor[0])
 
-    def forward(
+    def _preprocess(
         self,
         input_ids: Tensor,
         position_ids: Tensor,
-        attention_mask: Tensor,
         decoder_input: Tensor = None,
-        labels: Tensor = None,
         inference_context: BaseInferenceContext = None,
         packed_seq_params: PackedSeqParams = None,
-        extra_block_kwargs: dict = None,
-        runtime_gather_output: Optional[bool] = None,
-        *,
-        inference_params: Optional[BaseInferenceContext] = None,
-        loss_mask: Optional[Tensor] = None,
-    ) -> Tensor:
-        """Forward function of the GPT Model This function passes the input tensors
-        through the embedding layer, and then the decoeder and finally into the post
-        processing layer (optional).
+    ):
+        """Preprocesses inputs for the transformer decoder.
 
-        It either returns the Loss values if labels are given  or the final hidden units
-
-        Args:
-            runtime_gather_output (bool): Gather output at runtime. Default None means
-                `parallel_output` arg in the constructor will be used.
+        Applies embeddings to input tokens, or uses `decoder_input` from a previous
+        pipeline stage. Also sets up rotary positional embeddings.
         """
+
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+        in_inference_mode = inference_context is not None and not self.training
 
         # Decoder embedding.
         if decoder_input is not None:
@@ -277,7 +283,7 @@ class GPTModel(LanguageModule):
         rotary_pos_cos = None
         rotary_pos_sin = None
         if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
-            if not self.training and self.config.flash_decode and inference_context:
+            if in_inference_mode and self.config.flash_decode:
                 assert (
                     inference_context.is_static_batching()
                 ), "GPTModel currently only supports static inference batching."
@@ -306,14 +312,17 @@ class GPTModel(LanguageModule):
                 )
 
         if (
-            (self.config.enable_cuda_graph or self.config.flash_decode)
+            in_inference_mode
+            and (
+                (self.config.enable_cuda_graph and self.config.cuda_graph_scope != "full_iteration")
+                or self.config.flash_decode
+            )
             and rotary_pos_cos is not None
-            and inference_context
             and inference_context.is_static_batching()
-            and not self.training
         ):
+            current_batch_size = input_ids.shape[0]
             sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * inference_context.current_batch_size,
+                [inference_context.sequence_len_offset] * current_batch_size,
                 dtype=torch.int32,
                 device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
             )
@@ -323,12 +332,48 @@ class GPTModel(LanguageModule):
         # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
         # reference held by this caller function, enabling early garbage collection for
         # inference. Skip wrapping if decoder_input is logged after decoder completion.
-        if (
-            inference_context is not None
-            and not self.training
-            and not has_config_logger_enabled(self.config)
-        ):
+        if in_inference_mode and not has_config_logger_enabled(self.config):
             decoder_input = WrappedTensor(decoder_input)
+
+        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Forward function of the GPT Model This function passes the input tensors
+        through the embedding layer, and then the decoeder and finally into the post
+        processing layer (optional).
+
+        It either returns the Loss values if labels are given  or the final hidden units
+
+        Args:
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+            self._preprocess(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                decoder_input=decoder_input,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+            )
+        )
 
         # Run decoder.
         hidden_states = self.decoder(
@@ -343,18 +388,61 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
-        # Process inference output.
-        if inference_context and not inference_context.is_static_batching():
-            hidden_states = inference_context.last_token_logits(
-                hidden_states.squeeze(1).unsqueeze(0)
-            ).unsqueeze(1)
+        return self._postprocess(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mtp_in_postprocess=self.mtp_process,
+            loss_mask=loss_mask,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            runtime_gather_output=runtime_gather_output,
+            extra_block_kwargs=extra_block_kwargs,
+            inference_context=inference_context,
+        )
+
+    def _postprocess(
+        self,
+        hidden_states,
+        input_ids,
+        position_ids,
+        labels,
+        rotary_pos_emb,
+        rotary_pos_cos,
+        rotary_pos_sin,
+        mtp_in_postprocess=None,
+        loss_mask=None,
+        decoder_input=None,
+        attention_mask=None,
+        inference_params=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        runtime_gather_output=None,
+        extra_block_kwargs=None,
+        inference_context=None,
+    ):
+        """Postprocesses decoder hidden states to generate logits or compute loss.
+
+        Applies Multi-Token Prediction if enabled, generates output logits through
+        the output layer, and computes language model loss when labels are provided.
+        """
+        in_inference_mode = inference_context is not None and not self.training
+        if in_inference_mode:
+            assert runtime_gather_output, "Inference must always gather TP logits"
 
         # logits and loss
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if self.mtp_process:
+        if mtp_in_postprocess:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -379,13 +467,16 @@ class GPTModel(LanguageModule):
         if not self.post_process:
             return hidden_states
 
-        if (
-            not self.training
-            and inference_context is not None
-            and inference_context.is_static_batching()
-            and inference_context.materialize_only_last_token_logits
-        ):
-            hidden_states = hidden_states[-1:, :, :]
+        if in_inference_mode and inference_context.materialize_only_last_token_logits:
+            if inference_context.is_static_batching():
+                hidden_states = hidden_states[-1:, :, :]
+            else:
+                # Reshape [B, 1, H] to [1, B, H] → extract each sample’s true last‐token hidden
+                # state ([B, H]) → unsqueeze back to [1, B, H]
+                # (so that the output layer, which expects S×B×H, receives only the final token)
+                hidden_states = inference_context.last_token_logits(
+                    hidden_states.squeeze(1).unsqueeze(0)
+                ).unsqueeze(1)
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
@@ -430,6 +521,64 @@ class GPTModel(LanguageModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        inference_context: BaseInferenceContext = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        inference_params: Optional[BaseInferenceContext] = None,
+        loss_mask: Optional[Tensor] = None,
+    ):
+        """Builds a computation schedule plan for the model.
+
+        This function creates a schedule plan for a model chunk, including
+        preprocessing, transformer layers, and postprocessing.
+        The schedule plan is used to optimize computation and memory usage
+        in distributed environments.
+
+        Args:
+            input_ids (Tensor): Input token IDs.
+            position_ids (Tensor): Position IDs.
+            attention_mask (Tensor): Attention mask.
+            decoder_input (Tensor, optional): Decoder input tensor. Defaults to None.
+            labels (Tensor, optional): Labels for loss computation. Defaults to None.
+            inference_context (BaseInferenceContext, optional):
+                Inference context. Defaults to None.
+            packed_seq_params (PackedSeqParams, optional):
+                Parameters for packed sequences. Defaults to None.
+            extra_block_kwargs (dict, optional):
+                Additional keyword arguments for blocks. Defaults to None.
+            runtime_gather_output (Optional[bool], optional):
+                Whether to gather output at runtime. Defaults to None.
+            inference_params (InferenceParams, optional):
+                Parameters for inference. Defaults to None.
+            loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
+
+        Returns:
+            TransformerModelChunkSchedulePlan: The model chunk schedule plan.
+        """
+
+        from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
+
+        return TransformerModelChunkSchedulePlan(
+            self,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            extra_block_kwargs,
+            runtime_gather_output,
+            loss_mask,
+        )
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None

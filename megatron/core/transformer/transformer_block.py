@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -16,6 +16,7 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ModelCommProcessGroups
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -27,38 +28,60 @@ from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 try:
+    import transformer_engine.pytorch as te  # pylint: disable=unused-import
+
+    HAVE_TE = True
+except ImportError:
+    HAVE_TE = False
+
+try:
+    import apex  # pylint: disable=unused-import
+
+    HAVE_APEX = True
+except ImportError:
+    HAVE_APEX = False
+
+get_cpu_offload_context = None
+te_checkpoint = None
+
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TENorm,
         get_cpu_offload_context,
         te_checkpoint,
     )
 
-    HAVE_TE = True
     LayerNormImpl = TENorm
-except ImportError:
-    HAVE_TE = False
-    get_cpu_offload_context = None
 
-    try:
-        import apex  # pylint: disable=unused-import
+elif HAVE_APEX:
+    LayerNormImpl = FusedLayerNorm
 
-        LayerNormImpl = FusedLayerNorm
+else:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
-    except ImportError:
-        from megatron.core.transformer.torch_norm import WrappedTorchNorm
-
-        LayerNormImpl = WrappedTorchNorm
+    LayerNormImpl = WrappedTorchNorm
 
 
-def get_num_layers_to_build(config: TransformerConfig) -> int:
+logger = logging.getLogger(__name__)
+
+
+def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
         config (TransformerConfig): Configuration object containing transformer model parameters.
+        vp_stage (Optional[int]): Virtual pipeline stage number.
 
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    # If we have a custom PP layout, straightforwardly
+    # return the number of decoders in the layout array.
+    if config.pipeline_model_parallel_layout is not None:
+        return config.pipeline_model_parallel_layout.get_num_layers_to_build(
+            layer_type=LayerType.decoder, vp_stage=vp_stage
+        )
+
     if (
         config.num_layers_in_first_pipeline_stage is not None
         or config.num_layers_in_last_pipeline_stage is not None
@@ -84,10 +107,15 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
             layers_to_distribute -= config.num_layers_in_last_pipeline_stage
             pipeline_stages_left -= 1
 
-        assert (
-            layers_to_distribute % pipeline_stages_left == 0
-        ), "With uneven pipelineing the left over layers must be divisible by left over stages"
-        num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+        # If pp_size <= 2, we do not have any intermediate pipeline stages, and we do not
+        # need to check if the left over layers are divisible by the left over stages.
+        if pipeline_stages_left > 0:
+            assert (
+                layers_to_distribute % pipeline_stages_left == 0
+            ), "With uneven pipelineing the left over layers must be divisible by left over stages"
+            num_layers_per_pipeline_rank = layers_to_distribute // pipeline_stages_left
+        else:
+            num_layers_per_pipeline_rank = 0
 
         # If the uneven first (last) pipeline stage is enabled, return the specified number
         # of layers for all virtual pipeline parallel stages within the first (last) pipeline
@@ -138,9 +166,9 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
             num_layers_per_pipeline_rank % vp_size == 0
         ), f"num_layers_per_pipeline_rank {num_layers_per_pipeline_rank} \
             should be divisible by vp_size {vp_size}"
-        num_layers_per_virtual_rank = num_layers_per_pipeline_rank // vp_size
+        num_layers_per_virtual_stage = num_layers_per_pipeline_rank // vp_size
 
-        num_layers_to_build = num_layers_per_virtual_rank
+        num_layers_to_build = num_layers_per_virtual_stage
 
     else:
         # Non-interleaved pipeline parallelism:
@@ -151,14 +179,14 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
     # Reduce the number of layers to construct by 1 on the first (or last) stage if the
     # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
     if (
-        parallel_state.is_pipeline_first_stage(ignore_virtual=False)
+        parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
         and config.account_for_embedding_in_pipeline_split
     ):
         num_layers_to_build -= 1
         assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
 
     if (
-        parallel_state.is_pipeline_last_stage(ignore_virtual=False)
+        parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
         and config.account_for_loss_in_pipeline_split
     ):
         num_layers_to_build -= 1
@@ -188,7 +216,9 @@ class TransformerBlockSubmodules:
 
 
 def _get_block_submodules(
-    config: TransformerConfig, spec: Union[TransformerBlockSubmodules, ModuleSpec]
+    config: TransformerConfig,
+    spec: Union[TransformerBlockSubmodules, ModuleSpec],
+    vp_stage: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """
     Retrieve or construct TransformerBlockSubmodules based on the provided specification.
@@ -198,6 +228,7 @@ def _get_block_submodules(
         spec (Union[TransformerBlockSubmodules, ModuleSpec]): Specification for the
             transformer block submodules. Can be either a TransformerBlockSubmodules
             instance or a ModuleSpec.
+        vp_stage (Optional[int]): Virtual pipeline stage number.
 
     Returns:
         TransformerBlockSubmodules: The submodules for the transformer block.
@@ -214,7 +245,7 @@ def _get_block_submodules(
         if issubclass(spec.module, TransformerBlock):
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
-            num_layers = get_num_layers_to_build(config)
+            num_layers = get_num_layers_to_build(config, vp_stage)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
             )
@@ -235,13 +266,15 @@ class TransformerBlock(MegatronModule):
         pre_process: bool = True,
         post_process: bool = True,
         model_comm_pgs: ModelCommProcessGroups = None,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
 
-        self.submodules = _get_block_submodules(config, spec)
+        self.submodules = _get_block_submodules(config, spec, vp_stage)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
+        self.vp_stage = vp_stage
 
         # required for pipeline parallel schedules
         self.input_tensor = None
@@ -288,7 +321,7 @@ class TransformerBlock(MegatronModule):
         #     self.norm_factor *= coeff
         def build_layer(layer_spec, layer_number):
             global_layer_number = layer_number + get_transformer_layer_offset(
-                self.config
+                self.config, self.vp_stage
             )  # 1-based index
             if self.config.heterogeneous_block_specs:
                 layer_config = self.config.get_config_for_layer(global_layer_number)
@@ -302,6 +335,7 @@ class TransformerBlock(MegatronModule):
                     config=layer_config,
                     layer_number=layer_number,
                     model_comm_pgs=self.model_comm_pgs,
+                    vp_stage=self.vp_stage,
                 )
             return module
 
@@ -495,10 +529,6 @@ class TransformerBlock(MegatronModule):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
-        # Update the inference parameters with the current batch size in case it is variable
-        if inference_context and not self.training:
-            inference_context.current_batch_size = hidden_states.size(1)
-
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
@@ -582,6 +612,11 @@ class TransformerBlock(MegatronModule):
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
 
+        # If this TransformerBlock is empty, input and output hidden states will be the same node
+        # on the computational graph and will lead to unexpected errors in pipeline schedules.
+        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
+            hidden_states = hidden_states.clone()
+
         return hidden_states
 
     def sharded_state_dict(
@@ -601,9 +636,14 @@ class TransformerBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the model.
         """
         assert not sharded_offsets, "Unexpected sharded offsets"
+        # TODO: remove multiple non_homogeneous_layers=True assignments
+        #  once non_homogeneous_layers=False support is dropped
         non_homogeneous_layers = metadata is not None and metadata.get(
             'non_homogeneous_layers', False
         )
+        if self.config.hetereogenous_dist_checkpoint:
+            non_homogeneous_layers = True
+
         if isinstance(self.config.moe_layer_freq, int):
             if self.config.moe_layer_freq > 1:
                 non_homogeneous_layers = True
@@ -613,12 +653,21 @@ class TransformerBlock(MegatronModule):
         if self.config.heterogeneous_block_specs:
             non_homogeneous_layers = True
 
+        singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        if singleton_local_shards:
+            if not non_homogeneous_layers:
+                logger.warning(
+                    'non_homogeneous_layers=False is deprecated.'
+                    ' Setting non_homogeneous_layers=True.'
+                )
+            non_homogeneous_layers = True
+
         sharded_state_dict = {}
 
         layer_prefix = f'{prefix}layers.'
         num_layers = self.config.num_layers
         for layer in self.layers:
-            offset = get_transformer_layer_offset(self.config)
+            offset = get_transformer_layer_offset(self.config, self.vp_stage)
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long

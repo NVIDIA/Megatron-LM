@@ -60,7 +60,7 @@ def simple_generate(
             padded_tokens = torch.full(
                 padding_shape, 0, dtype=input_ids.dtype, device=input_ids.device
             )
-            tokens = torch.cat((padded_tokens, input_ids), dim=-1)
+            tokens = torch.cat((input_ids, padded_tokens), dim=-1)
         else:
             tokens = input_ids
 
@@ -78,7 +78,7 @@ def simple_generate(
 
         if mpu.is_pipeline_last_stage():
             logits = gather_from_tensor_model_parallel_region(list_of_logits[0])
-            eager_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True).detach()
+            eager_ids = logits[:, input_ids.shape[-1] - 1, :].argmax(dim=-1, keepdim=True).detach()
         else:
             eager_ids = None
 

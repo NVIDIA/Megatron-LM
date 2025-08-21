@@ -264,8 +264,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     if self.ddp_config.num_distributed_optimizer_instances == 1:
                         # Collective is averaging gradients in collective with data_parallel_group.
                         assert (
-                            gradient_scaling_factor
-                            / torch.distributed.get_world_size(group=data_parallel_group)
+                            gradient_scaling_factor / data_parallel_group.size()
                             == target_gradient_scaling_factor
                         )
                     else:
@@ -292,6 +291,7 @@ class DistributedDataParallel(_BaseDataParallel):
                         param_to_name,
                         gradient_scaling_factor,
                         param_and_grad_dtype_to_indices[(param_dtype, grad_dtype)],
+                        self.ddp_config.nccl_ub,
                     )
                 )
 
@@ -545,6 +545,23 @@ class DistributedDataParallel(_BaseDataParallel):
 
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_param_sync(force_sync=force_sync)
+            # For MXFP8 params, we need to copy the all-gathered param data from the buffer to
+            # the param.data, since param buffer is not mapped to model params for MXFP8 case.
+            # The paramaters are cast from bf16 to MXFP8 during copy.
+            # In the case of "overlap_param_gather=True", the param copy is done
+            # in "finish_param_sync" stage after zeroing the shared gardient buffers.
+            if (
+                self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and not self.ddp_config.overlap_param_gather
+            ):
+                for bucket in bucket_group.buckets:
+                    for param in bucket.params:
+                        param_start, param_end = bucket.param_to_index[param]
+                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                        param.data.copy_(param_slice.view(param.data.shape))
+                    # All-gathered params are not needed after being copied to param.data.
+                    # Zero out the grad buffer (shared with param buffer) for gradient accumulation.
+                    bucket.grad_data.zero_()
 
     def start_grad_sync(self, *unused):
         """
@@ -586,8 +603,16 @@ class DistributedDataParallel(_BaseDataParallel):
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.buffers + self.expert_parallel_buffers:
-            buffer.reset()
+        # In the case of "reuse_grad_buf_for_mxfp8_param_ag=True & overlap_param_gather=True",
+        # the grad buffer is not reset here because the grad buffer is shared with the param buffer.
+        # The grad buffer is zeroed by "bucket.grad_data.zero_()" in the "finish_param_sync" stage
+        # after the param all-gather.
+        if not (
+            self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+            and self.ddp_config.overlap_param_gather
+        ):
+            for buffer in self.buffers + self.expert_parallel_buffers:
+                buffer.reset()
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.reset()
 

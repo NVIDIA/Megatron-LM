@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import math
 import warnings
 from dataclasses import dataclass, replace
@@ -17,7 +18,7 @@ import torch.nn.functional as F
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
@@ -26,7 +27,9 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params
+from megatron.core.utils import deprecate_inference_params, log_single_rank
+
+from .mamba_context_parallel import MambaContextParallel
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -45,13 +48,23 @@ try:
         mamba_chunk_scan_combined,
         mamba_split_conv1d_scan_combined,
     )
+
+    HAVE_MAMBA_SSM = True
 except ImportError:
-    raise ImportError("mamba-ssm is required by the Mamba model but cannot be imported")
+    from unittest.mock import MagicMock
+
+    RMSNormGated = MagicMock()
+    HAVE_MAMBA_SSM = False
 
 try:
     from einops import rearrange, repeat
+
+    HAVE_EINOPS = True
 except ImportError:
-    raise ImportError("einops is required by the Mamba model but cannot be imported")
+    HAVE_EINOPS = False
+
+
+logger = logging.getLogger(__name__)
 
 
 class ExtendedRMSNorm(RMSNormGated):
@@ -59,11 +72,11 @@ class ExtendedRMSNorm(RMSNormGated):
     RMSNormGated with sharded state dict.
     """
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Sharding along axis 0, bias not sharded"""
-        state_dict = self.state_dict(prefix='', keep_vars=True)
+        state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
-            state_dict, prefix, {'weight': 0}, sharded_offsets
+            state_dict, prefix, {"weight": 0}, sharded_offsets
         )
 
 
@@ -104,6 +117,8 @@ class MambaMixer(MegatronModule):
         chunk_size: The chunk size for the fused kernel.
         use_mem_eff_path: Whether to use the memory-efficient path for the Mamba model.
         layer_number: The layer number of this Mamba layer.
+        model_comm_pgs: The required process groups to use for tensor model parallel and context
+            parallel.
     """
 
     def __init__(
@@ -132,7 +147,16 @@ class MambaMixer(MegatronModule):
         d_state=None,
         headdim=None,
         ngroups=None,
+        model_comm_pgs: ModelCommProcessGroups = None,
     ):
+        if not HAVE_MAMBA_SSM:
+            raise ImportError(
+                "MambaSSM is not installed. Please install it with `pip install mamba-ssm`."
+            )
+
+        if not HAVE_EINOPS:
+            raise ImportError("einops is required by the Mamba model but cannot be imported")
+
         super().__init__(config)
         self.config = config
         self.d_model = d_model
@@ -145,6 +169,9 @@ class MambaMixer(MegatronModule):
         self.norm_before_gate = norm_before_gate
         self.chunk_size = chunk_size
         self.layer_number = layer_number
+        self.cached_batch_size = None
+        assert model_comm_pgs is not None, "model_comm_pgs must be provided for MambaMixer"
+        self.model_comm_pgs = model_comm_pgs
 
         # Check for deprecated arguments and raise warnings
         if use_mem_eff_path is not None:
@@ -186,7 +213,7 @@ class MambaMixer(MegatronModule):
             assert self.nheads > 0
             self.d_inner = self.nheads * self.headdim
         else:
-            assert self.d_inner % self.headdim == 0
+            assert self.d_inner % self.headdim == 0, "d_inner must be evenly divisible by headdim"
             self.nheads = self.d_inner // self.headdim
 
         if self.config.fp8:
@@ -195,37 +222,55 @@ class MambaMixer(MegatronModule):
                 "input projection output tensor must be a multiple of 16."
             )
 
-        self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
-        assert self.d_inner % self.tensor_model_parallel_size == 0
-        assert self.ngroups % self.tensor_model_parallel_size == 0
-        assert self.nheads % self.tensor_model_parallel_size == 0
+        tp_size = self.model_comm_pgs.tp.size()
+
+        # Ensure that each TP rank gets at least one head:
+        assert self.nheads % tp_size == 0, "nheads must be evenly divisble by tp_size"
+        self.nheads_local_tp = self.nheads // tp_size
+
+        # Note that we do not need to confirm that `d_inner % tp_size == 0` because
+        # `d_inner % headdim == 0`, `nheads = d_inner // headdim`, and `nheads % tp_size == 0`
+        self.d_inner_local_tp = self.d_inner // tp_size
+
+        # Ensure that each TP rank gets at least one group:
+        assert self.ngroups % tp_size == 0, "ngroups must be evenly divisible by tp_size"
+        self.ngroups_local_tp = self.ngroups // tp_size
+
+        # Ensure that each group has a positive integer number of heads:
+        assert self.nheads % self.ngroups == 0, "nheads must be evenly divisible by ngroups"
+
         assert not bias
         assert not self.norm_before_gate
 
-        self.d_inner_local = self.d_inner // self.tensor_model_parallel_size
-        self.ngroups_local = self.ngroups // self.tensor_model_parallel_size
-        self.nheads_local = self.nheads // self.tensor_model_parallel_size
-
-        assert self.d_inner_local % self.ngroups_local == 0
-
-        # Assume sequence parallelism: input is already partitioned along the
-        # sequence dimension
+        # Assume sequence parallelism: input is already partitioned along the sequence dimension
         self.in_proj = build_module(
             submodules.in_proj,
             self.d_model,
-            self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads,  # AB CD E
+            self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads,  # z x B C dt
             config=self.config,
             init_method=self.config.init_method,
             gather_output=False,
             bias=bias,
             skip_bias_add=False,
             is_expert=False,
-            tp_comm_buffer_name='fc1',
+            tp_comm_buffer_name="fc1",
+            tp_group=self.model_comm_pgs.tp,
         )
 
-        conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state  # A CD
+        if not self.use_mem_eff_path:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                (
+                    "We are not currently using or functionally testing use_mem_eff_path==False "
+                    "for training. It may not work as expected."
+                ),
+            )
+
+        conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state  # x B C
         with get_cuda_rng_tracker().fork():
-            # weight dim: [conv_dim, conv_dim, d_conv]
+            # weight shape: [conv_dim, 1, d_conv]
+            # bias shape: [conv_dim]
             self.conv1d = nn.Conv1d(
                 in_channels=conv_dim,
                 out_channels=conv_dim,
@@ -236,8 +281,8 @@ class MambaMixer(MegatronModule):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
-            setattr(self.conv1d.weight, 'tensor_model_parallel', True)
-            setattr(self.conv1d.bias, 'tensor_model_parallel', True)
+            setattr(self.conv1d.weight, "tensor_model_parallel", True)
+            setattr(self.conv1d.bias, "tensor_model_parallel", True)
 
             if self.conv_init is not None:
                 nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
@@ -249,7 +294,9 @@ class MambaMixer(MegatronModule):
             # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
             dt = torch.exp(
                 torch.rand(
-                    self.nheads_local, device=torch.cuda.current_device(), dtype=config.params_dtype
+                    self.nheads_local_tp,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
                 )
                 * (math.log(dt_max) - math.log(dt_min))
                 + math.log(dt_min)
@@ -262,36 +309,36 @@ class MambaMixer(MegatronModule):
             self.dt_bias._no_reinit = True
             # Just to be explicit. Without this we already don't
             # put wd on dt_bias because of the check
-
             # name.endswith("bias") in param_grouping.py
             self.dt_bias._no_weight_decay = True
-            setattr(self.dt_bias, 'tensor_model_parallel', True)
+            setattr(self.dt_bias, "tensor_model_parallel", True)
 
+            # A parameter
             assert A_init_range[0] > 0 and A_init_range[1] >= A_init_range[0]
             A = torch.empty(
-                self.nheads_local, dtype=torch.float32, device=torch.cuda.current_device()
+                self.nheads_local_tp, dtype=torch.float32, device=torch.cuda.current_device()
             ).uniform_(*A_init_range)
             A_log = torch.log(A)  # Keep A_log in fp32
             self.A_log = nn.Parameter(A_log)
             self.A_log._no_weight_decay = True
-            setattr(self.A_log, 'tensor_model_parallel', True)
+            setattr(self.A_log, "tensor_model_parallel", True)
 
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
-                self.d_inner_local if self.D_has_hdim else self.nheads_local,
+                self.d_inner_local_tp if self.D_has_hdim else self.nheads_local_tp,
                 device=torch.cuda.current_device(),
             )
         )  # Keep in fp32
         self.D._no_weight_decay = True
-        setattr(self.D, 'tensor_model_parallel', True)
+        setattr(self.D, "tensor_model_parallel", True)
 
         if self.rmsnorm:
             assert RMSNormGated is not None
             self.norm = ExtendedRMSNorm(
-                self.d_inner_local,
+                self.d_inner_local_tp,
                 eps=1e-5,
-                group_size=self.d_inner_local // self.ngroups_local,
+                group_size=self.d_inner_local_tp // self.ngroups_local_tp,
                 norm_before_gate=self.norm_before_gate,
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
@@ -309,7 +356,26 @@ class MambaMixer(MegatronModule):
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
-            tp_comm_buffer_name='fc2',
+            tp_comm_buffer_name="fc2",
+            tp_group=self.model_comm_pgs.tp,
+        )
+
+        # Regarding `conv1d`.{`weight`, `bias`}, `dt_bias`, `A_log`, and `D`: these are the
+        # trainable variables for the current tensor parallel rank, with each tensor parallel rank
+        # having indepdendent trainable variables. All context parallel ranks in a tensor parallel
+        # rank store the same trainable variables, but only use and update their unique/independent
+        # slice of them.
+        self.cp = MambaContextParallel(
+            cp_group=self.model_comm_pgs.cp,
+            d_inner_local_tp=self.d_inner_local_tp,
+            nheads_local_tp=self.nheads_local_tp,
+            ngroups_local_tp=self.ngroups_local_tp,
+            d_state=self.d_state,
+            conv1d_cp1=self.conv1d,
+            dt_bias_cp1=self.dt_bias,
+            A_log_cp1=self.A_log,
+            D_cp1=self.D,
+            D_has_hdim=self.D_has_hdim,
         )
 
     def forward(
@@ -340,47 +406,57 @@ class MambaMixer(MegatronModule):
                 out, out_bias, _, _ = self.step(hidden_states, conv_state, ssm_state)
                 return out, out_bias
 
-        # (nheads_local)
-        A = -torch.exp(self.A_log.float())
+        zxBCdt, _ = self.in_proj(hidden_states)
 
-        xz, _ = self.in_proj(hidden_states)
+        zxBCdt = self.cp.pre_conv_ssm(zxBCdt)
 
         # transpose: l b pd --> b l pd
-        xz = rearrange(xz, "l b d -> b l d").contiguous()
+        zxBCdt = rearrange(zxBCdt, "l b d -> b l d").contiguous()
+
+        # (nheads_local_tpcp)
+        A = -torch.exp(self.cp.get_A_log().float())
 
         if self.use_mem_eff_path and inference_context is None:
             assert ssm_state is None
 
+            # TODO(duncan): Can this code be removed?
             if self.conv1d.bias is not None:
                 self.conv1d.bias.data_ptr()
 
             y = mamba_split_conv1d_scan_combined(
-                xz,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.dt_bias.float(),
+                zxBCdt,
+                rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                self.cp.get_conv1d_bias(),
+                self.cp.get_dt_bias().float(),
                 A,
                 D=(
-                    rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
+                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                     if self.D_has_hdim
-                    else self.D
+                    else self.cp.get_D()
                 ),
                 chunk_size=self.chunk_size,
                 activation=self.activation,
                 headdim=None if self.D_has_hdim else self.headdim,
-                ngroups=self.ngroups_local,
+                ngroups=self.cp.ngroups_local_tpcp,
                 norm_before_gate=self.norm_before_gate,
             )
+
+            y = rearrange(y, "b l d -> l b d").contiguous()
+            y = self.cp.post_conv_ssm(y)
 
             if self.rmsnorm:
                 y = self.norm(y)
         else:
+            # This path is always used for the inference prefill phase.
+            # `mamba_split_conv1d_scan_combined`, used in the other branch above, reduces the size
+            # of forward activations stored for backprop, which reduces memory pressure during
+            # training, and does not provide increased speed in the forward direction.
             z, xBC, dt = torch.split(
-                xz,
+                zxBCdt,
                 [
-                    self.d_inner_local,
-                    self.d_inner_local + 2 * self.ngroups_local * self.d_state,
-                    self.nheads_local,
+                    self.cp.d_inner_local_tpcp,
+                    self.cp.d_inner_local_tpcp + 2 * self.cp.ngroups_local_tpcp * self.d_state,
+                    self.cp.nheads_local_tpcp,
                 ],
                 dim=-1,
             )
@@ -398,13 +474,13 @@ class MambaMixer(MegatronModule):
 
             seqlen = xBC.size(2)
             if causal_conv1d_fn is None:
-                xBC = self.act(self.conv1d(xBC)[..., :seqlen])
+                xBC = self.act(self.cp.conv1d(xBC)[..., :seqlen])
             else:
                 assert self.activation in ["silu", "swish"]
                 xBC = causal_conv1d_fn(
                     x=xBC,
-                    weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                    bias=self.conv1d.bias,
+                    weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                    bias=self.cp.get_conv1d_bias(),
                     activation=self.activation,
                 )
 
@@ -414,9 +490,9 @@ class MambaMixer(MegatronModule):
             x, B, C = torch.split(
                 xBC,
                 [
-                    self.d_inner_local,
-                    self.ngroups_local * self.d_state,
-                    self.ngroups_local * self.d_state,
+                    self.cp.d_inner_local_tpcp,
+                    self.cp.ngroups_local_tpcp * self.d_state,
+                    self.cp.ngroups_local_tpcp * self.d_state,
                 ],
                 dim=-1,
             )
@@ -427,6 +503,15 @@ class MambaMixer(MegatronModule):
             B = rearrange(B, "b l (g n) -> b l g n", n=self.d_state).contiguous()
             C = rearrange(C, "b l (g n) -> b l g n", n=self.d_state).contiguous()
             z = rearrange(z, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+
+            # If `rmsnorm == False`, then the norm inside `mamba_chunk_scan_combined` will be used.
+            # In this case, if `cp_size > 1` then that norm could be performed on less heads than if
+            # `cp_size == 1` (groups of heads can be sharded across CP ranks), which would be
+            # mathematically incorrect, and potentially arithmetically unstable.
+            assert (
+                self.cp.cp_size == 1 or self.rmsnorm
+            ), "Context parallel not supported for use_mem_eff_path==False and rmsnorm==False"
+
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
@@ -435,12 +520,12 @@ class MambaMixer(MegatronModule):
                 C,
                 self.chunk_size,
                 D=(
-                    rearrange(self.D.float(), "(h p) -> h p", p=self.headdim)
+                    rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
                     if self.D_has_hdim
-                    else self.D
+                    else self.cp.get_D()
                 ),
                 z=z if not self.rmsnorm else None,
-                dt_bias=self.dt_bias.float(),
+                dt_bias=self.cp.get_dt_bias().float(),
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
             )
@@ -449,14 +534,14 @@ class MambaMixer(MegatronModule):
                 y, last_state = y
                 ssm_state.copy_(last_state)
 
-            if self.rmsnorm:
-                y = rearrange(y, "b l h p -> b l (h p)").contiguous()
-                z = rearrange(z, "b l h p -> b l (h p)").contiguous()
-                y = self.norm(y, z)
-            else:
-                y = rearrange(y, "b l h p -> b l (h p)").contiguous()
+            y = rearrange(y, "b l h p -> l b (h p)").contiguous()
+            y = self.cp.post_conv_ssm(y)
 
-        y = rearrange(y, "b l d -> l b d").contiguous()
+            if self.rmsnorm:
+                z = rearrange(z, "b l h p -> l b (h p)").contiguous()
+                z = self.cp.post_conv_ssm(z)
+                y = self.norm(y, z)
+
         out, out_bias = self.out_proj(y)
 
         return out, out_bias
@@ -465,7 +550,7 @@ class MambaMixer(MegatronModule):
         """
         Performs inference step for decoding
         """
-        # assert self.ngroups_local == 1, "Only support ngroups=1 for inference for now"
+        # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
         dtype = hidden_states.dtype
         assert hidden_states.shape[0] == 1, "Only support decoding with 1 token at a time for now"
 
@@ -473,14 +558,16 @@ class MambaMixer(MegatronModule):
         hidden_states = hidden_states.squeeze(0)
 
         #  b d_model --> b p(2d)
-        xz, _ = self.in_proj(hidden_states)
+        zxBCdt, _ = self.in_proj(hidden_states)
+
+        assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
 
         z, xBC, dt = torch.split(
-            xz,
+            zxBCdt,
             [
-                self.d_inner_local,
-                self.d_inner_local + 2 * self.ngroups_local * self.d_state,
-                self.nheads_local,
+                self.d_inner_local_tp,
+                self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state,
+                self.nheads_local_tp,
             ],
             dim=-1,
         )
@@ -507,9 +594,9 @@ class MambaMixer(MegatronModule):
         x, B, C = torch.split(
             xBC,
             [
-                self.d_inner_local,
-                self.ngroups_local * self.d_state,
-                self.ngroups_local * self.d_state,
+                self.d_inner_local_tp,
+                self.ngroups_local_tp * self.d_state,
+                self.ngroups_local_tp * self.d_state,
             ],
             dim=-1,
         )
@@ -517,11 +604,15 @@ class MambaMixer(MegatronModule):
 
         # SSM step
         if selective_state_update is None:
-            if self.ngroups_local > 1:
+            if self.ngroups_local_tp > 1:
                 B = rearrange(B, "b (g n) -> b g n", n=self.d_state)
                 C = rearrange(C, "b (g n) -> b g n", n=self.d_state)
-                B = repeat(B, "b g n -> b (g h) n", h=self.d_inner_local // self.ngroups_local)
-                C = repeat(C, "b g n -> b (g h) n", h=self.d_inner_local // self.ngroups_local)
+                B = repeat(
+                    B, "b g n -> b (g h) n", h=self.d_inner_local_tp // self.ngroups_local_tp
+                )
+                C = repeat(
+                    C, "b g n -> b (g h) n", h=self.d_inner_local_tp // self.ngroups_local_tp
+                )
 
                 dt = repeat(dt, "b h -> b (h p)", p=self.headdim)
                 dt_bias = repeat(self.dt_bias, "h -> (h p)", p=self.headdim)
@@ -531,7 +622,7 @@ class MambaMixer(MegatronModule):
                 dt = F.softplus(dt + dt_bias.to(dtype=dt.dtype))
                 dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
 
-                dB_x = torch.einsum('bd,bdn,bd->bdn', dt, B, x)
+                dB_x = torch.einsum("bd,bdn,bd->bdn", dt, B, x)
                 ssm_state.copy_(
                     ssm_state * rearrange(dA, "b (h p) n -> b h p n", p=self.headdim)
                     + rearrange(dB_x, "b (h p) n -> b h p n", p=self.headdim)
@@ -562,8 +653,8 @@ class MambaMixer(MegatronModule):
             dt = repeat(dt, "b h -> b h p", p=self.headdim)
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
             D = repeat(self.D, "h -> h p", p=self.headdim)
-            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups_local)
-            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups_local)
+            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups_local_tp)
+            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups_local_tp)
             x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
             if not self.rmsnorm:
                 z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
@@ -601,7 +692,7 @@ class MambaMixer(MegatronModule):
         # ssm_dtype = torch.float32
         ssm_state = torch.zeros(
             batch_size,
-            self.nheads_local,
+            self.nheads_local_tp,
             self.headdim,
             self.d_state,
             device=device,
@@ -609,14 +700,22 @@ class MambaMixer(MegatronModule):
         )
         return conv_state, ssm_state
 
-    def _get_states_from_cache(
-        self, inference_context, batch_size, initialize_states=False, *, inference_params=None
-    ):
+    def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
+        """Initializes or retrieves the SSM state tensors from the cache.
+
+        At the start of any inference (at the prefill step), if there is no cache or if the
+        cached batch size has changed, then new tensors are initialized and stored in the cache.
+        Otherwise the existing tensors are retrieved from the cache and zeroed out.
+        """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        assert inference_context is not None
         assert self.layer_number is not None
-        if self.layer_number not in inference_context.key_value_memory_dict:
+        if (
+            self.layer_number not in inference_context.key_value_memory_dict
+            or batch_size != self.cached_batch_size
+        ):
             conv_state = torch.zeros(
                 batch_size,
                 self.conv1d.weight.shape[0],
@@ -626,95 +725,97 @@ class MambaMixer(MegatronModule):
             )
             ssm_state = torch.zeros(
                 batch_size,
-                self.nheads_local,
+                self.nheads_local_tp,
                 self.headdim,
                 self.d_state,
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
             inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
+            self.cached_batch_size = batch_size
         else:
             conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
-            # TODO: What if batch size changes between generation, and we reuse the same states?
-            if initialize_states:
+            # TODO: Remove reference to `inference_context.sequence_len_offset` for dynamic batching
+            if inference_context.sequence_len_offset == 0:
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
         sharded_state_dict = {}
         # Parameters
-        self._save_to_state_dict(sharded_state_dict, '', keep_vars=True)
+        self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
             prefix,
             tensor_parallel_layers_axis_map={
-                'A_log': 0,
-                'dt_bias': 0,
-                'D': 0,
+                "A_log": 0,
+                "dt_bias": 0,
+                "D": 0,
             },  # parameters sharded across TP
             sharded_offsets=sharded_offsets,
         )
         # Submodules
         for name, module in self.named_children():
-            if name == 'conv1d':
+            if name == "conv1d":
                 # Add TP sharding for Conv1d
-                module_sd = module.state_dict(prefix='', keep_vars=True)
+                module_sd = module.state_dict(prefix="", keep_vars=True)
                 module_sharded_sd = make_sharded_tensors_for_checkpoint(
-                    module_sd, f'{prefix}{name}.', {f'weight': 0, f'bias': 0}, sharded_offsets
+                    module_sd, f"{prefix}{name}.", {f"weight": 0, f"bias": 0}, sharded_offsets
                 )
 
             else:
                 module_sharded_sd = sharded_state_dict_default(
-                    module, f'{prefix}{name}.', sharded_offsets, metadata
+                    module, f"{prefix}{name}.", sharded_offsets, metadata
                 )
 
             sharded_state_dict.update(module_sharded_sd)
 
-        # At this point the TP sharding is correctly defined fo each tensor, but some of the tensors
-        # must be additionally split into separate parts
-        # in_proj
+        # At this point the TP sharding is correctly defined for each tensor, but some of the
+        # tensors must be additionally split into separate parts
         in_proj_dim = (
-            self.d_inner_local * 2 + 2 * self.ngroups_local * self.d_state + self.nheads_local
+            self.d_inner_local_tp * 2
+            + 2 * self.ngroups_local_tp * self.d_state
+            + self.nheads_local_tp
         )
-        assert sharded_state_dict[f'{prefix}in_proj.weight'].data.size(0) == in_proj_dim, (
+        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
             in_proj_dim,
-            sharded_state_dict[f'{prefix}in_proj.weight'],
+            sharded_state_dict[f"{prefix}in_proj.weight"],
         )
 
-        sharded_state_dict[f'{prefix}in_proj.weight'] = _split_tensor_factory(
-            sharded_state_dict[f'{prefix}in_proj.weight'],
+        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+            sharded_state_dict[f"{prefix}in_proj.weight"],
             [
-                self.d_inner_local,
-                self.d_inner_local,
-                self.ngroups_local * self.d_state,
-                self.ngroups_local * self.d_state,
-                self.nheads_local,
+                self.d_inner_local_tp,
+                self.d_inner_local_tp,
+                self.ngroups_local_tp * self.d_state,
+                self.ngroups_local_tp * self.d_state,
+                self.nheads_local_tp,
             ],
-            ['z', 'x', 'B', 'C', 'dt'],
+            ["z", "x", "B", "C", "dt"],
             0,
         )
 
-        conv_dim = self.d_inner_local + 2 * self.ngroups_local * self.d_state
-        assert sharded_state_dict[f'{prefix}conv1d.weight'].data.size(0) == conv_dim, (
+        conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
+        assert sharded_state_dict[f"{prefix}conv1d.weight"].data.size(0) == conv_dim, (
             conv_dim,
-            sharded_state_dict[f'{prefix}conv1d.weight'],
+            sharded_state_dict[f"{prefix}conv1d.weight"],
         )
-        assert sharded_state_dict[f'{prefix}conv1d.bias'].data.size(0) == conv_dim, (
+        assert sharded_state_dict[f"{prefix}conv1d.bias"].data.size(0) == conv_dim, (
             conv_dim,
-            sharded_state_dict[f'{prefix}conv1d.bias'],
+            sharded_state_dict[f"{prefix}conv1d.bias"],
         )
 
-        for conv_layer_name in ['conv1d.weight', 'conv1d.bias']:
-            sharded_state_dict[f'{prefix}{conv_layer_name}'] = _split_tensor_factory(
-                sharded_state_dict[f'{prefix}{conv_layer_name}'],
+        for conv_layer_name in ["conv1d.weight", "conv1d.bias"]:
+            sharded_state_dict[f"{prefix}{conv_layer_name}"] = _split_tensor_factory(
+                sharded_state_dict[f"{prefix}{conv_layer_name}"],
                 [
-                    self.d_inner_local,
-                    self.ngroups_local * self.d_state,
-                    self.ngroups_local * self.d_state,
+                    self.d_inner_local_tp,
+                    self.ngroups_local_tp * self.d_state,
+                    self.ngroups_local_tp * self.d_state,
                 ],
-                ['x', 'B', 'C'],
+                ["x", "B", "C"],
                 0,
             )
 
@@ -730,14 +831,14 @@ def _split_tensor_factory(
 
     if sum(split_sections) != orig_sh_ten_no_data.local_shape[split_dim]:
         raise ValueError(
-            f'Split sections must cover the whole dimension size, '
-            f'got {split_sections=} vs dimensions size '
-            f'{orig_sh_ten_no_data.local_shape[split_dim]}'
+            f"Split sections must cover the whole dimension size, "
+            f"got {split_sections=} vs dimensions size "
+            f"{orig_sh_ten_no_data.local_shape[split_dim]}"
         )
 
     assert not isinstance(
         split_sections, int
-    ), 'Splitting into predefined section sizes is supported (`split_sections` must be a list)'
+    ), "Splitting into predefined section sizes is supported (`split_sections` must be a list)"
     assert len(split_sections) == len(split_names), (len(split_sections), len(split_names))
 
     @torch.no_grad()
@@ -758,7 +859,7 @@ def _split_tensor_factory(
         for split_size, split_name in zip(split_sections, split_names):
             split_chunks = factory_sh_ten.narrow(split_dim, split_start, split_size)
             for sh_ten in split_chunks:
-                sh_ten.key = f'{sh_ten.key}.{split_name}'
+                sh_ten.key = f"{sh_ten.key}.{split_name}"
             chunk_sh_tens.extend(split_chunks)
             split_start += split_size
 

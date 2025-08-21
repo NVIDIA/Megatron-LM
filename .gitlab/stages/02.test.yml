@@ -8,9 +8,48 @@
 include:
   - template: Security/Secret-Detection.gitlab-ci.yml
 
+wait_for_resources:
+  extends: [.test_rules]
+  needs:
+    - test:linting_formatting
+    - test:linting_copyright
+    - job: test:linting_secret_detection
+      optional: true
+    - test:build_image
+  image: python:3.10
+  timeout: 7 days
+  variables:
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 32Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 8
+    KUBERNETES_SERVICE_CPU_LIMIT: 12
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  script:
+    - env
+    - pip install --no-cache-dir python-gitlab click
+    - export RO_API_TOKEN=${PROJECT_ACCESS_TOKEN_MCORE}
+    - export GITLAB_ENDPOINT
+    - export NUM_CONCURRENT_JOBS
+    - python tests/test_utils/python_scripts/wait_for_resources.py --pipeline-id $CI_PIPELINE_ID
+  rules:
+    - if: $CI_MERGE_REQUEST_LABELS =~ /fast-track/
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: on_success
+    - when: never
+
 test:unit_tests_configure:
   extends: [.test_rules]
-  needs: [test:build_image]
+  needs:
+    - test:build_image
+    - job: wait_for_resources
+      optional: true
   image: ${UTILITY_IMAGE}:${CI_PIPELINE_ID}
   tags:
     - arch/amd64
@@ -35,9 +74,9 @@ test:unit_tests_configure:
         "--n-repeat ${UNIT_TEST_REPEAT}"
         "--time-limit $(( UNIT_TEST_TIMEOUT * 60 ))"
         "--test-cases all"
-        "--a100-cluster dgxa100_dracooci-ord"
-        "--h100-cluster dgxh100_coreweave"
-        "--h100-partition batch_short,batch"
+        "--cluster dgxh100_coreweave"
+        "--platform dgx_h100"
+        "--partition batch_short,batch"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
         "--dependent-job test:unit_tests_configure"
@@ -328,3 +367,42 @@ test:unit_tests_x_coverage_report:
       when: on_success
     - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
       when: on_success
+
+test:safe_imports:
+  extends: [.test_rules]
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/builder-large
+    - team/megatron
+  services:
+    - name: docker:24.0.5-dind
+      variables:
+        HEALTHCHECK_TCP_PORT: "2376"
+  variables:
+    KUBERNETES_SERVICE_MEMORY_REQUEST: 32Gi
+    KUBERNETES_SERVICE_MEMORY_LIMIT: 32Gi
+    KUBERNETES_SERVICE_CPU_REQUEST: 8
+    KUBERNETES_SERVICE_CPU_LIMIT: 12
+  image:
+    name: python:3.11
+    entrypoint: [""]
+  needs: [test:build_image]
+  script:
+    - env
+    - python -m ensurepip --upgrade
+    - python -m pip install --no-cache-dir -e .
+    - python -m pip install --no-cache-dir click
+    - python .gitlab/scripts/check_imports.py --package-name megatron.core
+  rules:
+    - if: $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME != 'main'
+      when: never
+    - if: $UNIT_TEST == 'yes' && $CI_MERGE_REQUEST_EVENT_TYPE == 'merged_result' && $CI_MERGE_REQUEST_TARGET_BRANCH_PROTECTED != "true"
+      allow_failure: true
+      when: on_success
+    - if: $UNIT_TEST == 'yes' && $UNIT_TEST_REPEAT != '0'
+      when: on_success
+  retry:
+    max: 2

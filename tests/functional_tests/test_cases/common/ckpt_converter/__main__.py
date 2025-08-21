@@ -92,7 +92,7 @@ class ModelMeta:
     """Basic information about a model.
 
     Args:
-        format (str): 'core', 'legacy', 'meta', 'hf', or 'llava'.
+        format (str): 'core', 'meta', 'hf', or 'llava'.
         mp (ModelParallelState): Defines TP, PP, EP.
         transformer_impl (str): 'transformer_engine' or 'local'.
     """
@@ -104,7 +104,7 @@ class ModelMeta:
         if transformer_impl is None:
             transformer_impl = "transformer_engine" if format in ("core", "llava") else "local"
 
-        assert format in ("core", "legacy", "meta", "hf", "llava")
+        assert format in ("core", "meta", "hf", "llava")
         assert isinstance(mp, ModelParallelState)
         assert transformer_impl in ("transformer_engine", "local")
 
@@ -206,10 +206,6 @@ class Pipeline:
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
 
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
-
         # Parse args.
         args = parse_args()
         validate_args(args)
@@ -283,7 +279,7 @@ class Pipeline:
             attention_mask = attention_mask.unsqueeze(0)
 
         # Other TP ranks on PP rank 0.
-        elif parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+        elif parallel_state.is_pipeline_first_stage():
             input_ids = torch.empty(
                 (args.micro_batch_size, args.seq_length),
                 dtype=torch.int64,
@@ -311,7 +307,7 @@ class Pipeline:
             attention_mask = None
 
         # Broadcast.
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_first_stage():
             broadcast(input_ids)
             broadcast(attention_mask)
             broadcast(position_ids)
@@ -366,13 +362,13 @@ class Pipeline:
             forward_only=True,
             collect_non_loss_data=True,
         )
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_last_stage():
             output_tensor = data[0]["output_tensor"]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_last_stage():
             output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
         else:
             output_tensor_gathered = None
@@ -384,6 +380,10 @@ class Pipeline:
 
         meta = self.get_meta(key)
 
+        # The test is only designed to work with single model
+        assert len(models) == 1
+        model = models[0]
+
         with torch.no_grad():
 
             # Randomly initialize all params.
@@ -392,14 +392,11 @@ class Pipeline:
                     p.normal_(0, 0.1)
 
             # Synchronize embeddings.
-            if meta.mp.pp != 1 and parallel_state.is_rank_in_embedding_group(ignore_virtual=False):
-                if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
-                    emb = models[0].module.module.shared_embedding_or_output_weight()
-                elif parallel_state.is_pipeline_last_stage(ignore_virtual=False):
-                    emb = models[-1].module.module.shared_embedding_or_output_weight()
-                else:
-                    raise Exception("should be either first/last pipeline rank.")
-                torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
+            if meta.mp.pp != 1:
+                emb = model.module.module.shared_embedding_or_output_weight()
+                # Make embedding the same on ranks that has is
+                if emb is not None:
+                    torch.distributed.all_reduce(emb, group=parallel_state.get_embedding_group())
 
     def save_checkpoint(self):
         """Initialize params, forward pass data, and save checkpoint."""
@@ -731,13 +728,13 @@ class LLaVAPipeline(Pipeline):
             collect_non_loss_data=True,
         )
 
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_last_stage():
             output_tensor = data[0]["output_tensor"][0]
         else:
             output_tensor = None
 
         # All-gather across the partitions.
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_last_stage():
             output_tensor_gathered = gather_from_tensor_model_parallel_region(output_tensor)
         else:
             output_tensor_gathered = None
@@ -810,10 +807,6 @@ class LLaVAPipeline(Pipeline):
         if key == "dst":
             sys.argv.append("--exit-on-missing-checkpoint")
 
-        # Use legacy.
-        if meta.format == "legacy":
-            sys.argv.append("--use-legacy-models")
-
         # Parse args.
         from examples.multimodal.multimodal_args import add_multimodal_extra_args
 
@@ -844,9 +837,6 @@ def get_gpt_pipelines():
         GPTPipeline(("core", (4, 2)), ("core", (2, 4), "local")),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4), "local")),
         GPTPipeline(("core", (4, 2), "local"), ("core", (2, 4))),
-        # GPTPipeline(("legacy", (4, 2)), ("core", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2)), ("legacy", (2, 4))),
-        # [todo] GPTPipeline(("legacy", (4, 2), "te"), ("legacy", (2, 4), "te")),
         # [todo] GPTPipeline("meta", "core", None, (8, 1)),
         # [todo] GPTPipeline("hf", "core", None, (8, 1)),
     ]

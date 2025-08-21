@@ -1,0 +1,50 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+TEST_TYPE: frozen-start
+MODE: inference
+MODEL_ARGS:
+  --tiktoken-pattern: v2
+  --use-mcore-models: true
+  --tokenizer-type: TikTokenizer
+  --tokenizer-model: ${DATA_PATH}/mcore_mistral/tokenizer/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+  --auto-detect-ckpt-format: true
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 4096
+  --attention-backend: flash
+  --use-checkpoint-args: true
+  --micro-batch-size: 1
+  --no-load-optim: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --timing-log-level: 2
+  --load: ${CHECKPOINT_LOAD_PATH}/mcore_mistral/model
+  --distributed-backend: nccl
+  --log-interval: 1
+  --transformer-impl: transformer_engine
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
+  --deterministic-mode: true
+  --ckpt-format: torch_dist
+  --bf16: true
+  --log-memory-to-tensorboard: true
+  --log-num-zeros-in-grad: true
+  --log-validation-ppl-to-tensorboard: true
+  --log-timers-to-tensorboard: true
+  --num-layers: 24
+  --hidden-size: 1152
+  --num-attention-heads: 16
+  --max-position-embeddings: 1024
+  --seq-length: 1024
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 30
+  --flash-decode: true
+  --dist-ckpt-strictness: log_unexpected
+  --output-path: ${TENSORBOARD_PATH}
+  --prompts: "Time travel to 2008, and go to a bar or a club or one of the myriad disco-basements on the Lower East Side that does not quite know which of those it is. Dance awkwardly in a room full of other glittered-up nerds, and wait for something to happen, buoyed on the feeling that this is the big swollen heart of life, that this is New York like the movies."
+METRICS:
+  - "generated_tokens"
+  - "logprobs"

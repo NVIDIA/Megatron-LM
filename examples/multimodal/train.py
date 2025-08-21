@@ -48,7 +48,7 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
     # Dataloader doesn't run on the middle stages in a pipeline parallel model.
     pp_size = get_pipeline_model_parallel_world_size()
-    if not is_first_or_last_stage(pp_size, args.encoder_pipeline_model_parallel_size):
+    if not is_first_or_last_stage(pp_size):
         # Note these are all set to None above.
         return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
 
@@ -302,16 +302,12 @@ def llava_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
-    if len(pp_ranks) == 1 or pp_ranks[epp] == last_rank:
+    if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp], last_rank]
+        return [pp_ranks[0], last_rank]
 
 
 def llava_position_embedding_ranks(pp_ranks):
@@ -319,16 +315,12 @@ def llava_position_embedding_ranks(pp_ranks):
     Args:
         pp_ranks: A list of global ranks that constitute a pipeline group.
     """
-    args = get_args()
-
-    # encoder size is also the index to the first rank of the decoder.
-    epp = args.encoder_pipeline_model_parallel_size
-
+    # With no separate encoder pipeline stages (epp=0), the decoder starts at rank 0
     last_rank = pp_ranks[-1]
     if len(pp_ranks) == 1:
         return [last_rank]
     else:
-        return [pp_ranks[epp]]
+        return [pp_ranks[0]]
 
 
 def run_online_eval(model):
@@ -340,34 +332,20 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
-    from run_text_generation import generate_and_write_samples
+    # Import the common evaluation functions
+    from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
-    with open(args.online_evaluation_config, "r") as f:
-        config_dict = yaml.safe_load(f)['datasets']
+    # Use the common config loading function
+    configs = get_evaluation_configs(config_path=args.online_evaluation_config)
 
-    scores = {}
-
-    for key, value in config_dict.items():
-        config = EvaluationConfig(**value)
-
-        # The inference code assumes the first rank is the leader.
-        # Tensorboard writer is on the last rank.
-        # We must write to a storage space that all ranks see.
-        output_dir = os.path.join(args.save, "online_eval")
-        os.makedirs(output_dir, exist_ok=True)
-        config.output_path = os.path.join(output_dir, args.language_model_type + '-' + key)
-
-        # The actual generation.
-        generate_and_write_samples(model[0].module, config, print_output=False)
-
-        # Make sure the first rank is done writing so that the last rank can run eval.
-        torch.distributed.barrier()
-
-        if is_last_rank():
-            from run_text_generation import run_eval
-            scores.update(run_eval(config))
-
-        torch.distributed.barrier()
+    # The inference code assumes the first rank is the leader.
+    # Tensorboard writer is on the last rank.
+    # We must write to a storage space that all ranks see.
+    output_dir = os.path.join(args.save, "online_eval")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Use the common evaluation loop
+    scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
 
     return [scores]
 
@@ -406,7 +384,7 @@ if __name__ == "__main__":
     pretrain(
         train_valid_test_dataloaders_provider,
         model_provider,
-        ModelType.encoder_and_decoder,
+        ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_multimodal_extra_args,

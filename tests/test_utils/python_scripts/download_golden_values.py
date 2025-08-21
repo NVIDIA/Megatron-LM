@@ -15,21 +15,33 @@ logger = logging.getLogger(__name__)
 
 @click.command()
 @click.option("--pipeline-id", required=True, type=int, help="Pipeline ID")
-def main(pipeline_id: int):
+@click.option(
+    "--only-failing/--no-only-failing",
+    default=False,
+    help="Only download artifacts from failing jobs",
+)
+def main(pipeline_id: int, only_failing: bool):
     logging.basicConfig(level=logging.INFO)
     logger.info('Started')
 
-    gl = gitlab.Gitlab(
-        f"https://{os.getenv('GITLAB_ENDPOINT')}", private_token=os.getenv("RO_API_TOKEN")
-    )
+    gitlab_endpoint = os.getenv('GITLAB_ENDPOINT')
+    ro_api_token = os.getenv('RO_API_TOKEN')
+
+    if not gitlab_endpoint or not ro_api_token:
+        raise Exception(
+            "Environment variables {GITLAB_ENDPOINT} and {RO_API_TOKEN} have not been set. ie. GITLAB_ENDPOINT=<gitlab-endpoint>, RO_API_TOKEN=<gitlab-token>"
+        )
+
+    gl = gitlab.Gitlab(f"https://{gitlab_endpoint}", private_token=ro_api_token)
+    logger.info("Setting only_failing to %s", only_failing)
 
     project = gl.projects.get(PROJECT_ID)
     pipeline = project.pipelines.get(pipeline_id)
-    print(pipeline.bridges.list())
+    print(pipeline.bridges.list(get_all=True))
 
     pipeline_bridges = [
         pipeline_bridge
-        for pipeline_bridge in pipeline.bridges.list()
+        for pipeline_bridge in pipeline.bridges.list(get_all=True)
         if pipeline_bridge.name.startswith("functional")
         and pipeline_bridge.downstream_pipeline is not None
     ]
@@ -43,6 +55,9 @@ def main(pipeline_id: int):
         for functional_pipeline_job in functional_pipeline_jobs:
             job = project.jobs.get(functional_pipeline_job.id)
             logger.info("Starting with job %s", job.name)
+            if only_failing and job.status != "failed":
+                logger.info("Job %s is not failing. Skipping.", job.name)
+                continue
 
             try:
                 file_name = '__artifacts.zip'
@@ -61,7 +76,7 @@ def main(pipeline_id: int):
                 / f"{restart_dir}"
                 / "assets"
                 / "basic"
-                / f"{job.name.replace('_', '-').lower()}-{environment}"
+                / f"{job.name.replace('_', '-').lower()}-{environment.replace('_', '-')}"
                 / f"golden_values_{environment}.json"
             )
             golden_values_target = (
@@ -81,9 +96,7 @@ def main(pipeline_id: int):
 
                 shutil.move(golden_values_source, golden_values_target)
             else:
-                logger.info(
-                    "Golden values for %s does not exist. Skip.", str(f"{job.stage} / {job.name}")
-                )
+                logger.info("Golden values for %s does not exist. Skip.", str(golden_values_source))
 
             shutil.rmtree("tmp")
 

@@ -186,10 +186,10 @@ class HFCheckpointSaverLLaVA:
 
 
     def recover_lm_qkv_weight(self, qkv_weight):
-        nh = self.md.num_attention_heads
-        ng = self.md.num_query_groups
         dim = self.md.kv_channels
         tp = self.md.previous_tensor_parallel_size
+        nh = self.md.num_attention_heads // tp
+        ng = self.md.num_query_groups // tp
         hidden_size = self.md.hidden_size
 
         params_per_tp = torch.chunk(qkv_weight, tp, dim=0)
@@ -223,10 +223,10 @@ class HFCheckpointSaverLLaVA:
         return q, k, v
 
     def recover_lm_qkv_bias(self, qkv_bias):
-        nh = self.md.num_attention_heads
-        ng = self.md.num_query_groups
         dim = self.md.kv_channels
         tp = self.md.previous_tensor_parallel_size
+        nh = self.md.num_attention_heads // tp
+        ng = self.md.num_query_groups // tp
 
         bias_per_tp = torch.chunk(qkv_bias, tp, dim=0)
 

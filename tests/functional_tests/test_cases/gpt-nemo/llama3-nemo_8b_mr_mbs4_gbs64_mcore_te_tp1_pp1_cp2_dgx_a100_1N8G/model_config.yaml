@@ -1,0 +1,22 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  SKIP_PYTEST: 1
+MODEL_ARGS:
+  trainer.num_nodes: 1
+  trainer.devices: 8
+  trainer.max_steps: 50
+  trainer.val_check_interval: 50
+  trainer.limit_val_batches: 50
+  trainer.strategy.tensor_model_parallel_size: 1
+  trainer.strategy.pipeline_model_parallel_size: 1
+  trainer.strategy.context_parallel_size: 2
+  trainer.strategy.sequence_parallel: True
+  model.config.num_layers: 12
+  model.config.hidden_size: 768
+  model.config.num_attention_heads: 16
+  model.config.ffn_hidden_size: 3072
+  data.micro_batch_size: 4
+  data.global_batch_size: 64
+  data.seq_length: 2048
+  log.log_dir: ${CHECKPOINT_SAVE_PATH}
+TEST_TYPE: regular

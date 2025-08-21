@@ -3,7 +3,6 @@ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config i
     InferenceWrapperConfig,
 )
 import argparse
-from collections import OrderedDict
 from pretrain_gpt import model_provider as gpt_model_provider
 from pretrain_mamba import model_provider as mamba_model_provider
 import random
@@ -54,6 +53,7 @@ def add_text_generate_args(parser):
         default=False,
         help='Return the log probabilities of the final output tokens',
     )
+    group.add_argument("--top-n-logprobs", type=int, default=0, help="Top-N logprobs")
     group.add_argument(
         "--num-tokens-to-generate",
         type=int,
@@ -70,13 +70,6 @@ def add_text_generate_args(parser):
     )
     group.add_argument(
         "--num-input-tokens", type=int, default=None, help='Number of input tokens per prompt'
-    )
-    group.add_argument(
-        "--max-batch-size",
-        type=int,
-        default=8,
-        dest="inference_max_requests",
-        help='Max number of prompts to process at once',
     )
     group.add_argument("--stream", action="store_true", default=False, help="Stream output tokens")
     group.add_argument(
@@ -111,9 +104,9 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
         fp32_residual_connection=args.fp32_residual_connection,
         params_dtype=args.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
-        inference_max_requests=args.inference_max_requests,
+        inference_max_requests=args.inference_max_batch_size,
         inference_max_seq_length=args.inference_max_seq_length,
-        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill
+        nccl_all_reduce_for_prefill=args.nccl_all_reduce_for_prefill,
     )
 
     if args.engine_type == "static":
@@ -240,7 +233,6 @@ def generate_dynamic(
     sampling_params: SamplingParams,
 ):
     global REQUEST_ID
-    req_data = OrderedDict()
     for request in inference_requests:
         request_id = REQUEST_ID
         REQUEST_ID += 1
@@ -248,46 +240,26 @@ def generate_dynamic(
         inference_engine.add_request(
             request_id, prompt_tokens, num_tokens_to_generate=args.num_tokens_to_generate
         )
-        cur_time = time.perf_counter()
-        req_data[request_id] = {
-            "prompt_tokens": prompt_tokens,
-            "output_tokens": [],
-            "tpot": [],
-            "prev_time": cur_time,
-            "start_time": cur_time,
-        }
 
+    start_time = time.perf_counter()
+    all_finished_requests = []
     while inference_engine.has_unfinished_requests():
-        result, _ = inference_engine.step(sampling_params, verbose=False)
-        if result is not None:
-            request_ids, finished_request_ids, sample = result
-
-            request_ids = request_ids.tolist()
-            sample = sample.tolist()
-
-            cur_time = time.perf_counter()
-            for req_id, token in zip(request_ids, sample):
-                req_data[req_id]["output_tokens"].append(token)
-                req_data[req_id]["tpot"].append(cur_time - req_data[req_id]["prev_time"])
-                req_data[req_id]["prev_time"] = cur_time
-                if req_id in finished_request_ids:
-                    req_data[req_id]["finish_time"] = time.perf_counter()
-                    latency = req_data[req_id]["finish_time"] - req_data[req_id]["start_time"]
-                    print(
-                        f"[{time.ctime()}] Request {req_id} finished in {latency} seconds and generated {len(req_data[req_id]['tpot'])} tokens"
-                    )
-
-    return [
-        InferenceRequest(
-            prompt="",
-            request_id=str(request_id),
-            prompt_tokens=data["prompt_tokens"],
-            generated_tokens=data["output_tokens"],
+        active_requests, finished_requests, step_time = inference_engine.step(
+            sampling_params, verbose=False
         )
-        for request_id, data in req_data.items()
-    ]
+        for request in finished_requests:
+            req_id = request.request_id
+            latency = time.perf_counter() - start_time
+            print(
+                f"[{time.ctime()}] Request {req_id} finished in {latency} seconds and "
+                f"generated {request.generated_length} tokens"
+            )
+        all_finished_requests.extend(finished_requests)
+
+    return all_finished_requests
 
 
+@torch.inference_mode()
 def main():
     """Main program."""
 
@@ -328,13 +300,15 @@ def main():
         top_k=args.top_k,
         top_p=args.top_p,
         return_log_probs=args.return_log_probs,
+        top_n_logprobs=args.top_n_logprobs,
         num_tokens_to_generate=args.num_tokens_to_generate,
     )
+    sampling_params.add_attributes({"no_early_termination": True})
 
     requests = []
     if args.num_input_tokens is not None:
         assert args.prompts is None
-        batch_size = args.inference_max_requests
+        batch_size = args.inference_max_batch_size
         for i in range(batch_size):
             prompt_tokens = get_random_prompt_tokens(tokenizer, args.num_input_tokens)
             requests.append(
@@ -359,10 +333,10 @@ def main():
 
     if args.enable_cuda_graph:
         print(f"Running warmup for CUDA graphs...")
+        warmup_sampling_params = SamplingParams(num_tokens_to_generate=10)
+        warmup_sampling_params.add_attributes({"no_early_termination": True})
         if args.engine_type == "static":
-            inference_engine.generate(
-                prompts=None, inference_requests=requests, sampling_params=sampling_params
-            )
+            inference_engine.generate(prompts=["warmup"], sampling_params=warmup_sampling_params)
         elif args.engine_type == "dynamic":
             generate_dynamic(args, requests, inference_engine, sampling_params)
 
@@ -403,6 +377,7 @@ def main():
                 'id': result.request_id,
                 'num_input_tokens': len(result.prompt_tokens),
                 'num_output_tokens': len(result.generated_tokens),
+                'tpot': result.tpot,
                 'latency': latency,
                 'memory_usage_GB': memory_allocated / (1024**3),
             }

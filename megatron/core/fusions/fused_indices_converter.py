@@ -1,12 +1,30 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import math
+from unittest.mock import MagicMock
 
 import torch
-import triton
-import triton.language as tl
+from packaging import version
 
-from megatron.core.utils import experimental_fn
+from megatron.core.utils import experimental_fn, null_decorator
+
+try:
+    import triton
+    import triton.language as tl
+
+    if version.parse(triton.__version__) < version.parse("3.4.0") and not torch.cuda.is_available():
+        HAVE_TRITON = False
+    else:
+        HAVE_TRITON = tl.constexpr(version.parse(triton.__version__) >= version.parse("2.0.0"))
+except ImportError:
+    HAVE_TRITON = False
+
+if not HAVE_TRITON:
+    triton = MagicMock()
+    triton.jit = null_decorator
+    triton.autotune = null_decorator
+    triton.heuristics = null_decorator
+    tl = MagicMock()
 
 
 # Assign a block to a row([1,topk]), generate a local routing map([1,num_of_local_experts])

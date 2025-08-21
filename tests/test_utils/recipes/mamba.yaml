@@ -3,7 +3,7 @@ format_version: 1
 maintainers: [mcore]
 loggers: [stdout]
 spec:
-  name: "{test_case}_{environment}"
+  name: "{test_case}_{environment}_{platforms}"
   model: hybrid
   build: mcore-pyt-{environment}
   nodes: 1
@@ -13,6 +13,7 @@ spec:
   artifacts:
     /workspace/data/gpt3_data: text/the_pile/shard00
   script_setup: |
+    unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
     # Checkout latest
@@ -47,30 +48,43 @@ spec:
         "CHECKPOINT_LOAD_PATH=/workspace/checkpoints/{name}"
         "TRAINING_SCRIPT_PATH=pretrain_mamba.py"
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
-        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}.json"
+        "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [hybrid_mr_mcore_te_tp1_pp1_dgx_a100_1N8G]
+  - test_case: [hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G]
     products:
       - environment: [dev]
         scope: [mr]
-      # - environment: [lts] # until triton is bumped
+        platforms: [dgx_h100]
+      # - environment: [lts] # disabled until triton is bumped
       #   scope: [nightly]
 
-  - test_case: [hybrid_mr_mcore_te_tp2_pp1_dgx_a100_1N8G]
-    products:
-      - environment: [dev]
-        scope: [mr]
-      # - environment: [lts] # until triton is bumped
-      #   scope: [nightly]
-
-  # - test_case: [hybrid_mr_mcore_te_tp1_pp4_dgx_a100_1N8G]
+  # PP functional testing deferred
+  # - test_case: [hybrid_mr_mcore_te_tp1_pp4_cp1_dgx_a100_1N8G]
   #   products:
   #     - environment: [dev]
   #       scope: [mr]
-  # - environment: [lts] # until triton is bumped
-  #   scope: [nightly]
+  #     - environment: [lts] # disabled until triton is bumped
+  #       scope: [nightly]
+
+  - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp1_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+      # - environment: [lts] # disabled until triton is bumped
+      #   scope: [nightly]
+
+  - test_case: [hybrid_mr_mcore_te_tp2_pp1_cp4_dgx_a100_1N8G]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_h100]
+      # - environment: [lts] # disabled until triton is bumped
+      #   scope: [nightly]

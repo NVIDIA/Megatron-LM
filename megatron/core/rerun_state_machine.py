@@ -14,7 +14,6 @@ from typing import Any, Callable, Iterable, NamedTuple, Optional, Set, Tuple, Un
 import numpy as np
 import torch
 
-import megatron.core.parallel_state as mpu
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 
 """DISCLAIMER: THIS IS AN EXPERIMENTAL FEATURE.
@@ -43,10 +42,9 @@ DataIteratorArgType = Optional[Union["RerunDataIterator", list["RerunDataIterato
 
 
 class Caller(NamedTuple):
-    """Class capturing the code and rank calling a function."""
+    """Class capturing where validate_result() is called from."""
 
-    filename: str
-    lineno: int
+    message: str
     rank: int
 
 
@@ -66,17 +64,17 @@ class RerunDiagnostic(str, Enum):
         not on a different GPU.
     """
 
-    CORRECT_RESULT = 'correct_result'
-    TRANSIENT_ERROR = 'transient_error'
-    PERSISTENT_ERROR = 'persistent_error'
+    CORRECT_RESULT = "correct_result"
+    TRANSIENT_ERROR = "transient_error"
+    PERSISTENT_ERROR = "persistent_error"
 
 
 class RerunMode(str, Enum):
     """Enum representing the different run mode for the rerun state machine."""
 
-    DISABLED = 'disabled'
-    VALIDATE_RESULTS = 'validate_results'
-    REPORT_DETERMINISM_STATS = 'report_determinism_stats'
+    DISABLED = "disabled"
+    VALIDATE_RESULTS = "validate_results"
+    REPORT_DETERMINISM_STATS = "report_determinism_stats"
 
 
 class RerunState(Enum):
@@ -114,9 +112,9 @@ class RerunState(Enum):
 class RerunValidationStatus(str, Enum):
     """Enum representing the status of a record in the tracker log file"""
 
-    RERUN_DISABLED = 'rerun_disabled'
-    INITIAL_RUN = 'initial_run'
-    FIRST_RERUN_NOT_REPRODUCIBLE = 'first_rerun_not_reproducible'
+    RERUN_DISABLED = "rerun_disabled"
+    INITIAL_RUN = "initial_run"
+    FIRST_RERUN_NOT_REPRODUCIBLE = "first_rerun_not_reproducible"
     FIRST_RERUN_REPRODUCIBLE = "first_rerun_reproducible"
     SECOND_RERUN_NOT_REPRODUCIBLE = "second_rerun_not_reproducible"
     SECOND_RERUN_REPRODUCIBLE = "second_rerun_reproducible"
@@ -193,6 +191,7 @@ class RerunStateMachine:
         self.mode: RerunMode = mode
         self.state: RerunState = RerunState.NOT_RUNNING_YET
         self.current_iteration: int = -1
+        self.first_iteration_complete = False
         # The flags below are per-rank flags that get all-reduced across all ranks
         # request to rerun iteration  because validation failed (1st re-run).
         self.rerun_requested: bool = False
@@ -216,7 +215,7 @@ class RerunStateMachine:
         self.result_rejected_tracker_filename = result_rejected_tracker_filename
         if self.result_rejected_tracker_filename is not None:
             try:
-                with open(self.result_rejected_tracker_filename, 'a'):
+                with open(self.result_rejected_tracker_filename, "a"):
                     pass
             except Exception as e:
                 raise RuntimeError(
@@ -308,7 +307,7 @@ class RerunStateMachine:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
             will_rerun_tensor: torch.Tensor = torch.tensor(
-                [self.rerun_requested], dtype=torch.int32, device='cuda'
+                [self.rerun_requested], dtype=torch.int32, device="cuda"
             )
             torch.distributed.all_reduce(will_rerun_tensor)
             if will_rerun_tensor.item() == 0:
@@ -332,7 +331,7 @@ class RerunStateMachine:
                 self.saved_results = defaultdict(list)
                 return False
             will_checkpoint_tensor: torch.Tensor = torch.tensor(
-                [self.checkpoint_requested], dtype=torch.int32, device='cuda'
+                [self.checkpoint_requested], dtype=torch.int32, device="cuda"
             )
             torch.distributed.all_reduce(will_checkpoint_tensor)
             if will_checkpoint_tensor.item() > 0:
@@ -349,7 +348,7 @@ class RerunStateMachine:
         # Are we done re-running from a checkpoint?
         elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
             will_restart_again_tensor: torch.Tensor = torch.tensor(
-                [self.restart_again_requested], dtype=torch.int32, device='cuda'
+                [self.restart_again_requested], dtype=torch.int32, device="cuda"
             )
             torch.distributed.all_reduce(will_restart_again_tensor)
             if will_restart_again_tensor.item() > 0:
@@ -361,7 +360,7 @@ class RerunStateMachine:
                 self.state = RerunState.RERUNNING_AGAIN_FROM_CHECKPOINT
             else:
                 will_continue_tensor: torch.Tensor = torch.tensor(
-                    [self.continue_requested], dtype=torch.int32, device='cuda'
+                    [self.continue_requested], dtype=torch.int32, device="cuda"
                 )
                 torch.distributed.all_reduce(will_continue_tensor)
                 if will_continue_tensor.item() > 0:
@@ -400,6 +399,7 @@ class RerunStateMachine:
                 optimizer.step()
         """
 
+        self.first_iteration_complete = True
         if self.mode in [RerunMode.DISABLED, RerunMode.REPORT_DETERMINISM_STATS]:
             return False, False, 0
         if self.state == RerunState.RERUNNING_IN_PLACE:
@@ -437,7 +437,7 @@ class RerunStateMachine:
         self,
         result: Any,
         rejection_func: Callable[[Any], bool],
-        message: str = "unexpected result",
+        message: str,
         comparison_func: Optional[Callable[[Any, Any], float]] = None,
         tolerance: float = 0.0,
         fatal: bool = True,
@@ -505,11 +505,6 @@ class RerunStateMachine:
                 raise RuntimeError(full_message)
             return
 
-        # Skip the validation on the first iteration, as we cannot guarantee a checkpoint can be
-        # taken before the optimizer has been stepped at least once.
-        if self.current_iteration < 1:
-            return
-
         if comparison_func is None:
             comparison_func = _compare_floats
 
@@ -517,7 +512,7 @@ class RerunStateMachine:
             self.state != RerunState.NOT_RUNNING_YET
         ), "validate_result should not be called outside of the forward-backward pass"
 
-        validation_call: Call = self._get_validation_call_info()
+        validation_call: Call = self._get_validation_call_info(message)
 
         # Handle the stats reporting mode. In that mode, we rerun every iteration once to collect
         # stats about any non-determinism in the calculations (as a relative difference between the
@@ -533,11 +528,7 @@ class RerunStateMachine:
                 initial_result = self.saved_results.get(validation_call)
                 assert initial_result is not None, "Result from initial run missing"
                 diff = comparison_func(initial_result, result)
-                caller: Caller = Caller(
-                    filename=validation_call.caller.filename,
-                    lineno=validation_call.caller.lineno,
-                    rank=0,
-                )
+                caller: Caller = Caller(message=message, rank=0)
                 self.stats[caller].record(diff)
             return
 
@@ -558,6 +549,12 @@ class RerunStateMachine:
         # If this the initial run of the iteration, and no unexpected result has already been
         # identified?
         if self.state == RerunState.INITIAL_RUN and not self.rerun_requested:
+
+            # Do not validate results on the first iteration, as we cannot guarantee a checkpoint
+            # can be taken before the optimizer has been stepped at least once.
+            if not self.first_iteration_complete:
+                return
+
             result_rejected: bool = self.error_injector.maybe_inject() or rejection_func(result)
             if result_rejected:
                 self.failed_validation_call = validation_call
@@ -567,10 +564,10 @@ class RerunStateMachine:
                     status=RerunValidationStatus.INITIAL_RUN, result=result, message=message
                 )
                 logger.error(
-                    f"Unexpected result {result} at {validation_call.caller.filename} "
-                    f"line {validation_call.caller.lineno}, "
-                    f"invokation #{validation_call.sequence} "
+                    f"Unexpected result {result} "
+                    f"on rank {_safe_get_rank()} "
                     f"at iteration #{self.current_iteration} "
+                    f"invokation #{validation_call.sequence} "
                     f"(message='{message}')"
                 )
         # If this the first rerun (same GPU) or second 2nd rerun (different GPU), and have we
@@ -579,7 +576,6 @@ class RerunStateMachine:
             self.state in [RerunState.RERUNNING_IN_PLACE, RerunState.RERUNNING_FROM_CHECKPOINT]
             and validation_call == self.failed_validation_call
         ):
-
             comparison: float = self.error_injector.maybe_miscompare(
                 comparison_func, self.initial_result, result, self.state
             )
@@ -720,7 +716,9 @@ class RerunStateMachine:
 
         return value >= self.max_values[context] * threshold
 
-    def state_dict(self, data_iterator: DataIteratorArgType, ckpt_format: str) -> dict[str, Any]:
+    def state_dict(
+        self, data_iterator: DataIteratorArgType, ckpt_format: str, force: bool = False
+    ) -> dict[str, Any]:
         """Method that returns a state dict to be checkpointed.
 
         Args:
@@ -743,50 +741,74 @@ class RerunStateMachine:
                 return checkpoint
         """
 
+        # Only save a checkpoint if a step needs to be rerun.
+        if not force:
+            if self.state == RerunState.NOT_RUNNING_YET:
+                return None
+
+            if ckpt_format != "torch_dist":
+                if _safe_get_rank() == 0:
+                    logger.warning(
+                        "RerunStateMachine checkpoints ONLY SUPPORTED "
+                        "for checkpoint format torch_dist"
+                    )
+                return None
+
         data_iterators: list[RerunDataIterator] = self._sanitize_data_iterators(data_iterator)
 
-        # The RerunStateMachine state is different across all ranks. Therefore it needs to be
-        # checkpointed using a ShardedObject. However, we keep the common state in the non-sharded
-        # (common) checkpoint. This allows us to verify whether a checkpoint contains a
-        # RerunStateMachine state by checking the common checkpoint.
-        state_dict: dict[str, Any] = {
-            'mode': self.mode,
-            'sharded': {
-                'state': self.state,
-                'current_iteration': self.current_iteration,
-                'rerun_requested': self.rerun_requested,
-                'checkpoint_requested': self.checkpoint_requested,
-                'restart_again_requested': self.restart_again_requested,
-                'continue_requested': self.continue_requested,
-                # logged_sdc_enabled should not be saved (set at the job startup time).
-                'error_injector_checkpoint': self.error_injector.state_dict(),
-                # validation_counts should not be saved (reset at start of training loop).
-                'failed_validation_call': self.failed_validation_call,
-                'initial_result': self.initial_result,
-                'suspicious_node': self.suspicious_node,
-                'suspicious_device': self.suspicious_device,
-                # No need to save saved_state (RNG state  already captured in checkpoint).
-                'data_iterator_checkpoints': (
-                    [d.state_dict() for d in data_iterators] if data_iterators else None
-                ),
-                'large_value_counts': self.large_value_counts,
-                'max_values': self.max_values,
-                # No need to save saved_results and stats (resets when job resumes).
-            },
+        # When saving a step to re-run, the RerunStateMachine state is different across all ranks.
+        # We keep the common state in the non-sharded (common) checkpoint and move the rank-level
+        # state to a sharded object.
+        sharded_dict = {
+            "rerun_requested": self.rerun_requested,
+            "checkpoint_requested": self.checkpoint_requested,
+            "restart_again_requested": self.restart_again_requested,
+            "continue_requested": self.continue_requested,
+            # logged_sdc_enabled should not be saved (set at the job startup time).
+            "error_injector_checkpoint": self.error_injector.state_dict(),
+            # validation_counts should not be saved (reset at start of training loop).
+            "failed_validation_call": self.failed_validation_call,
+            "initial_result": self.initial_result,
+            "suspicious_node": self.suspicious_node,
+            "suspicious_device": self.suspicious_device,
+            # No need to save saved_state (RNG state  already captured in checkpoint).
+            "data_iterator_checkpoints": (
+                [d.state_dict() for d in data_iterators] if data_iterators else None
+            ),
+            "large_value_counts": self.large_value_counts,
+            "max_values": self.max_values,
+            # No need to save saved_results and stats (resets when job resumes).
         }
-        if ckpt_format == "torch_dist":
-            pp_rank = mpu.get_pipeline_model_parallel_rank()
-            pp_size = mpu.get_pipeline_model_parallel_world_size()
-            tp_rank = mpu.get_tensor_model_parallel_rank()
-            tp_size = mpu.get_tensor_model_parallel_world_size()
-            state_dict['sharded'] = ShardedObject(
-                'rerun_state_machine_state',
-                state_dict['sharded'],
-                (pp_size, tp_size),
-                (pp_rank, tp_rank),
-                replica_id=mpu.get_data_parallel_rank(with_context_parallel=True),
-            )
+        sharded_dict = ShardedObject(
+            "rerun_state_machine_state",
+            sharded_dict,
+            (torch.distributed.get_world_size(),),
+            (torch.distributed.get_rank(),),
+        )
+
+        state_dict: dict[str, Any] = {
+            "mode": self.mode,
+            "state": self.state,
+            "current_iteration": self.current_iteration,
+            "sharded": sharded_dict,
+        }
         return state_dict
+
+    def validate_state_dict(self, state_dict: dict[str, Any]) -> bool:
+        """Method that validate a checkpoint state dict before loading it.
+
+        Args:
+            state_dict: the state dict saved in the checkpoint and originally
+                obtained from state_dict().
+        Returns:
+            bool
+        """
+
+        if state_dict is None:
+            return False
+        if 'state' not in state_dict or state_dict['state'] == RerunState.NOT_RUNNING_YET:
+            return False
+        return True
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Method that restores the state from a checkpoint.
@@ -812,33 +834,25 @@ class RerunStateMachine:
                     "RerunStateMachine disabled via CLI, ignoring machine state saved in checkpoint"
                 )
             return
-        if state_dict['mode'] == RerunMode.DISABLED:
-            if _safe_get_rank() == 0:
-                logger.warning(
-                    "RerunStateMachine disabled in checkpoint but enabled via CLI, "
-                    "ignoring machine state saved in checkpoint"
-                )
-            return
         if _safe_get_rank() == 0:
-            logger.warning(
-                "Getting RerunStateMachine state from checkpoint, CLI rerun args ignored"
-            )
-        self.mode = state_dict['mode']
-        sharded_dict = state_dict['sharded']
-        self.state = sharded_dict['state']
-        self.current_iteration = sharded_dict['current_iteration']
-        self.rerun_requested = sharded_dict['rerun_requested']
-        self.checkpoint_requested = sharded_dict['checkpoint_requested']
-        self.restart_again_requested = sharded_dict['restart_again_requested']
-        self.continue_requested = sharded_dict['continue_requested']
-        self.error_injector.load_state_dict(sharded_dict['error_injector_checkpoint'])
-        self.failed_validation_call = sharded_dict['failed_validation_call']
-        self.initial_result = sharded_dict['initial_result']
-        self.suspicious_node = sharded_dict['suspicious_node']
-        self.suspicious_device = sharded_dict['suspicious_device']
-        self.data_iterator_checkpoints = sharded_dict['data_iterator_checkpoints']
-        self.large_value_counts = sharded_dict['large_value_counts']
-        self.max_values = sharded_dict['max_values']
+            logger.warning("Getting RerunStateMachine state from checkpoint. Will rerun step.")
+        self.mode = state_dict["mode"]
+        self.current_iteration = state_dict["current_iteration"]
+        self.state = state_dict["state"]
+
+        sharded_dict = state_dict["sharded"]
+        self.rerun_requested = sharded_dict["rerun_requested"]
+        self.checkpoint_requested = sharded_dict["checkpoint_requested"]
+        self.restart_again_requested = sharded_dict["restart_again_requested"]
+        self.continue_requested = sharded_dict["continue_requested"]
+        self.error_injector.load_state_dict(sharded_dict["error_injector_checkpoint"])
+        self.failed_validation_call = sharded_dict["failed_validation_call"]
+        self.initial_result = sharded_dict["initial_result"]
+        self.suspicious_node = sharded_dict["suspicious_node"]
+        self.suspicious_device = sharded_dict["suspicious_device"]
+        self.data_iterator_checkpoints = sharded_dict["data_iterator_checkpoints"]
+        self.large_value_counts = sharded_dict["large_value_counts"]
+        self.max_values = sharded_dict["max_values"]
 
     def _sanitize_data_iterators(
         self, data_iterator: DataIteratorArgType
@@ -857,7 +871,7 @@ class RerunStateMachine:
             ), "data iterator is not wrapped with RerunDataIterator"
         return data_iterators
 
-    def _get_validation_call_info(self) -> Call:
+    def _get_validation_call_info(self, message: str) -> Call:
         """Internal method to get the context about the caller to validate_result()."""
 
         frame: inspect.frame = inspect.currentframe()
@@ -865,7 +879,7 @@ class RerunStateMachine:
         filename: str = inspect.getframeinfo(frame).filename
         lineno: int = frame.f_lineno
         rank: int = _safe_get_rank()
-        caller = Caller(filename=filename, lineno=lineno, rank=rank)
+        caller = Caller(message=message, rank=rank)
         self.validation_counts[caller] += 1
         sequence: int = self.validation_counts[caller]
         return Call(caller=caller, sequence=sequence)
@@ -881,26 +895,26 @@ class RerunStateMachine:
         """
 
         self.saved_state = {
-            'rng_state': {
-                'random_rng_state': random.getstate(),
-                'np_rng_state': np.random.get_state(),
-                'torch_rng_state': torch.get_rng_state(),
-                'cuda_rng_state': torch.cuda.get_rng_state(),
+            "rng_state": {
+                "random_rng_state": random.getstate(),
+                "np_rng_state": np.random.get_state(),
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state(),
             },
-            'other_state': self.state_save_func() if self.state_save_func else None,
+            "other_state": self.state_save_func() if self.state_save_func else None,
             # any other state to save to guarantee deterministic execution?
         }
 
     def _restore_state(self) -> None:
         """Internal method that restores the state that was saved in _save_state()."""
 
-        rng_state = self.saved_state['rng_state']
-        random.setstate(rng_state['random_rng_state'])
-        np.random.set_state(rng_state['np_rng_state'])
-        torch.set_rng_state(rng_state['torch_rng_state'])
-        torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
-        if self.saved_state['other_state'] and self.state_restore_func:
-            self.state_restore_func(self.saved_state['other_state'])
+        rng_state = self.saved_state["rng_state"]
+        random.setstate(rng_state["random_rng_state"])
+        np.random.set_state(rng_state["np_rng_state"])
+        torch.set_rng_state(rng_state["torch_rng_state"])
+        torch.cuda.set_rng_state(rng_state["cuda_rng_state"])
+        if self.saved_state["other_state"] and self.state_restore_func:
+            self.state_restore_func(self.saved_state["other_state"])
 
     def _maybe_report_stats(self) -> None:
         """Internal method that reports stats if needed."""
@@ -938,7 +952,7 @@ class RerunStateMachine:
                 rank: int = _safe_get_rank()
                 node: str = os.uname()[1]
                 device: int = torch.cuda.current_device()
-                with open(self.result_rejected_tracker_filename, 'a') as f:
+                with open(self.result_rejected_tracker_filename, "a") as f:
                     print(
                         f"ts={datetime.datetime.now()} node={node} device={device} "
                         f"jobID={os.getenv('SLURM_JOBID', 'N/A')} rank={rank} "
@@ -961,31 +975,53 @@ class RerunStateMachine:
         Returns:
             list[int]: List of iterations to skip.
         """
-        iterations_to_skip: set[int] = set()
-        seen: set[Tuple[int, int]]
-        regex = r"ts=.+ node=.+ device=.+ jobID=.+ rank=(.+) iteration=(.+) status=(.+) .+"
+        iterations_to_potentially_skip: set[int] = set()
+        iterations_to_ignore: set[int] = set()
+        iterations_seen: set[Tuple[int, int]] = set()
+        iterations_seen_by_job: dict[str, dict[int, set]] = {}
+
+        regex = (
+            r"ts=.+ node=.+ device=.+ jobID=(.+) rank=(.+) iteration=(.+) status=(.+) "
+            f"result=.+ message=.+"
+        )
         try:
-            with open(tracker_file_name, 'r') as f:
+            with open(tracker_file_name, "r") as f:
                 for line in f.readlines():
                     match = re.search(regex, line)
                     if match:
-                        rank = int(match[1])
-                        iteration = int(match[2])
-                        status = match[3]
+                        job = str(match[1])
+                        rank = int(match[2])
+                        iteration = int(match[3])
+                        status = str(match[4]).split(".")[-1].upper()
                         # Skip an iteration if:
                         # - Reruns were disabled and it has failed on the same rank twice.
                         # or
                         # - Reruns were enabled and it was reproducible on the 2nd rerun
-                        if status == RerunValidationStatus.RERUN_DISABLED:
-                            if (rank, iteration) in seen:
-                                iterations_to_skip.add(iteration)
-                            else:
-                                seen.add((rank, iteration))
-                        elif status == RerunValidationStatus.SECOND_RERUN_REPRODUCIBLE:
-                            iterations_to_skip.add(iteration)
+                        if status in [
+                            "RERUN_DISABLED",
+                            "FIRST_RERUN_REPRODUCIBLE",
+                            "SECOND_RERUN_REPRODUCIBLE",
+                        ]:
+                            if (rank, iteration) in iterations_seen:
+                                iterations_to_potentially_skip.add(iteration)
+                            iterations_seen.add((rank, iteration))
+                            if job not in iterations_seen_by_job:
+                                iterations_seen_by_job[job] = {}
+                            if iteration not in iterations_seen_by_job[job]:
+                                iterations_seen_by_job[job][iteration] = set()
+                            iterations_seen_by_job[job][iteration].add(rank)
+                            if len(iterations_seen_by_job[job][iteration]) > 1:
+                                iterations_to_ignore.add(iteration)
         except Exception as e:
             logger.error(f"Could not parse iterations to skip in tracker file! ({e})")
-        return sorted(iterations_to_skip)
+        iterations_to_skip = sorted(iterations_to_potentially_skip - iterations_to_ignore)
+        logger.warning(f"Will skip these iterations from tracker file: {iterations_to_skip}")
+        if len(iterations_to_ignore) > 0:
+            logger.warning(
+                "Will not skip these iterations due to multiple rank errors: "
+                f"{sorted(iterations_to_ignore)}"
+            )
+        return iterations_to_skip
 
 
 class RerunDataIterator:
@@ -1044,17 +1080,17 @@ class RerunDataIterator:
         """Method to capture the state of the iterator as a serializable dict."""
 
         return {
-            'saved_microbatches': self.saved_microbatches,
-            'replaying': self.replaying,
-            'replay_pos': self.replay_pos,
+            "saved_microbatches": self.saved_microbatches,
+            "replaying": self.replaying,
+            "replay_pos": self.replay_pos,
         }
 
     def load_state_dict(self, state_dict: SerializableStateType) -> None:
         """Method to restore the state saved as a serializable dict."""
 
-        self.saved_microbatches = state_dict['saved_microbatches']
-        self.replaying = state_dict['replaying']
-        self.replay_pos = state_dict['replay_pos']
+        self.saved_microbatches = state_dict["saved_microbatches"]
+        self.replaying = state_dict["replaying"]
+        self.replay_pos = state_dict["replay_pos"]
 
 
 class QuickStats:
@@ -1136,10 +1172,10 @@ class QuickStats:
     def __setstate(self, state: Any) -> Any:
         """Unpickle method, used by torch.distributed.gather_object."""
 
-        self.samples = state['samples']
-        self.pos = state['pos']
-        self.zero_cnt = state['zero_cnt']
-        self.max = state['max']
+        self.samples = state["samples"]
+        self.pos = state["pos"]
+        self.zero_cnt = state["zero_cnt"]
+        self.max = state["max"]
 
 
 class RerunErrorInjector:
@@ -1225,19 +1261,19 @@ class RerunErrorInjector:
         """Method to capture the state of the error injector as a serializable dict."""
 
         return {
-            'error_injection_rate': self.error_injection_rate,
-            'error_injection_type': self.error_injection_type,
+            "error_injection_rate": self.error_injection_rate,
+            "error_injection_type": self.error_injection_type,
             # No need to checkpoint should_inject_errors (inferred from error_injection_rate).
-            'injected_error_type': self.injected_error_type,
+            "injected_error_type": self.injected_error_type,
         }
 
     def load_state_dict(self, state_dict: SerializableStateType) -> None:
         """Method to restore the state saved as a serializable dict."""
 
-        self.error_injection_rate = state_dict['error_injection_rate']
-        self.error_injection_type = state_dict['error_injection_type']
+        self.error_injection_rate = state_dict["error_injection_rate"]
+        self.error_injection_type = state_dict["error_injection_type"]
         self.should_inject_errors = self.error_injection_rate > 0
-        self.injected_error_type = state_dict['injected_error_type']
+        self.injected_error_type = state_dict["injected_error_type"]
 
 
 def initialize_rerun_state_machine(**kwargs) -> None:
@@ -1270,7 +1306,7 @@ def _set_rerun_state_machine(rerun_state_machine) -> None:
     """Internal function to set the singleton instance of the rerun machine."""
 
     global _GLOBAL_RERUN_STATE_MACHINE
-    assert _GLOBAL_RERUN_STATE_MACHINE is None, 'Rerun state machine is already initialized'
+    assert _GLOBAL_RERUN_STATE_MACHINE is None, "Rerun state machine is already initialized"
     _GLOBAL_RERUN_STATE_MACHINE = rerun_state_machine
 
 

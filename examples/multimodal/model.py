@@ -33,8 +33,6 @@ def model_provider(
         model: A multimodal model.
     """
     args = get_args()
-    assert args.encoder_pipeline_model_parallel_size <= 1, "LLaVA does not support pp>1 for encoder on it's own pipeline rank"
-
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
@@ -112,12 +110,10 @@ def model_provider(
         vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
     )
     if vision_model_type.startswith("hf://"):
-        assert args.encoder_tensor_model_parallel_size < 2, "Huggingface vision encoders do not support --encoder-tensor-model-parallel-size > 1"
-        assert args.encoder_pipeline_model_parallel_size == 0, "Huggingface vision encoders do not support --encoder-pipeline-model-parallel-size > 0"
         assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert args.context_parallel_size < 2, "Huggingface models do not support --context-parallel-size > 1"
 
-    if vision_model_type in ["clip", "siglip", "radio"]:
+    if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
         if use_te:
             vision_transformer_layer_spec = get_layer_spec_te(
                 is_vit=True
@@ -152,21 +148,8 @@ def model_provider(
         vision_projection_config, language_config.hidden_size
     )
 
-    # --encoder-pipeline-model-parallel-size 1 will enable a separate pipeline stage for the vision model.
-    if args.encoder_pipeline_model_parallel_size > 0:
-        assert (
-            args.encoder_pipeline_model_parallel_size == 1
-        ), "vision model and projection can only live on 1 pipeline stage."
-
-        if args.encoder_tensor_model_parallel_size > 0:
-            vision_config.tensor_model_parallel_size = args.encoder_tensor_model_parallel_size
-            vision_projection_config.tensor_model_parallel_size = (
-                args.encoder_tensor_model_parallel_size
-            )
-
     # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
-    # 0 is not a valid for the config value, hence max(1, ).
-    vision_config.pipeline_model_parallel_size = max(1, args.encoder_pipeline_model_parallel_size)
+    vision_config.pipeline_model_parallel_size = 1
     vision_projection_config.pipeline_model_parallel_size = vision_config.pipeline_model_parallel_size
 
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.

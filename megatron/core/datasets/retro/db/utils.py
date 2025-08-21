@@ -11,10 +11,16 @@ import numpy as np
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.retro.config import RetroPreprocessingConfig
-from megatron.core.datasets.retro.external_libs import h5py
 from megatron.core.models.retro.utils import get_gpt_data_dir
 
 from .dataset import DBDataset
+
+try:
+    import h5py
+
+    HAVE_H5PY = True
+except ImportError:
+    HAVE_H5PY = False
 
 
 def get_db_dir(project_dir: str) -> str:
@@ -80,7 +86,8 @@ def save_indexed_dataset_infos(project_dir: str, indexed_dataset_infos: List[Dic
 
     Args:
         project_dir (str): Path to Retro project dir.
-        indexed_dataset_infos (List[Dict]): List of metadata for each dataset, with each entry containing:
+        indexed_dataset_infos (List[Dict]): List of metadata for each dataset,
+            with each entry containing:
 
         - ratio: Data split weight.
         - prefix: Relative path to dataset under DB sub-directory.
@@ -109,7 +116,8 @@ def load_indexed_datasets(project_dir: str, indexed_dataset_infos: List[Dict]) -
 
     Args:
         project_dir (str): Path to Retro project dir.
-        indexed_dataset_infos (List[Dict]): List of metadata for each dataset (see `save_indexed_dataset_infos()` for more details.
+        indexed_dataset_infos (List[Dict]): List of metadata for each dataset
+            (see `save_indexed_dataset_infos()` for more details.
     """
     data_dir = get_gpt_data_dir(project_dir)
     for info in indexed_dataset_infos:
@@ -169,11 +177,18 @@ def get_individual_chunk_db(project_dir: str, ds_id: int, ds_info: dict) -> np.n
     Args:
         project_dir (str): Path to Retro project dir.
         ds_id (int): Index of dataset within blended dataset.
-        ds_info (dict): Preprocessing metadata for dataset (see `save_indexed_dataset_infos()` for more detail).
+        ds_info (dict): Preprocessing metadata for dataset
+            (see `save_indexed_dataset_infos()` for more detail).
 
     Returns:
-        Array of chunk start/end indexes for this dataset, where the chunk indexes can be used for indexing into the corresponding indexed dataset.
+        Array of chunk start/end indexes for this dataset,
+            where the chunk indexes can be used for indexing into
+            the corresponding indexed dataset.
     """
+
+    if not HAVE_H5PY:
+        raise ImportError("h5py is required to use the RetroDataset. Please install h5py.")
+
     paths = get_individual_db_paths(project_dir, ds_info["prefix"])
     # *Note*: convert to dataset, rather than copying to memory.
     db = np.zeros((ds_info["n_chunks"], 5), dtype="uint32")
@@ -197,11 +212,16 @@ def get_individual_doc_offsets(project_dir: str, ds_id: int, ds_info: dict) -> n
     Args:
         project_dir (str): Path to Retro project dir.
         ds_id (int): Index of dataset within blended dataset.
-        ds_info (dict): Preprocessing metadata for dataset (see `save_indexed_dataset_infos()` for more detail).
+        ds_info (dict): Preprocessing metadata for dataset
+            (see `save_indexed_dataset_infos()` for more detail).
 
     Returns:
         Array of document offsets by chunk index for this dataset.
     """
+
+    if not HAVE_H5PY:
+        raise ImportError("h5py is required to use the RetroDataset. Please install h5py.")
+
     paths = get_individual_db_paths(project_dir, ds_info["prefix"])
     # *Note*: convert to dataset, rather than copying to memory.
     doc_offsets = np.zeros((ds_info["n_docs"], 3), dtype="uint64")
@@ -254,11 +274,15 @@ def get_merged_dataset(
         chunk_length (int): GPT chunk length (e.g., 64).
         eod_token_id (int): EOD token ID.
         db_type (str): DB type (e.g., 'sampled', 'train', or 'valid').
-        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list of dataset metadata (see `save_indexed_dataset_infos()` for more detail). If not provided, the indexed dataset infos will be loaded from disk.
+        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list
+            of dataset metadata (see `save_indexed_dataset_infos()` for more detail).
+            If not provided, the indexed dataset infos will be loaded from disk.
 
     Returns:
         A DBDataset, which is a dataset that wraps the HDF5 chunk index array.
     """
+    if not HAVE_H5PY:
+        raise ImportError("h5py is required to use the RetroDataset. Please install h5py.")
 
     if not indexed_dataset_infos:
         indexed_dataset_infos = get_indexed_dataset_infos(project_dir)
@@ -293,7 +317,9 @@ def get_merged_sampled_dataset(
         project_dir (str): Path to Retro project dir.
         chunk_length (int): GPT chunk length (e.g., 64).
         eod_token_id (int): EOD token ID.
-        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list of dataset metadata (see `save_indexed_dataset_infos()` for more detail). If not provided, the indexed dataset infos will be loaded from disk.
+        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list
+            of dataset metadata (see `save_indexed_dataset_infos()` for more detail).
+            If not provided, the indexed dataset infos will be loaded from disk.
 
     Returns:
         A DBDataset, which is a dataset that wraps the HDF5 chunk index array.
@@ -315,7 +341,9 @@ def get_merged_train_dataset(
         project_dir (str): Path to Retro project dir.
         chunk_length (int): GPT chunk length (e.g., 64).
         eod_token_id (int): EOD token ID.
-        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list of dataset metadata (see `save_indexed_dataset_infos()` for more detail). If not provided, the indexed dataset infos will be loaded from disk.
+        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list of
+            dataset metadata (see `save_indexed_dataset_infos()` for more detail).
+            If not provided, the indexed dataset infos will be loaded from disk.
 
     Returns:
         A DBDataset, which is a dataset that wraps the HDF5 chunk index array.
@@ -337,7 +365,9 @@ def get_merged_valid_dataset(
         project_dir (str): Path to Retro project dir.
         chunk_length (int): GPT chunk length (e.g., 64).
         eod_token_id (int): EOD token ID.
-        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list of dataset metadata (see `save_indexed_dataset_infos()` for more detail). If not provided, the indexed dataset infos will be loaded from disk.
+        indexed_dataset_infos (Optional[List[Dict]]): Optionally, pre-loaded list
+            of dataset metadata (see `save_indexed_dataset_infos()` for more detail).
+            If not provided, the indexed dataset infos will be loaded from disk.
 
     Returns:
         A DBDataset, which is a dataset that wraps the HDF5 chunk index array.
@@ -356,7 +386,8 @@ def get_merged_datasets(project_dir: str, chunk_length: int, eod_token_id: int) 
         eod_token_id (int): EOD token ID.
 
     Returns:
-        A dict mapping DB type ('sampled', 'train', or 'valid') to the corresponding DBDataset, which is a dataset that wraps the HDF5 chunk index array.
+        A dict mapping DB type ('sampled', 'train', or 'valid') to the corresponding DBDataset,
+            which is a dataset that wraps the HDF5 chunk index array.
     """
     fns = {
         "sampled": get_merged_sampled_dataset,

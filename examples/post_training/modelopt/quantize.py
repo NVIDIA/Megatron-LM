@@ -8,9 +8,11 @@ import warnings
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
+import modelopt
 import modelopt.torch.quantization as mtq
 import torch
 from datasets import load_dataset
+from packaging.version import Version
 from tqdm import tqdm
 
 from megatron.post_training.arguments import add_modelopt_args
@@ -26,15 +28,13 @@ warnings.filterwarnings('ignore')
 
 
 QUANT_CFG_CHOICES = {
-    "int8": mtq.INT8_DEFAULT_CFG,
     "int8_sq": mtq.INT8_SMOOTHQUANT_CFG,
     "fp8": mtq.FP8_DEFAULT_CFG,
     "fp8_real_quant": mtq.FP8_DEFAULT_CFG,
-    "fp8_blockwise_real_quant": mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
+    "fp8_blockwise": mtq.FP8_2D_BLOCKWISE_WEIGHT_ONLY_CFG,
     "int4_awq": mtq.INT4_AWQ_CFG,
     "w4a8_awq": mtq.W4A8_AWQ_BETA_CFG,
-    "int4": mtq.INT4_BLOCKWISE_WEIGHT_ONLY_CFG,
-    "fp4": mtq.NVFP4_DEFAULT_CFG,
+    "nvfp4": mtq.NVFP4_DEFAULT_CFG,
 }
 
 
@@ -44,20 +44,25 @@ def add_text_generate_ptq_args(parser):
     group.add_argument(
         "--calib-size", type=int, default=512, help="Samples to use for ptq calibration."
     )
-    parser.add_argument(
+    group.add_argument(
         "--prompts",
         type=str,
         default=("Hello!|Born in California, Soyer trained as a"),
         help="Input texts. Please use | to separate different batches.",
     )
-    parser.add_argument(
+    group.add_argument(
         "--references",
         type=str,
         default="",
         help="Reference texts. Please use | to separate different batches.",
     )
-    parser.add_argument(
+    group.add_argument(
         "--pretrained-model-path", type=str, default=None, help="HuggingFace pretrained model"
+    )
+    group.add_argument(
+        "--force-all-expert-routing",
+        action="store_true",
+        help="Forcing all experts to be routed during the calibration.",
     )
     add_modelopt_args(parser)
     return parser
@@ -158,11 +163,24 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
+    from megatron.core.transformer.moe.router import TopKRouter
+
     def _hf_dataset_forword_loop_func(model):
         dataloader = get_calib_dataloader(args.calib_size)
+    
+        if args.force_all_expert_routing:
+            for name, module in model.named_modules():
+                if isinstance(module, TopKRouter):
+                    module.topk = module.num_experts
+
         for prompt in tqdm(dataloader, total=args.calib_size, disable=torch.distributed.get_rank()):
             tokens = tokenizer(prompt, return_tensors="pt")
             generated_ids = simple_generate(model, tokens.input_ids.cuda(), osl=1)
+
+            if args.force_all_expert_routing:
+                for name, module in model.named_modules():
+                    if isinstance(module, TopKRouter):
+                        module.topk = module.config.moe_router_topk
 
     unwrapped_model = unwrap_model(model)[0]
 
@@ -180,6 +198,15 @@ if __name__ == "__main__":
             mtq.compress(unwrapped_model)
 
     print_rank_0(f"Fake Quantized Model:\n {unwrapped_model}")
+
+    if torch.distributed.get_rank() == 0:
+        for k, v in unwrapped_model.state_dict().items():
+            if "amax" not in k:
+                continue
+            if isinstance(v, torch.Tensor):
+                print("{:80} {:32} max {:.4e}".format(k, str(v.shape), torch.max(torch.abs(v))))
+            else:
+                print("{:80}".format(k))
 
     _custom_prompt_forward_loop_func(unwrapped_model)
 

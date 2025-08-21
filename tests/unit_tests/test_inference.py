@@ -11,45 +11,22 @@ from tests.unit_tests.inference.engines.test_static_engine import TestStaticInfe
 from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
 
-logitsT = torch.Tensor
 
-
-@pytest.fixture
-def static_inference_engine(gpt2_tiktoken_tokenizer):
-    engine = TestStaticInferenceEngine()
-
-    # Initialize engine with given tokenizer
-    engine.setup_engine()
-    engine.static_engine.text_generation_controller.tokenizer = gpt2_tiktoken_tokenizer
-
-    # Mock model forward to comply with test expectations
-    original_forward = (
-        engine.static_engine.text_generation_controller.inference_wrapped_model.model.forward
-    )
-
-    def mocked_forward(*args, **kwargs):
-        output = original_forward(*args, **kwargs)
-        output[:, :, :] = 0
-        output[:, :-1, torch.arange(output.shape[1] - 1)] = 100
-        output[:, -1, gpt2_tiktoken_tokenizer.eos] = 100
-        return output
-
-    engine.static_engine.text_generation_controller.inference_wrapped_model.model.forward = (
-        mocked_forward
-    )
-
-    yield engine.static_engine
-
-
-@pytest.fixture
+@pytest.fixture(scope="module")
 def gpt2_tiktoken_tokenizer(gpt2_tiktok_vocab):
     return tokenizer.build_tokenizer(gpt2_tiktok_vocab)
 
 
-def forward_step_wrapper(gpt2_tiktoken_tokenizer):
-    assert gpt2_tiktoken_tokenizer.vocab_size == GPT2_VOCAB_SIZE
+@pytest.fixture(scope="module")
+def static_inference_engine(gpt2_tiktoken_tokenizer):
+    engine_wrapper = TestStaticInferenceEngine()
+    engine_wrapper.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size)
 
-    def mock_forward_step_fn(tokens, position_ids, attention_mask) -> logitsT:
+    controller = engine_wrapper.static_engine.text_generation_controller
+    controller.tokenizer = gpt2_tiktoken_tokenizer
+
+    def mock_forward(*args, **kwargs):
+        tokens = args[0]
         B, L = tokens.shape
         assert B == 1, "Test assumes batch_size == 1"
         V = gpt2_tiktoken_tokenizer.vocab_size
@@ -59,53 +36,30 @@ def forward_step_wrapper(gpt2_tiktoken_tokenizer):
         logits[0, -1, gpt2_tiktoken_tokenizer.eos] = 100
         return logits
 
-    return mock_forward_step_fn
+    controller.inference_wrapped_model.model.forward = mock_forward
+    yield engine_wrapper.static_engine
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def app(static_inference_engine):
-    server = MegatronServer(static_inference_engine)
-    return server.app
+    return MegatronServer(static_inference_engine).app
 
 
-@pytest.fixture
+@pytest.fixture()
 def client(app):
     return app.test_client()
 
 
-@unittest.mock.patch('megatron.inference.endpoints.completions.get_tokenizer')
 @unittest.mock.patch('megatron.inference.endpoints.completions.send_do_generate')
-@unittest.mock.patch('megatron.inference.text_generation.generation.get_args')
-@unittest.mock.patch('megatron.inference.text_generation.api.mpu')
-@unittest.mock.patch('megatron.inference.text_generation.generation.mpu')
-@unittest.mock.patch('megatron.inference.text_generation.communication.mpu')
-@unittest.mock.patch('megatron.inference.text_generation.generation.ForwardStep')
-@unittest.mock.patch('megatron.inference.text_generation.tokenization.get_tokenizer')
-def test_completions(
-    mock_get_tokenizer1,
-    mock_forward_step,
-    mock_mpu_2,
-    mock_mpu_1,
-    mock_mpu_0,
-    mock_get_args_1,
-    mock_send_do_generate,
-    mock_get_tokenizer2,
-    client,
-    gpt2_tiktoken_tokenizer,
+@unittest.mock.patch("megatron.inference.text_generation.tokenization.get_tokenizer")
+@unittest.mock.patch("megatron.inference.endpoints.completions.get_tokenizer")
+def test_completions_endpoint(
+    mock_get_tokenizer1, mock_get_tokenizer2, mock_send_do_generate, client, gpt2_tiktoken_tokenizer
 ):
     Utils.initialize_distributed()
 
-    # set up the mocks
-    args = argparse.Namespace(
-        max_position_embeddings=1024, max_tokens_to_oom=1_000_000, inference_max_seq_length=1024
-    )
-    mock_get_args_1.return_value = args
     mock_get_tokenizer1.return_value = gpt2_tiktoken_tokenizer
     mock_get_tokenizer2.return_value = gpt2_tiktoken_tokenizer
-    mock_forward_step.return_value = forward_step_wrapper(gpt2_tiktoken_tokenizer)
-    mock_mpu_0.is_pipeline_last_stage.return_value = True
-    mock_mpu_1.is_pipeline_last_stage.return_value = True
-    mock_mpu_2.is_pipeline_last_stage.return_value = True
 
     twinkle = ("twinkle twinkle little star,", " how I wonder what you are")
     request_data = {"prompt": twinkle[0] + twinkle[1], "max_tokens": 0, "logprobs": 5, "echo": True}
@@ -137,5 +91,4 @@ def test_completions(
     response = client.put('/completions', json=request_data)
     assert response.status_code == 405  # Method Not Allowed
 
-    mock_get_tokenizer1.assert_called()
     mock_send_do_generate.assert_called_once()

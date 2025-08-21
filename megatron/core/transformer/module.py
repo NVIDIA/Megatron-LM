@@ -90,8 +90,9 @@ class MegatronModule(torch.nn.Module):
     def set_is_first_microbatch(self):
         """Sets the is_first_microbatch flag if it exists and config.fp8==True.
         When this flag is set, TE modules will update their fp8 parameter cache.
+        If kitchen is being used, kitchen controls quantization level.
         """
-        if self.config.fp8 is not None:
+        if self.config.fp8 is not None or getattr(self.config, 'use_kitchen', False):
             if not hasattr(self, "modules_with_is_first_microbatch"):
                 self.modules_with_is_first_microbatch = []
                 for m in self.modules():
@@ -208,6 +209,7 @@ class Float16Module(MegatronModule):
         self.config = config
         self.fp16 = config.fp16
         self.bf16 = config.bf16
+        self.vp_stage = getattr(module, 'vp_stage', None)
 
         if self.fp16:
             self.add_module('module', module.half())
@@ -230,10 +232,10 @@ class Float16Module(MegatronModule):
         return self.module.set_input_tensor(input_tensor)
 
     def forward(self, *inputs, **kwargs):  # pylint: disable=missing-function-docstring
-        if parallel_state.is_pipeline_first_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=self.vp_stage):
             inputs = fp32_to_float16(inputs, self.float16_convertor)
         outputs = self.module(*inputs, **kwargs)
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=False):
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=self.vp_stage):
             outputs = float16_to_fp32(outputs)
         return outputs
 

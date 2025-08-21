@@ -6,7 +6,7 @@ import torch
 
 try:
     from torch.distributed import DeviceMesh
-    from torch.distributed._composable.fsdp import fully_shard
+    from torch.distributed.fsdp import fully_shard
 
     HAVE_FSDP = True
 except ImportError:

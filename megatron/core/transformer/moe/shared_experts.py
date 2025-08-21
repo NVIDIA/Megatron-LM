@@ -64,6 +64,10 @@ class SharedExpertMLP(MLP):
                 if hasattr(linear, 'parallel_mode'):
                     # TELinear
                     linear.parallel_mode = None
+                    linear.ub_overlap_rs_fprop = False
+                    linear.ub_overlap_ag_dgrad = False
+                    linear.ub_overlap_ag_fprop = False
+                    linear.ub_overlap_rs_dgrad = False
                 else:
                     # MCore legacy Linear
                     linear.explicit_expert_comm = True

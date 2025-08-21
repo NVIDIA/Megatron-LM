@@ -334,7 +334,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             try:
                 encoded_sample = self.encode_llava_sft(sample, truncate_for_sample_list_packing=True)
                 if current_length + encoded_sample.total_len > self.packing_seq_length:
-                    print(f"Encoding list of samples: stopped at {idx+1} samples to stick to {self.packing_seq_length}. Last sample key: {sample.__key__}")
+                    print(f"Encoding list of samples: stopped at {idx} samples to stick to {self.packing_seq_length}. Last sample key: {sample.__key__}")
                     break
                 else:
                     encoded_samples.append(encoded_sample)
@@ -351,7 +351,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         # If the target aspect ratio are provided by the dataset, we use them instead of computing
         # them with the self.find_closest_aspect_ratio_fn function.
         local_find_closest_aspect_ratio_fn = self.find_closest_aspect_ratio_fn
-        if type(sample).__name__ == "OfflineTargetAspectRatioSample":
+        if type(sample).__name__ == "OfflineTargetAspectRatioSample" and len(sample.target_aspect_ratio) > 0:
             target_aspect_ratio = tuple(sample.target_aspect_ratio[0])
             assert target_aspect_ratio is not None, "Sample of type OfflineTargetAspectRatioSample needs to define the target aspect ratio."
             local_find_closest_aspect_ratio_fn = lambda *args, **kwargs: target_aspect_ratio
@@ -399,6 +399,13 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         if not has_video and len(sample.images) == 1 and number_image_tags > 1:
             sample.images = sample.images * number_image_tags
 
+        # If there are no images in the sample, remove the image tags in the conversation.
+        if len(sample.images) == 0:
+            for turn in conversation:
+                if turn["role"] == "user":
+                    turn["content"] = turn["content"].replace(IMAGE_TOKEN, "")
+            number_image_tags = 0   
+
         # We currently only support one video per sample.
         number_of_images = 1 if has_video else len(sample.images)
         # Fail if there are more image or video tags than image or videos:
@@ -429,6 +436,16 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 imgs = []
                 num_tiles = []
                 for img in sample.images:
+                    # This if block is a temporary fix to handle video frames. We hard code
+                    # `use_tiling = False` because we don't use tiling for videos frames to keep
+                    # the number of tokens to a reasonable value.
+                    if isinstance(img, torch.Tensor) or isinstance(img, np.ndarray):
+                        if len(img.shape) == 4:
+                            assert img.shape[0] == 1, f"When len(img.shape) == 4, we expect the first dimension to be 1, but got img.shape: {img.shape} instead."
+                            img = img[0]
+                            use_tiling = False
+                        to_pil = ToPILImage()
+                        img = to_pil(img)
                     img_tiles = self.transform_img(
                         img, self.img_h, self.img_w, self.args.use_tiling, max_num_tiles,
                         self.args.use_thumbnail, augment, find_closest_aspect_ratio_fn=local_find_closest_aspect_ratio_fn)
@@ -815,7 +832,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         """Selects which samples will be packed together.
 
         NOTE: Energon dataloader calls this method internally if packing is used.
-        Please see https://nvidia.github.io/Megatron-Energon/packing.html
+        Please see https://nvidia.github.io/Megatron-Energon/advanced/packing.html
         """
         lengths = [sample.total_len for sample in samples]
 
@@ -829,7 +846,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         Function to pack a list of ImageTaskSample into a single ImageTaskSamplePacked.
 
         NOTE: Energon dataloader calls this method internally if packing is used.
-        Please see https://nvidia.github.io/Megatron-Energon/packing.html
+        Please see https://nvidia.github.io/Megatron-Energon/advanced/packing.html
 
         Args:
             samples: List of ImageTaskSample instances to pack into one sample.

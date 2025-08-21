@@ -1,5 +1,5 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
-"""Pretrain Mamba."""
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+"""Pretrain and SFT Mamba."""
 
 import os
 import torch
@@ -7,6 +7,7 @@ from functools import partial
 from typing import List, Optional, Tuple, Union
 
 from megatron.training import get_args
+from megatron.training import inprocess_restart
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.training import get_tokenizer
@@ -29,6 +30,7 @@ from megatron.training.utils import (
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 
+from megatron.training.datasets.sft_dataset import SFTDataset
 
 stimer = StragglerDetector()
 
@@ -234,10 +236,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     config = core_gpt_dataset_config_from_args(args)
 
-    if args.mock_data:
-        dataset_type = MockGPTDataset
+    if args.sft:
+        dataset_type = SFTDataset
     else:
-        dataset_type = GPTDataset
+        if args.mock_data:
+            dataset_type = MockGPTDataset
+        else:
+            dataset_type = GPTDataset
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
@@ -258,8 +263,12 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
+    # Optionally enable inprocess restart on pretrain
+    pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
+
     pretrain(train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'})
+             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
+             store=store)

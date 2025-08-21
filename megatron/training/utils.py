@@ -4,9 +4,12 @@
 import json
 import os
 import sys
+import warnings
 from datetime import datetime
 
 import torch
+
+from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -15,9 +18,6 @@ except ImportError:
         from amp_C import multi_tensor_l2norm
         from apex.multi_tensor_apply import multi_tensor_applier
     except ImportError:
-
-        import warnings
-
         warnings.warn(
             f'Transformer Engine and Apex are not installed. '
             'Falling back to local implementations of '
@@ -30,8 +30,6 @@ except ImportError:
         )
 
 from megatron.training import get_args, get_adlr_autoresume
-from megatron.core import DistributedDataParallel as DDP
-from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel as custom_FSDP
 from megatron.core import mpu
 from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -39,31 +37,9 @@ from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
     to_local_if_dtensor,
+    unwrap_model,
 )
-from megatron.core.transformer.module import Float16Module
 from megatron.legacy.model.module import param_is_not_shared
-
-try:
-    from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, torch_FSDP, custom_FSDP, Float16Module)
-except ImportError:
-    ALL_MODULE_WRAPPER_CLASSNAMES = (DDP, custom_FSDP, Float16Module)
-
-
-def unwrap_model(model, module_instances=ALL_MODULE_WRAPPER_CLASSNAMES):
-    return_list = True
-    if not isinstance(model, list):
-        model = [model]
-        return_list = False
-    unwrapped_model = []
-    for model_module in model:
-        while isinstance(model_module, module_instances):
-            model_module = model_module.module
-        unwrapped_model.append(model_module)
-    if not return_list:
-        return unwrapped_model[0]
-    return unwrapped_model
 
 
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
@@ -143,9 +119,12 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
             False,  # no per-parameter norm.
         )
         sharded_norm_2 = sharded_norm * sharded_norm
-        # Sum over all DP groups.
+        # Sum over all DP groups, including CP since distributed optimizer state is
+        # sharded jointly over DP+CP.
         torch.distributed.all_reduce(
-            sharded_norm_2, op=torch.distributed.ReduceOp.SUM, group=mpu.get_data_parallel_group()
+            sharded_norm_2,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group(with_context_parallel=True)
         )
         norm_2 += sharded_norm_2
 
@@ -207,9 +186,7 @@ def average_losses_across_data_parallel_group(losses):
     """Reduce a tensor of losses across all GPUs."""
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
     torch.distributed.all_reduce(averaged_losses, group=mpu.get_data_parallel_group())
-    averaged_losses = averaged_losses / torch.distributed.get_world_size(
-        group=mpu.get_data_parallel_group()
-    )
+    averaged_losses = averaged_losses / mpu.get_data_parallel_group().size()
 
     return averaged_losses
 
@@ -355,13 +332,28 @@ def get_ltor_masks_and_position_ids(
     return attention_mask, loss_mask, position_ids
 
 
-def print_rank_0(message):
-    """If distributed is initialized, print only on rank 0."""
-    if torch.distributed.is_initialized():
+def print_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, print only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            print(message, flush=True)
+    elif torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
             print(message, flush=True)
     else:
         print(message, flush=True)
+
+
+def warn_rank_0(message, rank=None):
+    """If distributed is initialized or rank is specified, warn only on rank 0."""
+    if rank is not None:
+        if rank == 0:
+            warnings.warn(message)
+    elif torch.distributed.is_initialized():
+        if torch.distributed.get_rank() == 0:
+            warnings.warn(message)
+    else:
+        warnings.warn(message)
 
 
 def is_rank0():
@@ -396,7 +388,7 @@ def append_to_progress_log(string, barrier=True):
     if barrier:
         torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
-        with open(progress_log_filename, 'a') as f:
+        with open_file(progress_log_filename, 'a') as f:
             job_id = os.getenv('SLURM_JOB_ID', '')
             num_gpus = args.world_size
             f.write(
@@ -421,14 +413,14 @@ def get_blend_and_blend_per_split(args):
     if use_data_path:
         if args.data_args_path is not None:
             assert args.data_path is None
-            with open(args.data_args_path, 'r') as f:
+            with open_file(args.data_args_path, 'r') as f:
                 blend = get_blend_from_list(f.read().split())
         else:
             assert args.data_path is not None
             blend = get_blend_from_list(args.data_path)
     elif use_per_split_data_path:
         if args.per_split_data_args_path is not None:
-            with open(args.per_split_data_args_path, 'r') as f:
+            with open_file(args.per_split_data_args_path, 'r') as f:
                 per_split_data_args = json.load(f)
                 # Each element in blend_per_split should be a list of files (and optional
                 # weights), so split string if needed.
@@ -491,12 +483,12 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
 
-        elif mpu.is_pipeline_first_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_first_stage():
             _broadcast(batch['tokens'])
             _broadcast(batch['attention_mask'])
             _broadcast(batch['position_ids'])
 
-        elif mpu.is_pipeline_last_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.
@@ -545,7 +537,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(attention_mask)
             _broadcast(position_ids)
 
-        elif mpu.is_pipeline_first_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_first_stage():
             labels = None
             loss_mask = None
 
@@ -553,7 +545,7 @@ def get_batch_on_this_tp_rank(data_iterator):
             _broadcast(attention_mask)
             _broadcast(position_ids)
 
-        elif mpu.is_pipeline_last_stage(ignore_virtual=False):
+        elif mpu.is_pipeline_last_stage():
             # Multi-Token Prediction (MTP) layers need tokens and position_ids to calculate embedding.
             # Currently the Multi-Token Prediction (MTP) layers is fixed on the last stage, so we need
             # to broadcast tokens and position_ids to all of the tensor parallel ranks on the last stage.

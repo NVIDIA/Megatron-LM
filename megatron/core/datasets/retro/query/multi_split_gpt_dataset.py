@@ -26,8 +26,11 @@ class MultiSplitGPTDatasetConfig(GPTDatasetConfig):
     """Configuration object for Megatron Core blended and Retro datasets.
 
     Args:
-        return_document_ids (bool): Whether to return the document ids when querying the dataset. Turn this option on during preprocessing.
-        split_preprocessing (str): The Retro preprocessing split string. It follows the same pattern convention as 'split'. Not to be used with 'blend_per_split'.
+        return_document_ids (bool): Whether to return the document ids when querying the dataset.
+            Turn this option on during preprocessing.
+        split_preprocessing (str): The Retro preprocessing split string.
+            It follows the same pattern convention as 'split'.
+            Not to be used with 'blend_per_split'.
     """
 
     return_document_ids: bool = None
@@ -36,6 +39,7 @@ class MultiSplitGPTDatasetConfig(GPTDatasetConfig):
 
     def __post_init__(self) -> None:
         """Validate config attributes."""
+
         super().__post_init__()
         assert self.split is not None, "the Retro data pipeline does not support 'blend_per_split'"
         assert self.return_document_ids is not None, "this attribute must be user defined"
@@ -57,12 +61,14 @@ class MultiSplitGPTDataset(GPTDataset):
     """Retro's customized GPT dataset.
 
     Args:
-        indexed_dataset (IndexedDataset): The IndexedDataset around which to build the MegatronDataset.
+        indexed_dataset (IndexedDataset): The IndexedDataset around which
+            to build the MegatronDataset.
         dataset_path (str): The real path on disk to the dataset, for bookkeeping.
         indexed_indices (numpy.ndarray): The set of the documents indices to expose.
         num_samples (int): The number of samples to draw from the indexed dataset.
         index_split (Split): The indexed_indices Split.
-        config (MultiSplitGPTDatasetConfig): The Retro-specific container for all config sourced parameters.
+        config (MultiSplitGPTDatasetConfig): The Retro-specific container for all
+            config sourced parameters.
     """
 
     def __init__(
@@ -85,7 +91,8 @@ class MultiSplitGPTDataset(GPTDataset):
             idx (int): The index into the dataset.
 
         Returns:
-            Dict[str, numpy.ndarray]: The text ids and (optionally) the document ids wrapped in a dictionary.
+            Dict[str, numpy.ndarray]: The text ids and (optionally)
+                the document ids wrapped in a dictionary.
         """
         text, document_ids = self._query_document_sample_shuffle_indices(idx)
         if self.config.return_document_ids:
@@ -97,7 +104,8 @@ class MultiSplitGPTDataset(GPTDataset):
     def _key_config_attributes() -> List[str]:
         """Add custom attributes for building unique dataset hash.
 
-        The preprocessing split used for preprocessing will constrain the samples available for pretraining.
+        The preprocessing split used for preprocessing will constrain
+            the samples available for pretraining.
 
         Returns:
             List[str]: The key config attributes.

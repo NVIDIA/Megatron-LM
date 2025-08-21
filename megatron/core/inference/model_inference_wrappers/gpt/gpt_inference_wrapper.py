@@ -10,6 +10,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
+from megatron.core.inference.utils import get_attention_mask
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import get_model_config
@@ -47,7 +48,7 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
             A dict with all the inference input needed for the batch.
         """
         assert (
-            not self.inference_params.is_decode_only()
+            not self.inference_context.is_decode_only()
         ), "`prep_inference_input` should only be called in prefill mode"
 
         attention_mask, position_ids = self._build_attention_mask_and_position_ids(prompts_tokens)
@@ -74,12 +75,7 @@ class GPTInferenceWrapper(AbstractModelInferenceWrapper):
         attention_backend = config.attention_backend
 
         if attention_backend == AttnBackend.local:
-            attention_mask = torch.tril(
-                torch.ones((1, seq_length, seq_length), device=prompts_tokens.device)
-            ).view(1, 1, seq_length, seq_length)
-
-            # Convert to boolean
-            attention_mask = attention_mask < 0.5
+            attention_mask = get_attention_mask(seq_length)
         elif (
             attention_backend == AttnBackend.flash
             or attention_backend == AttnBackend.fused

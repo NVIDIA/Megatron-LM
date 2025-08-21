@@ -48,6 +48,7 @@ def collect_train_test_metrics(
             "mem-max-allocated-bytes",
             "lm loss",
             "num-zeros",
+            "mtp_1 loss",
         ]
     }
 
@@ -59,6 +60,7 @@ def collect_train_test_metrics(
                     for golden_value_key, golden_values in summaries.items()
                 },
                 fh,
+                indent=4,
             )
 
 

@@ -1,6 +1,5 @@
 datasets
 jsonlines
-mamba-ssm
 nvidia-modelopt
 omegaconf
 pulp

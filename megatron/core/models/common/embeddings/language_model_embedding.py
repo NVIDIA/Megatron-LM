@@ -8,7 +8,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_tensor_model_parallel_group_if_none
+from megatron.core.utils import get_tensor_model_parallel_group_if_none, nvtx_decorator
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -56,7 +56,7 @@ class LanguageModelEmbedding(MegatronModule):
         self.word_embeddings = tensor_parallel.VocabParallelEmbedding(
             num_embeddings=self.vocab_size,
             embedding_dim=self.config.hidden_size,
-            init_method=self.config.init_method,
+            init_method=self.config.embedding_init_method,
             reduce_scatter_embeddings=self.reduce_scatter_embeddings,
             config=self.config,
             tp_group=self.tp_group,
@@ -70,7 +70,7 @@ class LanguageModelEmbedding(MegatronModule):
 
             # Initialize the position embeddings.
             if self.config.perform_initialization:
-                self.config.init_method(self.position_embeddings.weight)
+                self.config.embedding_init_method(self.position_embeddings.weight)
 
         if self.num_tokentypes > 0:
             self.tokentype_embeddings = torch.nn.Embedding(
@@ -78,7 +78,7 @@ class LanguageModelEmbedding(MegatronModule):
             )
             # Initialize the token-type embeddings.
             if self.config.perform_initialization:
-                self.config.init_method(self.tokentype_embeddings.weight)
+                self.config.embedding_init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 
@@ -95,6 +95,7 @@ class LanguageModelEmbedding(MegatronModule):
             self.tokentype_embeddings.weight.data.fill_(0)
             self.tokentype_embeddings.weight.shared = True
 
+    @nvtx_decorator()
     def forward(self, input_ids: Tensor, position_ids: Tensor, tokentype_ids: int = None) -> Tensor:
         """Forward pass of the embedding module.
 

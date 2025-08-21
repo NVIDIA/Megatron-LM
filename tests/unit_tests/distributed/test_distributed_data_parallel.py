@@ -6,6 +6,7 @@ from packaging import version
 from torch import testing
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import GradCommProcessGroups, ModelCommProcessGroups
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -42,7 +43,6 @@ class TestDistributedDataParallel:
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
     def test_ddp_with_dp_process_groups(self, dp_size):
         """Test that DDP works correctly with dp pgs from parallel state and user defined pgs."""
-        from torch.distributed.device_mesh import init_device_mesh
 
         # Skip test if we don't have enough GPUs
         world_size = torch.distributed.get_world_size()
@@ -73,17 +73,20 @@ class TestDistributedDataParallel:
             transformer_config, ddp_config=ddp_config, module=model1
         )
 
-        # Create device mesh for explicit process groups
-        # Create a mesh with dimension dp [dp_size], 1 pp size and 1 ep size
-        device_mesh = init_device_mesh("cuda", (dp_size, 1, 1), mesh_dim_names=("dp", "ep", "pp"))
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dimension ep, pp, dp (reversed from device mesh order)
+        grid = HyperCommGrid([1, 1, dp_size], ["ep", "pp", "dp"])
 
         # Create process groups config with ONLY dp group
         grad_comm_pgs = GradCommProcessGroups()
         model_comm_pgs = ModelCommProcessGroups()
 
-        grad_comm_pgs.dp = device_mesh.get_group(mesh_dim="dp")
-        model_comm_pgs.pp = device_mesh.get_group(mesh_dim="pp")
-        model_comm_pgs.ep = device_mesh.get_group(mesh_dim="ep")
+        grad_comm_pgs.dp = grid.create_pg("dp")
+        model_comm_pgs.pp = grid.create_pg("pp")
+        model_comm_pgs.ep = grid.create_pg("ep")
 
         # Wrap second model with minimal process groups (only dp)
         ddp_model2 = DistributedDataParallel(
