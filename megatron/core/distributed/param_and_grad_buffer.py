@@ -12,7 +12,6 @@ from typing import Dict, List, Optional
 import torch
 from torch.distributed import _coalescing_manager
 
-import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 
 from ..fp8_utils import is_float8tensor, is_mxfp8tensor, modify_underlying_storage
@@ -31,6 +30,11 @@ try:
 except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
+
+try:
+    import apex.contrib.nccl_allocator as nccl_allocator
+except ImportError:
+    nccl_allocator = None
 
 
 class BufferType(Enum):

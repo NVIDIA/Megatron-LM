@@ -226,7 +226,7 @@ class TransformerConfig(ModelParallelConfig):
     init_model_with_meta_device: bool = False
     """
     If True, initializes the model with the meta device. This is helpful for
-    training of very large models. This feature is only works when custom fsdp is turned on.
+    training of very large models. This feature is only works when megatron fsdp is turned on.
     """
 
     ####################
@@ -658,6 +658,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     quant_recipe: Optional[RecipeConfig] = None
     """Configuration of any quantization to be applied to the model"""
+
+    transformer_impl: str = "transformer_engine"
+    """Transformer implementation to use.
+    Options are 'transformer_engine' for Transformer Engine and 'local' for MCore."""
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
