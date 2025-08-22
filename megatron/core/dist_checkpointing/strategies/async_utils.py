@@ -165,7 +165,7 @@ class AsyncCaller(ABC):
         return ten[0] == 0
 
     @abstractmethod
-    def close(self):
+    def close(self, abort=False):
         """Terminate the async caller at exit of an application or some termination conditions"""
         logger.info(f"AsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller")
 
@@ -252,15 +252,23 @@ class TemporalAsyncCaller(AsyncCaller):
             is_done = True
         return is_done
 
-    def close(self):
+    def close(self, abort=False):
         """For TemporalAsyncCaller, this method is called explictly in `is_current_async_calls_done`
 
         This method make sure the TemporalAsyncCaller terminated
         with all its assigned async request completed
+
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
         """
         if self.process:
             logger.debug(f"rank: {torch.distributed.get_rank()}, joining self.process")
-            self.process.join()
+            if abort:
+                logger.warning(f"Temporal worker aborted in rank {torch.distributed.get_rank()}")
+                self.process.kill()
+            else:
+                self.process.join()
             self.process = None
             logger.debug(
                 "TemporalAsyncCaller: Async process join finished "
@@ -403,18 +411,25 @@ class PersistentAsyncCaller(AsyncCaller):
 
         return is_done
 
-    def close(self):
+    def close(self, abort=False):
         """Wait on the left async requests and terminate the PersistentAsyncCaller
 
         Signals the PersistentAsyncCaller by sending a 'DONE' message to make it terminated
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
         """
         logger.info(
             f"PersistentAsyncCaller: {torch.distributed.get_rank()}, Destroying Async Caller"
         )
         if self.process:
-            self.queue.put('DONE')
-            self.queue.join()
-            self.process.join()
+            if abort:
+                logger.warning(f"Persistent worker aborted in rank {torch.distributed.get_rank()}")
+                self.process.kill()
+            else:
+                self.queue.put('DONE')
+                self.queue.join()
+                self.process.join()
             self.process = None
 
     def __del__(self):
@@ -572,8 +587,13 @@ class AsyncCallsQueue:
         """Get the number of active async calls."""
         return len(self.async_calls)
 
-    def close(self):
-        """Finalize all calls upon closing."""
-        self.maybe_finalize_async_calls(blocking=True)
+    def close(self, abort=False):
+        """Finalize all calls upon closing.
+        Args:
+            abort (bool, optional): Default to False. Needs to be manually set to true when
+                the checkpoint async process needs to be aborted.
+        """
+        if not abort:
+            self.maybe_finalize_async_calls(blocking=True)
         if self.persistent and self.persistent_caller:
-            self.persistent_caller.close()
+            self.persistent_caller.close(abort=abort)
