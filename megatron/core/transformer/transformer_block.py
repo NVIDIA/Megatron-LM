@@ -7,7 +7,7 @@ from typing import List, Optional, Union
 import torch
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -15,6 +15,12 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.utils import (
+    is_pp_first_stage,
+    is_pp_last_stage,
+    is_vp_first_stage,
+    is_vp_last_stage,
+)
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.module import MegatronModule
@@ -25,7 +31,7 @@ from megatron.core.transformer.transformer_layer import (
     get_transformer_layer_offset,
 )
 from megatron.core.transformer.utils import sharded_state_dict_default
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor, get_pg_rank
+from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 try:
     import transformer_engine.pytorch as te  # pylint: disable=unused-import
@@ -65,7 +71,11 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] = None, pp_group=None) -> int:
+def get_num_layers_to_build(
+    config: TransformerConfig,
+    vp_stage: Optional[int] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> int:
     """
     Determine the number of transformer layers to build for the current pipeline stage.
     Args:
@@ -120,18 +130,10 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
         # If the uneven first (last) pipeline stage is enabled, return the specified number
         # of layers for all virtual pipeline parallel stages within the first (last) pipeline
         # parallel stage.
-        if (
-            #parallel_state.is_pipeline_first_stage(ignore_virtual=True)
-            get_pg_rank(pp_group) == 0
-            and config.num_layers_in_first_pipeline_stage is not None
-        ):
+        if is_pp_first_stage(pp_group) and config.num_layers_in_first_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_first_pipeline_stage
 
-        if (
-            #parallel_state.is_pipeline_last_stage(ignore_virtual=True)
-            get_pg_rank(pp_group) == config.pipeline_model_parallel_size - 1
-            and config.num_layers_in_last_pipeline_stage is not None
-        ):
+        if is_pp_last_stage(pp_group) and config.num_layers_in_last_pipeline_stage is not None:
             num_layers_per_pipeline_rank = config.num_layers_in_last_pipeline_stage
     else:
         # Include the embedding layer and loss layer into pipeline parallelism partition
@@ -181,16 +183,14 @@ def get_num_layers_to_build(config: TransformerConfig, vp_stage: Optional[int] =
     # Reduce the number of layers to construct by 1 on the first (or last) stage if the
     # embedding (or loss) layer is included in the pipeline parallelism partition and placement.
     if (
-        #parallel_state.is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
-        get_pg_rank(pp_group) == 0
+        is_vp_first_stage(vp_stage, config.virtual_pipeline_model_parallel_size)
         and config.account_for_embedding_in_pipeline_split
     ):
         num_layers_to_build -= 1
         assert num_layers_to_build >= 0, "Not enough layers in the first virtual pipeline stage"
 
     if (
-        #parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
-        get_pg_rank(pp_group) == config.pipeline_model_parallel_size - 1
+        is_vp_last_stage(vp_stage, config.virtual_pipeline_model_parallel_size)
         and config.account_for_loss_in_pipeline_split
     ):
         num_layers_to_build -= 1
@@ -223,7 +223,7 @@ def _get_block_submodules(
     config: TransformerConfig,
     spec: Union[TransformerBlockSubmodules, ModuleSpec],
     vp_stage: Optional[int] = None,
-    pp_group = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> TransformerBlockSubmodules:
     """
     Retrieve or construct TransformerBlockSubmodules based on the provided specification.
@@ -274,8 +274,13 @@ class TransformerBlock(MegatronModule):
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=config)
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+        self.model_comm_pgs = model_comm_pgs
 
-        self.submodules = _get_block_submodules(config, spec, vp_stage, model_comm_pgs.pp)
+        pp_group = self.model_comm_pgs.pp if hasattr(self.model_comm_pgs, 'pp') else None
+
+        self.submodules = _get_block_submodules(config, spec, vp_stage, pp_group)
         self.post_layer_norm = post_layer_norm
         self.pre_process = pre_process
         self.post_process = post_process
@@ -309,10 +314,6 @@ class TransformerBlock(MegatronModule):
 
             self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
             self.config._cpu_offloading_context = None
-
-        if model_comm_pgs is None:
-            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
-        self.model_comm_pgs = model_comm_pgs
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
@@ -414,7 +415,7 @@ class TransformerBlock(MegatronModule):
                     forward_func,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.model_comm_pgs.tp,
                     hidden_states,
                     attention_mask,
                     context,

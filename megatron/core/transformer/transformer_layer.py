@@ -10,10 +10,11 @@ import torch
 import torch.distributed
 from torch import Tensor
 
-from megatron.core import parallel_state, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.pipeline_parallel.utils import is_vp_first_stage
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, is_graph_capturing
 from megatron.core.transformer.enums import LayerType
@@ -24,20 +25,23 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     deprecate_inference_params,
+    get_pg_rank,
     is_te_min_version,
     log_single_rank,
     make_viewless_tensor,
     nvtx_range_pop,
     nvtx_range_push,
-    get_pg_rank,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None, pp_group=None):
+def get_transformer_layer_offset(
+    config: TransformerConfig,
+    vp_stage: Optional[int] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
-    #pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
     pipeline_rank = get_pg_rank(pp_group)
 
     if config.pipeline_model_parallel_size > 1:
@@ -172,22 +176,16 @@ def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[i
                 )
 
                 # Reduce the offset of embedding layer from the total layer number
-                if (
-                    config.account_for_embedding_in_pipeline_split
-                    and not parallel_state.is_pipeline_first_stage(
-                        ignore_virtual=False, vp_stage=vp_stage
-                    )
+                if config.account_for_embedding_in_pipeline_split and not is_vp_first_stage(
+                    vp_stage, vp_size
                 ):
                     offset -= 1
             else:
                 offset = pipeline_rank * num_layers_per_pipeline_rank
 
                 # Reduce the offset of embedding layer from the total layer number
-                if (
-                    config.account_for_embedding_in_pipeline_split
-                    and not parallel_state.is_pipeline_first_stage(
-                        ignore_virtual=False, vp_stage=vp_stage
-                    )
+                if config.account_for_embedding_in_pipeline_split and not is_vp_first_stage(
+                    vp_stage, vp_size
                 ):
                     offset -= 1
     else:
@@ -613,7 +611,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                     self.mlp,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.model_comm_pgs.tp,
                     pre_mlp_layernorm_output,
                 )
             else:
