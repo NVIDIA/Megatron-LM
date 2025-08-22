@@ -36,7 +36,8 @@ class TestAsyncSave:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize('persistent', [True, False])
-    def test_async_is_equivalent_to_sync(self, tmp_path_dist_ckpt, persistent):
+    @pytest.mark.parametrize('abort', [True, False])
+    def test_async_is_equivalent_to_sync(self, tmp_path_dist_ckpt, persistent, abort):
         Utils.initialize_model_parallel(2, 4)
 
         sharded_state_dict = {
@@ -48,11 +49,10 @@ class TestAsyncSave:
             ),
         }
 
-        with TempNamedDir(
-            tmp_path_dist_ckpt / 'test_equivalence_async'
-        ) as async_ckpt_dir, TempNamedDir(
-            tmp_path_dist_ckpt / 'test_equivalence_sync'
-        ) as sync_ckpt_dir:
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_async') as async_ckpt_dir,
+            TempNamedDir(tmp_path_dist_ckpt / 'test_equivalence_sync') as sync_ckpt_dir,
+        ):
             # async
             async_calls = AsyncCallsQueue(persistent)
             async_request = save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
@@ -69,7 +69,7 @@ class TestAsyncSave:
             loaded_sync_state_dict = load(sharded_state_dict, sync_ckpt_dir)
             diffs = diff(loaded_async_state_dict, loaded_sync_state_dict)
             assert not any(map(bool, diffs)), diffs
-            async_calls.close()
+            async_calls.close(abort=abort)
 
         Utils.destroy_model_parallel()
 
