@@ -104,9 +104,12 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
+        # Use moe_latent_size only for routed experts. 'is_expert' is false for shared_experts
+        use_latent_size = (self.config.moe_latent_size is not None) and is_expert
+
         self.linear_fc1 = build_module(
             submodules.linear_fc1,
-            self.input_size,
+            self.input_size if not use_latent_size else self.config.moe_latent_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
@@ -126,7 +129,7 @@ class MLP(MegatronModule):
         self.linear_fc2 = build_module(
             submodules.linear_fc2,
             self.config.ffn_hidden_size,
-            self.config.hidden_size,
+            self.config.hidden_size if not use_latent_size else self.config.moe_latent_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,

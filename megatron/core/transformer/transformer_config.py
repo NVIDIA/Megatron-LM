@@ -216,6 +216,9 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for HybridEP. In pure NVL scenarios, 
     16 SMs can generally achieve good bandwidth."""
 
+    moe_latent_size: Optional[int] = None
+    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
+
     ####################
     # initialization
     ####################

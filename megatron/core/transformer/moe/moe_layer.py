@@ -23,7 +23,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
-    from megatron.core.extensions.transformer_engine import te_checkpoint
+    from megatron.core.extensions.transformer_engine import TELinear, te_checkpoint
 
     HAVE_TE = True
 except ImportError:
@@ -122,6 +122,32 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
+
+        # Initialize latent projections
+        if self.config.moe_latent_size:
+            assert HAVE_TE
+            self.fc1_latent_proj = TELinear(
+                self.config.hidden_size,
+                self.config.moe_latent_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+            self.fc2_latent_proj = TELinear(
+                self.config.moe_latent_size,
+                self.config.hidden_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -272,9 +298,26 @@ class MoELayer(BaseMoELayer):
         def custom_forward(hidden_states):
             shared_expert_output = self.shared_experts_compute(hidden_states)
             hidden_states, probs, residual = self.router_and_preprocess(hidden_states)
+
+            # Project the hidden_states from hidden dimension down to latent dimenion.
+            if self.config.moe_latent_size:
+                assert (
+                    not self.shared_expert_overlap
+                ), "Shared expert overlap not supported when MoE latent projections are used."
+                hidden_states, _ = self.fc1_latent_proj(hidden_states)
+
             dispatched_input, probs = self.dispatch(hidden_states, probs)
             output, mlp_bias = self.routed_experts_compute(dispatched_input, probs, residual)
+
+            if self.config.moe_latent_size and mlp_bias is not None:
+                output = output + mlp_bias
+                mlp_bias = None
             output = self.combine(output, shared_expert_output)
+            # Project the output back from latent dimension to hidden dimension after combine
+            # in latent dimension.
+            if self.config.moe_latent_size:
+                output, _ = self.fc2_latent_proj(output)
+
             return output, mlp_bias
 
         if self.moe_layer_recompute:
