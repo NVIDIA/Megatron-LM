@@ -187,8 +187,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_deepep_num_sms: int = 20
     """Number of SMs to use for DeepEP."""
 
-    moe_hybridep_num_sms: int =16
+    moe_hybridep_num_sms: int = 16
     """Number of SMs to use for HybridEP."""
+
+    moe_latent_size: Optional[int] = None
+    """Latent projection dimension for MoE. If None, MoE latent projections are not used."""
 
     ####################
     # initialization

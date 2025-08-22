@@ -22,7 +22,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
-    from megatron.core.extensions.transformer_engine import te_checkpoint
+    from megatron.core.extensions.transformer_engine import te_checkpoint, TELinear
 
     HAVE_TE = True
 except ImportError:
@@ -120,6 +120,32 @@ class MoELayer(BaseMoELayer):
 
         # Initialize router
         self.router = TopKRouter(config=self.config, model_comm_pgs=model_comm_pgs)
+
+        # Initialize latent projections
+        if self.config.moe_latent_size:
+            assert HAVE_TE
+            self.fc1_latent_proj = TELinear(
+                self.config.hidden_size,
+                self.config.moe_latent_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
+            self.fc2_latent_proj = TELinear(
+                self.config.moe_latent_size,
+                self.config.hidden_size,
+                parallel_mode="duplicated",
+                config=self.config,
+                init_method=self.config.output_layer_init_method,
+                bias=self.config.add_bias_linear,
+                skip_bias_add=True,
+                skip_weight_param_allocation=False,
+                is_expert=False,
+            )
 
         # Initialize token dispatcher
         if config.moe_token_dispatcher_type == "allgather":
@@ -241,10 +267,25 @@ class MoELayer(BaseMoELayer):
 
     def dispatch_compute_combine(self, hidden_states, probs, residual, shared_expert_output=None):
         """This is a combined method of dispatch, compute, and combine."""
-        dispatched_input, probs = self.dispatch(hidden_states, probs)
+        # Project the hidden_states from hidden dimension down to latent dimenion.
+        # Shared expert computation is still performed in hidden dimension with the 'residual' tensor.
+        if self.config.moe_latent_size:
+            assert not self.shared_expert_overlap, "Shared expert overlap not supported when MoE latent projections are used."
+            experts_input, _ = self.fc1_latent_proj(hidden_states)
+        else:
+            experts_input = hidden_states
+
+        dispatched_input, probs = self.dispatch(experts_input, probs)
         output, shared_expert_output, mlp_bias = self.experts_compute(
             dispatched_input, probs, residual, shared_expert_output
         )
+
+        # Project the output back from latent dimension to hidden dimension
+        if self.config.moe_latent_size:
+            if mlp_bias is not None:
+                output = output + mlp_bias
+            output, mlp_bias = self.fc2_latent_proj(output)
+
         output = self.combine(output, shared_expert_output)
         return output, mlp_bias
 
