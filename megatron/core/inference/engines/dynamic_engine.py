@@ -485,7 +485,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 request_satisfied = True # we are updating a request, not schedule one, so we don't need to check this
                 token_fully_satisfied = self.context.active_token_count + req.prompt_length <= self.chunked_prefill_token_count 
                 token_partially_satisfied = self.context.active_token_count < self.chunked_prefill_token_count
-                chunks = math.ceil(req.prompt_length + req.finished_chunked_tokens / self.context.chunk_size_tokens) \
+                chunks = math.ceil((req.prompt_length + req.finished_chunked_tokens) / self.context.chunk_size_tokens) \
                         - math.ceil(req.finished_chunked_tokens / self.context.chunk_size_tokens) # this is the amount of blocks to add
                 kv_cache_available = self.context.chunk_allocator.is_memory_available(chunks, safe=True) # use the backup space to guarantee that the request can fully prefill
             else:
