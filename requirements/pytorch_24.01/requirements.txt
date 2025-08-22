@@ -1,0 +1,15 @@
+einops
+flask-restful
+nltk
+pytest
+pytest-cov
+pytest_mock
+pytest-random-order
+sentencepiece
+tiktoken
+wrapt
+zarr
+wandb
+triton==2.1.0
+tensorstore==0.1.45
+nvidia-modelopt[torch]>=0.19.0; sys_platform != "darwin"
