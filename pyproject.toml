@@ -71,7 +71,7 @@ dev = [
     "tensorstore~=0.1,!=0.1.46,!=0.1.72",
     "nvtx~=0.2",
     "transformers~=4.53",
-    "multi-storage-client~=0.20",
+    "multi-storage-client~=0.25,<0.26",
     "opentelemetry-api~=1.33.1",
     "setuptools<80.0.0",
     "mamba-ssm~=2.2",
