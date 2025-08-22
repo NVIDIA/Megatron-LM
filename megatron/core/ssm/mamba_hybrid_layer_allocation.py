@@ -18,13 +18,20 @@ class Symbols:
     MAMBA = "M"
     ATTENTION = "*"
     MLP = "-"
+    PARALLEL = "P"
     VALID = {MAMBA, ATTENTION, MLP}
 
 
 def _allocate_auto(
-    total_layers_count: int, target_attention_ratio: float, target_mlp_ratio: float
+    total_layers_count: int, target_attention_ratio: float, target_mlp_ratio: float, target_parallel_hybrid_ratio: float
 ) -> list:
     # First, allocate attention (evenly spaced, starting and ending with mamba)
+
+    # TODO: decide on the best allocation logic here
+    if target_parallel_hybrid_ratio > 0.0:
+        layer_type_list = [Symbols.PARALLEL] * total_layers_count
+        return layer_type_list
+    
     attention_layers_count: int = round(total_layers_count * target_attention_ratio)
     mamba_layers_count: int = total_layers_count - attention_layers_count
     mamba_sections_count: int = attention_layers_count + 1
@@ -85,15 +92,16 @@ def allocate_layers(
     total_layers_count: int,
     target_attention_ratio: float,
     target_mlp_ratio: float,
+    target_parallel_hybrid_ratio: float,
     override_pattern: str = None,
 ) -> list:
     assert total_layers_count > 0
     assert target_attention_ratio >= 0.0 and target_attention_ratio <= 1.0
     assert target_mlp_ratio >= 0.0 and target_mlp_ratio <= 1.0
-    assert target_attention_ratio + target_mlp_ratio <= 1.0
+    assert target_attention_ratio + target_mlp_ratio + target_parallel_hybrid_ratio <= 1.0
     # Note: target_mamba_ratio = 1.0 - target_attention_ratio - target_mlp_ratio
 
-    layer_type_list = _allocate_auto(total_layers_count, target_attention_ratio, target_mlp_ratio)
+    layer_type_list = _allocate_auto(total_layers_count, target_attention_ratio, target_mlp_ratio, target_parallel_hybrid_ratio)
 
     if override_pattern is not None:
         layer_type_list_override = _allocate_override(total_layers_count, override_pattern)

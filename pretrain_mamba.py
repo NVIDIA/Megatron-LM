@@ -66,6 +66,8 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
     else:
         raise("You must provide a valid Mamba layer spec!")
 
+    import pdb; pdb.set_trace()
+
     model = MambaModel(
         config=config,
         mamba_stack_spec=mamba_stack_spec,
@@ -74,6 +76,7 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
         pre_process=pre_process,
         hybrid_attention_ratio=args.hybrid_attention_ratio,
         hybrid_mlp_ratio=args.hybrid_mlp_ratio,
+        parallel_hybrid_ratio=args.parallel_hybrid_ratio,
         hybrid_override_pattern=args.hybrid_override_pattern,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
