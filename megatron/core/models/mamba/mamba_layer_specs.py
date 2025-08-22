@@ -77,6 +77,7 @@ mamba_stack_spec = ModuleSpec(
                         in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
                     ),
                 ),
+                parallel_hybrid_bda=get_bias_dropout_add,
                 attention_layer=ModuleSpec(
                     module=ModuleSpec(
                         module=SelfAttention,

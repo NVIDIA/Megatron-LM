@@ -46,6 +46,7 @@ class ParallelHybridLayerSubmodules:
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
     input_layernorm: Union[ModuleSpec, type] = IdentityOp
+    parallel_hybrid_bda: Union[ModuleSpec, type] = IdentityOp
 
 
 class ParallelHybridLayer(MegatronModule):
@@ -106,13 +107,14 @@ class ParallelHybridLayer(MegatronModule):
                 attention_optional_kwargs["cp_comm_type"] = self.config.cp_comm_type
         model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
         attention_optional_kwargs["model_comm_pgs"] = model_comm_pgs
+
         # Create submodules for SelfAttention - extract from main submodules
         attention_submodules = SelfAttentionSubmodules(
-            linear_qkv=submodules.attention_layer.submodules.linear_qkv,
-            core_attention=submodules.attention_layer.submodules.core_attention,
-            linear_proj=submodules.attention_layer.submodules.linear_proj,
-            q_layernorm=getattr(submodules.attention_layer.submodules, 'q_layernorm', None),
-            k_layernorm=getattr(submodules.attention_layer.submodules, 'k_layernorm', None),
+            linear_qkv=submodules.attention_layer.module.submodules.linear_qkv,
+            core_attention=submodules.attention_layer.module.submodules.core_attention,
+            linear_proj=submodules.attention_layer.module.submodules.linear_proj,
+            q_layernorm=getattr(submodules.attention_layer.module.submodules, 'q_layernorm', None),
+            k_layernorm=getattr(submodules.attention_layer.module.submodules, 'k_layernorm', None),
         )
 
         self.self_attention = build_module(
@@ -124,13 +126,21 @@ class ParallelHybridLayer(MegatronModule):
         )
 
         # Bias-Dropout-Add fusion
-        self.mamba_bda = build_module(submodules.mamba_layer.mamba_bda)
+        self.parallel_hybrid_bda = build_module(submodules.parallel_hybrid_bda)
 
+    
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm, 
             config=self.config, 
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
+        )
+
+        self.mlp = build_module(
+            submodules.mlp_layer.module,
+            submodules=submodules.mlp_layer.submodules,
+            config=self.config,
+            layer_number=self.layer_number,
         )
 
         self.bias_dropout_add_exec_handler = torch.enable_grad
@@ -171,17 +181,16 @@ class ParallelHybridLayer(MegatronModule):
 
         # SSM Forward: Use existing MambaMixer
         mamba_output, mamba_bias = self.mamba_mixer(
-            hidden_states*self.config.ssm_in_multiplier,
+            hidden_states,
             inference_context=inference_context,
-            position_ids=position_ids,
         )
-        outputs.append(mamba_output*self.config.ssm_out_multiplier)
+        outputs.append(mamba_output)
         if mamba_bias is not None:
             biases.append(mamba_bias)
 
         # Attention Component: Use existing SelfAttention
         attn_output, attn_bias = self.self_attention(
-            hidden_states*self.config.attention_in_multiplier,
+            hidden_states,
             attention_mask=attention_mask,
             inference_context=inference_context,
             rotary_pos_emb=rotary_pos_emb,
@@ -191,7 +200,7 @@ class ParallelHybridLayer(MegatronModule):
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
         )
-        outputs.append(attn_output*self.config.attention_out_multiplier)
+        outputs.append(attn_output)
 
         if attn_bias is not None:
             biases.append(attn_bias)
@@ -213,10 +222,18 @@ class ParallelHybridLayer(MegatronModule):
         out_with_bias = (combined_output, combined_bias)
 
         with self.bias_dropout_add_exec_handler():
-            final_output = self.mamba_bda(
+            hidden_states = self.parallel_hybrid_bda(
                 training=self.training, 
                 fused=self.config.bias_dropout_fusion
             )(out_with_bias, residual, self.hidden_dropout)
+
+        # TODO: verify this
+        residual = hidden_states
+        hidden_states = self.pre_mlp_layernorm(hidden_states)
+
+        hidden_states, _ = self.mlp(hidden_states)
+        final_output = hidden_states + residual
+
         return final_output
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):

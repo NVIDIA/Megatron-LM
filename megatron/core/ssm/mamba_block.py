@@ -200,7 +200,6 @@ class MambaStack(MegatronModule):
                         layer_number=i + 1,
                         model_comm_pgs=model_comm_pgs,
                     )
-                    import pdb; pdb.set_trace()
                 else:
                     assert False, "unexpected layer_type"
             self.layers.append(layer)
@@ -346,7 +345,7 @@ class MambaStack(MegatronModule):
                 )
                 with inner_fp8_context:
                     if isinstance(layer, (TransformerLayer, ParallelHybridLayer)):
-                        hidden_states, _ = layer(
+                        hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
                             inference_context=inference_context,

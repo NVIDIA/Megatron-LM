@@ -66,8 +66,6 @@ def model_provider(pre_process=True, post_process=True) -> MambaModel:
     else:
         raise("You must provide a valid Mamba layer spec!")
 
-    import pdb; pdb.set_trace()
-
     model = MambaModel(
         config=config,
         mamba_stack_spec=mamba_stack_spec,
