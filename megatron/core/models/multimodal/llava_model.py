@@ -294,6 +294,11 @@ class LLaVAModel(MegatronModule):
                     embedder_bias = False
                     ln_post_impl = None
                     use_mask_token = False
+
+                if vision_transformer_config.fp8:
+                    # FP8 padding for final sequence length to be a multiple of 16 or 32.
+                    class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
+
                 self.vision_model = RADIOViTModel(
                     vision_transformer_config,
                     vision_transformer_layer_spec,
