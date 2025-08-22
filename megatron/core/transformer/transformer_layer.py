@@ -29,14 +29,16 @@ from megatron.core.utils import (
     make_viewless_tensor,
     nvtx_range_pop,
     nvtx_range_push,
+    get_pg_rank,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None):
+def get_transformer_layer_offset(config: TransformerConfig, vp_stage: Optional[int] = None, pp_group=None):
     """Get the index offset of current pipeline stage, given the level of pipelining."""
-    pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+    #pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
+    pipeline_rank = get_pg_rank(pp_group)
 
     if config.pipeline_model_parallel_size > 1:
 
