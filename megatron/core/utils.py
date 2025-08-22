@@ -1897,10 +1897,10 @@ def get_sub_sample_on_this_cp_rank(batch, scheduled_id, local_cp_size, packed_se
 
     sub_sample_packed_seq_params = PackedSeqParams(
         qkv_format="sbhd",
-        cu_seqlens_q=torch.tensor([0, packed_seq_params.cu_seqlens_q[scheduled_id+1] - packed_seq_params.cu_seqlens_q[scheduled_id]], device="cpu", pin_memory=True),
-        cu_seqlens_kv=torch.tensor([0, packed_seq_params.cu_seqlens_kv[scheduled_id+1] - packed_seq_params.cu_seqlens_kv[scheduled_id]], device="cpu", pin_memory=True),
-        cu_seqlens_q_padded=torch.tensor([0, packed_seq_params.cu_seqlens_q_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_q_padded[scheduled_id]], device="cpu", pin_memory=True),
-        cu_seqlens_kv_padded=torch.tensor([0, packed_seq_params.cu_seqlens_kv_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_kv_padded[scheduled_id]], device="cpu", pin_memory=True),
+        cu_seqlens_q=torch.tensor([0, packed_seq_params.cu_seqlens_q[scheduled_id+1] - packed_seq_params.cu_seqlens_q[scheduled_id]], device="cuda", pin_memory=True),
+        cu_seqlens_kv=torch.tensor([0, packed_seq_params.cu_seqlens_kv[scheduled_id+1] - packed_seq_params.cu_seqlens_kv[scheduled_id]], device="cuda", pin_memory=True),
+        cu_seqlens_q_padded=torch.tensor([0, packed_seq_params.cu_seqlens_q_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_q_padded[scheduled_id]], device="cuda", pin_memory=True),
+        cu_seqlens_kv_padded=torch.tensor([0, packed_seq_params.cu_seqlens_kv_padded[scheduled_id+1] - packed_seq_params.cu_seqlens_kv_padded[scheduled_id]], device="cuda", pin_memory=True),
         max_seqlen_q=end_index - start_index,
         max_seqlen_kv=end_index - start_index,
         local_cp_size=local_cp_size,

@@ -7,6 +7,49 @@ from functools import lru_cache
 import math
 import heapq
 
+class HybridCPWrapper():
+    """
+    A wrapper class that wraps around any existing dataset and prints samples
+    as they are requested from the original dataset.
+    
+    This wrapper implements the standard PyTorch Dataset interface and can be
+    used with any dataset that follows the same interface.
+    
+    Args:
+        dataset: The original dataset to wrap around
+        print_format: Format string for printing samples (default: "Sample {idx}: {sample}")
+        print_func: Function to use for printing (default: print)
+        max_print_length: Maximum length of sample to print (default: 200 chars)
+        print_every: Print every Nth sample (default: 1, print all)
+    """
+    
+    def __init__(
+        self, 
+        data_iterator,
+        config,
+    ):
+        self.data_iterator = data_iterator
+        self.sample_count = 0
+        self.config = config
+        self.cp_balancing_scheduler = BalancedCPScheduler(max_seq_len_per_rank=self.config.max_seqlen_per_cp_rank)
+
+    def __iter__(self):
+        """Return self as an iterator."""
+        return self
+
+    def __next__(self) -> Any:
+        """
+        Get the next item from the dataset, pull scheduling metadata and return it.
+        """
+        sample = next(self.data_iterator)
+        assert "cu_lengths" in sample, "cu_lengths must be in the sample"
+        # TODO(milestone 2): Get cu_lengths and all-gather the entire global batch worth cu_lengths and then perform the scheduling.
+        # But why should this scheduling information be integrated back into the data?
+        groups, sample_id_groups = self.cp_balancing_scheduler.get_groups_and_subsamples(sample, self.config)
+        sample["groups"] = groups
+        sample["sample_id_groups"] = sample_id_groups
+        return sample
+
 class BalancedCPScheduler:
     def __init__(self, max_seq_len_per_rank: int):
         self.max_seq_len_per_rank = max_seq_len_per_rank
@@ -554,7 +597,9 @@ def hybrid_context_parallel_forward_backward(
     with no_sync_func():
         for i in range(num_microbatches - 1):
             data = next(data_iterator)
-            groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(data, model, config)
+            # groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(data, model, config)
+            groups = data["groups"]
+            sample_id_groups = data["sample_id_groups"]
             for j in range(len(groups)):
                 # Get sub-samples for the current CP rank
                 # TODO: Update to DPxCP rank when milestone 2
@@ -593,7 +638,9 @@ def hybrid_context_parallel_forward_backward(
     # TODO: Call scheduler here.
     with no_sync_func():
         data = next(data_iterator)
-        groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(data, model, config)
+        # groups, sample_id_groups = cp_balancing_scheduler.get_groups_and_subsamples(data, model, config)
+        groups = data["groups"]
+        sample_id_groups = data["sample_id_groups"]
         for j in range(len(groups) - 1):
             sample_ids_per_group = sample_id_groups[j][parallel_state.get_context_parallel_rank()]
             for k in range(len(sample_ids_per_group)):
