@@ -765,7 +765,6 @@ def get_emerging_optimizer(
     scale_lr_cond: Optional[Callable] = None,
     lr_mult: float = 1.0,
     use_gloo_process_groups: bool = True,
-    extra_args = None,
 ) -> MegatronOptimizer:
     # currently it is only supporting muon, will add soaps later
 
