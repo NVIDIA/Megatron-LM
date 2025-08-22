@@ -758,7 +758,7 @@ def get_megatron_optimizer(
 
 # self-contained change depends on this but doesn't modify existing function.
 # will move to optimizer implementation directory
-def get_emerging_optimizer(
+def get_megatron_muon_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
     no_weight_decay_cond: Optional[Callable] = None,
@@ -773,6 +773,8 @@ def get_emerging_optimizer(
     # but there are strong dependency and assumption in DDP that prevent it
     if config.use_distributed_optimizer:
         raise Exception('muon with dist optimizer is not supported.')
+
+    log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
     optimizers = []
     # record list of non/linear params

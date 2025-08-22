@@ -69,7 +69,7 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig, get_emerging_optimizer
+from megatron.core.optimizer import get_megatron_optimizer, OptimizerConfig, get_megatron_muon_optimizer
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1330,7 +1330,7 @@ def setup_model_and_optimizer(
             default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
         )
     else:
-        optimizer = get_emerging_optimizer(
+        optimizer = get_megatron_muon_optimizer( 
             config,
             model,
             no_wd_decay_cond,
