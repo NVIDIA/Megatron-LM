@@ -2755,12 +2755,13 @@ def evaluate_and_print_results(
     wandb_writer = get_wandb_writer()
 
     data_iterators = data_iterator if args.multiple_validation_sets else [data_iterator]
-    if args.full_validation:
-        if not args.multiple_validation_sets:
-            eval_iters = [args.eval_iters]
-        else:
-            eval_iters = args.eval_iters
 
+    if not args.multiple_validation_sets:
+        eval_iters = [args.eval_iters]
+    else:
+        eval_iters = args.eval_iters
+        
+    if args.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
         # with full validation we need to distribute eval_iters to all ranks
