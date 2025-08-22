@@ -79,9 +79,24 @@ class AsyncRequest(NamedTuple):
 
         This logic is equivalent to what should happen in case of the async call.
         """
+        # preload tensors.
+        async_fn_args = list(self.async_fn_args)
+        if self.preload_fn:
+            assert len(async_fn_args) == 3, "Expected 3 args to be passed to async function"
+            # The async_fn is passed as a partial functool with pre-determined args
+            # In the async_fn_args we pass the remaining positional args required by the async_fn
+            # async_fn_args[1] refers to the write_buckets
+            # To ensure we stage the write_buckets to CPU memory for sync CP,
+            # we replace it with preload_fn callable that returns the CPU staged tensors
+            async_fn_args[1] = self.preload_fn()
+        # persist the state
         if self.async_fn is not None:
-            self.async_fn(*self.async_fn_args)
+            self.async_fn(*async_fn_args, **self.async_fn_kwargs)
+
+        # This utility implements a sync cp save. Hence the barrier.
         torch.distributed.barrier()
+
+        # Finalize the CP state
         for finalize_fn in self.finalize_fns:
             finalize_fn()
 
@@ -528,6 +543,9 @@ class AsyncCallsQueue:
             blocking (bool, optional): if True, will wait until all active requests
                 are done. Otherwise, finalizes only the async request that already
                 finished. Defaults to False.
+
+            no_dist (bool, Optional): if True, training ranks simply check its
+                asynchronous checkpoint writer without synchronization.
         Returns:
             List[int]: list of indices (as returned by `schedule_async_request`)
                 of async calls that have been successfully finalized.
@@ -545,8 +563,8 @@ class AsyncCallsQueue:
                     finalize_fn()
                 ten = torch.tensor([call_idx], dtype=torch.int, device=torch.cuda.current_device())
                 torch.distributed.all_reduce(ten, op=torch.distributed.ReduceOp.MAX)
-                assert ten.item() == call_idx, 'Unmatched async calls. '
-                'That probably means not all ranks are participating in async finalization'
+                assert ten.item() == call_idx, "Unmatched async calls. "
+                "That probably means not all ranks are participating in async finalization"
                 call_idx_finalized.append(call_idx)
         return call_idx_finalized
 
