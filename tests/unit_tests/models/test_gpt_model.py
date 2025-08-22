@@ -228,7 +228,9 @@ class TestGPTModelWithCustomPG:
             tp=tp_group, cp=cp_group, pp=pp_group, ep=ep_group, embd=embd_group
         )
 
-        model_parallel_cuda_manual_seed(1234, tp_rank=tp_group.rank(), ep_rank=ep_group.rank(), etp_rank=tp_group.rank())
+        model_parallel_cuda_manual_seed(
+            1234, tp_rank=tp_group.rank(), ep_rank=ep_group.rank(), etp_rank=tp_group.rank()
+        )
         transformer_config = TransformerConfig(
             num_layers=2, hidden_size=1024, num_attention_heads=16, use_cpu_initialization=False
         )
