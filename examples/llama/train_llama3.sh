@@ -86,6 +86,7 @@ CKPT_FORMAT="${CKPT_FORMAT:-torch}"
 DATA_CACHE_PATH="${DATA_CACHE_PATH:-/root/cache}"
 
 if [ "$FSDP" -eq 1 ]; then
+    unset CUDA_DEVICE_MAX_CONNECTIONS
     if [ "$TP" -gt 1 ]; then
         echo "It is not recommended to use FSDP and TP together. Disabling TP."
         TP=1
@@ -254,6 +255,7 @@ EXTRA_ARGS="
     --distributed-backend nccl \
     --distributed-timeout-minutes 120 \
     --overlap-grad-reduce \
+    --rerun-mode disabled \
 "
 
 if [ "$FSDP" -eq 1 ]; then

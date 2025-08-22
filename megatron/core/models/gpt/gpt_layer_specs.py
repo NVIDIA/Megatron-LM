@@ -32,7 +32,7 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayerSubmodules,
     get_transformer_layer_offset,
 )
-
+from megatron.core.utils import is_te_min_version
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 

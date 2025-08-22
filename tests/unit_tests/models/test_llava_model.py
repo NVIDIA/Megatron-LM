@@ -443,6 +443,8 @@ class TestLLaVAModel:
 
     @pytest.mark.internal
     def test_save_load(self, tmp_path):
+        import io
+        torch.serialization.add_safe_globals([io.BytesIO])
         path = tmp_path / "model.pt"
         torch.save(self.model.state_dict(), path)
 

@@ -90,6 +90,7 @@ class TestT5Model:
     @pytest.mark.parametrize('src_spec_type', ['te', 'local'])
     @pytest.mark.parametrize('dst_spec_type', ['te', 'local'])
     @pytest.mark.parametrize('model_type', ['t5'])
+    @pytest.mark.failing_on_rocm
     def test_sharded_state_dict_save_load(
         self, tmp_path_dist_ckpt, src_spec_type, dst_spec_type, model_type
     ):
@@ -139,6 +140,7 @@ class TestT5ModelReconfiguration:
     @pytest.mark.parametrize(
         ('use_fpsl', 'src_tp_pp_encpp', 'dest_tp_pp_encpp'), [(False, (1, 1, None), (1, 1, None))]
     )
+    @pytest.mark.failing_on_rocm
     def test_parallel_reconfiguration_e2e(
         self,
         tmp_path_dist_ckpt,

@@ -64,6 +64,8 @@ class TestMultimodalProjector:
         assert logits.shape == torch.Size([2, 64])
 
     def test_save_load(self, tmp_path):
+        import io
+        torch.serialization.add_safe_globals([io.BytesIO])
         path = tmp_path / "mlp.pt"
         torch.save(self.mlp.state_dict(), path)
 

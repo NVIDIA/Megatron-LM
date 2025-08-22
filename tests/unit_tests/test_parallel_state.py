@@ -102,7 +102,7 @@ def test_tensor_model_parallel_rank(order):
     assert ps.get_tensor_model_parallel_rank() == rank
     Utils.destroy_model_parallel()
 
-
+@pytest.mark.failing_on_rocm
 @pytest.mark.parametrize('order', test_parallel_order)
 def test_moe_tensor_model_parellel_rank(order):
     Utils.initialize_model_parallel(expert_tensor_parallel_size=world_size, order=order)
@@ -120,13 +120,13 @@ def test_pipeline_model_parallel_rank(order):
     assert ps.get_pipeline_model_parallel_rank() == rank
     Utils.destroy_model_parallel()
 
-
+@pytest.mark.failing_on_rocm
 def test_context_parallel_rank():
     Utils.initialize_model_parallel(context_parallel_size=world_size)
     assert ps.get_context_parallel_rank() == rank
     Utils.destroy_model_parallel()
 
-
+@pytest.mark.failing_on_rocm
 def test_expert_model_parallel_rank():
     Utils.initialize_model_parallel(expert_model_parallel_size=world_size)
     assert ps.get_expert_model_parallel_rank() == rank

@@ -751,7 +751,15 @@ class _ParamAndGradBuffer:
                 assert bucket_id == cur_bucket_id + 1
                 cur_bucket_id = bucket_id
             bucket_params.append(param)
-
+        
+        # Synchronize streams to ensure all AyncMemCpys are done. 
+        # The model is initialized in a separate CUDA stream,
+        # not the default one. This is essential to prevent a race condition where the
+        # main thread might try to access model parameters buffers before they're fully
+        # initialized. This race condition leads to numerical instability and NaNs
+        # during the forward pass.
+        # training.py - https://github.com/ROCm/Megatron-LM/commit/e7c55de99ed24278dcc2ed44455bf61ac2d95383
+        torch.cuda.synchronize()
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
             bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)

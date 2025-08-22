@@ -275,6 +275,7 @@ EXTRA_ARGS="
 "
 
 if [ "$FSDP" -eq 1 ]; then
+    unset CUDA_DEVICE_MAX_CONNECTIONS
     EXTRA_ARGS="$EXTRA_ARGS --use-torch-fsdp2"
     if [ "$SEQ_PARALLEL" -eq 1 ]; then
         echo "Warning: Sequence Parallelism and FSDP2 have conflicting CUDA_MAX_CONNECTIONS requirements. It is recommended not to use them together."

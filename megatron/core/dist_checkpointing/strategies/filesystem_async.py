@@ -33,17 +33,6 @@ from torch.futures import Future
 
 from .async_utils import _disable_gc
 
-from .async_utils import _disable_gc
-
-try:
-    # This PR https://github.com/pytorch/pytorch/pull/143359 introduced breaking change to saving checkpoints 
-    # in torch_dist format. This is a workaround to fix the issue.
-    from torch.distributed.checkpoint.filesystem import _StorageWriterTransforms
-    from functools import partial
-    _write_item = partial(_write_item, _StorageWriterTransforms())
-except ImportError:
-    pass
-
 logger = logging.getLogger(__name__)
 
 WriteBucket = Tuple[Path, str, Tuple[list, list]]  # represents writes to a single file
@@ -273,7 +262,7 @@ class FileSystemWriterAsync(FileSystemWriter):
         logger = logging.getLogger(__name__)
         w_start = time()
         write_results_or_exc: Union[dict, Exception] = dict()
-        ctx = mp.get_context("fork")
+        ctx = mp.get_context("spawn")
         local_results_queue = ctx.Queue()
         count_queue = ctx.JoinableQueue()
         p_list = []

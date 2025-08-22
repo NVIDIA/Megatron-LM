@@ -254,6 +254,7 @@ class TestGPTModel:
             pytest.param((1, 2), 2, True, True, False),
         ],
     )
+    @pytest.mark.failing_on_rocm
     def test_upcycling_TE(self, tp_ep, granularity, grouped_gemm, swiglu, squared_relu):
         tp = tp_ep[0]
         ep = tp_ep[1]

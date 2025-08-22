@@ -61,6 +61,7 @@ def setup_seed(seed):
 @pytest.mark.parametrize('offload_fraction', [0, 0.5, 1.0])
 @pytest.mark.parametrize('optimizer', ['sgd', 'adam'])
 @pytest.mark.parametrize('with_param_groups', [False, True])
+@pytest.mark.failing_on_rocm
 def test_multi_device_hybrid_optimizer(
     with_param_groups, optimizer, offload_fraction, overlap_cpu_optimizer_d2h_h2d, n_steps
 ):

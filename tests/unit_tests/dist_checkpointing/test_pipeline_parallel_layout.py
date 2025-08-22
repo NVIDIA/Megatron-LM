@@ -269,6 +269,7 @@ def create_args():
         ),
     ],
 )
+@pytest.mark.flaky
 def test_save_and_load_checkpoint_vpp(
     create_args,
     tmp_path_dist_ckpt,

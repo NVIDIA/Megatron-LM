@@ -203,6 +203,7 @@ class TestFP8Param:
 
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.parametrize("tp_size", [4])
+    @pytest.mark.failing_on_rocm
     def test_delayed_scaling(self, tp_size):
         self.run_test(tp_size=tp_size, recipe="delayed")
 

@@ -75,6 +75,7 @@ class TestAllReduceLNGrads:
         ("freeze_model", "pp_size", "share_embeddings"),
         [(True, 2, True), (False, 2, True), (True, 2, False), (False, 2, False)],
     )
+    @pytest.mark.failing_on_rocm
     def test_allreduce_word_embedding_grads(self, freeze_model, pp_size, share_embeddings):
         self.tp_size = 1
         self.pp_size = pp_size

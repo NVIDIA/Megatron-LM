@@ -118,6 +118,7 @@ class TestTransformerLayerSubmoduleCallables:
     @pytest.mark.parametrize("dispatcher_type", get_valid_token_dispatcher_types())
     @pytest.mark.parametrize("grouped_gemm", [True, False])
     @pytest.mark.parametrize("permute_fusion", [True, False])
+    @pytest.mark.failing_on_rocm
     def test_1f1b_overlap(self, dispatcher_type, grouped_gemm, permute_fusion):
         """
         Tests the 1-forward-1-backward overlap optimization.

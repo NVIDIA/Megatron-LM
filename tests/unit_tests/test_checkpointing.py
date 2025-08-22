@@ -161,6 +161,7 @@ def test_load_base_checkpoint(
         create_checkpoint(load_dir, ckpt_format)
         args = create_ckpt_load_args
         args.ckpt_format = ckpt_format
+        set_args(args)
 
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir, args, rank0=True

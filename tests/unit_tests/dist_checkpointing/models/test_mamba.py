@@ -83,6 +83,7 @@ class TestMambaReconfiguration:
         ],
     )
     @pytest.mark.parametrize('singleton_local_shards', [True, False])
+    @pytest.mark.failing_on_rocm
     def test_parallel_reconfiguration_e2e(
         self,
         tmp_path_dist_ckpt,

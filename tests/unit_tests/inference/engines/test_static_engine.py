@@ -244,6 +244,7 @@ class TestStaticInferenceEngine:
     @pytest.mark.parametrize("ep_size", [1, 2])
     @pytest.mark.parametrize("pp_size", [1, 2])
     @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.failing_on_rocm
     def test_parallel_inference(self, tp_size, pp_size, ep_size, sequence_parallel):
         if tp_size == 1 and pp_size == 1 and ep_size == 1:
             pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")

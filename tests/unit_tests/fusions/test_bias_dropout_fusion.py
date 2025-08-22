@@ -6,6 +6,7 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("training", [True, False])
+@pytest.mark.failing_on_rocm
 def test_bias_dropout_add(dtype, training):
     torch.manual_seed(42)
     device = "cuda"

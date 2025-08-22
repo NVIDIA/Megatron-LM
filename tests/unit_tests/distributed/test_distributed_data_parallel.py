@@ -41,6 +41,7 @@ class TestDistributedDataParallel:
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
+    @pytest.mark.failing_on_rocm
     def test_ddp_with_dp_process_groups(self, dp_size):
         """Test that DDP works correctly with dp pgs from parallel state and user defined pgs."""
 

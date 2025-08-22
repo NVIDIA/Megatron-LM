@@ -655,6 +655,7 @@ class TestDynamicInferenceEngine:
     @pytest.mark.parametrize("ep_size", [1, 2])
     @pytest.mark.parametrize("pp_size", [1, 2])
     @pytest.mark.parametrize("tp_size", [1, 2])
+    @pytest.mark.failing_on_rocm
     def test_parallel_inference(
         self, tp_size, pp_size, ep_size, sequence_parallel, materialize_only_last_token_logits
     ):

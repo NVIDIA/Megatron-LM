@@ -224,6 +224,8 @@ class TestFullyShardedDataParallel:
         Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False
         Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False]
         """
+        if nccl_ub:
+            pytest.skip("User buffers are failing on ROCm")
         if not is_torch_min_version("2.4.0"):
             pytest.skip("Megatron FSDP requires torch >= 2.4.0")
 

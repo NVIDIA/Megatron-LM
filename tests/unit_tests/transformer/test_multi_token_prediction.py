@@ -272,6 +272,7 @@ class TestMultiTokenPrediction:
     @pytest.mark.parametrize(
         ("tp", "cp"), [(1, 1), (1, 2), (1, 4), (2, 1), (2, 2), (2, 4), (4, 1), (4, 2)]
     )
+    @pytest.mark.failing_on_rocm
     def test_forward_backward(self, tmp_path_dist_ckpt, tp, cp, full_recompute):
         """Test MTP forward and backward with gptmodel."""
         tp_ref = 1

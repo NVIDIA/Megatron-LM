@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Copyright (c) 2023 Alibaba PAI Team.
-#
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -417,12 +417,6 @@ def validate_args(args, defaults={}):
 
     # Checks.
 
-    if args.pipeline_model_parallel_size > 1:
-        if args.pipeline_model_parallel_split_rank is not None:
-            assert args.pipeline_model_parallel_split_rank < \
-                    args.pipeline_model_parallel_size, 'split rank needs'\
-                    ' to be less than pipeline model parallel size ({})'.format(
-                            args.pipeline_model_parallel_size)
     if args.hierarchical_context_parallel_sizes:
         from numpy import prod
         assert args.context_parallel_size == prod(args.hierarchical_context_parallel_sizes)
@@ -1188,8 +1182,8 @@ def core_transformer_config_from_args(args, config_class=None):
     # Config class.
     config_class = config_class or TransformerConfig
 
-    # if args.multi_latent_attention:
-    #     config_class = MLATransformerConfig
+    if args.multi_latent_attention:
+        config_class = MLATransformerConfig
     
     if args.heterogeneous_layers_config_path is not None:
         assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
@@ -1238,7 +1232,7 @@ def core_transformer_config_from_args(args, config_class=None):
 
     if len(args.cp_comm_type) == 1:
         kw_args['cp_comm_type'] = args.cp_comm_type[0]
-        if args.is_hybrid_model:
+    if args.is_hybrid_model:
         kw_args['is_hybrid_model'] = args.is_hybrid_model
 
     # handle quantization config
@@ -3084,13 +3078,6 @@ def get_patch_args(parser):
         "valid if base optimizer is HybridAdam.",
     )
 
-    group.add_argument(
-        "--optimizer-offload-fraction",
-        type=float,
-        default=0.5,
-        help="Optimizer Offload Fraction used by static offload policy, "
-        "valid if base optimizer is HybridAdam",
-    )
     group.add_argument(
         "--train-mode", default="pretrain", type=str, help="pretrain or finetune"
     )

@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
 """Pretrain and SFT GPT."""
 
@@ -20,6 +21,9 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+
+from megatron.training.arguments import get_patch_args
+
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
@@ -384,6 +388,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     return train_ds, valid_ds, test_ds
 
+def combined_args_provider(parser):  
+    if has_nvidia_modelopt:  
+        parser = add_modelopt_args(parser)  
+    parser = get_patch_args(parser)  
+    return parser  
 
 if __name__ == "__main__":
 
@@ -399,6 +408,6 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        extra_args_provider=combined_args_provider,
         store=store,
     )
