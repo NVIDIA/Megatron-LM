@@ -24,7 +24,7 @@ from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import is_te_min_version, make_tp_sharded_tensor_for_checkpoint
 
 
 class LanguageModule(MegatronModule):
@@ -132,7 +132,24 @@ class LanguageModule(MegatronModule):
             if self.config.cross_entropy_fusion_impl == 'te':
                 if te_parallel_cross_entropy is not None:
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
-                    loss = te_parallel_cross_entropy(logits, labels, self.model_comm_pgs.tp)
+                    # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
+                    is_cg_capturable = (
+                        hasattr(self.config, 'cuda_graph_scope')
+                        and self.config.cuda_graph_scope == 'full_iteration'
+                    )
+                    if is_cg_capturable and not is_te_min_version("2.7.0"):
+                        from megatron.core.utils import get_te_version
+
+                        current_version = get_te_version()
+                        raise AssertionError(
+                            f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
+                            f"but found version {current_version}. Please upgrade TransformerEngine "
+                            f"or set cuda_graph_scope to a value other than 'full_iteration'."
+                        )
+
+                    loss = te_parallel_cross_entropy(
+                        logits, labels, self.model_comm_pgs.tp, is_cg_capturable
+                    )
                 else:
                     raise RuntimeError("Trying to use a TE block when it's not present.")
             elif self.config.cross_entropy_fusion_impl == 'native':
